@@ -3428,7 +3428,7 @@ keybind: Keybinds = .{},
 ///     This is because the update dialog is managed through a
 ///     separate framework and cannot be customized without significant
 ///     effort.
-@"macos-icon": MacAppIcon = .official,
+@"macos-icon": MacAppIcon = .chalkboard,
 
 /// The absolute path to the custom icon file.
 /// Supported formats include PNG, JPEG, and ICNS.
