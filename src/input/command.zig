@@ -540,55 +540,55 @@ fn actionCommands(action: Action.Key) []const Command {
         .flip_split => comptime &.{
             .{
                 .action = .{ .flip_split = .horizontal },
-                .title = "Flip Split Left/Right",
+                .title = "Flip Split: Left/Right",
                 .description = "Swap the two sides of the nearest enclosing left/right split.",
             },
             .{
                 .action = .{ .flip_split = .vertical },
-                .title = "Flip Split Up/Down",
-                .description = "Swap the two sides of the nearest enclosing top/bottom split.",
+                .title = "Flip Split: Up/Down",
+                .description = "Swap the two sides of the nearest enclosing up/down split.",
             },
         },
 
         .toggle_split_direction => comptime &.{
             .{
                 .action = .{ .toggle_split_direction = .horizontal },
-                .title = "Toggle Split Direction: Left/Right to Up/Down",
-                .description = "Stack the nearest enclosing left/right split top to bottom.",
+                .title = "Toggle Split Direction: Left/Right → Up/Down",
+                .description = "Turn the nearest enclosing left/right split into an up/down split.",
             },
             .{
                 .action = .{ .toggle_split_direction = .vertical },
-                .title = "Toggle Split Direction: Up/Down to Left/Right",
-                .description = "Place the nearest enclosing top/bottom split side by side.",
+                .title = "Toggle Split Direction: Up/Down → Left/Right",
+                .description = "Turn the nearest enclosing up/down split into a left/right split.",
             },
         },
 
         .move_split_to_new_tab => comptime &.{.{
             .action = .move_split_to_new_tab,
-            .title = "Move Pane to New Tab",
-            .description = "Move the focused pane out of its tab into a new tab.",
+            .title = "Move Split to New Tab",
+            .description = "Move the focused split out of its tab into a new tab.",
         }},
 
         .merge_tabs => comptime &.{
             .{
                 .action = .{ .merge_tabs = .next_horizontal },
-                .title = "Merge Next Tab (Side by Side)",
+                .title = "Merge Next Tab: Left/Right",
                 .description = "Combine the next tab into this one, side by side.",
             },
             .{
                 .action = .{ .merge_tabs = .next_vertical },
-                .title = "Merge Next Tab (Stacked)",
-                .description = "Combine the next tab into this one, stacked top and bottom.",
+                .title = "Merge Next Tab: Up/Down",
+                .description = "Combine the next tab into this one, stacked up and down.",
             },
             .{
                 .action = .{ .merge_tabs = .previous_horizontal },
-                .title = "Merge Previous Tab (Side by Side)",
+                .title = "Merge Previous Tab: Left/Right",
                 .description = "Combine the previous tab into this one, side by side.",
             },
             .{
                 .action = .{ .merge_tabs = .previous_vertical },
-                .title = "Merge Previous Tab (Stacked)",
-                .description = "Combine the previous tab into this one, stacked top and bottom.",
+                .title = "Merge Previous Tab: Up/Down",
+                .description = "Combine the previous tab into this one, stacked up and down.",
             },
         },
 
