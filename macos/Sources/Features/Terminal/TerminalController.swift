@@ -112,6 +112,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(onMergeTabs),
+            name: Ghostty.Notification.didMergeTabs,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(onResetWindowSize),
             name: .ghosttyResetWindowSize,
             object: nil
@@ -522,6 +527,104 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                         ghostty,
                         from: parent,
                         withBaseConfig: baseConfig)
+                }
+            }
+        }
+
+        return controller
+    }
+
+    /// Create a new tab in the same window as `parent`, hosting an existing
+    /// split tree. Falls back to a new window if `parent` isn't a terminal
+    /// window. Used to eject a pane into its own tab and to reopen a tab on undo.
+    @discardableResult
+    static func newTab(
+        _ ghostty: Ghostty.App,
+        from parent: NSWindow?,
+        tree: SplitTree<Ghostty.SurfaceView>,
+        confirmUndo: Bool = true
+    ) -> TerminalController? {
+        // If we don't have a terminal-window parent, just make a window.
+        guard let parent,
+              let parentController = parent.windowController as? TerminalController else {
+            return newWindow(ghostty, tree: tree, confirmUndo: confirmUndo)
+        }
+
+        // New tabs are unsupported in non-native fullscreen.
+        if let fullscreenStyle = parentController.fullscreenStyle,
+           fullscreenStyle.isFullscreen && !fullscreenStyle.supportsTabs {
+            let alert = NSAlert()
+            alert.messageText = "Cannot Create New Tab"
+            alert.informativeText = "New tabs are unsupported while in non-native fullscreen. Exit fullscreen and try again."
+            alert.addButton(withTitle: "OK")
+            alert.alertStyle = .warning
+            alert.beginSheetModal(for: parent)
+            return nil
+        }
+
+        let controller = TerminalController.init(ghostty, withSurfaceTree: tree)
+        controller.isBackgroundOpaque = parentController.isBackgroundOpaque
+        guard let window = controller.window else { return controller }
+
+        if parent.isMiniaturized { parent.deminiaturize(self) }
+
+        // If macOS already added this window to the tab group, remove it so we
+        // can place it in the correct order (mirrors newTab).
+        if let tg = parent.tabGroup,
+           tg.windows.firstIndex(of: window) != nil {
+            tg.removeWindow(window)
+        }
+
+        if window.tabbingMode != .disallowed {
+            switch ghostty.config.windowNewTabPosition {
+            case "end":
+                if let last = parent.tabGroup?.windows.last {
+                    last.addTabbedWindowSafely(window, ordered: .above)
+                } else {
+                    parent.addTabbedWindowSafely(window, ordered: .above)
+                }
+
+            default:
+                parent.addTabbedWindowSafely(window, ordered: .above)
+            }
+        }
+
+        controller.scheduleInitialPresentation {
+            controller.showWindow(self)
+            window.makeKeyAndOrderFront(self)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            controller.relabelTabs()
+        }
+
+        // Setup undo: closing the tab reverses the new tab. When confirmUndo is
+        // false (e.g. ejecting/merging) we close immediately without a prompt.
+        if let undoManager = parentController.undoManager {
+            undoManager.registerUndo(
+                withTarget: controller,
+                expiresAfter: controller.undoExpiration
+            ) { target in
+                DispatchQueue.main.async {
+                    undoManager.disableUndoRegistration {
+                        if confirmUndo {
+                            target.closeTab(nil)
+                        } else {
+                            target.closeTabImmediately()
+                        }
+                    }
+                }
+
+                undoManager.registerUndo(
+                    withTarget: ghostty,
+                    expiresAfter: target.undoExpiration
+                ) { ghostty in
+                    _ = TerminalController.newTab(
+                        ghostty,
+                        from: parent,
+                        tree: tree,
+                        confirmUndo: confirmUndo)
                 }
             }
         }
@@ -1544,6 +1647,74 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         guard finalIndex >= 0 else { return }
         let targetWindow = tabbedWindows[finalIndex]
         targetWindow.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func onMergeTabs(notification: SwiftUI.Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard target == self.focusedSurface else { return }
+        guard let window = self.window, let tabGroup = window.tabGroup else { return }
+
+        // Decode the neighbor direction and split orientation.
+        guard let modeAny = notification.userInfo?["mergeTabs"] else { return }
+        guard let mode = modeAny as? ghostty_action_merge_tabs_e else { return }
+        let towardNext: Bool
+        let direction: SplitTree<Ghostty.SurfaceView>.Direction
+        switch mode {
+        case GHOSTTY_MERGE_TABS_NEXT_HORIZONTAL: towardNext = true; direction = .horizontal
+        case GHOSTTY_MERGE_TABS_NEXT_VERTICAL: towardNext = true; direction = .vertical
+        case GHOSTTY_MERGE_TABS_PREVIOUS_HORIZONTAL: towardNext = false; direction = .horizontal
+        case GHOSTTY_MERGE_TABS_PREVIOUS_VERTICAL: towardNext = false; direction = .vertical
+        default: return
+        }
+
+        // Find the neighboring tab's controller. No wrapping: if there's no
+        // neighbor in the requested direction, do nothing.
+        let windows = tabGroup.windows
+        guard let index = windows.firstIndex(of: window) else { return }
+        let neighborIndex = towardNext ? index + 1 : index - 1
+        guard neighborIndex >= 0, neighborIndex < windows.count else { return }
+        guard let donor = windows[neighborIndex].windowController as? TerminalController,
+              donor !== self else { return }
+        guard !surfaceTree.isEmpty, !donor.surfaceTree.isEmpty else { return }
+
+        let keeperOldTree = surfaceTree
+        let donorTree = donor.surfaceTree
+        let keeperFocus = focusedSurface
+
+        // Merging the next tab puts our content first (left/top) and the donor
+        // second (right/bottom); merging the previous tab puts the donor first.
+        let merged = surfaceTree.combined(
+            with: donorTree,
+            direction: direction,
+            otherOnSecond: towardNext)
+
+        // Move the donor's surfaces into this tab, then empty the donor's tree,
+        // which closes its now-contentless tab cleanly (no process prompt since
+        // it no longer owns any surfaces).
+        surfaceTree = merged
+        donor.surfaceTree = SplitTree()
+
+        // Keep focus on what we had focused before the merge.
+        if let keeperFocus {
+            DispatchQueue.main.async { Ghostty.moveFocus(to: keeperFocus) }
+        }
+
+        // Undo: restore our previous tree and reopen the donor as a new tab with
+        // its original contents (which we still hold a reference to via donorTree).
+        if let undoManager {
+            undoManager.setActionName("Merge Tabs")
+            undoManager.registerUndo(
+                withTarget: self,
+                expiresAfter: undoExpiration
+            ) { keeper in
+                keeper.surfaceTree = keeperOldTree
+                _ = TerminalController.newTab(
+                    keeper.ghostty,
+                    from: keeper.window,
+                    tree: donorTree,
+                    confirmUndo: false)
+            }
+        }
     }
 
     @objc private func onCloseTab(notification: SwiftUI.Notification) {

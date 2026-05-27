@@ -5334,6 +5334,36 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .flip_split => |axis| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .flip_split,
+            switch (axis) {
+                inline else => |tag| @field(apprt.action.SplitAxis, @tagName(tag)),
+            },
+        ),
+
+        .toggle_split_direction => |axis| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_split_direction,
+            switch (axis) {
+                inline else => |tag| @field(apprt.action.SplitAxis, @tagName(tag)),
+            },
+        ),
+
+        .move_split_to_new_tab => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .move_split_to_new_tab,
+            {},
+        ),
+
+        .merge_tabs => |value| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .merge_tabs,
+            switch (value) {
+                inline else => |tag| @field(apprt.action.MergeTabs, @tagName(tag)),
+            },
+        ),
+
         .toggle_readonly => {
             self.readonly = !self.readonly;
             _ = try self.rt_app.performAction(

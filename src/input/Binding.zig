@@ -661,6 +661,53 @@ pub const Action = union(enum) {
     /// Equalize the size of all splits in the current window.
     equalize_splits,
 
+    /// Mirror a split enclosing the current surface, swapping the positions of
+    /// its two sides. The divider stays in the same place.
+    ///
+    /// The argument selects which enclosing split to act on by its orientation,
+    /// in the same way `resize_split` does: Ghostty walks up from the current
+    /// surface to the nearest enclosing split of the given orientation.
+    ///
+    ///   - `horizontal`: swap the left and right sides of a side-by-side split.
+    ///   - `vertical`: swap the top and bottom of a stacked split.
+    ///
+    /// This makes it possible to flip an outer split even when the current
+    /// surface is nested inside another split.
+    flip_split: SplitAxis,
+
+    /// Toggle the orientation of a split enclosing the current surface between
+    /// horizontal (side-by-side) and vertical (stacked).
+    ///
+    /// The argument selects which enclosing split to act on, by its _current_
+    /// orientation (Ghostty walks up to the nearest enclosing split of that
+    /// orientation, like `resize_split`):
+    ///
+    ///   - `horizontal`: take the nearest side-by-side split and stack it.
+    ///   - `vertical`: take the nearest stacked split and place it side-by-side.
+    toggle_split_direction: SplitAxis,
+
+    /// Move the currently focused split (pane) out of its tab and into a new
+    /// tab in the same window. Does nothing if the current tab isn't split
+    /// (the pane is already the whole tab).
+    ///
+    /// Only implemented on macOS.
+    move_split_to_new_tab,
+
+    /// Merge the current tab with a neighboring tab, combining their contents
+    /// into a single tab with a split between them.
+    ///
+    /// The argument selects the neighbor and the orientation of the new split:
+    ///
+    ///   - `next_horizontal`, `next_vertical`: merge with the next tab, placing
+    ///     it to the right (horizontal) or below (vertical).
+    ///   - `previous_horizontal`, `previous_vertical`: merge with the previous
+    ///     tab, placing it to the left (horizontal) or above (vertical).
+    ///
+    /// Does nothing if there is no neighboring tab in the requested direction.
+    ///
+    /// Only implemented on macOS.
+    merge_tabs: MergeTabs,
+
     /// Reset the window to the default size. The "default size" is the
     /// size that a new window would be created with. This has no effect
     /// if the window is fullscreen.
@@ -1038,6 +1085,23 @@ pub const Action = union(enum) {
         auto, // splits along the larger direction
 
         pub const default: SplitDirection = .auto;
+    };
+
+    /// The orientation of a split: the axis along which its two sides are
+    /// arranged. Used to select which enclosing split flip_split and
+    /// toggle_split_direction act on.
+    pub const SplitAxis = enum {
+        horizontal, // sides arranged left and right
+        vertical, // sides arranged top and bottom
+    };
+
+    /// Selects which neighboring tab to merge with and the orientation of the
+    /// resulting split. Used by merge_tabs.
+    pub const MergeTabs = enum {
+        next_horizontal,
+        next_vertical,
+        previous_horizontal,
+        previous_vertical,
     };
 
     pub const SplitFocusDirection = enum {
@@ -1426,6 +1490,10 @@ pub const Action = union(enum) {
             .toggle_readonly,
             .resize_split,
             .equalize_splits,
+            .flip_split,
+            .toggle_split_direction,
+            .move_split_to_new_tab,
+            .merge_tabs,
             .inspector,
             => .surface,
         };

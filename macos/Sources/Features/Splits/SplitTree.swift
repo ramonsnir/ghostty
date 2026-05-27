@@ -239,6 +239,84 @@ extension SplitTree {
         return .init(root: newRoot, zoomed: zoomed)
     }
 
+    /// Returns the nearest split node enclosing `view` whose direction matches
+    /// `orientation`, walking up from the view's leaf toward the root. This lets
+    /// callers target an outer split even when `view` is nested inside another
+    /// split, the same way `resizing(node:...)` finds the split to adjust.
+    ///
+    /// Returns nil if the view isn't in the tree or has no enclosing split of
+    /// that orientation.
+    func nearestSplit(containing view: ViewType, matching orientation: Direction) -> Node? {
+        guard let root else { return nil }
+        guard let path = root.path(to: .leaf(view: view)) else { return nil }
+
+        // Walk up from the immediate parent (longest prefix) to the root.
+        for i in stride(from: path.path.count - 1, through: 0, by: -1) {
+            let parentPath = Path(path: Array(path.path.prefix(i)))
+            if let parent = root.node(at: parentPath),
+               case .split(let split) = parent,
+               split.direction == orientation {
+                return parent
+            }
+        }
+
+        return nil
+    }
+
+    /// Mirror the nearest enclosing split of the given orientation that contains
+    /// `view`, swapping its two sides. The divider stays in the same visual
+    /// position.
+    ///
+    /// - Throws: SplitError.viewNotFound if there is no enclosing split of that
+    ///   orientation.
+    func flippingSplit(containing view: ViewType, orientation: Direction) throws -> Self {
+        guard let target = nearestSplit(containing: view, matching: orientation) else {
+            throw SplitError.viewNotFound
+        }
+        return try replacing(node: target, with: target.swappingChildren())
+    }
+
+    /// Toggle the orientation of the nearest enclosing split whose current
+    /// orientation is `orientation` and that contains `view`. The two sides and
+    /// their ratio are preserved.
+    ///
+    /// - Throws: SplitError.viewNotFound if there is no enclosing split of that
+    ///   orientation.
+    func togglingSplitDirection(containing view: ViewType, orientation: Direction) throws -> Self {
+        guard let target = nearestSplit(containing: view, matching: orientation) else {
+            throw SplitError.viewNotFound
+        }
+        return try replacing(node: target, with: target.togglingDirection())
+    }
+
+    /// Combine this tree with another into a single tree by creating a new root
+    /// split. Used to merge the contents of two tabs.
+    ///
+    /// - Parameters:
+    ///   - other: The tree to combine with.
+    ///   - direction: The orientation of the new root split.
+    ///   - otherOnSecond: If true, `other` is placed on the right/bottom and
+    ///     this tree on the left/top; if false, the reverse.
+    ///   - ratio: The split ratio for the new root split.
+    /// - Returns: A combined tree. If either tree is empty, the other is
+    ///   returned unchanged. The zoomed state is reset.
+    func combined(
+        with other: Self,
+        direction: Direction,
+        otherOnSecond: Bool = true,
+        ratio: Double = 0.5
+    ) -> Self {
+        guard let selfRoot = root else { return other }
+        guard let otherRoot = other.root else { return self }
+        let split = Node.Split(
+            direction: direction,
+            ratio: ratio,
+            left: otherOnSecond ? selfRoot : otherRoot,
+            right: otherOnSecond ? otherRoot : selfRoot
+        )
+        return .init(root: .split(split), zoomed: nil)
+    }
+
     /// Resize a node in the tree by the given pixel amount in the specified direction.
     ///
     /// This method adjusts the split ratios of the tree to accommodate the requested resize
@@ -647,6 +725,42 @@ extension SplitTree.Node {
             return .split(.init(
                 direction: split.direction,
                 ratio: ratio,
+                left: split.left,
+                right: split.right
+            ))
+        }
+    }
+
+    /// Returns a copy of this split with its two sides swapped. The ratio is
+    /// inverted so the divider stays in the same visual position. Leaf nodes
+    /// are returned unchanged.
+    func swappingChildren() -> Self {
+        switch self {
+        case .leaf:
+            return self
+
+        case .split(let split):
+            return .split(.init(
+                direction: split.direction,
+                ratio: 1.0 - split.ratio,
+                left: split.right,
+                right: split.left
+            ))
+        }
+    }
+
+    /// Returns a copy of this split with its direction toggled between
+    /// horizontal and vertical. Children and ratio are preserved. Leaf nodes
+    /// are returned unchanged.
+    func togglingDirection() -> Self {
+        switch self {
+        case .leaf:
+            return self
+
+        case .split(let split):
+            return .split(.init(
+                direction: split.direction == .horizontal ? .vertical : .horizontal,
+                ratio: split.ratio,
                 left: split.left,
                 right: split.right
             ))

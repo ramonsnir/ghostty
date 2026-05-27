@@ -574,6 +574,20 @@ typedef enum {
   GHOSTTY_SPLIT_DIRECTION_UP,
 } ghostty_action_split_direction_e;
 
+// apprt.action.SplitAxis
+typedef enum {
+  GHOSTTY_SPLIT_AXIS_HORIZONTAL,
+  GHOSTTY_SPLIT_AXIS_VERTICAL,
+} ghostty_action_split_axis_e;
+
+// apprt.action.MergeTabs
+typedef enum {
+  GHOSTTY_MERGE_TABS_NEXT_HORIZONTAL,
+  GHOSTTY_MERGE_TABS_NEXT_VERTICAL,
+  GHOSTTY_MERGE_TABS_PREVIOUS_HORIZONTAL,
+  GHOSTTY_MERGE_TABS_PREVIOUS_VERTICAL,
+} ghostty_action_merge_tabs_e;
+
 // apprt.action.GotoSplit
 typedef enum {
   GHOSTTY_GOTO_SPLIT_PREVIOUS,
@@ -948,10 +962,17 @@ typedef enum {
   GHOSTTY_ACTION_SEARCH_SELECTED,
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
+  GHOSTTY_ACTION_FLIP_SPLIT,
+  GHOSTTY_ACTION_TOGGLE_SPLIT_DIRECTION,
+  GHOSTTY_ACTION_MOVE_SPLIT_TO_NEW_TAB,
+  GHOSTTY_ACTION_MERGE_TABS,
 } ghostty_action_tag_e;
 
 typedef union {
   ghostty_action_split_direction_e new_split;
+  ghostty_action_split_axis_e flip_split;
+  ghostty_action_split_axis_e toggle_split_direction;
+  ghostty_action_merge_tabs_e merge_tabs;
   ghostty_action_fullscreen_e toggle_fullscreen;
   ghostty_action_move_tab_s move_tab;
   ghostty_action_goto_tab_e goto_tab;

@@ -537,6 +537,61 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Equalize the size of all splits.",
         }},
 
+        .flip_split => comptime &.{
+            .{
+                .action = .{ .flip_split = .horizontal },
+                .title = "Flip Split Left/Right",
+                .description = "Swap the two sides of the nearest enclosing left/right split.",
+            },
+            .{
+                .action = .{ .flip_split = .vertical },
+                .title = "Flip Split Up/Down",
+                .description = "Swap the two sides of the nearest enclosing top/bottom split.",
+            },
+        },
+
+        .toggle_split_direction => comptime &.{
+            .{
+                .action = .{ .toggle_split_direction = .horizontal },
+                .title = "Toggle Split Direction: Left/Right to Up/Down",
+                .description = "Stack the nearest enclosing left/right split top to bottom.",
+            },
+            .{
+                .action = .{ .toggle_split_direction = .vertical },
+                .title = "Toggle Split Direction: Up/Down to Left/Right",
+                .description = "Place the nearest enclosing top/bottom split side by side.",
+            },
+        },
+
+        .move_split_to_new_tab => comptime &.{.{
+            .action = .move_split_to_new_tab,
+            .title = "Move Pane to New Tab",
+            .description = "Move the focused pane out of its tab into a new tab.",
+        }},
+
+        .merge_tabs => comptime &.{
+            .{
+                .action = .{ .merge_tabs = .next_horizontal },
+                .title = "Merge Next Tab (Side by Side)",
+                .description = "Combine the next tab into this one, side by side.",
+            },
+            .{
+                .action = .{ .merge_tabs = .next_vertical },
+                .title = "Merge Next Tab (Stacked)",
+                .description = "Combine the next tab into this one, stacked top and bottom.",
+            },
+            .{
+                .action = .{ .merge_tabs = .previous_horizontal },
+                .title = "Merge Previous Tab (Side by Side)",
+                .description = "Combine the previous tab into this one, side by side.",
+            },
+            .{
+                .action = .{ .merge_tabs = .previous_vertical },
+                .title = "Merge Previous Tab (Stacked)",
+                .description = "Combine the previous tab into this one, stacked top and bottom.",
+            },
+        },
+
         .reset_window_size => comptime &.{.{
             .action = .reset_window_size,
             .title = "Reset Window Size",

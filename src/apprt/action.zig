@@ -343,6 +343,21 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// Mirror an enclosing split of the target surface, swapping its two
+    /// sides. The value selects which enclosing split by its orientation.
+    flip_split: SplitAxis,
+
+    /// Toggle the orientation of an enclosing split of the target surface.
+    /// The value selects which enclosing split by its current orientation.
+    toggle_split_direction: SplitAxis,
+
+    /// Move the focused split of the target surface into a new tab.
+    move_split_to_new_tab,
+
+    /// Merge the target surface's tab with a neighboring tab. The value selects
+    /// the neighbor and the orientation of the resulting split.
+    merge_tabs: MergeTabs,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -410,6 +425,10 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        flip_split,
+        toggle_split_direction,
+        move_split_to_new_tab,
+        merge_tabs,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -498,6 +517,32 @@ pub const SplitDirection = enum(c_int) {
 
     test "ghostty.h SplitDirection" {
         try lib.checkGhosttyHEnum(SplitDirection, "GHOSTTY_SPLIT_DIRECTION_");
+    }
+};
+
+// This is made extern (c_int) to make interop easier with our embedded
+// runtime. Selects which enclosing split flip_split/toggle_split_direction
+// act on, by orientation.
+pub const SplitAxis = enum(c_int) {
+    horizontal,
+    vertical,
+
+    test "ghostty.h SplitAxis" {
+        try lib.checkGhosttyHEnum(SplitAxis, "GHOSTTY_SPLIT_AXIS_");
+    }
+};
+
+// This is made extern (c_int) to make interop easier with our embedded
+// runtime. Selects which neighboring tab merge_tabs combines with and the
+// orientation of the resulting split.
+pub const MergeTabs = enum(c_int) {
+    next_horizontal,
+    next_vertical,
+    previous_horizontal,
+    previous_vertical,
+
+    test "ghostty.h MergeTabs" {
+        try lib.checkGhosttyHEnum(MergeTabs, "GHOSTTY_MERGE_TABS_");
     }
 };
 

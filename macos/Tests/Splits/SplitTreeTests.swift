@@ -228,6 +228,247 @@ struct SplitTreeTests {
         #expect(abs(s.ratio - expectedRatio) < 0.001)
     }
 
+    // MARK: - Flip (mirror) split
+
+    // Nested layout for the walk-up tests:  view1 | (view2 / view3)
+    //   root: horizontal { left: view1, right: vertical { view2, view3 } }
+    private func makeNestedTree() throws -> (SplitTree<MockView>, MockView, MockView, MockView) {
+        let view1 = MockView()
+        let view2 = MockView()
+        let view3 = MockView()
+        var tree = SplitTree<MockView>(view: view1)
+        tree = try tree.inserting(view: view2, at: view1, direction: .right)
+        tree = try tree.inserting(view: view3, at: view2, direction: .down)
+        return (tree, view1, view2, view3)
+    }
+
+    @Test func flippingSplitSwapsSides() throws {
+        let (tree, view1, view2) = try makeHorizontalSplit()
+        let flipped = try tree.flippingSplit(containing: view1, orientation: .horizontal)
+        guard case .split(let s) = flipped.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.direction == .horizontal)
+        #expect(s.left == .leaf(view: view2))
+        #expect(s.right == .leaf(view: view1))
+    }
+
+    @Test func flippingSplitInvertsRatioToKeepDividerInPlace() throws {
+        let (tree, view1, _) = try makeHorizontalSplit()
+        // Skew the root split so the inversion is observable.
+        let skewed = try tree.replacing(node: tree.root!, with: tree.root!.resizing(to: 0.3))
+        let flipped = try skewed.flippingSplit(containing: view1, orientation: .horizontal)
+        guard case .split(let s) = flipped.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(abs(s.ratio - 0.7) < 0.001)
+    }
+
+    @Test func flippingSplitTwiceRestoresOriginal() throws {
+        let (tree, view1, view2) = try makeHorizontalSplit()
+        let skewed = try tree.replacing(node: tree.root!, with: tree.root!.resizing(to: 0.3))
+        let twice = try skewed
+            .flippingSplit(containing: view1, orientation: .horizontal)
+            .flippingSplit(containing: view1, orientation: .horizontal)
+        guard case .split(let s) = twice.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.left == .leaf(view: view1))
+        #expect(s.right == .leaf(view: view2))
+        #expect(abs(s.ratio - 0.3) < 0.001)
+    }
+
+    @Test func flippingWithNoEnclosingSplitOfOrientationThrows() {
+        let view = MockView()
+        let tree = SplitTree<MockView>(view: view)
+        // Use do/catch rather than #expect(throws:) because the latter requires
+        // a @Sendable closure, and MockView (an NSView) is main-actor-isolated.
+        var threw = false
+        do {
+            _ = try tree.flippingSplit(containing: view, orientation: .horizontal)
+        } catch {
+            threw = true
+        }
+        #expect(threw)
+    }
+
+    @Test func flipTargetsInnerSplitForMatchingOrientation() throws {
+        let (tree, view1, view2, view3) = try makeNestedTree()
+
+        // From view3, the nearest VERTICAL enclosing split is the inner one.
+        let flipped = try tree.flippingSplit(containing: view3, orientation: .vertical)
+
+        guard case .split(let root) = flipped.root else {
+            Issue.record("unexpected root node type")
+            return
+        }
+        // Outer split untouched.
+        #expect(root.direction == .horizontal)
+        #expect(root.left == .leaf(view: view1))
+        // Inner split swapped.
+        guard case .split(let inner) = root.right else {
+            Issue.record("unexpected inner node type")
+            return
+        }
+        #expect(inner.direction == .vertical)
+        #expect(inner.left == .leaf(view: view3))
+        #expect(inner.right == .leaf(view: view2))
+    }
+
+    @Test func flipWalksUpToOuterSplitByOrientation() throws {
+        let (tree, view1, view2, view3) = try makeNestedTree()
+
+        // From view3, the nearest HORIZONTAL enclosing split is the OUTER one,
+        // reached by walking past the inner vertical split.
+        let flipped = try tree.flippingSplit(containing: view3, orientation: .horizontal)
+
+        guard case .split(let root) = flipped.root else {
+            Issue.record("unexpected root node type")
+            return
+        }
+        // Outer split swapped: the vertical pair moves to the left, view1 to the right.
+        #expect(root.direction == .horizontal)
+        #expect(root.right == .leaf(view: view1))
+        // Inner split unchanged, now on the left.
+        guard case .split(let inner) = root.left else {
+            Issue.record("unexpected inner node type")
+            return
+        }
+        #expect(inner.direction == .vertical)
+        #expect(inner.left == .leaf(view: view2))
+        #expect(inner.right == .leaf(view: view3))
+    }
+
+    // MARK: - Toggle split direction
+
+    @Test func togglingDirectionFlipsOrientation() throws {
+        let (tree, view1, view2) = try makeHorizontalSplit()
+        let toggled = try tree.togglingSplitDirection(containing: view1, orientation: .horizontal)
+        guard case .split(let s) = toggled.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.direction == .vertical)
+        // Sides and ratio are preserved.
+        #expect(s.left == .leaf(view: view1))
+        #expect(s.right == .leaf(view: view2))
+        #expect(abs(s.ratio - 0.5) < 0.001)
+    }
+
+    @Test func togglingDirectionAndBackRestoresOriginal() throws {
+        let (tree, view1, _) = try makeHorizontalSplit()
+        // The first toggle finds the horizontal split and makes it vertical; the
+        // second must target the now-vertical split to restore it.
+        let back = try tree
+            .togglingSplitDirection(containing: view1, orientation: .horizontal)
+            .togglingSplitDirection(containing: view1, orientation: .vertical)
+        guard case .split(let s) = back.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.direction == .horizontal)
+    }
+
+    @Test func togglingWalksUpToOuterSplitByOrientation() throws {
+        let (tree, _, view2, view3) = try makeNestedTree()
+
+        // From view3, toggling the nearest HORIZONTAL split targets the OUTER one.
+        let toggled = try tree.togglingSplitDirection(containing: view3, orientation: .horizontal)
+
+        guard case .split(let root) = toggled.root else {
+            Issue.record("unexpected root node type")
+            return
+        }
+        // Outer split re-oriented to vertical; inner split untouched.
+        #expect(root.direction == .vertical)
+        guard case .split(let inner) = root.right else {
+            Issue.record("unexpected inner node type")
+            return
+        }
+        #expect(inner.direction == .vertical)
+        #expect(inner.left == .leaf(view: view2))
+        #expect(inner.right == .leaf(view: view3))
+    }
+
+    @Test func togglingWithNoEnclosingSplitOfOrientationThrows() {
+        let view = MockView()
+        let tree = SplitTree<MockView>(view: view)
+        var threw = false
+        do {
+            _ = try tree.togglingSplitDirection(containing: view, orientation: .horizontal)
+        } catch {
+            threw = true
+        }
+        #expect(threw)
+    }
+
+    // MARK: - Combine (merge tabs)
+
+    @Test func combinedPlacesOtherOnSecondByDefault() throws {
+        let a = MockView()
+        let b = MockView()
+        let merged = SplitTree<MockView>(view: a)
+            .combined(with: SplitTree<MockView>(view: b), direction: .horizontal)
+        guard case .split(let s) = merged.root else {
+            Issue.record("expected a split root")
+            return
+        }
+        #expect(s.direction == .horizontal)
+        #expect(s.left == .leaf(view: a))
+        #expect(s.right == .leaf(view: b))
+    }
+
+    @Test func combinedCanPlaceOtherFirst() throws {
+        let a = MockView()
+        let b = MockView()
+        let merged = SplitTree<MockView>(view: a)
+            .combined(with: SplitTree<MockView>(view: b), direction: .vertical, otherOnSecond: false)
+        guard case .split(let s) = merged.root else {
+            Issue.record("expected a split root")
+            return
+        }
+        #expect(s.direction == .vertical)
+        #expect(s.left == .leaf(view: b))
+        #expect(s.right == .leaf(view: a))
+    }
+
+    @Test func combinedPreservesSubtrees() throws {
+        // Combine a two-pane horizontal split with a single pane.
+        let (treeA, a1, a2) = try makeHorizontalSplit()
+        let b = MockView()
+        let merged = treeA.combined(with: SplitTree<MockView>(view: b), direction: .vertical)
+        guard case .split(let root) = merged.root else {
+            Issue.record("expected split root")
+            return
+        }
+        #expect(root.direction == .vertical)
+        #expect(root.right == .leaf(view: b))
+        // The original A split is preserved on the left.
+        guard case .split(let left) = root.left else {
+            Issue.record("expected nested split")
+            return
+        }
+        #expect(left.left == .leaf(view: a1))
+        #expect(left.right == .leaf(view: a2))
+    }
+
+    @Test func combinedWithEmptyReturnsOther() {
+        let a = MockView()
+        let nonEmpty = SplitTree<MockView>(view: a)
+        let empty = SplitTree<MockView>()
+        // Empty combined with non-empty yields the non-empty tree unchanged.
+        let r1 = empty.combined(with: nonEmpty, direction: .horizontal)
+        #expect(r1.contains(.leaf(view: a)))
+        #expect(!r1.isSplit)
+        // Non-empty combined with empty yields self unchanged.
+        let r2 = nonEmpty.combined(with: empty, direction: .horizontal)
+        #expect(r2.contains(.leaf(view: a)))
+        #expect(!r2.isSplit)
+    }
+
     // MARK: - Codable
 
     @Test func encodingAndDecodingPreservesTree() throws {

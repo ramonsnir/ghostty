@@ -205,6 +205,21 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyDidFlipSplit(_:)),
+            name: Ghostty.Notification.didFlipSplit,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyDidToggleSplitDirection(_:)),
+            name: Ghostty.Notification.didToggleSplitDirection,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyDidMoveSplitToNewTab(_:)),
+            name: Ghostty.Notification.didMoveSplitToNewTab,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(ghosttyDidPresentTerminal(_:)),
             name: Ghostty.Notification.ghosttyPresentTerminal,
             object: nil)
@@ -641,6 +656,61 @@ class BaseTerminalController: NSWindowController,
         surfaceTree = surfaceTree.equalized()
     }
 
+    /// Map the `axis` carried in a split-reorg notification to a SplitTree direction.
+    private func splitOrientation(
+        from notification: Notification
+    ) -> SplitTree<Ghostty.SurfaceView>.Direction? {
+        guard let axisAny = notification.userInfo?["axis"] else { return nil }
+        guard let axis = axisAny as? ghostty_action_split_axis_e else { return nil }
+        switch axis {
+        case GHOSTTY_SPLIT_AXIS_HORIZONTAL: return .horizontal
+        case GHOSTTY_SPLIT_AXIS_VERTICAL: return .vertical
+        default: return nil
+        }
+    }
+
+    @objc private func ghosttyDidFlipSplit(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(target) else { return }
+        guard let orientation = splitOrientation(from: notification) else { return }
+
+        let newTree: SplitTree<Ghostty.SurfaceView>
+        do {
+            newTree = try surfaceTree.flippingSplit(containing: target, orientation: orientation)
+        } catch {
+            // No enclosing split of the requested orientation; nothing to do.
+            return
+        }
+
+        replaceSurfaceTree(newTree, undoAction: "Flip Split")
+
+        // Structural changes can drop the first responder, so reassert focus.
+        DispatchQueue.main.async {
+            Ghostty.moveFocus(to: target)
+        }
+    }
+
+    @objc private func ghosttyDidToggleSplitDirection(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(target) else { return }
+        guard let orientation = splitOrientation(from: notification) else { return }
+
+        let newTree: SplitTree<Ghostty.SurfaceView>
+        do {
+            newTree = try surfaceTree.togglingSplitDirection(containing: target, orientation: orientation)
+        } catch {
+            // No enclosing split of the requested orientation; nothing to do.
+            return
+        }
+
+        replaceSurfaceTree(newTree, undoAction: "Toggle Split Direction")
+
+        // Structural changes can drop the first responder, so reassert focus.
+        DispatchQueue.main.async {
+            Ghostty.moveFocus(to: target)
+        }
+    }
+
     @objc private func ghosttyDidFocusSplit(_ notification: Notification) {
         // The target must be within our tree
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
@@ -785,6 +855,37 @@ class BaseTerminalController: NSWindowController,
             position: notification.userInfo?[Notification.Name.ghosttySurfaceDragEndedNoTargetPointKey] as? NSPoint,
             confirmUndo: false,
             inheritBackgroundOpacity: isBackgroundOpaque)
+    }
+
+    @objc private func ghosttyDidMoveSplitToNewTab(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard let targetNode = surfaceTree.root?.node(view: target) else { return }
+
+        // If our tree isn't split then the pane is already its own tab.
+        guard surfaceTree.isSplit else { return }
+
+        // If we're removing our focused surface then we move focus elsewhere.
+        // Keep track of the old one so undo sends focus back correctly.
+        let oldFocusedSurface = focusedSurface
+        if focusedSurface == target {
+            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)
+        }
+
+        // Remove the surface from our tree and put it in a new single-pane tree.
+        let removedTree = surfaceTree.removing(targetNode)
+        let newTree = SplitTree<Ghostty.SurfaceView>(view: target)
+
+        // Group the removal and the new tab so undo reverses both at once.
+        undoManager?.beginUndoGrouping()
+        undoManager?.setActionName("Move Pane to New Tab")
+        defer { undoManager?.endUndoGrouping() }
+
+        replaceSurfaceTree(removedTree, moveFocusFrom: oldFocusedSurface)
+        _ = TerminalController.newTab(
+            ghostty,
+            from: window,
+            tree: newTree,
+            confirmUndo: false)
     }
 
     // MARK: Local Events

@@ -436,6 +436,18 @@ extension Ghostty.Notification {
     /// Notification sent to the split root to equalize split sizes
     static let didEqualizeSplits = Notification.Name("com.mitchellh.ghostty.didEqualizeSplits")
 
+    /// Notification sent to mirror (flip) the split containing a surface.
+    static let didFlipSplit = Notification.Name("com.mitchellh.ghostty.didFlipSplit")
+
+    /// Notification sent to toggle the direction of the split containing a surface.
+    static let didToggleSplitDirection = Notification.Name("com.mitchellh.ghostty.didToggleSplitDirection")
+
+    /// Notification sent to move the focused split into a new tab.
+    static let didMoveSplitToNewTab = Notification.Name("com.mitchellh.ghostty.didMoveSplitToNewTab")
+
+    /// Notification sent to merge the current tab with a neighboring tab.
+    static let didMergeTabs = Notification.Name("com.mitchellh.ghostty.didMergeTabs")
+
     /// Notification that renderer health changed
     static let didUpdateRendererHealth = Notification.Name("com.mitchellh.ghostty.didUpdateRendererHealth")
 

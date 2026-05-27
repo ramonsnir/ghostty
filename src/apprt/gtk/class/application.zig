@@ -761,6 +761,14 @@ pub const Application = extern struct {
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
+
+            // Not yet implemented on GTK (macOS-only for now).
+            .flip_split,
+            .toggle_split_direction,
+            .move_split_to_new_tab,
+            .merge_tabs,
+            => return false,
+
             .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
             .command_finished => return Action.commandFinished(target, value),
             .readonly => return Action.setReadonly(target, value),

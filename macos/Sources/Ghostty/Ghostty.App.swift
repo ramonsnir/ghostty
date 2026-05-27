@@ -533,6 +533,18 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM:
                 return toggleSplitZoom(app, target: target)
 
+            case GHOSTTY_ACTION_FLIP_SPLIT:
+                return flipSplit(app, target: target, axis: action.action.flip_split)
+
+            case GHOSTTY_ACTION_TOGGLE_SPLIT_DIRECTION:
+                return toggleSplitDirection(app, target: target, axis: action.action.toggle_split_direction)
+
+            case GHOSTTY_ACTION_MOVE_SPLIT_TO_NEW_TAB:
+                return moveSplitToNewTab(app, target: target)
+
+            case GHOSTTY_ACTION_MERGE_TABS:
+                return mergeTabs(app, target: target, mode: action.action.merge_tabs)
+
             case GHOSTTY_ACTION_INSPECTOR:
                 controlInspector(app, target: target, mode: action.action.inspector)
 
@@ -1339,6 +1351,102 @@ extension Ghostty {
                     name: Notification.didToggleSplitZoom,
                     object: surfaceView
                 )
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func flipSplit(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            axis: ghostty_action_split_axis_e) -> Bool {
+            return postSplitNotification(Notification.didFlipSplit, target: target, axis: axis)
+        }
+
+        private static func toggleSplitDirection(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            axis: ghostty_action_split_axis_e) -> Bool {
+            return postSplitNotification(Notification.didToggleSplitDirection, target: target, axis: axis)
+        }
+
+        /// Posts a notification targeting the surface's split tree, carrying the
+        /// orientation that selects which enclosing split to act on. Returns false
+        /// (action not performable) if the target isn't a surface inside a split,
+        /// so the keybind can fall through.
+        private static func postSplitNotification(
+            _ name: Foundation.Notification.Name,
+            target: ghostty_target_s,
+            axis: ghostty_action_split_axis_e) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return false }
+
+                // If the window has no splits, the action is not performable.
+                guard controller.surfaceTree.isSplit else { return false }
+
+                NotificationCenter.default.post(
+                    name: name,
+                    object: surfaceView,
+                    userInfo: ["axis": axis])
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func moveSplitToNewTab(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return false }
+
+                // Only meaningful when the tab has more than one pane.
+                guard controller.surfaceTree.isSplit else { return false }
+
+                NotificationCenter.default.post(
+                    name: Notification.didMoveSplitToNewTab,
+                    object: surfaceView)
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func mergeTabs(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            mode: ghostty_action_merge_tabs_e) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+
+                NotificationCenter.default.post(
+                    name: Notification.didMergeTabs,
+                    object: surfaceView,
+                    userInfo: ["mergeTabs": mode])
                 return true
 
             default:
