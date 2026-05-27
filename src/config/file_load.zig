@@ -24,6 +24,18 @@ pub fn legacyDefaultXdgPath(alloc: Allocator) ![]const u8 {
     );
 }
 
+/// Fork-only (ramon): an additional XDG config path that is loaded on top of
+/// the shared `ghostty` config. Fork-specific settings (e.g. keybinds for
+/// fork-only actions) live here so they never appear in — and never error in —
+/// an official Ghostty build that shares the `ghostty` config file.
+/// Returned value must be freed by the caller.
+pub fn forkXdgPath(alloc: Allocator) ![]const u8 {
+    return try internal_os.xdg.config(
+        alloc,
+        .{ .subdir = "ghostty-ramon/config" },
+    );
+}
+
 /// Preferred default path for the XDG home configuration file.
 /// Returned value must be freed by the caller.
 pub fn preferredXdgPath(alloc: Allocator) ![]const u8 {

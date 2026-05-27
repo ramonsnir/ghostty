@@ -4100,6 +4100,16 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
             };
         }
     }
+
+    // Fork-only (ramon): after the shared `ghostty` config, additionally load
+    // this fork's own config from `$XDG_CONFIG_HOME/ghostty-ramon/config`, if it
+    // exists. This keeps fork-specific keybinds/settings out of the shared
+    // config so an official Ghostty build never sees (or errors on) them. It is
+    // purely additive and optional — nothing happens if the file is absent, and
+    // it never triggers template creation.
+    const fork_xdg_path = try file_load.forkXdgPath(alloc);
+    defer alloc.free(fork_xdg_path);
+    _ = self.loadOptionalFile(alloc, fork_xdg_path);
 }
 
 /// Load and parse the CLI args.
