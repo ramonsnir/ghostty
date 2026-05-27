@@ -44,20 +44,10 @@ class UpdateController {
     /// This must be called before the updater can check for updates. If starting fails,
     /// the error will be shown to the user.
     func startUpdater() {
-        do {
-            try updater.start()
-        } catch {
-            userDriver.viewModel.state = .error(.init(
-                error: error,
-                retry: { [weak self] in
-                    self?.userDriver.viewModel.state = .idle
-                    self?.startUpdater()
-                },
-                dismiss: { [weak self] in
-                    self?.userDriver.viewModel.state = .idle
-                }
-            ))
-        }
+        // Auto-updates are intentionally disabled in this fork so it is never
+        // replaced by an official Ghostty release by mistake. We deliberately do
+        // NOT start the Sparkle updater, which prevents all automatic, scheduled,
+        // and background update checks.
     }
 
     /// Force install the current update. As long as we're in some "update available" state this will
@@ -92,22 +82,8 @@ class UpdateController {
     ///
     /// This is typically connected to a menu item action.
     @objc func checkForUpdates() {
-        // If we're already idle, then just check for updates immediately.
-        if viewModel.state == .idle {
-            updater.checkForUpdates()
-            return
-        }
-
-        // If we're not idle then we need to cancel any prior state.
-        installCancellable?.cancel()
-        viewModel.state.cancel()
-
-        // The above will take time to settle, so we delay the check for some time.
-        // The 100ms is arbitrary and I'd rather not, but we have to wait more than
-        // one loop tick it seems.
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
-            self?.updater.checkForUpdates()
-        }
+        // Auto-updates are disabled in this fork (see startUpdater); manual
+        // update checks are intentionally a no-op.
     }
 
     /// Validate the check for updates menu item.
@@ -116,7 +92,8 @@ class UpdateController {
     /// - Returns: Whether the menu item should be enabled
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(checkForUpdates) {
-            return updater.canCheckForUpdates
+            // Auto-updates are disabled in this fork.
+            return false
         }
         return true
     }
