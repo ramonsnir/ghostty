@@ -87,12 +87,18 @@ private struct TerminalSplitSubtreeView: View {
 }
 
 private struct TerminalSplitLeaf: View {
+    @EnvironmentObject var ghostty: Ghostty.App
+
     let surfaceView: Ghostty.SurfaceView
     let isSplit: Bool
     let action: (TerminalSplitOperation) -> Void
 
     @State private var dropState: DropState = .idle
     @State private var isSelfDragging: Bool = false
+
+    private var isMarked: Bool {
+        ghostty.markedSurface === surfaceView
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -117,6 +123,19 @@ private struct TerminalSplitLeaf: View {
                 if !isSelfDragging, case .dropping(let zone) = dropState {
                     zone.overlay(in: geometry)
                         .allowsHitTesting(false)
+                }
+            }
+            .overlay {
+                // App-wide single mark indicator: a thick inset stroke so the
+                // border is visible without obscuring terminal content. Drawn
+                // after the drop overlay so an active drop zone wins. The
+                // surrounding view reacts to `ghostty.markedSurface` via the
+                // env's `objectWillChange` (fired from the willSet on App).
+                if isMarked {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(Color.orange, lineWidth: 3)
+                        .allowsHitTesting(false)
+                        .accessibilityLabel("Marked pane")
                 }
             }
             .onPreferenceChange(Ghostty.DraggingSurfaceKey.self) { value in
