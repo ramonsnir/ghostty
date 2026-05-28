@@ -254,11 +254,26 @@ const Mouse = struct {
     }
 };
 
+/// Window (in milliseconds) during which a sequence kept alive by a
+/// `repeatable:`-flagged action accepts a bare re-press of the same
+/// trigger without re-issuing the prefix. Mirrors tmux's `repeat-time`
+/// default (500ms). Hardcoded for now — exposing it as a config option
+/// is a follow-up.
+const sequence_repeat_timeout_ms: i64 = 500;
+
 /// Keyboard state for the surface.
 pub const Keyboard = struct {
     /// The currently active key sequence for the surface. If this is null
     /// then we're not currently in a key sequence.
     sequence_set: ?*const input.Binding.Set = null,
+
+    /// Milliseconds (since unix epoch via std.time.milliTimestamp) after
+    /// which a `sequence_set` that's only being kept alive by a
+    /// `repeatable:`-flagged action should expire. Zero means "no expiry"
+    /// (normal sequence behaviour — the prefix stays armed until the user
+    /// presses something). Non-zero only when a repeatable leaf has fired
+    /// and we're waiting for either another matching press or the timeout.
+    sequence_repeat_deadline_ms: i64 = 0,
 
     /// The queued keys when we're in the middle of a sequenced binding.
     /// These are flushed when the sequence is completed and unconsumed or
@@ -2843,6 +2858,17 @@ fn maybeHandleBinding(
         .press, .repeat => {},
     }
 
+    // If a previous repeatable action left the sequence armed and the
+    // tmux-style repeat window has expired, drop the sequence before we
+    // look up this event so a stale prefix doesn't eat a stray keypress.
+    if (self.keyboard.sequence_set != null and
+        self.keyboard.sequence_repeat_deadline_ms != 0 and
+        std.time.milliTimestamp() > self.keyboard.sequence_repeat_deadline_ms)
+    {
+        self.keyboard.sequence_set = null;
+        self.keyboard.sequence_repeat_deadline_ms = 0;
+    }
+
     // Find an entry in the keybind set that matches our event.
     const entry: input.Binding.Set.Entry = entry: {
         // Handle key sequences first.
@@ -2898,11 +2924,16 @@ fn maybeHandleBinding(
             return null;
     };
 
+    // Track whether we matched this event inside an active sequence — used
+    // below for the tmux-style `repeatable:` flag.
+    const matched_in_sequence = self.keyboard.sequence_set != null;
+
     // Determine if this entry has an action or if its a leader key.
     const leaf: input.Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
         .leader => |set| {
             // Setup the next set we'll look at.
             self.keyboard.sequence_set = set;
+            self.keyboard.sequence_repeat_deadline_ms = 0;
 
             // Store this event so that we can drain and encode on invalid.
             // We don't need to cap this because it is naturally capped by
@@ -2946,8 +2977,18 @@ fn maybeHandleBinding(
     // perform an action (below)
     self.keyboard.last_trigger = null;
 
-    // An action also always resets the sequence set.
-    self.keyboard.sequence_set = null;
+    // An action normally resets the sequence set. EXCEPTION: a leaf with
+    // the `repeatable:` flag that matched inside an active sequence keeps
+    // the same sequence_set armed for `sequence_repeat_timeout_ms`, so
+    // bare presses of the same trigger keep firing without re-issuing the
+    // prefix (tmux `bind -r`).
+    if (leaf.flags.repeatable and matched_in_sequence) {
+        self.keyboard.sequence_repeat_deadline_ms =
+            std.time.milliTimestamp() + sequence_repeat_timeout_ms;
+    } else {
+        self.keyboard.sequence_set = null;
+        self.keyboard.sequence_repeat_deadline_ms = 0;
+    }
 
     // Setup our actions
     const actions = leaf.actionsSlice();
@@ -3021,8 +3062,20 @@ fn maybeHandleBinding(
     // it, we processed the action but we still want to process our
     // encodings, too.
     if (consumed) {
+        // Preserve the repeat-armed state across endKeySequence — that
+        // helper nulls sequence_set as part of "the sequence has ended",
+        // but for a repeatable leaf we want to stay armed at the same
+        // depth so the next bare press of the same trigger re-fires.
+        const armed_set = self.keyboard.sequence_set;
+        const armed_deadline = self.keyboard.sequence_repeat_deadline_ms;
+
         // If we had queued events, we deinit them since we consumed
         self.endKeySequence(.drop, .retain);
+
+        if (leaf.flags.repeatable and matched_in_sequence) {
+            self.keyboard.sequence_set = armed_set;
+            self.keyboard.sequence_repeat_deadline_ms = armed_deadline;
+        }
 
         // Store our last trigger so we don't encode the release event
         self.keyboard.last_trigger = event.bindingHash();
@@ -3128,6 +3181,7 @@ fn endKeySequence(
     // No matter what we clear our current sequence set. This restores
     // the set we look at to the root set.
     self.keyboard.sequence_set = null;
+    self.keyboard.sequence_repeat_deadline_ms = 0;
 
     // If we have no queued data, there is nothing else to do.
     if (self.keyboard.sequence_queued.items.len == 0) return;

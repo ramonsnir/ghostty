@@ -47,6 +47,15 @@ pub const Flags = packed struct {
     /// if it doesn't exist.
     performable: bool = false,
 
+    /// True if this binding, when matched inside a key sequence, should
+    /// leave the sequence "armed" at the same level for a short window
+    /// instead of dropping back to the root set. This is the tmux `bind -r`
+    /// behaviour — pressing `ctrl+a>shift+l` once arms it, then bare
+    /// `shift+l` keeps firing for the timeout window without re-pressing
+    /// `ctrl+a`. Only meaningful on a leaf inside a sequence; ignored on
+    /// a root-level binding.
+    repeatable: bool = false,
+
     /// C type
     pub const C = u8;
 
@@ -60,12 +69,13 @@ pub const Flags = packed struct {
 
     test "cval" {
         const testing = std.testing;
-        try testing.expectEqual(@as(u8, 0b0001), (Flags{}).cval());
-        try testing.expectEqual(@as(u8, 0b0000), (Flags{ .consumed = false }).cval());
-        try testing.expectEqual(@as(u8, 0b0011), (Flags{ .all = true }).cval());
-        try testing.expectEqual(@as(u8, 0b0101), (Flags{ .global = true }).cval());
-        try testing.expectEqual(@as(u8, 0b1001), (Flags{ .performable = true }).cval());
-        try testing.expectEqual(@as(u8, 0b1111), (Flags{ .consumed = true, .all = true, .global = true, .performable = true }).cval());
+        try testing.expectEqual(@as(u8, 0b0_0001), (Flags{}).cval());
+        try testing.expectEqual(@as(u8, 0b0_0000), (Flags{ .consumed = false }).cval());
+        try testing.expectEqual(@as(u8, 0b0_0011), (Flags{ .all = true }).cval());
+        try testing.expectEqual(@as(u8, 0b0_0101), (Flags{ .global = true }).cval());
+        try testing.expectEqual(@as(u8, 0b0_1001), (Flags{ .performable = true }).cval());
+        try testing.expectEqual(@as(u8, 0b1_0001), (Flags{ .repeatable = true }).cval());
+        try testing.expectEqual(@as(u8, 0b1_1111), (Flags{ .consumed = true, .all = true, .global = true, .performable = true, .repeatable = true }).cval());
     }
 };
 
@@ -168,6 +178,9 @@ pub const Parser = struct {
             } else if (std.mem.eql(u8, prefix, "performable")) {
                 if (flags.performable) return Error.InvalidFormat;
                 flags.performable = true;
+            } else if (std.mem.eql(u8, prefix, "repeatable")) {
+                if (flags.repeatable) return Error.InvalidFormat;
+                flags.repeatable = true;
             } else {
                 // If we don't recognize the prefix then we're done. We
                 // let any unknown prefix fallthrough to trigger-specific
@@ -3101,6 +3114,29 @@ test "parse: triggers" {
         .action = .{ .ignore = {} },
         .flags = .{ .performable = true },
     }, try parseSingle("performable:shift+a=ignore"));
+
+    // repeatable keys
+    try testing.expectEqual(Binding{
+        .trigger = .{
+            .mods = .{ .shift = true },
+            .key = .{ .unicode = 'l' },
+        },
+        .action = .{ .ignore = {} },
+        .flags = .{ .repeatable = true },
+    }, try parseSingle("repeatable:shift+l=ignore"));
+
+    // repeatable + performable stack
+    try testing.expectEqual(Binding{
+        .trigger = .{ .key = .{ .unicode = 'l' } },
+        .action = .{ .ignore = {} },
+        .flags = .{ .repeatable = true, .performable = true },
+    }, try parseSingle("performable:repeatable:l=ignore"));
+
+    // repeated repeatable prefix
+    try testing.expectError(
+        Error.InvalidFormat,
+        parseSingle("repeatable:repeatable:l=ignore"),
+    );
 
     // invalid key
     try testing.expectError(Error.InvalidFormat, parseSingle("foo=ignore"));
