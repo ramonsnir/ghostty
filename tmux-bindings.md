@@ -71,7 +71,7 @@ Things that **only partially** port:
 Each gap is a missing capability in Ghostty that prevents a faithful port of a
 bind the user actually used. Listed in rough order of value/effort.
 
-### G1. No "move split into another tab" (tmux `join-pane`) — ✅ shipped (partial)
+### G1. No "move split into another tab" (tmux `join-pane`) — ✅ shipped
 
 - Tmux flow: `prefix q` mark a pane, switch tabs, `prefix j` pull it in;
   or `prefix J <n>` push current pane to window N.
@@ -83,8 +83,16 @@ bind the user actually used. Listed in rough order of value/effort.
     Mark toggles on re-press, so a single keybind handles both set and
     unset. (This is also G4; the original "do not port" call was based
     on a misreading of `prefix j`.)
+  - **Visible mark feedback**: the marked pane gets a 3pt orange
+    inset border. Cross-window safe (observers share `Ghostty.App`),
+    auto-clears on pull/toggle/close.
   - `merge_tabs:{next,previous}_{horizontal,vertical}` — the adjacent-tab
     variant, no mark required.
+  - `swap_split:{previous,next,up,down,left,right}` — exchange the
+    focused pane with another in the same tab (tmux `swap-pane -U/-D`
+    and the spatial variants). Tree structure and ratios preserved.
+    Repeated `:next` walks the focused content to the bottom-right
+    corner in N-1 presses.
 - **Shelved**: `move_split_to_tab:<n>` (push current pane to tab N with a
   numeric prompt). Coverage from mark-and-pull + adjacent merge is
   considered enough.
@@ -115,12 +123,58 @@ Reversed the original "do not port" call. The mark-pane mechanism is the
 *source-selection* half of `prefix j`; without it, "pull the marked pane"
 has no meaning. See G1 for the shipped form.
 
-### G5. No modal "resize mode" — shelved
+### G5. No "repeatable" prefix-bound keys (tmux `bind -r`) — 🚧 next
 
-- Ghostty's out-of-the-box bindings already auto-repeat while a modifier
-  is held, so the missing piece is less acute than the doc originally
-  suggested. The key-table snippet still works and is the right path if
-  we ever want a dedicated resize mode with custom keys; deferred.
+Originally framed as "modal resize mode" and shelved on the grounds
+that OS-level key auto-repeat (while a modifier is held) covered the
+common case. That framing was wrong. The actual missing capability is
+tmux's **`-r` (repeatable) flag** on a binding: after the first
+`prefix L`, the next ~500ms accepts bare `L`/`H`/`J`/`K` (separate
+keystrokes, not held) and treats each as another repeat of the same
+class of action *without re-issuing the prefix*. So `prefix L L L L`
+grows the split four times.
+
+This is a different mechanism from OS key-repeat:
+
+  * OS key-repeat: hold the key down, the keyboard driver synthesises
+    repeated presses. Works fine for single bindings, but doesn't help
+    when the binding is behind a key sequence (the prefix is consumed
+    on the first press, so subsequent OS-repeated `L` events just go
+    to the terminal as `L`).
+  * tmux `-r`: separate physical presses, with a short timeout. The
+    prefix layer stays "armed" for repeatable bindings at the same
+    sequence depth for the duration of the timeout, then drops back to
+    normal handling. Any non-matching key, or timeout expiry, ends
+    the repeat window.
+
+**Design sketch (next iteration):**
+
+  * New keybind flag prefix `repeatable:` alongside the existing
+    `unconsumed:`, `performable:`, `global:`, `all:`. Stored on
+    `Binding.Flags.repeatable: bool`.
+  * Runtime: in `Surface.maybeHandleBinding`, when a leaf action with
+    `repeatable: true` fires inside an active sequence, instead of
+    clearing `sequence_set`, leave it pointing at the **parent set**
+    (one level up) and arm a timer for `keybind-repeat-timeout`
+    (default 500ms). On the next keypress, the normal sequence match
+    runs against that same parent set:
+      - if it lands on another `repeatable:` action → re-arm the timer
+        and continue.
+      - if it lands on a non-repeatable action → fire normally, then
+        clear the sequence.
+      - if no match → drop the sequence as usual (current behaviour).
+    On timer expiry → clear `sequence_set`.
+  * New config key `keybind-repeat-timeout` (default `500ms`) parsed
+    the same way as the existing `*-timeout` durations.
+
+**Why now:** the resize and goto_split bindings benefit immediately;
+once shipped, the v1 fork config can use `ctrl+a>repeatable:shift+l=
+resize_split:right,2` and friends, recovering the tmux `-rH/-rL/...`
+feel verbatim.
+
+The original "modal resize mode via key table" path stays available
+as an escape hatch if `-r` turns out to be insufficient, but the
+expectation is that `-r` is sufficient on its own.
 
 ### G6. No "sessions"
 
@@ -214,8 +268,10 @@ sees these unknown actions.
 # G1 + G4 — eject / mark / pull, mirroring tmux prefix !/q/Q/j.
 # `mark_split` toggles, so re-pressing on the marked pane clears it.
 # `shift+q` is the explicit "clear from anywhere" chord (sequence triggers
-# are case-insensitive, so the uppercase form must be written as `shift+q`).
-keybind = ctrl+a>!=move_split_to_new_tab
+# are case-insensitive, so the uppercase form must be written as `shift+q`;
+# the same applies to symbol keys like `!`, `%`, `&`, `"` that require
+# shift to type — write the modifier explicitly or the trigger never matches).
+keybind = ctrl+a>shift+!=move_split_to_new_tab
 keybind = ctrl+a>q=mark_split
 keybind = ctrl+a>shift+q=clear_split_mark
 keybind = ctrl+a>j=pull_marked_split:auto
@@ -225,13 +281,26 @@ keybind = ctrl+a>j=pull_marked_split:auto
 keybind = ctrl+a>g=new_tab:~/git/ghostty
 keybind = ctrl+a>shift+n=new_tab:~/git/ExampleOS
 keybind = ctrl+a>i=new_tab:~/git/another-project
+
+# Swap (tmux swap-pane).
+keybind = ctrl+a>shift+{=swap_split:previous
+keybind = ctrl+a>shift+}=swap_split:next
 ```
+
+## v2 — pending the repeater (G5)
+
+Once `repeatable:` ships, the resize bindings can stop demanding
+shift+letter for big steps and instead emit one motion per press with
+a 500ms re-arm window — closer to tmux's `bind -r L resize-pane -R 5`.
+Until then, the current config uses static `shift+H/J/K/L` for
+10-cell steps and lowercase `h/j/k/l` for 2-cell steps without the
+re-arm.
 
 Postponed / dropped:
 - **G3a** (prompted launcher) — needs a generic prompt-with-substitution
   action; revisit if G3b's one-key shortcuts don't cover the workflow.
 - **G2** (broadcast input) — dropped, unused in years.
-- **G5** (modal resize mode) — OOTB key auto-repeat is enough for now.
+- **G5** (repeatable bindings) — 🚧 next iteration. See section above.
 - **G6** (sessions) — out of scope.
 - **`move_split_to_tab:<n>`** (push current pane to tab N) — shelved;
   mark-and-pull + adjacent `merge_tabs` cover the workflow.
