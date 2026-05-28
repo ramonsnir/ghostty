@@ -681,6 +681,9 @@ typedef struct {
 typedef struct {
   // Optional working directory. NULL inherits from the source surface.
   const char* working_directory;
+  // Optional command to feed to the new tab's shell as its first input
+  // (caller includes any trailing newline). NULL opens an empty prompt.
+  const char* initial_input;
 } ghostty_action_new_tab_s;
 
 // apprt.action.SetTitle.C

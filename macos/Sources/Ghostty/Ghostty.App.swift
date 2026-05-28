@@ -872,12 +872,17 @@ extension Ghostty {
                 (String(cString: $0) as NSString).expandingTildeInPath
             }
 
+            // Optional command to run as the new tab's first input (from
+            // `new_tab_command:<cmd>`). The core already appended a newline.
+            let initialInput: String? = params.initial_input.map { String(cString: $0) }
+
             switch target.tag {
             case GHOSTTY_TARGET_APP:
                 var userInfo: [AnyHashable: Any] = [:]
-                if let cwd = overrideCwd {
+                if overrideCwd != nil || initialInput != nil {
                     var config = SurfaceConfiguration()
-                    config.workingDirectory = cwd
+                    config.workingDirectory = overrideCwd
+                    config.initialInput = initialInput
                     userInfo[Notification.NewSurfaceConfigKey] = config
                 }
                 NotificationCenter.default.post(
@@ -903,6 +908,9 @@ extension Ghostty {
                 var config = SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB))
                 if let cwd = overrideCwd {
                     config.workingDirectory = cwd
+                }
+                if let initialInput {
+                    config.initialInput = initialInput
                 }
 
                 NotificationCenter.default.post(

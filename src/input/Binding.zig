@@ -578,6 +578,18 @@ pub const Action = union(enum) {
     /// inheriting behavior.
     new_tab: NewTab,
 
+    /// Open a new tab and run a command in it as its first input.
+    ///
+    /// The tab launches your normal shell (inheriting the working directory
+    /// from the source surface, like bare `new_tab`), then the given command
+    /// is fed to the shell as if typed, followed by a newline so it executes.
+    /// You are left at a live, interactive prompt afterward.
+    ///
+    /// Example: `new_tab_command:~/git/foo/scripts/list.sh`. The whole value
+    /// after the colon is the command; it is sent verbatim (no `~` expansion),
+    /// so use an absolute path or a shell that expands `~` itself.
+    new_tab_command: []const u8,
+
     /// Go to the previous tab.
     previous_tab,
 
@@ -1565,6 +1577,7 @@ pub const Action = union(enum) {
             // come from. For example `new_window` needs to be sourced to
             // a surface so inheritance can be done correctly.
             .new_tab,
+            .new_tab_command,
             .previous_tab,
             .next_tab,
             .last_tab,
@@ -3590,6 +3603,30 @@ test "parse: new_tab with and without working directory" {
         const binding = try parseSingle("a=new_tab:");
         try testing.expect(binding.action == .new_tab);
         try testing.expectEqual(@as(?[]const u8, null), binding.action.new_tab.working_directory);
+    }
+}
+
+test "parse: new_tab_command round-trips its command verbatim" {
+    const testing = std.testing;
+
+    // The whole value after the colon is the command, including spaces,
+    // slashes and `~` (which is intentionally not expanded here).
+    {
+        const binding = try parseSingle("a=new_tab_command:~/git/foo/list.sh --all");
+        try testing.expect(binding.action == .new_tab_command);
+        try testing.expectEqualStrings(
+            "~/git/foo/list.sh --all",
+            binding.action.new_tab_command,
+        );
+    }
+
+    // Round-trips through format back to the same string.
+    {
+        const a: Action = .{ .new_tab_command = "~/git/foo/list.sh" };
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+        try a.format(&buf.writer);
+        try testing.expectEqualStrings("new_tab_command:~/git/foo/list.sh", buf.written());
     }
 }
 

@@ -763,14 +763,22 @@ pub const NewTab = struct {
     /// is expanded by the apprt.
     working_directory: ?[:0]const u8 = null,
 
+    /// Optional command to run in the new tab as its first input. The tab
+    /// still launches the normal shell; this is fed to it as if typed
+    /// (the caller is responsible for any trailing newline). If null, the
+    /// tab just opens at an empty prompt (the pre-existing behavior).
+    initial_input: ?[:0]const u8 = null,
+
     // Sync with: ghostty_action_new_tab_s
     pub const C = extern struct {
         working_directory: ?[*:0]const u8,
+        initial_input: ?[*:0]const u8,
     };
 
     pub fn cval(self: NewTab) C {
         return .{
             .working_directory = if (self.working_directory) |wd| wd.ptr else null,
+            .initial_input = if (self.initial_input) |in| in.ptr else null,
         };
     }
 
@@ -780,7 +788,11 @@ pub const NewTab = struct {
         _: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
     ) !void {
-        try writer.print("{s}{{ {?s} }}", .{ @typeName(@This()), value.working_directory });
+        try writer.print("{s}{{ {?s}, {?s} }}", .{
+            @typeName(@This()),
+            value.working_directory,
+            value.initial_input,
+        });
     }
 };
 
