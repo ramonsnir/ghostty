@@ -452,6 +452,11 @@ extension Ghostty.Notification {
     /// surface's tab as a split, in the direction carried in userInfo.
     static let didPullMarkedSplit = Notification.Name("com.mitchellh.ghostty.didPullMarkedSplit")
 
+    /// Notification sent to swap the focused pane with another pane in the
+    /// same tab. Direction is carried in userInfo under "direction" as a
+    /// `Ghostty.SplitFocusDirection`.
+    static let didSwapSplit = Notification.Name("com.mitchellh.ghostty.didSwapSplit")
+
     /// Notification that renderer health changed
     static let didUpdateRendererHealth = Notification.Name("com.mitchellh.ghostty.didUpdateRendererHealth")
 

@@ -726,6 +726,19 @@ pub const Action = union(enum) {
     /// Only implemented on macOS.
     pull_marked_split: SplitDirection,
 
+    /// Swap the focused pane with another pane in the same tab. The argument
+    /// selects the target:
+    ///
+    ///   - `previous`, `next`: previous/next leaf in tree traversal order,
+    ///     wrapping at the ends. Matches tmux's `prefix {` / `prefix }`.
+    ///   - `up`, `down`, `left`, `right`: spatial neighbor in that direction.
+    ///
+    /// Does nothing if there is only one pane, or if the requested neighbor
+    /// resolves to the focused pane itself.
+    ///
+    /// Only implemented on macOS.
+    swap_split: SplitFocusDirection,
+
     /// Merge the current tab with a neighboring tab, combining their contents
     /// into a single tab with a split between them.
     ///
@@ -1559,6 +1572,7 @@ pub const Action = union(enum) {
             .mark_split,
             .clear_split_mark,
             .pull_marked_split,
+            .swap_split,
             .inspector,
             => .surface,
         };
@@ -3569,6 +3583,35 @@ test "parse: mark/clear/pull split actions" {
         try testing.expectEqual(
             Action.SplitDirection.auto,
             binding.action.pull_marked_split,
+        );
+    }
+}
+
+test "parse: swap_split action" {
+    const testing = std.testing;
+
+    {
+        const binding = try parseSingle("a=swap_split:previous");
+        try testing.expect(binding.action == .swap_split);
+        try testing.expectEqual(
+            Action.SplitFocusDirection.previous,
+            binding.action.swap_split,
+        );
+    }
+    {
+        const binding = try parseSingle("a=swap_split:next");
+        try testing.expect(binding.action == .swap_split);
+        try testing.expectEqual(
+            Action.SplitFocusDirection.next,
+            binding.action.swap_split,
+        );
+    }
+    {
+        const binding = try parseSingle("a=swap_split:left");
+        try testing.expect(binding.action == .swap_split);
+        try testing.expectEqual(
+            Action.SplitFocusDirection.left,
+            binding.action.swap_split,
         );
     }
 }

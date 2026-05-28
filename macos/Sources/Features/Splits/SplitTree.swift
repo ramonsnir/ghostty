@@ -289,6 +289,41 @@ extension SplitTree {
         return try replacing(node: target, with: target.togglingDirection())
     }
 
+    /// Swap the focused leaf with the leaf reached by traversing in `direction`.
+    /// The tree's structure and ratios are preserved — only the two leaves
+    /// exchange positions.
+    ///
+    /// - Throws: SplitError.viewNotFound if the view isn't in the tree, if the
+    ///   tree has only one leaf, or if the requested neighbor resolves back to
+    ///   `view` (i.e., nothing to swap with).
+    func swappingLeaf(of view: ViewType, with direction: FocusDirection) throws -> Self {
+        guard let root else { throw SplitError.viewNotFound }
+        let focusedNode: Node = .leaf(view: view)
+        guard let focusedPath = root.path(to: focusedNode) else {
+            throw SplitError.viewNotFound
+        }
+        guard let targetView = focusTarget(for: direction, from: focusedNode),
+              targetView !== view else {
+            throw SplitError.viewNotFound
+        }
+        guard let targetPath = root.path(to: .leaf(view: targetView)) else {
+            // Shouldn't happen — focusTarget returned a view it found in the
+            // tree — but bail safely if it does.
+            throw SplitError.viewNotFound
+        }
+
+        // Two-step path replacement. The intermediate tree briefly has the
+        // target view appearing at both paths; the second replacement removes
+        // that duplicate. Because both replacements swap leaf-for-leaf the
+        // structure (and therefore both paths) stay valid throughout.
+        let step1 = try root.replacingNode(at: focusedPath, with: .leaf(view: targetView))
+        let step2 = try step1.replacingNode(at: targetPath, with: .leaf(view: view))
+
+        // Zoomed Node values are leaf-view-equal, so a zoom anchored on either
+        // view remains valid — Node.== compares leaves by view identity.
+        return .init(root: step2, zoomed: zoomed)
+    }
+
     /// Combine this tree with another into a single tree by creating a new root
     /// split. Used to merge the contents of two tabs.
     ///

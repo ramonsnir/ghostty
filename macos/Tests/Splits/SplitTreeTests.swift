@@ -405,6 +405,104 @@ struct SplitTreeTests {
         #expect(threw)
     }
 
+    // MARK: - Swap split (exchange leaf positions)
+
+    @Test func swappingSwapsTwoLeavesByNext() throws {
+        let (tree, view1, view2) = try makeHorizontalSplit()
+        let swapped = try tree.swappingLeaf(of: view1, with: .next)
+        guard case .split(let s) = swapped.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.left == .leaf(view: view2))
+        #expect(s.right == .leaf(view: view1))
+    }
+
+    @Test func swappingPreservesRatio() throws {
+        let (tree, view1, _) = try makeHorizontalSplit()
+        // Skew the root split so we'd notice a ratio change (flip would
+        // invert it; swap must not).
+        let skewed = try tree.replacing(node: tree.root!, with: tree.root!.resizing(to: 0.3))
+        let swapped = try skewed.swappingLeaf(of: view1, with: .next)
+        guard case .split(let s) = swapped.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(abs(s.ratio - 0.3) < 0.001)
+    }
+
+    @Test func swappingTwiceRestoresOriginal() throws {
+        let (tree, view1, view2) = try makeHorizontalSplit()
+        let twice = try tree
+            .swappingLeaf(of: view1, with: .next)
+            .swappingLeaf(of: view1, with: .next)
+        guard case .split(let s) = twice.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.left == .leaf(view: view1))
+        #expect(s.right == .leaf(view: view2))
+    }
+
+    @Test func swappingByPreviousWrapsToOpposite() throws {
+        let (tree, view1, view2) = try makeHorizontalSplit()
+        // previous from view1 wraps to view2 (single-split tree of two leaves).
+        let swapped = try tree.swappingLeaf(of: view1, with: .previous)
+        guard case .split(let s) = swapped.root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(s.left == .leaf(view: view2))
+        #expect(s.right == .leaf(view: view1))
+    }
+
+    @Test func swappingAcrossNestedSplitSwapsOnlyTheLeaves() throws {
+        // Layout: view1 | (view2 / view3)
+        let (tree, view1, view2, view3) = try makeNestedTree()
+        // Spatially `right` from view1 lands on view2 (top of the right column).
+        let swapped = try tree.swappingLeaf(of: view1, with: .spatial(.right))
+
+        guard case .split(let root) = swapped.root else {
+            Issue.record("unexpected root node type")
+            return
+        }
+        #expect(root.direction == .horizontal)
+        // Outer left now holds view2 (the previous top-right leaf).
+        #expect(root.left == .leaf(view: view2))
+        // Inner vertical split kept its structure; view1 took view2's slot.
+        guard case .split(let inner) = root.right else {
+            Issue.record("unexpected inner node type")
+            return
+        }
+        #expect(inner.direction == .vertical)
+        #expect(inner.left == .leaf(view: view1))
+        #expect(inner.right == .leaf(view: view3))
+    }
+
+    @Test func swappingOnSingleLeafTreeThrows() {
+        let view = MockView()
+        let tree = SplitTree<MockView>(view: view)
+        var threw = false
+        do {
+            _ = try tree.swappingLeaf(of: view, with: .next)
+        } catch {
+            threw = true
+        }
+        #expect(threw)
+    }
+
+    @Test func swappingWithSpatialDeadEndThrows() throws {
+        let (tree, view1, _) = try makeHorizontalSplit()
+        // No pane to the left of view1; spatial swap should refuse.
+        var threw = false
+        do {
+            _ = try tree.swappingLeaf(of: view1, with: .spatial(.left))
+        } catch {
+            threw = true
+        }
+        #expect(threw)
+    }
+
     // MARK: - Combine (merge tabs)
 
     @Test func combinedPlacesOtherOnSecondByDefault() throws {

@@ -975,12 +975,14 @@ typedef enum {
   GHOSTTY_ACTION_MARK_SPLIT,
   GHOSTTY_ACTION_CLEAR_SPLIT_MARK,
   GHOSTTY_ACTION_PULL_MARKED_SPLIT,
+  GHOSTTY_ACTION_SWAP_SPLIT,
 } ghostty_action_tag_e;
 
 typedef union {
   ghostty_action_new_tab_s new_tab;
   ghostty_action_split_direction_e new_split;
   ghostty_action_split_direction_e pull_marked_split;
+  ghostty_action_goto_split_e swap_split;
   ghostty_action_split_axis_e flip_split;
   ghostty_action_split_axis_e toggle_split_direction;
   ghostty_action_merge_tabs_e merge_tabs;
