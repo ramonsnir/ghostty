@@ -5303,6 +5303,22 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             );
         },
 
+        .new_tab_command => |v| {
+            // Open a new tab (inheriting the source surface's cwd) and feed
+            // the command to its shell as if typed, with a trailing newline
+            // so it executes. An empty value behaves like a bare new_tab.
+            const cmd_input: ?[:0]const u8 = if (v.len > 0)
+                try std.fmt.allocPrintSentinel(self.alloc, "{s}\n", .{v}, 0)
+            else
+                null;
+            defer if (cmd_input) |s| self.alloc.free(s);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                .{ .initial_input = cmd_input },
+            );
+        },
+
         .close_tab => |v| return try self.rt_app.performAction(
             .{ .surface = self },
             .close_tab,
