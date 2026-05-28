@@ -24,7 +24,22 @@ extension Ghostty {
         /// The currently marked surface — set by the `mark_split` action and pulled
         /// into another tab by `pull_marked_split`. App-wide single mark; auto-clears
         /// when the underlying view is deallocated (weak reference).
-        weak var markedSurface: SurfaceView?
+        ///
+        /// Notifies observers (SwiftUI views via `objectWillChange`, AppKit via
+        /// `Notification.didChangeMarkedSurface`) when the value changes, so the
+        /// marked-pane border indicator can update reactively across windows.
+        weak var markedSurface: SurfaceView? {
+            willSet {
+                guard markedSurface !== newValue else { return }
+                objectWillChange.send()
+            }
+            didSet {
+                guard markedSurface !== oldValue else { return }
+                NotificationCenter.default.post(
+                    name: Notification.didChangeMarkedSurface,
+                    object: self)
+            }
+        }
 
         /// The readiness value of the state.
         @Published var readiness: Readiness = .loading

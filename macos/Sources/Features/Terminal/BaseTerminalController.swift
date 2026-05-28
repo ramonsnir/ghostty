@@ -317,6 +317,25 @@ class BaseTerminalController: NSWindowController,
         if to.isEmpty {
             focusedSurface = nil
         }
+
+        // If the app-wide marked surface left our tree (close_surface, drag
+        // to another tab, etc.) and isn't held by any other controller, clear
+        // it explicitly so the indicator disappears immediately. The weak
+        // reference auto-clears on dealloc but SwiftUI wouldn't get notified
+        // — willSet only fires on explicit assignment.
+        if let marked = ghostty.markedSurface,
+           from.contains(marked),
+           !to.contains(marked) {
+            let heldElsewhere = NSApp.windows.contains { window in
+                guard let other = window.windowController as? BaseTerminalController,
+                      other !== self else { return false }
+                return other.surfaceTree.contains(marked)
+            }
+            if !heldElsewhere {
+                ghostty.markedSurface = nil
+            }
+        }
+
         syncSurfaceTreeOcclusionState()
     }
 

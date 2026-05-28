@@ -457,6 +457,12 @@ extension Ghostty.Notification {
     /// `Ghostty.SplitFocusDirection`.
     static let didSwapSplit = Notification.Name("com.mitchellh.ghostty.didSwapSplit")
 
+    /// Notification posted when the app-wide marked surface changes (set,
+    /// cleared, or replaced). The `object` is the `Ghostty.App`. Listeners
+    /// that need to repaint a mark indicator should re-read
+    /// `ghostty.markedSurface` and compare.
+    static let didChangeMarkedSurface = Notification.Name("com.mitchellh.ghostty.didChangeMarkedSurface")
+
     /// Notification that renderer health changed
     static let didUpdateRendererHealth = Notification.Name("com.mitchellh.ghostty.didUpdateRendererHealth")
 
