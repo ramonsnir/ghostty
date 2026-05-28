@@ -14,8 +14,16 @@ reachable from nested panes. The split tree is strictly binary.
 sequences are case-insensitive — `ctrl+a>q` and `ctrl+a>Q` resolve to the
 same trigger, with the second binding silently clobbering the first. To bind
 a shift-modified key, write the modifier explicitly: `ctrl+a>shift+q=…`.
-Tripped over this during the mark/pull smoke test; safe rule of thumb: never
-rely on letter case alone to disambiguate two bindings at the same prefix.
+The same applies to **any symbol that requires shift to type on your layout**
+— `!`, `%`, `&`, `"`, `?`, etc. `ctrl+a>!=foo` parses without complaint but
+stores empty mods, while the keypress always arrives with `mods={shift}`,
+so the trigger never matches. `Set.getEvent` (`src/input/Binding.zig`) only
+strips mods for `catch_all`, not for unicode keys. Write `ctrl+a>shift+!=foo`
+instead (matches via the utf8 codepoint fallback); `ctrl+a>shift+1=foo` also
+works (matches via the unshifted_codepoint fallback). Tripped over this
+during the mark/pull smoke test and again on `prefix !`; safe rule of thumb:
+never rely on letter case alone to disambiguate two bindings at the same
+prefix, and always write `shift+` for keys that need shift to type.
 
 - `flip_split:horizontal|vertical` — mirror the nearest left/right or up/down split (swap its two sides; divider stays put).
 - `toggle_split_direction:horizontal|vertical` — re-orient the nearest split of that orientation (L/R ⇄ U/D).
