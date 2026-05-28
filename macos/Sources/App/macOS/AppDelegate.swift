@@ -169,6 +169,23 @@ class AppDelegate: NSObject,
     // MARK: - NSApplicationDelegate
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // Fork: if another process with our bundle id is already running from a
+        // different bundle URL, activate it and bail. This stops two copies of
+        // the fork (e.g. /Applications/Ghostty (ramon).app and an in-tree
+        // build that shares the same bundle id) from racing each other —
+        // dock-attention bouncing one instance while the user clicks the other.
+        if let bundleID = Bundle.main.bundleIdentifier {
+            let ourURL = Bundle.main.bundleURL.standardizedFileURL
+            let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+                .filter { $0.bundleURL?.standardizedFileURL != ourURL }
+            if let other = others.first {
+                Self.logger.warning("another instance is already running at \(other.bundleURL?.path ?? "?", privacy: .public); activating it and exiting")
+                other.activate(options: [.activateAllWindows])
+                exit(0)
+            }
+        }
+
         #if DEBUG
         if
             let suite = UserDefaults.ghosttySuite,

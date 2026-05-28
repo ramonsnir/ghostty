@@ -7,13 +7,19 @@ class DockTilePlugin: NSObject, NSDockTilePlugIn {
 
     private let pluginBundle = Bundle(for: DockTilePlugin.self)
 
-    // Separate defaults based on debug vs release builds so we can test icons
-    // without messing up releases.
-    #if DEBUG
-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty-ramon.debug")
-    #else
-    private let ghosttyUserDefaults = UserDefaults(suiteName: "com.mitchellh.ghostty-ramon")
-    #endif
+    // Read the defaults suite that belongs to the host .app we're embedded in.
+    // The plugin lives at Host.app/Contents/PlugIns/DockTilePlugin.plugin, so
+    // walking three parents up gets us back to the host bundle. This avoids
+    // hardcoding the suite, so Debug / Release / ReleaseLocal all read their
+    // own UserDefaults domain.
+    private let ghosttyUserDefaults: UserDefaults? = {
+        let hostURL = Bundle(for: DockTilePlugin.self).bundleURL
+            .deletingLastPathComponent()  // PlugIns
+            .deletingLastPathComponent()  // Contents
+            .deletingLastPathComponent()  // Host.app
+        guard let hostID = Bundle(url: hostURL)?.bundleIdentifier else { return nil }
+        return UserDefaults(suiteName: hostID)
+    }()
 
     private var iconChangeObserver: Any?
 

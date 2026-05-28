@@ -21,8 +21,9 @@ Wiring — core: `src/input/Binding.zig`, `src/apprt/action.zig` (+`include/ghos
 `Ghostty.App.swift`, `GhosttyPackage.swift`. Tests: `macos/Tests/Splits/SplitTreeTests.swift`.
 
 ## Fork-identity / non-functional changes
-- **Bundle id** `com.mitchellh.ghostty-ramon` (Debug: `.debug`) — coexists with official `com.mitchellh.ghostty`; own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift`)
-- **Display name** "Ghostty (ramon)"; installed at `/Applications/Ghostty (ramon).app` next to the official one.
+- **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
+- **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
+- **Single-instance guard** in `AppDelegate.applicationWillFinishLaunching`: if another process with the same bundle id is already running from a different bundle URL, that one is activated and this process exits. Stops two copies of the same fork identity from racing each other (e.g. dock-attention bouncing one while you click the other).
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`).
 - **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
 - **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
@@ -36,8 +37,15 @@ this macOS); `nushell` for `build.nu`.
 2. **Zig tests**: `zig build test -Demit-macos-app=false -Demit-xcframework=false -Dtest-filter=<name>`.
 3. **Rebuild lib** (required after any Zig change before the app build): `zig build -Demit-macos-app=false -Doptimize=ReleaseFast`.
 4. **Swift tests**: `macos/build.nu --action test` (or `xcodebuild … -only-testing:GhosttyTests/SplitTreeTests test`).
-5. **Build the app**: `macos/build.nu --configuration ReleaseLocal --action build` → `macos/build/ReleaseLocal/Ghostty.app` (optimized, no debug banner).
-6. **Install/update the fork**: `ditto macos/build/ReleaseLocal/Ghostty.app "/Applications/Ghostty (ramon).app"`. Never touch `/Applications/Ghostty.app`.
+5. **Build the app**: `macos/build.nu --configuration ReleaseLocal --action build` → `macos/build/ReleaseLocal/Ghostty.app` (optimized, no debug banner). This produces "Ghostty (ramon-local)" with bundle id `com.mitchellh.ghostty-ramon.local` — runs side-by-side with the installed Release identity.
+6. **Install/update the fork**: `ditto macos/build/ReleaseLocal/Ghostty.app "/Applications/Ghostty (ramon).app"`, then rewrite the bundle id / display name to the Release identity and re-ad-hoc-sign so the installed app keeps `com.mitchellh.ghostty-ramon`:
+   ```sh
+   APP="/Applications/Ghostty (ramon).app"
+   /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.mitchellh.ghostty-ramon' "$APP/Contents/Info.plist"
+   /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Ghostty (ramon)' "$APP/Contents/Info.plist"
+   codesign --force --deep --sign - "$APP"
+   ```
+   Never touch `/Applications/Ghostty.app`.
 7. **Commit** to `ramon-fork`.
 
 ## ⚠️ Safety
