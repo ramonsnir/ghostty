@@ -313,9 +313,21 @@ class BaseTerminalController: NSWindowController,
     ///
     /// Subclasses should call super first.
     func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
-        // If our surface tree becomes empty then we have no focused surface.
-        if to.isEmpty {
-            focusedSurface = nil
+        // If our focused surface is no longer in the tree (cross-controller
+        // pull, merge donor empty-out, move-to-new-tab, etc.), route the
+        // change through focusedSurfaceDidChange so the title/bell cancellables
+        // get torn down against the now-foreign surface. Without this, two
+        // visible bugs follow:
+        //   * bell events from the moved surface keep painting THIS window's
+        //     tab title because the $bell cancellable still observes it; and
+        //   * notification dispatch that self-filters via
+        //     `focusedSurface == target` fires on the wrong controller (the
+        //     symptom users see is prev/next tab cycling the wrong window).
+        if let focused = focusedSurface, !to.contains(focused) {
+            focusedSurfaceDidChange(to: replacementFocus(
+                from: from,
+                to: to,
+                leaving: focused))
         }
 
         // If the app-wide marked surface left our tree (close_surface, drag
@@ -496,6 +508,27 @@ class BaseTerminalController: NSWindowController,
         } else {
             return surfaceTree.focusTarget(for: .previous, from: node)
         }
+    }
+
+    /// Pick a sensible replacement focus when `leaving` is being removed from
+    /// our tree. Looks for the leaf that was adjacent to `leaving` in the OLD
+    /// tree (matching close-surface UX) and that's still in the NEW tree,
+    /// otherwise falls back to the first leaf, or nil if the tree is empty.
+    private func replacementFocus(
+        from: SplitTree<Ghostty.SurfaceView>,
+        to: SplitTree<Ghostty.SurfaceView>,
+        leaving: Ghostty.SurfaceView
+    ) -> Ghostty.SurfaceView? {
+        if to.isEmpty { return nil }
+        let oldLeaves = from.root?.leaves() ?? []
+        if let idx = oldLeaves.firstIndex(where: { $0 === leaving }) {
+            let next = idx + 1 < oldLeaves.count ? oldLeaves[idx + 1] : nil
+            let prev = idx > 0 ? oldLeaves[idx - 1] : nil
+            if let still = [next, prev].compactMap({ $0 }).first(where: { to.contains($0) }) {
+                return still
+            }
+        }
+        return to.first
     }
 
     /// Remove a node from the surface tree and move focus appropriately.
@@ -894,10 +927,13 @@ class BaseTerminalController: NSWindowController,
         guard surfaceTree.isSplit else { return }
 
         // If we're removing our focused surface then we move focus elsewhere.
-        // Keep track of the old one so undo sends focus back correctly.
+        // Keep track of the old one so undo sends focus back correctly. Route
+        // through focusedSurfaceDidChange (not a bare assignment) so the
+        // title/bell cancellable rebinds against the in-tree replacement —
+        // otherwise the donor window keeps showing the moved pane's bell glyph.
         let oldFocusedSurface = focusedSurface
         if focusedSurface == target {
-            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)
+            focusedSurfaceDidChange(to: findNextFocusTargetAfterClosing(node: targetNode))
         }
 
         // Remove the surface from our tree and put it in a new single-pane tree.

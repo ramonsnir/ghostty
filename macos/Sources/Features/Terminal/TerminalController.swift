@@ -1176,8 +1176,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // we should resize to that default size.
         if case let .leaf(view) = surfaceTree.root {
             // If this is our first surface then our focused surface will be nil
-            // so we force the focused surface to the leaf.
-            focusedSurface = view
+            // so we force the focused surface to the leaf. Route through
+            // focusedSurfaceDidChange so the title/bell cancellable is wired
+            // up immediately — otherwise a controller created for a moved
+            // pane (move_split_to_new_tab) won't surface its bell on its own
+            // tab title until the focus delegate fires (after key window
+            // activation).
+            focusedSurfaceDidChange(to: view)
         }
 
         // Initialize our content view to the SwiftUI root
