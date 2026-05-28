@@ -86,7 +86,7 @@ pub const Action = union(Key) {
     /// Open a new tab. If the target is a surface it should be opened in
     /// the same window as the surface. If the target is the app then
     /// the tab should be opened in a new window.
-    new_tab,
+    new_tab: NewTab,
 
     /// Closes the tab belonging to the currently focused split, or all other
     /// tabs, depending on the mode.
@@ -358,6 +358,19 @@ pub const Action = union(Key) {
     /// the neighbor and the orientation of the resulting split.
     merge_tabs: MergeTabs,
 
+    /// Toggle the target surface as the app-wide "marked pane". If it was
+    /// already the marked pane, the mark is cleared; otherwise it replaces
+    /// any prior mark. A subsequent `pull_marked_split` from any surface
+    /// will move this pane into that surface's tab.
+    mark_split,
+
+    /// Clear the app-wide marked pane, if any.
+    clear_split_mark,
+
+    /// Pull the marked pane into the target surface's tab as a split next to
+    /// the target, in the given direction.
+    pull_marked_split: SplitDirection,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -429,6 +442,9 @@ pub const Action = union(Key) {
         toggle_split_direction,
         move_split_to_new_tab,
         merge_tabs,
+        mark_split,
+        clear_split_mark,
+        pull_marked_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -734,6 +750,33 @@ pub const InitialSize = extern struct {
 pub const CellSize = extern struct {
     width: u32,
     height: u32,
+};
+
+pub const NewTab = struct {
+    /// Working directory for the new tab. If null, the tab inherits the cwd
+    /// from the source surface (the pre-existing behavior). A leading `~/`
+    /// is expanded by the apprt.
+    working_directory: ?[:0]const u8 = null,
+
+    // Sync with: ghostty_action_new_tab_s
+    pub const C = extern struct {
+        working_directory: ?[*:0]const u8,
+    };
+
+    pub fn cval(self: NewTab) C {
+        return .{
+            .working_directory = if (self.working_directory) |wd| wd.ptr else null,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {?s} }}", .{ @typeName(@This()), value.working_directory });
+    }
 };
 
 pub const SetTitle = struct {

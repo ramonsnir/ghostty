@@ -448,6 +448,10 @@ extension Ghostty.Notification {
     /// Notification sent to merge the current tab with a neighboring tab.
     static let didMergeTabs = Notification.Name("com.mitchellh.ghostty.didMergeTabs")
 
+    /// Notification sent to pull the app-wide marked pane into the receiving
+    /// surface's tab as a split, in the direction carried in userInfo.
+    static let didPullMarkedSplit = Notification.Name("com.mitchellh.ghostty.didPullMarkedSplit")
+
     /// Notification that renderer health changed
     static let didUpdateRendererHealth = Notification.Name("com.mitchellh.ghostty.didUpdateRendererHealth")
 

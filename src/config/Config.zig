@@ -6642,7 +6642,7 @@ pub const Keybinds = struct {
             try self.set.put(
                 alloc,
                 .{ .key = .{ .unicode = 't' }, .mods = .{ .ctrl = true, .shift = true } },
-                .{ .new_tab = {} },
+                .{ .new_tab = .{} },
             );
             try self.set.put(
                 alloc,
@@ -7027,7 +7027,7 @@ pub const Keybinds = struct {
             try self.set.put(
                 alloc,
                 .{ .key = .{ .unicode = 't' }, .mods = .{ .super = true } },
-                .{ .new_tab = {} },
+                .{ .new_tab = .{} },
             );
             try self.set.put(
                 alloc,

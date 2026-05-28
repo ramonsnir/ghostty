@@ -220,6 +220,11 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyDidPullMarkedSplit(_:)),
+            name: Ghostty.Notification.didPullMarkedSplit,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(ghosttyDidPresentTerminal(_:)),
             name: Ghostty.Notification.ghosttyPresentTerminal,
             object: nil)
@@ -886,6 +891,71 @@ class BaseTerminalController: NSWindowController,
             from: window,
             tree: newTree,
             confirmUndo: false)
+    }
+
+    @objc private func ghosttyDidPullMarkedSplit(_ notification: Notification) {
+        // The focused surface in this controller is the *anchor* — the marked
+        // pane will be inserted next to it in the requested direction. The
+        // notification fans out to every controller; non-anchor controllers
+        // drop it via the `contains` check.
+        guard let anchor = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(anchor) else { return }
+
+        // The marked pane lives off the app. Nothing to do if unset (auto-cleared
+        // on dealloc thanks to the weak ref).
+        guard let marked = ghostty.markedSurface else { return }
+
+        // Disallow inserting a pane next to itself.
+        guard marked !== anchor else { return }
+
+        // Decode the direction (the apprt SplitDirection is 4 cardinals; `auto`
+        // is resolved upstream in Surface.zig).
+        guard let directionAny = notification.userInfo?["direction"] else { return }
+        guard let cDirection = directionAny as? ghostty_action_split_direction_e else { return }
+        let direction: SplitTree<Ghostty.SurfaceView>.NewDirection
+        switch cDirection {
+        case GHOSTTY_SPLIT_DIRECTION_RIGHT: direction = .right
+        case GHOSTTY_SPLIT_DIRECTION_LEFT: direction = .left
+        case GHOSTTY_SPLIT_DIRECTION_DOWN: direction = .down
+        case GHOSTTY_SPLIT_DIRECTION_UP: direction = .up
+        default: return
+        }
+
+        // Locate the source: the controller currently holding the marked view.
+        guard let sourceController = marked.window?.windowController as? BaseTerminalController else { return }
+        guard let markedNode = sourceController.surfaceTree.root?.node(view: marked) else { return }
+
+        // Build the new trees. Same-tab pulls are a rearrange (one tree edit);
+        // cross-tab/window pulls do remove-from-source + insert-into-target.
+        if sourceController === self {
+            // Remove first to avoid the same view appearing twice in transit.
+            let intermediate = surfaceTree.removing(markedNode)
+            let rearranged: SplitTree<Ghostty.SurfaceView>
+            do {
+                rearranged = try intermediate.inserting(view: marked, at: anchor, direction: direction)
+            } catch {
+                // The anchor was in the same parent split as the marked node;
+                // `removing` collapsed the split and the anchor's identity in
+                // the tree is preserved, so this shouldn't normally fail.
+                return
+            }
+            replaceSurfaceTree(rearranged, moveFocusTo: marked, undoAction: "Pull Marked Pane")
+        } else {
+            // Cross-controller: empty out of source first; if the source tree
+            // becomes empty its TerminalController will close itself.
+            let newTarget: SplitTree<Ghostty.SurfaceView>
+            do {
+                newTarget = try surfaceTree.inserting(view: marked, at: anchor, direction: direction)
+            } catch {
+                return
+            }
+            sourceController.surfaceTree = sourceController.surfaceTree.removing(markedNode)
+            surfaceTree = newTarget
+            DispatchQueue.main.async { Ghostty.moveFocus(to: marked) }
+        }
+
+        // Mark is consumed by a successful pull.
+        ghostty.markedSurface = nil
     }
 
     // MARK: Local Events

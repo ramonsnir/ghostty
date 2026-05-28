@@ -767,6 +767,9 @@ pub const Application = extern struct {
             .toggle_split_direction,
             .move_split_to_new_tab,
             .merge_tabs,
+            .mark_split,
+            .clear_split_mark,
+            .pull_marked_split,
             => return false,
 
             .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
@@ -1153,7 +1156,7 @@ pub const Application = extern struct {
         self.syncActionAccelerator("win.toggle-command-palette", .toggle_command_palette);
         self.syncActionAccelerator("win.close", .{ .close_window = {} });
         self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
-        self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
+        self.syncActionAccelerator("win.new-tab", .{ .new_tab = .{} });
         self.syncActionAccelerator("win.close-tab::this", .{ .close_tab = .this });
         self.syncActionAccelerator("tab.close::this", .{ .close_tab = .this });
         self.syncActionAccelerator("win.split-right", .{ .new_split = .right });
