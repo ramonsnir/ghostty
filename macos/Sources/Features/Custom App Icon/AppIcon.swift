@@ -54,6 +54,19 @@ enum AppIcon: Equatable, Codable, Sendable {
             }
             self = .customStyle(ColorizedGhosttyIcon(screenColors: screenColors, ghostColor: ghostColor, frame: config.macosIconFrame))
         }
+
+        // Fork: per-build override of the fork default so the installed
+        // Release (chalkboard), in-tree ReleaseLocal (paper), and Xcode
+        // Debug (blueprint) builds are visually distinct at a glance.
+        // Only fires when the resolved icon is the fork default — any
+        // explicit non-chalkboard config still wins.
+        if self == .chalkboard, let bundleID = Bundle.main.bundleIdentifier {
+            if bundleID.hasSuffix(".debug") {
+                self = .blueprint
+            } else if bundleID.hasSuffix(".local") {
+                self = .paper
+            }
+        }
     }
 #endif
 
