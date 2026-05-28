@@ -1289,7 +1289,7 @@ pub const Window = extern struct {
     }
 
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
-        self.performBindingAction(.new_tab);
+        self.performBindingAction(.{ .new_tab = .{} });
     }
 
     fn tabOverviewCreateTab(
@@ -1832,7 +1832,7 @@ pub const Window = extern struct {
         _: ?*glib.Variant,
         self: *Window,
     ) callconv(.c) void {
-        self.performBindingAction(.new_tab);
+        self.performBindingAction(.{ .new_tab = .{} });
     }
 
     fn actionPromptContextTabTitle(

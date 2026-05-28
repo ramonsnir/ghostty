@@ -557,7 +557,13 @@ pub const Action = union(enum) {
     new_window,
 
     /// Open a new tab.
-    new_tab,
+    ///
+    /// Optionally takes a working directory: `new_tab:~/git/foo` opens the
+    /// tab with that as its initial cwd instead of inheriting from the
+    /// source surface. A leading `~/` is expanded to the user's home
+    /// directory by the app runtime. Bare `new_tab` keeps the existing
+    /// inheriting behavior.
+    new_tab: NewTab,
 
     /// Go to the previous tab.
     previous_tab,
@@ -692,6 +698,33 @@ pub const Action = union(enum) {
     ///
     /// Only implemented on macOS.
     move_split_to_new_tab,
+
+    /// Toggle the focused split's mark — an app-wide single-pane mark that
+    /// can later be pulled into another tab with `pull_marked_split`.
+    ///
+    /// If the focused pane is already the marked pane, the mark is cleared.
+    /// Otherwise the focused pane becomes the mark, replacing any prior mark.
+    /// This is analogous to tmux's `select-pane -m`/`-M`, collapsed into one
+    /// keystroke since re-marking the same pane is the natural undo.
+    ///
+    /// Only implemented on macOS.
+    mark_split,
+
+    /// Clear the marked pane, if any. Analogous to tmux's `select-pane -M`.
+    ///
+    /// Only implemented on macOS.
+    clear_split_mark,
+
+    /// Pull the marked pane (set by a previous `mark_split`) into the current
+    /// tab as a split next to the focused pane, in the given direction. The
+    /// mark is cleared after a successful pull. If the source tab becomes
+    /// empty, it is closed. Analogous to tmux's `join-pane`.
+    ///
+    /// Does nothing if nothing is marked, the marked pane no longer exists,
+    /// or the marked pane is the same as the focused pane.
+    ///
+    /// Only implemented on macOS.
+    pull_marked_split: SplitDirection,
 
     /// Merge the current tab with a neighboring tab, combining their contents
     /// into a single tab with a split between them.
@@ -1104,6 +1137,35 @@ pub const Action = union(enum) {
         previous_vertical,
     };
 
+    /// Parameters for the `new_tab` action.
+    pub const NewTab = struct {
+        /// Working directory for the new tab. If null, the tab inherits the
+        /// working directory from the source surface (the pre-existing
+        /// behavior). A leading `~/` is expanded by the app runtime.
+        working_directory: ?[]const u8 = null,
+
+        pub const default: NewTab = .{};
+
+        pub fn parse(input: []const u8) !NewTab {
+            // An empty value is equivalent to bare `new_tab`.
+            if (input.len == 0) return .{};
+            return .{ .working_directory = input };
+        }
+
+        pub fn format(self: NewTab, writer: *std.Io.Writer) !void {
+            if (self.working_directory) |wd| try writer.writeAll(wd);
+        }
+
+        pub fn clone(self: NewTab, alloc: Allocator) !NewTab {
+            return .{
+                .working_directory = if (self.working_directory) |wd|
+                    try alloc.dupe(u8, wd)
+                else
+                    null,
+            };
+        }
+    };
+
     pub const SplitFocusDirection = enum {
         previous,
         next,
@@ -1494,6 +1556,9 @@ pub const Action = union(enum) {
             .toggle_split_direction,
             .move_split_to_new_tab,
             .merge_tabs,
+            .mark_split,
+            .clear_split_mark,
+            .pull_marked_split,
             .inspector,
             => .surface,
         };
@@ -1567,14 +1632,33 @@ pub const Action = union(enum) {
     ) !void {
         switch (self) {
             inline else => |value| {
+                const Value = @TypeOf(value);
+
                 // All actions start with the tag.
                 try writer.print("{s}", .{@tagName(self)});
 
-                // Only write the value depending on the type if it's not void
-                if (@TypeOf(value) != void) {
-                    try writer.writeAll(":");
-                    try formatValue(writer, value);
+                // Void-typed actions are bare.
+                if (Value == void) return;
+
+                // If the value type has a `default` decl and the value
+                // equals it, emit the bare form (no `:value`). This is
+                // the round-tripping form because `parse` falls back to
+                // `default` when no `:value` is present.
+                const has_default = comptime hasDefault: {
+                    const info = @typeInfo(Value);
+                    break :hasDefault switch (info) {
+                        .@"struct", .@"union", .@"enum" => @hasDecl(Value, "default"),
+                        else => false,
+                    };
+                };
+                if (has_default and
+                    deepEqual(Value, value, @field(Value, "default")))
+                {
+                    return;
                 }
+
+                try writer.writeAll(":");
+                try formatValue(writer, value);
             },
         }
     }
@@ -3430,6 +3514,89 @@ test "parse: action with enum" {
     }
 }
 
+test "parse: new_tab with and without working directory" {
+    const testing = std.testing;
+
+    // Bare form preserves the existing void-style behavior via the
+    // type's `default` decl.
+    {
+        const binding = try parseSingle("a=new_tab");
+        try testing.expect(binding.action == .new_tab);
+        try testing.expectEqual(@as(?[]const u8, null), binding.action.new_tab.working_directory);
+    }
+
+    // With a working directory (e.g. `ctrl+a>g=new_tab:~/git/ghostty`).
+    {
+        const binding = try parseSingle("a=new_tab:~/git/foo");
+        try testing.expect(binding.action == .new_tab);
+        try testing.expectEqualStrings(
+            "~/git/foo",
+            binding.action.new_tab.working_directory.?,
+        );
+    }
+
+    // Empty value after colon is treated as bare (no working directory).
+    {
+        const binding = try parseSingle("a=new_tab:");
+        try testing.expect(binding.action == .new_tab);
+        try testing.expectEqual(@as(?[]const u8, null), binding.action.new_tab.working_directory);
+    }
+}
+
+test "parse: mark/clear/pull split actions" {
+    const testing = std.testing;
+
+    {
+        const binding = try parseSingle("a=mark_split");
+        try testing.expect(binding.action == .mark_split);
+    }
+    {
+        const binding = try parseSingle("a=clear_split_mark");
+        try testing.expect(binding.action == .clear_split_mark);
+    }
+    {
+        const binding = try parseSingle("a=pull_marked_split:right");
+        try testing.expect(binding.action == .pull_marked_split);
+        try testing.expectEqual(
+            Action.SplitDirection.right,
+            binding.action.pull_marked_split,
+        );
+    }
+    {
+        // `auto` is the default for SplitDirection; bare form should work.
+        const binding = try parseSingle("a=pull_marked_split");
+        try testing.expect(binding.action == .pull_marked_split);
+        try testing.expectEqual(
+            Action.SplitDirection.auto,
+            binding.action.pull_marked_split,
+        );
+    }
+}
+
+test "format: new_tab round-trips bare and with value" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Bare new_tab formats without a colon (matches the old void-form
+    // output, so existing configs keep their format).
+    {
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        defer buf.deinit();
+        const a: Action = .{ .new_tab = .{} };
+        try a.format(&buf.writer);
+        try testing.expectEqualStrings("new_tab", buf.written());
+    }
+
+    // With a working directory.
+    {
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        defer buf.deinit();
+        const a: Action = .{ .new_tab = .{ .working_directory = "~/git/foo" } };
+        try a.format(&buf.writer);
+        try testing.expectEqualStrings("new_tab:~/git/foo", buf.written());
+    }
+}
+
 test "parse: action with enum with default" {
     const testing = std.testing;
 
@@ -3501,7 +3668,7 @@ test "parse: chain" {
     {
         var p = try Parser.init("chain=new_tab");
         try testing.expectEqual(Parser.Elem{
-            .chain = .new_tab,
+            .chain = .{ .new_tab = .{} },
         }, try p.next());
         try testing.expect(try p.next() == null);
     }
@@ -4177,7 +4344,7 @@ test "set: overriding a mapping updates reverse" {
     }
 
     // should be most recent
-    try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_tab = {} });
+    try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_tab = .{} });
     {
         const trigger = s.getTrigger(.{ .new_window = {} });
         try testing.expect(trigger == null);
@@ -4701,7 +4868,7 @@ test "set: appendChain with no parent returns error" {
     var s: Set = .{};
     defer s.deinit(alloc);
 
-    try testing.expectError(error.NoChainParent, s.appendChain(alloc, .{ .new_tab = {} }));
+    try testing.expectError(error.NoChainParent, s.appendChain(alloc, .{ .new_tab = .{} }));
 }
 
 test "set: appendChain after put converts to leaf_chained" {
@@ -4714,7 +4881,7 @@ test "set: appendChain after put converts to leaf_chained" {
     try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_window = {} });
 
     // First appendChain converts leaf to leaf_chained and appends the new action
-    try s.appendChain(alloc, .{ .new_tab = {} });
+    try s.appendChain(alloc, .{ .new_tab = .{} });
 
     const entry = s.get(.{ .key = .{ .unicode = 'a' } }).?;
     try testing.expect(entry.value_ptr.* == .leaf_chained);
@@ -4738,7 +4905,7 @@ test "set: appendChain after putFlags preserves flags" {
         .{ .new_window = {} },
         .{ .consumed = false },
     );
-    try s.appendChain(alloc, .{ .new_tab = {} });
+    try s.appendChain(alloc, .{ .new_tab = .{} });
 
     const entry = s.get(.{ .key = .{ .unicode = 'a' } }).?;
     try testing.expect(entry.value_ptr.* == .leaf_chained);
@@ -4758,7 +4925,7 @@ test "set: appendChain multiple times" {
     defer s.deinit(alloc);
 
     try s.put(alloc, .{ .key = .{ .unicode = 'a' } }, .{ .new_window = {} });
-    try s.appendChain(alloc, .{ .new_tab = {} });
+    try s.appendChain(alloc, .{ .new_tab = .{} });
     try s.appendChain(alloc, .{ .close_surface = {} });
 
     const entry = s.get(.{ .key = .{ .unicode = 'a' } }).?;
@@ -4784,7 +4951,7 @@ test "set: appendChain removes reverse mapping" {
     try testing.expect(s.getTrigger(.{ .new_window = {} }) != null);
 
     // Chaining should remove the reverse mapping
-    try s.appendChain(alloc, .{ .new_tab = {} });
+    try s.appendChain(alloc, .{ .new_tab = .{} });
 
     // Reverse mapping should be gone since chained actions are not in reverse map
     try testing.expect(s.getTrigger(.{ .new_window = {} }) == null);
@@ -4813,7 +4980,7 @@ test "set: appendChain with performable does not affect reverse mapping" {
     try testing.expect(s.getTrigger(.{ .close_surface = {} }) == null);
 
     // Chaining the performable binding should not crash or affect anything
-    try s.appendChain(alloc, .{ .new_tab = {} });
+    try s.appendChain(alloc, .{ .new_tab = .{} });
 
     // The non-performable new_window binding should still be in reverse map
     try testing.expect(s.getTrigger(.{ .new_window = {} }) != null);
@@ -4837,7 +5004,7 @@ test "set: appendChain restores next valid reverse mapping" {
     }
 
     // Chain an action to 'b', which should restore 'a' in the reverse map
-    try s.appendChain(alloc, .{ .new_tab = {} });
+    try s.appendChain(alloc, .{ .new_tab = .{} });
 
     // Now reverse mapping should point to 'a'
     {

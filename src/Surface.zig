@@ -5235,11 +5235,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
-        .new_tab => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_tab,
-            {},
-        ),
+        .new_tab => |v| {
+            // Duplicate to a null-terminated string for the C ABI.
+            const wd: ?[:0]const u8 = if (v.working_directory) |raw|
+                try self.alloc.dupeZ(u8, raw)
+            else
+                null;
+            defer if (wd) |s| self.alloc.free(s);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                .{ .working_directory = wd },
+            );
+        },
 
         .close_tab => |v| return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5361,6 +5369,33 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .merge_tabs,
             switch (value) {
                 inline else => |tag| @field(apprt.action.MergeTabs, @tagName(tag)),
+            },
+        ),
+
+        .mark_split => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .mark_split,
+            {},
+        ),
+
+        .clear_split_mark => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .clear_split_mark,
+            {},
+        ),
+
+        .pull_marked_split => |direction| return try self.rt_app.performAction(
+            .{ .surface = self },
+            .pull_marked_split,
+            switch (direction) {
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
+                .auto => if (self.size.screen.width > self.size.screen.height)
+                    .right
+                else
+                    .down,
             },
         ),
 

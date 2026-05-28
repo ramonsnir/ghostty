@@ -414,7 +414,7 @@ fn actionCommands(action: Action.Key) []const Command {
         }},
 
         .new_tab => comptime &.{.{
-            .action = .new_tab,
+            .action = .{ .new_tab = .{} },
             .title = "New Tab",
             .description = "Open a new tab.",
         }},
@@ -589,6 +589,41 @@ fn actionCommands(action: Action.Key) []const Command {
                 .action = .{ .merge_tabs = .previous_vertical },
                 .title = "Merge Previous Tab: Up/Down",
                 .description = "Combine the previous tab into this one, stacked up and down.",
+            },
+        },
+
+        .mark_split => comptime &.{.{
+            .action = .mark_split,
+            .title = "Toggle Split Mark",
+            .description = "Mark the focused split (or unmark it if already marked). A later Pull Marked Split moves it here.",
+        }},
+
+        .clear_split_mark => comptime &.{.{
+            .action = .clear_split_mark,
+            .title = "Clear Split Mark",
+            .description = "Clear the marked split, if any.",
+        }},
+
+        .pull_marked_split => comptime &.{
+            .{
+                .action = .{ .pull_marked_split = .right },
+                .title = "Pull Marked Split: Right",
+                .description = "Pull the marked split into this tab to the right of the focused pane.",
+            },
+            .{
+                .action = .{ .pull_marked_split = .down },
+                .title = "Pull Marked Split: Down",
+                .description = "Pull the marked split into this tab below the focused pane.",
+            },
+            .{
+                .action = .{ .pull_marked_split = .left },
+                .title = "Pull Marked Split: Left",
+                .description = "Pull the marked split into this tab to the left of the focused pane.",
+            },
+            .{
+                .action = .{ .pull_marked_split = .up },
+                .title = "Pull Marked Split: Up",
+                .description = "Pull the marked split into this tab above the focused pane.",
             },
         },
 

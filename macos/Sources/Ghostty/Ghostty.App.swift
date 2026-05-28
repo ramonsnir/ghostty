@@ -21,6 +21,11 @@ extension Ghostty {
         /// Optional delegate
         weak var delegate: GhosttyAppDelegate?
 
+        /// The currently marked surface — set by the `mark_split` action and pulled
+        /// into another tab by `pull_marked_split`. App-wide single mark; auto-clears
+        /// when the underlying view is deallocated (weak reference).
+        weak var markedSurface: SurfaceView?
+
         /// The readiness value of the state.
         @Published var readiness: Readiness = .loading
 
@@ -498,7 +503,7 @@ extension Ghostty {
                 newWindow(app, target: target)
 
             case GHOSTTY_ACTION_NEW_TAB:
-                newTab(app, target: target)
+                newTab(app, target: target, params: action.action.new_tab)
 
             case GHOSTTY_ACTION_NEW_SPLIT:
                 newSplit(app, target: target, direction: action.action.new_split)
@@ -544,6 +549,15 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_MERGE_TABS:
                 return mergeTabs(app, target: target, mode: action.action.merge_tabs)
+
+            case GHOSTTY_ACTION_MARK_SPLIT:
+                return markSplit(app, target: target)
+
+            case GHOSTTY_ACTION_CLEAR_SPLIT_MARK:
+                return clearSplitMark(app, target: target)
+
+            case GHOSTTY_ACTION_PULL_MARKED_SPLIT:
+                return pullMarkedSplit(app, target: target, direction: action.action.pull_marked_split)
 
             case GHOSTTY_ACTION_INSPECTOR:
                 controlInspector(app, target: target, mode: action.action.inspector)
@@ -824,13 +838,30 @@ extension Ghostty {
             }
         }
 
-        private static func newTab(_ app: ghostty_app_t, target: ghostty_target_s) {
+        private static func newTab(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            params: ghostty_action_new_tab_s
+        ) {
+            // Optional working_directory override from the keybind action.
+            // A leading "~" is expanded here so users can write
+            // `keybind = ctrl+a>g=new_tab:~/git/foo`.
+            let overrideCwd: String? = params.working_directory.map {
+                (String(cString: $0) as NSString).expandingTildeInPath
+            }
+
             switch target.tag {
             case GHOSTTY_TARGET_APP:
+                var userInfo: [AnyHashable: Any] = [:]
+                if let cwd = overrideCwd {
+                    var config = SurfaceConfiguration()
+                    config.workingDirectory = cwd
+                    userInfo[Notification.NewSurfaceConfigKey] = config
+                }
                 NotificationCenter.default.post(
                     name: Notification.ghosttyNewTab,
                     object: nil,
-                    userInfo: [:]
+                    userInfo: userInfo
                 )
 
             case GHOSTTY_TARGET_SURFACE:
@@ -847,11 +878,16 @@ extension Ghostty {
                     return
                 }
 
+                var config = SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB))
+                if let cwd = overrideCwd {
+                    config.workingDirectory = cwd
+                }
+
                 NotificationCenter.default.post(
                     name: Notification.ghosttyNewTab,
                     object: surfaceView,
                     userInfo: [
-                        Notification.NewSurfaceConfigKey: SurfaceConfiguration(from: ghostty_surface_inherited_config(surface, GHOSTTY_SURFACE_CONTEXT_TAB)),
+                        Notification.NewSurfaceConfigKey: config,
                     ]
                 )
 
@@ -1447,6 +1483,72 @@ extension Ghostty {
                     name: Notification.didMergeTabs,
                     object: surfaceView,
                     userInfo: ["mergeTabs": mode])
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func markSplit(_ app: ghostty_app_t, target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let appState = self.appState(fromView: surfaceView) else { return false }
+
+                // Toggle: re-marking the already-marked pane clears the mark.
+                if appState.markedSurface === surfaceView {
+                    appState.markedSurface = nil
+                } else {
+                    appState.markedSurface = surfaceView
+                }
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func clearSplitMark(_ app: ghostty_app_t, target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let appState = self.appState(fromView: surfaceView) else { return false }
+                appState.markedSurface = nil
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func pullMarkedSplit(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            direction: ghostty_action_split_direction_e) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+
+                NotificationCenter.default.post(
+                    name: Notification.didPullMarkedSplit,
+                    object: surfaceView,
+                    userInfo: ["direction": direction])
                 return true
 
             default:

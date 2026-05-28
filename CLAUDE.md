@@ -10,10 +10,19 @@ All act on the focused surface. flip/toggle walk **up** to the nearest enclosing
 split of the given orientation (like `resize_split`), so outer splits are
 reachable from nested panes. The split tree is strictly binary.
 
+**Keybind authoring note (upstream, not fork-specific):** trigger keys in
+sequences are case-insensitive — `ctrl+a>q` and `ctrl+a>Q` resolve to the
+same trigger, with the second binding silently clobbering the first. To bind
+a shift-modified key, write the modifier explicitly: `ctrl+a>shift+q=…`.
+Tripped over this during the mark/pull smoke test; safe rule of thumb: never
+rely on letter case alone to disambiguate two bindings at the same prefix.
+
 - `flip_split:horizontal|vertical` — mirror the nearest left/right or up/down split (swap its two sides; divider stays put).
 - `toggle_split_direction:horizontal|vertical` — re-orient the nearest split of that orientation (L/R ⇄ U/D).
 - `move_split_to_new_tab` — eject the focused pane into its own new tab.
 - `merge_tabs:{next,previous}_{horizontal,vertical}` — merge a neighboring tab into this one with a split.
+- `new_tab[:<dir>]` — extends upstream `new_tab` with an optional working directory (e.g. `new_tab:~/git/ghostty`); `~/` is expanded by the apprt. Bare `new_tab` keeps the existing inherit-from-source behavior. The format roundtrips: actions equal to their type's `default` decl serialize without the `:value` suffix (also affects `new_split`, `close_tab`, etc., which already accepted a bare form on parse).
+- `mark_split` / `clear_split_mark` / `pull_marked_split:<right\|down\|left\|up\|auto>` — tmux-style `select-pane -m` / `select-pane -M` / `join-pane`. `mark_split` **toggles** (re-marking the marked pane clears it), so a single binding can both set and unset; the explicit `clear_split_mark` is still useful as a "clear from anywhere" command-palette entry. The mark is a single app-wide weak reference on `Ghostty.App`; if the marked pane is closed externally it silently goes away. `pull_marked_split` moves the marked pane into the focused tab next to the focused pane in the requested direction, works cross-tab and cross-window, and closes the source tab if it becomes empty.
 
 Wiring — core: `src/input/Binding.zig`, `src/apprt/action.zig` (+`include/ghostty.h`),
 `src/Surface.zig`, `src/input/command.zig`. macOS: `SplitTree.swift` (pure transforms),
@@ -51,7 +60,21 @@ this macOS); `nushell` for `build.nu`.
 ## ⚠️ Safety
 NEVER run `osascript -e 'quit app "Ghostty"'` — the fork and the official build are
 both *named* "Ghostty", so it's ambiguous and can quit the user's real, working
-Ghostty (which may host your shell). To restart the fork, target it precisely:
-`osascript -e 'tell application id "com.mitchellh.ghostty-ramon" to quit'`, or kill
-the PID whose path is under `macos/build/`. Prefer letting the user quit/relaunch
-while they're working live.
+Ghostty.
+
+**Also never quit the installed Release fork (`com.mitchellh.ghostty-ramon`) — it
+normally hosts the shell Claude Code is running in, so quitting it (even by
+bundle id) terminates this session mid-task.** The three identities exist
+specifically so iteration doesn't touch the host:
+
+| Identity | Bundle id | Path | Safe to quit/launch? |
+|---|---|---|---|
+| Release (installed) | `com.mitchellh.ghostty-ramon` | `/Applications/Ghostty (ramon).app` | **No** — usually hosts this session |
+| ReleaseLocal | `com.mitchellh.ghostty-ramon.local` | `macos/build/ReleaseLocal/Ghostty.app` | Yes |
+| Debug | `com.mitchellh.ghostty-ramon.debug` | `macos/build/Debug/Ghostty.app` | Yes |
+
+To restart the dev fork, target precisely:
+`osascript -e 'tell application id "com.mitchellh.ghostty-ramon.local" to quit'`
+(or `.debug`), or kill the PID whose path is under `macos/build/`. For the
+installed Release, **prepare the install (`ditto` + plist rewrite + re-sign) and
+ask the user to quit and relaunch it themselves**.
