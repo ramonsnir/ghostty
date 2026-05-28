@@ -47,11 +47,15 @@ this macOS); `nushell` for `build.nu`.
 3. **Rebuild lib** (required after any Zig change before the app build): `zig build -Demit-macos-app=false -Doptimize=ReleaseFast`.
 4. **Swift tests**: `macos/build.nu --action test` (or `xcodebuild … -only-testing:GhosttyTests/SplitTreeTests test`).
 5. **Build the app**: `macos/build.nu --configuration ReleaseLocal --action build` → `macos/build/ReleaseLocal/Ghostty.app` (optimized, no debug banner). This produces "Ghostty (ramon-local)" with bundle id `com.mitchellh.ghostty-ramon.local` — runs side-by-side with the installed Release identity.
-6. **Install/update the fork**: `ditto macos/build/ReleaseLocal/Ghostty.app "/Applications/Ghostty (ramon).app"`, then rewrite the bundle id / display name to the Release identity and re-ad-hoc-sign so the installed app keeps `com.mitchellh.ghostty-ramon`:
+6. **Install/update the fork** over `/Applications/Ghostty (ramon).app`. Verified to be safe to run while the installed Release fork is still hosting Claude Code's shell — `ditto` and `PlistBuddy` don't disturb the running mmap'd binary, and `codesign` succeeds after stripping Apple's `com.apple.provenance` xattrs. The new binary only takes effect on the next launch, so the user still has to quit + relaunch themselves.
+
+   **Always ask the user to confirm before running this block — it overwrites the running host app.** The block:
    ```sh
    APP="/Applications/Ghostty (ramon).app"
+   ditto macos/build/ReleaseLocal/Ghostty.app "$APP"
    /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.mitchellh.ghostty-ramon' "$APP/Contents/Info.plist"
    /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Ghostty (ramon)' "$APP/Contents/Info.plist"
+   xattr -cr "$APP"                          # codesign rejects provenance xattrs
    codesign --force --deep --sign - "$APP"
    ```
    Never touch `/Applications/Ghostty.app`.
@@ -76,5 +80,8 @@ specifically so iteration doesn't touch the host:
 To restart the dev fork, target precisely:
 `osascript -e 'tell application id "com.mitchellh.ghostty-ramon.local" to quit'`
 (or `.debug`), or kill the PID whose path is under `macos/build/`. For the
-installed Release, **prepare the install (`ditto` + plist rewrite + re-sign) and
-ask the user to quit and relaunch it themselves**.
+installed Release, the install block in step 6 of the iteration lifecycle is
+safe to run while the host is live (ditto/plist/codesign don't disturb the
+running binary), but **always ask the user to confirm** before running it, and
+let them quit + relaunch the installed Release themselves to pick up the new
+binary.
