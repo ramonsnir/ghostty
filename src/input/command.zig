@@ -627,6 +627,39 @@ fn actionCommands(action: Action.Key) []const Command {
             },
         },
 
+        .swap_split => comptime &.{
+            .{
+                .action = .{ .swap_split = .previous },
+                .title = "Swap Split: Previous",
+                .description = "Swap the focused pane with the previous pane in tree order.",
+            },
+            .{
+                .action = .{ .swap_split = .next },
+                .title = "Swap Split: Next",
+                .description = "Swap the focused pane with the next pane in tree order.",
+            },
+            .{
+                .action = .{ .swap_split = .left },
+                .title = "Swap Split: Left",
+                .description = "Swap the focused pane with the pane to its left.",
+            },
+            .{
+                .action = .{ .swap_split = .right },
+                .title = "Swap Split: Right",
+                .description = "Swap the focused pane with the pane to its right.",
+            },
+            .{
+                .action = .{ .swap_split = .up },
+                .title = "Swap Split: Up",
+                .description = "Swap the focused pane with the pane above it.",
+            },
+            .{
+                .action = .{ .swap_split = .down },
+                .title = "Swap Split: Down",
+                .description = "Swap the focused pane with the pane below it.",
+            },
+        },
+
         .reset_window_size => comptime &.{.{
             .action = .reset_window_size,
             .title = "Reset Window Size",

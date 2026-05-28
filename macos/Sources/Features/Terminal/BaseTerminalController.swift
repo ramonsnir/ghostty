@@ -225,6 +225,11 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyDidSwapSplit(_:)),
+            name: Ghostty.Notification.didSwapSplit,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(ghosttyDidPresentTerminal(_:)),
             name: Ghostty.Notification.ghosttyPresentTerminal,
             object: nil)
@@ -956,6 +961,32 @@ class BaseTerminalController: NSWindowController,
 
         // Mark is consumed by a successful pull.
         ghostty.markedSurface = nil
+    }
+
+    @objc private func ghosttyDidSwapSplit(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(target) else { return }
+        guard let directionAny = notification.userInfo?["direction"] else { return }
+        guard let direction = directionAny as? Ghostty.SplitFocusDirection else { return }
+
+        let newTree: SplitTree<Ghostty.SurfaceView>
+        do {
+            newTree = try surfaceTree.swappingLeaf(
+                of: target,
+                with: direction.toSplitTreeFocusDirection())
+        } catch {
+            // No swap target (single pane or spatial dead end); nothing to do.
+            return
+        }
+
+        replaceSurfaceTree(newTree, undoAction: "Swap Split")
+
+        // Structural changes can drop the first responder, so reassert focus
+        // on the originating surface — the pane moved but the user is still
+        // "looking at" the same content.
+        DispatchQueue.main.async {
+            Ghostty.moveFocus(to: target)
+        }
     }
 
     // MARK: Local Events

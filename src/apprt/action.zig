@@ -371,6 +371,10 @@ pub const Action = union(Key) {
     /// the target, in the given direction.
     pull_marked_split: SplitDirection,
 
+    /// Swap the focused pane in the target surface's tab with another pane in
+    /// the same tab, selected by direction.
+    swap_split: GotoSplit,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -445,6 +449,7 @@ pub const Action = union(Key) {
         mark_split,
         clear_split_mark,
         pull_marked_split,
+        swap_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

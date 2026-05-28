@@ -559,6 +559,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_PULL_MARKED_SPLIT:
                 return pullMarkedSplit(app, target: target, direction: action.action.pull_marked_split)
 
+            case GHOSTTY_ACTION_SWAP_SPLIT:
+                return swapSplit(app, target: target, direction: action.action.swap_split)
+
             case GHOSTTY_ACTION_INSPECTOR:
                 controlInspector(app, target: target, mode: action.action.inspector)
 
@@ -1549,6 +1552,36 @@ extension Ghostty {
                     name: Notification.didPullMarkedSplit,
                     object: surfaceView,
                     userInfo: ["direction": direction])
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        private static func swapSplit(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            direction: ghostty_action_goto_split_e) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let controller = surfaceView.window?.windowController as? BaseTerminalController else { return false }
+
+                // Single-pane tabs have nothing to swap.
+                guard controller.surfaceTree.isSplit else { return false }
+
+                guard let splitDirection = SplitFocusDirection.from(direction: direction) else { return false }
+
+                NotificationCenter.default.post(
+                    name: Notification.didSwapSplit,
+                    object: surfaceView,
+                    userInfo: ["direction": splitDirection])
                 return true
 
             default:
