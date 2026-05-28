@@ -704,13 +704,17 @@ extension Ghostty {
                 return presentTerminal(app, target: target)
 
             case GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW:
-                fallthrough
-            case GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS:
-                fallthrough
-            case GHOSTTY_ACTION_SIZE_LIMIT:
-                fallthrough
-            case GHOSTTY_ACTION_QUIT_TIMER:
-                fallthrough
+                return toggleTabOverview(app, target: target)
+
+            case GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS,
+                 GHOSTTY_ACTION_SIZE_LIMIT,
+                 GHOSTTY_ACTION_QUIT_TIMER:
+                // No-op on macOS — Linux/GTK-only actions. Previously these
+                // accidentally fell through into showChildExited because of a
+                // 4-way `fallthrough` chain, dispatching it with a garbage
+                // payload. Returning false marks them as not performable.
+                return false
+
             case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
                 return showChildExited(app, target: target, v: action.action.child_exited)
             case GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD:
@@ -1110,6 +1114,35 @@ extension Ghostty {
         ) {
             guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return }
             appDelegate.toggleVisibility(self)
+        }
+
+        private static func toggleTabOverview(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s
+        ) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                guard let window = surfaceView.window else { return false }
+
+                // toggleTabOverview only does anything visible when the window
+                // belongs to a tab group with ≥ 2 tabs. Bail (and return not
+                // performable) otherwise so the keybind can fall through.
+                guard let tabGroup = window.tabGroup, tabGroup.windows.count > 1 else {
+                    return false
+                }
+
+                window.toggleTabOverview(nil)
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
         }
 
         private static func ringBell(
