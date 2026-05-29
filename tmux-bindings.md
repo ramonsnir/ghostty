@@ -111,11 +111,20 @@ Split into two sub-features after debate:
   `new_tab` now accepts an optional `working_directory`:
   `keybind = ctrl+a>g=new_tab:~/git/ghostty`. `~/` is expanded apprt-side.
   Covers the everyday case of opening the same handful of projects.
-- **G3a — generic prompted launcher** (tmux `bind h command-prompt`) —
-  postponed. Would need (1) a generic prompt-with-substitution action,
-  (2) optional tab-completion against a configured base dir, on top of
-  the `working_directory` parameter we already have. Big scope for a
-  feature that may not pull its weight once G3b is in everyday use.
+- **G3a — generic dynamic launcher** (tmux `bind h command-prompt` /
+  tmux-sessionizer) — ✅ shipped. Rather than a free-text prompt, it landed
+  as a **dynamic project selector**: `ctrl+a>f=toggle_project_selector`
+  opens a fuzzy palette built at open-time from a fork-only
+  `project-directory` config key. Each `project-directory` entry is a BASE
+  dir whose immediate subdirectories become the offered projects (deduped
+  across bases, sorted, hidden dirs skipped, `~/` expanded). Picking one
+  opens it in a new tab via the existing `new_tab` path (the project tab
+  starts from app defaults in the chosen dir, not inheriting the source
+  tab's context). Empty/misconfigured state shows an informational row +
+  logs a warning, so the toggle is never a silent no-op. This complements
+  G3b: G3b's one-key binds cover the fixed handful of everyday projects;
+  G3a's selector covers "everything under `~/git`" without a bind per repo.
+  See CLAUDE.md "Functional changes" for the full wiring.
 
 ### G4. No "mark + join" for splits (tmux `prefix q/Q` + `j`) — ✅ shipped (with G1)
 
@@ -282,6 +291,13 @@ keybind = ctrl+a>g=new_tab:~/git/ghostty
 keybind = ctrl+a>shift+n=new_tab:~/git/NoetiveOS
 keybind = ctrl+a>i=new_tab:~/git/nil
 
+# G3a — dynamic project selector (tmux-sessionizer). `project-directory` lists
+# BASE dirs; each base's immediate subdirs become the fuzzy-palette options.
+# Repeatable, so list as many bases as you like.
+project-directory = ~/git
+project-directory = ~/work
+keybind = ctrl+a>f=toggle_project_selector
+
 # Swap (tmux swap-pane).
 keybind = ctrl+a>shift+{=swap_split:previous
 keybind = ctrl+a>shift+}=swap_split:next
@@ -297,8 +313,6 @@ Until then, the current config uses static `shift+H/J/K/L` for
 re-arm.
 
 Postponed / dropped:
-- **G3a** (prompted launcher) — needs a generic prompt-with-substitution
-  action; revisit if G3b's one-key shortcuts don't cover the workflow.
 - **G2** (broadcast input) — dropped, unused in years.
 - **G5** (repeatable bindings) — 🚧 next iteration. See section above.
 - **G6** (sessions) — out of scope.

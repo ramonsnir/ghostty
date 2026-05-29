@@ -911,6 +911,11 @@ pub const Action = union(enum) {
     /// version can be found by running `ghostty +version`.
     toggle_command_palette,
 
+    /// (ramon fork) Toggle the project selector: a fuzzy palette of project
+    /// directories (the immediate subdirectories of each `project-directory`
+    /// base) that opens the chosen one in a new tab. Payload-less.
+    toggle_project_selector,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1561,6 +1566,7 @@ pub const Action = union(enum) {
             .toggle_secure_input,
             .toggle_mouse_reporting,
             .toggle_command_palette,
+            .toggle_project_selector,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,
@@ -3687,6 +3693,21 @@ test "parse: swap_split action" {
             binding.action.swap_split,
         );
     }
+}
+
+test "Binding toggle_project_selector" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=toggle_project_selector");
+    try testing.expect(binding.action == .toggle_project_selector);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("toggle_project_selector", buf.written());
 }
 
 test "format: new_tab round-trips bare and with value" {

@@ -515,6 +515,12 @@ typedef struct {
   size_t len;
 } ghostty_config_command_list_s;
 
+// config.RepeatableString
+typedef struct {
+  const char* const* items;
+  uintptr_t len;
+} ghostty_config_string_list_s;
+
 // config.Palette
 typedef struct {
   ghostty_config_color_s colors[256];
@@ -979,6 +985,7 @@ typedef enum {
   GHOSTTY_ACTION_CLEAR_SPLIT_MARK,
   GHOSTTY_ACTION_PULL_MARKED_SPLIT,
   GHOSTTY_ACTION_SWAP_SPLIT,
+  GHOSTTY_ACTION_TOGGLE_PROJECT_SELECTOR,
 } ghostty_action_tag_e;
 
 typedef union {

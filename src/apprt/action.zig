@@ -375,6 +375,9 @@ pub const Action = union(Key) {
     /// the same tab, selected by direction.
     swap_split: GotoSplit,
 
+    /// (ramon fork) Toggle the project selector palette for the target surface.
+    toggle_project_selector,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -450,6 +453,7 @@ pub const Action = union(Key) {
         clear_split_mark,
         pull_marked_split,
         swap_split,
+        toggle_project_selector,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

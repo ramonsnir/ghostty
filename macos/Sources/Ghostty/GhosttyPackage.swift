@@ -365,6 +365,9 @@ extension Notification.Name {
     static let ReadonlyKey = ghosttyDidChangeReadonly.rawValue + ".readonly"
     static let ghosttyCommandPaletteDidToggle = Notification.Name("com.mitchellh.ghostty.commandPaletteDidToggle")
 
+    /// (ramon fork) Toggle the project selector palette
+    static let ghosttyProjectSelectorDidToggle = Notification.Name("com.mitchellh.ghostty.projectSelectorDidToggle")
+
     /// Toggle maximize of current window
     static let ghosttyMaximizeDidToggle = Notification.Name("com.mitchellh.ghostty.maximizeDidToggle")
 
