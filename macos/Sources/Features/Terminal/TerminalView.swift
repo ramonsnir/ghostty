@@ -33,6 +33,9 @@ protocol TerminalViewModel: ObservableObject {
     /// The command palette state.
     var commandPaletteIsShowing: Bool { get set }
 
+    /// (ramon fork) The project selector palette state.
+    var projectSelectorIsShowing: Bool { get set }
+
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
 }
@@ -115,6 +118,13 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         updateViewModel: (NSApp.delegate as? AppDelegate)?.updateViewModel) { action in
                         self.delegate?.performAction(action, on: surfaceView)
                     }
+
+                    ProjectPaletteView(
+                        surfaceView: surfaceView,
+                        isPresented: $viewModel.projectSelectorIsShowing,
+                        ghosttyConfig: ghostty.config,
+                        projectDirectories: ghostty.config.projectDirectories
+                    )
                 }
 
                 // Show update information above all else.

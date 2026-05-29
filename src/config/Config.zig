@@ -2900,6 +2900,13 @@ keybind: Keybinds = .{},
 /// Available since: 1.2.0
 @"command-palette-entry": RepeatableCommand = .{},
 
+/// (ramon fork) Base directories scanned by the `toggle_project_selector`
+/// action. Each entry is a BASE directory whose immediate subdirectories are
+/// offered as projects in the project selector palette. Repeatable; `~/` is
+/// expanded by the macOS apprt. This is a fork-only key, so keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
+@"project-directory": RepeatableString = .{},
+
 /// Sets the reporting format for OSC sequences that request color information.
 /// Ghostty currently supports OSC 10 (foreground), OSC 11 (background), and
 /// OSC 4 (256 color palette) queries, and by default the reported values
@@ -6007,10 +6014,29 @@ pub const RepeatableString = struct {
     // Allocator for the list is the arena for the parent config.
     list: std.ArrayListUnmanaged([:0]const u8) = .{},
 
+    // Parallel array of sentinel-terminated pointers into `list`'s strings,
+    // used only to hand a stable C view across `ghostty_config_get`. This is
+    // a PURE VIEW: it owns the pointer array only, never the string bytes, so
+    // it must never free its elements (they alias `list`'s entries).
+    list_c: std.ArrayListUnmanaged([*:0]const u8) = .{},
+
     // If true, then the next value will clear the list and start over
     // rather than append. This is a bit of a hack but is here to make
     // the font-family set of configurations work with CLI parsing.
     overwrite_next: bool = false,
+
+    /// C representation of the string list. Mirrors RepeatableCommand.C.
+    pub const C = extern struct {
+        items: [*]const [*:0]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: *const Self) C {
+        return .{
+            .items = self.list_c.items.ptr,
+            .len = self.list_c.items.len,
+        };
+    }
 
     pub fn parseCLI(self: *Self, alloc: Allocator, input: ?[]const u8) !void {
         const value = input orelse return error.ValueRequired;
@@ -6018,17 +6044,20 @@ pub const RepeatableString = struct {
         // Empty value resets the list
         if (value.len == 0) {
             self.list.clearRetainingCapacity();
+            self.list_c.clearRetainingCapacity();
             return;
         }
 
         // If we're overwriting then we clear before appending
         if (self.overwrite_next) {
             self.list.clearRetainingCapacity();
+            self.list_c.clearRetainingCapacity();
             self.overwrite_next = false;
         }
 
         const copy = try alloc.dupeZ(u8, value);
         try self.list.append(alloc, copy);
+        try self.list_c.append(alloc, copy.ptr);
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -6047,7 +6076,15 @@ pub const RepeatableString = struct {
             list.appendAssumeCapacity(copy);
         }
 
-        return .{ .list = list };
+        // Rebuild the C view from the clone's own strings (deliberately diverges
+        // from RepeatableCommand.clone, which aliases the source's C pointers).
+        var list_c = try std.ArrayListUnmanaged([*:0]const u8).initCapacity(
+            alloc,
+            list.items.len,
+        );
+        for (list.items) |item| list_c.appendAssumeCapacity(item.ptr);
+
+        return .{ .list = list, .list_c = list_c };
     }
 
     /// The number of items in the list
@@ -6150,6 +6187,74 @@ pub const RepeatableString = struct {
         try list.parseCLI(alloc, "B");
         try list.formatEntry(formatterpkg.entryFormatter("a", &buf.writer));
         try std.testing.expectEqualSlices(u8, "a = A\na = B\n", buf.written());
+    }
+
+    test "RepeatableString cval" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "A");
+        try list.parseCLI(alloc, "B");
+
+        try testing.expectEqual(@as(usize, 2), list.list.items.len);
+        try testing.expectEqual(@as(usize, 2), list.list_c.items.len);
+
+        const cv = list.cval();
+        try testing.expectEqual(@as(usize, 2), cv.len);
+        try testing.expectEqualStrings("A", std.mem.sliceTo(cv.items[0], 0));
+        try testing.expectEqualStrings("B", std.mem.sliceTo(cv.items[1], 0));
+    }
+
+    test "RepeatableString cval cleared" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "A");
+        try list.parseCLI(alloc, "");
+
+        try testing.expectEqual(@as(usize, 0), list.cval().len);
+    }
+
+    test "RepeatableString cval overwrite" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "A");
+        list.overwrite_next = true;
+        try list.parseCLI(alloc, "B");
+
+        const cv = list.cval();
+        try testing.expectEqual(@as(usize, 1), cv.len);
+        try testing.expectEqualStrings("B", std.mem.sliceTo(cv.items[0], 0));
+    }
+
+    test "RepeatableString cval after clone" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var list: Self = .{};
+        try list.parseCLI(alloc, "A");
+        try list.parseCLI(alloc, "B");
+
+        const cloned = try list.clone(alloc);
+        try testing.expectEqual(@as(usize, 2), cloned.cval().len);
+        try testing.expectEqualStrings("A", std.mem.sliceTo(cloned.cval().items[0], 0));
+        try testing.expectEqualStrings("B", std.mem.sliceTo(cloned.cval().items[1], 0));
+
+        // The C view must alias the clone's own strings, not the source's.
+        try testing.expectEqual(cloned.list_c.items[0], cloned.list.items[0].ptr);
+        try testing.expectEqual(cloned.list_c.items[1], cloned.list.items[1].ptr);
     }
 };
 

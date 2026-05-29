@@ -577,6 +577,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_SWAP_SPLIT:
                 return swapSplit(app, target: target, direction: action.action.swap_split)
 
+            case GHOSTTY_ACTION_TOGGLE_PROJECT_SELECTOR:
+                toggleProjectSelector(app, target: target)
+
             case GHOSTTY_ACTION_INSPECTOR:
                 controlInspector(app, target: target, mode: action.action.inspector)
 
@@ -1086,6 +1089,28 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 NotificationCenter.default.post(
                     name: .ghosttyCommandPaletteDidToggle,
+                    object: surfaceView
+                )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        // (ramon fork) Toggle the project selector palette for the target surface.
+        private static func toggleProjectSelector(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("toggle project selector does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                NotificationCenter.default.post(
+                    name: .ghosttyProjectSelectorDidToggle,
                     object: surfaceView
                 )
 

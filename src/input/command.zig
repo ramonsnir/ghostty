@@ -569,6 +569,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Move the focused split out of its tab into a new tab.",
         }},
 
+        .toggle_project_selector => comptime &.{.{
+            .action = .toggle_project_selector,
+            .title = "Open Project…",
+            .description = "Open a project directory in a new tab.",
+        }},
+
         .merge_tabs => comptime &.{
             .{
                 .action = .{ .merge_tabs = .next_horizontal },

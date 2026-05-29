@@ -48,6 +48,9 @@ class BaseTerminalController: NSWindowController,
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 
+    /// (ramon fork) This can be set to show/hide the project selector palette.
+    @Published var projectSelectorIsShowing: Bool = false
+
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 
@@ -165,6 +168,11 @@ class BaseTerminalController: NSWindowController,
             self,
             selector: #selector(ghosttyCommandPaletteDidToggle(_:)),
             name: .ghosttyCommandPaletteDidToggle,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyProjectSelectorDidToggle(_:)),
+            name: .ghosttyProjectSelectorDidToggle,
             object: nil)
         center.addObserver(
             self,
@@ -667,6 +675,12 @@ class BaseTerminalController: NSWindowController,
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(surfaceView) else { return }
         toggleCommandPalette(nil)
+    }
+
+    @objc private func ghosttyProjectSelectorDidToggle(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(surfaceView) else { return }
+        toggleProjectSelector(nil)
     }
 
     @objc private func ghosttyMaximizeDidToggle(_ notification: Notification) {
@@ -1701,6 +1715,15 @@ class BaseTerminalController: NSWindowController,
             // Since `performKeyEquivalent(with:)` is called on all of the subviews
             // until one of the return `true` so the paste action is consumed by the surface
             // instead of the first responder (command palette).
+            _ = focusedSurface?.resignFirstResponder()
+        }
+    }
+
+    @IBAction func toggleProjectSelector(_ sender: Any?) {
+        projectSelectorIsShowing.toggle()
+        if projectSelectorIsShowing {
+            // Mirror toggleCommandPalette: resign the surface's first responder
+            // so the palette receives keyboard input rather than the surface.
             _ = focusedSurface?.resignFirstResponder()
         }
     }

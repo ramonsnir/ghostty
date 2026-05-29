@@ -740,6 +740,17 @@ extension Ghostty {
             return buffer.map { Ghostty.Command(cValue: $0) }
         }
 
+        // (ramon fork) Base directories scanned by the project selector.
+        var projectDirectories: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "project-directory"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
         var progressStyle: Bool {
             guard let config = self.config else { return true }
             var v = true
