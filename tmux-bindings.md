@@ -276,7 +276,7 @@ Pure config additions that depend on fork actions. Add to
 sees these unknown actions.
 
 ```ini
-# G1 + G4 — eject / mark / pull, mirroring tmux prefix !/q/Q/j.
+# G1 + G4 — eject / mark / pull, mirroring tmux prefix !/q/Q.
 # `mark_split` toggles, so re-pressing on the marked pane clears it.
 # `shift+q` is the explicit "clear from anywhere" chord (sequence triggers
 # are case-insensitive, so the uppercase form must be written as `shift+q`;
@@ -285,7 +285,10 @@ sees these unknown actions.
 keybind = ctrl+a>shift+!=move_split_to_new_tab
 keybind = ctrl+a>q=mark_split
 keybind = ctrl+a>shift+q=clear_split_mark
-keybind = ctrl+a>j=pull_marked_split:auto
+# Pull lives on `m` ("move marked here"), NOT `j`: `ctrl+a>j` is the vim-style
+# resize-down chord, and identical triggers silently clobber (the later
+# definition wins; the `repeatable:` flag is not part of trigger identity).
+keybind = ctrl+a>m=pull_marked_split:auto
 
 # G3b — one-key launchers for the projects under ~/git that are opened often.
 # Single letters where free; `shift+n` for NoetiveOS because `n` is next_tab.
