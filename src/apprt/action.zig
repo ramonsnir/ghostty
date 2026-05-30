@@ -378,6 +378,10 @@ pub const Action = union(Key) {
     /// (ramon fork) Toggle the project selector palette for the target surface.
     toggle_project_selector,
 
+    /// (ramon fork) Focus the previously focused surface, across any tab or
+    /// window. Two-deep toggle.
+    goto_last_surface,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -454,6 +458,7 @@ pub const Action = union(Key) {
         pull_marked_split,
         swap_split,
         toggle_project_selector,
+        goto_last_surface,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

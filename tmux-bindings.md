@@ -40,6 +40,7 @@ key tables for genuinely modal extensions later (see "Future").
 | pane            | **split**                             |
 | session         | — (no group-of-tabs container)        |
 | prefix (`C-a`)  | `ctrl+a>…` key sequence               |
+| `last-pane`     | `goto_last_surface` (fork) — but **global** across tabs+windows, not window-local |
 | copy mode       | — (selection exists, no modal motions)|
 
 ---
@@ -49,7 +50,8 @@ key tables for genuinely modal extensions later (see "Future").
 | Old tmux bind                         | Ghostty bind                                       |
 |---------------------------------------|----------------------------------------------------|
 | `prefix C-a`, `bind a send-prefix`    | `ctrl+a>a=text:\x01` (literal C-a to shell)        |
-| `bind C-a last-window`                | `ctrl+a>ctrl+a=last_tab`                           |
+| `bind C-a last-window`                | `ctrl+a>ctrl+a=last_tab`, or fork `goto_last_surface` (see below) |
+| tmux `last-pane` (last focused pane)  | `ctrl+a>ctrl+a=goto_last_surface` (fork) — **global** last-focused pane across tabs+windows |
 | `bind r source-file …`                | `ctrl+a>r=reload_config`                           |
 | `bind < rename-window`                | `ctrl+a><=prompt_tab_title` (popup vs status line) |
 | `bind '"' split-window` (vertical)    | `ctrl+a>-=new_split:down` (see "`"` key" caveat)   |
@@ -301,6 +303,16 @@ keybind = ctrl+a>f=toggle_project_selector
 # Swap (tmux swap-pane).
 keybind = ctrl+a>shift+{=swap_split:previous
 keybind = ctrl+a>shift+}=swap_split:next
+
+# Last-focused pane (tmux `last-pane`), but GLOBAL across tabs + windows.
+# Two-deep toggle: jump to the previously focused split, press again to return.
+# Repurposes the `ctrl+a>ctrl+a` chord the v0 block bound to `last_tab` — the
+# global pane-level analog is the more useful default; tabs are still reachable
+# via next/previous/goto_tab. The jumped-to pane gets a highlight flash, which
+# is especially handy for cross-window jumps. NOTE: this overrides the v0
+# `ctrl+a>ctrl+a=last_tab` above — the fork config loads after the shared
+# `~/.config/ghostty/config`, so the later binding for the same chord wins.
+keybind = ctrl+a>ctrl+a=goto_last_surface
 ```
 
 ## v2 — pending the repeater (G5)

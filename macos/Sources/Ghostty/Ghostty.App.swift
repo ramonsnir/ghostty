@@ -41,6 +41,28 @@ extension Ghostty {
             }
         }
 
+        /// (ramon fork) App-wide focus history for `goto_last_surface` (tmux
+        /// `last-pane`): a two-deep most-recently-used pair tracking the
+        /// currently focused surface and the one focused immediately before it,
+        /// across every tab and window. Both are plain weak refs (no observers):
+        /// pure bookkeeping that auto-drops surfaces when their views are freed.
+        ///
+        /// Distinct from the SwiftUI `lastFocusedSurface` env value in
+        /// `TerminalView.swift` — that is a per-view SwiftUI value, these are the
+        /// global app-wide refs that drive the action.
+        weak var globalCurrentSurface: SurfaceView?
+        weak var globalPreviousSurface: SurfaceView?
+
+        /// (ramon fork) Record that `surface` just gained focus, updating the
+        /// two-deep MRU pair above. Called from the AppKit focus path
+        /// (`SurfaceView.focusDidChange(true)`). Re-focusing the current surface
+        /// is a no-op so the toggle stays correct.
+        func recordFocusedSurface(_ surface: SurfaceView) {
+            guard globalCurrentSurface !== surface else { return }
+            globalPreviousSurface = globalCurrentSurface
+            globalCurrentSurface = surface
+        }
+
         /// The readiness value of the state.
         @Published var readiness: Readiness = .loading
 
@@ -479,7 +501,7 @@ extension Ghostty {
         }
 
         /// Returns the GhosttyState from the given userdata value.
-        static private func appState(fromView view: SurfaceView) -> App? {
+        static func appState(fromView view: SurfaceView) -> App? {
             guard let surface = view.surface else { return nil }
             guard let app = ghostty_surface_app(surface) else { return nil }
             guard let app_ud = ghostty_app_userdata(app) else { return nil }
@@ -579,6 +601,9 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_TOGGLE_PROJECT_SELECTOR:
                 toggleProjectSelector(app, target: target)
+
+            case GHOSTTY_ACTION_GOTO_LAST_SURFACE:
+                gotoLastSurface(app, target: target)
 
             case GHOSTTY_ACTION_INSPECTOR:
                 controlInspector(app, target: target, mode: action.action.inspector)
@@ -1112,6 +1137,45 @@ extension Ghostty {
                 NotificationCenter.default.post(
                     name: .ghosttyProjectSelectorDidToggle,
                     object: surfaceView
+                )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        /// (ramon fork) Focus the previously focused surface, across any tab or
+        /// window (tmux `last-pane`, global, two-deep toggle). Reads the
+        /// app-wide `globalPreviousSurface` synchronously and posts
+        /// `ghosttyPresentTerminal` to focus it; the focus landing then runs
+        /// `recordFocusedSurface` asynchronously, which swaps the two refs so a
+        /// second press returns to where you were. No-op if there is no previous
+        /// surface, or if it is the same as the current one.
+        private static func gotoLastSurface(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("goto last surface does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                guard let appState = self.appState(fromView: surfaceView) else { return }
+
+                guard let previous = appState.globalPreviousSurface else {
+                    Ghostty.logger.debug("goto_last_surface: no previous surface")
+                    return
+                }
+                guard previous !== appState.globalCurrentSurface else {
+                    Ghostty.logger.debug("goto_last_surface: previous === current, no-op")
+                    return
+                }
+
+                NotificationCenter.default.post(
+                    name: Notification.ghosttyPresentTerminal,
+                    object: previous
                 )
 
             default:

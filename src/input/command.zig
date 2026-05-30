@@ -575,6 +575,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Open a project directory in a new tab.",
         }},
 
+        .goto_last_surface => comptime &.{.{
+            .action = .goto_last_surface,
+            .title = "Go to Last Split",
+            .description = "Focus the previously focused split, across any tab or window.",
+        }},
+
         .merge_tabs => comptime &.{
             .{
                 .action = .{ .merge_tabs = .next_horizontal },

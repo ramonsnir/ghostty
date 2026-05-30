@@ -434,6 +434,12 @@ extension Ghostty {
                             withIdentifiers: Array(notificationIdentifiers))
                     self.notificationIdentifiers = []
                 }
+
+                // (ramon fork) Record this surface in the app-wide two-deep
+                // focus history that drives `goto_last_surface`.
+                if let appState = Ghostty.App.appState(fromView: self) {
+                    appState.recordFocusedSurface(self)
+                }
             }
         }
 
