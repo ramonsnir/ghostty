@@ -916,6 +916,11 @@ pub const Action = union(enum) {
     /// base) that opens the chosen one in a new tab. Payload-less.
     toggle_project_selector,
 
+    /// (ramon fork) Focus the previously focused surface, across any tab or
+    /// window (tmux `last-pane`, global). Two-deep toggle: pressing again
+    /// returns to where you were. Payload-less.
+    goto_last_surface,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1567,6 +1572,7 @@ pub const Action = union(enum) {
             .toggle_mouse_reporting,
             .toggle_command_palette,
             .toggle_project_selector,
+            .goto_last_surface,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,
@@ -3708,6 +3714,21 @@ test "Binding toggle_project_selector" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("toggle_project_selector", buf.written());
+}
+
+test "Binding goto_last_surface" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=goto_last_surface");
+    try testing.expect(binding.action == .goto_last_surface);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("goto_last_surface", buf.written());
 }
 
 test "format: new_tab round-trips bare and with value" {
