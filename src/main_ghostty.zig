@@ -204,6 +204,10 @@ test {
     _ = @import("unicode/props_uucode.zig");
     _ = @import("unicode/symbols_uucode.zig");
 
+    // ghostty-host (Phase 1). Pulled in so `-Dtest-filter=host` reaches the
+    // host tests (this test exe roots at src/main.zig -> main_ghostty.zig).
+    _ = @import("host/main.zig");
+
     // Extra
     _ = @import("extra/bash.zig");
     _ = @import("extra/fish.zig");

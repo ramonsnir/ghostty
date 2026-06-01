@@ -84,6 +84,33 @@ pub fn build(b: *std.Build) !void {
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
+    // ghostty-host: the headless emulation-on-host process (Phase 1).
+    //
+    // This is a sibling executable to the main Ghostty exe. It links the core
+    // (Termio/.exec + a real host-side renderer.State, inspector=null) but
+    // never runs GPU draw and never instantiates apprt.embedded. It is rooted
+    // at src/main_host.zig (which MUST live at src/ root so core @import paths
+    // resolve); the rest of the host lives under src/host/.
+    //
+    // Only build it for native (non-cross, non-wasm) targets; SharedDeps.add
+    // bails on cross-Darwin and the host has no business cross-compiling.
+    if (!config.target.result.cpu.arch.isWasm() and
+        !(!builtin.os.tag.isDarwin() and config.target.result.os.tag.isDarwin()))
+    {
+        const host_exe = b.addExecutable(.{
+            .name = "ghostty-host",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main_host.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            // Match GhosttyExe: x86_64 self-hosted crashes on 0.15.
+            .use_llvm = true,
+        });
+        _ = try deps.add(host_exe);
+        b.installArtifact(host_exe);
+    }
+
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);
     if (config.emit_docs) {
