@@ -1,4 +1,4 @@
-//! Host-side RenderState projection (Phase 1).
+//! Host-side RenderState projection (Phase 1 + Phase 2a expansion).
 //!
 //! This builds a pointer-free, self-contained Snapshot of a terminal's
 //! `RenderState` (the viewport grid) suitable for (a) diffing between frames
@@ -12,6 +12,36 @@
 //! `page.Cell` is its grapheme data, which `RenderState.update` arena-
 //! duplicates; we copy the grapheme codepoints inline so the Snapshot owns
 //! all its memory.
+//!
+//! ## Phase 2a §2.1 GridFrame expansion
+//!
+//! Beyond Phase 1's rows/cols/colors/cursor/grapheme set, the Snapshot now
+//! carries, toward a faithful §2.1 GridFrame round-trip:
+//!   - `dirty` (false|partial|full) + per-row `dirty` flag with row-index
+//!     framing (partial frames ship only dirty rows; reattach uses `.full`).
+//!   - the full 256-entry `palette`, `cursor_color`, and the full cursor
+//!     projection (visual_style, password_input, viewport, cursor_style POD).
+//!   - a per-cell `StylePod` (a wire-stable 16-field projection of
+//!     terminal.style.Style, NOT a bitcast of the private PackedStyle).
+//!   - per-row `selection` + `highlights`.
+//!   - header bits scrolled_to_bottom / synchronized_output / scrollbar triple
+//!     / cursor_blink_visible.
+//!
+//! ### Documented §2.1 followups (NOT silently dropped)
+//!
+//!   - `scrolled_to_bottom`, `synchronized_output`, the `scrollbar` triple, and
+//!     `cursor_blink_visible` are NOT derivable from the viewport-only
+//!     RenderState: the scroll/scrollbar values are computed host-side in
+//!     `src/renderer/generic.zig` per plan §1.1, and synchronized_output is a
+//!     terminal mode read host-side. Phase 2a sets placeholders
+//!     (scrolled_to_bottom=true, synchronized_output=false, scrollbar={0,0,0},
+//!     cursor_blink_visible=true) that round-trip faithfully. Wiring these to
+//!     real host-tick computation (`terminal.modes.get(.synchronized_output)`
+//!     plus the scrollbar triple) is Phase 2b/3 work.
+//!   - A deduped `u16 style_id -> POD` style table (§2.1 `nstyles`) is replaced
+//!     in Phase 2a by an inline per-cell `StylePod`: simpler and correct,
+//!     slightly larger wire. The dedup table is a Phase-2b size optimization.
+//!   - The LinkFrame / ImageFrame / SurfaceEvent channels are Phase 3.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,30 +53,183 @@ const terminalpkg = @import("../terminal/main.zig");
 const render = @import("../terminal/render.zig");
 const page = @import("../terminal/page.zig");
 const color = @import("../terminal/color.zig");
+const cursorpkg = @import("../terminal/cursor.zig");
+const stylepkg = @import("../terminal/style.zig");
+const sgr = @import("../terminal/sgr.zig");
 const RenderState = render.RenderState;
 
 const log = std.log.scoped(.host_render);
 
+/// A wire-stable, field-by-field projection of terminal.style.Style. We do NOT
+/// bitcast the private `PackedStyle` (`style.zig` keeps it `const`/unexported);
+/// instead we mirror the explicit public field set used by
+/// `src/terminal/c/style.zig`'s `fromStyle`: fg/bg/underline `Color`, the 8
+/// bool flags, and the underline enum.
+pub const StylePod = struct {
+    pub const ColorTag = enum(u8) { none = 0, palette = 1, rgb = 2 };
+
+    pub const Color = struct {
+        tag: ColorTag = .none,
+        palette: u8 = 0,
+        rgb: color.RGB = .{},
+
+        fn fromColor(c: stylepkg.Style.Color) Color {
+            return switch (c) {
+                .none => .{ .tag = .none },
+                .palette => |idx| .{ .tag = .palette, .palette = idx },
+                .rgb => |rgb| .{ .tag = .rgb, .rgb = rgb },
+            };
+        }
+
+        fn eql(a: Color, b: Color) bool {
+            if (a.tag != b.tag) return false;
+            return switch (a.tag) {
+                .none => true,
+                .palette => a.palette == b.palette,
+                .rgb => a.rgb.eql(b.rgb),
+            };
+        }
+
+        fn write(self: Color, w: anytype) !void {
+            try w.writeByte(@intFromEnum(self.tag));
+            try w.writeByte(self.palette);
+            try writeRGB(w, self.rgb);
+        }
+
+        fn read(r: anytype) !Color {
+            const tag = try r.readByte();
+            const pal = try r.readByte();
+            const rgb = try readRGB(r);
+            // Fail closed on an unknown tag, matching every other deserialize
+            // validator (InvalidDirty / InvalidCursorStyle / InvalidRowIndex /
+            // InvalidCodepoint / GridTooLarge): a corrupt/desynced/hostile frame
+            // must return a clean error, never silently coerce to .none and
+            // mask the corruption (finding PCR3-2).
+            return .{
+                .tag = std.meta.intToEnum(ColorTag, tag) catch
+                    return error.InvalidColorTag,
+                .palette = pal,
+                .rgb = rgb,
+            };
+        }
+    };
+
+    fg_color: Color = .{},
+    bg_color: Color = .{},
+    underline_color: Color = .{},
+    bold: bool = false,
+    italic: bool = false,
+    faint: bool = false,
+    blink: bool = false,
+    inverse: bool = false,
+    invisible: bool = false,
+    strikethrough: bool = false,
+    overline: bool = false,
+    underline: u8 = 0,
+
+    pub fn fromStyle(s: stylepkg.Style) StylePod {
+        return .{
+            .fg_color = .fromColor(s.fg_color),
+            .bg_color = .fromColor(s.bg_color),
+            .underline_color = .fromColor(s.underline_color),
+            .bold = s.flags.bold,
+            .italic = s.flags.italic,
+            .faint = s.flags.faint,
+            .blink = s.flags.blink,
+            .inverse = s.flags.inverse,
+            .invisible = s.flags.invisible,
+            .strikethrough = s.flags.strikethrough,
+            .overline = s.flags.overline,
+            .underline = @intFromEnum(s.flags.underline),
+        };
+    }
+
+    pub fn eql(a: StylePod, b: StylePod) bool {
+        return a.fg_color.eql(b.fg_color) and
+            a.bg_color.eql(b.bg_color) and
+            a.underline_color.eql(b.underline_color) and
+            a.bold == b.bold and
+            a.italic == b.italic and
+            a.faint == b.faint and
+            a.blink == b.blink and
+            a.inverse == b.inverse and
+            a.invisible == b.invisible and
+            a.strikethrough == b.strikethrough and
+            a.overline == b.overline and
+            a.underline == b.underline;
+    }
+
+    fn write(self: StylePod, w: anytype) !void {
+        try self.fg_color.write(w);
+        try self.bg_color.write(w);
+        try self.underline_color.write(w);
+        try w.writeByte(@intFromBool(self.bold));
+        try w.writeByte(@intFromBool(self.italic));
+        try w.writeByte(@intFromBool(self.faint));
+        try w.writeByte(@intFromBool(self.blink));
+        try w.writeByte(@intFromBool(self.inverse));
+        try w.writeByte(@intFromBool(self.invisible));
+        try w.writeByte(@intFromBool(self.strikethrough));
+        try w.writeByte(@intFromBool(self.overline));
+        try w.writeByte(self.underline);
+    }
+
+    fn read(r: anytype) !StylePod {
+        return .{
+            .fg_color = try Color.read(r),
+            .bg_color = try Color.read(r),
+            .underline_color = try Color.read(r),
+            .bold = (try r.readByte()) != 0,
+            .italic = (try r.readByte()) != 0,
+            .faint = (try r.readByte()) != 0,
+            .blink = (try r.readByte()) != 0,
+            .inverse = (try r.readByte()) != 0,
+            .invisible = (try r.readByte()) != 0,
+            .strikethrough = (try r.readByte()) != 0,
+            .overline = (try r.readByte()) != 0,
+            .underline = try r.readByte(),
+        };
+    }
+};
+
 /// A single cell in the snapshot: the raw page.Cell (a packed u64, pointer-
-/// free) plus any grapheme codepoints copied inline.
+/// free) plus any grapheme codepoints copied inline plus the style projection.
 pub const Cell = struct {
     raw: page.Cell,
     grapheme: []const u21 = &.{},
+    style: StylePod = .{},
 
     pub fn eql(a: Cell, b: Cell) bool {
         const ai: u64 = @bitCast(a.raw);
         const bi: u64 = @bitCast(b.raw);
         if (ai != bi) return false;
         if (a.grapheme.len != b.grapheme.len) return false;
-        return std.mem.eql(u21, a.grapheme, b.grapheme);
+        if (!std.mem.eql(u21, a.grapheme, b.grapheme)) return false;
+        return a.style.eql(b.style);
     }
+};
+
+/// A highlight within a row (mirrors render.RenderState.Highlight).
+pub const Highlight = struct {
+    tag: u8,
+    range: [2]u16,
 };
 
 /// A single row in the snapshot.
 pub const Row = struct {
     cells: []Cell,
+    dirty: bool = false,
+    selection: ?[2]u16 = null,
+    highlights: []Highlight = &.{},
 
-    fn eql(a: Row, b: Row) bool {
+    pub fn eql(a: Row, b: Row) bool {
+        if (a.dirty != b.dirty) return false;
+        if (!std.meta.eql(a.selection, b.selection)) return false;
+        if (a.highlights.len != b.highlights.len) return false;
+        for (a.highlights, b.highlights) |ha, hb| {
+            if (ha.tag != hb.tag) return false;
+            if (ha.range[0] != hb.range[0] or ha.range[1] != hb.range[1]) return false;
+        }
         if (a.cells.len != b.cells.len) return false;
         for (a.cells, b.cells) |ca, cb| {
             if (!ca.eql(cb)) return false;
@@ -56,22 +239,45 @@ pub const Row = struct {
 };
 
 /// A self-contained, pointer-free (PageList.Pin-stripped) projection of a
-/// terminal's viewport RenderState.
+/// terminal's viewport RenderState. See the file header for the §2.1 field
+/// coverage and documented followups.
 pub const Snapshot = struct {
     rows: u16,
     cols: u16,
 
+    /// Frame dirty state (false|partial|full). On a `.partial` frame only the
+    /// dirty rows are serialized (each prefixed by its row index); on `.full`
+    /// all rows; on `.false` none. Deserialize always reconstructs a full
+    /// `rows`-length row_data (non-listed rows default blank — fine for Phase
+    /// 2a since reattach always sends a `.full` frame, plan §5 step 2).
+    dirty: RenderState.Dirty = .full,
+
     /// Colors (reverse-video already applied by RenderState.update).
     background: color.RGB,
     foreground: color.RGB,
+    cursor_color: ?color.RGB = null,
+    palette: color.Palette,
 
     /// Cursor projection (pointer-free fields only).
     cursor_x: u16,
     cursor_y: u32,
     cursor_visible: bool,
     cursor_blinking: bool,
+    cursor_password_input: bool = false,
+    cursor_visual_style: cursorpkg.Style = .block,
+    cursor_viewport: ?CursorViewport = null,
+    cursor_style: StylePod = .{},
     /// The cursor cell as a raw page.Cell bitcast.
     cursor_cell: page.Cell,
+
+    /// Placeholder header bits — see file header followups. These round-trip
+    /// faithfully but are NOT yet wired to real host-tick computation.
+    scrolled_to_bottom: bool = true,
+    synchronized_output: bool = false,
+    scrollbar_total: u64 = 0,
+    scrollbar_offset: u64 = 0,
+    scrollbar_len: u64 = 0,
+    cursor_blink_visible: bool = true,
 
     /// The viewport rows, top to bottom. Length == rows.
     row_data: []Row,
@@ -80,9 +286,34 @@ pub const Snapshot = struct {
     /// May be empty.
     grapheme_pool: []u21,
 
+    /// Backing storage for all highlights, freed in one shot like grapheme_pool.
+    /// May be empty.
+    highlight_pool: []Highlight,
+
+    pub const CursorViewport = struct {
+        x: u16,
+        y: u16,
+        wide_tail: bool,
+    };
+
     /// Capture a Snapshot from a live renderer.State. The caller MUST hold
     /// `state.mutex` for the duration of this call: it runs RenderState.update
     /// (which reads the terminal) and copies all needed data out.
+    ///
+    /// PHASE-2a SCOPE NOTE (findings P1 / F2): because this builds a FRESH
+    /// `.empty` RenderState on every call, `update` always trips its
+    /// dimension-mismatch redraw branch (rows/cols go 0 -> real on the first
+    /// update) and forces `dirty == .full`. So every Snapshot the live host
+    /// captures — both the per-tick push (Session.renderTick) and the (re)attach
+    /// push (Server.pushFullFrames) — is FULL. The `.partial` serialize/
+    /// deserialize codec exists and is exercised by an explicit round-trip test
+    /// (see test.zig "partial"), but the running host does NOT yet emit `.partial`
+    /// frames: real per-tick diffing (persisting a RenderState across ticks so
+    /// `update` can produce `.partial`) is deferred to Phase 2b/3. Until then,
+    /// note the `.partial` deserialize contract: non-listed rows are reconstructed
+    /// BLANK, so a Phase-2b GUI mirror MUST treat a partial frame as a MERGE of
+    /// the listed dirty rows over its prior viewport, never a wholesale row_data
+    /// replacement (which would erase non-dirty rows).
     pub fn capture(alloc: Allocator, state: *const renderer.State) !Snapshot {
         // Build a transient RenderState, update it from the terminal, then
         // project it into our pointer-free form. We keep the RenderState local
@@ -99,25 +330,35 @@ pub const Snapshot = struct {
         const rows: u16 = rs.rows;
         const cols: u16 = rs.cols;
 
-        // Count grapheme codepoints so we can allocate the pool once.
-        var grapheme_total: usize = 0;
         const src = rs.row_data.slice();
         const src_cells = src.items(.cells);
+        const src_dirty = src.items(.dirty);
+        const src_sel = src.items(.selection);
+        const src_hl = src.items(.highlights);
+
+        // Count grapheme codepoints and highlights so we can allocate pools once.
+        var grapheme_total: usize = 0;
+        var highlight_total: usize = 0;
         for (0..rs.row_data.len) |y| {
             const cells = src_cells[y];
             const cell_slice = cells.slice();
             for (cell_slice.items(.grapheme), cell_slice.items(.raw)) |g, raw| {
                 if (raw.content_tag == .codepoint_grapheme) grapheme_total += g.len;
             }
+            highlight_total += src_hl[y].items.len;
         }
 
         const grapheme_pool = try alloc.alloc(u21, grapheme_total);
         errdefer alloc.free(grapheme_pool);
 
+        const highlight_pool = try alloc.alloc(Highlight, highlight_total);
+        errdefer alloc.free(highlight_pool);
+
         const row_data = try alloc.alloc(Row, rows);
         errdefer alloc.free(row_data);
 
         var g_off: usize = 0;
+        var h_off: usize = 0;
         var allocated_rows: usize = 0;
         errdefer for (0..allocated_rows) |y| alloc.free(row_data[y].cells);
 
@@ -129,7 +370,7 @@ pub const Snapshot = struct {
             // Rows beyond row_data.len shouldn't happen (update guarantees
             // row_data.len == rows), but be defensive.
             if (y >= rs.row_data.len) {
-                for (out_cells) |*c| c.* = .{ .raw = .{}, .grapheme = &.{} };
+                for (out_cells) |*c| c.* = .{ .raw = .{} };
                 continue;
             }
 
@@ -137,37 +378,85 @@ pub const Snapshot = struct {
             const cell_slice = cells.slice();
             const raws = cell_slice.items(.raw);
             const graphemes = cell_slice.items(.grapheme);
+            const styles = cell_slice.items(.style);
 
             for (0..cols) |x| {
                 if (x >= cells.len) {
-                    out_cells[x] = .{ .raw = .{}, .grapheme = &.{} };
+                    out_cells[x] = .{ .raw = .{} };
                     continue;
                 }
                 const raw = raws[x];
+
+                // Style is only populated on the source for styled / bg-color
+                // cells; default otherwise.
+                const style_pod: StylePod = blk: {
+                    if (raw.style_id > 0 or
+                        raw.content_tag == .bg_color_rgb or
+                        raw.content_tag == .bg_color_palette)
+                    {
+                        break :blk StylePod.fromStyle(styles[x]);
+                    }
+                    break :blk .{};
+                };
+
                 if (raw.content_tag == .codepoint_grapheme) {
                     const g = graphemes[x];
                     const dst = grapheme_pool[g_off .. g_off + g.len];
                     @memcpy(dst, g);
                     g_off += g.len;
-                    out_cells[x] = .{ .raw = raw, .grapheme = dst };
+                    out_cells[x] = .{ .raw = raw, .grapheme = dst, .style = style_pod };
                 } else {
-                    out_cells[x] = .{ .raw = raw, .grapheme = &.{} };
+                    out_cells[x] = .{ .raw = raw, .style = style_pod };
                 }
             }
+
+            // Per-row dirty + selection.
+            row_data[y].dirty = src_dirty[y];
+            if (src_sel[y]) |s| row_data[y].selection = .{ s[0], s[1] };
+
+            // Per-row highlights into the shared pool.
+            const hls = src_hl[y].items;
+            const hl_dst = highlight_pool[h_off .. h_off + hls.len];
+            for (hls, hl_dst) |src_h, *dst_h| {
+                dst_h.* = .{ .tag = src_h.tag, .range = .{ src_h.range[0], src_h.range[1] } };
+            }
+            row_data[y].highlights = hl_dst;
+            h_off += hls.len;
         }
+
+        const cursor_viewport: ?CursorViewport = if (rs.cursor.viewport) |v| .{
+            .x = v.x,
+            .y = v.y,
+            .wide_tail = v.wide_tail,
+        } else null;
 
         return .{
             .rows = rows,
             .cols = cols,
+            .dirty = rs.dirty,
             .background = rs.colors.background,
             .foreground = rs.colors.foreground,
+            .cursor_color = rs.colors.cursor,
+            .palette = rs.colors.palette,
             .cursor_x = rs.cursor.active.x,
             .cursor_y = rs.cursor.active.y,
             .cursor_visible = rs.cursor.visible,
             .cursor_blinking = rs.cursor.blinking,
+            .cursor_password_input = rs.cursor.password_input,
+            .cursor_visual_style = rs.cursor.visual_style,
+            .cursor_viewport = cursor_viewport,
+            .cursor_style = StylePod.fromStyle(rs.cursor.style),
             .cursor_cell = rs.cursor.cell,
+            // Placeholder header bits (see file header followups).
+            .scrolled_to_bottom = true,
+            .synchronized_output = false,
+            .scrollbar_total = 0,
+            .scrollbar_offset = 0,
+            .scrollbar_len = 0,
+            .cursor_blink_visible = true,
             .row_data = row_data,
             .grapheme_pool = grapheme_pool,
+            .highlight_pool = highlight_pool,
         };
     }
 
@@ -175,22 +464,36 @@ pub const Snapshot = struct {
         for (self.row_data) |row| alloc.free(row.cells);
         alloc.free(self.row_data);
         alloc.free(self.grapheme_pool);
+        alloc.free(self.highlight_pool);
         self.* = undefined;
     }
 
     /// Content equality (PageList.Pin already stripped by construction).
     pub fn eql(a: Snapshot, b: Snapshot) bool {
         if (a.rows != b.rows or a.cols != b.cols) return false;
+        if (a.dirty != b.dirty) return false;
         if (!std.meta.eql(a.background, b.background)) return false;
         if (!std.meta.eql(a.foreground, b.foreground)) return false;
+        if (!std.meta.eql(a.cursor_color, b.cursor_color)) return false;
+        if (!std.mem.eql(color.RGB, &a.palette, &b.palette)) return false;
         if (a.cursor_x != b.cursor_x or a.cursor_y != b.cursor_y) return false;
         if (a.cursor_visible != b.cursor_visible) return false;
         if (a.cursor_blinking != b.cursor_blinking) return false;
+        if (a.cursor_password_input != b.cursor_password_input) return false;
+        if (a.cursor_visual_style != b.cursor_visual_style) return false;
+        if (!std.meta.eql(a.cursor_viewport, b.cursor_viewport)) return false;
+        if (!a.cursor_style.eql(b.cursor_style)) return false;
         {
             const ai: u64 = @bitCast(a.cursor_cell);
             const bi: u64 = @bitCast(b.cursor_cell);
             if (ai != bi) return false;
         }
+        if (a.scrolled_to_bottom != b.scrolled_to_bottom) return false;
+        if (a.synchronized_output != b.synchronized_output) return false;
+        if (a.scrollbar_total != b.scrollbar_total) return false;
+        if (a.scrollbar_offset != b.scrollbar_offset) return false;
+        if (a.scrollbar_len != b.scrollbar_len) return false;
+        if (a.cursor_blink_visible != b.cursor_blink_visible) return false;
         if (a.row_data.len != b.row_data.len) return false;
         for (a.row_data, b.row_data) |ra, rb| {
             if (!ra.eql(rb)) return false;
@@ -199,109 +502,317 @@ pub const Snapshot = struct {
     }
 
     /// Serialize this snapshot into a flat, pointer-free byte buffer. The
-    /// caller owns the returned slice. This is the basis of the Phase 2 wire
-    /// format; the PageList.Pin is already stripped (never captured).
+    /// caller owns the returned slice. This is the GridFrame payload (after the
+    /// session_id) in the Phase 2 wire format; PageList.Pin is already stripped.
     pub fn serialize(self: Snapshot, alloc: Allocator) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(alloc);
         const w = buf.writer(alloc);
 
+        // Header.
         try writeInt(w, u16, self.rows);
         try writeInt(w, u16, self.cols);
+        try w.writeByte(@intFromEnum(self.dirty));
         try writeRGB(w, self.background);
         try writeRGB(w, self.foreground);
+        // cursor color (present-flag + RGB).
+        if (self.cursor_color) |c| {
+            try w.writeByte(1);
+            try writeRGB(w, c);
+        } else {
+            try w.writeByte(0);
+        }
+        // palette: 256 * RGB.
+        for (self.palette) |c| try writeRGB(w, c);
+
+        // Cursor projection.
         try writeInt(w, u16, self.cursor_x);
         try writeInt(w, u32, self.cursor_y);
         try w.writeByte(@intFromBool(self.cursor_visible));
         try w.writeByte(@intFromBool(self.cursor_blinking));
+        try w.writeByte(@intFromBool(self.cursor_password_input));
+        try w.writeByte(@intFromEnum(self.cursor_visual_style));
+        if (self.cursor_viewport) |v| {
+            try w.writeByte(1);
+            try writeInt(w, u16, v.x);
+            try writeInt(w, u16, v.y);
+            try w.writeByte(@intFromBool(v.wide_tail));
+        } else {
+            try w.writeByte(0);
+        }
+        try self.cursor_style.write(w);
         try writeInt(w, u64, @bitCast(self.cursor_cell));
 
-        for (self.row_data) |row| {
-            for (row.cells) |cell| {
-                try writeInt(w, u64, @bitCast(cell.raw));
-                try writeInt(w, u16, @intCast(cell.grapheme.len));
-                for (cell.grapheme) |cp| try writeInt(w, u32, cp);
-            }
+        // Placeholder header bits.
+        try w.writeByte(@intFromBool(self.scrolled_to_bottom));
+        try w.writeByte(@intFromBool(self.synchronized_output));
+        try writeInt(w, u64, self.scrollbar_total);
+        try writeInt(w, u64, self.scrollbar_offset);
+        try writeInt(w, u64, self.scrollbar_len);
+        try w.writeByte(@intFromBool(self.cursor_blink_visible));
+
+        // Row framing. We serialize the row count actually written: for .full
+        // all rows; for .partial only dirty rows (prefixed by row index); for
+        // .false zero rows. Each emitted row is prefixed by its u16 index in
+        // all cases so the deserializer can place it.
+        var emit_count: u16 = 0;
+        switch (self.dirty) {
+            .false => emit_count = 0,
+            .partial => {
+                for (self.row_data) |row| {
+                    if (row.dirty) emit_count += 1;
+                }
+            },
+            .full => emit_count = @intCast(self.row_data.len),
+        }
+        try writeInt(w, u16, emit_count);
+
+        for (self.row_data, 0..) |row, y| {
+            const emit = switch (self.dirty) {
+                .false => false,
+                .partial => row.dirty,
+                .full => true,
+            };
+            if (!emit) continue;
+            // PROTO-4: the row wire form is header-implied, not self-describing
+            // at the row level — serializeRow writes exactly row.cells.len cells
+            // with no per-row count prefix, and deserialize reads exactly
+            // `cols` cells per emitted row from the header. That round-trips
+            // only when every emitted row is exactly `cols` wide. The sole
+            // constructor (fromRenderState) guarantees this, but a future
+            // partial-frame / resize-in-flight builder that produced a row with
+            // cells.len != cols would silently desync the byte stream (over- or
+            // under-running every subsequent field) with no boundary error.
+            // Assert here so that latent corruption fails loudly instead.
+            std.debug.assert(row.cells.len == self.cols);
+            try writeInt(w, u16, @intCast(y));
+            try serializeRow(w, row);
         }
 
         return buf.toOwnedSlice(alloc);
     }
 
+    fn serializeRow(w: anytype, row: Row) !void {
+        try w.writeByte(@intFromBool(row.dirty));
+        // selection.
+        if (row.selection) |s| {
+            try w.writeByte(1);
+            try writeInt(w, u16, s[0]);
+            try writeInt(w, u16, s[1]);
+        } else {
+            try w.writeByte(0);
+        }
+        // highlights.
+        try writeInt(w, u16, @intCast(row.highlights.len));
+        for (row.highlights) |h| {
+            try w.writeByte(h.tag);
+            try writeInt(w, u16, h.range[0]);
+            try writeInt(w, u16, h.range[1]);
+        }
+        // cells.
+        for (row.cells) |cell| {
+            try writeInt(w, u64, @bitCast(cell.raw));
+            try cell.style.write(w);
+            try writeInt(w, u16, @intCast(cell.grapheme.len));
+            for (cell.grapheme) |cp| try writeInt(w, u32, cp);
+        }
+    }
+
     /// Deserialize a snapshot from a flat byte buffer produced by serialize.
-    /// The caller owns the returned Snapshot (call deinit).
+    /// The caller owns the returned Snapshot (call deinit). Non-listed rows
+    /// (when the frame was .partial or .false) are reconstructed blank.
     pub fn deserialize(alloc: Allocator, bytes: []const u8) !Snapshot {
         var fbs = std.io.fixedBufferStream(bytes);
         const r = fbs.reader();
 
         const rows = try readInt(r, u16);
         const cols = try readInt(r, u16);
+        const dirty = std.meta.intToEnum(RenderState.Dirty, try r.readByte()) catch
+            return error.InvalidDirty;
         const background = try readRGB(r);
         const foreground = try readRGB(r);
+        const cursor_color: ?color.RGB = if ((try r.readByte()) != 0)
+            try readRGB(r)
+        else
+            null;
+
+        var palette: color.Palette = undefined;
+        for (&palette) |*c| c.* = try readRGB(r);
+
         const cursor_x = try readInt(r, u16);
         const cursor_y = try readInt(r, u32);
         const cursor_visible = (try r.readByte()) != 0;
         const cursor_blinking = (try r.readByte()) != 0;
+        const cursor_password_input = (try r.readByte()) != 0;
+        const cursor_visual_style = std.meta.intToEnum(cursorpkg.Style, try r.readByte()) catch
+            return error.InvalidCursorStyle;
+        const cursor_viewport: ?CursorViewport = if ((try r.readByte()) != 0) .{
+            .x = try readInt(r, u16),
+            .y = try readInt(r, u16),
+            .wide_tail = (try r.readByte()) != 0,
+        } else null;
+        const cursor_style = try StylePod.read(r);
         const cursor_cell: page.Cell = @bitCast(try readInt(r, u64));
 
-        // First pass to count grapheme codepoints would require seeking; we
-        // instead build into a temporary list then copy into a single pool.
+        const scrolled_to_bottom = (try r.readByte()) != 0;
+        const synchronized_output = (try r.readByte()) != 0;
+        const scrollbar_total = try readInt(r, u64);
+        const scrollbar_offset = try readInt(r, u64);
+        const scrollbar_len = try readInt(r, u64);
+        const cursor_blink_visible = (try r.readByte()) != 0;
+
+        // Pools accumulated into temporary lists then copied once.
         var g_list: std.ArrayList(u21) = .empty;
         errdefer g_list.deinit(alloc);
+        var h_list: std.ArrayList(Highlight) = .empty;
+        errdefer h_list.deinit(alloc);
+
+        // Bound the blank-grid pre-allocation against the wire-frame size cap
+        // (findings SR-5 / ZM2 / SR3-1 / ZM-R3-1). deserialize allocates a full
+        // rows*cols blank Cell grid from the unvalidated u16/u16 header BEFORE
+        // reading any row payload; a corrupt/desynced frame could claim
+        // rows=cols=65535 (~4.3e9 cells, hundreds of GB) inside a frame whose
+        // total length is still under the 64 MiB wire cap.
+        //
+        // The bound must be on the IN-MEMORY pre-allocation, not on emitted-cell
+        // wire bytes: a .partial or .false frame legitimately describes a large
+        // rows*cols grid while emitting few or zero rows, so its payload can be
+        // tiny even though we still pre-allocate every blank Cell. An
+        // emitted-wire-bytes bound (the old MIN_CELL_BYTES=8 heuristic) therefore
+        // under-counts the .partial/.false case and left the pre-alloc bounded to
+        // ~7x the wire cap (8.4M cells * ~48 B/Cell ~= 400 MB) instead of to the
+        // cap itself. Bound the actual bytes we are about to allocate
+        // (rows*cols*@sizeOf(Cell)) to the wire-frame cap so a malformed header
+        // can never amplify beyond a single frame's worth of memory, regardless
+        // of dirty state. This self-corrects if Cell grows. (The host doesn't
+        // decode GridFrame today — dispatch ignores it — but this is the frozen
+        // protocol surface and the Phase-2b GUI-side decode path; matches the
+        // readBytes pre-alloc guard in protocol.zig.) 64 MiB is hardcoded here
+        // (rather than importing protocol.MAX_FRAME_LEN) to avoid a
+        // protocol<->RenderState import cycle; keep the two in sync.
+        const MAX_FRAME_PAYLOAD: u64 = 64 * 1024 * 1024;
+        const cell_count: u64 = @as(u64, rows) * @as(u64, cols);
+        if (cell_count * @as(u64, @sizeOf(Cell)) > MAX_FRAME_PAYLOAD) return error.GridTooLarge;
 
         const row_data = try alloc.alloc(Row, rows);
         errdefer alloc.free(row_data);
 
+        // Initialize every row blank (so non-listed rows are valid).
         var allocated_rows: usize = 0;
         errdefer for (0..allocated_rows) |y| alloc.free(row_data[y].cells);
-
-        // We must record grapheme (offset,len) per cell so we can patch the
-        // slices after the pool is finalized.
-        const Span = struct { row: usize, col: usize, off: usize, len: usize };
-        var spans: std.ArrayList(Span) = .empty;
-        defer spans.deinit(alloc);
-
         for (0..rows) |y| {
             const cells = try alloc.alloc(Cell, cols);
+            for (cells) |*c| c.* = .{ .raw = .{} };
             row_data[y] = .{ .cells = cells };
             allocated_rows += 1;
+        }
 
+        // Patch tracking for grapheme + highlight slices.
+        const GSpan = struct { row: usize, col: usize, off: usize, len: usize };
+        const HSpan = struct { row: usize, off: usize, len: usize };
+        var gspans: std.ArrayList(GSpan) = .empty;
+        defer gspans.deinit(alloc);
+        var hspans: std.ArrayList(HSpan) = .empty;
+        defer hspans.deinit(alloc);
+
+        const emit_count = try readInt(r, u16);
+        var e: usize = 0;
+        while (e < emit_count) : (e += 1) {
+            const y = try readInt(r, u16);
+            if (y >= rows) return error.InvalidRowIndex;
+
+            const row_dirty = (try r.readByte()) != 0;
+            const selection: ?[2]u16 = if ((try r.readByte()) != 0) .{
+                try readInt(r, u16),
+                try readInt(r, u16),
+            } else null;
+
+            const hcount = try readInt(r, u16);
+            const h_start = h_list.items.len;
+            var h: usize = 0;
+            while (h < hcount) : (h += 1) {
+                const tag = try r.readByte();
+                const r0 = try readInt(r, u16);
+                const r1 = try readInt(r, u16);
+                try h_list.append(alloc, .{ .tag = tag, .range = .{ r0, r1 } });
+            }
+            if (hcount > 0) try hspans.append(alloc, .{
+                .row = y,
+                .off = h_start,
+                .len = hcount,
+            });
+
+            const cells = row_data[y].cells;
             for (0..cols) |x| {
                 const raw: page.Cell = @bitCast(try readInt(r, u64));
+                const style = try StylePod.read(r);
                 const glen = try readInt(r, u16);
                 const off = g_list.items.len;
-                for (0..glen) |_| {
-                    const cp: u21 = @intCast(try readInt(r, u32));
+                var gi: usize = 0;
+                while (gi < glen) : (gi += 1) {
+                    // Grapheme codepoints are serialized as u32 but stored as
+                    // u21. A corrupt/desynced/hostile frame can carry any u32
+                    // here; bound it before narrowing so an out-of-range value
+                    // fails closed (error.InvalidCodepoint) like the dirty /
+                    // cursor-style / row-index / grid-size validators above,
+                    // rather than panicking (safe builds) or silently
+                    // truncating (ReleaseFast) on the @intCast.
+                    const cp32 = try readInt(r, u32);
+                    if (cp32 > std.math.maxInt(u21)) return error.InvalidCodepoint;
+                    const cp: u21 = @intCast(cp32);
                     try g_list.append(alloc, cp);
                 }
-                cells[x] = .{ .raw = raw, .grapheme = &.{} };
-                if (glen > 0) try spans.append(alloc, .{
+                cells[x] = .{ .raw = raw, .style = style };
+                if (glen > 0) try gspans.append(alloc, .{
                     .row = y,
                     .col = x,
                     .off = off,
                     .len = glen,
                 });
             }
+
+            row_data[y].dirty = row_dirty;
+            row_data[y].selection = selection;
         }
 
         const grapheme_pool = try g_list.toOwnedSlice(alloc);
         errdefer alloc.free(grapheme_pool);
+        const highlight_pool = try h_list.toOwnedSlice(alloc);
+        errdefer alloc.free(highlight_pool);
 
-        for (spans.items) |s| {
+        for (gspans.items) |s| {
             row_data[s.row].cells[s.col].grapheme = grapheme_pool[s.off .. s.off + s.len];
+        }
+        for (hspans.items) |s| {
+            row_data[s.row].highlights = highlight_pool[s.off .. s.off + s.len];
         }
 
         return .{
             .rows = rows,
             .cols = cols,
+            .dirty = dirty,
             .background = background,
             .foreground = foreground,
+            .cursor_color = cursor_color,
+            .palette = palette,
             .cursor_x = cursor_x,
             .cursor_y = cursor_y,
             .cursor_visible = cursor_visible,
             .cursor_blinking = cursor_blinking,
+            .cursor_password_input = cursor_password_input,
+            .cursor_visual_style = cursor_visual_style,
+            .cursor_viewport = cursor_viewport,
+            .cursor_style = cursor_style,
             .cursor_cell = cursor_cell,
+            .scrolled_to_bottom = scrolled_to_bottom,
+            .synchronized_output = synchronized_output,
+            .scrollbar_total = scrollbar_total,
+            .scrollbar_offset = scrollbar_offset,
+            .scrollbar_len = scrollbar_len,
+            .cursor_blink_visible = cursor_blink_visible,
             .row_data = row_data,
             .grapheme_pool = grapheme_pool,
+            .highlight_pool = highlight_pool,
         };
     }
 };

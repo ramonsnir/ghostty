@@ -110,6 +110,21 @@ poll_interval_ms: u64 = 100,
 /// The previous RenderState snapshot, for diffing.
 prev_snapshot: ?RenderState.Snapshot = null,
 
+/// Phase 2a render-tick push hook. Set by the Server so it can serialize and
+/// broadcast a GridFrame (+ ModeFrame) to subscribers on each tick. Invoked at
+/// the END of renderTick with the just-captured Snapshot (still owned by the
+/// session; the callback must NOT free it). null in the Phase-1 stdout-diff
+/// path, so the default behavior is unchanged.
+on_render_ctx: ?*anyopaque = null,
+on_render: ?*const fn (ctx: *anyopaque, self: *Session, snapshot: *const RenderState.Snapshot) void = null,
+
+/// Phase 2a child-exit signal. Set by the Server to observe a .child_exited
+/// surface message (with exit_code/runtime_ms) in addition to the existing
+/// render_stop notify. Invoked from renderTick when the app queue drains a
+/// .child_exited message. null in the Phase-1 path (unchanged behavior).
+on_child_exited_ctx: ?*anyopaque = null,
+on_child_exited: ?*const fn (ctx: *anyopaque, self: *Session, exit_code: u32, runtime_ms: u64) void = null,
+
 /// Total changed rows across all render ticks. Bumped by renderTick; lets a
 /// test observe that the wakeup-driven render path actually produced a diff
 /// even though renderTick's return value is consumed inside the callback.
@@ -453,6 +468,13 @@ pub fn renderTick(self: *Session) !usize {
             .surface_message => |sm| {
                 log.debug("surface message: {s}", .{@tagName(sm.message)});
                 if (sm.message == .child_exited) {
+                    const ce = sm.message.child_exited;
+                    // Phase 2a: surface the child-exit details to the Server
+                    // (buffer-or-deliver a ChildExited frame) in addition to
+                    // the render-loop stop below. No-op in the Phase-1 path.
+                    if (self.on_child_exited) |cb| {
+                        cb(self.on_child_exited_ctx.?, self, ce.exit_code, ce.runtime_ms);
+                    }
                     log.info("child exited; stopping render loop", .{});
                     self.render_stop.notify() catch |err| log.warn(
                         "error notifying render loop stop err={}",
@@ -479,6 +501,28 @@ pub fn renderTick(self: *Session) !usize {
 
     if (self.prev_snapshot) |*prev| prev.deinit(self.alloc);
     self.prev_snapshot = snapshot;
+
+    // Phase 2a render-tick push: hand the just-captured snapshot to the Server
+    // (if wired) so it can serialize + broadcast a GridFrame + ModeFrame. The
+    // snapshot stays owned by self.prev_snapshot; the callback must not free it.
+    // No-op in the Phase-1 stdout-diff path (on_render == null).
+    //
+    // Gate on `changed > 0` (finding SR-3): renderTick is driven by the
+    // periodic poll_timer (~10 Hz in production) as well as real output, and
+    // every captured Snapshot is currently .full, so pushing unconditionally
+    // would broadcast a full GridFrame + ModeFrame to every subscriber ~10
+    // times/sec on a completely idle session — a steady-state bandwidth/CPU
+    // drain and a divergence from the frozen cadence contract (plan §2.2:
+    // render-tick only when output marked something dirty). A freshly-attached
+    // GUI still gets immediate state because (re)attach pushes a full frame via
+    // Server.pushFullFrames independent of the tick; only redundant idle ticks
+    // are suppressed. FOLLOWUP (Phase 2b): persist a RenderState across ticks so
+    // capture can emit .partial and the poll-timer path stops forcing .full.
+    if (changed > 0) {
+        if (self.on_render) |cb| {
+            cb(self.on_render_ctx.?, self, &self.prev_snapshot.?);
+        }
+    }
 
     self.total_changed_rows += changed;
     return changed;
