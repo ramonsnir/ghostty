@@ -5,9 +5,13 @@
 
 const Session = @import("Session.zig");
 const RenderState = @import("RenderState.zig");
+const protocol = @import("protocol.zig");
+const Server = @import("Server.zig");
 
 test {
     _ = Session;
     _ = RenderState;
+    _ = protocol;
+    _ = Server;
     _ = @import("test.zig");
 }

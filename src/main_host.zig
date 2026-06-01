@@ -16,10 +16,9 @@ const builtin = @import("builtin");
 
 const global = @import("global.zig");
 const Session = @import("host/Session.zig");
+const Server = @import("host/Server.zig");
 
 pub fn main() !void {
-    std.log.info("ghostty-host starting (Phase 1: headless, no IPC)", .{});
-
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -28,6 +27,53 @@ pub fn main() !void {
     // needs GHOSTTY_RESOURCES_DIR/TERMINFO for the ghostty terminfo entry.
     try global.state.init();
     defer global.state.deinit();
+
+    // Parse args: `--listen=<path>` (or a bare positional socket path) runs the
+    // Phase 2a transport Server; otherwise keep the EXACT Phase-1 single-session
+    // stdout-diff path so nothing regresses.
+    if (try listenPath(alloc)) |path| {
+        defer alloc.free(path);
+        try runServer(alloc, path);
+        return;
+    }
+
+    try runStdoutDiff(alloc);
+}
+
+/// Resolve the socket path from argv: `--listen=<path>` or a bare positional
+/// path. Returns null if no listen arg was given (Phase-1 mode). Caller owns
+/// the returned slice.
+fn listenPath(alloc: std.mem.Allocator) !?[]u8 {
+    var it = try std.process.argsWithAllocator(alloc);
+    defer it.deinit();
+    _ = it.next(); // argv[0]
+    while (it.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--listen=")) {
+            return try alloc.dupe(u8, arg["--listen=".len..]);
+        }
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            return try alloc.dupe(u8, arg);
+        }
+    }
+    return null;
+}
+
+/// Phase 2a: run the transport Server, accepting GUI connections forever.
+fn runServer(alloc: std.mem.Allocator, path: []const u8) !void {
+    std.log.info("ghostty-host starting (Phase 2a: serving on {s})", .{path});
+    const server = try Server.init(alloc, path);
+    defer server.deinit();
+    try server.start();
+    std.log.info("ghostty-host: server listening, accepting connections", .{});
+
+    // Block forever (until killed). The accept + per-connection + per-session
+    // threads do the work. A future SIGTERM handler can flip server.running.
+    while (true) std.Thread.sleep(60 * std.time.ns_per_s);
+}
+
+/// Phase 1 (preserved verbatim): single-session, no-IPC stdout-diff harness.
+fn runStdoutDiff(alloc: std.mem.Allocator) !void {
+    std.log.info("ghostty-host starting (Phase 1: headless, no IPC)", .{});
 
     const session = try Session.create(alloc, .{});
     defer session.destroy();
