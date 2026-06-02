@@ -281,6 +281,165 @@ fn buildFramed(
     return try protocol.encodeFrame(alloc, .grid_frame, gf);
 }
 
+// --- Slice 3a: renderer source-selection + pin-gating wiring ---
+
+test "client renderer source-selection + pin-gating (Slice 3a)" {
+    // T2 (Slice 3a, GPU-free): prove the renderer's `updateFrame` correctly
+    // (a) SELECTS the host mirror as its draw source when `state.mirror != null`
+    //     (vs. the `RenderState.update(terminal)` arm when it's null), and
+    // (b) GATES the two pin-dereferencing paths (linkCells,
+    //     updateHighlightsFlattened) OFF under a mirror — which is what protects
+    //     the mirror's poisoned `invalid_pin` row pins from ever being
+    //     dereferenced this phase.
+    //
+    // updateFrame itself needs a GPU-backed renderer Self, so this exercises the
+    // exact branch PREDICATES updateFrame uses (`state.mirror == null`) at the
+    // smallest GPU-free unit, plus proves copyFrom (the mirror arm's body) lands
+    // a faithful owned copy and that the gated calls would otherwise touch the
+    // sentinel pins. The end-to-end GPU draw is deferred to the human smoke.
+    const alloc = testing.allocator;
+
+    // --- Build a populated mirror via the real client decode pipeline (pins ==
+    // invalid_pin), exactly as the fidelity fixtures do. ---
+    const cols: u16 = 10;
+    const rows: u16 = 3;
+    const bytes = "ABCD\r\nEFGH";
+
+    const framed = try buildFramed(alloc, cols, rows, bytes, .{});
+    defer alloc.free(framed);
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    try client.reader.push(alloc, framed);
+    while (try client.reader.next(alloc)) |frame| {
+        try client.handleFrame(alloc, frame.tag, frame.payload);
+    }
+    try testing.expect(client.render_state.rows == rows);
+
+    // Sanity: the mirror's row pins ARE the poisoned sentinel. This is the
+    // hazard the gate exists to avoid; dereferencing `.node` is UB by design.
+    {
+        const mirror_rows = client.render_state.row_data.slice();
+        const pins = mirror_rows.items(.pin);
+        for (pins) |p| {
+            try testing.expectEqual(
+                @as(usize, 0xdead_0000_dead_0000),
+                @intFromPtr(p.node),
+            );
+            try testing.expect(p.garbage);
+        }
+    }
+
+    var mutex: std.Thread.Mutex = .{};
+
+    // --- (a) SOURCE SELECTION. updateFrame branches on `state.mirror`: a
+    // non-null mirror => copyFrom(mirror); null => update(terminal). We assert
+    // the predicate AND that the mirror arm's body (copyFrom) produces an owned
+    // draw source equal to the mirror. ---
+    {
+        // The .client construction: terminal is unused under a mirror, but the
+        // field is non-optional, so point it at a throwaway live terminal. The
+        // assertion is that the MIRROR is selected, never `terminal`.
+        var dummy_term = try buildTerminal(alloc, cols, rows, "", .{});
+        defer dummy_term.deinit(alloc);
+
+        const state_client: renderer.State = .{
+            .mutex = &mutex,
+            .terminal = &dummy_term,
+            .mirror = &client.render_state,
+        };
+        // The exact predicate updateFrame uses to pick the mirror arm.
+        try testing.expect(state_client.mirror != null);
+
+        // Drive the mirror arm's body: copyFrom into a renderer-owned local.
+        var local: RenderStateCore = .empty;
+        defer local.deinit(alloc);
+        try local.copyFrom(alloc, state_client.mirror.?);
+
+        // The chosen draw source equals the mirror (re-projected through the
+        // audited comparator), and is independently owned (different backing).
+        var local_snap = try Snapshot.fromRenderState(alloc, &local);
+        defer local_snap.deinit(alloc);
+        var mirror_snap = try Snapshot.fromRenderState(alloc, &client.render_state);
+        defer mirror_snap.deinit(alloc);
+        try testing.expect(local_snap.eql(mirror_snap));
+        try testing.expect(local.row_data.bytes != client.render_state.row_data.bytes);
+    }
+
+    // --- The .exec construction: mirror == null => update(terminal) arm. ---
+    {
+        var term_exec = try buildTerminal(alloc, cols, rows, bytes, .{});
+        defer term_exec.deinit(alloc);
+        const state_exec: renderer.State = .{
+            .mutex = &mutex,
+            .terminal = &term_exec,
+        };
+        // .exec selects the update(terminal) arm.
+        try testing.expect(state_exec.mirror == null);
+
+        // Drive the .exec arm's body to confirm it is the live-terminal path.
+        var local: RenderStateCore = .empty;
+        defer local.deinit(alloc);
+        try local.update(alloc, state_exec.terminal);
+        try testing.expectEqual(@as(@TypeOf(local.rows), rows), local.rows);
+    }
+
+    // --- (b) PIN GATING. The two pin-dereferencing paths in updateFrame —
+    // RenderState.linkCells (OSC8 hover links, generic.zig ~1307) and
+    // RenderState.updateHighlightsFlattened (search highlights, generic.zig
+    // ~1378/1389) — both index `row_data.items(.pin)` and deref `pin.node`.
+    // Under a client mirror those pins are the poisoned `invalid_pin` sentinel
+    // (asserted above at "Sanity:"), so dereferencing them is UB by design.
+    //
+    // Both call sites are gated by `state.usesLivePinPaths()` — the SAME pure
+    // predicate the renderer evaluates (renderer/State.zig), reused here so this
+    // test pins the renderer's actual gate rather than re-deriving the literal.
+    // If a future edit inverts/removes either gate, `usesLivePinPaths()` is the
+    // shared truth: the renderer would change behavior in lockstep with what
+    // this asserts. We verify the predicate is FALSE under a mirror (the gates
+    // skip the pin paths) and TRUE under .exec (the gates run them).
+    //
+    // We deliberately do NOT call linkCells/updateHighlightsFlattened on the
+    // mirror: doing so is precisely the sentinel-deref UB the gate prevents, and
+    // the GPU-bound remainder of updateFrame's body is deferred to the human
+    // ReleaseLocal smoke test (no headless GPU here).
+    {
+        const state_client: renderer.State = .{
+            .mutex = &mutex,
+            .terminal = undefined, // never read under a mirror
+            .mirror = &client.render_state,
+        };
+        // The renderer's exact gate predicate. Under a mirror it is false, so
+        // both `if (!state.usesLivePinPaths()) break :osc8 .empty;` and
+        // `if (state.usesLivePinPaths() and ...)` skip the pin paths.
+        try testing.expect(!state_client.usesLivePinPaths());
+
+        // And it is the negation of "has a mirror" — i.e. the pin paths run
+        // iff there is NO mirror. Tie this to the sentinel hazard: the pins we
+        // would have dereferenced are the poisoned ones, confirming what the
+        // gate is actually protecting.
+        try testing.expect(state_client.mirror != null);
+        const gated_pins = state_client.mirror.?.row_data.slice().items(.pin);
+        for (gated_pins) |p| {
+            try testing.expectEqual(
+                @as(usize, 0xdead_0000_dead_0000),
+                @intFromPtr(p.node),
+            );
+        }
+
+        // Under .exec (mirror == null) the same predicate is TRUE: the pin
+        // paths run, which is today's unchanged behavior. (terminal is required
+        // by the field but never read by usesLivePinPaths.)
+        var dummy_term_b = try buildTerminal(alloc, cols, rows, "", .{});
+        defer dummy_term_b.deinit(alloc);
+        const state_exec: renderer.State = .{
+            .mutex = &mutex,
+            .terminal = &dummy_term_b,
+        };
+        try testing.expect(state_exec.usesLivePinPaths());
+    }
+}
+
 // --- Fixtures (byte streams copied verbatim from host/difftest.zig). ---
 
 test "client decode fidelity F1 plain text + wrap + scroll" {
