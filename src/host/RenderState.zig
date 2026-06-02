@@ -259,8 +259,23 @@ pub const Row = struct {
     dirty: bool = false,
     selection: ?[2]u16 = null,
     highlights: []Highlight = &.{},
+    /// The raw page.Row (a packed struct(u64), pointer-free — its only
+    /// sub-field, `cells: Offset(Cell)`, is a relative page offset, not a
+    /// pointer). The Slice-3 renderer reads its flag bits (wrap,
+    /// wrap_continuation, grapheme, styled, hyperlink, semantic_prompt,
+    /// kitty_virtual_placeholder) via `row_data.items(.raw)`
+    /// (generic.zig:2366), so the Snapshot must carry it. Round-tripped as a
+    /// u64 bitcast, exactly like the per-cell `Cell.raw`. Default is the
+    /// all-zero page.Row (its first field `cells: Offset(Cell)` has no struct
+    /// default, so we bitcast 0 rather than `.{}`).
+    raw: page.Row = @bitCast(@as(u64, 0)),
 
     pub fn eql(a: Row, b: Row) bool {
+        {
+            const ai: u64 = @bitCast(a.raw);
+            const bi: u64 = @bitCast(b.raw);
+            if (ai != bi) return false;
+        }
         if (a.dirty != b.dirty) return false;
         if (!std.meta.eql(a.selection, b.selection)) return false;
         if (a.highlights.len != b.highlights.len) return false;
@@ -373,6 +388,7 @@ pub const Snapshot = struct {
         const src_dirty = src.items(.dirty);
         const src_sel = src.items(.selection);
         const src_hl = src.items(.highlights);
+        const src_raw = src.items(.raw);
 
         // Count grapheme codepoints and highlights so we can allocate pools once.
         var grapheme_total: usize = 0;
@@ -448,8 +464,9 @@ pub const Snapshot = struct {
                 }
             }
 
-            // Per-row dirty + selection.
+            // Per-row dirty + selection + raw page.Row (u64, pointer-free).
             row_data[y].dirty = src_dirty[y];
+            row_data[y].raw = src_raw[y];
             if (src_sel[y]) |s| row_data[y].selection = .{ s[0], s[1] };
 
             // Per-row highlights into the shared pool.
@@ -628,11 +645,20 @@ pub const Snapshot = struct {
         const src_dirty = src.items(.dirty);
         const src_sel = src.items(.selection);
         const src_hl = src.items(.highlights);
+        const src_raw = src.items(.raw);
 
         if (self.row_data.len != rs.rows) return fail(out, .{ .field = "row_data.len" });
 
         for (0..self.rows) |y| {
             const mrow = self.row_data[y];
+
+            // Per-row raw page.Row (u64 bitcast). The renderer reads the row's
+            // flag bits via row_data.items(.raw); compare them cross-path here.
+            {
+                const e: u64 = @bitCast(src_raw[y]);
+                const a: u64 = @bitCast(mrow.raw);
+                if (e != a) return fail(out, .{ .field = "row.raw", .y = y, .expected = e, .actual = a });
+            }
 
             // Per-row dirty.
             if (mrow.dirty != src_dirty[y]) return fail(out, .{ .field = "row.dirty", .y = y });
@@ -814,6 +840,18 @@ pub const Snapshot = struct {
             try writeInt(w, u16, h.range[0]);
             try writeInt(w, u16, h.range[1]);
         }
+        // raw page.Row (u64 bitcast, pointer-free). Written here, after the
+        // highlights block and BEFORE the per-cell loop; deserialize reads it
+        // at the identical position so the PROTO-4 header-implied row stream
+        // stays in sync.
+        //
+        // This is an additive GridFrame wire change. protocol.PROTOCOL_VERSION_MINOR
+        // is documentary/defensive only (a default field value in Hello/HelloAck,
+        // never validated against the GridFrame body on either side), so it is not
+        // touched here: both peers are built from the same tree, and the additive
+        // field round-trips regardless of the advertised minor. Decode/rehydrate
+        // and the fidelity tests are unaffected.
+        try writeInt(w, u64, @bitCast(row.raw));
         // cells.
         for (row.cells) |cell| {
             try writeInt(w, u64, @bitCast(cell.raw));
@@ -947,6 +985,10 @@ pub const Snapshot = struct {
                 .len = hcount,
             });
 
+            // raw page.Row (u64 bitcast), read at the same position serialize
+            // wrote it: after highlights, before the per-cell loop.
+            const row_raw: page.Row = @bitCast(try readInt(r, u64));
+
             const cells = row_data[y].cells;
             for (0..cols) |x| {
                 const raw: page.Cell = @bitCast(try readInt(r, u64));
@@ -978,6 +1020,7 @@ pub const Snapshot = struct {
 
             row_data[y].dirty = row_dirty;
             row_data[y].selection = selection;
+            row_data[y].raw = row_raw;
         }
 
         const grapheme_pool = try g_list.toOwnedSlice(alloc);

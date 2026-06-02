@@ -468,8 +468,10 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update the size of our pty. The backend takes the full size: Exec
+    // derives grid/terminal from it, while Client sends a Resize frame whose
+    // wire fields (cell/padding/full screen) reconstruct the size host-side.
+    try self.backend.resize(td, size);
 
     // Enter the critical area that we want to keep small
     {
