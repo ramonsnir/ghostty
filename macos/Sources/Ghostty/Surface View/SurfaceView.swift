@@ -647,6 +647,17 @@ extension Ghostty {
         /// Extra input to send as stdin
         var initialInput: String?
 
+        /// Optional PTY-host session id to reattach to (phase 2b). When set and
+        /// the `.client` termio backend is in use, the surface attempts to
+        /// reattach to this live host session instead of spawning fresh. A
+        /// null/unknown/GC'd id degrades to a fresh spawn (today's layout-only
+        /// restore). This is currently Swift-side only: there is no
+        /// `ghostty_surface_config_s.session_id` field yet, so `withCValue`
+        /// does not forward it — the `.client` backend wiring (later task)
+        /// reads it from here. Persisted across restarts via SurfaceView's
+        /// Codable `sessionID` key.
+        var sessionID: String?
+
         /// Wait after the command
         var waitAfterCommand: Bool = false
 
