@@ -138,6 +138,14 @@ extension Ghostty {
             return .init(rawValue: v)
         }
 
+        var bellFeaturesFocused: BellFeatures {
+            guard let config = self.config else { return .init() }
+            var v: CUnsignedInt = 0
+            let key = "bell-features-focused"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return .init() }
+            return .init(rawValue: v)
+        }
+
         var bellAudioPath: ConfigPath? {
             guard let config = self.config else { return nil }
             var v = ghostty_config_path_s()

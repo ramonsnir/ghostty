@@ -3128,6 +3128,22 @@ keybind: Keybinds = .{},
 /// Available since: 1.2.0
 @"bell-features": BellFeatures = .{},
 
+/// (Fork-only.) Bell features to enable when the ringing surface is truly in
+/// focus, i.e. it is the focused split AND its window is the key window AND
+/// the macOS app is frontmost/active. When the ringing surface is NOT in
+/// focus by that definition, `bell-features` is used instead. This lets the
+/// in-focus bell be quieter (e.g. sound only) while keeping the existing
+/// out-of-focus attention/title behavior.
+///
+/// Uses the same value format as `bell-features`. Defaults are identical to
+/// `bell-features` (`attention` and `title` enabled), so behavior is
+/// unchanged until you set this key. For "sound only when focused", set e.g.
+/// `bell-features-focused = audio,no-attention,no-title` (or `system,...`).
+///
+/// This is a fork-only key and must live in `~/.config/ghostty-ramon/config`;
+/// an official Ghostty would error on the unknown key.
+@"bell-features-focused": BellFeatures = .{},
+
 /// If `audio` is an enabled bell feature, this is a path to an audio file. If
 /// the path is not absolute, it is considered relative to the directory of the
 /// configuration file that it is referenced from, or from the current working
@@ -11044,6 +11060,47 @@ test "compatibility: window new-window" {
         try testing.expectEqual(
             MacOSDockDropBehavior.@"new-window",
             cfg.@"macos-dock-drop-behavior",
+        );
+    }
+}
+
+test "bell-features-focused: parse and default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default matches bell-features default (attention + title).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(
+            BellFeatures{ .attention = true, .title = true },
+            cfg.@"bell-features-focused",
+        );
+        // bell-features default is unchanged and identical.
+        try testing.expectEqual(
+            cfg.@"bell-features",
+            cfg.@"bell-features-focused",
+        );
+    }
+
+    // "sound only" override leaves bell-features untouched.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--bell-features-focused=audio,no-attention,no-title",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(
+            BellFeatures{ .audio = true, .attention = false, .title = false },
+            cfg.@"bell-features-focused",
+        );
+        // bell-features keeps its default.
+        try testing.expectEqual(
+            BellFeatures{ .attention = true, .title = true },
+            cfg.@"bell-features",
         );
     }
 }
