@@ -582,6 +582,14 @@ fn setRecvTimeout(fd: posix.socket_t) void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
+/// Bound for the frame-scan loops below: how many `pollNext(tries=4)` rounds to
+/// wait for an expected frame. 50 × 4 × 100ms RCVTIMEO ≈ 20s worst case — ample
+/// for child-shell echo under heavy parallel build load, yet ~9× below a 180s
+/// no-output watchdog. The previous bound (400) allowed ~160s of near-silent
+/// looping, which under load tripped the workflow watchdog and masqueraded as a
+/// hang; this fails fast with a clear assertion instead.
+const FRAME_SCAN_ITERS = 50;
+
 /// Poll up to `tries` recv-timeouts for the next frame; WouldBlock -> retry.
 /// Returns the tag (payload in out_payload), or null if EOF / exhausted tries.
 fn pollNext(
@@ -650,7 +658,7 @@ test "host socket integration: attach, input, gridframe marker, reattach" {
         // it from the immediate push, so scan until we see Attached.
         var i: usize = 0;
         var got = false;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
             if (tag == .attached) {
                 const a = try protocol.Attached.decode(alloc, payload.items);
@@ -674,7 +682,7 @@ test "host socket integration: attach, input, gridframe marker, reattach" {
     {
         var i: usize = 0;
         var found = false;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
             if (tag != .grid_frame) continue;
             var gf = try protocol.GridFrame.decode(alloc, payload.items);
@@ -714,7 +722,7 @@ test "host socket integration: attach, input, gridframe marker, reattach" {
         var i: usize = 0;
         var found_grid = false;
         var found_attached = false;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
             switch (tag) {
                 .attached => {
@@ -863,7 +871,7 @@ test "host Server tears down a naturally-exited session cleanly (F1)" {
     var session_id: u64 = 0;
     {
         var i: usize = 0;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
             if (tag == .attached) {
                 session_id = (try protocol.Attached.decode(alloc, payload.items)).session_id;
@@ -885,7 +893,7 @@ test "host Server tears down a naturally-exited session cleanly (F1)" {
     {
         var i: usize = 0;
         var got = false;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
             if (tag == .child_exited) {
                 const ce = try protocol.ChildExited.decode(alloc, payload.items);
@@ -920,7 +928,7 @@ test "host Server tears down a naturally-exited session cleanly (F1)" {
         // not consumed-once). Assert client2 receives BOTH Attached and a
         // ChildExited replayed from buffered_child_exited.
         var got_child_exited = false;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
             if (tag == .attached) {
                 try testing.expectEqual(session_id, (try protocol.Attached.decode(alloc, payload.items)).session_id);
@@ -1015,7 +1023,7 @@ test "host Server rejects a stateful frame before the Hello handshake (PROTO-1)"
         try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
         var session_id: u64 = 0;
         var i: usize = 0;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
             if (tag == .attached) {
                 session_id = (try protocol.Attached.decode(alloc, payload.items)).session_id;
@@ -1067,7 +1075,7 @@ test "host Server reports live (post-resize) dims in Attached on reattach (SR-2/
     var spawn_rows: u16 = 0;
     {
         var i: usize = 0;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
             if (tag == .attached) {
                 const a = try protocol.Attached.decode(alloc, payload.items);
@@ -1117,7 +1125,7 @@ test "host Server reports live (post-resize) dims in Attached on reattach (SR-2/
     {
         var i: usize = 0;
         var got = false;
-        while (i < 400) : (i += 1) {
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
             const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
             if (tag == .attached) {
                 const a = try protocol.Attached.decode(alloc, payload.items);
