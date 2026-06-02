@@ -1328,6 +1328,14 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+
+        // Slice 1: `.client` is never selected (Surface.zig hardcodes
+        // `.exec`), so this path is unreachable in practice. We return an
+        // empty arg slice (-> empty command string) rather than touch the
+        // stub backend; real command lookup lands with the Client impl in
+        // Slice 2. The slice element type must match `exec.subprocess.args`
+        // ([]const [:0]const u8) so `std.mem.join` still type-checks.
+        .client => &[_][:0]const u8{},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
