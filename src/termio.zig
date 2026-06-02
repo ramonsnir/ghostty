@@ -37,4 +37,8 @@ test {
     @import("std").testing.refAllDecls(@This());
 
     _ = @import("termio/shell_integration.zig");
+
+    // Phase 2b Slice 2: the .client decode-fidelity differential test. Named
+    // "client decode fidelity ...", reachable via -Dtest-filter=client.
+    _ = @import("termio/client_difftest.zig");
 }

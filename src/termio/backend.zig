@@ -75,12 +75,15 @@ pub const Backend = union(Kind) {
 
     pub fn resize(
         self: *Backend,
-        grid_size: renderer.GridSize,
-        screen_size: renderer.ScreenSize,
+        td: *termio.Termio.ThreadData,
+        size: renderer.Size,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.resize(grid_size, screen_size),
-            .client => |*client| try client.resize(grid_size, screen_size),
+            // Exec keeps its grid/screen API and does not need td.
+            .exec => |*exec| try exec.resize(size.grid(), size.terminal()),
+            // Client needs td (to send a Resize frame on the write stream)
+            // and the full size (cell/padding/screen all round-trip the wire).
+            .client => |*client| try client.resize(td, size),
         }
     }
 

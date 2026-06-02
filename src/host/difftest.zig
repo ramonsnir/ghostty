@@ -403,6 +403,53 @@ test "host difftest F9 active-screen selection range" {
     );
 }
 
+test "host difftest row.raw negative perturbation" {
+    // Prove the new per-row `row.raw` leg of eqlRenderState actually bites: a
+    // bit flipped in a serialized row's page.Row flag bits must surface as a
+    // "row.raw" mismatch (not silently pass like the pre-fix Snapshot did).
+    //
+    // We self-locate row 0's raw page.Row u64 by VALUE in the serialized bytes
+    // (not a magic offset) and flip the low bit of byte 4 of that u64. In the
+    // LE layout the low u32 (bytes 0-3) is the `cells` Offset and the boolean
+    // flag bits begin at bit 32 (byte 4, low bit = `wrap`). The source row has
+    // wrap=0, so setting it makes the deserialized mirror's row.raw differ from
+    // the live RenderState — a pure-flag perturbation that leaves the embedded
+    // `cells` Offset intact (frame stays structurally valid).
+    const alloc = testing.allocator;
+    const cols: u16 = 10;
+    const rows: u16 = 3;
+    const bytes = "ABCDEFGHIJKLMNOPQR\r\nrow2\r\nrow3\r\nrow4\r\nrow5";
+
+    var term_ref = try buildTerminal(alloc, cols, rows, bytes, .{});
+    defer term_ref.deinit(alloc);
+    var rs_ref: RenderStateCore = .empty;
+    defer rs_ref.deinit(alloc);
+    try rs_ref.update(alloc, &term_ref);
+
+    var snap = try Snapshot.fromRenderState(alloc, &rs_ref);
+    defer snap.deinit(alloc);
+    try testing.expect(snap.row_data.len > 0);
+
+    const wire = try snap.serialize(alloc);
+    defer alloc.free(wire);
+
+    const target_raw: u64 = @bitCast(snap.row_data[0].raw);
+    var raw_le: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw_le, target_raw, .little);
+    const raw_off = std.mem.indexOf(u8, wire, &raw_le) orelse
+        return error.RowRawNotFoundInFrame;
+    // Set the `wrap` flag bit (byte 4, bit 0), which the source row has clear.
+    wire[raw_off + 4] |= 0x01;
+
+    var mirror = try Snapshot.deserialize(alloc, wire);
+    defer mirror.deinit(alloc);
+
+    var mm: Snapshot.Mismatch = .{};
+    try testing.expect(!mirror.eqlRenderState(&rs_ref, &mm));
+    try testing.expectEqualStrings("row.raw", mm.field);
+    try testing.expect(mm.y != null);
+}
+
 test "host difftest F10 scrolled-up viewport -> cursor.viewport null" {
     // cols=10,rows=3. Push content into scrollback (so there IS scrollback),
     // then scroll the viewport to the TOP. The cursor stays on the last
