@@ -764,9 +764,37 @@ extension Ghostty {
             }
         }
 
+        /// True only when this surface is in focus by the strict definition used
+        /// for bell routing: it is the focused split / first responder in its
+        /// window (encoded by `focused`, which already implies window.isKeyWindow),
+        /// AND its window is currently the key window (re-checked live to defend
+        /// against the async focus-sync after becomeKey), AND the app is active.
+        /// A surface on another Space, in a backgrounded app, or a non-focused
+        /// split is NOT in focus.
+        var bellIsFocused: Bool {
+            return NSApp.isActive
+                && (self.window?.isKeyWindow ?? false)
+                && self.focused
+        }
+
+        /// The bell feature set to apply for a ring on THIS surface right now,
+        /// chosen by `bellIsFocused`. Used by both this view's bell handler and
+        /// the app-wide AppDelegate bell handler so the focus rule lives in one
+        /// place.
+        func bellFeaturesForCurrentFocus(_ config: Ghostty.Config) -> Ghostty.Config.BellFeatures {
+            return bellIsFocused ? config.bellFeaturesFocused : config.bellFeatures
+        }
+
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
-            // Bell state goes to true
-            bell = true
+            // Decide which bell-features set applies based on true focus, and only
+            // arm the visual bell (title 🔔 + border + dock badge aggregate) if that
+            // set wants title OR border. In-focus rings configured as sound-only
+            // therefore leave `bell` false, so nothing visual/badge-y is stranded.
+            guard let appState = Ghostty.App.appState(fromView: self) else { return }
+            let features = bellFeaturesForCurrentFocus(appState.config)
+            if features.contains(.title) || features.contains(.border) {
+                bell = true
+            }
         }
 
         @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {

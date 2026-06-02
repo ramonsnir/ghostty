@@ -653,11 +653,22 @@ class AppDelegate: NSObject,
     }
 
     @objc private func ghosttyBellDidRing(_ notification: Notification) {
-        if ghostty.config.bellFeatures.contains(.system) {
+        // Choose the focused vs out-of-focus bell-features set based on the
+        // ringing surface's true focus state. The notification object is the
+        // ringing surfaceView. If we can't resolve it, fall back to the
+        // out-of-focus (existing) set so we never silently drop the bell.
+        let features: Ghostty.Config.BellFeatures
+        if let surfaceView = notification.object as? Ghostty.SurfaceView {
+            features = surfaceView.bellFeaturesForCurrentFocus(ghostty.config)
+        } else {
+            features = ghostty.config.bellFeatures
+        }
+
+        if features.contains(.system) {
             NSSound.beep()
         }
 
-        if ghostty.config.bellFeatures.contains(.audio) {
+        if features.contains(.audio) {
             if let configPath = ghostty.config.bellAudioPath,
                let sound = NSSound(contentsOfFile: configPath.path, byReference: false) {
                 sound.volume = ghostty.config.bellAudioVolume
@@ -665,7 +676,7 @@ class AppDelegate: NSObject,
             }
         }
 
-        if ghostty.config.bellFeatures.contains(.attention) {
+        if features.contains(.attention) {
             // Bounce the dock icon if we're not focused.
             NSApp.requestUserAttention(.informationalRequest)
         }

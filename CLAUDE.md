@@ -58,13 +58,38 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 `macos/Tests/Splits/SplitTreeTests.swift`; `RepeatableString cval*` +
 `Binding toggle_project_selector` + `Binding goto_last_surface` (Zig).
 
+- `bell-features-focused: BellFeatures` (fork-only config key) — a second bell-feature
+  set governing the bell when the ringing surface is **truly in focus**: focused split
+  / first responder AND `window.isKeyWindow` AND `NSApp.isActive` (a surface on another
+  Space, in a backgrounded app, or a non-focused split counts as OUT OF FOCUS). When in
+  focus, this set is used; otherwise the existing `bell-features` (unchanged, the
+  OUT-OF-FOCUS set) is used. Same value format and same `BellFeatures` type
+  (`system,audio,attention,title,border`); defaults are IDENTICAL to `bell-features`
+  (`attention`+`title`), so behavior is unchanged until set. For "sound only when
+  focused" set `bell-features-focused = audio,no-attention,no-title` (or `system,...`).
+  The focus decision is made at RING time (not render) in a shared SurfaceView helper
+  `bellFeaturesForCurrentFocus(_:)` / `bellIsFocused`, reused by both AppDelegate's bell
+  handler (system/audio/attention) and SurfaceView's own handler (title/border via the
+  single `bell` bool). Because `bell=true` is an all-or-nothing gate for title+border+
+  dock-badge, the SurfaceView handler only arms it when the chosen set has `.title` or
+  `.border`; the downstream `.title`/`.border` checks still read static `bell-features`,
+  so enabling title/border in `bell-features-focused` while disabling them in
+  `bell-features` would NOT show them (acceptable: the intended use is focused = no
+  title/border). Fork-only — keep it in `~/.config/ghostty-ramon/config` (an official
+  Ghostty shares `~/.config/ghostty/config` and would error on the unknown key).
+  Wiring: `src/config/Config.zig` (field + doc + parse test), reusing `BellFeatures`;
+  `macos/Sources/Ghostty/Ghostty.Config.swift` (`bellFeaturesFocused` getter, reusing
+  the `BellFeatures` OptionSet); `macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift`
+  (`bellIsFocused`, `bellFeaturesForCurrentFocus(_:)`, gated `ghosttyBellDidRing`);
+  `macos/Sources/App/macOS/AppDelegate.swift` (`ghosttyBellDidRing` branches the set).
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
 - **Single-instance guard** in `AppDelegate.applicationWillFinishLaunching`: if another process with the same bundle id is already running from a different bundle URL, that one is activated and this process exits. Stops two copies of the same fork identity from racing each other (e.g. dock-attention bouncing one while you click the other).
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 ## Iteration lifecycle (macOS)
 Toolchain: full **Xcode** (not just Command Line Tools) + Metal toolchain + accepted
