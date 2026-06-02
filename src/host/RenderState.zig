@@ -90,6 +90,20 @@ pub const StylePod = struct {
             };
         }
 
+        /// Compare this projected Color DIRECTLY against a source
+        /// `terminal.style.Style.Color` union — by union tag + payload, NOT by
+        /// routing the source through `fromColor` first. Part of the
+        /// cross-path style assertion (finding DR-1): a `fromColor` mis-map
+        /// would no longer be masked because we read the union's own tag and
+        /// payload here.
+        fn eqlSrc(self: Color, c: stylepkg.Style.Color) bool {
+            return switch (c) {
+                .none => self.tag == .none,
+                .palette => |idx| self.tag == .palette and self.palette == idx,
+                .rgb => |rgb| self.tag == .rgb and self.rgb.eql(rgb),
+            };
+        }
+
         fn write(self: Color, w: anytype) !void {
             try w.writeByte(@intFromEnum(self.tag));
             try w.writeByte(self.palette);
@@ -142,6 +156,30 @@ pub const StylePod = struct {
             .overline = s.flags.overline,
             .underline = @intFromEnum(s.flags.underline),
         };
+    }
+
+    /// Compare this projected StylePod field-by-field DIRECTLY against the
+    /// source `terminal.style.Style` the renderer actually reads — NOT against
+    /// `fromStyle(s)`. This deliberately breaks the self-reference: if
+    /// `fromStyle` ever drops or mis-maps a Style field, the mirror it built no
+    /// longer matches the raw Style and this returns false. Used by the
+    /// differential fidelity test (difftest.zig) so the per-cell / cursor style
+    /// legs are a true cross-path comparison against the renderer's input
+    /// (finding DR-1). Mirrors the exact public Style surface `Style.eql`
+    /// compares (fg/bg/underline Color + the 16-bit Flags).
+    pub fn eqlStyle(self: StylePod, s: stylepkg.Style) bool {
+        return self.fg_color.eqlSrc(s.fg_color) and
+            self.bg_color.eqlSrc(s.bg_color) and
+            self.underline_color.eqlSrc(s.underline_color) and
+            self.bold == s.flags.bold and
+            self.italic == s.flags.italic and
+            self.faint == s.flags.faint and
+            self.blink == s.flags.blink and
+            self.inverse == s.flags.inverse and
+            self.invisible == s.flags.invisible and
+            self.strikethrough == s.flags.strikethrough and
+            self.overline == s.flags.overline and
+            self.underline == @intFromEnum(s.flags.underline);
     }
 
     pub fn eql(a: StylePod, b: StylePod) bool {
@@ -498,6 +536,173 @@ pub const Snapshot = struct {
         for (a.row_data, b.row_data) |ra, rb| {
             if (!ra.eql(rb)) return false;
         }
+        return true;
+    }
+
+    /// A precise mismatch reporter for `eqlRenderState`. When a comparison
+    /// fails, the first mismatch is recorded here (the test side dumps it).
+    /// This keeps `eqlRenderState` a pure read-only comparison (no stderr
+    /// spew, no host-state mutation) while still giving callers a precise
+    /// coordinate + field for failure output.
+    pub const Mismatch = struct {
+        field: []const u8 = "",
+        /// Cell coordinate, when the mismatch is per-cell (else null).
+        y: ?usize = null,
+        x: ?usize = null,
+        /// Optional u64 expected/actual (e.g. raw page.Cell bitcast).
+        expected: u64 = 0,
+        actual: u64 = 0,
+    };
+
+    /// Compare this Snapshot (the deserialized HOST mirror) against the core
+    /// `render.RenderState` the .exec renderer literally consumes, field by
+    /// field, for everything the renderer draws. This is the primary fidelity
+    /// assertion of the differential test: it validates the host PROJECTION
+    /// against the renderer's input (not merely serialize/deserialize
+    /// symmetry).
+    ///
+    /// This is READ-ONLY over both the Snapshot and the RenderState; it
+    /// mutates no host state and touches no host invariant (no .exec, inspector
+    /// stays null, mailbox untouched). It is a pure comparison fn placed beside
+    /// `eql` so review is trivial.
+    ///
+    /// Style reads on the RenderState are GATED on the exact populated-cell
+    /// condition `fromRenderState` uses (style_id > 0 or bg_color_rgb/palette):
+    /// `rs` cell `.style` is undefined for default cells (render.zig:223), so
+    /// reading it there would be UB. The placeholder header bits
+    /// (scrolled_to_bottom, synchronized_output, scrollbar triple,
+    /// cursor_blink_visible) are NOT read from `rs` — they are not derivable
+    /// from a viewport-only RenderState and are pinned to their constants
+    /// separately by the test.
+    pub fn eqlRenderState(
+        self: Snapshot,
+        rs: *const RenderState,
+        out: ?*Mismatch,
+    ) bool {
+        const fail = struct {
+            fn f(o: ?*Mismatch, m: Mismatch) bool {
+                if (o) |p| p.* = m;
+                return false;
+            }
+        }.f;
+
+        // Dims.
+        if (self.rows != rs.rows) return fail(out, .{ .field = "rows", .expected = rs.rows, .actual = self.rows });
+        if (self.cols != rs.cols) return fail(out, .{ .field = "cols", .expected = rs.cols, .actual = self.cols });
+
+        // Colors / palette (reverse-video already applied by update).
+        if (!self.background.eql(rs.colors.background)) return fail(out, .{ .field = "background" });
+        if (!self.foreground.eql(rs.colors.foreground)) return fail(out, .{ .field = "foreground" });
+        if (!std.meta.eql(self.cursor_color, rs.colors.cursor)) return fail(out, .{ .field = "cursor_color" });
+        if (!std.mem.eql(color.RGB, &self.palette, &rs.colors.palette)) return fail(out, .{ .field = "palette" });
+
+        // Cursor.
+        if (self.cursor_x != rs.cursor.active.x) return fail(out, .{ .field = "cursor_x", .expected = rs.cursor.active.x, .actual = self.cursor_x });
+        if (self.cursor_y != rs.cursor.active.y) return fail(out, .{ .field = "cursor_y", .expected = rs.cursor.active.y, .actual = self.cursor_y });
+        if (self.cursor_visible != rs.cursor.visible) return fail(out, .{ .field = "cursor_visible" });
+        if (self.cursor_blinking != rs.cursor.blinking) return fail(out, .{ .field = "cursor_blinking" });
+        if (self.cursor_password_input != rs.cursor.password_input) return fail(out, .{ .field = "cursor_password_input" });
+        if (self.cursor_visual_style != rs.cursor.visual_style) return fail(out, .{ .field = "cursor_visual_style" });
+        {
+            const rv: ?CursorViewport = if (rs.cursor.viewport) |v| .{ .x = v.x, .y = v.y, .wide_tail = v.wide_tail } else null;
+            if (!std.meta.eql(self.cursor_viewport, rv)) return fail(out, .{ .field = "cursor_viewport" });
+        }
+        // cursor.style is always valid post-update (render.zig:312). Compare
+        // the mirror's StylePod DIRECTLY against the raw terminal.style.Style
+        // (not against fromStyle(...)), so a dropped/mis-mapped Style field in
+        // the projection fails the diff instead of cancelling on both sides
+        // (finding DR-1).
+        if (!self.cursor_style.eqlStyle(rs.cursor.style)) return fail(out, .{ .field = "cursor_style" });
+        {
+            const e: u64 = @bitCast(rs.cursor.cell);
+            const a: u64 = @bitCast(self.cursor_cell);
+            if (e != a) return fail(out, .{ .field = "cursor_cell", .expected = e, .actual = a });
+        }
+
+        // dirty framing.
+        if (self.dirty != rs.dirty) return fail(out, .{ .field = "dirty" });
+
+        // Per-row + per-cell.
+        const src = rs.row_data.slice();
+        const src_cells = src.items(.cells);
+        const src_dirty = src.items(.dirty);
+        const src_sel = src.items(.selection);
+        const src_hl = src.items(.highlights);
+
+        if (self.row_data.len != rs.rows) return fail(out, .{ .field = "row_data.len" });
+
+        for (0..self.rows) |y| {
+            const mrow = self.row_data[y];
+
+            // Per-row dirty.
+            if (mrow.dirty != src_dirty[y]) return fail(out, .{ .field = "row.dirty", .y = y });
+
+            // Per-row selection.
+            const rsel: ?[2]u16 = if (src_sel[y]) |s| .{ s[0], s[1] } else null;
+            if (!std.meta.eql(mrow.selection, rsel)) return fail(out, .{ .field = "row.selection", .y = y });
+
+            // Per-row highlights.
+            const rhls = src_hl[y].items;
+            if (mrow.highlights.len != rhls.len) return fail(out, .{ .field = "row.highlights.len", .y = y });
+            for (mrow.highlights, rhls) |mh, rh| {
+                if (mh.tag != rh.tag or mh.range[0] != rh.range[0] or mh.range[1] != rh.range[1])
+                    return fail(out, .{ .field = "row.highlight", .y = y });
+            }
+
+            // Per-cell.
+            const cells = src_cells[y];
+            const cell_slice = cells.slice();
+            const raws = cell_slice.items(.raw);
+            const graphemes = cell_slice.items(.grapheme);
+            const styles = cell_slice.items(.style);
+
+            if (mrow.cells.len != self.cols) return fail(out, .{ .field = "row.cells.len", .y = y });
+
+            for (0..self.cols) |x| {
+                const mcell = mrow.cells[x];
+
+                // The RenderState row may be narrower than cols in pathological
+                // cases; fromRenderState treats those as blank. Mirror that.
+                const r_raw: page.Cell = if (x < cells.len) raws[x] else .{};
+
+                // raw packed cell (content_tag, codepoint, wide/spacer,
+                // style_id, protected, hyperlink).
+                {
+                    const e: u64 = @bitCast(r_raw);
+                    const a: u64 = @bitCast(mcell.raw);
+                    if (e != a) return fail(out, .{ .field = "cell.raw", .y = y, .x = x, .expected = e, .actual = a });
+                }
+
+                // grapheme run.
+                if (r_raw.content_tag == .codepoint_grapheme) {
+                    const g: []const u21 = if (x < cells.len) graphemes[x] else &.{};
+                    if (!std.mem.eql(u21, mcell.grapheme, g)) return fail(out, .{ .field = "cell.grapheme", .y = y, .x = x });
+                } else {
+                    if (mcell.grapheme.len != 0) return fail(out, .{ .field = "cell.grapheme(nonempty)", .y = y, .x = x });
+                }
+
+                // style — GATED on the populated condition (style undefined for
+                // default cells, render.zig:223). When populated, compare the
+                // mirror's StylePod DIRECTLY against the raw
+                // terminal.style.Style the renderer reads (NOT against
+                // fromStyle(styles[x])): this is the cross-path leg that breaks
+                // the self-reference, so a field fromStyle silently drops or
+                // mis-maps fails the diff rather than cancelling on both sides
+                // (finding DR-1). For unpopulated/default cells the renderer
+                // reads no style, so we require the mirror's StylePod be the
+                // all-default value.
+                const populated = x < cells.len and
+                    (r_raw.style_id > 0 or
+                        r_raw.content_tag == .bg_color_rgb or
+                        r_raw.content_tag == .bg_color_palette);
+                if (populated) {
+                    if (!mcell.style.eqlStyle(styles[x])) return fail(out, .{ .field = "cell.style", .y = y, .x = x });
+                } else {
+                    if (!mcell.style.eql(.{})) return fail(out, .{ .field = "cell.style(default)", .y = y, .x = x });
+                }
+            }
+        }
+
         return true;
     }
 
