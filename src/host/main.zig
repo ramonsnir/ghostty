@@ -14,4 +14,5 @@ test {
     _ = protocol;
     _ = Server;
     _ = @import("test.zig");
+    _ = @import("difftest.zig");
 }
