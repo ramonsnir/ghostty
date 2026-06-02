@@ -648,6 +648,157 @@ pub const RenderState = struct {
         s.dirty = .{};
     }
 
+    /// Deep-copy `src` into `self`, producing a fully self-owned RenderState
+    /// (independent per-row arenas, general-allocator cell lists, arena-backed
+    /// highlights) byte-equivalent to what `update` would have produced for the
+    /// same terminal. This is the `.client` analog of `update`: the host ships a
+    /// rehydrated mirror RenderState (Client.render_state) owned under the
+    /// Client mutex, and the renderer must take an OWNED snapshot of it while
+    /// that lock is held so the downstream draw pipeline (which runs AFTER the
+    /// renderer unlocks) never aliases or mutates host-owned memory.
+    ///
+    /// This reuses the exact resize/arena/cell-init shape of `update`
+    /// (render.zig:345-552) and `Client.rehydrate` (Client.zig:596-714):
+    ///   - row_data resized to src.rows, new rows init exactly like `update`,
+    ///     dropped rows' arena+cells freed on shrink.
+    ///   - per-row arena promoted + reset on reuse; cells via the GENERAL
+    ///     allocator; graphemes deep-duped into the per-row arena; highlights
+    ///     deep-copied into the per-row arena (RenderState.deinit frees row
+    ///     highlights ONLY via arena.deinit, so they MUST be arena-backed).
+    ///
+    /// Pin-agnostic: `pin` is copied verbatim from src (a defined value on both
+    /// sides — a real host pin under an `.exec`-derived src, or the deliberately
+    /// poisoned `invalid_pin` sentinel in a Client mirror). copyFrom NEVER
+    /// dereferences a pin; the downstream pin-reading paths (linkCells,
+    /// updateHighlightsFlattened) are gated off in the renderer under a mirror.
+    /// `viewport_pin`/`selection_cache` are NOT copied (left null) — they are
+    /// pin-bearing host-side caches not meaningful in a mirror, and the mirror
+    /// src already carries them as null.
+    pub fn copyFrom(
+        self: *RenderState,
+        alloc: Allocator,
+        src: *const RenderState,
+    ) Allocator.Error!void {
+        // Scalars / colors / cursor — all POD.
+        self.rows = src.rows;
+        self.cols = src.cols;
+        self.dirty = src.dirty;
+        self.screen = src.screen;
+        self.colors = src.colors;
+        self.cursor = src.cursor;
+
+        // Pin-bearing host-side caches: never copied into a mirror snapshot.
+        self.viewport_pin = null;
+        self.selection_cache = null;
+
+        // Resize the row MultiArrayList to match, init-ing NEW rows exactly
+        // like update (render.zig:357-367) and deinit-ing dropped rows'
+        // arena+cells on shrink (render.zig:368-379) to avoid leaks.
+        if (self.row_data.len != src.rows) {
+            if (self.row_data.len < src.rows) {
+                const old_len = self.row_data.len;
+                try self.row_data.resize(alloc, src.rows);
+                var slice = self.row_data.slice();
+                for (old_len..src.rows) |y| {
+                    slice.set(y, .{
+                        .arena = .{},
+                        // `pin` is overwritten verbatim from src below; seed
+                        // it to a DEFINED value (NOT undefined — the row list
+                        // copies fields on resize/shrink and copying undefined
+                        // is UB). src.row_data's own pin is assigned per-row.
+                        .pin = undefined,
+                        .raw = undefined,
+                        .cells = .empty,
+                        .dirty = true,
+                        .selection = null,
+                        .highlights = .empty,
+                    });
+                }
+            } else {
+                const slice = self.row_data.slice();
+                for (
+                    slice.items(.arena)[src.rows..],
+                    slice.items(.cells)[src.rows..],
+                ) |state, *cells| {
+                    var arena: ArenaAllocator = state.promote(alloc);
+                    arena.deinit();
+                    cells.deinit(alloc);
+                }
+                self.row_data.shrinkRetainingCapacity(src.rows);
+            }
+        }
+
+        const src_data = src.row_data.slice();
+        const src_pins = src_data.items(.pin);
+        const src_raws = src_data.items(.raw);
+        const src_cells = src_data.items(.cells);
+        const src_dirties = src_data.items(.dirty);
+        const src_sels = src_data.items(.selection);
+        const src_highlights = src_data.items(.highlights);
+
+        const dst_data = self.row_data.slice();
+        const dst_arenas = dst_data.items(.arena);
+        const dst_pins = dst_data.items(.pin);
+        const dst_raws = dst_data.items(.raw);
+        const dst_cells = dst_data.items(.cells);
+        const dst_dirties = dst_data.items(.dirty);
+        const dst_sels = dst_data.items(.selection);
+        const dst_highlights = dst_data.items(.highlights);
+
+        for (0..src.rows) |y| {
+            // Promote the per-row arena, reset it on reuse (render.zig:465-471 /
+            // Client.zig:653-668). Drop stale arena-backed selection/highlights
+            // handles after reset so the rebuild reallocates fresh and never
+            // aliases the post-reset arena (the grapheme/highlight dupes below).
+            var arena = dst_arenas[y].promote(alloc);
+            defer dst_arenas[y] = arena.state;
+            if (dst_cells[y].len > 0) {
+                _ = arena.reset(.retain_capacity);
+                dst_sels[y] = null;
+                dst_highlights[y] = .empty;
+            }
+            const arena_alloc = arena.allocator();
+
+            // Cells use the GENERAL allocator (render.zig:484-492), NOT arena.
+            const src_cell_slice = src_cells[y].slice();
+            const src_cell_raw = src_cell_slice.items(.raw);
+            const src_cell_grapheme = src_cell_slice.items(.grapheme);
+            const src_cell_style = src_cell_slice.items(.style);
+
+            const cells = &dst_cells[y];
+            try cells.resize(alloc, src.cols);
+            const cells_slice = cells.slice();
+            const cells_raw = cells_slice.items(.raw);
+            const cells_grapheme = cells_slice.items(.grapheme);
+            const cells_style = cells_slice.items(.style);
+
+            for (0..src.cols) |x| {
+                cells_raw[x] = src_cell_raw[x];
+                // `style`/`grapheme` are only meaningful for populated cells
+                // (render.zig:213-223), but copying style unconditionally is
+                // harmless and keeps the field never-undefined, matching the
+                // mirror's rehydrate (Client.zig:685).
+                cells_style[x] = src_cell_style[x];
+                if (src_cell_raw[x].content_tag == .codepoint_grapheme) {
+                    cells_grapheme[x] = try arena_alloc.dupe(u21, src_cell_grapheme[x]);
+                }
+            }
+
+            dst_raws[y] = src_raws[y];
+            dst_dirties[y] = src_dirties[y];
+            dst_sels[y] = src_sels[y];
+            // Pin-agnostic verbatim copy; never dereferenced. See doc comment.
+            dst_pins[y] = src_pins[y];
+
+            // Highlights MUST be arena-backed (RenderState.deinit frees them
+            // ONLY via arena.deinit — render.zig:247-256). Reset to .empty on
+            // reuse above, so this appends fresh from the post-reset arena.
+            for (src_highlights[y].items) |h| {
+                try dst_highlights[y].append(arena_alloc, h);
+            }
+        }
+    }
+
     /// Update the highlights in the render state from the given flattened
     /// highlights. Because this uses flattened highlights, it does not require
     /// reading from the terminal state so it should be done outside of
@@ -1024,6 +1175,100 @@ test "grapheme" {
         try testing.expectEqual(0, cell.raw.codepoint());
         try testing.expectEqual(.spacer_tail, cell.raw.wide);
     }
+}
+
+test "copyFrom owned fidelity" {
+    // T1 (Slice 3a): copyFrom produces a cell-identical, independently-owned
+    // (non-aliased) RenderState — the .client analog of `update`. This is the
+    // GPU-free witness that the renderer's mirror source-population is faithful
+    // and self-owned (no aliasing of the host-owned mirror past the unlock).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b[1mAB"); // bold A,B
+    s.nextSlice("\x1b[0m"); // reset
+    s.nextSlice("👨‍"); // ZWJ grapheme (managed memory)
+
+    var rs_ref: RenderState = .empty;
+    defer rs_ref.deinit(alloc);
+    try rs_ref.update(alloc, &t);
+
+    var dst: RenderState = .empty;
+    defer dst.deinit(alloc);
+    try dst.copyFrom(alloc, &rs_ref);
+
+    // Scalars / colors / cursor / dirty all match.
+    try testing.expectEqual(rs_ref.rows, dst.rows);
+    try testing.expectEqual(rs_ref.cols, dst.cols);
+    try testing.expectEqual(rs_ref.dirty, dst.dirty);
+    try testing.expectEqual(rs_ref.screen, dst.screen);
+    try testing.expectEqual(rs_ref.colors.background, dst.colors.background);
+    try testing.expectEqual(rs_ref.colors.foreground, dst.colors.foreground);
+    try testing.expectEqual(rs_ref.cursor.active, dst.cursor.active);
+
+    const ref_rd = rs_ref.row_data.slice();
+    const dst_rd = dst.row_data.slice();
+    try testing.expectEqual(ref_rd.len, dst_rd.len);
+
+    // The MultiArrayList backing buffer must be independently allocated.
+    try testing.expect(rs_ref.row_data.bytes != dst.row_data.bytes);
+
+    const ref_cells = ref_rd.items(.cells);
+    const dst_cells = dst_rd.items(.cells);
+    const ref_raws = ref_rd.items(.raw);
+    const dst_raws = dst_rd.items(.raw);
+    const ref_dirty = ref_rd.items(.dirty);
+    const dst_dirty = dst_rd.items(.dirty);
+
+    for (0..rs_ref.rows) |y| {
+        try testing.expectEqual(ref_dirty[y], dst_dirty[y]);
+        // raw page.Row flag bits copied verbatim (page.Row is a packed struct).
+        try testing.expectEqual(
+            @as(u64, @bitCast(ref_raws[y])),
+            @as(u64, @bitCast(dst_raws[y])),
+        );
+
+        const rc = ref_cells[y].slice();
+        const dc = dst_cells[y].slice();
+        try testing.expectEqual(rc.len, dc.len);
+
+        // The general-allocator cell list is independently owned (no aliasing).
+        if (rc.len > 0) {
+            try testing.expect(ref_cells[y].bytes != dst_cells[y].bytes);
+        }
+
+        for (0..rs_ref.cols) |x| {
+            const rcell = ref_cells[y].get(x);
+            const dcell = dst_cells[y].get(x);
+            // page.Cell is an untagged union; compare its observable scalar
+            // projections rather than the whole union.
+            try testing.expectEqual(rcell.raw.codepoint(), dcell.raw.codepoint());
+            try testing.expectEqual(rcell.raw.content_tag, dcell.raw.content_tag);
+            try testing.expectEqual(rcell.raw.wide, dcell.raw.wide);
+            try testing.expectEqual(rcell.raw.style_id, dcell.raw.style_id);
+            // Grapheme deep-duped into dst's OWN per-row arena.
+            if (rcell.raw.content_tag == .codepoint_grapheme) {
+                try testing.expectEqualSlices(u21, rcell.grapheme, dcell.grapheme);
+                if (rcell.grapheme.len > 0) {
+                    try testing.expect(rcell.grapheme.ptr != dcell.grapheme.ptr);
+                }
+            }
+        }
+    }
+
+    // Spot-check the known content survived the copy.
+    try testing.expectEqual('A', dst_cells[0].get(0).raw.codepoint());
+    try testing.expect(dst_cells[0].get(0).style.flags.bold);
+    try testing.expectEqual(0x1F468, dst_cells[0].get(2).raw.codepoint());
+    try testing.expectEqualSlices(u21, &.{0x200D}, dst_cells[0].get(2).grapheme);
 }
 
 test "cursor state in viewport" {
