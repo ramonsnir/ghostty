@@ -6,7 +6,7 @@ import AppKit
 struct TerminalRestorableTests {
     @Test
     func areYouForgettingToAddMigrationTests() {
-        #expect(TerminalRestorableState.version == 7)
+        #expect(TerminalRestorableState.version == 8)
         #expect(TerminalRestorableState.minimumVersion == 5)
 
         #expect(QuickTerminalRestorableState.version == 1)
@@ -108,6 +108,72 @@ struct TerminalRestorableTests {
         #expect(v7Generic.titleOverride == "tip")
         #expect(v7Generic.surfaceTree.contains(where: { $0.id.uuidString == "953CE952-D91D-4D36-AC72-9D0F1F6BCE73" }))
         #expect(v7Generic.surfaceTree.contains(where: { $0.id.uuidString == "D3223569-2E01-4BC5-9DB2-DBFC3AFF46D1" }))
+    }
+
+    /// (phase 2b) A v7 archive must still decode after the concrete `version`
+    /// was bumped 7 -> 8. The bump intentionally left `minimumVersion` at 5
+    /// (TerminalRestorable.swift:62), so the decode guard
+    /// `current >= minimumVersion` (TerminalRestorable.swift:38) keeps accepting
+    /// every v5/v7 archive — the survival event this project exists to support.
+    ///
+    /// `sessionID` is a per-`SurfaceView` Codable key (SurfaceView_AppKit.swift),
+    /// not part of `InternalState`, so it cannot be exercised through the
+    /// `MockView`-backed fixtures here; it is absent from every pre-2b archive
+    /// and therefore reads `nil` (spawn-fresh fallback) on those views. This
+    /// test pins the structural backward-compat: the v7 payload still restores
+    /// its tree/focus/decorations unchanged under the v8 binary.
+    @MainActor
+    @Test func v7ArchiveDecodesAfterV8Bump() throws {
+        #expect(TerminalRestorableState.version == 8)
+        #expect(TerminalRestorableState.minimumVersion == 5)
+
+        let v7 = try unarchive(v7Data, className: "CodableBridge<Terminal>", as: CodableBridge<DummyTerminalRestorableState>.self)
+            .value.internalState
+        #expect(v7.focusedSurface == "v7")
+        #expect(v7.effectiveFullscreenMode == .native)
+        #expect(v7.tabColor == .green)
+        #expect(v7.titleOverride == "1.3.0")
+        #expect(v7.surfaceTree.contains(where: { $0.id.uuidString == "5D580A7A-81EA-47C6-BB9A-AD4B1783E478" }))
+        #expect(v7.surfaceTree.contains(where: { $0.id.uuidString == "96EA1189-7482-41BC-A6CD-26E5190E4BFA" }))
+    }
+
+    /// (phase 2b) v8 fixture round-trip. We archive a v8 payload and decode it
+    /// back to prove the v8 code path produces a decodable archive.
+    ///
+    /// This is a runtime archive rather than a hardcoded base64 blob: the
+    /// `InternalState<MockView>` payload is byte-structurally identical at v7
+    /// and v8 (the new `sessionID` lives on `SurfaceView`, which `MockView` does
+    /// not model, and the `version` integer is encoded by `encode(with:)` on a
+    /// separate NSCoder key that is not part of this `CodableBridge` payload),
+    /// so a pre-generated v8 blob would be indistinguishable from `v7Data`.
+    /// Generating one through the real `SurfaceView` would require launching the
+    /// GUI host, which the fork's iteration rules forbid in this worktree.
+    @MainActor
+    @Test func restoreTerminalV8RoundTrip() throws {
+        let tree = try SplitTreeTests.makeHorizontalSplit()
+        let state = DummyTerminalRestorableState(
+            .init(
+                focusedSurface: "v8",
+                surfaceTree: tree.0,
+                effectiveFullscreenMode: .native,
+                tabColor: .green,
+                titleOverride: "v8"
+            )
+        )
+
+        let data = try archive(CodableBridge(state), className: "CodableBridge<Terminal>")
+        let decoded = try unarchive(
+            data,
+            className: "CodableBridge<Terminal>",
+            as: CodableBridge<DummyTerminalRestorableState>.self
+        ).value.internalState
+
+        #expect(decoded.focusedSurface == "v8")
+        #expect(decoded.effectiveFullscreenMode == .native)
+        #expect(decoded.tabColor == .green)
+        #expect(decoded.titleOverride == "v8")
+        #expect(decoded.surfaceTree.contains(where: { $0.id == tree.1.id }))
+        #expect(decoded.surfaceTree.contains(where: { $0.id == tree.2.id }))
     }
 }
 
