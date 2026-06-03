@@ -150,6 +150,54 @@ test "RenderState round-trip (serialize->deserialize->equal) host" {
     try testing.expect(found_grapheme);
 }
 
+test "host cursor-only move pushes (Slice 8): rows identical, cursor differs => printDiff==0 but cursorEql=false; identical => no push" {
+    const alloc = testing.allocator;
+
+    // A terminal with some content on one line. The cursor lands after the
+    // printed text.
+    var term = try terminalpkg.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer term.deinit(alloc);
+    try term.printString("hello world");
+
+    // Snapshot A: cursor at end-of-text.
+    var rs_a: RenderStateCore = .empty;
+    defer rs_a.deinit(alloc);
+    try rs_a.update(alloc, &term);
+    var snap_a = try RenderState.Snapshot.fromRenderState(alloc, &rs_a);
+    defer snap_a.deinit(alloc);
+
+    // Move the cursor LEFT several columns WITHOUT changing any cell content
+    // (the arrow-key case). Rows are byte-identical; only the cursor moves.
+    term.cursorLeft(7);
+
+    var rs_b: RenderStateCore = .empty;
+    defer rs_b.deinit(alloc);
+    try rs_b.update(alloc, &term);
+    var snap_b = try RenderState.Snapshot.fromRenderState(alloc, &rs_b);
+    defer snap_b.deinit(alloc);
+
+    // The cursor genuinely moved.
+    try testing.expect(snap_a.cursor_x != snap_b.cursor_x);
+
+    // No ROW changed: this is exactly the bug condition where the old gate
+    // (changed>0 or search_dirty) would have suppressed the frame.
+    const changed = try RenderState.printDiff(alloc, snap_a, snap_b);
+    try testing.expectEqual(@as(usize, 0), changed);
+
+    // The widened gate's cursor predicate fires: cursorEql is false, so
+    // `changed > 0 or force_push or cursor_changed` is true => frame pushes.
+    try testing.expect(!snap_a.cursorEql(snap_b));
+
+    // Negative / idle case: a snapshot compared against ITSELF (same rows,
+    // same cursor) has changed==0 AND cursorEql==true, so the gate stays
+    // closed — confirms a fully-idle identical snapshot pushes nothing.
+    var snap_b2 = try RenderState.Snapshot.fromRenderState(alloc, &rs_b);
+    defer snap_b2.deinit(alloc);
+    const changed_idle = try RenderState.printDiff(alloc, snap_b, snap_b2);
+    try testing.expectEqual(@as(usize, 0), changed_idle);
+    try testing.expect(snap_b.cursorEql(snap_b2));
+}
+
 test "host session shuts down on child exit with no trailing output" {
     // Regression test for the child-exit shutdown gap: a child that exits
     // delivers .child_exited ONLY via the surface mailbox (none.App.wakeup is
