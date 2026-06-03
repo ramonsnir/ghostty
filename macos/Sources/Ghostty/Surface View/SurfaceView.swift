@@ -651,11 +651,13 @@ extension Ghostty {
         /// the `.client` termio backend is in use, the surface attempts to
         /// reattach to this live host session instead of spawning fresh. A
         /// null/unknown/GC'd id degrades to a fresh spawn (today's layout-only
-        /// restore). This is currently Swift-side only: there is no
-        /// `ghostty_surface_config_s.session_id` field yet, so `withCValue`
-        /// does not forward it — the `.client` backend wiring (later task)
-        /// reads it from here. Persisted across restarts via SurfaceView's
-        /// Codable `sessionID` key.
+        /// restore). `withCValue` forwards it into
+        /// `ghostty_surface_config_s.session_id` (parsed String -> u64; 0 =
+        /// fresh), and the core threads it to the `.client` Attach (Slice 5a).
+        /// The LIVE host-assigned id is read back at encode time via
+        /// `ghostty_surface_session_id` (Slice 5b) so a freshly-spawned
+        /// session's id is what gets persisted. Stored as a String and
+        /// persisted across restarts via SurfaceView's Codable `sessionID` key.
         var sessionID: String?
 
         /// Wait after the command
@@ -721,6 +723,14 @@ extension Ghostty {
 
             // Set context
             config.context = context
+
+            // (phase 2b) Forward the persisted host session id (if any) so a
+            // restored `.client` surface reattaches an EXISTING host session
+            // instead of spawning fresh. 0 = none/fresh (the core maps 0 ->
+            // null via Client.sessionIdFromConfig). sessionID is stored as a
+            // String for Codable simplicity; parse it back to the u64 the C
+            // ABI + host expect (unparseable / nil -> 0 = fresh).
+            config.session_id = sessionID.flatMap { UInt64($0) } ?? 0
 
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in
