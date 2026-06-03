@@ -9,6 +9,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const terminalpkg = @import("../terminal/main.zig");
+const inputpkg = @import("../input.zig");
 const render = @import("../terminal/render.zig");
 const RenderStateCore = render.RenderState;
 
@@ -600,6 +601,58 @@ test "host protocol frame round-trip + partial read" {
         defer dec.deinit(alloc);
         try testing.expectEqual(@as(u64, 42), dec.session_id);
         try testing.expect(snap.eql(dec.snapshot));
+    }
+
+    // Slice 3c: Hover (GUI->host).
+    {
+        const mods = inputpkg.ctrlOrSuper(.{});
+        const orig: protocol.Hover = .{
+            .session_id = 77,
+            .viewport_x = 13,
+            .viewport_y = 4,
+            .mods = mods.int(),
+            .present = true,
+        };
+        const framed = try protocol.encodeFrame(alloc, .hover, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.hover, tag);
+        const decoded = try protocol.Hover.decode(alloc, payload.items);
+        try testing.expectEqual(orig, decoded);
+        // The mods byte round-trips back to the same Mods value.
+        const back: inputpkg.Mods = @bitCast(decoded.mods);
+        try testing.expect(back.equal(mods));
+    }
+
+    // Slice 3c: LinkFrame (host->GUI), non-empty + empty.
+    {
+        const cells = [_]protocol.LinkFrame.Cell{
+            .{ .x = 0, .y = 0 },
+            .{ .x = 5, .y = 2 },
+            .{ .x = 6, .y = 2 },
+        };
+        const orig: protocol.LinkFrame = .{ .session_id = 9, .cells = &cells };
+        const framed = try protocol.encodeFrame(alloc, .link_frame, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.link_frame, tag);
+        var decoded = try protocol.LinkFrame.decode(alloc, payload.items);
+        defer decoded.deinit(alloc);
+        try testing.expectEqual(@as(u64, 9), decoded.session_id);
+        try testing.expectEqual(@as(usize, 3), decoded.cells.len);
+        try testing.expectEqual(cells[0], decoded.cells[0]);
+        try testing.expectEqual(cells[1], decoded.cells[1]);
+        try testing.expectEqual(cells[2], decoded.cells[2]);
+    }
+    {
+        const orig: protocol.LinkFrame = .{ .session_id = 9, .cells = &.{} };
+        const framed = try protocol.encodeFrame(alloc, .link_frame, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.link_frame, tag);
+        var decoded = try protocol.LinkFrame.decode(alloc, payload.items);
+        defer decoded.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), decoded.cells.len);
     }
 }
 
@@ -1434,6 +1487,60 @@ test "host search produces row highlights on grid frame" {
     try testing.expectEqual(@as(usize, 2), countHighlights(snap, tag));
     _ = try expectHighlight(snap, tag, .{ 0, 2 });
     _ = try expectHighlight(snap, tag, .{ 8, 10 });
+}
+
+test "host hoverLink computes OSC8 link cells (Slice 3c)" {
+    // Feed a Session terminal an OSC8 hyperlink, then assert Session.hoverLink
+    // (which reuses RenderState.linkCells against the live host terminal)
+    // returns the link's cell set when the ctrl/super mods are held, and an
+    // empty set off the link / without mods. Synchronous, timing-independent.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 10, .rows = 5 });
+    defer session.destroy();
+
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var s = session.io.terminal.vtStream();
+        defer s.deinit();
+        // "LINK" (4 cells) at row 0, cols 0..3, all carrying the hyperlink.
+        s.nextSlice("\x1b]8;;http://example.com\x1b\\LINK\x1b]8;;\x1b\\");
+    }
+
+    const mods = inputpkg.ctrlOrSuper(.{});
+
+    // Hover at (0,0) WITH mods => the 4 link cells.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var cells = try session.hoverLink(alloc, .{ .x = 0, .y = 0 }, mods);
+        defer cells.deinit(alloc);
+        try testing.expectEqual(@as(usize, 4), cells.count());
+        try testing.expect(cells.contains(.{ .x = 0, .y = 0 }));
+        try testing.expect(cells.contains(.{ .x = 1, .y = 0 }));
+        try testing.expect(cells.contains(.{ .x = 2, .y = 0 }));
+        try testing.expect(cells.contains(.{ .x = 3, .y = 0 }));
+    }
+
+    // Hover at a NON-link cell => empty.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var cells = try session.hoverLink(alloc, .{ .x = 5, .y = 0 }, mods);
+        defer cells.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), cells.count());
+    }
+
+    // Hover ON the link but WITHOUT the link mods => empty (gate matches the
+    // GUI's .exec branch at generic.zig:1310).
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var cells = try session.hoverLink(alloc, .{ .x = 0, .y = 0 }, .{});
+        defer cells.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), cells.count());
+    }
 }
 
 test "host search selected highlight uses the selected tag" {

@@ -1294,14 +1294,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Get our OSC8 links we're hovering if we have a mouse.
                 // This requires terminal state because of URLs.
                 const links: terminal.RenderState.CellSet = osc8: {
-                    // Phase 2b: 3c will restore OSC8 hover links host-side
-                    // (host-computed LinkFrame). RenderState.linkCells
-                    // dereferences row.pin, which in a client mirror is the
+                    // Phase 2b / Slice 3c: under a client mirror,
+                    // RenderState.linkCells dereferences row.pin, which is the
                     // deliberately-poisoned `invalid_pin` sentinel and MUST NOT
-                    // be dereferenced — so under a mirror we resolve no links.
-                    // `usesLivePinPaths()` is the shared gate predicate (see
-                    // renderer/State.zig); the wiring test pins it too.
-                    if (!state.usesLivePinPaths()) break :osc8 .empty;
+                    // be dereferenced. So instead of computing OSC8 links here
+                    // we use the HOST-computed set (shipped on a LinkFrame,
+                    // decoded by termio.Client into a CellSet, threaded in via
+                    // `state.link_cells`). We CLONE it into the per-frame arena
+                    // so the downstream regex `renderCellMap` can extend it
+                    // without mutating the Client-owned set (and so its arena
+                    // lifetime matches the linkCells path). `usesLivePinPaths()`
+                    // is the shared gate predicate (see renderer/State.zig); the
+                    // wiring test pins it too. Regex links are added for BOTH
+                    // backends below (renderCellMap, against the mirror cells).
+                    if (!state.usesLivePinPaths()) {
+                        const host_set = state.link_cells orelse break :osc8 .empty;
+                        const cloned = host_set.clone(arena_alloc) catch |err| {
+                            log.warn("error cloning host OSC8 link set err={}", .{err});
+                            break :osc8 .empty;
+                        };
+                        break :osc8 cloned;
+                    }
 
                     // If our mouse isn't hovering, we have no links.
                     const vp = state.mouse.point orelse break :osc8 .empty;
