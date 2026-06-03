@@ -35,6 +35,7 @@ const testing = std.testing;
 
 const RenderState = @import("RenderState.zig");
 const terminalpkg = @import("../terminal/main.zig");
+const point = terminalpkg.point;
 
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
@@ -79,6 +80,14 @@ pub const FrameType = enum(u8) {
     // row.highlights — these two carry only the n/total status.
     search_total,
     search_selected,
+    // --- Slice 3c: host-side OSC8 hover links ---
+    // GUI->host: report the current hover viewport cell + mods + present flag.
+    // host->GUI: the OSC8 link-cell coordinate set for that hover (empty when
+    // no link / present=false / mods not held). Regex links stay GUI-side
+    // (renderCellMap matches viewport cell text against the mirror), so they
+    // are NOT carried on the wire — only OSC8 links, which require host pins.
+    hover,
+    link_frame,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -894,5 +903,130 @@ pub const SearchSelected = struct {
 
     pub fn deinit(self: *SearchSelected, _: Allocator) void {
         self.* = undefined;
+    }
+};
+
+// --- Slice 3c: host-side OSC8 hover links ---
+
+/// GUI->host: the current OSC8 hover state for a session. `viewport_x`/
+/// `viewport_y` is the viewport cell under the mouse; `mods` is the
+/// `inputpkg.Mods` byte representation (so the host can apply the same
+/// ctrl/super gate the GUI uses under `.exec`); `present` is false when the
+/// mouse has left the surface (or there is otherwise no hover), in which case
+/// the host replies with an empty LinkFrame.
+pub const Hover = struct {
+    session_id: u64,
+    viewport_x: u16 = 0,
+    viewport_y: u16 = 0,
+    /// `inputpkg.Mods.int()` (its u16 backing representation), shipped whole so
+    /// the host can `@bitCast` it back to `Mods` and apply the same
+    /// `ctrlOrSuper` gate the GUI uses under `.exec`. See Session.hoverLink.
+    mods: u16 = 0,
+    present: bool = false,
+
+    pub fn encode(self: Hover, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeInt(w, u16, self.viewport_x);
+        try writeInt(w, u16, self.viewport_y);
+        try writeInt(w, u16, self.mods);
+        try writeBool(w, self.present);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !Hover {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .viewport_x = try readInt(r, u16),
+            .viewport_y = try readInt(r, u16),
+            .mods = try readInt(r, u16),
+            .present = try readBool(r),
+        };
+    }
+
+    pub fn deinit(self: *Hover, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// host->GUI: the OSC8 link-cell coordinate set for the most recent Hover.
+/// Empty `cells` means "no OSC8 link here" (the GUI clears its OSC8 link
+/// overlay). Each cell is a (viewport x, viewport y) pair — the keys of the
+/// host's `RenderState.CellSet` (`render.zig:948`).
+pub const LinkFrame = struct {
+    session_id: u64,
+    /// Owned by this struct (freed by deinit). Decoded as a flat array of
+    /// (x:u16, y:u16) pairs.
+    cells: []const Cell = &.{},
+
+    pub const Cell = struct { x: u16, y: u16 };
+
+    pub fn encode(self: LinkFrame, alloc: Allocator) ![]u8 {
+        // Bound the cell count BEFORE narrowing to u32 (mirrors writeBytes'
+        // PCR-1 guard): a CellSet larger than u32 range would make the
+        // @intCast illegal behavior. Each cell is 4 bytes, so the cap is in
+        // cells, not bytes.
+        if (self.cells.len > MAX_FRAME_LEN / 4) return error.FrameTooLarge;
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeInt(w, u32, @intCast(self.cells.len));
+        for (self.cells) |c| {
+            try writeInt(w, u16, c.x);
+            try writeInt(w, u16, c.y);
+        }
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(alloc: Allocator, payload: []const u8) !LinkFrame {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        const session_id = try readInt(r, u64);
+        const count = try readInt(r, u32);
+        // Bound the claimed count against the bytes actually remaining BEFORE
+        // allocating (finding P6 / readBytes parallel): each cell is 4 bytes.
+        const remaining = fbs.buffer.len - fbs.pos;
+        if (@as(usize, count) * 4 > remaining) return error.InvalidFrame;
+        const cells = try alloc.alloc(Cell, count);
+        errdefer alloc.free(cells);
+        for (cells) |*c| {
+            c.x = try readInt(r, u16);
+            c.y = try readInt(r, u16);
+        }
+        return .{ .session_id = session_id, .cells = cells };
+    }
+
+    pub fn deinit(self: *LinkFrame, alloc: Allocator) void {
+        alloc.free(self.cells);
+        self.* = undefined;
+    }
+
+    /// Convert the host's `RenderState.CellSet` (the linkCells result) into a
+    /// freshly-allocated array of wire Cells. Caller owns the result. Used by
+    /// the host to build a LinkFrame from `Session.hoverLink`'s CellSet.
+    pub fn cellsFromSet(
+        alloc: Allocator,
+        set: *const terminalpkg.RenderState.CellSet,
+    ) ![]Cell {
+        // These are VIEWPORT coordinates from linkCells, so x < cols and
+        // y < viewport rows — both far below maxInt(u16). `Coordinate.y` is
+        // nonetheless a wider type (it can address history rows in other
+        // contexts), so guard the narrowing rather than `@intCast` (which would
+        // panic in safe builds) — defensively drop any coord that does not fit
+        // a u16 wire field instead of trusting the invariant blindly.
+        var out = try std.ArrayList(Cell).initCapacity(alloc, set.count());
+        errdefer out.deinit(alloc);
+        var it = set.iterator();
+        while (it.next()) |entry| {
+            const x = std.math.cast(u16, entry.key_ptr.x) orelse continue;
+            const y = std.math.cast(u16, entry.key_ptr.y) orelse continue;
+            out.appendAssumeCapacity(.{ .x = x, .y = y });
+        }
+        return out.toOwnedSlice(alloc);
     }
 };

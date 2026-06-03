@@ -102,6 +102,16 @@ render_state: render.RenderState = .empty,
 /// The flat input-mode mirror, updated wholesale from each ModeFrame.
 mode: protocol.ModeFrame = .{ .session_id = 0 },
 
+/// --- Slice 3c: host-computed OSC8 hover links ---
+///
+/// The current OSC8 link-cell set, decoded from the most recent LinkFrame. The
+/// host computes this (its pins are live) and ships the coordinate set; the
+/// GUI renderer reads it INSTEAD of `RenderState.linkCells` under `.client`
+/// (the mirror's pins are poisoned). Regex links are NOT here — they stay
+/// GUI-side via `Set.renderCellMap` against the mirror cell text. Held under
+/// `mutex` like `render_state`. Owned by this Client (freed in deinit).
+osc8_links: render.RenderState.CellSet = .empty,
+
 /// The renderer image-state mirror slot. Stays `.empty` this slice (no
 /// ImageFrame channel until Phase 3); exists so Slice 3 has the slot.
 images: imagepkg.State = .empty,
@@ -173,6 +183,7 @@ pub fn init(alloc: Allocator, cfg: Config) !Client {
 pub fn deinit(self: *Client) void {
     self.render_state.deinit(self.gpa);
     self.images.deinit(self.gpa);
+    self.osc8_links.deinit(self.gpa);
     self.reader.deinit(self.gpa);
     // `mode` is POD; `config` strings are caller-owned. Nothing else owned.
 }
@@ -474,6 +485,21 @@ pub fn handleFrame(
                 .exit_code = ce.exit_code,
                 .runtime_ms = ce.runtime_ms,
             };
+        },
+
+        .link_frame => {
+            // Replace the OSC8 link set wholesale. An empty `cells` clears it
+            // (the host sends empty when there is no link / the mods aren't
+            // held / present=false). Rebuild into a fresh map so a shrinking
+            // set drops stale coords. Keys are stored in `self.gpa` (the
+            // Client owns them; freed in deinit / on the next replace).
+            var lf = try protocol.LinkFrame.decode(alloc, payload);
+            defer lf.deinit(alloc);
+            self.osc8_links.clearRetainingCapacity();
+            try self.osc8_links.ensureUnusedCapacity(self.gpa, lf.cells.len);
+            for (lf.cells) |c| {
+                self.osc8_links.putAssumeCapacity(.{ .x = c.x, .y = c.y }, {});
+            }
         },
 
         // Everything else is either a request-direction frame (the GUI sends

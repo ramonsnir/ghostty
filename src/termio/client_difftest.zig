@@ -68,6 +68,8 @@ const HostRenderState = @import("../host/RenderState.zig");
 const Snapshot = HostRenderState.Snapshot;
 const protocol = @import("../host/protocol.zig");
 const Client = @import("Client.zig");
+const inputpkg = @import("../input.zig");
+const LinkSet = @import("../renderer/link.zig").Set;
 
 /// Per-fixture knobs, mirroring difftest.zig's Opts so the client test can
 /// reach the same comparison legs a pure VT byte stream cannot (findings DF-4):
@@ -1409,4 +1411,105 @@ fn clientBuildRowHighlight(
         .end = p.y + 1,
     });
     return .{ .chunks = chunks, .top_x = x0, .bot_x = x1 };
+}
+
+// --- Slice 3c: host-computed OSC8 link decode + GUI-side regex links ---
+
+test "client decodes LinkFrame into the OSC8 link CellSet (Slice 3c)" {
+    // The host computes OSC8 links (its pins are live) and ships the coordinate
+    // set on a LinkFrame; the Client decodes it into `osc8_links`. Prove a
+    // non-empty LinkFrame populates the right coords and an empty one clears it.
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // Non-empty: 4 contiguous cells (the "LINK" hyperlink shape from the host
+    // hoverLink test).
+    {
+        const cells = [_]protocol.LinkFrame.Cell{
+            .{ .x = 0, .y = 0 },
+            .{ .x = 1, .y = 0 },
+            .{ .x = 2, .y = 0 },
+            .{ .x = 3, .y = 0 },
+        };
+        const lf: protocol.LinkFrame = .{ .session_id = 1, .cells = &cells };
+        const framed = try protocol.encodeFrame(alloc, .link_frame, lf);
+        defer alloc.free(framed);
+        try client.reader.push(alloc, framed);
+        while (try client.reader.next(alloc)) |frame| {
+            try client.handleFrame(alloc, frame.tag, frame.payload);
+        }
+        try testing.expectEqual(@as(usize, 4), client.osc8_links.count());
+        try testing.expect(client.osc8_links.contains(.{ .x = 0, .y = 0 }));
+        try testing.expect(client.osc8_links.contains(.{ .x = 3, .y = 0 }));
+        try testing.expect(!client.osc8_links.contains(.{ .x = 4, .y = 0 }));
+    }
+
+    // Empty LinkFrame clears the set (host sends empty on no-link / no-mods).
+    {
+        const lf: protocol.LinkFrame = .{ .session_id = 1, .cells = &.{} };
+        const framed = try protocol.encodeFrame(alloc, .link_frame, lf);
+        defer alloc.free(framed);
+        try client.reader.push(alloc, framed);
+        while (try client.reader.next(alloc)) |frame| {
+            try client.handleFrame(alloc, frame.tag, frame.payload);
+        }
+        try testing.expectEqual(@as(usize, 0), client.osc8_links.count());
+    }
+}
+
+test "client regex links match against the mirror cell text (Slice 3c)" {
+    // Regex links stay GUI-side: Set.renderCellMap matches viewport CELL TEXT
+    // (no pin/Terminal deref), so it works against the client mirror. Build a
+    // mirror via the real decode pipeline (its pins are the poisoned sentinel),
+    // then run renderCellMap against it and confirm the matches land — proving
+    // the regex-stays-GUI-side claim end to end on a mirror.
+    const alloc = testing.allocator;
+
+    const cols: u16 = 10;
+    const rows: u16 = 3;
+    // Row 0: "1ABCD2EFGH"; row 1: "3IJKL" (same shape as link.zig's test).
+    const bytes = "1ABCD2EFGH\r\n3IJKL";
+
+    const framed = try buildFramed(alloc, cols, rows, bytes, .{});
+    defer alloc.free(framed);
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    try client.reader.push(alloc, framed);
+    while (try client.reader.next(alloc)) |frame| {
+        try client.handleFrame(alloc, frame.tag, frame.payload);
+    }
+
+    // The mirror's pins are the poisoned sentinel — renderCellMap must NOT
+    // touch them (it reads cell text only). Confirm the hazard is present.
+    {
+        const pins = client.render_state.row_data.slice().items(.pin);
+        for (pins) |p| {
+            try testing.expectEqual(
+                @as(usize, 0xdead_0000_dead_0000),
+                @intFromPtr(p.node),
+            );
+        }
+    }
+
+    var set = try LinkSet.fromConfig(alloc, &.{
+        .{ .regex = "AB", .action = .{ .open = {} }, .highlight = .{ .always = {} } },
+        .{ .regex = "EF", .action = .{ .open = {} }, .highlight = .{ .always = {} } },
+    });
+    defer set.deinit(alloc);
+
+    var result: render.RenderState.CellSet = .empty;
+    defer result.deinit(alloc);
+    // Run against the MIRROR (client.render_state), exactly as generic.zig:1341
+    // does for both backends. No mouse point / no mods needed for `.always`.
+    try set.renderCellMap(alloc, &result, &client.render_state, null, .{});
+
+    // "AB" at cols 1-2 row 0; "EF" at cols 6-7 row 0.
+    try testing.expect(result.contains(.{ .x = 1, .y = 0 }));
+    try testing.expect(result.contains(.{ .x = 2, .y = 0 }));
+    try testing.expect(!result.contains(.{ .x = 0, .y = 0 }));
+    try testing.expect(result.contains(.{ .x = 6, .y = 0 }));
+    try testing.expect(result.contains(.{ .x = 7, .y = 0 }));
 }

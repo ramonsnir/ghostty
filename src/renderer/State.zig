@@ -46,6 +46,26 @@ terminal: *terminalpkg.Terminal,
 /// until this is resolved.
 mirror: ?*terminalpkg.RenderState = null,
 
+/// Optional host-computed OSC8 link-cell set (Phase 2b / Slice 3c, `.client`
+/// backend). Under `.client` the mirror's pins are poisoned, so the GUI cannot
+/// run `RenderState.linkCells`; instead the host computes the OSC8 link cells
+/// (its pins are live) and ships them on a LinkFrame, the `termio.Client`
+/// decodes them into its `osc8_links` CellSet, and this points at that set.
+/// `updateFrame`'s osc8 block reads THIS instead of calling `linkCells` when
+/// `usesLivePinPaths()` is false (see `generic.zig`). Regex links are NOT here
+/// — `Set.renderCellMap` matches the mirror's cell text and runs for both
+/// backends.
+///
+/// `null` under `.exec` (the `linkCells` path is used, byte-for-byte
+/// unchanged). Like `mirror`, Slice 4 is what threads a non-null value through
+/// here from `Surface.zig`; today this is always null.
+///
+/// LOCK NOTE: same cross-domain caveat as `mirror` — the Client writes
+/// `osc8_links` under `Client.mutex` while the renderer reads it under
+/// `renderer_state.mutex`. Slice 4 must reconcile the two lock domains before
+/// wiring a non-null value (see the mirror field's SLICE-4-BLOCKING note).
+link_cells: ?*const terminalpkg.RenderState.CellSet = null,
+
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,

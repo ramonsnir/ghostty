@@ -26,6 +26,7 @@ const renderer = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const App = @import("../App.zig");
 const terminalpkg = @import("../terminal/main.zig");
+const inputpkg = @import("../input.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const internal_os = @import("../os/main.zig");
@@ -675,6 +676,41 @@ pub fn captureSnapshotLocked(self: *Session, alloc: Allocator) !RenderState.Snap
     }
 
     return try RenderState.Snapshot.fromRenderState(alloc, &rs);
+}
+
+/// --- Slice 3c: host-side OSC8 hover links ---
+///
+/// Compute the OSC8 hyperlink-cell set for a hover at viewport `(x, y)`,
+/// REUSING `RenderState.linkCells` (the same routine the GUI runs under
+/// `.exec`) against the host's live terminal — the OSC8 lookup dereferences
+/// row pins, which exist only on the host (the client mirror's pins are the
+/// poisoned sentinel). Returns an EMPTY set when the hover mods don't include
+/// the ctrl/super link gate, or when there is no link under the cell.
+///
+/// The caller MUST hold `render_mutex` (this reads the live terminal via
+/// `RenderState.update`, exactly like `captureSnapshotLocked`). The returned
+/// CellSet is owned by the caller and must be freed with `alloc`.
+///
+/// Regex links are intentionally NOT computed here: `Set.renderCellMap`
+/// matches viewport CELL TEXT (no pin/Terminal deref), so it stays GUI-side
+/// and already works against the client mirror (see generic.zig:1341).
+pub fn hoverLink(
+    self: *Session,
+    alloc: Allocator,
+    viewport: terminalpkg.point.Coordinate,
+    mods: inputpkg.Mods,
+) !RenderStateCore.CellSet {
+    // Apply the same mods gate the GUI uses under `.exec` (generic.zig:1310):
+    // OSC8 links only highlight while the ctrl/super link modifier is held.
+    if (!mods.equal(inputpkg.ctrlOrSuper(.{}))) return .empty;
+
+    var rs: RenderStateCore = .empty;
+    defer rs.deinit(alloc);
+    try rs.update(alloc, self.renderer_state.terminal);
+
+    // linkCells validates the viewport point against its own bounds and
+    // returns empty for out-of-range / non-link cells.
+    return try rs.linkCells(alloc, viewport);
 }
 
 /// Run the host render loop on the calling thread. Blocks until render_stop

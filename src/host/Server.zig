@@ -640,12 +640,18 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             }
         },
 
+        .hover => {
+            var hover = try protocol.Hover.decode(alloc, frame.payload);
+            defer hover.deinit(alloc);
+            try self.handleHover(conn, hover);
+        },
+
         .ping => {
             conn.writeFramed(.pong, protocol.Pong{});
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -980,6 +986,71 @@ fn onSearchEvent(ctx: *anyopaque, session: *Session, event: Session.SearchEvent)
             }),
         }
     }
+}
+
+/// --- Slice 3c: host-side OSC8 hover links ---
+///
+/// Compute the OSC8 link-cell set for the hover and reply to the REQUESTING
+/// `conn` (not all subscribers — each GUI has its own mouse) with a LinkFrame.
+/// `present=false` or a missing/torn-down session => an empty LinkFrame so the
+/// GUI deterministically clears its OSC8 overlay (never a silent no-op).
+///
+/// Lock order mirrors `.input`/`.set_search`: hold `registry_mutex` across the
+/// whole dereference (finding F3 TOCTOU) so a concurrent Close/deinit can't
+/// free the entry while we read its terminal. The link computation takes
+/// `render_mutex` (Session.hoverLink reads the live terminal via
+/// RenderState.update), which is a distinct lock; the canonical order is
+/// registry_mutex outermost, then per-session locks, so this adds no deadlock
+/// risk. The reply write happens AFTER we drop both locks (writeFramed can
+/// block on a slow peer; see the BLOCKING-WRITE CONTRACT).
+fn handleHover(self: *Server, conn: *Conn, hover: protocol.Hover) !void {
+    const alloc = self.alloc;
+
+    // NOTE (known-low, deliberate): unlike the brief `.input`/`.set_search`
+    // arms — which take `registry_mutex` only long enough to look up the entry
+    // and enqueue a mailbox message — this arm holds `registry_mutex` across the
+    // full `hoverLink` (RenderState.update + linkCells). Holding it keeps the
+    // SessionEntry alive against the teardown path (which removes from the
+    // registry under this same lock) without a separate liveness handshake. The
+    // compute is bounded (one viewport's link match) and hover is low-frequency
+    // (ctrl/super held), so the head-of-line cost to other registry lookups is
+    // accepted rather than risk a use-after-free by releasing the lock mid-
+    // compute. Revisit if hover ever becomes hot.
+    //
+    // Build the link cells under both locks, then release before writing.
+    var cells: []protocol.LinkFrame.Cell = &.{};
+    defer if (cells.len > 0) alloc.free(cells);
+
+    if (hover.present) compute: {
+        self.registry_mutex.lock();
+        defer self.registry_mutex.unlock();
+        const e = self.sessions.get(hover.session_id) orelse break :compute;
+        if (!sessionLive(e)) break :compute;
+
+        const mods: @import("../input.zig").Mods = @bitCast(hover.mods);
+        const viewport: @import("../terminal/main.zig").point.Coordinate = .{
+            .x = hover.viewport_x,
+            .y = hover.viewport_y,
+        };
+
+        e.session.render_mutex.lock();
+        defer e.session.render_mutex.unlock();
+        var set = e.session.hoverLink(alloc, viewport, mods) catch |err| {
+            log.warn("hoverLink failed err={}", .{err});
+            break :compute;
+        };
+        defer set.deinit(alloc);
+        cells = protocol.LinkFrame.cellsFromSet(alloc, &set) catch |err| {
+            log.warn("link cell projection failed err={}", .{err});
+            break :compute;
+        };
+    }
+
+    // Reply to the requester (empty cells == "no link / clear overlay").
+    conn.writeFramed(.link_frame, protocol.LinkFrame{
+        .session_id = hover.session_id,
+        .cells = cells,
+    });
 }
 
 /// Push a full GridFrame + ModeFrame to all subscribers immediately (used on
