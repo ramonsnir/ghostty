@@ -680,6 +680,24 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
+        // SLICE 3d (lock-domain reconciliation, plumbing-only): the `.client`
+        // backend, when Slice 4 selects it, must guard its mirror writes under
+        // the SAME `*std.Thread.Mutex` the renderer reads the mirror under
+        // (`self.renderer_state.mutex` == `mutex`, created at the top of this
+        // fn). That is threaded through `Client.Config.render_mutex` here.
+        //
+        // This config is BUILT (so the wiring is type-checked and exercises the
+        // `render_mutex` field) but NOT selected: `.exec` stays the only live
+        // backend (Surface still hardcodes it below). Slice 4's entire job at
+        // this site is to swap the exec backend tag for a client one built from
+        // `termio.Client.init(alloc, client_config)` — the shared-mutex
+        // plumbing is already in place and correct.
+        const client_config: termio.Client.Config = .{
+            .render_mutex = mutex,
+            // socket_path / session_id are filled by Slice 4's selection logic.
+        };
+        _ = client_config;
+
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,

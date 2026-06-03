@@ -34,16 +34,20 @@ terminal: *terminalpkg.Terminal,
 /// did before Phase 2b (byte-for-byte). Slice 4 is what threads a non-null
 /// mirror through here; today this is always null in Surface.zig.
 ///
-/// SLICE-4-BLOCKING LOCK INVARIANT: `updateFrame` reads this mirror (via
-/// `RenderState.copyFrom`) while holding `renderer_state.mutex`, but the
-/// `termio.Client` WRITES the mirror under its own `Client.mutex` (a different
-/// lock domain). That is a data race the moment a live mirror is wired in
-/// Slice 4. It is dormant today ONLY because this field is always null
-/// (`.exec`), so the copy path never runs. Slice 4 MUST reconcile the two lock
-/// domains before selecting `.client` — e.g. have the Client write the mirror
-/// under `renderer_state.mutex` (point both at one mutex), or have the renderer
-/// acquire `Client.mutex` for the `copyFrom`. Do NOT wire a non-null mirror
-/// until this is resolved.
+/// LOCK INVARIANT (RECONCILED in Slice 3d): `updateFrame` reads this mirror
+/// (via `RenderState.copyFrom`) while holding `renderer_state.mutex`. The
+/// `termio.Client` WRITES the mirror in `handleFrame` under the SAME
+/// `*std.Thread.Mutex` — Slice 3d had the Client guard its mirror under the
+/// renderer-state mutex (shared by pointer via `Client.Config.render_mutex` /
+/// `Client.setRenderMutex`), so writer (read thread) and reader (render thread)
+/// are fully serialized on one lock. There is no recursive-lock / lock-order
+/// inversion: `updateFrame` reads the mirror DIRECTLY and never calls a Client
+/// method while holding the mutex. What remains for Slice 4: (1) select
+/// `.client` at `Surface.zig` (it is hardcoded `.exec` today), (2) thread a
+/// non-null `mirror`/`link_cells` pointer through here from `Surface.zig`, and
+/// (3) ensure the shared mutex is set on the Client (the plumbing —
+/// `Client.Config.render_mutex = renderer_state.mutex` — is already in place in
+/// `Surface.init`). This field is still always null today (`.exec`).
 mirror: ?*terminalpkg.RenderState = null,
 
 /// Optional host-computed OSC8 link-cell set (Phase 2b / Slice 3c, `.client`
@@ -60,10 +64,10 @@ mirror: ?*terminalpkg.RenderState = null,
 /// unchanged). Like `mirror`, Slice 4 is what threads a non-null value through
 /// here from `Surface.zig`; today this is always null.
 ///
-/// LOCK NOTE: same cross-domain caveat as `mirror` — the Client writes
-/// `osc8_links` under `Client.mutex` while the renderer reads it under
-/// `renderer_state.mutex`. Slice 4 must reconcile the two lock domains before
-/// wiring a non-null value (see the mirror field's SLICE-4-BLOCKING note).
+/// LOCK NOTE (RECONCILED in Slice 3d): same as `mirror` — the Client writes
+/// `osc8_links` under the renderer-state mutex (shared by pointer), the SAME
+/// lock the renderer reads it under, so the two are serialized. Slice 4 only
+/// has to thread a non-null pointer through here (see the mirror field's note).
 link_cells: ?*const terminalpkg.RenderState.CellSet = null,
 
 /// The terminal inspector, if any. This will be null while the inspector

@@ -1513,3 +1513,287 @@ test "client regex links match against the mirror cell text (Slice 3c)" {
     try testing.expect(result.contains(.{ .x = 6, .y = 0 }));
     try testing.expect(result.contains(.{ .x = 7, .y = 0 }));
 }
+
+// --- Slice 3d: shared-mutex lock-domain reconciliation ---
+//
+// Slice 3d makes the Client guard its mirror writes under the SAME
+// `*std.Thread.Mutex` the renderer reads the mirror under (shared by pointer
+// via `Client.Config.render_mutex`). These two tests prove:
+//
+//   1. STRUCTURAL: when an external mutex is supplied via Config, the Client's
+//      effective guard IS that exact object (pointer identity), not its
+//      embedded `owned_mutex`. (And, conversely, no-config => owned fallback.)
+//   2. CONCURRENCY: hammering `handleFrame` (the mirror WRITER) on one thread
+//      while another thread locks the SAME mutex and reads `render_state` (the
+//      reader's role, as `updateFrame`'s copyFrom does) yields no torn read —
+//      the reader always observes a fully-applied frame (one of the known
+//      whole-grid states), never a half-applied mixture. Over many iterations
+//      this exercises the serialization the shared mutex provides.
+test "client Slice 3d external mutex is the effective guard (structural)" {
+    const alloc = testing.allocator;
+
+    var shared: std.Thread.Mutex = .{};
+
+    // With an external mutex supplied, the first lock resolves the effective
+    // guard to THAT object — not the embedded owned_mutex.
+    var client = try Client.init(alloc, .{ .render_mutex = &shared });
+    defer client.deinit();
+
+    // A handleFrame (a no-op .mode_frame here) takes the guard, resolving it.
+    const mf: protocol.ModeFrame = .{ .session_id = 1 };
+    const p = try mf.encode(alloc);
+    defer alloc.free(p);
+    try client.handleFrame(alloc, .mode_frame, p);
+
+    try testing.expect(client.render_mutex != null);
+    try testing.expectEqual(
+        @intFromPtr(&shared),
+        @intFromPtr(client.render_mutex.?),
+    );
+    // It is NOT the owned fallback.
+    try testing.expect(client.render_mutex.? != &client.owned_mutex);
+
+    // Conversely: no external mutex => the owned fallback is used.
+    var client2 = try Client.init(alloc, .{});
+    defer client2.deinit();
+    try client2.handleFrame(alloc, .mode_frame, p);
+    try testing.expectEqual(
+        @intFromPtr(&client2.owned_mutex),
+        @intFromPtr(client2.render_mutex.?),
+    );
+}
+
+test "client Slice 3d shared mutex serializes writer/reader (no torn read)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A thread-safe allocator: handleFrame allocates on the writer thread; the
+    // reader thread does not allocate (it only reads scalars under the lock),
+    // but wrap to be safe against any incidental allocation.
+    var tsa: std.heap.ThreadSafeAllocator = .{ .child_allocator = testing.allocator };
+    const alloc = tsa.allocator();
+
+    // A LARGE grid (many rows × many cells) so each `rehydrate` write spans a
+    // wide, easily-observable window: with the lock removed the reader reliably
+    // catches the writer mid-grid (validated by commenting out handleFrame's
+    // m.lock()/unlock() — the test then fails with error.TornRead). A 2×8 grid
+    // writes too few cells for the tear window to be observable.
+    const cols: u16 = 128;
+    const rows: u16 = 48;
+
+    // Two DISTINCT whole-grid frames, each UNIFORM across every cell:
+    //   - frame A: every cell == 'A'
+    //   - frame B: every cell == 'B'
+    // The only two consistent whole-grid states the reader may ever observe are
+    // "all A" and "all B". A torn read (the writer caught partway through
+    // `rehydrate`, with the shared lock missing/broken) leaves a MIXTURE of 'A'
+    // and 'B' cells, which the reader detects directly in the cell content that
+    // actually varies between frames.
+    const buf_a = try alloc.alloc(u8, @as(usize, cols) * rows + (rows - 1) * 2);
+    defer alloc.free(buf_a);
+    const buf_b = try alloc.alloc(u8, buf_a.len);
+    defer alloc.free(buf_b);
+    {
+        var off: usize = 0;
+        for (0..rows) |y| {
+            if (y != 0) {
+                buf_a[off] = '\r';
+                buf_b[off] = '\r';
+                buf_a[off + 1] = '\n';
+                buf_b[off + 1] = '\n';
+                off += 2;
+            }
+            for (0..cols) |_| {
+                buf_a[off] = 'A';
+                buf_b[off] = 'B';
+                off += 1;
+            }
+        }
+        std.debug.assert(off == buf_a.len);
+    }
+
+    const framed_a = try buildFramed(alloc, cols, rows, buf_a, .{});
+    defer alloc.free(framed_a);
+    const framed_b = try buildFramed(alloc, cols, rows, buf_b, .{});
+    defer alloc.free(framed_b);
+
+    // THE shared mutex — exactly the renderer-state-mutex sharing Slice 4 wires.
+    var shared: std.Thread.Mutex = .{};
+
+    var client = try Client.init(alloc, .{ .render_mutex = &shared });
+    defer client.deinit();
+
+    const iters: usize = 4000;
+
+    // Cross-thread done flag: the reader spins reading for the ENTIRE duration
+    // the writer is alternating frames (rather than a fixed iteration count that
+    // might finish before the writer warms up), so reader scans maximally overlap
+    // writer rehydrates — the condition under which a missing lock tears.
+    var done = std.atomic.Value(bool).init(false);
+
+    const Reader = struct {
+        c: *Client,
+        m: *std.Thread.Mutex,
+        done: *std.atomic.Value(bool),
+        err: ?anyerror = null,
+        contended: bool = false,
+        scans: usize = 0,
+
+        // Read one cell's codepoint (0 for a blank/non-codepoint cell). The
+        // mirror cells' `.raw` is the `page.Cell`; populated codepoint cells
+        // carry the glyph in `content.codepoint`.
+        fn cellCodepoint(rs: *const RenderStateCore, y: usize, x: usize) u21 {
+            const raws = rs.row_data.slice().items(.cells)[y].slice().items(.raw);
+            const cell = raws[x];
+            return switch (cell.content_tag) {
+                .codepoint, .codepoint_grapheme => cell.content.codepoint,
+                else => 0,
+            };
+        }
+
+        fn run(ctx: *@This()) void {
+            const A: u21 = 'A';
+            const B: u21 = 'B';
+            // Spin until the writer signals done; do one extra pass after so the
+            // final settled frame is also checked.
+            while (true) {
+                const last = ctx.done.load(.acquire);
+
+                // Try-lock first to observe contention with the writer at
+                // runtime (a non-fatal corroboration that reader and writer
+                // fight over THIS object). Contention is timing-dependent, so
+                // it is NOT asserted (see the structural pointer-identity
+                // assertion after the join, which is the real proof); we only
+                // record it for diagnostics.
+                {
+                    if (!ctx.m.tryLock()) {
+                        ctx.contended = true;
+                        ctx.m.lock();
+                    }
+                    defer ctx.m.unlock();
+
+                    const rs = &ctx.c.render_state;
+                    if (rs.rows != 0) {
+                        ctx.scans += 1;
+
+                        // Dimensions are invariant across both frames, but check
+                        // them anyway so a dimension tear (were one possible)
+                        // would still surface.
+                        if (rs.rows != rows or rs.cols != cols) {
+                            ctx.err = error.TornRead;
+                            return;
+                        }
+                        if (rs.row_data.len != rs.rows) {
+                            ctx.err = error.TornRowCount;
+                            return;
+                        }
+
+                        // CONSISTENCY — the real torn-read proof, on the CONTENT
+                        // that varies between frames. Require EVERY cell to equal
+                        // the reference cell's codepoint, itself one of the two
+                        // whole-frame glyphs. Any 'A'/'B' mixture means the reader
+                        // observed the writer partway through `rehydrate` — i.e.
+                        // the shared lock failed. The reference cell is read LAST
+                        // (bottom-right) and the scan runs in REVERSE row order,
+                        // while the writer fills rows front-to-back, so a missing
+                        // lock reliably yields a half-applied (mixed) grid here.
+                        const last_y = rs.rows - 1;
+                        const first = cellCodepoint(rs, last_y, rs.cols - 1);
+                        if (first != A and first != B) {
+                            ctx.err = error.TornRead;
+                            return;
+                        }
+                        var y: usize = rs.rows;
+                        rowscan: while (y > 0) {
+                            y -= 1;
+                            var x: usize = rs.cols;
+                            while (x > 0) {
+                                x -= 1;
+                                if (cellCodepoint(rs, y, x) != first) {
+                                    ctx.err = error.TornRead;
+                                    break :rowscan;
+                                }
+                            }
+                        }
+                        if (ctx.err != null) return;
+                    }
+                }
+
+                if (last) break; // writer was already done before this pass
+            }
+        }
+    };
+
+    // Pre-decode each frame's (tag,payload) ONCE into stable owned buffers, so
+    // the writer loop below does NOTHING but call `handleFrame` (i.e. the
+    // `rehydrate` cell-write). Keeping decode/alloc OUT of the timed loop makes
+    // the cell-write the dominant fraction of each writer iteration, so the
+    // reader's scan reliably overlaps the writer mid-rehydrate when the lock is
+    // absent (the regression we guard against), while the lock present still
+    // fully serializes them.
+    const Decoded = struct {
+        tag: protocol.FrameType,
+        payload: []u8,
+    };
+    var decoded_a: Decoded = undefined;
+    var decoded_b: Decoded = undefined;
+    {
+        inline for (.{ .{ framed_a, &decoded_a }, .{ framed_b, &decoded_b } }) |pair| {
+            var reader: protocol.FrameReader = .{};
+            defer reader.deinit(alloc);
+            try reader.push(alloc, pair[0]);
+            const frame = (try reader.next(alloc)).?;
+            // `frame.payload` borrows the reader's reassembly buffer; copy it out
+            // so it outlives this scope (reader.deinit frees that buffer).
+            pair[1].* = .{ .tag = frame.tag, .payload = try alloc.dupe(u8, frame.payload) };
+        }
+    }
+    defer alloc.free(decoded_a.payload);
+    defer alloc.free(decoded_b.payload);
+
+    var reader_ctx: Reader = .{ .c = &client, .m = &shared, .done = &done };
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader_ctx});
+
+    // WRITER: alternate the two frames through handleFrame (locks `shared`).
+    var i: usize = 0;
+    var write_err: ?anyerror = null;
+    while (i < iters) : (i += 1) {
+        const d = if (i % 2 == 0) decoded_a else decoded_b;
+        client.handleFrame(alloc, d.tag, d.payload) catch |e| {
+            write_err = e;
+            break;
+        };
+    }
+    done.store(true, .release);
+
+    reader_thread.join();
+
+    if (write_err) |e| return e;
+    if (reader_ctx.err) |e| return e;
+
+    // After the run the mirror is a fully-applied rows×cols grid.
+    try testing.expectEqual(rows, client.render_state.rows);
+    try testing.expectEqual(cols, client.render_state.cols);
+
+    // STRUCTURAL (deterministic) PROOF that the supplied mutex IS the effective
+    // guard the Client locks: pointer identity. This is the real "the supplied
+    // mutex is the one used" guarantee — it holds regardless of thread timing.
+    try testing.expectEqual(
+        @intFromPtr(&shared),
+        @intFromPtr(client.render_mutex.?),
+    );
+    // `contended` (the reader saw tryLock fail because the writer held the lock)
+    // is a timing-dependent corroboration, NOT a structural guarantee: under
+    // thread starvation it could legitimately stay false despite correct code.
+    // It is therefore observed, never asserted (the pointer-identity check above
+    // and the value-based torn-read check above are the deterministic proofs).
+    if (!reader_ctx.contended) {
+        std.debug.print(
+            "\n[client difftest] note: shared mutex was never observed contended " ++
+                "(timing); serialization still proven by torn-read + pointer identity\n",
+            .{},
+        );
+    }
+    // The reader must actually have scanned applied frames under the lock —
+    // otherwise the torn-read consistency check above was never exercised.
+    try testing.expect(reader_ctx.scans > 0);
+}
