@@ -681,11 +681,20 @@ pub fn init(
         // `Client.Config.render_mutex` here, so `renderMutex()` resolves to the
         // renderer-state mutex (no separate `setRenderMutex` call needed).
         const backend: termio.Backend = if (config.@"pty-host") |sock| backend: {
+            // Forward-map the surface-config session id (carried on the
+            // apprt surface from `Options.session_id`) into the Client's
+            // Attach: 0 => null (spawn a FRESH host session, today's
+            // behavior); non-zero => reattach to that existing host session.
+            // Read defensively so apprts that don't carry a session id
+            // (e.g. the bare `none` surface) still compile to "fresh".
+            const req_session_id: u64 = if (@hasField(
+                @TypeOf(rt_surface.*),
+                "session_id",
+            )) rt_surface.session_id else 0;
             const io_client = try termio.Client.init(alloc, .{
                 .socket_path = sock,
                 .render_mutex = mutex,
-                // FRESH session this slice (reattach-by-session is a follow-on).
-                .session_id = null,
+                .session_id = termio.Client.sessionIdFromConfig(req_session_id),
             });
             // Note: Client.init dupes socket_path into Client-owned memory
             // (freed in Client.deinit), so the value owns heap state immediately

@@ -421,6 +421,13 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// Host pty session to (re)attach to, carried from the surface init
+    /// Options so the core `Surface.init` can read it off `rt_surface` when
+    /// it builds the `.client` backend config. 0 means none/fresh (today's
+    /// behavior); non-zero requests reattach to that existing host session.
+    /// See `Options.session_id`. Only meaningful for the `.client` backend.
+    session_id: u64 = 0,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -457,6 +464,15 @@ pub const Surface = struct {
         /// Input to send to the command after it is started.
         initial_input: ?[*:0]const u8 = null,
 
+        /// Host pty session to (re)attach to. 0 (the default) means none:
+        /// spawn a FRESH host session (today's behavior). A non-zero value
+        /// requests that the `.client` backend attach to the existing host
+        /// session with this id instead of spawning a new one. Host session
+        /// ids start at 1 (see `src/host/Server.zig` `next_session_id = 1`),
+        /// so 0 is a safe "none/fresh" sentinel. Only consulted when the
+        /// `.client` backend is selected (`pty-host` set); ignored by `.exec`.
+        session_id: u64 = 0,
+
         /// Wait after the command exits
         wait_after_command: bool = false,
 
@@ -476,6 +492,10 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            // Carry the requested host session id through to the core
+            // Surface.init, which reads it off `rt_surface` when building the
+            // `.client` backend config (0 => fresh; non-zero => reattach).
+            .session_id = opts.session_id,
         };
 
         // Add ourselves to the list of surfaces on the app.
