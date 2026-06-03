@@ -68,6 +68,17 @@ pub const FrameType = enum(u8) {
     child_exited,
     ping,
     pong,
+    // --- Slice 3b: host-side search ---
+    // GUI->host search commands (host decodes + handles in 3b; the GUI sends
+    // them in Slice 4).
+    set_search,
+    search_nav,
+    clear_search,
+    // host->GUI search status events (host emits in 3b; the GUI consumes in
+    // Slice 4). The actual match HIGHLIGHTS ride the existing grid_frame as
+    // row.highlights — these two carry only the n/total status.
+    search_total,
+    search_selected,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -743,6 +754,145 @@ pub const ModeFrame = struct {
     }
 
     pub fn deinit(self: *ModeFrame, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+// --- Slice 3b: host-side search frames ---
+
+/// GUI->host: start/replace the search needle for a session. An empty `query`
+/// is equivalent to ClearSearch (the host tears down its search and clears
+/// highlights). `opts` is reserved for future search options (case sensitivity,
+/// regex, etc.) and is currently always 0.
+///
+/// `query` is the LAST field so the trailing-field `readBytes` invariant
+/// (see readBytes' doc) holds: a well-formed frame's query consumes ALL
+/// remaining payload bytes.
+pub const SetSearch = struct {
+    session_id: u64,
+    opts: u8 = 0,
+    /// Owned by this struct (freed by deinit).
+    query: []const u8 = &.{},
+
+    pub fn encode(self: SetSearch, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try w.writeByte(self.opts);
+        try writeBytes(w, self.query);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(alloc: Allocator, payload: []const u8) !SetSearch {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        const session_id = try readInt(r, u64);
+        const opts = try r.readByte();
+        const query = try readBytes(alloc, &fbs, r);
+        return .{ .session_id = session_id, .opts = opts, .query = query };
+    }
+
+    pub fn deinit(self: *SetSearch, alloc: Allocator) void {
+        alloc.free(self.query);
+        self.* = undefined;
+    }
+};
+
+/// GUI->host: move the search selection. `dir` is 0=next, 1=prev.
+pub const SearchNav = struct {
+    session_id: u64,
+    dir: u8 = 0,
+
+    pub fn encode(self: SearchNav, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try w.writeByte(self.dir);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !SearchNav {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .dir = try r.readByte(),
+        };
+    }
+
+    pub fn deinit(self: *SearchNav, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// GUI->host: clear the active search for a session (tear down the host search
+/// thread + drop highlights). Same shape as Detach/Close.
+pub const ClearSearch = SessionIdFrame(.clear_search);
+
+/// host->GUI: the total match count changed. `present`=0 means the count is
+/// null (search cleared); `present`=1 means `total` is meaningful. Mirrors the
+/// GUI's `?usize` search_total event.
+pub const SearchTotal = struct {
+    session_id: u64,
+    present: u8 = 0,
+    total: u64 = 0,
+
+    pub fn encode(self: SearchTotal, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try w.writeByte(self.present);
+        try writeInt(w, u64, self.total);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !SearchTotal {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .present = try r.readByte(),
+            .total = try readInt(r, u64),
+        };
+    }
+
+    pub fn deinit(self: *SearchTotal, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// host->GUI: the selected match index changed. `present`=0 means the selection
+/// is null; `present`=1 means `idx` is meaningful. Mirrors the GUI's `?usize`
+/// search_selected event.
+pub const SearchSelected = struct {
+    session_id: u64,
+    present: u8 = 0,
+    idx: u64 = 0,
+
+    pub fn encode(self: SearchSelected, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try w.writeByte(self.present);
+        try writeInt(w, u64, self.idx);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !SearchSelected {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .present = try r.readByte(),
+            .idx = try readInt(r, u64),
+        };
+    }
+
+    pub fn deinit(self: *SearchSelected, _: Allocator) void {
         self.* = undefined;
     }
 };

@@ -18,6 +18,7 @@ const Session = @import("Session.zig");
 const RenderState = @import("RenderState.zig");
 const protocol = @import("protocol.zig");
 const Server = @import("Server.zig");
+const Client = @import("../termio/Client.zig");
 
 test "host session spawn+diff" {
     const alloc = testing.allocator;
@@ -233,6 +234,48 @@ test "host Termio pushes only resize and reset_cursor_blink to renderer mailbox"
     // is dead code: its identifier appears exactly once (its own definition),
     // i.e. zero call sites.
     try testing.expectEqual(@as(usize, 1), countOccurrences(stream_src, "rendererMessageWriter"));
+}
+
+test "host search slice 3b leaves .exec GUI search untouched" {
+    // Slice 3b is purely ADDITIVE: the host GAINS search; the GUI KEEPS its
+    // own GUI-side search for .exec. Static guard that Surface.zig still owns
+    // its own terminal.search.Thread (the GUI search engine) and that the
+    // backend selection at the documented site is still hardcoded `.exec`.
+    // A regression that relocated the GUI search to the host, or flipped the
+    // Surface backend to .client, fails HERE.
+    const surface_src = @embedFile("../Surface.zig");
+
+    // The GUI still constructs its own search Thread state.
+    try testing.expect(std.mem.indexOf(u8, surface_src, "search: ?Search = null") != null);
+    try testing.expect(std.mem.indexOf(u8, surface_src, "state: terminal.search.Thread") != null);
+    // The GUI still spawns the search thread itself.
+    try testing.expect(std.mem.indexOf(u8, surface_src, "terminal.search.Thread.threadMain") != null);
+    // The Surface backend remains hardcoded .exec (never .client).
+    try testing.expect(std.mem.indexOf(u8, surface_src, ".backend = .{ .exec = io_exec }") != null);
+    try testing.expect(std.mem.indexOf(u8, surface_src, ".backend = .{ .client") == null);
+
+    // And the GUI renderer still GATES updateHighlightsFlattened behind the
+    // live-pin predicate (Slice 3a), i.e. the host did not un-gate it.
+    const generic_src = @embedFile("../renderer/generic.zig");
+    try testing.expect(std.mem.indexOf(u8, generic_src, "usesLivePinPaths() and") != null);
+
+    // Pin the GUI's private HighlightTag enum ordering (finding
+    // SEARCH-TAG-CONST-2): the host hardcodes search_match=0 /
+    // search_match_selected=1 (Session.zig:Session.highlight_tag_search_match*) because
+    // that enum is a private const nested in the Renderer(...) generic and
+    // cannot be imported. A reorder/insert there would silently remap
+    // host-produced row.highlights to the wrong color on the client with no
+    // compile error. Assert the declaration order so such a reorder fails HERE.
+    const tag_decl = "const HighlightTag = enum(u8) {";
+    const tag_at = std.mem.indexOf(u8, generic_src, tag_decl) orelse
+        return error.HighlightTagDeclMissing;
+    const sm = std.mem.indexOfPos(u8, generic_src, tag_at, "search_match") orelse
+        return error.SearchMatchVariantMissing;
+    const sms = std.mem.indexOfPos(u8, generic_src, tag_at, "search_match_selected") orelse
+        return error.SearchMatchSelectedVariantMissing;
+    // search_match (host const 0) must be declared before search_match_selected
+    // (host const 1).
+    try testing.expect(sm < sms);
 }
 
 /// Feed `framed` to a FrameReader one byte at a time, asserting `next` returns
@@ -464,6 +507,71 @@ test "host protocol frame round-trip + partial read" {
         const tag = try feedOneByteAtATime(alloc, framed, &payload);
         try testing.expectEqual(protocol.FrameType.mode_frame, tag);
         const dec = try protocol.ModeFrame.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+
+    // --- Slice 3b: search frames. ---
+
+    // SetSearch (owned query; trailing-field readBytes path). Test empty,
+    // typical, and a long query.
+    for ([_][]const u8{ "", "foo", "a very long search query " ** 8 }) |q| {
+        const orig: protocol.SetSearch = .{ .session_id = 21, .opts = 0, .query = q };
+        const framed = try protocol.encodeFrame(alloc, .set_search, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.set_search, tag);
+        var dec = try protocol.SetSearch.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+        try testing.expectEqual(orig.opts, dec.opts);
+        try testing.expectEqualStrings(orig.query, dec.query);
+    }
+
+    // SearchNav (next + prev).
+    for ([_]u8{ 0, 1 }) |dir| {
+        const orig: protocol.SearchNav = .{ .session_id = 22, .dir = dir };
+        const framed = try protocol.encodeFrame(alloc, .search_nav, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.search_nav, tag);
+        const dec = try protocol.SearchNav.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+
+    // ClearSearch.
+    {
+        const orig: protocol.ClearSearch = .{ .session_id = 23 };
+        const framed = try protocol.encodeFrame(alloc, .clear_search, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.clear_search, tag);
+        const dec = try protocol.ClearSearch.decode(alloc, payload.items);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+    }
+
+    // SearchTotal (present + null).
+    for ([_]protocol.SearchTotal{
+        .{ .session_id = 24, .present = 1, .total = 7 },
+        .{ .session_id = 24, .present = 0, .total = 0 },
+    }) |orig| {
+        const framed = try protocol.encodeFrame(alloc, .search_total, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.search_total, tag);
+        const dec = try protocol.SearchTotal.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+
+    // SearchSelected (present + null).
+    for ([_]protocol.SearchSelected{
+        .{ .session_id = 25, .present = 1, .idx = 3 },
+        .{ .session_id = 25, .present = 0, .idx = 0 },
+    }) |orig| {
+        const framed = try protocol.encodeFrame(alloc, .search_selected, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.search_selected, tag);
+        const dec = try protocol.SearchSelected.decode(alloc, payload.items);
         try testing.expectEqual(orig, dec);
     }
 
@@ -1217,4 +1325,480 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
         idx = pos + needle.len;
     }
     return count;
+}
+
+// --- Slice 3b: host-side search ---
+
+const PageList = terminalpkg.PageList;
+const Flattened = terminalpkg.highlight.Flattened;
+
+/// Build a single-row `Flattened` highlight covering active-screen row `y`,
+/// columns `[x0, x1]` (inclusive). Models the flattened highlight the real
+/// search engine produces for a one-row, contiguous match — the precise shape
+/// `updateHighlightsFlattened` consumes (one chunk whose [start,end) brackets
+/// the row, with top_x/bot_x as the column bounds). Caller owns the result
+/// (call `deinit`).
+fn buildRowHighlight(
+    alloc: std.mem.Allocator,
+    t: *terminalpkg.Terminal,
+    y: u16,
+    x0: u16,
+    x1: u16,
+) !Flattened {
+    const p = t.screens.active.pages.pin(.{ .active = .{ .x = x0, .y = y } }) orelse
+        return error.NoPin;
+    var chunks: std.MultiArrayList(Flattened.Chunk) = .empty;
+    errdefer chunks.deinit(alloc);
+    try chunks.append(alloc, .{
+        .node = p.node,
+        .serial = p.node.serial,
+        .start = p.y,
+        .end = p.y + 1,
+    });
+    return .{ .chunks = chunks, .top_x = x0, .bot_x = x1 };
+}
+
+/// Find a row in a Snapshot carrying a highlight with the given tag, and assert
+/// its range. Returns the matching row index.
+fn expectHighlight(
+    snap: RenderState.Snapshot,
+    tag: u8,
+    range: [2]u16,
+) !usize {
+    for (snap.row_data, 0..) |row, y| {
+        for (row.highlights) |h| {
+            if (h.tag == tag and h.range[0] == range[0] and h.range[1] == range[1]) {
+                return y;
+            }
+        }
+    }
+    return error.HighlightNotFound;
+}
+
+fn countHighlights(snap: RenderState.Snapshot, tag: u8) usize {
+    var n: usize = 0;
+    for (snap.row_data) |row| {
+        for (row.highlights) |h| {
+            if (h.tag == tag) n += 1;
+        }
+    }
+    return n;
+}
+
+test "host search produces row highlights on grid frame" {
+    // Deterministic injection test of captureSnapshotLocked's flatten step:
+    // store a synthetically-built Flattened (the exact shape the real search
+    // engine produces for a one-row match) on the Session, then assert
+    // captureSnapshotLocked projects it into row.highlights with the
+    // search_match tag and the right column range. No async search thread, so
+    // the assertion is timing-independent.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("foo bar foo");
+    }
+
+    // Build two "foo" highlights on row 0: cols [0,2] and [8,10].
+    var hl0 = try buildRowHighlight(alloc, &session.io.terminal, 0, 0, 2);
+    var hl1 = try buildRowHighlight(alloc, &session.io.terminal, 0, 8, 10);
+    // The stored matches must live in a Session-owned arena (captureSnapshot
+    // reads session.search_matches under render_mutex). Stash them like the
+    // callback would.
+    {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        const a = arena.allocator();
+        const matches = try a.alloc(Flattened, 2);
+        matches[0] = try hl0.clone(a);
+        matches[1] = try hl1.clone(a);
+        hl0.deinit(alloc);
+        hl1.deinit(alloc);
+        session.render_mutex.lock();
+        session.search_match_arena = arena;
+        session.search_matches = matches;
+        session.render_mutex.unlock();
+    }
+
+    var snap = blk: {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        break :blk try session.captureSnapshotLocked(alloc);
+    };
+    defer snap.deinit(alloc);
+
+    const tag = 0; // HighlightTag.search_match
+    try testing.expectEqual(@as(usize, 2), countHighlights(snap, tag));
+    _ = try expectHighlight(snap, tag, .{ 0, 2 });
+    _ = try expectHighlight(snap, tag, .{ 8, 10 });
+}
+
+test "host search selected highlight uses the selected tag" {
+    // captureSnapshotLocked applies the selected match with the
+    // search_match_selected tag (1) so it wins over the plain match tag (0),
+    // mirroring the GUI flatten order.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("foo bar foo");
+    }
+
+    var sel = try buildRowHighlight(alloc, &session.io.terminal, 0, 8, 10);
+    {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        const a = arena.allocator();
+        const cloned = try sel.clone(a);
+        sel.deinit(alloc);
+        session.render_mutex.lock();
+        session.search_selected_arena = arena;
+        session.search_selected = cloned;
+        session.render_mutex.unlock();
+    }
+
+    var snap = blk: {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        break :blk try session.captureSnapshotLocked(alloc);
+    };
+    defer snap.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 1), countHighlights(snap, 1));
+    _ = try expectHighlight(snap, 1, .{ 8, 10 });
+}
+
+test "host clear search removes highlights" {
+    // After highlights are stored, clearSearch (no active thread here) frees
+    // them, and a fresh captureSnapshotLocked yields zero search_match rows.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("foo bar foo");
+    }
+
+    var hl0 = try buildRowHighlight(alloc, &session.io.terminal, 0, 0, 2);
+    {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        const a = arena.allocator();
+        const matches = try a.alloc(Flattened, 1);
+        matches[0] = try hl0.clone(a);
+        hl0.deinit(alloc);
+        session.render_mutex.lock();
+        session.search_match_arena = arena;
+        session.search_matches = matches;
+        session.render_mutex.unlock();
+    }
+
+    // Sanity: present before clear.
+    {
+        var snap = blk: {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            break :blk try session.captureSnapshotLocked(alloc);
+        };
+        defer snap.deinit(alloc);
+        try testing.expectEqual(@as(usize, 1), countHighlights(snap, 0));
+    }
+
+    // clearSearch (no thread is active, so it just drops stored highlights +
+    // marks search_dirty + notifies the wakeup).
+    session.clearSearch();
+    try testing.expect(session.search_dirty);
+
+    {
+        var snap = blk: {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            break :blk try session.captureSnapshotLocked(alloc);
+        };
+        defer snap.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), countHighlights(snap, 0));
+    }
+}
+
+test "host search emits total/selected events over the socket" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hs.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "search.client" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                session_id = (try protocol.Attached.decode(alloc, payload.items)).session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // Make the child echo deterministic content so the search has matches.
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'NEEDLE_X NEEDLE_X\\n'\n",
+    });
+    {
+        // Wait until a grid frame carries the marker (so the content is on the
+        // emulator before we search).
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, "NEEDLE_X")) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+
+    // SetSearch -> expect a search_total with present=1, total>=1.
+    try clientSend(alloc, client, .set_search, protocol.SetSearch{
+        .session_id = session_id,
+        .query = "NEEDLE_X",
+    });
+    {
+        var i: usize = 0;
+        var got_total = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .search_total) continue;
+            const st = try protocol.SearchTotal.decode(alloc, payload.items);
+            try testing.expectEqual(session_id, st.session_id);
+            if (st.present == 1 and st.total >= 1) {
+                got_total = true;
+                break;
+            }
+        }
+        try testing.expect(got_total);
+    }
+
+    // SearchNav next -> expect a search_selected with present=1.
+    try clientSend(alloc, client, .search_nav, protocol.SearchNav{
+        .session_id = session_id,
+        .dir = 0,
+    });
+    {
+        var i: usize = 0;
+        var got_sel = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .search_selected) continue;
+            const ss = try protocol.SearchSelected.decode(alloc, payload.items);
+            try testing.expectEqual(session_id, ss.session_id);
+            if (ss.present == 1) {
+                got_sel = true;
+                break;
+            }
+        }
+        try testing.expect(got_sel);
+    }
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host search integration: real search thread flattens row highlights" {
+    // End-to-end through the REAL host search thread: feed content, drive
+    // setSearch with a matching needle, pump the render loop until the search
+    // callback has stored matches, then assert captureSnapshotLocked projects
+    // them. Bounded so a wiring regression fails fast rather than hanging.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+    try session.start();
+    defer session.stop();
+
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("alpha beta alpha");
+    }
+
+    try session.setSearch("alpha");
+
+    // Wait (bounded) for the search thread to feed + notify viewport_matches,
+    // which stores session.search_matches.
+    var found = false;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            if (session.search_matches.len > 0) found = true;
+        }
+        if (found) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(found);
+
+    var snap = blk: {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        break :blk try session.captureSnapshotLocked(alloc);
+    };
+    defer snap.deinit(alloc);
+
+    // Two "alpha" occurrences on row 0 -> two search_match highlights.
+    try testing.expect(countHighlights(snap, 0) >= 1);
+}
+
+test "host search to client mirror end-to-end (real thread -> wire -> rehydrate -> clear)" {
+    // Single continuous flow closing the seam that findings HSC-1 + the GATE
+    // caveat called out: a REAL host search thread produces row.highlights,
+    // those EXACT ranges ride a GridFrame across the wire, a real Client
+    // rehydrates them into its mirror, and a real clearSearch -> cleared
+    // GridFrame removes them from the mirror. No injected/synthetic Flattened
+    // and no locally-rebuilt projection: the Snapshot the client consumes is
+    // the one the genuine search thread produced.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+    try session.start();
+    defer session.stop();
+
+    // "needle" at cols [0,5] and [7,12] on row 0 (two occurrences).
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("needle needle");
+    }
+
+    try session.setSearch("needle");
+
+    // Bounded wait for the real search thread to store viewport matches.
+    var found = false;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            if (session.search_matches.len > 0) found = true;
+        }
+        if (found) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(found);
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // Capture the REAL search Snapshot and ship it as a GridFrame.
+    {
+        var snap = blk: {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            break :blk try session.captureSnapshotLocked(alloc);
+        };
+        defer snap.deinit(alloc);
+
+        // Host projection carried at least one search_match (tag 0).
+        try testing.expect(countHighlights(snap, 0) >= 1);
+
+        // Collect the exact ranges the host produced so we can assert the
+        // client mirror carries the SAME ranges (not just "some" highlight).
+        var host_ranges: std.ArrayList([2]u16) = .empty;
+        defer host_ranges.deinit(alloc);
+        for (snap.row_data) |row| {
+            for (row.highlights) |h| {
+                if (h.tag == Session.highlight_tag_search_match) {
+                    try host_ranges.append(alloc, h.range);
+                }
+            }
+        }
+        try testing.expect(host_ranges.items.len >= 1);
+
+        const gf: protocol.GridFrame = .{ .session_id = 1, .snapshot = snap };
+        const payload = try gf.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .grid_frame, payload);
+
+        // Every host-produced search_match range must be present in the mirror
+        // with the same tag, on the same row.
+        const mirror = client.render_state.row_data.slice();
+        const mirror_hls = mirror.items(.highlights);
+        for (host_ranges.items) |want| {
+            var saw = false;
+            for (mirror_hls) |hls| {
+                for (hls.items) |h| {
+                    if (h.tag == Session.highlight_tag_search_match and
+                        h.range[0] == want[0] and h.range[1] == want[1])
+                    {
+                        saw = true;
+                    }
+                }
+            }
+            try testing.expect(saw);
+        }
+    }
+
+    // ClearSearch over the REAL clear path: tears down the search thread and
+    // swaps matches out under render_mutex. The next captured Snapshot carries
+    // no search highlights, and that cleared GridFrame removes them from the
+    // mirror on reuse.
+    session.clearSearch();
+    {
+        var snap = blk: {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            break :blk try session.captureSnapshotLocked(alloc);
+        };
+        defer snap.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), countHighlights(snap, 0));
+
+        const gf: protocol.GridFrame = .{ .session_id = 1, .snapshot = snap };
+        const payload = try gf.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .grid_frame, payload);
+
+        const mirror = client.render_state.row_data.slice();
+        for (mirror.items(.highlights)) |hls| {
+            try testing.expectEqual(@as(usize, 0), hls.items.len);
+        }
+    }
 }
