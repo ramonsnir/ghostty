@@ -15,8 +15,14 @@
 //!   - `images`: a `renderer/image.zig` `State` mirror slot (stays `.empty`
 //!     this slice — no ImageFrame on the wire until Phase 3).
 //!
-//! All three are held under `mutex` (Slice 3 reads them under
-//! `renderer_state.mutex`).
+//! All three are held under the mutex returned by `renderMutex()` (see the
+//! `owned_mutex` / `render_mutex` fields). Slice 3d RECONCILED the lock
+//! domains: when the renderer-state mutex is supplied (via `Config.render_mutex`
+//! or `setRenderMutex`), the Client guards these mirrors under THAT SAME
+//! `*std.Thread.Mutex` the renderer reads them under, so writer (read-thread
+//! `handleFrame`) and reader (render-thread `updateFrame` `copyFrom`) are fully
+//! serialized on one lock. When no external mutex is supplied (standalone
+//! construction, e.g. the decode tests) an embedded `owned_mutex` is used.
 //!
 //! The DECODE path (`handleFrame`, driven off `FrameReader`) is unit-testable
 //! WITHOUT a live socket (see `client_difftest.zig`'s fidelity fixtures). The
@@ -90,10 +96,41 @@ config: Config,
 
 // --- the draw-source mirror (Slice 3 will let the renderer read this) ---
 
-/// Guards the three mirrors below. Slice 3 reads them under the renderer
-/// state mutex; this mutex protects against the read thread writing while a
-/// later reader is reading.
-mutex: std.Thread.Mutex = .{},
+/// Guards the three mirrors below.
+///
+/// SLICE 3d (lock-domain reconciliation): the mirrors (`render_state`,
+/// `osc8_links`, plus `mode`/`child_exited`) are READ by the renderer's
+/// `updateFrame` under the renderer-state mutex (`renderer.State.mutex`, a
+/// heap-owned `*std.Thread.Mutex` created in `Surface.init`) and WRITTEN by the
+/// read thread in `handleFrame`. To make those two the SAME lock, the Client
+/// guards every write through `renderMutex()`, which returns either an
+/// externally-supplied renderer-state mutex (`render_mutex`, set via
+/// `Config.render_mutex` or `setRenderMutex`) or, absent one, `&owned_mutex`.
+///
+/// POINTER-LIFETIME SAFETY: `render_mutex` is left `null` by `init()` (which
+/// returns a `Client` BY VALUE — taking `&self.owned_mutex` there would dangle
+/// once the value is moved to its final home). It is resolved in `renderMutex()`
+/// (by which point the Client is always behind a stable `*Client`), or set
+/// eagerly by `setRenderMutex` / `initTerminal` once the Client is at its final
+/// address. The owned fallback pointer is therefore only ever taken on a Client
+/// that already has its final address — never on the by-value `init()` return.
+///
+/// SINGLE-WRITER RESOLUTION (finding 3d-lifetime-1): `renderMutex()` resolves
+/// the field with a plain (non-atomic) write, so it must NOT be the first caller
+/// from two threads at once. `connectAndAttach` forces resolution
+/// (`_ = self.renderMutex();`) once, while still single-threaded, BEFORE spawning
+/// the read thread, so every later caller (`handleFrame` on the read thread,
+/// `childExitedAbnormally`) sees an already-resolved field and only reads it.
+/// The lazy path in `renderMutex()` is thus only ever hit pre-spawn (or in
+/// single-threaded standalone/decode tests) — it is NOT relied upon to be
+/// race-free under concurrency.
+owned_mutex: std.Thread.Mutex = .{},
+
+/// The effective guard pointer. `null` until first resolved by `renderMutex()`
+/// (or set by `setRenderMutex`). Points at either an external renderer-state
+/// mutex (shared with the renderer) or at `&self.owned_mutex`. See the
+/// pointer-lifetime note on `owned_mutex`.
+render_mutex: ?*std.Thread.Mutex = null,
 
 /// The rehydrated `terminal.RenderState` mirror — the draw source. Populated
 /// by `rehydrate` from decoded GridFrames.
@@ -169,6 +206,15 @@ pub const Config = struct {
     /// If non-null, attach to this existing session; otherwise spawn a fresh
     /// one (Attach.session_id == null).
     session_id: ?u64 = null,
+
+    /// SLICE 3d: the renderer-state mutex (`renderer.State.mutex`) the GUI
+    /// renderer reads the mirror under. When supplied, the Client guards its
+    /// mirror writes under THIS same lock, reconciling the writer/reader lock
+    /// domains (see the `owned_mutex` field). Heap-owned by `Surface.init` and
+    /// outlives the Client. `null` => the Client uses its embedded
+    /// `owned_mutex` instead (standalone construction / decode tests). Plumbed
+    /// from `Surface.init`; only exercised once Slice 4 selects `.client`.
+    render_mutex: ?*std.Thread.Mutex = null,
 };
 
 /// Initialize the client state. This will NOT connect; it only sets up the
@@ -178,6 +224,41 @@ pub fn init(alloc: Allocator, cfg: Config) !Client {
         .gpa = alloc,
         .config = cfg,
     };
+}
+
+/// Return the effective guard mutex, resolving it on first use.
+///
+/// SLICE 3d: prefers an externally-supplied renderer-state mutex
+/// (`render_mutex`, from `Config.render_mutex` / `setRenderMutex`); falls back
+/// to the embedded `owned_mutex`. The fallback address `&self.owned_mutex` is
+/// only taken here, on a `*Client` that already has its final address — never
+/// on the by-value `init()` return (see the `owned_mutex` field doc). All lock
+/// sites go through this so writer and reader share one lock once an external
+/// mutex is wired.
+///
+/// The first resolution performs a plain (non-atomic) field write, so it must
+/// run single-threaded: `connectAndAttach` forces it before the read thread is
+/// spawned (finding 3d-lifetime-1). All later concurrent callers hit the
+/// already-resolved fast path and only read.
+fn renderMutex(self: *Client) *std.Thread.Mutex {
+    if (self.render_mutex) |m| return m;
+    // Prefer a config-supplied external mutex; otherwise fall back to the
+    // embedded owned mutex. Resolved lazily here (rather than in `init`, which
+    // returns by value) so `&self.owned_mutex` is only ever taken on a stable
+    // `*Client` — never on the by-value `init()` return (no dangling pointer).
+    const m = self.config.render_mutex orelse &self.owned_mutex;
+    self.render_mutex = m;
+    return m;
+}
+
+/// Set the external renderer-state mutex the Client guards its mirror under
+/// (Slice 3d). Must be called with the Client at its FINAL address (the backend
+/// union slot, after `Termio.init` has moved it in) and BEFORE the read thread
+/// is spawned (`threadEnter`/`connectAndAttach`), so the very first
+/// `handleFrame` already locks the shared mutex. Idempotent re-points are fine
+/// as long as no lock is currently held through the old pointer.
+pub fn setRenderMutex(self: *Client, m: *std.Thread.Mutex) void {
+    self.render_mutex = m;
 }
 
 pub fn deinit(self: *Client) void {
@@ -194,6 +275,16 @@ pub fn deinit(self: *Client) void {
 pub fn initTerminal(self: *Client, term: *terminal.Terminal) void {
     self.grid_size = .{ .columns = term.cols, .rows = term.rows };
     self.screen_size = .{ .width = term.width_px, .height = term.height_px };
+
+    // SLICE 3d: seed the shared guard mutex from the config-supplied
+    // renderer-state mutex, if any. Safe to set here even though `initTerminal`
+    // runs on the pre-move backend copy in `Termio.init`: `render_mutex` is an
+    // EXTERNAL pointer (heap-owned by Surface), not into `self`, so it survives
+    // the union move into the final backend slot. The owned fallback is NOT
+    // taken here (that would dangle across the move); it is resolved lazily by
+    // `renderMutex()` on the final-address `*Client` when no external mutex is
+    // supplied.
+    if (self.config.render_mutex) |m| self.render_mutex = m;
 }
 
 pub fn threadEnter(
@@ -311,6 +402,19 @@ pub fn connectAndAttach(
         .session_id = self.config.session_id,
     });
 
+    // SLICE 3d (finding 3d-lifetime-1): RESOLVE the effective guard mutex now,
+    // while still single-threaded, BEFORE the read thread exists. `renderMutex()`
+    // resolves `render_mutex` lazily with a plain (non-atomic) field write; if
+    // that first write happened concurrently from the read thread (`handleFrame`)
+    // and another thread (`childExitedAbnormally`), it would be a data race on
+    // the field — benign by outcome (both compute the same pointer) but still UB.
+    // Forcing resolution here, before any concurrent caller can exist, guarantees
+    // the field is already set by the time those callers run, so they hit the
+    // `if (self.render_mutex) |m| return m;` fast path and never write. (When an
+    // external mutex was supplied via Config/setRenderMutex it is already set, so
+    // this is a no-op then; this matters for the owned-fallback path.)
+    _ = self.renderMutex();
+
     // Spawn the blocking read thread that drives the FrameReader. This is the
     // last fallible step; if it fails, the fd/pipe/stream errdefers above run
     // and (since no thread was created) close each fd exactly once.
@@ -425,8 +529,9 @@ pub fn childExitedAbnormally(
 ) !void {
     _ = gpa;
     _ = t;
-    self.mutex.lock();
-    defer self.mutex.unlock();
+    const m = self.renderMutex();
+    m.lock();
+    defer m.unlock();
     self.child_exited = .{ .exit_code = exit_code, .runtime_ms = runtime_ms };
 }
 
@@ -442,17 +547,20 @@ pub fn getProcessInfo(self: *Client, comptime info: ProcessInfo) ?ProcessInfo.Ty
 // --- DECODE entry point (unit-testable, NO socket) ---
 
 /// Handle one decoded frame: dispatch on the tag and fold it into the mirror
-/// state. Held under `self.mutex` (Slice 3's renderer reads the mirror under
-/// the renderer state mutex). `alloc` is used for any per-frame decode
-/// allocations and for the rehydrated RenderState's owned memory.
+/// state. Held under `renderMutex()` — the SAME `*std.Thread.Mutex` Slice 3's
+/// renderer reads the mirror under (Slice 3d lock-domain reconciliation), or
+/// the embedded `owned_mutex` when no external mutex was supplied. `alloc` is
+/// used for any per-frame decode allocations and for the rehydrated
+/// RenderState's owned memory.
 pub fn handleFrame(
     self: *Client,
     alloc: Allocator,
     tag: protocol.FrameType,
     payload: []const u8,
 ) !void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
+    const m = self.renderMutex();
+    m.lock();
+    defer m.unlock();
 
     switch (tag) {
         .grid_frame => {
@@ -470,9 +578,10 @@ pub fn handleFrame(
         },
 
         .attached => {
-            // Atomic store (even though we hold `self.mutex` here): the
+            // Atomic store (even though we hold the guard mutex here): the
             // UNLOCKED IO-thread readers in queueWrite/focusGained synchronize
-            // against this store, not against the mutex.
+            // against this store, not against the mutex. Independent of the
+            // Slice 3d shared-mutex change — the lock-free path is untouched.
             self.session_id.store(
                 (try protocol.Attached.decode(alloc, payload)).session_id,
                 .release,
@@ -554,7 +663,7 @@ fn rehydrateStyle(pod: HostRenderState.StylePod) terminal.Style {
 /// promote/reset; cells via the GENERAL allocator; graphemes arena-duped;
 /// highlights via the general allocator).
 ///
-/// Caller MUST hold `self.mutex`.
+/// Caller MUST hold the guard returned by `renderMutex()` (handleFrame does).
 ///
 /// ⚠️ SLICE-3-BLOCKING INVARIANT — client mirror pins are INVALID.
 /// `render.RenderState.Row.pin` (PageList.Pin, render.zig:181) is a

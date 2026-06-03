@@ -1220,10 +1220,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // AFTER we unlock) never aliases or mutates host-owned memory.
                 // Under .exec this is the unchanged `update(state.terminal)` path.
                 //
-                // SLICE-4-BLOCKING: this copyFrom reads the mirror under
-                // renderer_state.mutex, but termio.Client writes it under
-                // Client.mutex. Reconcile the two lock domains before wiring a
-                // live mirror (see the lock invariant on renderer.State.mirror).
+                // LOCK DOMAINS RECONCILED (Slice 3d): this copyFrom reads the
+                // mirror under renderer_state.mutex, and termio.Client writes it
+                // (in handleFrame) under the SAME mutex — shared by pointer via
+                // Client.Config.render_mutex, so writer/reader are serialized on
+                // one lock (see the lock invariant on renderer.State.mirror).
                 // Dormant today: state.mirror is always null under .exec.
                 if (state.mirror) |mirror| {
                     try self.terminal_state.copyFrom(self.alloc, mirror);
