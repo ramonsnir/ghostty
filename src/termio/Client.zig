@@ -136,6 +136,16 @@ render_mutex: ?*std.Thread.Mutex = null,
 /// by `rehydrate` from decoded GridFrames.
 render_state: render.RenderState = .empty,
 
+/// The GUI renderer's wakeup, copied from `Termio.renderer_wakeup` in
+/// `connectAndAttach`. After the read thread decodes a VISIBLE frame
+/// (GridFrame / LinkFrame) into the mirror, it `notify()`s this so the renderer
+/// thread draws PROMPTLY — exactly what `.exec` does via `queueRender`
+/// (Termio.zig:504/542/618). Without it the renderer only redraws on a slow
+/// fallback, which is the ~hundreds-of-ms input lag the first live smoke showed.
+/// `null` under standalone construction (decode tests), where there is no
+/// renderer to wake; the notify is then a no-op.
+renderer_wakeup: ?xev.Async = null,
+
 /// The flat input-mode mirror, updated wholesale from each ModeFrame.
 mode: protocol.ModeFrame = .{ .session_id = 0 },
 
@@ -333,6 +343,15 @@ pub fn threadEnter(
     // without standing up a renderer state / mailboxes / running loop. See the
     // T2 (connect-failure) and T3 (forced Attach-send-failure, finding #2)
     // regression tests in `client_difftest.zig`.
+    // Capture the GUI renderer's wakeup HERE (the real entry, where `io` is
+    // valid) rather than in `connectAndAttach` — the lifecycle tests call
+    // `connectAndAttach` directly with an `undefined` io (it historically
+    // touched only `client_td`), so dereferencing io there would crash them.
+    // Tests bypass threadEnter, leaving `renderer_wakeup` null => handleFrame's
+    // notify is a no-op for them. The read thread (spawned in connectAndAttach)
+    // notify()s this on each visible frame so the renderer draws promptly.
+    self.renderer_wakeup = io.renderer_wakeup;
+
     td.backend = .{ .client = undefined };
     try self.connectAndAttach(td.alloc, td.loop, &td.backend.client, io);
 }
@@ -608,6 +627,11 @@ pub fn handleFrame(
             var gf = try protocol.GridFrame.decode(alloc, payload);
             defer gf.deinit(alloc);
             try self.rehydrate(alloc, gf.snapshot);
+            // Wake the GUI renderer so it draws this frame promptly (else it
+            // only redraws on a slow fallback -> input lag). notify() is a quick
+            // cross-thread signal; doing it under the render mutex is a tiny
+            // window (the woken renderer briefly waits for this unlock).
+            if (self.renderer_wakeup) |*w| w.notify() catch {};
         },
 
         .mode_frame => {
@@ -647,6 +671,8 @@ pub fn handleFrame(
             for (lf.cells) |c| {
                 self.osc8_links.putAssumeCapacity(.{ .x = c.x, .y = c.y }, {});
             }
+            // Link highlights are visible state; wake the renderer (see grid_frame).
+            if (self.renderer_wakeup) |*w| w.notify() catch {};
         },
 
         // Everything else is either a request-direction frame (the GUI sends
