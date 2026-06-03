@@ -49,6 +49,7 @@ const xev = @import("../global.zig").xev;
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
+const apprt = @import("../apprt.zig");
 const internal_os = @import("../os/main.zig");
 const fastmem = @import("../fastmem.zig");
 const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
@@ -145,6 +146,18 @@ render_state: render.RenderState = .empty,
 /// `null` under standalone construction (decode tests), where there is no
 /// renderer to wake; the notify is then a no-op.
 renderer_wakeup: ?xev.Async = null,
+
+/// The surface mailbox, copied from `Termio.surface_mailbox` in `threadEnter`.
+/// When the read thread decodes a `.child_exited` frame (the host detected the
+/// child exit and sent a ChildExited protocol frame), it pushes a
+/// `child_exited` `apprt.surface.Message` onto this mailbox so `Surface.childExited`
+/// runs and the tab closes/shows-exited per `wait-after-command` — exactly what
+/// `.exec` does from its IO thread (Exec.zig:291). Without it the `.client`
+/// surface decodes+stores the exit but never delivers it, so the tab hangs.
+/// `null` under standalone construction (decode/lifecycle tests, which bypass
+/// `threadEnter`), where there is no surface to notify; the push is then a
+/// no-op — same pattern as `renderer_wakeup`.
+surface_mailbox: ?apprt.surface.Mailbox = null,
 
 /// The flat input-mode mirror, updated wholesale from each ModeFrame.
 mode: protocol.ModeFrame = .{ .session_id = 0 },
@@ -363,6 +376,15 @@ pub fn threadEnter(
     // notify is a no-op for them. The read thread (spawned in connectAndAttach)
     // notify()s this on each visible frame so the renderer draws promptly.
     self.renderer_wakeup = io.renderer_wakeup;
+
+    // Capture the surface mailbox HERE too (same reasoning as renderer_wakeup:
+    // `io` is valid only at the real entry; the lifecycle tests call
+    // `connectAndAttach` directly with an `undefined` io). Tests bypass
+    // threadEnter, leaving `surface_mailbox` null => handleFrame's child_exited
+    // push is a no-op for them. On a real .client surface the read thread pushes
+    // a `child_exited` apprt.surface.Message through this on the ChildExited
+    // frame so Surface.childExited closes the tab (mirrors .exec / Exec.zig:291).
+    self.surface_mailbox = io.surface_mailbox;
 
     td.backend = .{ .client = undefined };
     try self.connectAndAttach(td.alloc, td.loop, &td.backend.client, io);
@@ -668,6 +690,19 @@ pub fn handleFrame(
                 .exit_code = ce.exit_code,
                 .runtime_ms = ce.runtime_ms,
             };
+            // Deliver the exit to the surface so Surface.childExited runs and
+            // the tab closes/shows-exited per wait-after-command — exactly what
+            // .exec does from its IO thread (Exec.zig:291). Without this the
+            // .client tab HANGS on `exit`. `protocol.ChildExited`'s fields match
+            // `apprt.surface.Message.ChildExited` (exit_code: u32, runtime_ms:
+            // u64). No-op when `surface_mailbox` is null (decode/lifecycle tests
+            // bypass threadEnter), same as the renderer_wakeup notify above.
+            if (self.surface_mailbox) |mb| _ = mb.push(.{
+                .child_exited = .{
+                    .exit_code = ce.exit_code,
+                    .runtime_ms = ce.runtime_ms,
+                },
+            }, .{ .forever = {} });
         },
 
         .link_frame => {
@@ -1214,4 +1249,103 @@ test "client/config: reverse-map host-assigned session_id out of .client backend
 
     backend.client.session_id.store(std.math.maxInt(u64), .release);
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), read(&backend));
+}
+
+// Slice 5d exit-hang fix. Named to match the `client` filter. Asserts that
+// decoding a ChildExited protocol frame through `handleFrame`, with a
+// surface_mailbox set on the Client, DELIVERS a `child_exited`
+// apprt.surface.Message onto that mailbox — the bit that was missing and left
+// the .client tab hanging on `exit` (the .exec arm pushes the same message from
+// its IO thread, Exec.zig:291, which drives Surface.childExited -> close/
+// show-exited per wait-after-command). We use the smallest REAL mechanism: a
+// genuine `apprt.surface.Mailbox` over a real `App.Mailbox.Queue` (BlockingQueue)
+// backed by a no-op headless `apprt.App` (`.none` wakeup), then drain the queue
+// and assert the pushed message's tag + exit_code/runtime_ms round-trip the
+// frame. The `.surface` pointer is only STORED into the wrapped message (never
+// dereferenced by `Mailbox.push`), so a sentinel pointer is sufficient.
+test "client: child_exited frame delivers child_exited surface message" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const App = @import("../App.zig");
+    const CoreSurface = @import("../Surface.zig");
+
+    // A real app-side mailbox queue we can drain after the push.
+    const queue = try App.Mailbox.Queue.create(alloc);
+    defer queue.destroy(alloc);
+
+    // A no-op headless apprt App (its wakeup is a pure no-op under
+    // app_runtime=.none — the build artifact for tests). Heap-stable so the
+    // App.Mailbox can hold a *apprt.App to it.
+    var rt_app: apprt.App = undefined;
+
+    // The Surface pointer is only stored into the wrapped surface_message, never
+    // dereferenced by Mailbox.push, so a sentinel is fine here. This is the CORE
+    // `src/Surface.zig` type (what apprt.surface.Mailbox.surface is typed as),
+    // NOT the apprt-runtime Surface.
+    const surface_sentinel: *CoreSurface = @ptrFromInt(@alignOf(CoreSurface));
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    client.surface_mailbox = .{
+        .surface = surface_sentinel,
+        .app = .{ .rt_app = &rt_app, .mailbox = queue },
+    };
+
+    // Encode a real ChildExited frame payload and decode it through handleFrame.
+    const ce: protocol.ChildExited = .{
+        .session_id = 7,
+        .exit_code = 42,
+        .runtime_ms = 1234,
+    };
+    const payload = try ce.encode(alloc);
+    defer alloc.free(payload);
+    try client.handleFrame(alloc, .child_exited, payload);
+
+    // The stored mirror state is updated (decode half, unchanged behavior)...
+    try testing.expect(client.child_exited != null);
+    try testing.expectEqual(@as(u32, 42), client.child_exited.?.exit_code);
+    try testing.expectEqual(@as(u64, 1234), client.child_exited.?.runtime_ms);
+
+    // ...AND the surface message was DELIVERED (the 5d fix). Drain the queue
+    // and assert it's a child_exited carrying the frame's fields.
+    const msg = queue.pop() orelse return error.NoMessagePushed;
+    try testing.expect(msg == .surface_message);
+    try testing.expect(msg.surface_message.surface == surface_sentinel);
+    try testing.expect(msg.surface_message.message == .child_exited);
+    try testing.expectEqual(
+        @as(u32, 42),
+        msg.surface_message.message.child_exited.exit_code,
+    );
+    try testing.expectEqual(
+        @as(u64, 1234),
+        msg.surface_message.message.child_exited.runtime_ms,
+    );
+}
+
+// Slice 5d: with no surface_mailbox set (standalone/decode construction, the
+// state of every lifecycle/decode test which bypasses threadEnter), the
+// child_exited push is a pure no-op and decoding still updates the mirror —
+// proving the new push doesn't regress the headless path.
+test "client: child_exited frame with null surface_mailbox is a no-op push" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(?apprt.surface.Mailbox, null), client.surface_mailbox);
+
+    const ce: protocol.ChildExited = .{
+        .session_id = 3,
+        .exit_code = 0,
+        .runtime_ms = 5,
+    };
+    const payload = try ce.encode(alloc);
+    defer alloc.free(payload);
+
+    // No mailbox => push branch is skipped; decode still folds into the mirror.
+    try client.handleFrame(alloc, .child_exited, payload);
+    try testing.expect(client.child_exited != null);
+    try testing.expectEqual(@as(u32, 0), client.child_exited.?.exit_code);
+    try testing.expectEqual(@as(u64, 5), client.child_exited.?.runtime_ms);
 }
