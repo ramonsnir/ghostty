@@ -1615,6 +1615,16 @@ pub const CAPI = struct {
         return surface.core_surface.needsConfirmQuit();
     }
 
+    /// Returns the host-assigned pty-host session id for this surface, or 0 if
+    /// the surface is not attached to a pty host (the in-process `.exec`
+    /// backend, or a pty-host client that has not yet been assigned an id).
+    /// Slice 5b: the GUI reads this at restorable-state encode time to persist
+    /// the id and reattach after a restart. Reads a lock-free atomic, so it is
+    /// safe to call from the apprt/main thread.
+    export fn ghostty_surface_session_id(surface: *Surface) u64 {
+        return surface.core_surface.sessionId();
+    }
+
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
