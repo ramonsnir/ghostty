@@ -233,6 +233,18 @@ pub const Config = struct {
     render_mutex: ?*std.Thread.Mutex = null,
 };
 
+/// Forward-map a surface-config host session id (a `u64` carried from the
+/// apprt `Surface.Options.session_id` through the apprt surface) into a
+/// `Config.session_id` (the `?u64` the Client uses for its `Attach`):
+/// 0 => null (spawn a FRESH host session, today's behavior), any non-zero
+/// id => `Some(id)` (reattach to that existing host session). Host session
+/// ids start at 1 (`src/host/Server.zig` `next_session_id = 1`), so 0 is a
+/// safe "none/fresh" sentinel. Single source of truth for this sentinel
+/// mapping; `Surface.init` calls this when it builds the `.client` config.
+pub fn sessionIdFromConfig(id: u64) ?u64 {
+    return if (id == 0) null else id;
+}
+
 /// Initialize the client state. This will NOT connect; it only sets up the
 /// internal state necessary to start it later (mirrors `Exec.init`).
 ///
@@ -1124,3 +1136,38 @@ pub const ThreadData = struct {
         self.write_stream.deinit();
     }
 };
+
+// Slice 5a forward-mapping test. Named to match both the `client` and
+// `config` test filters. Asserts the surface-config host session id is
+// forward-mapped onto the Client's `Attach` session id with the 0 => fresh
+// sentinel: 0 => null (spawn a FRESH host session, unchanged behavior),
+// non-zero => Some(id) (reattach to that existing host session). This is
+// the pure mapping `Surface.init` applies when it builds the `.client`
+// backend config (`Client.sessionIdFromConfig(req_session_id)`), where
+// `req_session_id` is `rt_surface.session_id` == `Options.session_id` ==
+// the C `ghostty_surface_config_s.session_id`. The remaining wiring (the C
+// struct field is copied into apprt `Options`, then onto the apprt surface,
+// then read by `Surface.init`) is type-checked by the build and covered by
+// the Slice-5c human smoke (an actual reattach from the macOS GUI).
+test "client/config: forward-map surface session_id into Client.Config.session_id" {
+    const testing = std.testing;
+
+    // 0 is the none/fresh sentinel: maps to a null Attach session_id, i.e.
+    // spawn a fresh host session (today's behavior, .exec & .client alike).
+    try testing.expectEqual(@as(?u64, null), sessionIdFromConfig(0));
+
+    // Any non-zero id requests reattach to that exact host session.
+    try testing.expectEqual(@as(?u64, 1), sessionIdFromConfig(1));
+    try testing.expectEqual(@as(?u64, 42), sessionIdFromConfig(42));
+    try testing.expectEqual(
+        @as(?u64, std.math.maxInt(u64)),
+        sessionIdFromConfig(std.math.maxInt(u64)),
+    );
+
+    // And the mapped value lands on the actual Client.Config field the
+    // Attach is sent from (Client.zig connectAndAttach reads cfg.session_id).
+    const fresh: Config = .{ .session_id = sessionIdFromConfig(0) };
+    try testing.expectEqual(@as(?u64, null), fresh.session_id);
+    const reattach: Config = .{ .session_id = sessionIdFromConfig(7) };
+    try testing.expectEqual(@as(?u64, 7), reattach.session_id);
+}

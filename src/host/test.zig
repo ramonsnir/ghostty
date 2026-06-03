@@ -319,8 +319,15 @@ test "client backend selection seam (slice 4)" {
     try testing.expect(client_init > sel);
     try testing.expect(exec_init > client_init);
 
-    // FRESH session this slice (reattach is a follow-on).
-    try testing.expect(std.mem.indexOf(u8, surface_src, ".session_id = null") != null);
+    // Forward-mapped host session id (Slice 5a): the Client config's
+    // session_id is now derived from the surface-config session id via the
+    // shared sentinel mapping (0 => null/fresh, non-zero => reattach), so
+    // the reattach request can reach the Client.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        surface_src,
+        ".session_id = termio.Client.sessionIdFromConfig(req_session_id)",
+    ) != null);
     // Shared render mutex threaded into the Client config (Slice 3d).
     try testing.expect(std.mem.indexOf(u8, surface_src, ".render_mutex = mutex") != null);
 
