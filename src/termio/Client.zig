@@ -199,8 +199,14 @@ pub const ChildExited = struct {
 
 /// Configuration for the client backend: how to reach the ptyhost.
 pub const Config = struct {
-    /// AF_UNIX socket path of the ptyhost. Caller/arena-owned (mirrors the
-    /// string-ownership convention of `Exec.Config`).
+    /// AF_UNIX socket path of the ptyhost. The caller's slice is borrowed only
+    /// for the duration of `init`, which DUPES it into Client-owned memory (see
+    /// `init`/`deinit`); the stored copy in `Client.config.socket_path` is owned
+    /// by the Client and freed in `deinit`. This duping is required because the
+    /// IO/read thread reads `socket_path` later (in `connectAndAttach` ->
+    /// `connectUnix`), long after the borrowed source (e.g. a conditional-state
+    /// config clone in `Surface.init`) may have been freed — without the dupe
+    /// that is a use-after-free.
     socket_path: []const u8 = &.{},
 
     /// If non-null, attach to this existing session; otherwise spawn a fresh
@@ -219,10 +225,26 @@ pub const Config = struct {
 
 /// Initialize the client state. This will NOT connect; it only sets up the
 /// internal state necessary to start it later (mirrors `Exec.init`).
+///
+/// OWNERSHIP: `cfg.socket_path` is borrowed only for the duration of this call.
+/// We DUPE it into Client-owned memory (freed in `deinit`) so the stored copy
+/// outlives the caller's slice. The borrowed slice in `Surface.init` is often a
+/// conditional-state config clone freed when `Surface.init` returns, while the
+/// read thread reads `socket_path` LATER in `connectAndAttach`; storing the
+/// borrowed slice by value would be a use-after-free (`.exec` dodges this by
+/// duping its borrowed cwd in `Exec.init`). Duping empty (`&.{}`) is fine. The
+/// dupe survives the by-value return — it is heap memory, not a pointer into
+/// the returned `Client`.
 pub fn init(alloc: Allocator, cfg: Config) !Client {
+    const socket_path = try alloc.dupe(u8, cfg.socket_path);
+    errdefer alloc.free(socket_path);
+
+    var owned_cfg = cfg;
+    owned_cfg.socket_path = socket_path;
+
     return .{
         .gpa = alloc,
-        .config = cfg,
+        .config = owned_cfg,
     };
 }
 
@@ -266,7 +288,11 @@ pub fn deinit(self: *Client) void {
     self.images.deinit(self.gpa);
     self.osc8_links.deinit(self.gpa);
     self.reader.deinit(self.gpa);
-    // `mode` is POD; `config` strings are caller-owned. Nothing else owned.
+    // `config.socket_path` is OWNED (duped from the caller's borrowed slice in
+    // `init`); free it here. Freeing the empty-default dupe (`&.{}` -> a
+    // zero-length owned slice) is safe. `mode` is POD; the remaining `config`
+    // fields hold no owned heap memory.
+    self.gpa.free(self.config.socket_path);
 }
 
 /// Call to initialize the terminal state as necessary for this backend.

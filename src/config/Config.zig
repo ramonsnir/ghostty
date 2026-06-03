@@ -2907,6 +2907,19 @@ keybind: Keybinds = .{},
 /// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
 @"project-directory": RepeatableString = .{},
 
+/// (ramon fork / Phase 2b) AF_UNIX socket path of a running `ghostty-host`
+/// (`zig-out/bin/ghostty-host --listen=<sockpath>`). When set, a new surface
+/// connects to that host and runs its terminal emulation ON THE HOST,
+/// rendering live from the host-supplied mirror (the `.client` IO backend);
+/// keyboard, resize, and focus are forwarded to the host. When `null` (the
+/// default), surfaces use the in-process `.exec` backend that forks a shell —
+/// today's behavior, byte-for-byte unchanged.
+///
+/// This slice always spawns a FRESH session on the host (reattach-by-session
+/// is a follow-on). This is a fork-only key, so keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
+@"pty-host": ?[]const u8 = null,
+
 /// Sets the reporting format for OSC sequences that request color information.
 /// Ghostty currently supports OSC 10 (foreground), OSC 11 (background), and
 /// OSC 4 (256 color palette) queries, and by default the reported values
@@ -10659,6 +10672,33 @@ test "working-directory expands tilde" {
         &buf,
     ) catch "~/projects/ghostty";
     try testing.expectEqualStrings(expected, cfg.@"working-directory".?.value().?);
+}
+
+test "config pty-host default is null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.finalize();
+
+    // Default => .exec backend (null).
+    try testing.expect(cfg.@"pty-host" == null);
+}
+
+test "config pty-host parses a socket path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        "--pty-host=/tmp/ghostty-host.sock",
+    } };
+    try cfg.loadIter(alloc, &it);
+    try cfg.finalize();
+
+    try testing.expectEqualStrings("/tmp/ghostty-host.sock", cfg.@"pty-host".?);
 }
 
 test "changed" {

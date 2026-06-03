@@ -1797,3 +1797,61 @@ test "client Slice 3d shared mutex serializes writer/reader (no torn read)" {
     // otherwise the torn-read consistency check above was never exercised.
     try testing.expect(reader_ctx.scans > 0);
 }
+
+// --- Slice 4: socket_path ownership (use-after-free regression) ---
+
+test "client owns its socket_path (UAF regression)" {
+    // REGRESSION (Slice-4 finding #1): `Client.init` must DUPE its
+    // `cfg.socket_path` into Client-owned memory. In production the borrowed
+    // slice is frequently a conditional-state config CLONE in `Surface.init`
+    // that is freed (`defer config_.deinit()`) as soon as `Surface.init`
+    // returns — while the IO/read thread reads `socket_path` LATER, in
+    // `connectAndAttach` -> `connectUnix(self.config.socket_path)`. If the
+    // Client stored the borrowed slice by value, that later read would be a
+    // use-after-free (fires intermittently — only when conditional state is
+    // active, e.g. a light/dark theme).
+    //
+    // This proves the dupe is REAL and INDEPENDENT of the source buffer:
+    // construct the Client from a heap source slice, then FREE + SCRIBBLE that
+    // source before anything reads `config.socket_path`, and assert the stored
+    // copy is unchanged (distinct backing memory, still equal to the expected
+    // path — i.e. what `connectUnix` would see is valid). No socket needed.
+    const alloc = testing.allocator;
+
+    const expected = "/tmp/ghostty-ptyhost-uaf-regression.sock";
+
+    // Heap-allocate the SOURCE slice so we can free it out from under the
+    // Client (a stack literal could not model the conditional-state-clone
+    // lifetime this regression is about).
+    const source = try alloc.dupe(u8, expected);
+
+    var client = try Client.init(alloc, .{ .socket_path = source });
+    defer client.deinit();
+
+    // The stored copy must be DISTINCT backing memory (a real dupe, not the
+    // borrowed slice aliased by value).
+    try testing.expect(client.config.socket_path.ptr != source.ptr);
+    try testing.expectEqualStrings(expected, client.config.socket_path);
+
+    // Now FREE + SCRIBBLE the source, exactly as `Surface.init` frees the
+    // conditional-state clone before the read thread connects. (Scribble first,
+    // then free, so the bytes are clobbered regardless of allocator reuse.)
+    @memset(source, 0xAA);
+    alloc.free(source);
+
+    // The Client's OWN copy is untouched — `connectUnix` would still see the
+    // correct, valid path. Without the dupe, this read would be a UAF.
+    try testing.expectEqualStrings(expected, client.config.socket_path);
+}
+
+test "client owns empty default socket_path (no UAF, no double-free)" {
+    // The empty-default path (`&.{}`, the `Config` default when no `pty-host`
+    // is configured) must also be duped and freed safely: `alloc.dupe(u8,
+    // &.{})` yields a zero-length OWNED slice, and `deinit`'s `free` of it is a
+    // no-op-safe free. Proves the empty case neither leaks nor double-frees
+    // (the testing allocator would flag either).
+    const alloc = testing.allocator;
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(usize, 0), client.config.socket_path.len);
+}
