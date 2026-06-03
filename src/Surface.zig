@@ -2943,7 +2943,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3743,7 +3743,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -4878,11 +4878,36 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     return .{ .x = grid.x, .y = grid.y };
 }
 
+/// Centralized scroll seam (Slice 7). All apprt-thread scroll sites that used
+/// to call `self.io.terminal.scrollViewport(...)` directly route through here.
+///
+/// - .exec: scroll the LOCAL terminal synchronously, byte-for-byte identical to
+///   the prior direct call. PRECONDITION: the render_state mutex must be held
+///   (every direct call site already holds it — keystroke scroll-to-bottom,
+///   mouse-wheel scroll, scrollToBottom's documented precondition).
+/// - .client: the local terminal is the host-fed mirror and scrolling it is a
+///   silent no-op (the host overwrites it next GridFrame), so instead enqueue a
+///   `.scroll_viewport` message; the IO thread sends a `scroll_viewport` frame
+///   (Client.scrollViewport) and the scrolled viewport arrives on the next
+///   GridFrame. Fire-and-forget — no blocking round-trip on this thread. We pass
+///   `.locked` because callers hold the render_state mutex (queueMessage's
+///   MutexState governs only mailbox.send's lock handling, not the local
+///   terminal).
+fn scrollViewport(
+    self: *Surface,
+    scroll: terminal.Terminal.ScrollViewport,
+) void {
+    switch (self.io.backend) {
+        .exec => self.io.terminal.scrollViewport(scroll),
+        .client => self.queueIo(.{ .scroll_viewport = scroll }, .locked),
+    }
+}
+
 /// Scroll to the bottom of the viewport.
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
@@ -5338,6 +5363,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }, .unlocked);
         },
 
+        // Slice 7 NOTE: scroll_to_row (.row) and scroll_to_selection (.pin)
+        // operate on the local terminal's scroll positions (a raw row index, a
+        // selection pin), which have NO representation in the
+        // terminal.Terminal.ScrollViewport union (top/bottom/delta) and so are
+        // not expressible as a scroll_viewport frame. Under .client these scroll
+        // the host-fed mirror (ineffective — the host overwrites it next
+        // GridFrame), so they stay GUI-local for now. Carrying row/pin scrolls
+        // to the host is a future frame beyond Slice 7's viewport-only scope.
         .scroll_to_row => |n| {
             {
                 self.renderer_state.mutex.lock();

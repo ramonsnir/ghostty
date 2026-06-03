@@ -611,6 +611,36 @@ pub fn queueWrite(
     });
 }
 
+/// Send a `scroll_viewport` frame. The local mirror terminal is unused under
+/// .client, so scrolling it would be a silent no-op; instead the host repins
+/// ITS terminal (which owns the real scrollback) and the next GridFrame
+/// reflects the scrolled viewport. Fire-and-forget on the write stream — same
+/// pattern/thread as queueWrite/focusGained/resize (session_id via the same
+/// unlocked atomic load).
+pub fn scrollViewport(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+    scroll: terminal.Terminal.ScrollViewport,
+) !void {
+    try self.sendFrame(td, .scroll_viewport, protocol.ScrollViewport.fromTarget(
+        self.session_id.load(.acquire),
+        scroll,
+    ));
+}
+
+/// Send a `jump_to_prompt` frame. Same .client routing rationale as
+/// scrollViewport: the host jumps ITS terminal's viewport to the prompt.
+pub fn jumpToPrompt(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+    delta: isize,
+) !void {
+    try self.sendFrame(td, .jump_to_prompt, protocol.JumpToPrompt{
+        .session_id = self.session_id.load(.acquire),
+        .delta = @intCast(delta),
+    });
+}
+
 pub fn childExitedAbnormally(
     self: *Client,
     gpa: Allocator,

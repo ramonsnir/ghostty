@@ -722,6 +722,125 @@ test "host protocol frame round-trip + partial read" {
         defer decoded.deinit(alloc);
         try testing.expectEqual(@as(usize, 0), decoded.cells.len);
     }
+
+    // --- Slice 7: scroll-via-host frames. ---
+
+    // ScrollViewport: top / bottom / delta (positive + negative), each
+    // round-tripping the core ScrollViewport union via fromTarget/toTarget.
+    {
+        const targets = [_]terminalpkg.Terminal.ScrollViewport{
+            .top,
+            .bottom,
+            .{ .delta = 25 },
+            .{ .delta = -300 },
+        };
+        for (targets) |t| {
+            const orig = protocol.ScrollViewport.fromTarget(77, t);
+            const framed = try protocol.encodeFrame(alloc, .scroll_viewport, orig);
+            defer alloc.free(framed);
+            const tag = try feedOneByteAtATime(alloc, framed, &payload);
+            try testing.expectEqual(protocol.FrameType.scroll_viewport, tag);
+            const dec = try protocol.ScrollViewport.decode(alloc, payload.items);
+            try testing.expectEqual(orig, dec);
+            try testing.expectEqual(@as(u64, 77), dec.session_id);
+            // The recovered union must equal the original target.
+            const got = dec.toTarget().?;
+            try testing.expectEqual(t, got);
+        }
+    }
+    // ScrollViewport: an unknown kind byte decodes but toTarget() yields null
+    // (drop, not panic) — guards the host dispatch against a desynced peer.
+    {
+        const bad: protocol.ScrollViewport = .{ .session_id = 1, .kind = 99, .delta = 0 };
+        const framed = try protocol.encodeFrame(alloc, .scroll_viewport, bad);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.scroll_viewport, tag);
+        const dec = try protocol.ScrollViewport.decode(alloc, payload.items);
+        try testing.expectEqual(@as(?terminalpkg.Terminal.ScrollViewport, null), dec.toTarget());
+    }
+
+    // JumpToPrompt: positive + negative deltas.
+    for ([_]i64{ 1, -1, 5, -42 }) |d| {
+        const orig: protocol.JumpToPrompt = .{ .session_id = 13, .delta = d };
+        const framed = try protocol.encodeFrame(alloc, .jump_to_prompt, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.jump_to_prompt, tag);
+        const dec = try protocol.JumpToPrompt.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+}
+
+test "host scroll_viewport repins the host terminal -> next captured GridFrame differs (Slice 7)" {
+    const alloc = testing.allocator;
+
+    // Synchronous host-side test (no IO thread / no child): drive the host
+    // terminal directly, then exercise the EXACT scroll the Server dispatch +
+    // Termio/Exec backend apply on the host (decode a scroll_viewport frame ->
+    // toTarget() -> terminal.scrollViewport), and assert the captured snapshot's
+    // viewport changes. This is the host half of the contract: a scroll_viewport
+    // frame scrolls the host terminal and the next GridFrame reflects a
+    // different viewport.
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 10 });
+    defer session.destroy();
+
+    // Fill well past the 10-row viewport so there's real scrollback: 30 lines
+    // "L00".."L29". The viewport then shows the LAST 10 (L20..L29); the top of
+    // scrollback is L00.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var i: usize = 0;
+        while (i < 30) : (i += 1) {
+            var lb: [8]u8 = undefined;
+            const line = try std.fmt.bufPrint(&lb, "L{d:0>2}", .{i});
+            try session.io.terminal.printString(line);
+            session.io.terminal.carriageReturn();
+            try session.io.terminal.linefeed();
+        }
+    }
+
+    // Baseline snapshot: viewport at the bottom -> shows newest, NOT the oldest.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        try testing.expect(try snapshotContainsMarker(alloc, &snap, "L29"));
+        try testing.expect(!try snapshotContainsMarker(alloc, &snap, "L00"));
+    }
+
+    // Apply a scroll_viewport(top) frame EXACTLY as the host path does: decode
+    // the wire frame, recover the union via toTarget(), and scroll the host
+    // terminal (Termio.scrollViewport -> Exec.scrollViewport ultimately calls
+    // terminal.scrollViewport under the render mutex).
+    {
+        const orig = protocol.ScrollViewport.fromTarget(1, .top);
+        const framed = try protocol.encodeFrame(alloc, .scroll_viewport, orig);
+        defer alloc.free(framed);
+        var rdr: protocol.FrameReader = .{};
+        defer rdr.deinit(alloc);
+        try rdr.push(alloc, framed);
+        const f = (try rdr.next(alloc)).?;
+        const dec = try protocol.ScrollViewport.decode(alloc, f.payload);
+        const target = dec.toTarget().?;
+
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.scrollViewport(target);
+    }
+
+    // After scrolling to the top of scrollback the captured viewport must now
+    // show the OLDEST content and no longer the newest -> a different viewport.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        try testing.expect(try snapshotContainsMarker(alloc, &snap, "L00"));
+        try testing.expect(!try snapshotContainsMarker(alloc, &snap, "L29"));
+    }
 }
 
 test "host SurfaceEvent frame round-trip across representative variants (Slice 6)" {

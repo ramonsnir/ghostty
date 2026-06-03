@@ -579,6 +579,35 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             }
         },
 
+        .scroll_viewport => {
+            var sv = try protocol.ScrollViewport.decode(alloc, frame.payload);
+            defer sv.deinit(alloc);
+            // Drop an unknown kind byte from a desynced/buggy peer rather than
+            // panic on an invalid union tag.
+            if (sv.toTarget()) |target| {
+                // Hold registry_mutex across the dereference (finding F3
+                // TOCTOU), mirroring the .input/.resize arms. queueMessage is
+                // cheap + non-blocking.
+                self.registry_mutex.lock();
+                defer self.registry_mutex.unlock();
+                if (self.sessions.get(sv.session_id)) |e| {
+                    if (sessionLive(e)) e.session.scrollViewport(target);
+                }
+            } else {
+                log.warn("ignoring scroll_viewport with unknown kind={}", .{sv.kind});
+            }
+        },
+
+        .jump_to_prompt => {
+            var jp = try protocol.JumpToPrompt.decode(alloc, frame.payload);
+            defer jp.deinit(alloc);
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(jp.session_id)) |e| {
+                if (sessionLive(e)) e.session.jumpToPrompt(@intCast(jp.delta));
+            }
+        },
+
         .detach => {
             var detach = try protocol.Detach.decode(alloc, frame.payload);
             defer detach.deinit(alloc);

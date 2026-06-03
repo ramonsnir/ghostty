@@ -100,6 +100,15 @@ pub const FrameType = enum(u8) {
     // Surface drain handles them identically to `.exec`. child_exited and the
     // search counts have dedicated frames and are NOT carried here.
     surface_event,
+    // --- Slice 7: scroll-via-host ---
+    // GUI->host: repin the host terminal's viewport. Under .client the GUI's
+    // local terminal is unused (the renderer draws the host-fed mirror), so
+    // scroll must be a request to the host, which owns the real scrollback;
+    // the scrolled viewport arrives on the next grid_frame. scroll_viewport
+    // encodes terminal.Terminal.ScrollViewport (top/bottom/delta); jump_to_prompt
+    // carries a signed prompt delta.
+    scroll_viewport,
+    jump_to_prompt,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -581,6 +590,104 @@ pub const Focus = struct {
     }
 
     pub fn deinit(self: *Focus, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// GUI->host: scroll the session's viewport. Encodes
+/// `terminal.Terminal.ScrollViewport` as a 1-byte kind tag (0=top, 1=bottom,
+/// 2=delta) plus a signed i64 `delta` field. For top/bottom the delta is 0 and
+/// ignored; for delta it carries the (sign-extended) isize delta. The on-wire
+/// width is i64 so the frame is host-pointer-width independent (isize is 32-bit
+/// on some targets); the host re-narrows via @intCast.
+pub const ScrollViewport = struct {
+    session_id: u64,
+    /// 0=top, 1=bottom, 2=delta. Matches `kindFrom`/`toTarget` below.
+    kind: u8 = 0,
+    delta: i64 = 0,
+
+    pub const kind_top: u8 = 0;
+    pub const kind_bottom: u8 = 1;
+    pub const kind_delta: u8 = 2;
+
+    /// Build a frame from the core union (GUI/client side).
+    pub fn fromTarget(
+        session_id: u64,
+        target: terminalpkg.Terminal.ScrollViewport,
+    ) ScrollViewport {
+        return switch (target) {
+            .top => .{ .session_id = session_id, .kind = kind_top, .delta = 0 },
+            .bottom => .{ .session_id = session_id, .kind = kind_bottom, .delta = 0 },
+            .delta => |d| .{
+                .session_id = session_id,
+                .kind = kind_delta,
+                .delta = @intCast(d),
+            },
+        };
+    }
+
+    /// Recover the core union (host side). Returns null for an unknown kind
+    /// byte (a desynced/buggy peer) so the dispatcher can drop it rather than
+    /// panic.
+    pub fn toTarget(self: ScrollViewport) ?terminalpkg.Terminal.ScrollViewport {
+        return switch (self.kind) {
+            kind_top => .top,
+            kind_bottom => .bottom,
+            kind_delta => .{ .delta = @intCast(self.delta) },
+            else => null,
+        };
+    }
+
+    pub fn encode(self: ScrollViewport, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try w.writeByte(self.kind);
+        try writeInt(w, i64, self.delta);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !ScrollViewport {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .kind = try r.readByte(),
+            .delta = try readInt(r, i64),
+        };
+    }
+
+    pub fn deinit(self: *ScrollViewport, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// GUI->host: jump the session's viewport to a prompt by `delta` (negative =
+/// toward older prompts). i64 on the wire for host-pointer-width independence.
+pub const JumpToPrompt = struct {
+    session_id: u64,
+    delta: i64 = 0,
+
+    pub fn encode(self: JumpToPrompt, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeInt(w, i64, self.delta);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !JumpToPrompt {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .delta = try readInt(r, i64),
+        };
+    }
+
+    pub fn deinit(self: *JumpToPrompt, _: Allocator) void {
         self.* = undefined;
     }
 };
