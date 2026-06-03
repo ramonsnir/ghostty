@@ -1907,9 +1907,19 @@ extension Ghostty {
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
-            // (phase 2b) Only emitted when a host session id is present, so
-            // archives for `.exec`-backed surfaces are byte-for-byte unchanged.
-            try container.encodeIfPresent(sessionID, forKey: .sessionID)
+            // (phase 2b) Persist the host session id for reattach. Prefer the
+            // LIVE host-assigned id (Slice 5b's ghostty_surface_session_id) over
+            // the init-time `sessionID`, so a FRESHLY-spawned `.client` session
+            // (whose id the host assigned at attach) is the one that round-trips
+            // — not the nil/old value it started with. Falls back to the stored
+            // `sessionID` if the surface is gone or returns 0 (`.exec` /
+            // unattached). Only emitted when an id is present, so `.exec`
+            // archives stay byte-for-byte unchanged.
+            let liveSessionID: String? = surface.flatMap { s in
+                let id = ghostty_surface_session_id(s)
+                return id != 0 ? String(id) : nil
+            }
+            try container.encodeIfPresent(liveSessionID ?? sessionID, forKey: .sessionID)
         }
     }
 }
