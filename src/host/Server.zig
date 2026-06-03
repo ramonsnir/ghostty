@@ -192,8 +192,8 @@ pub const Conn = struct {
 
     /// BLOCKING-WRITE CONTRACT (findings SR-4 / SF2): the fd is a blocking
     /// SOCK_STREAM, so this loop blocks if the peer's send buffer fills (a slow
-    /// or stalled GUI). The four delivery paths (onRender / onChildExited /
-    /// pushFullFrames / deliverBufferedExit) call writeFramed -> writeAll while
+    /// or stalled GUI). The five delivery paths (onRender / onChildExited /
+    /// onSearchEvent / pushFullFrames / deliverBufferedExit) call writeFramed -> writeAll while
     /// holding `SessionEntry.mutex`, so a wedged subscriber head-of-line-blocks
     /// delivery to OTHER subscribers, stalls the session render thread, and
     /// delays teardownEntry (which needs e.mutex to clear subscribers before it
@@ -597,12 +597,55 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             try self.handleClose(conn, close.session_id);
         },
 
+        .set_search => {
+            var set = try protocol.SetSearch.decode(alloc, frame.payload);
+            defer set.deinit(alloc);
+            // `opts` is reserved (always 0 this slice); setSearch ignores it.
+            // Log if a peer sends a non-zero value so a future/buggy option
+            // doesn't pass unnoticed (finding SETSEARCH-OPTS-DROP-3).
+            if (set.opts != 0) log.debug(
+                "ignoring unsupported search opts={}",
+                .{set.opts},
+            );
+            // Hold registry_mutex across the dereference (finding F3 TOCTOU),
+            // mirroring the .input arm. setSearch is brief (lazy thread spawn +
+            // a mailbox push); the search WORK runs async on the search thread.
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(set.session_id)) |e| {
+                if (sessionLive(e)) {
+                    e.session.setSearch(set.query) catch |err|
+                        log.warn("setSearch failed err={}", .{err});
+                }
+            }
+        },
+
+        .search_nav => {
+            var nav = try protocol.SearchNav.decode(alloc, frame.payload);
+            defer nav.deinit(alloc);
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(nav.session_id)) |e| {
+                if (sessionLive(e)) e.session.navSearch(nav.dir);
+            }
+        },
+
+        .clear_search => {
+            var clear = try protocol.ClearSearch.decode(alloc, frame.payload);
+            defer clear.deinit(alloc);
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(clear.session_id)) |e| {
+                if (sessionLive(e)) e.session.clearSearch();
+            }
+        },
+
         .ping => {
             conn.writeFramed(.pong, protocol.Pong{});
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -772,6 +815,8 @@ fn spawnSession(self: *Server) !*SessionEntry {
     session.on_render = onRender;
     session.on_child_exited_ctx = e;
     session.on_child_exited = onChildExited;
+    session.on_search_event_ctx = e;
+    session.on_search_event = onSearchEvent;
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -908,6 +953,35 @@ fn onChildExited(ctx: *anyopaque, session: *Session, exit_code: u32, runtime_ms:
     }
 }
 
+/// Search-status callback (runs on the session's SEARCH thread). Frames a
+/// search_total / search_selected event to subscribers, mirroring onChildExited's
+/// subscriber-broadcast shape. The match HIGHLIGHTS ride the grid_frame; this
+/// carries only the n/total status. NOT buffered for reattach: a reattach gets a
+/// fresh full frame (with highlights) via pushFullFrames, and the GUI recomputes
+/// status from the live search state in Slice 4.
+fn onSearchEvent(ctx: *anyopaque, session: *Session, event: Session.SearchEvent) void {
+    _ = session;
+    const e: *SessionEntry = @ptrCast(@alignCast(ctx));
+
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    for (e.subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        switch (event) {
+            .total => |t| conn.writeFramed(.search_total, protocol.SearchTotal{
+                .session_id = e.session_id,
+                .present = @intFromBool(t != null),
+                .total = if (t) |v| @intCast(v) else 0,
+            }),
+            .selected => |s| conn.writeFramed(.search_selected, protocol.SearchSelected{
+                .session_id = e.session_id,
+                .present = @intFromBool(s != null),
+                .idx = if (s) |v| @intCast(v) else 0,
+            }),
+        }
+    }
+}
+
 /// Push a full GridFrame + ModeFrame to all subscribers immediately (used on
 /// (re)attach so a freshly-subscribed GUI gets state without waiting a tick).
 fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
@@ -923,7 +997,11 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
     const captured = blk: {
         session.render_mutex.lock();
         defer session.render_mutex.unlock();
-        const snap = RenderState.Snapshot.capture(session.alloc, &session.renderer_state) catch |err| {
+        // Route through captureSnapshotLocked (not the bare Snapshot.capture)
+        // so any active host search highlights are flattened into row.highlights
+        // for a freshly-(re)attached GUI too (no-op when no search is active).
+        // We already hold render_mutex here.
+        const snap = session.captureSnapshotLocked(session.alloc) catch |err| {
             log.warn("attach snapshot failed err={}", .{err});
             return;
         };

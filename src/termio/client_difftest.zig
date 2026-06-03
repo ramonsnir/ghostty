@@ -1298,3 +1298,115 @@ test "client resize emits a Resize frame whose host reconstruction == source Siz
     try testing.expectEqual(r.cols, reconstructed.grid().columns);
     try testing.expectEqual(r.rows, reconstructed.grid().rows);
 }
+
+// --- Slice 3b: host search highlights rehydrate into the client mirror ---
+//
+// The host's captureSnapshotLocked runs updateHighlightsFlattened on a real
+// RenderState to turn search-match pin-ranges into row.highlights, then projects
+// to a Snapshot. This test reproduces that exact projection (real
+// updateHighlightsFlattened on a live RenderState), pushes the Snapshot through
+// the wire (GridFrame.encode -> Client.handleFrame .grid_frame), and asserts the
+// search highlights land in the client mirror's row.highlights with the same
+// tag + range. This is the post-3a draw source the renderer reads, so it proves
+// the end-to-end host-search -> wire -> mirror chain that gives .client sessions
+// search highlights. A trailing ClearSearch-equivalent (a highlight-free frame)
+// then confirms the mirror highlights are removed.
+test "client rehydrates host search highlights" {
+    const alloc = testing.allocator;
+
+    const cols: u16 = 40;
+    const rows: u16 = 5;
+
+    // Live terminal with two "foo" occurrences on row 0.
+    var term = try buildTerminal(alloc, cols, rows, "foo bar foo", .{});
+    defer term.deinit(alloc);
+
+    // Build a real RenderState and inject search-match highlights exactly like
+    // the host's captureSnapshotLocked: one Flattened per "foo" (cols [0,2] and
+    // [8,10]) applied with the search_match tag (0).
+    var rs: RenderStateCore = .empty;
+    defer rs.deinit(alloc);
+    try rs.update(alloc, &term);
+
+    var hl0 = try clientBuildRowHighlight(alloc, &term, 0, 0, 2);
+    defer hl0.deinit(alloc);
+    var hl1 = try clientBuildRowHighlight(alloc, &term, 0, 8, 10);
+    defer hl1.deinit(alloc);
+    try rs.updateHighlightsFlattened(alloc, 0, &.{ hl0, hl1 });
+
+    var snap = try Snapshot.fromRenderState(alloc, &rs);
+    defer snap.deinit(alloc);
+
+    // Sanity: the host projection carried the highlights.
+    var host_hl_count: usize = 0;
+    for (snap.row_data) |row| host_hl_count += row.highlights.len;
+    try testing.expectEqual(@as(usize, 2), host_hl_count);
+
+    // Wire: GridFrame.encode -> Client.handleFrame .grid_frame -> mirror.
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    {
+        const gf: protocol.GridFrame = .{ .session_id = 1, .snapshot = snap };
+        const payload = try gf.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .grid_frame, payload);
+    }
+
+    // The mirror's row 0 must carry both highlights (tag 0, the same ranges).
+    {
+        const mirror = client.render_state.row_data.slice();
+        const hls = mirror.items(.highlights)[0];
+        try testing.expectEqual(@as(usize, 2), hls.items.len);
+        var saw_0 = false;
+        var saw_8 = false;
+        for (hls.items) |h| {
+            try testing.expectEqual(@as(u8, 0), h.tag);
+            if (h.range[0] == 0 and h.range[1] == 2) saw_0 = true;
+            if (h.range[0] == 8 and h.range[1] == 10) saw_8 = true;
+        }
+        try testing.expect(saw_0 and saw_8);
+    }
+
+    // ClearSearch removal: a fresh frame with NO highlights (what the host ships
+    // after clearSearch) must clear the mirror's row.highlights on reuse.
+    {
+        var rs2: RenderStateCore = .empty;
+        defer rs2.deinit(alloc);
+        try rs2.update(alloc, &term);
+        var snap2 = try Snapshot.fromRenderState(alloc, &rs2);
+        defer snap2.deinit(alloc);
+
+        const gf2: protocol.GridFrame = .{ .session_id = 1, .snapshot = snap2 };
+        const payload2 = try gf2.encode(alloc);
+        defer alloc.free(payload2);
+        try client.handleFrame(alloc, .grid_frame, payload2);
+
+        const mirror = client.render_state.row_data.slice();
+        for (mirror.items(.highlights)) |hls| {
+            try testing.expectEqual(@as(usize, 0), hls.items.len);
+        }
+    }
+}
+
+/// Build a single-row `Flattened` covering active-screen row `y`, cols [x0,x1]
+/// inclusive — the shape updateHighlightsFlattened consumes for a one-row match.
+fn clientBuildRowHighlight(
+    alloc: std.mem.Allocator,
+    t: *terminalpkg.Terminal,
+    y: u16,
+    x0: u16,
+    x1: u16,
+) !terminalpkg.highlight.Flattened {
+    const p = t.screens.active.pages.pin(.{ .active = .{ .x = x0, .y = y } }) orelse
+        return error.NoPin;
+    var chunks: std.MultiArrayList(terminalpkg.highlight.Flattened.Chunk) = .empty;
+    errdefer chunks.deinit(alloc);
+    try chunks.append(alloc, .{
+        .node = p.node,
+        .serial = p.node.serial,
+        .start = p.y,
+        .end = p.y + 1,
+    });
+    return .{ .chunks = chunks, .top_x = x0, .bot_x = x1 };
+}

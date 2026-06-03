@@ -32,6 +32,10 @@ const internal_os = @import("../os/main.zig");
 const Surface = @import("../Surface.zig");
 
 const RenderState = @import("RenderState.zig");
+/// The core terminal RenderState (the transient flatten target). Distinct from
+/// the host `RenderState` module above, which is the pointer-free Snapshot
+/// projection.
+const RenderStateCore = @import("../terminal/render.zig").RenderState;
 
 const log = std.log.scoped(.host_session);
 
@@ -44,6 +48,31 @@ pub const Options = struct {
     /// Fixed cell size in pixels (fabricated; only used for width_px/height_px).
     cell_width: u32 = 8,
     cell_height: u32 = 16,
+};
+
+/// The host's search thread + OS thread handle, mirroring `Surface.Search`
+/// (`Surface.zig:199-216`).
+const HostSearch = struct {
+    state: terminalpkg.search.Thread,
+    thread: std.Thread,
+
+    pub fn deinit(self: *HostSearch) void {
+        self.state.stop.notify() catch |err| log.err(
+            "error notifying host search thread to stop, may stall err={}",
+            .{err},
+        );
+        self.thread.join();
+        self.state.deinit();
+    }
+};
+
+/// A search status event surfaced to the Server so it can frame it to GUI
+/// subscribers. Mirrors the GUI's `search_total` / `search_selected` surface
+/// messages (`Surface.zig:1167-1178`). `null` totals/indices encode the
+/// "search cleared" state.
+pub const SearchEvent = union(enum) {
+    total: ?usize,
+    selected: ?usize,
 };
 
 alloc: Allocator,
@@ -144,6 +173,42 @@ unexpected_renderer_count: usize = 0,
 /// (via render_stop, including the child-exit path). Lets a test observe that
 /// shutdown actually fired without blocking on runRenderLoop.
 loop_stopped: bool = false,
+
+/// --- Slice 3b: host-side search ---
+///
+/// The host's own search engine, mirroring the GUI's `Surface.search`
+/// (`Surface.zig:174`). Created lazily on the first non-empty `setSearch`,
+/// parented to `self.io.terminal` and sharing `self.render_mutex` (the same
+/// lock `renderTick`/capture take), so its `feed`/`select` are serialized
+/// against snapshot capture exactly as on the GUI side. Torn down by
+/// `clearSearch`/empty `setSearch`. Fork/host-only: gives `.client` sessions
+/// search highlights without touching `.exec`'s GUI-side search.
+search: ?HostSearch = null,
+
+/// Deep-cloned viewport matches from the last `viewport_matches` callback,
+/// backed by `search_match_arena`. Read under `render_mutex` by
+/// `captureSnapshotLocked` to flatten into the transient RenderState. Callback
+/// memory is valid only during the call (Thread.zig:483-484), so we clone like
+/// the GUI does (`Surface.zig:1458-1459`).
+search_match_arena: ?std.heap.ArenaAllocator = null,
+search_matches: []terminalpkg.highlight.Flattened = &.{},
+
+/// Deep-cloned selected match from the last `selected_match` callback, backed
+/// by `search_selected_arena`. Applied with the `search_match_selected` tag so
+/// it wins over plain matches (matching the GUI flatten order in generic.zig).
+search_selected_arena: ?std.heap.ArenaAllocator = null,
+search_selected: ?terminalpkg.highlight.Flattened = null,
+
+/// Set by the search callback to force the next renderTick to push a frame even
+/// when no cells changed (a pure search command mutates highlights, not cells).
+/// Cleared after the push in renderTick.
+search_dirty: bool = false,
+
+/// Phase 3b search status events. Set by the Server so search_total/
+/// search_selected can be framed to subscribers. Invoked from the host search
+/// callback (which runs on the search thread). null in the standalone path.
+on_search_event_ctx: ?*anyopaque = null,
+on_search_event: ?*const fn (ctx: *anyopaque, self: *Session, event: SearchEvent) void = null,
 
 started: bool = false,
 
@@ -346,6 +411,272 @@ pub fn sendInput(self: *Session, data: []const u8) !void {
     );
 }
 
+/// --- Slice 3b: host-side search ---
+///
+/// HighlightTag values MUST match the GUI renderer's `HighlightTag` enum
+/// (`src/renderer/generic.zig:234-236`) so `rebuildRow` maps the host-produced
+/// row.highlights identically on the client (search_match -> .search,
+/// search_match_selected -> .search_selected).
+pub const highlight_tag_search_match: u8 = 0;
+pub const highlight_tag_search_match_selected: u8 = 1;
+
+/// Start or replace the search needle. An empty `query` clears the search (same
+/// as `clearSearch`). Mirrors `Surface.zig:4968-5013`. The search thread is
+/// created lazily, parented to this Session's terminal and sharing
+/// `render_mutex`.
+pub fn setSearch(self: *Session, query: []const u8) !void {
+    if (query.len == 0) {
+        self.clearSearch();
+        return;
+    }
+
+    const s: *HostSearch = if (self.search) |*s| s else init: {
+        self.search = .{
+            .state = try .init(self.alloc, .{
+                .mutex = &self.render_mutex,
+                .terminal = &self.io.terminal,
+                .event_cb = &hostSearchCallback,
+                .event_userdata = self,
+            }),
+            .thread = undefined,
+        };
+        const s: *HostSearch = &self.search.?;
+        errdefer {
+            s.state.deinit();
+            self.search = null;
+        }
+
+        s.thread = try .spawn(
+            .{},
+            terminalpkg.search.Thread.threadMain,
+            .{&s.state},
+        );
+        s.thread.setName("host-search") catch {};
+
+        break :init s;
+    };
+
+    _ = s.state.mailbox.push(
+        .{ .change_needle = try .init(self.alloc, query) },
+        .forever,
+    );
+    s.state.wakeup.notify() catch {};
+}
+
+/// Navigate the search selection. `dir` 0=next, 1=prev. No-op if no active
+/// search. Mirrors `Surface.zig:5015-5025`.
+pub fn navSearch(self: *Session, dir: u8) void {
+    const s: *HostSearch = if (self.search) |*s| s else return;
+    _ = s.state.mailbox.push(
+        .{ .select = if (dir == 0) .next else .prev },
+        .forever,
+    );
+    s.state.wakeup.notify() catch {};
+}
+
+/// Clear the active search: tear down the search thread and drop stored
+/// highlights. Forces a render so the highlight-free GridFrame ships. Mirrors
+/// `Surface.zig:4999-5002`.
+///
+/// Runs on the per-connection READ thread (via Server.dispatch's .clear_search
+/// / empty-query .set_search arms), concurrently with the owning thread's
+/// renderTick -> captureSnapshotLocked, which reads `search_matches` /
+/// `search_selected` and iterates their arena-backed `Flattened` chunks under
+/// `render_mutex`. We therefore tear the search thread down FIRST (so no
+/// callback can race), then swap the stored matches out and set `search_dirty`
+/// UNDER `render_mutex` (deinit'ing the detached arenas outside the lock),
+/// mirroring the callback's locked-swap pattern. Without the lock this would be
+/// a use-after-free against a mid-flatten render tick (finding SEARCH-RACE-1).
+pub fn clearSearch(self: *Session) void {
+    if (self.search) |*s| {
+        s.deinit();
+        self.search = null;
+    }
+    self.clearSearchHighlightsLocked();
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// Detach the stored cloned matches/selected arenas under `render_mutex`, then
+/// deinit the detached arenas OUTSIDE the lock. Sets `search_dirty` within the
+/// locked region so the cleared-highlights frame still ships. Safe against the
+/// render-loop reader (captureSnapshotLocked). The SEARCH-thread callback must
+/// be torn down (joined) before calling this so it can't concurrently re-store
+/// matches; clearSearch guarantees that ordering.
+fn clearSearchHighlightsLocked(self: *Session) void {
+    var old_match: ?std.heap.ArenaAllocator = null;
+    var old_sel: ?std.heap.ArenaAllocator = null;
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+        old_match = self.search_match_arena;
+        self.search_match_arena = null;
+        self.search_matches = &.{};
+        old_sel = self.search_selected_arena;
+        self.search_selected_arena = null;
+        self.search_selected = null;
+        // Force a frame so the cleared highlights reach subscribers, even if
+        // no cell changed.
+        self.search_dirty = true;
+    }
+    if (old_match) |*a| a.deinit();
+    if (old_sel) |*a| a.deinit();
+}
+
+/// Free the stored cloned matches/selected arenas WITHOUT taking `render_mutex`.
+/// ONLY safe to call from the owning thread AFTER the render loop has stopped
+/// (destroy()), where no render tick and no search callback can race. Use
+/// `clearSearchHighlightsLocked` from any other context.
+fn clearSearchHighlights(self: *Session) void {
+    if (self.search_match_arena) |*a| a.deinit();
+    self.search_match_arena = null;
+    self.search_matches = &.{};
+    if (self.search_selected_arena) |*a| a.deinit();
+    self.search_selected_arena = null;
+    self.search_selected = null;
+}
+
+/// Search-thread event callback. Runs on the host search thread (same
+/// constraints as `Surface.searchCallback`, `Surface.zig:1435`). Deep-clones
+/// the flattened matches into Session-owned arenas, marks `search_dirty`, wakes
+/// the render loop, and surfaces total/selected status via `on_search_event`.
+fn hostSearchCallback(event: terminalpkg.search.Thread.Event, ud: ?*anyopaque) void {
+    const self: *Session = @ptrCast(@alignCast(ud.?));
+    self.hostSearchCallback_(event) catch |err| {
+        log.warn("error in host search callback err={}", .{err});
+    };
+}
+
+fn hostSearchCallback_(
+    self: *Session,
+    event: terminalpkg.search.Thread.Event,
+) !void {
+    switch (event) {
+        .viewport_matches => |matches_unowned| {
+            // Clone OUTSIDE the render_mutex (the clone allocates; the callback
+            // owns the source only during this call). Then swap the stored
+            // matches in under render_mutex so captureSnapshotLocked (which
+            // reads them) never observes a half-swapped state. This mirrors the
+            // GUI's mailbox decoupling, here collapsed to a brief lock since the
+            // search thread shares render_mutex with capture anyway.
+            var arena: std.heap.ArenaAllocator = .init(self.alloc);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            const matches = try alloc.dupe(terminalpkg.highlight.Flattened, matches_unowned);
+            for (matches) |*m| m.* = try m.clone(alloc);
+
+            var old_arena: ?std.heap.ArenaAllocator = null;
+            {
+                self.render_mutex.lock();
+                defer self.render_mutex.unlock();
+                old_arena = self.search_match_arena;
+                self.search_match_arena = arena;
+                self.search_matches = matches;
+                self.search_dirty = true;
+            }
+            if (old_arena) |*a| a.deinit();
+
+            self.renderer_wakeup.notify() catch {};
+        },
+
+        .selected_match => |selected_| {
+            var new_arena: ?std.heap.ArenaAllocator = null;
+            var new_selected: ?terminalpkg.highlight.Flattened = null;
+            var emit: SearchEvent = .{ .selected = null };
+
+            if (selected_) |sel| {
+                var arena: std.heap.ArenaAllocator = .init(self.alloc);
+                errdefer arena.deinit();
+                const alloc = arena.allocator();
+                new_selected = try sel.highlight.clone(alloc);
+                new_arena = arena;
+                emit = .{ .selected = sel.idx };
+            }
+
+            var old_arena: ?std.heap.ArenaAllocator = null;
+            {
+                self.render_mutex.lock();
+                defer self.render_mutex.unlock();
+                old_arena = self.search_selected_arena;
+                self.search_selected_arena = new_arena;
+                self.search_selected = new_selected;
+                self.search_dirty = true;
+            }
+            if (old_arena) |*a| a.deinit();
+
+            if (self.on_search_event) |cb| {
+                cb(self.on_search_event_ctx.?, self, emit);
+            }
+            self.renderer_wakeup.notify() catch {};
+        },
+
+        .total_matches => |total| {
+            if (self.on_search_event) |cb| {
+                cb(self.on_search_event_ctx.?, self, .{ .total = total });
+            }
+        },
+
+        .quit => {
+            var old_match: ?std.heap.ArenaAllocator = null;
+            var old_sel: ?std.heap.ArenaAllocator = null;
+            {
+                self.render_mutex.lock();
+                defer self.render_mutex.unlock();
+                old_match = self.search_match_arena;
+                self.search_match_arena = null;
+                self.search_matches = &.{};
+                old_sel = self.search_selected_arena;
+                self.search_selected_arena = null;
+                self.search_selected = null;
+                self.search_dirty = true;
+            }
+            if (old_match) |*a| a.deinit();
+            if (old_sel) |*a| a.deinit();
+
+            if (self.on_search_event) |cb| {
+                cb(self.on_search_event_ctx.?, self, .{ .total = null });
+                cb(self.on_search_event_ctx.?, self, .{ .selected = null });
+            }
+            self.renderer_wakeup.notify() catch {};
+        },
+
+        .complete => {},
+    }
+}
+
+/// Capture a Snapshot, applying any stored host search highlights into the
+/// transient RenderState BEFORE projecting to the pointer-free Snapshot. The
+/// caller MUST hold `render_mutex` (this runs RenderState.update against the
+/// live terminal and reads live pins via updateHighlightsFlattened).
+///
+/// This is the load-bearing step that turns search-match pin-ranges into
+/// row.highlights on the host (the GUI does this under `.exec` but cannot under
+/// `.client`). The flatten order mirrors the GUI renderer (generic.zig:1381):
+/// selected first (so it wins), then the plain matches.
+pub fn captureSnapshotLocked(self: *Session, alloc: Allocator) !RenderState.Snapshot {
+    var rs: RenderStateCore = .empty;
+    defer rs.deinit(alloc);
+    try rs.update(alloc, self.renderer_state.terminal);
+
+    // Apply stored host search highlights (no-op when there is no search).
+    if (self.search_selected) |sel| {
+        try rs.updateHighlightsFlattened(
+            alloc,
+            highlight_tag_search_match_selected,
+            &.{sel},
+        );
+    }
+    if (self.search_matches.len > 0) {
+        try rs.updateHighlightsFlattened(
+            alloc,
+            highlight_tag_search_match,
+            self.search_matches,
+        );
+    }
+
+    return try RenderState.Snapshot.fromRenderState(alloc, &rs);
+}
+
 /// Run the host render loop on the calling thread. Blocks until render_stop
 /// is notified (via stop(), or a child-exit message drained by renderTick),
 /// at which point renderStopCallback calls loop.stop() and run(.until_done)
@@ -486,14 +817,23 @@ pub fn renderTick(self: *Session) !usize {
         }
     }
 
-    // Build the current snapshot under the mutex.
+    // Build the current snapshot under the mutex. Route through
+    // captureSnapshotLocked so any stored host search highlights are flattened
+    // into row.highlights before projection (no-op when no search is active).
+    //
+    // Read-and-clear `search_dirty` INSIDE this same critical section (finding
+    // SD-RACE-1): the search-thread callbacks and clearSearch write it `=true`
+    // under render_mutex, so reading/clearing it here under the same lock makes
+    // every access to it synchronized and closes the lost-flag window (a
+    // callback that fires after capture but before the clear can no longer have
+    // its flag dropped without its matches being in the captured snapshot).
+    var force_push = false;
     var snapshot = blk: {
         self.render_mutex.lock();
         defer self.render_mutex.unlock();
-        break :blk try RenderState.Snapshot.capture(
-            self.alloc,
-            &self.renderer_state,
-        );
+        force_push = self.search_dirty;
+        self.search_dirty = false;
+        break :blk try self.captureSnapshotLocked(self.alloc);
     };
     errdefer snapshot.deinit(self.alloc);
 
@@ -518,7 +858,14 @@ pub fn renderTick(self: *Session) !usize {
     // Server.pushFullFrames independent of the tick; only redundant idle ticks
     // are suppressed. FOLLOWUP (Phase 2b): persist a RenderState across ticks so
     // capture can emit .partial and the poll-timer path stops forcing .full.
-    if (changed > 0) {
+    //
+    // Slice 3b: a pure search command mutates row.highlights but no cells, so
+    // `changed` may still be > 0 because Snapshot.Row.eql compares highlights
+    // (RenderState.zig:281-282) — but the diff can also be 0 when the search is
+    // CLEARED and the cleared frame must still ship. `force_push` (the
+    // read-and-clear of `search_dirty` captured under render_mutex above) forces
+    // the push in that case so the highlight delta reaches subscribers.
+    if (changed > 0 or force_push) {
         if (self.on_render) |cb| {
             cb(self.on_render_ctx.?, self, &self.prev_snapshot.?);
         }
@@ -558,6 +905,14 @@ pub fn destroy(self: *Session) void {
     }
 
     if (self.started) self.stop();
+
+    // Tear down the host search thread (joins it) BEFORE freeing the terminal
+    // it searches, then drop any stored cloned highlights.
+    if (self.search) |*s| {
+        s.deinit();
+        self.search = null;
+    }
+    self.clearSearchHighlights();
 
     self.io.deinit();
     if (self.prev_snapshot) |*s| s.deinit(self.alloc);
