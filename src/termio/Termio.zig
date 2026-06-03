@@ -597,25 +597,25 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
     try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
-/// Scroll the viewport
+/// Scroll the viewport. Delegates to the backend: .exec scrolls the LOCAL
+/// terminal synchronously (byte-for-byte identical to the prior direct
+/// `self.terminal.scrollViewport` under renderer_state.mutex — Exec.scrollViewport
+/// performs the same locked call); .client sends a `scroll_viewport` frame so
+/// the host repins its terminal and the next GridFrame reflects it.
 pub fn scrollViewport(
     self: *Termio,
+    td: *ThreadData,
     scroll: terminalpkg.Terminal.ScrollViewport,
-) void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-    self.terminal.scrollViewport(scroll);
+) !void {
+    try self.backend.scrollViewport(td, scroll);
 }
 
-/// Jump the viewport to the prompt.
-pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
-    }
-
-    try self.renderer_wakeup.notify();
+/// Jump the viewport to the prompt. Delegates to the backend (same .exec local
+/// / .client frame split as scrollViewport). The post-scroll renderer wakeup is
+/// handled by the IO thread's after-drain notify (Thread.zig), matching how the
+/// other mailbox-driven scroll messages already trigger a redraw.
+pub fn jumpToPrompt(self: *Termio, td: *ThreadData, delta: isize) !void {
+    try self.backend.jumpToPrompt(td, delta);
 }
 
 /// Called when focus is gained or lost (when focus events are enabled)

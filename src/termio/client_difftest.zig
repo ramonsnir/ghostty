@@ -1469,6 +1469,134 @@ test "client resize emits a Resize frame whose host reconstruction == source Siz
     try testing.expectEqual(r.rows, reconstructed.grid().rows);
 }
 
+test "client scrollViewport/jumpToPrompt SEND frames (Slice 7), not a local scroll" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(alloc);
+    try listener.startCapturing(alloc, &captured);
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(99, .release);
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+    // The real send paths under test: a delta scroll, a top scroll, a bottom
+    // scroll, and a prompt jump. Each must produce a wire frame (the .client
+    // backend NEVER touches a local terminal — there is none in this fixture).
+    try client.scrollViewport(&td, .{ .delta = -7 });
+    try client.scrollViewport(&td, .top);
+    try client.scrollViewport(&td, .bottom);
+    try client.jumpToPrompt(&td, -3);
+
+    var pumps: usize = 0;
+    while (pumps < 16) : (pumps += 1) try loop.run(.no_wait);
+
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+    listener.joinAccept();
+
+    // Parse the wire: collect the scroll_viewport + jump_to_prompt frames.
+    var reader: protocol.FrameReader = .{};
+    defer reader.deinit(alloc);
+    try reader.push(alloc, captured.items);
+
+    var scrolls: std.ArrayList(protocol.ScrollViewport) = .empty;
+    defer scrolls.deinit(alloc);
+    var jumps: std.ArrayList(protocol.JumpToPrompt) = .empty;
+    defer jumps.deinit(alloc);
+    while (try reader.next(alloc)) |frame| {
+        switch (frame.tag) {
+            .scroll_viewport => try scrolls.append(
+                alloc,
+                try protocol.ScrollViewport.decode(alloc, frame.payload),
+            ),
+            .jump_to_prompt => try jumps.append(
+                alloc,
+                try protocol.JumpToPrompt.decode(alloc, frame.payload),
+            ),
+            else => {},
+        }
+    }
+
+    // Three scroll_viewport frames (delta/top/bottom), recovering the exact
+    // union targets, all carrying the forced session id.
+    try testing.expectEqual(@as(usize, 3), scrolls.items.len);
+    for (scrolls.items) |s| try testing.expectEqual(@as(u64, 99), s.session_id);
+    try testing.expectEqual(
+        @as(terminalpkg.Terminal.ScrollViewport, .{ .delta = -7 }),
+        scrolls.items[0].toTarget().?,
+    );
+    try testing.expectEqual(
+        @as(terminalpkg.Terminal.ScrollViewport, .top),
+        scrolls.items[1].toTarget().?,
+    );
+    try testing.expectEqual(
+        @as(terminalpkg.Terminal.ScrollViewport, .bottom),
+        scrolls.items[2].toTarget().?,
+    );
+
+    // One jump_to_prompt frame with the signed delta intact.
+    try testing.expectEqual(@as(usize, 1), jumps.items.len);
+    try testing.expectEqual(@as(u64, 99), jumps.items[0].session_id);
+    try testing.expectEqual(@as(i64, -3), jumps.items[0].delta);
+}
+
+test "client vs exec: exec backend scrollViewport scrolls the LOCAL terminal (Slice 7, byte-for-byte path)" {
+    const alloc = testing.allocator;
+
+    // The .exec backend scroll must scroll the LOCAL terminal synchronously —
+    // the pre-Slice-7 behavior. Build a real terminal with scrollback, wire a
+    // minimal ThreadData carrying a renderer.State that points at it (exactly
+    // what Exec.scrollViewport reaches through: td.renderer_state.{mutex,terminal}),
+    // and assert the viewport moves.
+    var term = try terminalpkg.Terminal.init(alloc, .{ .cols = 20, .rows = 10 });
+    defer term.deinit(alloc);
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        var lb: [8]u8 = undefined;
+        const line = try std.fmt.bufPrint(&lb, "L{d:0>2}", .{i});
+        try term.printString(line);
+        term.carriageReturn();
+        try term.linefeed();
+    }
+
+    var mutex: std.Thread.Mutex = .{};
+    var rstate: renderer.State = .{ .mutex = &mutex, .terminal = &term };
+
+    var exec_backend: termio.Exec = undefined;
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.renderer_state = &rstate;
+    td.backend = .{ .exec = undefined };
+
+    // Capture the viewport's top-left codepoint before/after a top scroll. At
+    // the bottom the viewport shows the newest lines; after .top it shows the
+    // oldest scrollback row. The top-left pin's row must change.
+    const before = term.screens.active.pages.getTopLeft(.viewport);
+    exec_backend.scrollViewport(&td, .top);
+    const after_top = term.screens.active.pages.getTopLeft(.viewport);
+    try testing.expect(!std.meta.eql(before, after_top));
+
+    // And .bottom returns it to the active-area top (the pre-scroll viewport).
+    exec_backend.scrollViewport(&td, .bottom);
+    const after_bottom = term.screens.active.pages.getTopLeft(.viewport);
+    try testing.expect(std.meta.eql(before, after_bottom));
+    try testing.expect(!std.meta.eql(after_top, after_bottom));
+}
+
 // --- Slice 3b: host search highlights rehydrate into the client mirror ---
 //
 // The host's captureSnapshotLocked runs updateHighlightsFlattened on a real

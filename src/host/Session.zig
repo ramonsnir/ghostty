@@ -486,6 +486,27 @@ pub fn navSearch(self: *Session, dir: u8) void {
     s.state.wakeup.notify() catch {};
 }
 
+/// --- Slice 7: scroll-via-host ---
+///
+/// Repin the host terminal's viewport on behalf of a .client GUI. Routed
+/// through the host Termio mailbox exactly like .resize/.focus: the IO thread
+/// applies it via Termio.scrollViewport (backend .exec -> local terminal
+/// scroll) and then notifies renderer_wakeup after the drain, so the next host
+/// render tick ships a GridFrame of the scrolled viewport. No extra wakeup
+/// here (the Thread drain handles it).
+pub fn scrollViewport(
+    self: *Session,
+    scroll: terminalpkg.Terminal.ScrollViewport,
+) void {
+    self.io.queueMessage(.{ .scroll_viewport = scroll }, .unlocked);
+}
+
+/// Jump the host terminal's viewport to a prompt by `delta`. Same routing as
+/// scrollViewport.
+pub fn jumpToPrompt(self: *Session, delta: isize) void {
+    self.io.queueMessage(.{ .jump_to_prompt = delta }, .unlocked);
+}
+
 /// Clear the active search: tear down the search thread and drop stored
 /// highlights. Forces a render so the highlight-free GridFrame ships. Mirrors
 /// `Surface.zig:4999-5002`.

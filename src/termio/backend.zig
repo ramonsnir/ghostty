@@ -100,6 +100,35 @@ pub const Backend = union(Kind) {
         }
     }
 
+    /// Scroll the viewport. For .exec this scrolls the LOCAL terminal
+    /// synchronously (byte-for-byte identical to the pre-Slice-7 behavior);
+    /// for .client it sends a `scroll_viewport` frame to the host, which
+    /// repins ITS terminal and ships the scrolled viewport on the next
+    /// GridFrame (the local mirror terminal is unused under .client).
+    pub fn scrollViewport(
+        self: *Backend,
+        td: *termio.Termio.ThreadData,
+        scroll: terminal.Terminal.ScrollViewport,
+    ) !void {
+        switch (self.*) {
+            .exec => |*exec| exec.scrollViewport(td, scroll),
+            .client => |*client| try client.scrollViewport(td, scroll),
+        }
+    }
+
+    /// Jump the viewport to a prompt by `delta` (negative = up). Same .exec
+    /// (local, synchronous) vs .client (frame to host) split as scrollViewport.
+    pub fn jumpToPrompt(
+        self: *Backend,
+        td: *termio.Termio.ThreadData,
+        delta: isize,
+    ) !void {
+        switch (self.*) {
+            .exec => |*exec| exec.jumpToPrompt(td, delta),
+            .client => |*client| try client.jumpToPrompt(td, delta),
+        }
+    }
+
     pub fn childExitedAbnormally(
         self: *Backend,
         gpa: Allocator,
