@@ -70,6 +70,8 @@ const protocol = @import("../host/protocol.zig");
 const Client = @import("Client.zig");
 const inputpkg = @import("../input.zig");
 const LinkSet = @import("../renderer/link.zig").Set;
+const apprt = @import("../apprt.zig");
+const App = @import("../App.zig");
 
 /// Per-fixture knobs, mirroring difftest.zig's Opts so the client test can
 /// reach the same comparison legs a pure VT byte stream cannot (findings DF-4):
@@ -1147,6 +1149,172 @@ test "client handleFrame .child_exited records exit_code + runtime_ms" {
     try testing.expect(client.child_exited != null);
     try testing.expectEqual(@as(u32, 137), client.child_exited.?.exit_code);
     try testing.expectEqual(@as(u64, 12345), client.child_exited.?.runtime_ms);
+}
+
+// --- Slice 6: SurfaceEvent re-inject into the surface mailbox ---
+//
+// handleFrame's .surface_event arm DESERIALIZES a forwarded apprt.surface.Message
+// and re-injects it into the Client's captured surface_mailbox (the same field
+// Slice 5d captured for child_exited). The GUI's existing Surface drain then
+// handles it identically to .exec. These tests build a CAPTURING mailbox (a real
+// App.Mailbox.Queue + a zero-size headless apprt.App), drive handleFrame with an
+// encoded surface_event payload, and assert the exact apprt.surface.Message that
+// lands in the queue. A null mailbox (the decode-fidelity default) must be a
+// no-op — proven by the last case.
+
+/// Build a capturing surface mailbox over a freshly-created queue. The `surface`
+/// pointer is only STORED by the mailbox/Message (never dereferenced by `push`),
+/// so a bogus aligned sentinel is safe. Caller owns the returned queue (destroy
+/// it with `q.destroy(alloc)`).
+fn captureMailbox(alloc: std.mem.Allocator, rt_app: *apprt.App) !struct {
+    queue: *App.Mailbox.Queue,
+    mailbox: apprt.surface.Mailbox,
+} {
+    const q = try App.Mailbox.Queue.create(alloc);
+    return .{
+        .queue = q,
+        .mailbox = .{
+            // Never dereferenced by push (it only stores the pointer in the
+            // surface_message); a recognizable aligned sentinel stands in for a
+            // real *Surface in this socket-/surface-free unit test.
+            .surface = @ptrFromInt(@alignOf(@import("../Surface.zig"))),
+            .app = .{ .rt_app = rt_app, .mailbox = q },
+        },
+    };
+}
+
+/// Drain exactly one surface_message from the capture queue, asserting one is
+/// present, and return the apprt.surface.Message.
+fn drainOne(q: *App.Mailbox.Queue) !apprt.surface.Message {
+    const msg = q.pop() orelse return error.NoMessage;
+    try testing.expect(msg == .surface_message);
+    return msg.surface_message.message;
+}
+
+test "client handleFrame .surface_event re-injects simple variants into the mailbox" {
+    const alloc = testing.allocator;
+    var rt_app: apprt.App = .{};
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    const cap = try captureMailbox(alloc, &rt_app);
+    defer cap.queue.destroy(alloc);
+    client.surface_mailbox = cap.mailbox;
+
+    // Helper: encode a SurfaceEvent from an apprt.surface.Message, feed it through
+    // handleFrame, and return the re-injected message drained from the queue.
+    const H = struct {
+        fn run(
+            a: std.mem.Allocator,
+            c: *Client,
+            q: *App.Mailbox.Queue,
+            src: apprt.surface.Message,
+        ) !apprt.surface.Message {
+            const ev = try protocol.SurfaceEvent.fromMessage(99, &src);
+            const p = try ev.encode(a);
+            defer a.free(p);
+            try c.handleFrame(a, .surface_event, p);
+            return try drainOne(q);
+        }
+    };
+
+    // ring_bell (void).
+    {
+        const got = try H.run(alloc, &client, cap.queue, .{ .ring_bell = {} });
+        try testing.expect(got == .ring_bell);
+    }
+
+    // password_input (bool).
+    {
+        const got = try H.run(alloc, &client, cap.queue, .{ .password_input = true });
+        try testing.expect(got == .password_input);
+        try testing.expectEqual(true, got.password_input);
+    }
+
+    // set_mouse_shape (enum).
+    {
+        const got = try H.run(alloc, &client, cap.queue, .{ .set_mouse_shape = .text });
+        try testing.expect(got == .set_mouse_shape);
+        try testing.expectEqual(terminalpkg.MouseShape.text, got.set_mouse_shape);
+    }
+
+    // set_title (fixed buffer).
+    {
+        var title: [256]u8 = [_]u8{0} ** 256;
+        @memcpy(title[0..4], "tab1");
+        const got = try H.run(alloc, &client, cap.queue, .{ .set_title = title });
+        try testing.expect(got == .set_title);
+        try testing.expectEqualSlices(u8, &title, &got.set_title);
+    }
+
+    // color_change (Target + RGB).
+    {
+        const rgb: terminalpkg.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+        const got = try H.run(alloc, &client, cap.queue, .{ .color_change = .{
+            .target = .{ .dynamic = .foreground },
+            .color = rgb,
+        } });
+        try testing.expect(got == .color_change);
+        try testing.expect(rgb.eql(got.color_change.color));
+        try testing.expectEqual(
+            @as(terminalpkg.osc.color.Target, .{ .dynamic = .foreground }),
+            got.color_change.target,
+        );
+    }
+}
+
+test "client handleFrame .surface_event re-injects a pwd_change WriteReq into the mailbox" {
+    const alloc = testing.allocator;
+    var rt_app: apprt.App = .{};
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    const cap = try captureMailbox(alloc, &rt_app);
+    defer cap.queue.destroy(alloc);
+    client.surface_mailbox = cap.mailbox;
+
+    const pwd = "/Users/ramon/git/ghostty-phase2b";
+    const src_req = try apprt.surface.Message.WriteReq.init(alloc, @as([]const u8, pwd));
+    defer src_req.deinit();
+    const src = apprt.surface.Message{ .pwd_change = src_req };
+
+    const ev = try protocol.SurfaceEvent.fromMessage(99, &src);
+    const p = try ev.encode(alloc);
+    defer alloc.free(p);
+    try client.handleFrame(alloc, .surface_event, p);
+
+    // The re-injected message carries a reconstructed WriteReq whose bytes equal
+    // the source pwd. The WriteReq the surface drain receives is owned by it; in
+    // this test we own it and must free it (a `<=255` pwd is a `.small`, so deinit
+    // is a no-op, but call it for symmetry with the real drain contract).
+    var got = try drainOne(cap.queue);
+    try testing.expect(got == .pwd_change);
+    try testing.expectEqualStrings(pwd, got.pwd_change.slice());
+    got.pwd_change.deinit();
+}
+
+test "client handleFrame .surface_event with null mailbox is a no-op" {
+    // The decode-fidelity default: no surface_mailbox captured (threadEnter
+    // bypassed). The arm must still DECODE (and free any owned bytes) without
+    // pushing anywhere — no crash, no leak (testing.allocator catches a leak).
+    const alloc = testing.allocator;
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    try testing.expect(client.surface_mailbox == null);
+
+    // A WriteReq-bearing variant exercises the decode allocation + deinit path
+    // under the null-mailbox branch (no toMessage call -> the decoded bytes must
+    // be freed by the arm's `ev.deinit`).
+    const data = "x" ** 600; // forces the .alloc decode path
+    const req = try apprt.surface.Message.WriteReq.init(alloc, @as([]const u8, data));
+    defer req.deinit();
+    const src = apprt.surface.Message{ .pwd_change = req };
+    const ev = try protocol.SurfaceEvent.fromMessage(99, &src);
+    const p = try ev.encode(alloc);
+    defer alloc.free(p);
+    try client.handleFrame(alloc, .surface_event, p);
+    // No assertion beyond "did not crash / did not leak" — the testing allocator
+    // fails the test on any leak from the decoded-but-undelivered bytes.
 }
 
 // --- Resize wire fidelity (finding #5) ---

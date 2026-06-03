@@ -211,6 +211,17 @@ search_dirty: bool = false,
 on_search_event_ctx: ?*anyopaque = null,
 on_search_event: ?*const fn (ctx: *anyopaque, self: *Session, event: SearchEvent) void = null,
 
+/// Slice 6 general SurfaceEvent channel. Set by the Server so each FORWARDED
+/// `apprt.surface.Message` drained from the app queue (everything the host's
+/// StreamHandler emits except the dedicated/excluded variants) can be
+/// serialized into a `surface_event` frame and pushed to subscribers, mirroring
+/// onChildExited/onSearchEvent. Invoked SYNCHRONOUSLY from the app-queue drain
+/// in renderTick (the message — including any owned WriteReq bytes — is alive
+/// only for the duration of the callback), so the callback must serialize/copy
+/// before returning. null in the Phase-1/standalone path (unchanged behavior).
+on_surface_event_ctx: ?*anyopaque = null,
+on_surface_event: ?*const fn (ctx: *anyopaque, self: *Session, msg: *const apprt.surface.Message) void = null,
+
 started: bool = false,
 
 /// The thread id that called runRenderLoop, recorded so destroy() can assert
@@ -839,6 +850,9 @@ pub fn renderTick(self: *Session) !usize {
                     // Phase 2a: surface the child-exit details to the Server
                     // (buffer-or-deliver a ChildExited frame) in addition to
                     // the render-loop stop below. No-op in the Phase-1 path.
+                    // child_exited keeps its DEDICATED path (its own ChildExited
+                    // frame + render-stop); it is NOT forwarded over the general
+                    // SurfaceEvent channel (no double-delivery).
                     if (self.on_child_exited) |cb| {
                         cb(self.on_child_exited_ctx.?, self, ce.exit_code, ce.runtime_ms);
                     }
@@ -847,6 +861,18 @@ pub fn renderTick(self: *Session) !usize {
                         "error notifying render loop stop err={}",
                         .{err},
                     );
+                } else if (self.on_surface_event) |cb| {
+                    // Slice 6: forward EVERY OTHER surface message over the
+                    // general SurfaceEvent channel. The callback serializes it
+                    // SYNCHRONOUSLY (the message — including any owned WriteReq
+                    // bytes — is alive only here) and pushes a surface_event
+                    // frame to subscribers. The Server's onSurfaceEvent filters
+                    // the EXCLUDED variants (change_config/close/renderer_health/
+                    // present_surface/selection_scroll_tick/scrollbar/search_*)
+                    // via SurfaceEvent.fromMessage's NotForwarded — those stay
+                    // ignored (NOT log-dropped) here, no double-delivery with the
+                    // dedicated search frames. No-op in the standalone path.
+                    cb(self.on_surface_event_ctx.?, self, &sm.message);
                 }
             },
             else => log.debug("app message: {s}", .{@tagName(msg)}),

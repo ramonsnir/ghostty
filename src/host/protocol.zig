@@ -36,6 +36,9 @@ const testing = std.testing;
 const RenderState = @import("RenderState.zig");
 const terminalpkg = @import("../terminal/main.zig");
 const point = terminalpkg.point;
+const apprt = @import("../apprt.zig");
+const color = terminalpkg.color;
+const osccolor = terminalpkg.osc.color;
 
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
@@ -88,6 +91,15 @@ pub const FrameType = enum(u8) {
     // are NOT carried on the wire — only OSC8 links, which require host pins.
     hover,
     link_frame,
+    // --- Slice 6: the general SurfaceEvent channel ---
+    // host->GUI: a forwarded `apprt.surface.Message` (title, bell, OSC52
+    // clipboard, pwd_change, dynamic colors, desktop notifications, progress,
+    // mouse-shape, shell command-tracking, password-input). The host's
+    // StreamHandler emits these; under `.client` the host re-frames them here
+    // and the GUI re-injects them into its surface mailbox so the existing
+    // Surface drain handles them identically to `.exec`. child_exited and the
+    // search counts have dedicated frames and are NOT carried here.
+    surface_event,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -1030,3 +1042,370 @@ pub const LinkFrame = struct {
         return out.toOwnedSlice(alloc);
     }
 };
+
+// --- Slice 6: the general SurfaceEvent channel ---
+
+/// Write/read a `MessageData`-style byte slice payload (the WriteReq bytes of
+/// `pwd_change` / `clipboard_write`). On the wire these are length-prefixed
+/// bytes (`writeBytes`/`readBytes`), identical in shape to Input.bytes. The
+/// `apprt.surface.Message.WriteReq` is reconstructed on the GUI side from the
+/// decoded slice via `writeReqFromBytes` (a `.small` for <=255, else `.alloc`).
+const WriteReq = apprt.surface.Message.WriteReq;
+
+/// Reconstruct an `apprt.surface.Message.WriteReq` from a decoded byte slice.
+/// `<=255` bytes -> a `.small` (copies into the inline buffer; no allocation,
+/// no ownership transfer). Larger -> a `.alloc` duped from `alloc` (owned by the
+/// reconstructed WriteReq; the caller's downstream surface drain frees it via
+/// the message's own deinit, exactly as `.exec` does). Mirrors the host-side
+/// shape of `pwd_change`/`clipboard_write` (a `WriteReq` whose `.slice()` is the
+/// bytes regardless of small/stable/alloc variant).
+fn writeReqFromBytes(alloc: Allocator, bytes: []const u8) !WriteReq {
+    if (bytes.len <= WriteReq.Small.Max) {
+        var buf: WriteReq.Small.Array = undefined;
+        @memcpy(buf[0..bytes.len], bytes);
+        return .{ .small = .{ .data = buf, .len = @intCast(bytes.len) } };
+    }
+    const dup = try alloc.dupe(u8, bytes);
+    return .{ .alloc = .{ .alloc = alloc, .data = dup } };
+}
+
+/// host->GUI: a forwarded `apprt.surface.Message`. Carries the session id, a
+/// variant tag, and the per-variant payload. Built host-side from a drained
+/// surface message via `fromMessage`; reconstructed GUI-side into an
+/// `apprt.surface.Message` via `toMessage` for re-injection into the surface
+/// mailbox.
+///
+/// OWNERSHIP: decode() may allocate owned bytes for the `pwd_change` /
+/// `clipboard_write` variants (the WriteReq payload); `deinit` frees them.
+/// `toMessage` MOVES those bytes into the reconstructed WriteReq (which the
+/// downstream surface drain then owns), so a decoded SurfaceEvent that has been
+/// converted via `toMessage` must NOT also be `deinit`'d for those bytes — see
+/// `toMessage`'s doc. encode() borrows the source message (does not free it).
+///
+/// The serialized variant set MIRRORS the host StreamHandler's forwarded subset
+/// (plan §4.5). EXCLUDED (never forwarded; see Session's drain): change_config,
+/// close, child_exited (dedicated ChildExited frame), renderer_health,
+/// present_surface, selection_scroll_tick, scrollbar, search_total,
+/// search_selected.
+pub const SurfaceEvent = struct {
+    session_id: u64,
+    payload: Payload,
+
+    /// One-byte wire tag selecting the payload variant. Stable on the wire;
+    /// append new variants at the END.
+    pub const Tag = enum(u8) {
+        ring_bell,
+        start_command,
+        password_input,
+        stop_command,
+        set_title,
+        report_title,
+        set_mouse_shape,
+        desktop_notification,
+        color_change,
+        progress_report,
+        pwd_change,
+        clipboard_write,
+        clipboard_read,
+    };
+
+    /// The decoded payload. Mirrors the forwarded `apprt.surface.Message`
+    /// variants. Byte-slice-bearing variants (`pwd_change`/`clipboard_write`)
+    /// own their bytes after decode (freed by `deinit` unless moved by
+    /// `toMessage`).
+    pub const Payload = union(Tag) {
+        ring_bell: void,
+        start_command: void,
+        password_input: bool,
+        stop_command: ?u8,
+        set_title: [256]u8,
+        report_title: apprt.surface.Message.ReportTitleStyle,
+        set_mouse_shape: terminalpkg.MouseShape,
+        desktop_notification: struct {
+            title: [63:0]u8,
+            body: [255:0]u8,
+        },
+        color_change: osccolor.ColoredTarget,
+        progress_report: terminalpkg.osc.Command.ProgressReport,
+        /// Owned bytes after decode (the WriteReq slice).
+        pwd_change: []const u8,
+        clipboard_write: struct {
+            clipboard_type: apprt.Clipboard,
+            /// Owned bytes after decode (the WriteReq slice).
+            bytes: []const u8,
+        },
+        clipboard_read: apprt.Clipboard,
+    };
+
+    /// Build a SurfaceEvent (borrowing the message) from a drained
+    /// `apprt.surface.Message`. Returns `error.NotForwarded` for any EXCLUDED
+    /// variant so the host drain can keep ignoring those (it never forwards
+    /// them). The byte-slice variants copy the WriteReq's `.slice()` (valid only
+    /// while the source message is alive — the host serializes synchronously in
+    /// the drain), so the returned SurfaceEvent's slices ALIAS the source
+    /// message; `encode` reads them immediately and the result is not retained.
+    pub fn fromMessage(session_id: u64, msg: *const apprt.surface.Message) error{NotForwarded}!SurfaceEvent {
+        const payload: Payload = switch (msg.*) {
+            .ring_bell => .{ .ring_bell = {} },
+            .start_command => .{ .start_command = {} },
+            .password_input => |v| .{ .password_input = v },
+            .stop_command => |v| .{ .stop_command = v },
+            .set_title => |v| .{ .set_title = v },
+            .report_title => |v| .{ .report_title = v },
+            .set_mouse_shape => |v| .{ .set_mouse_shape = v },
+            .desktop_notification => |v| .{ .desktop_notification = .{
+                .title = v.title,
+                .body = v.body,
+            } },
+            .color_change => |v| .{ .color_change = v },
+            .progress_report => |v| .{ .progress_report = v },
+            // Capture the WriteReq variants BY POINTER (`|*v|`): `WriteReq.slice()`
+            // for the `.small` variant returns a slice into the WriteReq's INLINE
+            // buffer, so a by-value capture would alias the switch's stack-local
+            // COPY (dangling once the switch expression ends). By pointer, the
+            // slice aliases the ORIGINAL message storage, which stays alive for
+            // the synchronous fromMessage->encode in the drain (per this fn's doc).
+            .pwd_change => |*v| .{ .pwd_change = v.slice() },
+            .clipboard_write => |*v| .{ .clipboard_write = .{
+                .clipboard_type = v.clipboard_type,
+                .bytes = v.req.slice(),
+            } },
+            .clipboard_read => |v| .{ .clipboard_read = v },
+
+            // EXCLUDED — never forwarded over the SurfaceEvent channel. Each has
+            // its own handling (see Session's drain doc): child_exited rides a
+            // dedicated ChildExited frame + render-stop; search_total/selected
+            // ride dedicated frames; change_config (config flows separately),
+            // close (surface-internal), renderer_health (no host GPU),
+            // present_surface / selection_scroll_tick / scrollbar (GUI-side).
+            .change_config,
+            .close,
+            .child_exited,
+            .renderer_health,
+            .present_surface,
+            .selection_scroll_tick,
+            .scrollbar,
+            .search_total,
+            .search_selected,
+            => return error.NotForwarded,
+        };
+        return .{ .session_id = session_id, .payload = payload };
+    }
+
+    /// Reconstruct an `apprt.surface.Message` for re-injection into the GUI's
+    /// surface mailbox. For the byte-slice variants this MOVES the decoded owned
+    /// bytes into a reconstructed WriteReq (via `writeReqFromBytes`): a `.small`
+    /// copies them (the SurfaceEvent still owns the originals, freed by
+    /// `deinit`), while `.alloc` would re-dupe. To keep ownership simple and
+    /// match the `.exec` mailbox contract (the surface drain owns + frees the
+    /// WriteReq), `writeReqFromBytes` always COPIES (small) or DUPES (alloc), so
+    /// the decoded SurfaceEvent's own bytes are still freed by `deinit` and the
+    /// reconstructed message independently owns its copy. `alloc` is used for the
+    /// `.alloc` WriteReq dupe.
+    pub fn toMessage(self: *const SurfaceEvent, alloc: Allocator) !apprt.surface.Message {
+        return switch (self.payload) {
+            .ring_bell => .{ .ring_bell = {} },
+            .start_command => .{ .start_command = {} },
+            .password_input => |v| .{ .password_input = v },
+            .stop_command => |v| .{ .stop_command = v },
+            .set_title => |v| .{ .set_title = v },
+            .report_title => |v| .{ .report_title = v },
+            .set_mouse_shape => |v| .{ .set_mouse_shape = v },
+            .desktop_notification => |v| .{ .desktop_notification = .{
+                .title = v.title,
+                .body = v.body,
+            } },
+            .color_change => |v| .{ .color_change = v },
+            .progress_report => |v| .{ .progress_report = v },
+            .pwd_change => |bytes| .{ .pwd_change = try writeReqFromBytes(alloc, bytes) },
+            .clipboard_write => |v| .{ .clipboard_write = .{
+                .clipboard_type = v.clipboard_type,
+                .req = try writeReqFromBytes(alloc, v.bytes),
+            } },
+            .clipboard_read => |v| .{ .clipboard_read = v },
+        };
+    }
+
+    pub fn encode(self: SurfaceEvent, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try w.writeByte(@intFromEnum(@as(Tag, self.payload)));
+        switch (self.payload) {
+            .ring_bell, .start_command => {},
+            .password_input => |v| try writeBool(w, v),
+            .stop_command => |v| {
+                try writeBool(w, v != null);
+                try w.writeByte(if (v) |b| b else 0);
+            },
+            .set_title => |v| {
+                // Zero the tail past the NUL terminator before sending so we
+                // never serialize UNINITIALIZED buffer bytes over the wire
+                // (the title is the NUL-terminated prefix; the tail is don't-
+                // care to the GUI but would otherwise leak nondeterministic
+                // process memory). Wire size + decode are unchanged (256 bytes).
+                var t = v;
+                const n = std.mem.indexOfScalar(u8, &t, 0) orelse t.len;
+                @memset(t[n..], 0);
+                try w.writeAll(&t);
+            },
+            .report_title => |v| try writeEnum(w, v),
+            .set_mouse_shape => |v| try writeEnum(w, v),
+            .desktop_notification => |v| {
+                // Serialize the full fixed buffers incl. the sentinel slot
+                // (64 + 256 bytes); decode reads them back verbatim. Zero each
+                // buffer's tail past its NUL first (same rationale as set_title:
+                // no uninitialized bytes on the wire).
+                var title = v.title;
+                var body = v.body;
+                const tn = std.mem.indexOfScalar(u8, title[0..], 0) orelse title.len;
+                const bn = std.mem.indexOfScalar(u8, body[0..], 0) orelse body.len;
+                @memset(title[tn..title.len], 0);
+                @memset(body[bn..body.len], 0);
+                try w.writeAll(title[0 .. title.len + 1]);
+                try w.writeAll(body[0 .. body.len + 1]);
+            },
+            .color_change => |v| {
+                try writeTarget(w, v.target);
+                try writeRGB(w, v.color);
+            },
+            .progress_report => |v| {
+                try writeEnum(w, v.state);
+                try writeBool(w, v.progress != null);
+                try w.writeByte(if (v.progress) |p| p else 0);
+            },
+            .pwd_change => |bytes| try writeBytes(w, bytes),
+            .clipboard_write => |v| {
+                try writeEnum(w, v.clipboard_type);
+                try writeBytes(w, v.bytes);
+            },
+            .clipboard_read => |v| try writeEnum(w, v),
+        }
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(alloc: Allocator, payload: []const u8) !SurfaceEvent {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        const session_id = try readInt(r, u64);
+        const tag = std.meta.intToEnum(Tag, try r.readByte()) catch
+            return error.InvalidFrame;
+        const p: Payload = switch (tag) {
+            .ring_bell => .{ .ring_bell = {} },
+            .start_command => .{ .start_command = {} },
+            .password_input => .{ .password_input = try readBool(r) },
+            .stop_command => blk: {
+                const present = try readBool(r);
+                const b = try r.readByte();
+                break :blk .{ .stop_command = if (present) b else null };
+            },
+            .set_title => blk: {
+                var v: [256]u8 = undefined;
+                try r.readNoEof(&v);
+                break :blk .{ .set_title = v };
+            },
+            .report_title => .{ .report_title = try readEnum(r, apprt.surface.Message.ReportTitleStyle) },
+            .set_mouse_shape => .{ .set_mouse_shape = try readEnum(r, terminalpkg.MouseShape) },
+            .desktop_notification => blk: {
+                var title: [63:0]u8 = undefined;
+                try r.readNoEof(title[0 .. title.len + 1]);
+                var body: [255:0]u8 = undefined;
+                try r.readNoEof(body[0 .. body.len + 1]);
+                break :blk .{ .desktop_notification = .{ .title = title, .body = body } };
+            },
+            .color_change => blk: {
+                const target = try readTarget(r);
+                const rgb = try readRGB(r);
+                break :blk .{ .color_change = .{ .target = target, .color = rgb } };
+            },
+            .progress_report => blk: {
+                const state = try readEnum(r, terminalpkg.osc.Command.ProgressReport.State);
+                const present = try readBool(r);
+                const b = try r.readByte();
+                break :blk .{ .progress_report = .{
+                    .state = state,
+                    .progress = if (present) b else null,
+                } };
+            },
+            .pwd_change => .{ .pwd_change = try readBytes(alloc, &fbs, r) },
+            .clipboard_write => blk: {
+                const ct = try readEnum(r, apprt.Clipboard);
+                const bytes = try readBytes(alloc, &fbs, r);
+                break :blk .{ .clipboard_write = .{ .clipboard_type = ct, .bytes = bytes } };
+            },
+            .clipboard_read => .{ .clipboard_read = try readEnum(r, apprt.Clipboard) },
+        };
+        return .{ .session_id = session_id, .payload = p };
+    }
+
+    pub fn deinit(self: *SurfaceEvent, alloc: Allocator) void {
+        switch (self.payload) {
+            .pwd_change => |bytes| alloc.free(bytes),
+            .clipboard_write => |v| alloc.free(v.bytes),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+// --- SurfaceEvent serialization helpers ---
+
+/// Serialize any enum as its integer value in a fixed i64 wire field. Covers
+/// `enum(c_int)` (MouseShape / ProgressReport.State), small unsized enums
+/// (ReportTitleStyle), and `apprt.Clipboard` (whose backing is u2 in the
+/// headless `.none` runtime and c_int under GTK) uniformly. decode validates
+/// the value against the enum via `std.meta.intToEnum`.
+fn writeEnum(w: anytype, v: anytype) !void {
+    try writeInt(w, i64, @intFromEnum(v));
+}
+
+fn readEnum(r: anytype, comptime E: type) !E {
+    const raw = try readInt(r, i64);
+    const Int = @typeInfo(E).@"enum".tag_type;
+    const narrowed = std.math.cast(Int, raw) orelse return error.InvalidFrame;
+    return std.meta.intToEnum(E, narrowed) catch return error.InvalidFrame;
+}
+
+/// Serialize `terminal.color.RGB` (a packed struct(u24) of r,g,b u8) as three
+/// raw bytes. protocol.zig has no RGB helper of its own (the RenderState ones
+/// are file-private there), so define a local pair matching that 3-byte shape.
+fn writeRGB(w: anytype, rgb: color.RGB) !void {
+    try w.writeByte(rgb.r);
+    try w.writeByte(rgb.g);
+    try w.writeByte(rgb.b);
+}
+
+fn readRGB(r: anytype) !color.RGB {
+    return .{ .r = try r.readByte(), .g = try r.readByte(), .b = try r.readByte() };
+}
+
+/// Serialize a `terminal.osc.color.Target` union (palette: u8 / special:
+/// enum(u3) / dynamic: enum(u5)). One tag byte + one value byte.
+fn writeTarget(w: anytype, t: osccolor.Target) !void {
+    switch (t) {
+        .palette => |idx| {
+            try w.writeByte(0);
+            try w.writeByte(idx);
+        },
+        .special => |s| {
+            try w.writeByte(1);
+            try w.writeByte(@intFromEnum(s));
+        },
+        .dynamic => |d| {
+            try w.writeByte(2);
+            try w.writeByte(@intFromEnum(d));
+        },
+    }
+}
+
+fn readTarget(r: anytype) !osccolor.Target {
+    const kind = try r.readByte();
+    const v = try r.readByte();
+    return switch (kind) {
+        0 => .{ .palette = v },
+        1 => .{ .special = std.meta.intToEnum(color.Special, v) catch return error.InvalidFrame },
+        2 => .{ .dynamic = std.meta.intToEnum(color.Dynamic, v) catch return error.InvalidFrame },
+        else => error.InvalidFrame,
+    };
+}

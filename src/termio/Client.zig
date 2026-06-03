@@ -722,6 +722,29 @@ pub fn handleFrame(
             if (self.renderer_wakeup) |*w| w.notify() catch {};
         },
 
+        .surface_event => {
+            // Slice 6: a forwarded `apprt.surface.Message` (title, bell, OSC52
+            // clipboard, pwd_change, dynamic colors, desktop notifications,
+            // progress, mouse-shape, shell command-tracking, password-input).
+            // DESERIALIZE and re-inject into the surface mailbox — the existing
+            // Surface drain then handles it identically to `.exec`. Mirrors the
+            // child_exited push above; same null-mailbox no-op (decode tests
+            // bypass threadEnter -> surface_mailbox is null).
+            //
+            // OWNERSHIP: `toMessage` COPIES/DUPES the WriteReq-bearing payloads
+            // (pwd_change/clipboard_write) into a freshly-owned WriteReq the
+            // surface drain then owns; the decoded SurfaceEvent's own bytes are
+            // freed by `ev.deinit(alloc)`. The response-bearing variants
+            // (clipboard_read / report_title) ride the surface's normal termio
+            // path back to the host over the Input channel — no reply frame here.
+            var ev = try protocol.SurfaceEvent.decode(alloc, payload);
+            defer ev.deinit(alloc);
+            if (self.surface_mailbox) |mb| {
+                const msg = try ev.toMessage(alloc);
+                _ = mb.push(msg, .{ .forever = {} });
+            }
+        },
+
         // Everything else is either a request-direction frame (the GUI sends
         // these, never receives them) or a liveness frame we don't model yet.
         else => log.debug("client ignoring frame tag={}", .{tag}),
