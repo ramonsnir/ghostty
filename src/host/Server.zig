@@ -651,7 +651,7 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -823,6 +823,8 @@ fn spawnSession(self: *Server) !*SessionEntry {
     session.on_child_exited = onChildExited;
     session.on_search_event_ctx = e;
     session.on_search_event = onSearchEvent;
+    session.on_surface_event_ctx = e;
+    session.on_surface_event = onSurfaceEvent;
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -985,6 +987,39 @@ fn onSearchEvent(ctx: *anyopaque, session: *Session, event: Session.SearchEvent)
                 .idx = if (s) |v| @intCast(v) else 0,
             }),
         }
+    }
+}
+
+/// Slice 6 SurfaceEvent callback (runs on the session owning thread, invoked
+/// SYNCHRONOUSLY from Session's app-queue drain while `msg` — including any owned
+/// WriteReq bytes — is still alive). Builds a `surface_event` frame from the
+/// forwarded `apprt.surface.Message` and writes it to every subscriber, mirroring
+/// onChildExited/onSearchEvent's broadcast shape.
+///
+/// EXCLUDED variants return `error.NotForwarded` from `SurfaceEvent.fromMessage`;
+/// we simply DROP those (no frame) so the channel forwards exactly the §4.5
+/// subset. `fromMessage` BORROWS `msg` (its byte-slice variants alias the live
+/// message), so the SurfaceEvent must be encoded here, synchronously, before this
+/// returns — which `writeFramed` -> `encode` does per subscriber.
+///
+/// NOT buffered for reattach: these are live terminal events (title/bell/colors/
+/// cwd/etc.); a reattach gets fresh full state via pushFullFrames and the live
+/// stream resumes. Matches onSearchEvent's no-buffer policy.
+fn onSurfaceEvent(ctx: *anyopaque, session: *Session, msg: *const @import("../apprt.zig").surface.Message) void {
+    _ = session;
+    const e: *SessionEntry = @ptrCast(@alignCast(ctx));
+
+    const ev = protocol.SurfaceEvent.fromMessage(e.session_id, msg) catch |err| switch (err) {
+        // An EXCLUDED variant reached the drain; the host deliberately does not
+        // forward it (it has a dedicated path or is GUI-/config-side). Drop it.
+        error.NotForwarded => return,
+    };
+
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    for (e.subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.writeFramed(.surface_event, ev);
     }
 }
 

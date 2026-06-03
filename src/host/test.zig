@@ -10,6 +10,7 @@ const testing = std.testing;
 
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
+const apprt = @import("../apprt.zig");
 const render = @import("../terminal/render.zig");
 const RenderStateCore = render.RenderState;
 
@@ -721,6 +722,298 @@ test "host protocol frame round-trip + partial read" {
         defer decoded.deinit(alloc);
         try testing.expectEqual(@as(usize, 0), decoded.cells.len);
     }
+}
+
+test "host SurfaceEvent frame round-trip across representative variants (Slice 6)" {
+    // encode -> partial-read -> decode -> equal, across a void variant, a bool,
+    // an enum, the set_title fixed buffer, a WriteReq-bearing one (pwd_change),
+    // color_change, and progress_report. Mirrors the protocol round-trip harness.
+    const alloc = testing.allocator;
+    const SurfaceEvent = protocol.SurfaceEvent;
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // Helper: encode an apprt.surface.Message into a SurfaceEvent, partial-read,
+    // decode, and return the owned decoded event (caller deinits).
+    const H = struct {
+        fn roundtrip(
+            a: std.mem.Allocator,
+            buf: *std.ArrayList(u8),
+            session_id: u64,
+            msg: apprt.surface.Message,
+        ) !SurfaceEvent {
+            const ev = try SurfaceEvent.fromMessage(session_id, &msg);
+            const framed = try protocol.encodeFrame(a, .surface_event, ev);
+            defer a.free(framed);
+            const tag = try feedOneByteAtATime(a, framed, buf);
+            try testing.expectEqual(protocol.FrameType.surface_event, tag);
+            return try SurfaceEvent.decode(a, buf.items);
+        }
+    };
+
+    // ring_bell (void).
+    {
+        var dec = try H.roundtrip(alloc, &payload, 1, .{ .ring_bell = {} });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 1), dec.session_id);
+        try testing.expect(dec.payload == .ring_bell);
+    }
+
+    // start_command (void).
+    {
+        var dec = try H.roundtrip(alloc, &payload, 2, .{ .start_command = {} });
+        defer dec.deinit(alloc);
+        try testing.expect(dec.payload == .start_command);
+    }
+
+    // password_input (bool).
+    {
+        var dec = try H.roundtrip(alloc, &payload, 3, .{ .password_input = true });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(true, dec.payload.password_input);
+    }
+
+    // stop_command (?u8): present + null.
+    {
+        var dec = try H.roundtrip(alloc, &payload, 4, .{ .stop_command = 42 });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(?u8, 42), dec.payload.stop_command);
+    }
+    {
+        var dec = try H.roundtrip(alloc, &payload, 4, .{ .stop_command = null });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(?u8, null), dec.payload.stop_command);
+    }
+
+    // set_title ([256]u8 fixed buffer): NUL-terminated prefix preserved exactly.
+    {
+        var title: [256]u8 = [_]u8{0} ** 256;
+        const text = "hello title";
+        @memcpy(title[0..text.len], text);
+        var dec = try H.roundtrip(alloc, &payload, 5, .{ .set_title = title });
+        defer dec.deinit(alloc);
+        try testing.expectEqualSlices(u8, &title, &dec.payload.set_title);
+    }
+
+    // report_title (enum).
+    {
+        var dec = try H.roundtrip(alloc, &payload, 6, .{ .report_title = .csi_21_t });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(apprt.surface.Message.ReportTitleStyle.csi_21_t, dec.payload.report_title);
+    }
+
+    // set_mouse_shape (enum(c_int)).
+    {
+        var dec = try H.roundtrip(alloc, &payload, 7, .{ .set_mouse_shape = .pointer });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(terminalpkg.MouseShape.pointer, dec.payload.set_mouse_shape);
+    }
+
+    // desktop_notification (two fixed NUL-terminated buffers).
+    {
+        var t: [63:0]u8 = [_:0]u8{0} ** 63;
+        var b: [255:0]u8 = [_:0]u8{0} ** 255;
+        @memcpy(t[0..5], "Title");
+        @memcpy(b[0..4], "Body");
+        var dec = try H.roundtrip(alloc, &payload, 8, .{ .desktop_notification = .{ .title = t, .body = b } });
+        defer dec.deinit(alloc);
+        try testing.expectEqualSlices(u8, t[0 .. t.len + 1], dec.payload.desktop_notification.title[0 .. t.len + 1]);
+        try testing.expectEqualSlices(u8, b[0 .. b.len + 1], dec.payload.desktop_notification.body[0 .. b.len + 1]);
+    }
+
+    // color_change (Target + RGB), across all three Target shapes.
+    {
+        const cases = [_]terminalpkg.osc.color.Target{
+            .{ .palette = 7 },
+            .{ .special = .bold },
+            .{ .dynamic = .cursor },
+        };
+        for (cases) |target| {
+            const rgb: terminalpkg.color.RGB = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+            var dec = try H.roundtrip(alloc, &payload, 9, .{ .color_change = .{ .target = target, .color = rgb } });
+            defer dec.deinit(alloc);
+            try testing.expectEqual(target, dec.payload.color_change.target);
+            try testing.expect(rgb.eql(dec.payload.color_change.color));
+        }
+    }
+
+    // progress_report (State enum + ?u8): present + null.
+    {
+        var dec = try H.roundtrip(alloc, &payload, 10, .{ .progress_report = .{ .state = .set, .progress = 73 } });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(terminalpkg.osc.Command.ProgressReport.State.set, dec.payload.progress_report.state);
+        try testing.expectEqual(@as(?u8, 73), dec.payload.progress_report.progress);
+    }
+    {
+        var dec = try H.roundtrip(alloc, &payload, 10, .{ .progress_report = .{ .state = .remove, .progress = null } });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(?u8, null), dec.payload.progress_report.progress);
+    }
+
+    // pwd_change (WriteReq byte slice): small + large (alloc) reconstruct paths.
+    {
+        const pwd = "/Users/ramon/git/ghostty";
+        const req = try apprt.surface.Message.WriteReq.init(alloc, @as([]const u8, pwd));
+        defer req.deinit();
+        var dec = try H.roundtrip(alloc, &payload, 11, .{ .pwd_change = req });
+        defer dec.deinit(alloc);
+        try testing.expectEqualStrings(pwd, dec.payload.pwd_change);
+        // toMessage reconstructs a small WriteReq (<=255) carrying the same bytes.
+        const reinjected = try dec.toMessage(alloc);
+        try testing.expectEqualStrings(pwd, reinjected.pwd_change.slice());
+    }
+    {
+        const big = "x" ** 600; // forces the .alloc reconstruct path
+        const req = try apprt.surface.Message.WriteReq.init(alloc, @as([]const u8, big));
+        defer req.deinit();
+        var dec = try H.roundtrip(alloc, &payload, 11, .{ .pwd_change = req });
+        defer dec.deinit(alloc);
+        try testing.expectEqualStrings(big, dec.payload.pwd_change);
+        var reinjected = try dec.toMessage(alloc);
+        defer reinjected.pwd_change.deinit();
+        try testing.expect(reinjected.pwd_change == .alloc);
+        try testing.expectEqualStrings(big, reinjected.pwd_change.slice());
+    }
+
+    // clipboard_write (Clipboard enum + WriteReq bytes).
+    {
+        const data = "clipboard payload";
+        const req = try apprt.surface.Message.WriteReq.init(alloc, @as([]const u8, data));
+        defer req.deinit();
+        var dec = try H.roundtrip(alloc, &payload, 12, .{ .clipboard_write = .{
+            .clipboard_type = .selection,
+            .req = req,
+        } });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(apprt.Clipboard.selection, dec.payload.clipboard_write.clipboard_type);
+        try testing.expectEqualStrings(data, dec.payload.clipboard_write.bytes);
+    }
+
+    // clipboard_read (Clipboard enum).
+    {
+        var dec = try H.roundtrip(alloc, &payload, 13, .{ .clipboard_read = .standard });
+        defer dec.deinit(alloc);
+        try testing.expectEqual(apprt.Clipboard.standard, dec.payload.clipboard_read);
+    }
+}
+
+test "host SurfaceEvent fromMessage rejects EXCLUDED variants (Slice 6)" {
+    // The excluded set must NOT be forwarded (each has a dedicated path or is
+    // GUI-/config-side). fromMessage returns error.NotForwarded so the host drain
+    // drops them rather than framing them.
+    const SurfaceEvent = protocol.SurfaceEvent;
+    const excluded = [_]apprt.surface.Message{
+        .{ .close = {} },
+        .{ .child_exited = .{ .exit_code = 0, .runtime_ms = 0 } },
+        .{ .renderer_health = .healthy },
+        .{ .present_surface = {} },
+        .{ .selection_scroll_tick = true },
+        .{ .search_total = 3 },
+        .{ .search_selected = 1 },
+    };
+    for (excluded) |msg| {
+        try testing.expectError(error.NotForwarded, SurfaceEvent.fromMessage(1, &msg));
+    }
+}
+
+// --- Slice 6 host-side forward (drain -> on_surface_event -> surface_event) ---
+
+const SurfaceForwardCapture = struct {
+    /// The last forwarded message, copied as a freshly-built SurfaceEvent (no
+    /// owned bytes for the variants this test uses, so no deinit needed).
+    last: ?protocol.SurfaceEvent = null,
+    count: usize = 0,
+
+    fn cb(ctx: *anyopaque, _: *Session, msg: *const apprt.surface.Message) void {
+        const self: *SurfaceForwardCapture = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        // Mirror the Server's onSurfaceEvent: build the SurfaceEvent from the
+        // forwarded message. EXCLUDED variants would error.NotForwarded, but the
+        // drain only invokes this for non-child_exited messages and the test
+        // pushes a forwarded variant.
+        self.last = protocol.SurfaceEvent.fromMessage(7, msg) catch null;
+    }
+};
+
+test "host drain forwards a non-child_exited surface message as a surface_event (Slice 6)" {
+    // Push a forwardable surface message (ring_bell) onto the app queue, drive a
+    // render tick (which drains the queue), and assert the Session's
+    // on_surface_event hook fired with a message that builds a surface_event
+    // frame round-tripping to the same variant. This is the host half of the
+    // SurfaceEvent channel — the same drain path child_exited uses, but for the
+    // general forwarded set.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    var cap: SurfaceForwardCapture = .{};
+    session.on_surface_event_ctx = &cap;
+    session.on_surface_event = SurfaceForwardCapture.cb;
+
+    // Enqueue a forwardable surface message exactly as the StreamHandler would
+    // (a ring_bell). The surface pointer is stored only (never dereferenced by
+    // the drain); use the Session's own heap surface.
+    _ = session.app_queue.push(.{ .surface_message = .{
+        .surface = session.surface,
+        .message = .{ .ring_bell = {} },
+    } }, .{ .forever = {} });
+
+    // Drive a tick; the drain runs and invokes on_surface_event for the message.
+    _ = try session.renderTick();
+
+    try testing.expectEqual(@as(usize, 1), cap.count);
+    try testing.expect(cap.last != null);
+    try testing.expectEqual(@as(u64, 7), cap.last.?.session_id);
+    try testing.expect(cap.last.?.payload == .ring_bell);
+
+    // And the built event frames + round-trips back to ring_bell.
+    const framed = try protocol.encodeFrame(alloc, .surface_event, cap.last.?);
+    defer alloc.free(framed);
+    var payload2: std.ArrayList(u8) = .empty;
+    defer payload2.deinit(alloc);
+    const tag = try feedOneByteAtATime(alloc, framed, &payload2);
+    try testing.expectEqual(protocol.FrameType.surface_event, tag);
+    var dec = try protocol.SurfaceEvent.decode(alloc, payload2.items);
+    defer dec.deinit(alloc);
+    try testing.expect(dec.payload == .ring_bell);
+}
+
+test "host drain does NOT forward child_exited over surface_event (no double-delivery, Slice 6)" {
+    // child_exited keeps its DEDICATED ChildExited frame + render-stop path; it
+    // must NOT also be handed to on_surface_event. Wire BOTH hooks and assert the
+    // child-exit hook fires while the surface-event hook does NOT.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    var cap: SurfaceForwardCapture = .{};
+    session.on_surface_event_ctx = &cap;
+    session.on_surface_event = SurfaceForwardCapture.cb;
+
+    const ChildCapture = struct {
+        fired: bool = false,
+        fn cb(ctx: *anyopaque, _: *Session, _: u32, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired = true;
+        }
+    };
+    var child_cap: ChildCapture = .{};
+    session.on_child_exited_ctx = &child_cap;
+    session.on_child_exited = ChildCapture.cb;
+
+    _ = session.app_queue.push(.{ .surface_message = .{
+        .surface = session.surface,
+        .message = .{ .child_exited = .{ .exit_code = 0, .runtime_ms = 0 } },
+    } }, .{ .forever = {} });
+
+    _ = try session.renderTick();
+
+    // The dedicated child-exit hook fired; the general SurfaceEvent hook did not.
+    try testing.expect(child_cap.fired);
+    try testing.expectEqual(@as(usize, 0), cap.count);
 }
 
 /// Encode a frame and write it to a client fd (BE length prefix + tag + payload).
