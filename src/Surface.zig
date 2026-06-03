@@ -660,55 +660,123 @@ pub fn init(
             std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
         );
 
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
-
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
-        // SLICE 3d (lock-domain reconciliation, plumbing-only): the `.client`
-        // backend, when Slice 4 selects it, must guard its mirror writes under
-        // the SAME `*std.Thread.Mutex` the renderer reads the mirror under
-        // (`self.renderer_state.mutex` == `mutex`, created at the top of this
-        // fn). That is threaded through `Client.Config.render_mutex` here.
+        // SLICE 4 (backend selection): if `pty-host` names a running
+        // ghostty-host socket, run the terminal emulation ON THE HOST via the
+        // `.client` backend; otherwise fork a shell in-process via `.exec`
+        // (today's behavior, byte-for-byte unchanged when `pty-host` is null).
         //
-        // This config is BUILT (so the wiring is type-checked and exercises the
-        // `render_mutex` field) but NOT selected: `.exec` stays the only live
-        // backend (Surface still hardcodes it below). Slice 4's entire job at
-        // this site is to swap the exec backend tag for a client one built from
-        // `termio.Client.init(alloc, client_config)` — the shared-mutex
-        // plumbing is already in place and correct.
-        const client_config: termio.Client.Config = .{
-            .render_mutex = mutex,
-            // socket_path / session_id are filled by Slice 4's selection logic.
+        // We branch BEFORE constructing either backend so selecting `.client`
+        // does NOT fork a shell subprocess (no `termio.Exec.init`, which spawns
+        // the pty child). Each arm builds and `errdefer`-deinits exactly one
+        // backend, then hands its tagged union value to `termio.Termio.init`.
+        //
+        // SLICE 3d (lock-domain reconciliation): the `.client` mirror writes
+        // must be guarded by the SAME `*std.Thread.Mutex` the renderer reads
+        // the mirror under (`self.renderer_state.mutex` == `mutex`, created at
+        // the top of this fn). That shared mutex is threaded through
+        // `Client.Config.render_mutex` here, so `renderMutex()` resolves to the
+        // renderer-state mutex (no separate `setRenderMutex` call needed).
+        const backend: termio.Backend = if (config.@"pty-host") |sock| backend: {
+            const io_client = try termio.Client.init(alloc, .{
+                .socket_path = sock,
+                .render_mutex = mutex,
+                // FRESH session this slice (reattach-by-session is a follow-on).
+                .session_id = null,
+            });
+            // Note: Client.init dupes socket_path into Client-owned memory
+            // (freed in Client.deinit), so the value owns heap state immediately
+            // after init even though connect happens later in threadEnter. Its
+            // value is moved into the Termio backend union below, transferring
+            // ownership (and the cleanup duty) to self.io — so this errdefer/
+            // move is load-bearing, not merely symmetric with Exec.
+            errdefer {
+                var c = io_client;
+                c.deinit();
+            }
+            break :backend .{ .client = io_client };
+        } else backend: {
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+            break :backend .{ .exec = io_exec };
         };
-        _ = client_config;
+
+        // BACKEND-LEAK FIX: the per-arm `errdefer`s above are scoped INSIDE the
+        // `backend:` block-expression, so they are DEAD by the time
+        // `termio.Termio.init` runs — if it (or the inner `DerivedConfig.init`)
+        // throws, the live backend built above (`.client`'s `Client` or
+        // `.exec`'s `Exec`, both holding owned heap state) would leak. `backend`
+        // is the LIVE `termio.Backend` union, whose `deinit` switches on tag and
+        // calls the right backend's `deinit`, so this single errdefer at the
+        // SAME scope as the `Termio.init` call cleans it up on failure.
+        //
+        // No double free on the success path: `Termio.init` MOVES the backend
+        // union into `self.io.backend` (taking ownership), and there is NO
+        // further fallible (`try`) statement in this block after it — the only
+        // thing left is the success-path `switch`/`env.deinit()` below, which
+        // cannot error — so this errdefer can only fire when `Termio.init`
+        // itself throws, before ownership transferred. The outer
+        // `errdefer self.io.deinit()` (registered after this block) covers the
+        // backend only once `self.io` is successfully constructed.
+        var backend_cleanup = backend;
+        errdefer backend_cleanup.deinit();
 
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
+
+        // SLICE 4 (mirror/link wiring — lifetime-critical): point the renderer
+        // at the host-supplied draw-source mirror, but ONLY for `.client`
+        // (`.exec` leaves both null and renders from the in-process terminal).
+        //
+        // These pointers MUST reference the Client at its FINAL address —
+        // `self.io.backend.client`, where `termio.Termio.init` just MOVED the
+        // backend union value. Taking the address of the pre-move local
+        // (`io_client` above) would dangle the moment the union is copied into
+        // `self.io`. This is the exact lifetime reasoning Slice 3d applied to
+        // the shared mutex (`&self.owned_mutex` is only ever taken on the
+        // final-address `*Client`). The shared render mutex was already wired
+        // via `Config.render_mutex`, so `renderMutex()` resolves to the same
+        // lock the renderer holds when reading `mirror`/`link_cells`.
+        switch (self.io.backend) {
+            .client => |*c| {
+                self.renderer_state.mirror = &c.render_state;
+                self.renderer_state.link_cells = &c.osc8_links;
+
+                // The `.client` backend never consumed `env` (the host owns the
+                // subprocess and its environment); `.exec` would have taken
+                // ownership of it inside `Exec.init`. Free it now, on the
+                // success path, to avoid a leak. This is safe relative to the
+                // block-scoped `errdefer env.deinit()` registered above: there
+                // are no further `try` statements in this block, so that
+                // errdefer cannot fire after this point (no double free).
+                env.deinit();
+            },
+            .exec => {},
+        }
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.

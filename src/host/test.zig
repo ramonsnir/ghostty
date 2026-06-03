@@ -251,9 +251,16 @@ test "host search slice 3b leaves .exec GUI search untouched" {
     try testing.expect(std.mem.indexOf(u8, surface_src, "state: terminal.search.Thread") != null);
     // The GUI still spawns the search thread itself.
     try testing.expect(std.mem.indexOf(u8, surface_src, "terminal.search.Thread.threadMain") != null);
-    // The Surface backend remains hardcoded .exec (never .client).
-    try testing.expect(std.mem.indexOf(u8, surface_src, ".backend = .{ .exec = io_exec }") != null);
-    try testing.expect(std.mem.indexOf(u8, surface_src, ".backend = .{ .client") == null);
+    // SLICE 4: the Surface backend is now SELECTABLE — `.exec` when `pty-host`
+    // is null (today's behavior), `.client` when it is set. The Slice-3-era
+    // "hardcoded .exec / never .client" guard was intentionally relaxed here;
+    // selection lives in the documented io-backend block keyed off
+    // `config.@"pty-host"`. We still pin that BOTH arms exist so a regression
+    // that drops either backend (e.g. removing .client, or losing the .exec
+    // fallback) fails HERE, and that the GUI search ownership above is intact.
+    try testing.expect(std.mem.indexOf(u8, surface_src, ".exec = io_exec") != null);
+    try testing.expect(std.mem.indexOf(u8, surface_src, ".client = io_client") != null);
+    try testing.expect(std.mem.indexOf(u8, surface_src, "config.@\"pty-host\"") != null);
 
     // And the GUI renderer still GATES updateHighlightsFlattened behind the
     // live-pin predicate (Slice 3a), i.e. the host did not un-gate it.
@@ -277,6 +284,59 @@ test "host search slice 3b leaves .exec GUI search untouched" {
     // search_match (host const 0) must be declared before search_match_selected
     // (host const 1).
     try testing.expect(sm < sms);
+}
+
+test "client backend selection seam (slice 4)" {
+    // SLICE 4 selection seam, asserted statically against Surface.zig source
+    // (the init path needs a full app/window context and is not unit-testable
+    // headlessly — the live render is the documented human smoke). This pins
+    // the THREE load-bearing properties of the selection + wiring:
+    //
+    //   1. Selection is keyed off `config.@"pty-host"` (null => .exec, the
+    //      byte-for-byte-unchanged default; set => .client).
+    //   2. The `.client` arm builds the Client via `termio.Client.init` and
+    //      does NOT call `termio.Exec.init` inside it — i.e. selecting .client
+    //      forks NO shell subprocess. We pin this by requiring the branch to be
+    //      an `if (config.@"pty-host")` whose then-arm constructs the Client and
+    //      whose else-arm constructs Exec (so Exec.init is only reachable when
+    //      pty-host is null).
+    //   3. The mirror/link wiring takes the FINAL post-move address inside
+    //      `self.io.backend` (the lifetime-critical part), NOT a pre-move local.
+    const surface_src = @embedFile("../Surface.zig");
+
+    // (1) selection keyed off the config key, with both backend arms present.
+    const sel = std.mem.indexOf(u8, surface_src, "if (config.@\"pty-host\")") orelse
+        return error.PtyHostSelectionMissing;
+    const client_init = std.mem.indexOf(u8, surface_src, "termio.Client.init(alloc") orelse
+        return error.ClientInitMissing;
+    const exec_init = std.mem.indexOf(u8, surface_src, "termio.Exec.init(alloc") orelse
+        return error.ExecInitMissing;
+
+    // (2) Client.init is in the then-arm and Exec.init is in the else-arm:
+    // both must appear AFTER the `if (config.@"pty-host")`, and Client.init
+    // (then) must precede Exec.init (else). This makes Exec.init — the call
+    // that forks the pty child — unreachable when .client is selected.
+    try testing.expect(client_init > sel);
+    try testing.expect(exec_init > client_init);
+
+    // FRESH session this slice (reattach is a follow-on).
+    try testing.expect(std.mem.indexOf(u8, surface_src, ".session_id = null") != null);
+    // Shared render mutex threaded into the Client config (Slice 3d).
+    try testing.expect(std.mem.indexOf(u8, surface_src, ".render_mutex = mutex") != null);
+
+    // (3) lifetime-critical wiring: the mirror/link pointers are taken from the
+    // FINAL post-move home `self.io.backend` (the `.client => |*c|` capture),
+    // NOT from the pre-move `io_client` local.
+    const wire = std.mem.indexOf(u8, surface_src, "switch (self.io.backend)") orelse
+        return error.MirrorWireSwitchMissing;
+    const mirror_at = std.mem.indexOfPos(u8, surface_src, wire, "self.renderer_state.mirror = &c.render_state") orelse
+        return error.MirrorWireMissing;
+    const links_at = std.mem.indexOfPos(u8, surface_src, wire, "self.renderer_state.link_cells = &c.osc8_links") orelse
+        return error.LinkWireMissing;
+    try testing.expect(mirror_at > wire);
+    try testing.expect(links_at > wire);
+    // Must NOT wire from the pre-move local (would dangle after the union move).
+    try testing.expect(std.mem.indexOf(u8, surface_src, "mirror = &io_client") == null);
 }
 
 /// Feed `framed` to a FrameReader one byte at a time, asserting `next` returns
