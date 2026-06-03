@@ -424,6 +424,18 @@ pub fn connectAndAttach(
     // Doing it before the spawn also means a failed Attach unwinds via the
     // fd/pipe[0]/pipe[1]/stream errdefers above with NO live thread touching
     // any fd (no race, no double-close).
+    // HANDSHAKE FIRST: the host rejects every stateful frame (including Attach)
+    // until it receives a compatible-major Hello (Server's `handshaked` gate;
+    // it closes the conn on "frame attach before Hello handshake"). Enqueue
+    // Hello BEFORE Attach so it is ahead in the single-producer write queue and
+    // the host observes the handshake first. `protocol.Hello{}` carries the
+    // current PROTOCOL_VERSION_MAJOR/MINOR defaults; identity_bundle_id is left
+    // empty (the host only gates on major-version compatibility) and is encoded
+    // by value (no ownership transfer). Found by the first live ReleaseLocal
+    // smoke — the socket integration test sent Hello-then-Attach, so it never
+    // caught that connectAndAttach skipped the Hello.
+    try sendFrameRaw(client_td, loop, alloc, .hello, protocol.Hello{});
+
     try sendFrameRaw(client_td, loop, alloc, .attach, protocol.Attach{
         .session_id = self.config.session_id,
     });
