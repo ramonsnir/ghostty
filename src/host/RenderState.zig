@@ -556,6 +556,34 @@ pub const Snapshot = struct {
         return true;
     }
 
+    /// Cursor-only equality over the RENDER-AFFECTING cursor fields. Used by
+    /// Session.renderTick (Slice 8) to widen the per-tick push gate so a
+    /// cursor-only move (arrow keys change NO rows => printDiff-changed==0)
+    /// still pushes a frame and the GUI mirror's cursor follows.
+    ///
+    /// DELIBERATELY EXCLUDES `cursor_blink_visible`: it is a hard-coded
+    /// placeholder (always true, Slice 2/2a) and the real blink on/off is
+    /// GUI-LOCAL (renderer blink timer), so it is not in the snapshot and must
+    /// not gate pushes — including it would change nothing today but could
+    /// reintroduce idle spam if it were ever wired to a host-side timer. Every
+    /// field compared here changes only on a genuine cursor move/visibility/
+    /// style change, so an idle session with a steady cursor compares equal and
+    /// pushes nothing.
+    pub fn cursorEql(a: Snapshot, b: Snapshot) bool {
+        if (a.cursor_x != b.cursor_x or a.cursor_y != b.cursor_y) return false;
+        if (a.cursor_visible != b.cursor_visible) return false;
+        if (a.cursor_blinking != b.cursor_blinking) return false;
+        if (a.cursor_password_input != b.cursor_password_input) return false;
+        if (a.cursor_visual_style != b.cursor_visual_style) return false;
+        if (!std.meta.eql(a.cursor_viewport, b.cursor_viewport)) return false;
+        {
+            const ai: u64 = @bitCast(a.cursor_cell);
+            const bi: u64 = @bitCast(b.cursor_cell);
+            if (ai != bi) return false;
+        }
+        return true;
+    }
+
     /// A precise mismatch reporter for `eqlRenderState`. When a comparison
     /// fails, the first mismatch is recorded here (the test side dumps it).
     /// This keeps `eqlRenderState` a pure read-only comparison (no stderr

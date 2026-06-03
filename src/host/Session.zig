@@ -922,6 +922,19 @@ pub fn renderTick(self: *Session) !usize {
 
     const changed = try RenderState.printDiff(self.alloc, self.prev_snapshot, snapshot);
 
+    // Slice 8: a cursor-only move (arrow keys) changes NO rows, so
+    // `changed`==0 and the row-diff gate below would suppress the push,
+    // leaving the GUI mirror's cursor stranded. Detect a render-affecting
+    // cursor change vs. the last pushed snapshot (null prev => first frame =>
+    // treat as changed) and widen the gate to include it. This does NOT
+    // reintroduce idle spam: cursorEql compares real position/visibility/style
+    // only (NOT the blink-phase placeholder), so a steady idle cursor compares
+    // equal and pushes nothing.
+    const cursor_changed = if (self.prev_snapshot) |prev|
+        !prev.cursorEql(snapshot)
+    else
+        true;
+
     if (self.prev_snapshot) |*prev| prev.deinit(self.alloc);
     self.prev_snapshot = snapshot;
 
@@ -948,7 +961,7 @@ pub fn renderTick(self: *Session) !usize {
     // CLEARED and the cleared frame must still ship. `force_push` (the
     // read-and-clear of `search_dirty` captured under render_mutex above) forces
     // the push in that case so the highlight delta reaches subscribers.
-    if (changed > 0 or force_push) {
+    if (changed > 0 or force_push or cursor_changed) {
         if (self.on_render) |cb| {
             cb(self.on_render_ctx.?, self, &self.prev_snapshot.?);
         }
