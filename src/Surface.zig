@@ -1065,6 +1065,24 @@ pub fn needsConfirmQuit(self: *Surface) bool {
     };
 }
 
+/// Returns the host-assigned pty-host session id for this surface, or 0 if the
+/// surface is not attached to a pty host (the `.exec` backend, or a `.client`
+/// backend that has not yet received its `Attached` frame).
+///
+/// Slice 5b (reverse half of reattach): the GUI reads this PULL getter at
+/// restorable-state ENCODE time to persist the id so it can reattach after a
+/// restart. It reads the Client's lock-free atomic (`session_id.load(.acquire)`,
+/// paired with the `handleFrame` store-release), so it is safe to call from the
+/// apprt/main thread without taking any lock. Host ids start at 1, so 0 is an
+/// unambiguous "unattached" sentinel. The `.exec` backend never dereferences a
+/// client union, returning 0 directly.
+pub fn sessionId(self: *Surface) u64 {
+    return switch (self.io.backend) {
+        .client => |*c| c.session_id.load(.acquire),
+        .exec => 0,
+    };
+}
+
 /// Called from the app thread to handle mailbox messages to our specific
 /// surface.
 pub fn handleMessage(self: *Surface, msg: Message) !void {

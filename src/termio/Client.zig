@@ -1171,3 +1171,47 @@ test "client/config: forward-map surface session_id into Client.Config.session_i
     const reattach: Config = .{ .session_id = sessionIdFromConfig(7) };
     try testing.expectEqual(@as(?u64, 7), reattach.session_id);
 }
+
+// Slice 5b reverse-mapping test. Named to match both the `client` and
+// `config` filters. Asserts the host-ASSIGNED session id flows back OUT of a
+// `.client` backend via the same lock-free atomic the accessor reads. This is
+// the load-bearing half of `Surface.sessionId` (src/Surface.zig):
+//   switch (self.io.backend) { .client => |*c| c.session_id.load(.acquire), .exec => 0 }
+// We build a real `termio.Backend` union (not a stub) holding a `.client`,
+// reproduce the accessor's exact switch over it, and assert:
+//   - default (no Attached frame yet) => 0 (the unattached sentinel; host ids
+//     start at 1), so an unattached client reads as 0 just like `.exec`.
+//   - after the host assigns an id (modeled by the same `.release` store
+//     `handleFrame` performs on the Attached frame) => that exact id.
+// The trivial `.exec => 0` constant arm (no client-union deref) is enforced by
+// the build's exhaustive switch and exercised by the Slice-5c human smoke (a
+// real reattach from the macOS GUI reading `ghostty_surface_session_id`).
+test "client/config: reverse-map host-assigned session_id out of .client backend" {
+    const testing = std.testing;
+
+    var backend: termio.Backend = .{
+        .client = try Client.init(testing.allocator, .{}),
+    };
+    defer backend.deinit();
+
+    // The accessor's exact switch (mirrors Surface.sessionId).
+    const read = struct {
+        fn sessionId(b: *termio.Backend) u64 {
+            return switch (b.*) {
+                .client => |*c| c.session_id.load(.acquire),
+                .exec => 0,
+            };
+        }
+    }.sessionId;
+
+    // Freshly-built client has not received its Attached frame: 0 = unattached.
+    try testing.expectEqual(@as(u64, 0), read(&backend));
+
+    // Model the host assigning an id (same store-release `handleFrame` does on
+    // the Attached frame); the accessor must read it back lock-free.
+    backend.client.session_id.store(99, .release);
+    try testing.expectEqual(@as(u64, 99), read(&backend));
+
+    backend.client.session_id.store(std.math.maxInt(u64), .release);
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), read(&backend));
+}
