@@ -83,6 +83,31 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`bellIsFocused`, `bellFeaturesForCurrentFocus(_:)`, gated `ghosttyBellDidRing`);
   `macos/Sources/App/macOS/AppDelegate.swift` (`ghosttyBellDidRing` branches the set).
 
+- **Bell visibility across splits/zoom** (fork-only tweak to upstream macOS Swift; no
+  config key — always on) — two fixes so a bell in a non-focused or zoomed-away split is
+  never silently lost (previously only the dock badge lit up). **(A) Tab-title
+  aggregation:** the 🔔 title prefix now reflects the **window-level aggregate** bell
+  (ANY surface in the tab rang), not just the focused surface — `setupTitleListener`
+  combines `titleSurface.$title` with `self.$bell` (the same aggregate the dock badge
+  uses, from `setupBellNotificationPublisher`) instead of `titleSurface.$bell`, and
+  `applyTitleToWindow`'s `titleOverride` branch reads `self.bell`. **(B) Hidden-split
+  bell badge under zoom:** while a split is zoomed, a hidden split that rings can't draw
+  its own bell border (hidden splits aren't in the SwiftUI hierarchy — `TerminalSplitTreeView`
+  renders only the zoomed subtree), so a small amber `bell.badge` pill is shown
+  top-trailing on the zoomed view, driven by a new `BaseTerminalController.zoomedHiddenBell`
+  (`@Published`, derived in `setupZoomedHiddenBellPublisher` by combining `$surfaceTree`
+  with `surfaceValuesPublisher(\.bell)` → `SplitTree.hasBellOutsideZoom(bells:)`; reads
+  the tree from the combineLatest tuple, NOT `self.surfaceTree`, because `@Published`
+  emits in `willSet` so the stored prop still holds the old tree mid-cycle). The badge is
+  gated on the same static `bell-features` `.border` as the border, so badge-under-zoom
+  and amber-border-on-unzoom are a symmetric handoff; its corner-pill geometry stays
+  visually distinct from the full-perimeter amber bell border and the orange marked-pane
+  inset. Wiring: `macos/Sources/Features/Splits/SplitTree.swift` (`zoomedLeaves()` +
+  `hasBellOutsideZoom(bells:)` pure transforms), `BaseTerminalController.swift` (title
+  aggregate + `zoomedHiddenBell` publisher), `macos/Sources/Features/Terminal/TerminalView.swift`
+  (`zoomedHiddenBell` protocol requirement + `HiddenSplitBellBadge`). Tests:
+  `macos/Tests/Splits/SplitTreeTests.swift` (`hasBellOutsideZoom*`, `zoomedLeaves*`).
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.

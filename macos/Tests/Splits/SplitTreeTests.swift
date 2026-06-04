@@ -1007,4 +1007,83 @@ struct SplitTreeTests {
         nodeIds.insert(s.right.structuralIdentity)
         #expect(nodeIds.count == 2)
     }
+
+    // MARK: - Hidden-split bell (ramon fork)
+
+    /// Builds a 3-leaf tree where v2/v3 form a sub-split:
+    ///   root = .split(left: .leaf(v1), right: .split(left: .leaf(v2), right: .leaf(v3)))
+    private func makeThreeLeafTree() throws -> (SplitTree<MockView>, MockView, MockView, MockView) {
+        let v1 = MockView()
+        let v2 = MockView()
+        let v3 = MockView()
+        var tree = SplitTree<MockView>(view: v1)
+        tree = try tree.inserting(view: v2, at: v1, direction: .right)
+        tree = try tree.inserting(view: v3, at: v2, direction: .down)
+        return (tree, v1, v2, v3)
+    }
+
+    @Test func hasBellOutsideZoomFalseWhenNotZoomed() throws {
+        let (tree, v1, v2, v3) = try makeThreeLeafTree()
+        #expect(tree.zoomed == nil)
+        #expect(tree.hasBellOutsideZoom(bells: [v1.id: true, v2.id: true, v3.id: true]) == false)
+    }
+
+    @Test func hasBellOutsideZoomFalseWhenRingerInsideZoom() throws {
+        let (tree, v1, _, _) = try makeThreeLeafTree()
+        let zoomedTree = SplitTree(root: tree.root, zoomed: .leaf(view: v1))
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v1.id: true]) == false)
+    }
+
+    @Test func hasBellOutsideZoomTrueWhenRingerOutsideZoom() throws {
+        let (tree, v1, v2, _) = try makeThreeLeafTree()
+        let zoomedTree = SplitTree(root: tree.root, zoomed: .leaf(view: v1))
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v2.id: true]) == true)
+    }
+
+    @Test func hasBellOutsideZoomMultipleClearsToLast() throws {
+        let (tree, v1, v2, v3) = try makeThreeLeafTree()
+        let zoomedTree = SplitTree(root: tree.root, zoomed: .leaf(view: v1))
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v2.id: true, v3.id: true]) == true)
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v2.id: false, v3.id: true]) == true)
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v2.id: false, v3.id: false]) == false)
+    }
+
+    @Test func hasBellOutsideZoomIgnoresInsideRingerWithOutsideQuiet() throws {
+        let (tree, v1, v2, _) = try makeThreeLeafTree()
+        guard case .split(let rootSplit) = tree.root else {
+            Issue.record("expected root to be a split")
+            return
+        }
+        let subSplit = rootSplit.right
+        let zoomedTree = SplitTree(root: tree.root, zoomed: subSplit)
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v2.id: true]) == false)
+        #expect(zoomedTree.hasBellOutsideZoom(bells: [v2.id: true, v1.id: true]) == true)
+    }
+
+    @Test func zoomedLeavesReturnsSubtreeLeaves() throws {
+        let (tree, _, v2, v3) = try makeThreeLeafTree()
+        guard case .split(let rootSplit) = tree.root else {
+            Issue.record("expected root to be a split")
+            return
+        }
+        let subSplit = rootSplit.right
+        let zoomedTree = SplitTree(root: tree.root, zoomed: subSplit)
+        #expect(Set(zoomedTree.zoomedLeaves().map(\.id)) == [v2.id, v3.id])
+    }
+
+    @Test func zoomedLeavesEmptyWhenNotZoomed() throws {
+        let (tree, _, _, _) = try makeThreeLeafTree()
+        #expect(tree.zoomed == nil)
+        #expect(tree.zoomedLeaves().isEmpty)
+    }
+
+    @Test func hasBellOutsideZoomSingleAndEmptyTree() {
+        let v1 = MockView()
+        let single = SplitTree(root: .leaf(view: v1), zoomed: .leaf(view: v1))
+        #expect(single.hasBellOutsideZoom(bells: [v1.id: true]) == false)
+
+        let empty = SplitTree<MockView>()
+        #expect(empty.hasBellOutsideZoom(bells: [:]) == false)
+        #expect(empty.zoomedLeaves().isEmpty)
+    }
 }

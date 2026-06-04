@@ -1365,6 +1365,29 @@ extension SplitTree: Collection {
     }
 }
 
+// MARK: SplitTree Bell (ramon fork)
+
+extension SplitTree {
+    /// Leaf views inside the currently-zoomed subtree (empty when not zoomed).
+    func zoomedLeaves() -> [ViewType] {
+        zoomed?.leaves() ?? []
+    }
+
+    /// True iff the tree is zoomed AND some leaf OUTSIDE the zoomed subtree has
+    /// bell == true. Drives the hidden-split bell badge: while a split is zoomed,
+    /// any other (hidden) split that rings can't show its own bell border, so we
+    /// surface it as a corner badge instead.
+    func hasBellOutsideZoom(bells: [ViewType.ID: Bool]) -> Bool {
+        guard zoomed != nil else { return false }
+        let zoomedIDs = Set(zoomedLeaves().map(\.id))
+        for leaf in self {
+            if zoomedIDs.contains(leaf.id) { continue }
+            if bells[leaf.id] == true { return true }
+        }
+        return false
+    }
+}
+
 // MARK: SplitTree Combine
 
 extension SplitTree {

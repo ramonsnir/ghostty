@@ -38,6 +38,9 @@ protocol TerminalViewModel: ObservableObject {
 
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// (ramon fork) True when the tree is zoomed and a hidden split has an active bell.
+    var zoomedHiddenBell: Bool { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -65,6 +68,13 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
     private var pwdURL: URL? {
         guard let surfacePwd, surfacePwd != "" else { return nil }
         return URL(fileURLWithPath: surfacePwd)
+    }
+
+    /// (ramon fork) Gate for the hidden-split bell badge. Gated on the SAME static
+    /// `bellFeatures.contains(.border)` that mounts BellBorderOverlay, so the badge
+    /// (under zoom) and the amber bell border (on un-zoom) are a symmetric handoff.
+    private var showHiddenBellBadge: Bool {
+        ghostty.config.bellFeatures.contains(.border)
     }
 
     var body: some View {
@@ -106,6 +116,16 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         }
                         .frame(idealWidth: lastFocusedSurface?.value?.initialSize?.width,
                                idealHeight: lastFocusedSurface?.value?.initialSize?.height)
+                        // (ramon fork) Hidden-split bell badge. Attached to the outer
+                        // TerminalSplitTreeView value, OUTSIDE its internal `.id` scope,
+                        // so it survives zoom identity changes. The `value:`-driven
+                        // animation is what fires the badge's opacity transition.
+                        .overlay(alignment: .topTrailing) {
+                            if viewModel.zoomedHiddenBell && showHiddenBellBadge {
+                                HiddenSplitBellBadge()
+                            }
+                        }
+                        .animation(.easeInOut(duration: 0.3), value: viewModel.zoomedHiddenBell)
                 }
                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
                 .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
@@ -134,6 +154,26 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
         }
+    }
+}
+
+/// (ramon fork) Corner pill shown on a zoomed split when a HIDDEN split rings.
+/// Distinct GEOMETRY (top-trailing pill) from the two full-perimeter strokes
+/// (amber bell border, orange marked-pane), reusing the bell amber on the glyph
+/// for a semantic tie to the bell border without copying the stroke shape.
+private struct HiddenSplitBellBadge: View {
+    var body: some View {
+        Image(systemName: "bell.badge.fill")
+            .font(.system(size: 11, weight: .semibold))
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(.white, Color(red: 1.0, green: 0.8, blue: 0.0))
+            .padding(5)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.black.opacity(0.15), lineWidth: 0.5))
+            .padding(8)
+            .allowsHitTesting(false)
+            .accessibilityLabel("Hidden split bell")
+            .transition(.opacity)
     }
 }
 
