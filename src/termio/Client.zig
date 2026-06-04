@@ -162,6 +162,23 @@ surface_mailbox: ?apprt.surface.Mailbox = null,
 /// The flat input-mode mirror, updated wholesale from each ModeFrame.
 mode: protocol.ModeFrame = .{ .session_id = 0 },
 
+/// PHASE A (audit R2): the SAME local `terminal.Terminal` the GUI's
+/// key/mouse/paste encode paths read input modes off of (`io.terminal` in
+/// `Surface.zig`). Under `.client` that terminal is never fed VT, so its modes
+/// would stay at defaults — vim/tmux/less arrows, mouse reporting, kitty
+/// keyboard, keypad, bracketed paste, etc. all broken. The host ships the real
+/// modes in a `ModeFrame`; `handleFrame`'s `.mode_frame` arm now APPLIES the
+/// decoded modes onto THIS terminal (under the shared `renderMutex()`, the same
+/// lock the encode reads take), so the encode paths read correct values. Set by
+/// `setLocalTerminal` from `Surface.init` on the FINAL-address `*Client` (the
+/// post-move backend slot) with `&self.io.terminal` — NOT by `initTerminal`,
+/// which runs pre-move and would capture a dead stack address (see
+/// `R2-DANGLING-TERMINAL`). `null` in standalone/decode tests that bypass it,
+/// where the apply is a safe no-op. POINTER: owned by the Surface (the backend
+/// reads it, never frees it), exactly like `Exec`'s relationship to
+/// `io.terminal`.
+local_terminal: ?*terminal.Terminal = null,
+
 /// --- Slice 3c: host-computed OSC8 hover links ---
 ///
 /// The current OSC8 link-cell set, decoded from the most recent LinkFrame. The
@@ -340,6 +357,20 @@ pub fn setRenderMutex(self: *Client, m: *std.Thread.Mutex) void {
     self.render_mutex = m;
 }
 
+/// Set the local terminal that `handleFrame`'s `.mode_frame` arm applies the
+/// host's real input modes onto (Phase A / audit R2). MUST be called with the
+/// Client at its FINAL address (the backend union slot, after `Termio.init`
+/// has moved it in) and with `t` == the final `&io.terminal` — the EXACT
+/// terminal the GUI encode paths read (`key_encode.Options.fromTerminal`,
+/// `paste.Options.fromTerminal`, the mouse-reporting gates). Setting this from
+/// `initTerminal` would capture the pre-move stack-local terminal address,
+/// which dangles across `Termio.init`'s by-value move; this setter parallels
+/// `setRenderMutex` and the mirror/link_cells re-pointing in `Surface.init`.
+/// `null` (never called) leaves `handleFrame`'s apply a safe no-op.
+pub fn setLocalTerminal(self: *Client, t: *terminal.Terminal) void {
+    self.local_terminal = t;
+}
+
 pub fn deinit(self: *Client) void {
     self.render_state.deinit(self.gpa);
     self.images.deinit(self.gpa);
@@ -362,6 +393,22 @@ pub fn deinit(self: *Client) void {
 pub fn initTerminal(self: *Client, term: *terminal.Terminal) void {
     self.grid_size = .{ .columns = term.cols, .rows = term.rows };
     self.screen_size = .{ .width = term.width_px, .height = term.height_px };
+
+    // PHASE A (audit R2): do NOT capture `term` here for `local_terminal`.
+    // `initTerminal` runs on the PRE-MOVE backend copy inside `Termio.init`,
+    // and `term` is the stack-local `var term` (Termio.zig:241) that
+    // `Termio.init` then COPIES BY VALUE into `self.terminal` (Termio.zig:300,
+    // a distinct FINAL address) before its stack frame is reclaimed. Capturing
+    // `&term` here would store a dead pre-move stack address — both a no-op
+    // against the terminal the encode paths actually read (`self.io.terminal`
+    // == the final `&Termio.terminal`) AND a use-after-scope when written
+    // through in `handleFrame`. Instead `local_terminal` is set from
+    // `Surface.init` via `setLocalTerminal(&self.io.terminal)` on the
+    // FINAL-address `*Client` (the backend union slot, after the move),
+    // mirroring how the mirror/link_cells pointers are re-taken there. This is
+    // the same lifetime hazard the author avoided for `render_mutex` below
+    // (external pointer, survives the move) — `local_terminal` must point at
+    // the final terminal, which only exists after the move.
 
     // SLICE 3d: seed the shared guard mutex from the config-supplied
     // renderer-state mutex, if any. Safe to set here even though `initTerminal`
@@ -736,7 +783,92 @@ pub fn handleFrame(
 
         .mode_frame => {
             // POD; replace the mirror wholesale.
-            self.mode = try protocol.ModeFrame.decode(alloc, payload);
+            const decoded = try protocol.ModeFrame.decode(alloc, payload);
+            self.mode = decoded;
+
+            // PHASE A (audit R2): APPLY the decoded modes onto the local
+            // terminal so the GUI's key/mouse/paste encode paths read the
+            // host's REAL input modes instead of stuck defaults. We already
+            // hold the shared `renderMutex()` here, which is the SAME lock the
+            // encode reads take (Surface.zig locks `renderer_state.mutex`
+            // around `fromTerminal`/the mouse gates) — so no new locking and the
+            // apply is synchronized with those reads. This is `.client`-only by
+            // construction (this code never runs under `.exec`). No-op when
+            // `local_terminal` is null (standalone/decode tests bypass initTerminal).
+            if (self.local_terminal) |t| {
+                const mf = decoded;
+                // The 8 bool modes -> ModeState.set(.<name>, bool). Names
+                // verified against the ModeFrame.fromTerminal source reads.
+                t.modes.set(.alt_esc_prefix, mf.alt_esc_prefix);
+                t.modes.set(.cursor_keys, mf.cursor_keys);
+                t.modes.set(.keypad_keys, mf.keypad_keys);
+                t.modes.set(.backarrow_key_mode, mf.backarrow_key_mode);
+                t.modes.set(.ignore_keypad_with_numlock, mf.ignore_keypad_with_numlock);
+                t.modes.set(.bracketed_paste, mf.bracketed_paste);
+                t.modes.set(.disable_keyboard, mf.disable_keyboard);
+                t.modes.set(.mouse_alternate_scroll, mf.mouse_alternate_scroll);
+
+                // The mouse-reporting + modify_other_keys cluster lives on
+                // t.flags (not modes). The u8/u2 wire fields are the enum
+                // indices written by fromTerminal's @intFromEnum, so for a
+                // well-formed host they round-trip exactly. They are, however,
+                // UNTRUSTED wire bytes: the target enums are EXHAUSTIVE with
+                // narrow backing (mouse.Event/.Format are u3 with valid 0..4,
+                // mouse_shift_capture is u2 with valid 0..2), so a raw
+                // @enumFromInt on an out-of-range byte from a corrupt / desynced
+                // / version-skewed peer is illegal behavior (checked panic in
+                // safe builds, UB in the ReleaseFast lib). The protocol layer's
+                // contract is that untrusted wire integers must NEVER abort the
+                // process — they degrade to error.InvalidFrame, treated as a
+                // clean connection close (FrameReader.next, readEnum, etc.). So
+                // validate via intToEnum and mirror that convention here.
+                t.flags.mouse_event = std.meta.intToEnum(
+                    @TypeOf(t.flags.mouse_event),
+                    mf.mouse_event,
+                ) catch return error.InvalidFrame;
+                t.flags.mouse_format = std.meta.intToEnum(
+                    @TypeOf(t.flags.mouse_format),
+                    mf.mouse_format,
+                ) catch return error.InvalidFrame;
+                t.flags.mouse_shift_capture = std.meta.intToEnum(
+                    @TypeOf(t.flags.mouse_shift_capture),
+                    mf.mouse_shift_capture,
+                ) catch return error.InvalidFrame;
+                t.flags.modify_other_keys_2 = mf.modify_other_keys_2;
+
+                // Kitty keyboard: set the ACTIVE screen's flag stack so
+                // `current().int()` == mf.kitty_flags — exactly what
+                // `key_encode`/`fromTerminal` read
+                // (`t.screens.active.kitty_keyboard.current().int()`). The wire
+                // u8 holds a u5 Flags bit-pattern; @bitCast it back to Flags and
+                // `set(.set, …)` overwrites the current stack slot (vs. push,
+                // which would mutate the stack depth). The host already resolved
+                // the value for ITS active screen, and fromTerminal reads the
+                // local active screen, so no active_key switch is needed.
+                //
+                // UNTRUSTED wire byte: kitty_flags is a u8 carrying a u5 from a
+                // well-formed host. A narrowing @intCast(u5) would be illegal
+                // behavior if a corrupt/skewed peer set any high bit (>31). The
+                // @bitCast to Flags is total (every u5 is a valid packed
+                // struct(u5)), so only the narrowing is unsafe. Reject high bits
+                // to mirror the protocol's "malformed wire int -> InvalidFrame
+                // -> clean close" convention (same as the mouse casts above).
+                if (mf.kitty_flags > std.math.maxInt(u5)) return error.InvalidFrame;
+                t.screens.active.kitty_keyboard.set(
+                    .set,
+                    @bitCast(@as(u5, @intCast(mf.kitty_flags))),
+                );
+
+                // RESIDUAL (documented, MEDIUM audit item): alt_screen_active is
+                // intentionally NOT applied. Switching the local terminal's
+                // active screen requires mutating `t.screens.active_key`, which
+                // is tied to DECSET 1049 handling + screen-swap assertions and is
+                // unsafe to set directly here. The only behavior that still reads
+                // the local active_key under .client is the alt-screen
+                // wheel->arrow scroll translation; everything else covered above
+                // (all HIGH items + kitty) is now correct. A future slice can
+                // address alt-screen via the mirror's alt flag.
+            }
         },
 
         .attached => {
