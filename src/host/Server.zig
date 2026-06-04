@@ -514,7 +514,13 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         .attach => {
             var attach = try protocol.Attach.decode(alloc, frame.payload);
             defer attach.deinit(alloc);
-            try self.handleAttach(conn, attach.session_id);
+            // SLICE 11: carry the spawn-opt cwd through to the spawn path.
+            // `working_directory` is borrowed from the decoded frame (freed by
+            // `attach.deinit` above); handleAttach/spawnSession use it
+            // synchronously to seed Session.Options before this returns, and
+            // Session.create dupes it into the session config's arena — no
+            // lifetime extension needed past this call.
+            try self.handleAttach(conn, attach.session_id, attach.working_directory);
         },
 
         .input => {
@@ -720,7 +726,12 @@ pub fn connCountForTest(self: *Server) usize {
     return self.conns.items.len + self.dead_conns.items.len;
 }
 
-fn handleAttach(self: *Server, conn: *Conn, session_id: ?u64) !void {
+fn handleAttach(
+    self: *Server,
+    conn: *Conn,
+    session_id: ?u64,
+    working_directory: ?[]const u8,
+) !void {
     // Reattach to a session whose Session is still valid (alive child OR a
     // child that exited but whose entry has not been Closed — plan §4.8).
     //
@@ -768,7 +779,11 @@ fn handleAttach(self: *Server, conn: *Conn, session_id: ?u64) !void {
     // registry_mutex itself (it's already held here).
     self.registry_mutex.lock();
     defer self.registry_mutex.unlock();
-    const e = try self.spawnSession();
+    // SLICE 11: a FRESH spawn (or a degrade-to-spawn from an unknown/torn-down
+    // id) honors the Attach's spawn-opt cwd; a LIVE reattach above returned
+    // before reaching here, so it never applies the cwd (the existing session
+    // keeps its own). `null` => host default ($HOME), today's behavior.
+    const e = try self.spawnSession(working_directory);
     // spawnSession registered `e` in the registry AND started its owner thread.
     // If any subsequent step fails (subscribe OOM, pushFullFrames), tear down
     // the just-spawned session (finding SR-R2-2): the conn was never subscribed
@@ -832,11 +847,17 @@ fn subscribe(self: *Server, conn: *Conn, e: *SessionEntry) !void {
 /// CALLER MUST HOLD registry_mutex (findings SR-1 / ZM1): the only caller,
 /// handleAttach, holds it across the whole spawn+dereference so a concurrent
 /// Close cannot fetchRemove+free the entry mid-attach.
-fn spawnSession(self: *Server) !*SessionEntry {
+fn spawnSession(self: *Server, working_directory: ?[]const u8) !*SessionEntry {
     const id = self.next_session_id;
     self.next_session_id += 1;
 
-    const session = try Session.create(self.alloc, .{});
+    // SLICE 11: seed the spawn-opt cwd into Session.Options. Session.create
+    // dupes it into the session config's arena, so the borrowed slice (from the
+    // decoded Attach frame, still alive in handleClientFrame) only needs to
+    // outlive this call. `null` => the config's $HOME finalize default stands.
+    const session = try Session.create(self.alloc, .{
+        .working_directory = working_directory,
+    });
     errdefer session.destroy();
 
     const e = try self.alloc.create(SessionEntry);

@@ -49,6 +49,16 @@ pub const Options = struct {
     /// Fixed cell size in pixels (fabricated; only used for width_px/height_px).
     cell_width: u32 = 8,
     cell_height: u32 = 16,
+
+    /// SLICE 11: spawn-opt working directory carried from the GUI's Attach
+    /// frame (cwd-inherit). Borrowed for the duration of `create` (which DUPES
+    /// it into the session config's arena before storing); the caller need not
+    /// keep it alive past `create`. `null` => no cwd opt: the config's
+    /// finalize-time default ($HOME via passwd) stands, preserving pre-Slice-11
+    /// behavior. Applied to `config.@"working-directory"` only on a FRESH spawn
+    /// (the only path that calls `create`); reattach never reaches here, so the
+    /// existing session keeps its cwd.
+    working_directory: ?[]const u8 = null,
 };
 
 /// The host's search thread + OS thread handle, mirroring `Surface.Search`
@@ -253,6 +263,21 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
         // bare default (sh, no integration) — degrade, don't fail the session.
         log.warn("config.finalize failed, shell integration may be disabled err={}", .{err});
     };
+
+    // SLICE 11 (cwd-inherit): if the GUI's Attach carried a spawn-opt cwd,
+    // override the config's working-directory with it AFTER finalize (so this
+    // explicit path wins over finalize's $HOME default). The Exec.init below
+    // reads `config.@"working-directory".value()`, so setting it here makes the
+    // fresh child terminal start in the requested directory. DUPE the borrowed
+    // opts slice into the config's OWN arena (the same arena every other config
+    // string lives in, freed by `config.deinit()`); WorkingDirectory.value()
+    // returns this `.path`, and Exec.init dupes it again into Exec-owned memory,
+    // so the config-arena copy only needs to outlive this create call. `null`
+    // opts leaves the finalize default untouched (today's $HOME behavior).
+    if (opts.working_directory) |wd| {
+        const arena_alloc = config._arena.?.allocator();
+        config.@"working-directory" = .{ .path = try arena_alloc.dupe(u8, wd) };
+    }
 
     const size: renderer.Size = .{
         .screen = .{
