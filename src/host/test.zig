@@ -3028,6 +3028,20 @@ fn hostScreenContains(h: *HostHarness, alloc: std.mem.Allocator, marker: []const
     return std.mem.indexOf(u8, dump, marker) != null;
 }
 
+// True iff the marker is present in the live host terminal's VIEWPORT (the
+// currently-displayed rows only — what a GridFrame snapshot would carry), read
+// under render_mutex via captureSnapshotLocked. Distinguishes "viewport pinned
+// at bottom" (marker absent) from "viewport scrolled to history" (marker
+// present) — i.e. where the viewport actually sits, independent of whether a
+// frame was pushed over the wire.
+fn hostViewportContains(h: *HostHarness, alloc: std.mem.Allocator, marker: []const u8) !bool {
+    h.entry.session.render_mutex.lock();
+    defer h.entry.session.render_mutex.unlock();
+    var snap = try h.entry.session.captureSnapshotLocked(alloc);
+    defer snap.deinit(alloc);
+    return snapshotContainsMarker(alloc, &snap, marker);
+}
+
 // Snapshot the live host terminal's grid (cols, rows) under render_mutex.
 fn hostGrid(h: *HostHarness) struct { cols: u16, rows: u16 } {
     h.entry.session.render_mutex.lock();
@@ -3213,5 +3227,420 @@ test "host reattach: degenerate Resize resolves below the min-window floor the h
     // the guard lets it through (Slice 9 not regressed).
     const ok = hostResolveResizeGrid(wellFormedResize(80, 50));
     try testing.expect(ok.columns >= min_w and ok.rows >= min_h);
+}
+
+// --- 2nd reattach-scrollback mechanism: well-formed reattach Resize + scroll ---
+//
+// Scan the wire for the FIRST GridFrame whose snapshot contains `marker`, within
+// a bounded poll. Returns true if such a frame arrives. Unlike hostScreenContains
+// (which reads the live host terminal directly), this asserts on what the GUI
+// ACTUALLY RECEIVES over the socket — the GridFrame snapshot it renders. The bug
+// is "scroll-up shows nothing in the GUI", so the contract that matters is the
+// content of the pushed GridFrame, not the host terminal's internal state.
+fn wireGridFrameContains(
+    alloc: std.mem.Allocator,
+    rdr: *ClientReader,
+    fd: posix.socket_t,
+    payload: *std.ArrayList(u8),
+    marker: []const u8,
+) !bool {
+    var i: usize = 0;
+    while (i < FRAME_SCAN_ITERS) : (i += 1) {
+        const tag = (try pollNext(rdr, alloc, fd, payload, 4)) orelse continue;
+        if (tag != .grid_frame) continue;
+        var gf = try protocol.GridFrame.decode(alloc, payload.items);
+        defer gf.deinit(alloc);
+        if (try snapshotContainsMarker(alloc, &gf.snapshot, marker)) return true;
+    }
+    return false;
+}
+
+// Drain whatever frames are currently queued on `fd` (best-effort, bounded) so a
+// subsequent wireGridFrameContains observes only frames produced AFTER this
+// point — e.g. so a scroll's fresh GridFrame is not confused with the pre-scroll
+// pushFullFrames frame still sitting in the socket buffer.
+fn wireDrain(
+    alloc: std.mem.Allocator,
+    rdr: *ClientReader,
+    fd: posix.socket_t,
+    payload: *std.ArrayList(u8),
+) !void {
+    var i: usize = 0;
+    while (i < FRAME_SCAN_ITERS) : (i += 1) {
+        _ = (try pollNext(rdr, alloc, fd, payload, 2)) orelse return;
+    }
+}
+
+// Reattach a fresh client fd to an EXISTING session_id over the real socket,
+// completing hello + attach(existing). Drives Server.handleAttach's
+// existing-session branch (subscribe + Attached + pushFullFrames). Returns the
+// connected fd; caller owns it (posix.close) and the returned reader. Asserts
+// the reattach Attached carries the same session_id.
+fn reattachExisting(
+    alloc: std.mem.Allocator,
+    sock_path: []const u8,
+    session_id: u64,
+    rdr: *ClientReader,
+    payload: *std.ArrayList(u8),
+) !posix.socket_t {
+    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    errdefer posix.close(fd);
+    try connectUnix(fd, sock_path);
+    setRecvTimeout(fd);
+
+    try clientSend(alloc, fd, .hello, protocol.Hello{ .identity_bundle_id = "reattach" });
+    {
+        const tag = (try pollNext(rdr, alloc, fd, payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, fd, .attach, protocol.Attach{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var got = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(rdr, alloc, fd, payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                try testing.expectEqual(session_id, a.session_id);
+                got = true;
+                break;
+            }
+        }
+        try testing.expect(got);
+    }
+    return fd;
+}
+
+// END-TO-END POSITIVE SANITY + NEGATIVE CONTROL (2nd reattach-scrollback
+// mechanism — NOT Slice 12's degenerate resize). This test does NOT, on its own,
+// reproduce the bug fail-before/pass-after: with the viewport_dirty force-push
+// REVERTED it still PASSES (verified by experiment), because here the final
+// scroll-to-top produces a viewport that DIFFERS from the resize-time
+// prev_snapshot, so renderTick's `changed>0` arm pushes the frame regardless of
+// the fix. The GENUINE fail-before/pass-after reproducer of this mechanism is the
+// next test ("host reattach: resize-while-scrolled ...", the M1 variant), whose
+// final scroll is a redundant scroll-to-top that yields changed==0 and is
+// suppressed without the fix. Keep this test as the broad end-to-end guard:
+//   - it drives the FULL reattach sequence over the real socket,
+//   - it proves M1 is NOT the mechanism (scrollback survives every well-formed
+//     reattach resize, host-side), and
+//   - it carries the NEGATIVE CONTROL (pre-scroll, the bottom-pinned wire frame
+//     must NOT contain L000) that makes the post-scroll positive meaningful.
+//
+// Live smoke being modeled: after a GUI quit+relaunch (reattach), the shell
+// PROCESS + state survive, but the SCROLLBACK appears gone — scrolling up shows
+// nothing — with ZERO degenerate resizes. Two candidate mechanisms:
+//   (M1) the WELL-FORMED reattach Resize reflows scrollback away (shrink / cols
+//        change / resize-while-scrolled differs from Slice 9's grow case).
+//   (M2) the post-reattach ScrollViewport -> repin -> GridFrame push fails to
+//        SURFACE the host scrollback to the GUI (the push gate). << FOUND
+//
+// Sequence (asserting on the WIRE GridFrame the GUI actually receives):
+//   (a) attach (spawn) client1, feed ~120 lines so ~96 land in scrollback,
+//   (b) DETACH client1 (real .detach frame; child stays alive),
+//   (c) REATTACH on a fresh client2 with the existing session_id (drives
+//       handleAttach existing-session branch + pushFullFrames),
+//   (d) apply a WELL-FORMED reattach Resize over the wire — a same-size (80x24)
+//       frame, then different sizes (100x30, then 80x40); each must PRESERVE
+//       scrollback host-side (the M1 question — answered NO here),
+//   (e) NEGATIVE CONTROL: the bottom-pinned wire frame must NOT carry L000,
+//   (f) issue ScrollViewport(.top) over the wire and assert "L000" (the oldest
+//       scrollback line) is reachable in the resulting GridFrame.
+test "host reattach->resize->scroll end-to-end sanity: scrollback survives every well-formed resize + is scrollable on the wire (M1 ruled out; positive+negative control)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // (a) attach (spawn) client1 + feed scrollback.
+    var h = try hostHarnessAttach(alloc, server, sock_path);
+    defer h.deinit(alloc);
+    var client1_open = true;
+    defer if (client1_open) posix.close(h.client);
+
+    try feedScrollback(&h, 120);
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // (b) DETACH client1 (the real .detach frame), then close its fd — modeling
+    // the GUI quitting. The child stays alive; the entry keeps its scrollback.
+    try clientSend(alloc, h.client, .detach, protocol.Detach{ .session_id = h.session_id });
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    posix.close(h.client);
+    client1_open = false;
+
+    // (c) REATTACH on a fresh client2 with the existing session_id (drives
+    // handleAttach's existing-session branch -> subscribe + Attached +
+    // pushFullFrames). The immediate pushFullFrames carries the BOTTOM viewport
+    // (newest), so the oldest line is NOT in it yet — we must scroll to reach it.
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+    var payload2: std.ArrayList(u8) = .empty;
+    defer payload2.deinit(alloc);
+    const client2 = try reattachExisting(alloc, sock_path, h.session_id, &rdr2, &payload2);
+    defer posix.close(client2);
+
+    // Host-side sanity post-reattach: the host terminal STILL holds the
+    // scrollback (handleAttach does not touch it).
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // (d) WELL-FORMED reattach Resize over the wire. The original session is
+    // 80x24 (hostHarnessAttach spawns default Options). We exercise a SAME-size
+    // frame first, then a DIFFERENT size (a cols+rows change that is a GROW on
+    // cols but the kind of well-formed restore-time resize the GUI sends), then a
+    // shrink-rows variant. All well-formed (>= the min-window floor), so Slice 12
+    // does not drop them; each must PRESERVE scrollback (the M1 question).
+    const reattach_sizes = [_][2]u16{ .{ 80, 24 }, .{ 100, 30 }, .{ 80, 40 } };
+    for (reattach_sizes) |sz| {
+        try clientSend(alloc, client2, .resize, blk: {
+            var r = wellFormedResize(sz[0], sz[1]);
+            r.session_id = h.session_id;
+            break :blk r;
+        });
+        std.Thread.sleep(80 * std.time.ns_per_ms);
+    }
+
+    // After the well-formed reattach resizes, the host terminal MUST still hold
+    // the oldest scrollback line (M1 check, host-side). If this fails, M1 is the
+    // mechanism (a well-formed reattach resize reflowed scrollback away).
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // NEGATIVE CONTROL: BEFORE scrolling, the viewport is pinned at the bottom
+    // (newest), so the most recent pushed GridFrame must NOT contain the oldest
+    // line "L000". This proves the positive assertion below is genuinely
+    // exercising the scroll path (the oldest line only appears after scrolling),
+    // not a frame that happened to already carry it. We scan a fresh post-resize
+    // frame for L000 and require its ABSENCE.
+    try testing.expect(!try wireGridFrameContains(alloc, &rdr2, client2, &payload2, "L000"));
+
+    // Drain any remaining resize-induced GridFrames so the next read observes the
+    // post-scroll frame.
+    try wireDrain(alloc, &rdr2, client2, &payload2);
+
+    // (e) ScrollViewport(.top) over the wire — the GUI scrolling up after
+    // reattach. Routed through Server.dispatch's .scroll_viewport arm ->
+    // Session.scrollViewport -> Termio mailbox -> terminal.scrollViewport, then
+    // the owning thread's renderTick ships a fresh GridFrame of the scrolled
+    // viewport.
+    try clientSend(alloc, client2, .scroll_viewport, blk: {
+        var sv = protocol.ScrollViewport.fromTarget(0, .top);
+        sv.session_id = h.session_id;
+        break :blk sv;
+    });
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+
+    // (f) ACCEPTANCE: the GridFrame the GUI receives after scrolling to the top
+    // MUST contain "L000". This is the exact thing the live smoke reported as
+    // broken ("scrolling up shows nothing"). If the host path is correct, the
+    // wire frame surfaces the oldest scrollback line.
+    try testing.expect(try wireGridFrameContains(alloc, &rdr2, client2, &payload2, "L000"));
+
+    // Clean up: close the session.
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = h.session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+// GENUINE REPRODUCER of the 2nd reattach-scrollback mechanism (M2: the host
+// push gate suppresses the post-reattach scroll frame). VERIFIED fail-before/
+// pass-after: with the `viewport_dirty` force-push in Session.renderTick disabled
+// this test FAILS at the final wire assertion (line ~"wireGridFrameContains ...
+// L000"); with the fix in place it PASSES. (Confirmed by experiment: temporarily
+// gating the force-push off makes ONLY this test fail; the end-to-end sanity test
+// above still passes, which is why THIS test — not that one — is the reproducer.)
+//
+// Why this one reproduces and the sanity test above does not: the order is
+// scroll-to-top FIRST, then a well-formed reattach resize WHILE scrolled, then a
+// REDUNDANT scroll-to-top. That last scroll lands on a viewport whose rows EQUAL
+// the prev_snapshot left by the prior tick, so renderTick computes `changed==0`.
+// Without the force-push the push gate (`changed>0 || force_push || cursor_changed`)
+// SUPPRESSES the frame and the GUI "scrolls up and sees nothing" — exactly the
+// live smoke. The host viewport itself is correct (asserted via
+// hostViewportContains below); only the wire push was gated out. The fix sets
+// `viewport_dirty` on every scroll/jump and converts it to force_push, so an
+// explicit GUI scroll always ships its frame.
+//
+// Also the only test covering RESIZE-WHILE-SCROLLED (Slice 9 resizes at the
+// BOTTOM): it additionally asserts the well-formed resize does NOT erase
+// scrollback nor re-pin the viewport off the oldest line (M1 ruled out here too).
+test "host reattach: resize-while-scrolled then redundant scroll surfaces scrollback on the wire (2nd mechanism repro; fail-before/pass-after for the push-gate fix)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    var h = try hostHarnessAttach(alloc, server, sock_path);
+    defer h.deinit(alloc);
+    var client1_open = true;
+    defer if (client1_open) posix.close(h.client);
+
+    try feedScrollback(&h, 120);
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // Detach client1 (GUI quit).
+    try clientSend(alloc, h.client, .detach, protocol.Detach{ .session_id = h.session_id });
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    posix.close(h.client);
+    client1_open = false;
+
+    // Reattach client2 (existing session).
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+    var payload2: std.ArrayList(u8) = .empty;
+    defer payload2.deinit(alloc);
+    const client2 = try reattachExisting(alloc, sock_path, h.session_id, &rdr2, &payload2);
+    defer posix.close(client2);
+
+    // Scroll to the TOP FIRST (viewport now on the oldest content)...
+    try clientSend(alloc, client2, .scroll_viewport, blk: {
+        var sv = protocol.ScrollViewport.fromTarget(0, .top);
+        sv.session_id = h.session_id;
+        break :blk sv;
+    });
+    std.Thread.sleep(80 * std.time.ns_per_ms);
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // ...THEN apply a well-formed reattach resize WHILE scrolled (the order
+    // Slice 9 does not exercise). Use a different size (100x30) to also cover the
+    // cols-change reflow path.
+    try clientSend(alloc, client2, .resize, blk: {
+        var r = wellFormedResize(100, 30);
+        r.session_id = h.session_id;
+        break :blk r;
+    });
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // The oldest scrollback line must STILL be in the host terminal after the
+    // resize-while-scrolled reflow (a resize must never erase scrollback).
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+    // The viewport stayed scrolled (the resize did NOT re-pin to bottom): the
+    // host viewport itself still shows the oldest line. The bug is purely in
+    // SURFACING it to the GUI over the wire (the push gate), proven below.
+    try testing.expect(try hostViewportContains(&h, alloc, "L000"));
+
+    // And a scroll-to-top after the resize must surface it on the WIRE again
+    // (whatever the resize did to the viewport pin, the GUI can still reach the
+    // oldest line). Drain first so we read a fresh post-scroll frame.
+    try wireDrain(alloc, &rdr2, client2, &payload2);
+    try clientSend(alloc, client2, .scroll_viewport, blk: {
+        var sv = protocol.ScrollViewport.fromTarget(0, .top);
+        sv.session_id = h.session_id;
+        break :blk sv;
+    });
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+    // FAIL-BEFORE / PASS-AFTER: without the viewport_dirty force-push (the fix),
+    // this scroll's resulting viewport equals the stale prev_snapshot, so
+    // renderTick's `changed==0` gate SUPPRESSES the frame and no GridFrame with
+    // "L000" ever arrives — even though the host viewport (asserted above) shows
+    // it. With the fix, the scroll forces the push and the GUI receives it.
+    try testing.expect(try wireGridFrameContains(alloc, &rdr2, client2, &payload2, "L000"));
+
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = h.session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+// CRITIC-GAP DIAGNOSTIC (mechanism-completeness, NOT a fix gate). The live smoke
+// is "FIRST scroll up shows nothing on ALL tabs after reattach". This test models
+// EXACTLY that minimal gesture — a single, plain ScrollViewport(.top) as the very
+// first navigation after reattach, with NO prior scroll and NO redundant
+// re-scroll — and asserts the host DOES surface the oldest scrollback line on the
+// wire.
+//
+// PURPOSE: localize the residual smoke component. The host push-gate fix
+// (viewport_dirty force-push) demonstrably closes the REDUNDANT-scroll gap (the
+// reproducer test above is fail-before/pass-after). But a plain first scroll-up
+// from a bottom-pinned reattach lands on a viewport that DIFFERS from the
+// (bottom) prev_snapshot, so renderTick's `changed>0` arm pushes it REGARDLESS of
+// the fix. This test therefore PASSES WITH OR WITHOUT the fix — VERIFIED by
+// disabling the force-push (only the redundant-scroll reproducer fails; this test
+// and the end-to-end sanity test still pass).
+//
+// CONCLUSION it nails down: the host-side first-scroll-after-reattach path is
+// CORRECT — it is NOT a host mechanism for "first scroll up shows nothing". Hence
+// the residual smoke component (if the redundant-scroll fix does not fully
+// explain the field report) is GUI-SIDE, not host-side. Precise GUI-side
+// next-steps to investigate are documented in the agent report:
+//   (1) does the GUI even SEND a ScrollViewport on the first wheel/key after
+//       reattach, or is its scroll handler gated on a restored/stale local
+//       scroll-position state that makes the first gesture a no-op send?
+//   (2) does the GUI apply the post-reattach pushFullFrames frame as the new
+//       viewport baseline, or does it keep a restored (pre-quit) scroll offset
+//       that swallows the first scroll delta before it becomes a wire send?
+// Both are Swift (TerminalView / SurfaceView scroll handling) — out of this
+// Zig-only scope, hence left as a documented follow-up, not a host change.
+test "host reattach: a PLAIN first scroll-up (no prior/redundant scroll) surfaces scrollback on the wire — host first-scroll path is correct (critic-gap diagnostic; passes with AND without the push-gate fix)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    var h = try hostHarnessAttach(alloc, server, sock_path);
+    defer h.deinit(alloc);
+    var client1_open = true;
+    defer if (client1_open) posix.close(h.client);
+
+    try feedScrollback(&h, 120);
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // Detach client1 (GUI quit) — the viewport is pinned at the BOTTOM and the
+    // last tick-pushed prev_snapshot reflects that bottom viewport.
+    try clientSend(alloc, h.client, .detach, protocol.Detach{ .session_id = h.session_id });
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    posix.close(h.client);
+    client1_open = false;
+
+    // Reattach client2 (existing session) — pushFullFrames sends the BOTTOM
+    // viewport (no L000 yet); prev_snapshot is untouched (still the bottom).
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+    var payload2: std.ArrayList(u8) = .empty;
+    defer payload2.deinit(alloc);
+    const client2 = try reattachExisting(alloc, sock_path, h.session_id, &rdr2, &payload2);
+    defer posix.close(client2);
+
+    // NEGATIVE CONTROL: the bottom-pinned reattach frame must NOT carry L000.
+    try testing.expect(!try wireGridFrameContains(alloc, &rdr2, client2, &payload2, "L000"));
+    try wireDrain(alloc, &rdr2, client2, &payload2);
+
+    // THE MINIMAL SMOKE GESTURE: a single, plain first scroll-to-top. No prior
+    // scroll, no resize-while-scrolled, no redundant re-scroll. The resulting
+    // viewport (top, showing L000) DIFFERS from the bottom prev_snapshot, so the
+    // host pushes it via the ordinary `changed>0` arm — independent of the fix.
+    try clientSend(alloc, client2, .scroll_viewport, blk: {
+        var sv = protocol.ScrollViewport.fromTarget(0, .top);
+        sv.session_id = h.session_id;
+        break :blk sv;
+    });
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+
+    // The host MUST surface L000 on the wire for a plain first scroll-up. (Passes
+    // with AND without the push-gate fix — proving the host first-scroll path is
+    // correct and the residual smoke is GUI-side, see the docstring.)
+    try testing.expect(try wireGridFrameContains(alloc, &rdr2, client2, &payload2, "L000"));
+
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = h.session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
 }
 
