@@ -163,6 +163,71 @@ a buggy peer) yields a degenerate near-1×1 grid that **erases the terminal and
 scrollback**. Driving from `{cols, rows}` makes the host authoritative-grid
 driven rather than pixel-derived. `.exec`'s own resize path is untouched.
 
+### Drop the degenerate reattach Resize (Slice 12 fix)
+
+**Bug (tab-dependent, live smoke):** after a GUI quit + relaunch (reattach), the
+shell process + state survived on ALL tabs, but the terminal **scrollback was
+lost on some tabs** — observed lost on the first/heaviest tab (~200 lines, had
+been resized during the session) and preserved on two others. Root cause: on
+reattach the GUI can momentarily report a **0 / near-0 grid** for a restored tab
+before layout/font-metrics settle (tab-dependent restore timing — active vs
+background tabs are sized at different moments). The Slice-9 fix made the host
+authoritative-grid driven off the wire `{cols, rows}`, but `Resize.toSize` only
+guards `cell==0`, **not `cols==0`/`rows==0`** — so a degenerate frame still
+flows through. `size.grid()`'s `@max(1,…)` floor (`src/renderer/size.zig:260-261`)
+then resolves `{0,0}` to a **1×1 collapse grid**, and `terminal.resize(1,1)`
+against real history doesn't merely discard scrollback — it **panics with
+integer overflow in `PageList.resizeCols`**.
+
+**Fix:** `Server.dispatch`'s `.resize` arm DROPS a degenerate frame (logged at
+debug) before queueing it to Termio — a terminal is never legitimately tiny, and
+the next well-formed Resize carries the real restored size. Dropping the frame
+(vs clamping) is cleanest: it never touches the terminal, so no reflow/discard.
+
+The guard gates on the **RESOLVED grid** — the `(cols,rows)` Termio.resize will
+actually apply via `Resize.toSize().grid()` — against the GUI's OWN minimum
+terminal size, `CoreSurface.min_window_{width,height}_cells` (10x4,
+`src/Surface.zig`), which every apprt embedder enforces as the minimum window
+size. A resolved grid below that floor is, by the app's own definition, not a
+legitimate terminal; it can only be a transient/garbled reattach frame.
+
+**Why resolved, not the raw wire value (MF-1):** an earlier cut gated on
+`resize.cols == 0 or resize.rows == 0`, catching only a literal `{0,0}` frame.
+But `size.grid()`'s `@max(1,…)` floor (`src/renderer/size.zig:260-261`) maps
+`{0,0}` to a 1x1 collapse grid, and a wire `{1,1}` (or `{1,24}`/`{80,1}`, both
+dims nonzero) sails straight through the wire-only guard to the SAME
+`PageList.resizeCols` underflow panic (`self.rows - cursor.y - 1`) once a column
+shrink triggers reflow with real history present. Empirically confirmed: with
+the wire-only guard, a wire `{1,1}` reattach transient aborts the IO thread with
+`thread … panic: integer overflow` at `src/terminal/PageList.zig:1062`.
+Resolving first and gating against the 10x4 floor closes that gap — every
+degenerate transient (`{0,0}`, `{1,1}`, `{1,24}`, `{80,1}`) resolves below the
+floor and is dropped. Well-formed frames (>= the floor in both dims, e.g.
+`80x50`, `100x50`) are unaffected and still apply the authoritative wire grid,
+so Slice 9 is not regressed. `.exec` untouched.
+
+**Repro (fail-before/pass-after, real host path):** `src/host/test.zig` →
+`"host reattach: degenerate-then-real Resize preserves scrollback (Slice 12)"`.
+It stands up `Server.init` + `start`, attaches a client, feeds 120 lines into
+the **live** session terminal (so ~96 land in scrollback), then sends the
+reattach transient as wire frames through `clientSend(.resize)` →
+**`Server.dispatch`** → Termio mailbox → live terminal: FIRST a sequence of
+degenerate frames (`{0,0}`, `{1,1}`, `{1,24}`, `{80,1}`), THEN the real `80×50`.
+It reads back off the live session and asserts (a) the grid is `80×50` (no
+degenerate frame was ever applied) and (b) `"L000"` survived. **Confirmed
+fail-before:** with the guard reverted to the wire-only form
+(`if (resize.cols == 0 or resize.rows == 0)`) and the lib rebuilt,
+`-Dtest-filter="degenerate-then-real"` aborts with
+`thread … panic: integer overflow` raised on the IO thread at
+`src/terminal/PageList.zig:1062` (`terminal.resize(1,1)` → `PageList.resizeCols`
+underflow) — triggered by the wire `{1,1}` case, which the wire-only guard lets
+through (MF-1). With the resolved-grid guard restored the test passes. The test
+drives the PRODUCTION guard, not a copy — reverting `Server.zig` alone flips it
+red. A companion `"… well-formed resize preserves scrollback + applies wire
+grid (Slice 9 guard)"` test drives a legit `80×10`→`100×50` shrink-then-grow
+through the same real path and asserts both the authoritative grid and `"L000"`
+survive, locking in that the guard does not regress well-formed frames.
+
 ### Protocol, handshake, frozen-ABI discipline
 
 `src/host/protocol.zig` defines **length-prefixed binary frames**. A **`Hello`
@@ -356,8 +421,24 @@ important thing to re-verify when resuming:
 - **Host lifecycle is manual.** launchd lifecycle, per-identity socket
   namespacing, orphan GC, and a fuller version handshake are NOT done; the host
   is started by hand for now.
-- **Re-smoke pending.** Slices 6–9 need a live re-smoke; Swift app-hosted unit
-  tests are deferred to the human smoke.
+- **Scrollback lost on reattach, tab-dependent (FIXED, Slice 12).** In a 3-tab
+  reattach smoke: shell state (a marker var) survived on ALL tabs, but
+  **scrollback was lost on 1 tab (the first/heaviest — had ~200 lines + had been
+  resized during the session) and PRESERVED on the other two.** Root cause was
+  the Slice-9 residual: a **transient degenerate reattach Resize** (wire
+  `cols==0`/`rows==0` for a tab whose layout hadn't settled) resolved
+  (toSize→grid, `@max(1,…)` floor) to a 1×1 collapse grid and `terminal.resize`
+  underflow-panicked / discarded scrollback. **Fixed** by dropping degenerate
+  frames in `Server.dispatch` — see "Drop the degenerate reattach Resize (Slice
+  12 fix)" above for the mechanism, the fix, and the fail-before/pass-after repro
+  (driven through the real `Server.dispatch` path; confirmed to panic pre-fix).
+- **Live re-smoke status:** Slice 8 (cursor tracks arrow keys) and Slice 9
+  (resize preserves scrollback/content, in-session) VERIFIED live. Slice 10
+  (shell integration injected) verified at the host log. Title is dynamic (zsh
+  shell-integration OSC → SurfaceEvent → GUI), confirming Slice 6 forwarding +
+  Slice 10 together. Reattach: shell state survives (see the tab-dependent
+  scrollback bug above). Swift app-hosted unit tests still deferred to the human
+  smoke.
 - **Debugging practice.** Bugs in the push gate or the resize grid derivation are
   best confirmed by **reproducing the gate / derivation behavior before fixing**
   (both the cursor-not-moving and resize-erases-content bugs were gate/derivation

@@ -14,6 +14,7 @@ const apprt = @import("../apprt.zig");
 const render = @import("../terminal/render.zig");
 const RenderStateCore = render.RenderState;
 const renderer = @import("../renderer.zig");
+const renderer_size = @import("../renderer/size.zig");
 
 const posix = std.posix;
 
@@ -22,6 +23,7 @@ const RenderState = @import("RenderState.zig");
 const protocol = @import("protocol.zig");
 const Server = @import("Server.zig");
 const Client = @import("../termio/Client.zig");
+const CoreSurface = @import("../Surface.zig");
 
 test "host session spawn+diff" {
     const alloc = testing.allocator;
@@ -2762,3 +2764,299 @@ test "host session create with null working_directory keeps default" {
         try testing.expectEqual(@as(?[]const u8, null), wd.value());
     }
 }
+
+// --- Slice 12: reattach scrollback survival across a degenerate resize ---
+
+// Resolve a `protocol.Resize` to the (columns, rows) the host would actually
+// apply to the terminal, by walking the SAME two-step host path as
+// `Termio.resize`: `Resize.toSize()` -> `renderer.Size.grid()`. This is the
+// pure-resolution slice of the host resize dispatch (Server.dispatch's .resize
+// arm calls `resize.toSize()` and queues it; Termio.resize then does
+// `const grid_size = size.grid(); try self.terminal.resize(grid.columns,
+// grid.rows)`). The Slice-12 mechanism test uses this to PROVE a degenerate
+// frame resolves to a collapse grid (so dropping it is mandatory).
+fn hostResolveResizeGrid(r: protocol.Resize) renderer_size.GridSize {
+    return r.toSize().grid();
+}
+
+// Stand up a Server on a fresh unix socket, connect a client, complete the
+// hello+attach handshake, and return the live server, the connected client fd,
+// the assigned session_id, and the SessionEntry. Resizes/scrollback are then
+// driven THROUGH THE REAL HOST PATH (clientSend(.resize) -> Server.dispatch ->
+// Termio mailbox -> live terminal), and read back off `entry.session` — so the
+// production guard in Server.dispatch (NOT a test-local copy) decides whether a
+// degenerate frame collapses the terminal. Caller must `posix.close(client)`,
+// `server.deinit()`, and free `sock_path`/`dir_path` (returned via `out_*`).
+const HostHarness = struct {
+    server: *Server,
+    client: posix.socket_t,
+    session_id: u64,
+    entry: *Server.SessionEntry,
+    rdr: ClientReader = .{},
+    payload: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *HostHarness, alloc: std.mem.Allocator) void {
+        self.rdr.deinit(alloc);
+        self.payload.deinit(alloc);
+    }
+};
+
+fn hostHarnessAttach(
+    alloc: std.mem.Allocator,
+    server: *Server,
+    sock_path: []const u8,
+) !HostHarness {
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    errdefer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var h: HostHarness = .{
+        .server = server,
+        .client = client,
+        .session_id = 0,
+        .entry = undefined,
+    };
+    errdefer h.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "rs" });
+    _ = (try pollNext(&h.rdr, alloc, client, &h.payload, 50)).?;
+
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&h.rdr, alloc, client, &h.payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, h.payload.items);
+                h.session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(h.session_id != 0);
+    }
+
+    server.registry_mutex.lock();
+    defer server.registry_mutex.unlock();
+    h.entry = server.sessions.get(h.session_id) orelse return error.SessionMissing;
+    return h;
+}
+
+// Feed `count` numbered lines "L000".."L<count-1>" into the live host terminal
+// under render_mutex, so most land in scrollback above the active viewport.
+// "L000" is the oldest and is reachable only from history — it is the line the
+// reattach-collapse bug erases.
+fn feedScrollback(h: *HostHarness, count: usize) !void {
+    const t = &h.entry.session.io.terminal;
+    h.entry.session.render_mutex.lock();
+    defer h.entry.session.render_mutex.unlock();
+    var buf: [16]u8 = undefined;
+    var line: usize = 0;
+    while (line < count) : (line += 1) {
+        const s = try std.fmt.bufPrint(&buf, "L{d:0>3}", .{line});
+        try t.printString(s);
+        t.carriageReturn();
+        try t.linefeed();
+    }
+}
+
+// True iff the marker is present anywhere in the live host terminal's screen
+// (active + history), read under render_mutex.
+fn hostScreenContains(h: *HostHarness, alloc: std.mem.Allocator, marker: []const u8) !bool {
+    h.entry.session.render_mutex.lock();
+    defer h.entry.session.render_mutex.unlock();
+    const dump = try h.entry.session.io.terminal.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{} },
+    );
+    defer alloc.free(dump);
+    return std.mem.indexOf(u8, dump, marker) != null;
+}
+
+// Snapshot the live host terminal's grid (cols, rows) under render_mutex.
+fn hostGrid(h: *HostHarness) struct { cols: u16, rows: u16 } {
+    h.entry.session.render_mutex.lock();
+    defer h.entry.session.render_mutex.unlock();
+    const t = &h.entry.session.io.terminal;
+    return .{ .cols = @intCast(t.cols), .rows = @intCast(t.rows) };
+}
+
+// A well-formed Resize the GUI would send for an 80xN window with 8x16 cells
+// and zero padding. screen_w/h are kept consistent with cols/rows so the frame
+// is "healthy" (matches what a real client emits).
+fn wellFormedResize(cols: u16, rows: u16) protocol.Resize {
+    const cw: u32 = 8;
+    const ch: u32 = 16;
+    return .{
+        .session_id = 1,
+        .cols = cols,
+        .rows = rows,
+        .cell_width = cw,
+        .cell_height = ch,
+        .screen_w = @as(u32, cols) * cw,
+        .screen_h = @as(u32, rows) * ch,
+    };
+}
+
+// REPRODUCER (Slice 12): on reattach the GUI can momentarily report a 0/near-0
+// grid for a restored tab before layout/font-metrics settle, then the real
+// restored size. The host must NOT collapse the terminal to a 1x1 grid on the
+// transient frame (which reflows away scrollback); the early scrollback line
+// must survive the degenerate-then-real Resize sequence.
+//
+// This drives the resize THROUGH THE REAL HOST PATH — clientSend(.resize)
+// frames over the socket -> Server.dispatch's .resize arm -> Termio mailbox ->
+// the live terminal on the IO thread — then reads the result back off the live
+// session. So the PRODUCTION guard in Server.dispatch (Server.zig), not a copy
+// in the test, decides the degenerate frame's fate. It is genuinely
+// fail-before/pass-after w.r.t. that guard:
+//   GUARD PRESENT  (fix): degenerate {0,0} is dropped; the terminal stays at
+//                  the well-formed grid and "L000" survives -> PASS.
+//   GUARD REMOVED (pre-fix): the degenerate frame resolves (toSize -> grid,
+//                  @max(1,...) floor) to a 1x1 collapse grid; terminal.resize
+//                  reflows the screen down to one row, discarding scrollback
+//                  (and, with real history present, underflow-panics
+//                  PageList.resizeCols) -> FAIL (asserts/crashes).
+test "host reattach: degenerate-then-real Resize preserves scrollback (Slice 12)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    var h = try hostHarnessAttach(alloc, server, sock_path);
+    defer h.deinit(alloc);
+    defer posix.close(h.client);
+
+    // Feed ~120 numbered lines into the LIVE host terminal so ~96 land in
+    // scrollback above the active viewport. "L000" is the oldest line.
+    try feedScrollback(&h, 120);
+
+    // Sanity: "L000" is present in the live screen (history + active) BEFORE any
+    // resize. This is the line the bug erases.
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // The reattach transient, sent over the wire as the GUI would:
+    //   FIRST a sequence of degenerate frames — a tab momentarily reporting a
+    //         degenerate grid before layout/font-metrics settle. We exercise
+    //         not just the literal {0,0} but also a {1,1} and the mixed
+    //         {1,24}/{80,1} cases (MF-1): {1,1} has both dims NONZERO so a
+    //         wire-value-only guard would pass it through, yet it resolves to a
+    //         1x1 collapse grid that underflow-PANICS PageList.resizeCols during
+    //         the column reflow with real history present. The resolved-grid
+    //         guard must drop all of them.
+    //   THEN  the real restored size (80x50).
+    // Each goes through Server.dispatch; we sleep so the Termio mailbox applies
+    // it on the IO thread before the next step (same pattern as the Slice-9
+    // real-path test).
+    const degenerates = [_][2]u16{ .{ 0, 0 }, .{ 1, 1 }, .{ 1, 24 }, .{ 80, 1 } };
+    for (degenerates) |d| {
+        try clientSend(alloc, h.client, .resize, blk: {
+            var r = wellFormedResize(d[0], d[1]);
+            r.session_id = h.session_id;
+            break :blk r;
+        });
+        std.Thread.sleep(60 * std.time.ns_per_ms);
+    }
+
+    try clientSend(alloc, h.client, .resize, blk: {
+        var r = wellFormedResize(80, 50);
+        r.session_id = h.session_id;
+        break :blk r;
+    });
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // degenerate_dim_not_applied: the live grid is the WELL-FORMED restored
+    // size, never the degenerate frame's 1x1 collapse. (Pre-fix, the degenerate
+    // frame collapses the grid to 1x1 — or panics during its reflow — so this
+    // readback is also a fail-before/pass-after signal independent of content.)
+    const grid = hostGrid(&h);
+    try testing.expectEqual(@as(u16, 80), grid.cols);
+    try testing.expectEqual(@as(u16, 50), grid.rows);
+
+    // ACCEPTANCE: the oldest scrollback line survived the degenerate-then-real
+    // sequence on the live host terminal.
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+}
+
+// Slice-9 guardrail (must NOT regress): a well-formed shrink-then-grow resize
+// driven through the SAME real host path applies the authoritative wire
+// {cols, rows} and preserves scrollback content, just like .exec's
+// terminal.resize across a normal reflow. The Slice-12 guard must keep
+// well-formed frames (both dims nonzero) flowing through untouched.
+test "host reattach: well-formed resize preserves scrollback + applies wire grid (Slice 9 guard)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    var h = try hostHarnessAttach(alloc, server, sock_path);
+    defer h.deinit(alloc);
+    defer posix.close(h.client);
+
+    try feedScrollback(&h, 120);
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+
+    // A legitimate shrink (80x10) then grow (100x50), each well-formed: both
+    // must flow through the guard and be APPLIED (not dropped).
+    try clientSend(alloc, h.client, .resize, blk: {
+        var r = wellFormedResize(80, 10);
+        r.session_id = h.session_id;
+        break :blk r;
+    });
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    try clientSend(alloc, h.client, .resize, blk: {
+        var r = wellFormedResize(100, 50);
+        r.session_id = h.session_id;
+        break :blk r;
+    });
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // Wire grid is authoritative: terminal ends at the last frame's {cols,rows}.
+    const grid = hostGrid(&h);
+    try testing.expectEqual(@as(u16, 100), grid.cols);
+    try testing.expectEqual(@as(u16, 50), grid.rows);
+
+    // Scrollback content survives a normal reflow.
+    try testing.expect(try hostScreenContains(&h, alloc, "L000"));
+}
+
+// A degenerate RESOLVED grid must never reach terminal.resize. The host's
+// dispatch guard gates on the RESOLVED grid (Resize.toSize().grid()) against the
+// GUI's own minimum terminal size (CoreSurface.min_window_{width,height}_cells,
+// 10x4) — not the raw wire {cols,rows}. This documents that every degenerate
+// transient (the literal {0,0}, a {1,1} with both dims nonzero, and the mixed
+// {1,24}/{80,1} cases) resolves BELOW that floor, so the host recognizes and
+// drops it. Gating on the wire value alone (cols==0 or rows==0) would let the
+// {1,1} case through to the PageList.resizeCols underflow panic (MF-1).
+test "host reattach: degenerate Resize resolves below the min-window floor the host drops (Slice 12)" {
+    const min_w = CoreSurface.min_window_width_cells;
+    const min_h = CoreSurface.min_window_height_cells;
+    const degenerates = [_][2]u16{ .{ 0, 0 }, .{ 1, 1 }, .{ 1, 24 }, .{ 80, 1 }, .{ 0, 24 }, .{ 80, 0 } };
+    for (degenerates) |d| {
+        const grid = hostResolveResizeGrid(wellFormedResize(d[0], d[1]));
+        // Below the floor in at least one dimension => the dispatch drops it.
+        try testing.expect(grid.columns < min_w or grid.rows < min_h);
+    }
+    // A well-formed restored size resolves AT/ABOVE the floor in both dims, so
+    // the guard lets it through (Slice 9 not regressed).
+    const ok = hostResolveResizeGrid(wellFormedResize(80, 50));
+    try testing.expect(ok.columns >= min_w and ok.rows >= min_h);
+}
+
