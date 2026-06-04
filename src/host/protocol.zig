@@ -110,6 +110,19 @@ pub const FrameType = enum(u8) {
     // carries a signed prompt delta.
     scroll_viewport,
     jump_to_prompt,
+    // --- Slice B1: host-authoritative drag-select + copy ---
+    // GUI->host: the current drag selection as VIEWPORT coordinates (anchor +
+    // head + rectangle flag). The host maps the two viewport coords to pins on
+    // ITS terminal and runs select(). Sent on press (anchor==head) and on each
+    // drag update.
+    selection_drag,
+    // GUI->host: clear the host selection (select(null)).
+    selection_clear,
+    // host->GUI: the current selection TEXT, so the GUI can copy without a sync
+    // round-trip. Emitted whenever the host selection changes (set or cleared).
+    // The GUI caches {present, text}. The selection HIGHLIGHT itself rides the
+    // existing grid_frame as row.selection — this frame carries only the text.
+    selection_text,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -758,6 +771,92 @@ pub const JumpToPrompt = struct {
     }
 
     pub fn deinit(self: *JumpToPrompt, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+// --- Slice B1: host-authoritative drag-select + copy frames ---
+
+/// GUI->host: the current drag selection as VIEWPORT coordinates. The host maps
+/// (anchor_x, anchor_y) and (head_x, head_y) to pins on ITS terminal and runs
+/// `screens.active.select(Selection.init(anchor_pin, head_pin, rectangle))`.
+/// Viewport coords (not pins) are on the wire — pins are host-only. Sent on
+/// press (anchor==head) and on each in-viewport drag update. Fixed-width.
+pub const SelectionDrag = struct {
+    session_id: u64,
+    anchor_x: u16 = 0,
+    anchor_y: u16 = 0,
+    head_x: u16 = 0,
+    head_y: u16 = 0,
+    rectangle: bool = false,
+
+    pub fn encode(self: SelectionDrag, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeInt(w, u16, self.anchor_x);
+        try writeInt(w, u16, self.anchor_y);
+        try writeInt(w, u16, self.head_x);
+        try writeInt(w, u16, self.head_y);
+        try writeBool(w, self.rectangle);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !SelectionDrag {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .anchor_x = try readInt(r, u16),
+            .anchor_y = try readInt(r, u16),
+            .head_x = try readInt(r, u16),
+            .head_y = try readInt(r, u16),
+            .rectangle = try readBool(r),
+        };
+    }
+
+    pub fn deinit(self: *SelectionDrag, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// GUI->host: clear the host selection (`screens.active.select(null)`). Same
+/// shape as Detach/Close.
+pub const SelectionClear = SessionIdFrame(.selection_clear);
+
+/// host->GUI: the current selection TEXT so the GUI copies with no sync
+/// round-trip. `present`=false means the selection was cleared (text is empty).
+/// `text` is the LAST field so the trailing-field `readBytes` invariant holds.
+/// Emitted whenever the host selection changes (set or cleared); the GUI caches
+/// {present, text}.
+pub const SelectionText = struct {
+    session_id: u64,
+    present: bool = false,
+    /// Owned by this struct after decode (freed by deinit).
+    text: []const u8 = &.{},
+
+    pub fn encode(self: SelectionText, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeBool(w, self.present);
+        try writeBytes(w, self.text);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(alloc: Allocator, payload: []const u8) !SelectionText {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        const session_id = try readInt(r, u64);
+        const present = try readBool(r);
+        const text = try readBytes(alloc, &fbs, r);
+        return .{ .session_id = session_id, .present = present, .text = text };
+    }
+
+    pub fn deinit(self: *SelectionText, alloc: Allocator) void {
+        alloc.free(self.text);
         self.* = undefined;
     }
 };

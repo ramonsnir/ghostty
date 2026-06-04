@@ -732,12 +732,56 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             try self.handleHover(conn, hover);
         },
 
+        .selection_drag => {
+            var drag = try protocol.SelectionDrag.decode(alloc, frame.payload);
+            defer drag.deinit(alloc);
+            // Hold registry_mutex across the dereference (finding F3 TOCTOU),
+            // mirroring the .set_search/.hover arms. selectDrag takes the
+            // session's render_mutex internally for the select() + selectionString,
+            // a BOUNDED compute (one viewport map + one selection-string extract),
+            // and only STAGES the selection_text into the session's pending fields.
+            // It does NOT broadcast the selection_text frame here (findings SEL-1 /
+            // SEL-LOCK-1): that BLOCKING per-subscriber write would head-of-line-
+            // block every other session behind one slow GUI peer while this
+            // app-global registry_mutex is held, on a hot path (a frame per mouse-
+            // move). The owning thread's renderTick drains + broadcasts it off
+            // registry_mutex, alongside the forced GridFrame.
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(drag.session_id)) |e| {
+                if (sessionLive(e)) {
+                    e.session.selectDrag(
+                        .{ .x = drag.anchor_x, .y = drag.anchor_y },
+                        .{ .x = drag.head_x, .y = drag.head_y },
+                        drag.rectangle,
+                    ) catch |err|
+                        log.warn("selectDrag failed err={}", .{err});
+                }
+            }
+        },
+
+        .selection_clear => {
+            var clear = try protocol.SelectionClear.decode(alloc, frame.payload);
+            defer clear.deinit(alloc);
+            // Same lock discipline as .selection_drag: selectClear only STAGES the
+            // cleared selection_text under render_mutex; renderTick broadcasts it
+            // off registry_mutex (findings SEL-1 / SEL-LOCK-1).
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(clear.session_id)) |e| {
+                if (sessionLive(e)) {
+                    e.session.selectClear() catch |err|
+                        log.warn("selectClear failed err={}", .{err});
+                }
+            }
+        },
+
         .ping => {
             conn.writeFramed(.pong, protocol.Pong{});
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -926,6 +970,8 @@ fn spawnSession(self: *Server, working_directory: ?[]const u8) !*SessionEntry {
     session.on_search_event = onSearchEvent;
     session.on_surface_event_ctx = e;
     session.on_surface_event = onSurfaceEvent;
+    session.on_selection_text_ctx = e;
+    session.on_selection_text = onSelectionText;
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -1088,6 +1134,38 @@ fn onSearchEvent(ctx: *anyopaque, session: *Session, event: Session.SearchEvent)
                 .idx = if (s) |v| @intCast(v) else 0,
             }),
         }
+    }
+}
+
+/// Slice B1 selection-text callback. Frames a `selection_text` event to every
+/// subscriber, mirroring onRender/onSearchEvent's broadcast shape. `text` BORROWS
+/// the caller's buffer (Session frees it after this returns), so `writeFramed` ->
+/// `encode` must copy it synchronously here — which it does per subscriber.
+///
+/// LOCK DISCIPLINE (findings SEL-1 / SEL-LOCK-1): this runs on the session
+/// OWNING thread, from Session.renderTick (which drains the selection text staged
+/// by selectDrag/selectClear), holding ONLY the session-local `e.mutex` here —
+/// NOT the app-global `registry_mutex`. Like onRender, the owning thread is
+/// joined by teardownEntry, so it never races the registry teardown, and a slow
+/// subscriber's blocking write only stalls THIS session (the documented SR-4
+/// single-GUI contract), never head-of-line-blocks dispatch for other sessions.
+///
+/// NOT buffered for reattach: a reattach gets row.selection (the highlight) via
+/// pushFullFrames; the selection TEXT cache re-seeds on the next drag. Matches
+/// onSearchEvent's no-buffer policy.
+fn onSelectionText(ctx: *anyopaque, session: *Session, present: bool, text: []const u8) void {
+    _ = session;
+    const e: *SessionEntry = @ptrCast(@alignCast(ctx));
+
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    for (e.subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.writeFramed(.selection_text, protocol.SelectionText{
+            .session_id = e.session_id,
+            .present = present,
+            .text = text,
+        });
     }
 }
 
