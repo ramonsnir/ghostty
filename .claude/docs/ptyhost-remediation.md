@@ -115,9 +115,22 @@ bulk-history frame on attach. This is the one genuinely *new protocol* piece.
 Closes / enables: `read_text` over history (VoiceOver line/word reads),
 `write_screen` (`.history`/full `.screen` dumps), **true select-all** + copy across
 history, proper scrollback **paging** (smooth scroll, select+copy across history —
-the long-deferred §4.7), and **likely the "2nd reattach scrollback-loss on all
-tabs" bug** (REPRODUCE-FIRST to confirm it's R3 vs a reattach-resize reflow before
-building).
+the long-deferred §4.7).
+
+> **The "2nd reattach scrollback-loss on all tabs" bug is RESOLVED — and it was
+> NOT R3.** Reproduce-first (as this doc urged) showed it was the suspected
+> "reattach-resize reflow," not history transport. It was two independent
+> mechanisms: **(1)** the render-tick push gate suppressed the post-reattach
+> scroll's `GridFrame` when the scrolled rows matched a stale `prev_snapshot`
+> (`pushFullFrames` doesn't update it) — fixed by a `viewport_dirty` force-push
+> (`e4a8e0927`); and **(2)** the GUI's post-reattach resize-flood drove a
+> shrink-cols+shrink-rows resize whose old cursor `y` exceeded the new row count,
+> underflowing `PageList.resizeCols` (`self.rows - c.y - 1`) and crashing the
+> WHOLE host — taking down every session (the "all tabs frozen" symptom) — fixed
+> by saturating subtraction (`040cb33ca`). Both toggle-proven + live-smoke
+> validated (reattach is responsive and shows scrollback). Phase C is therefore
+> NOT a prerequisite for reattach scrollback; it remains required only for the
+> history-spanning operations listed above.
 
 **Effort:** High (protocol design + host paging + GUI mirror extension beyond
 viewport + memory bounds). **Risk:** High (bandwidth/backpressure, the viewport-only
@@ -157,8 +170,9 @@ Mostly small host-forwards or mirror-reads, each independent:
   (select, reset, clear, at-prompt bit, history paging). Budget host work per phase.
 - **`.exec` must stay byte-for-byte** through all phases (gate every change on
   `.client`/mirror presence).
-- **Reproduce-first for the bugs** (the 2nd reattach-scrollback especially) — the
-  pattern that has reliably found real mechanisms here.
+- **Reproduce-first for the bugs** — the pattern that has reliably found real
+  mechanisms here (it pinned the 2nd reattach-scrollback bug to a push-gate +
+  a `resizeCols` underflow crash, NOT R3 — see Phase C; `e4a8e0927`+`040cb33ca`).
 - **Suggested order:** A (cheap, unblocks TUIs) → B (selection/copy, the most
   user-noticed) → decide on C (history) since it's the costliest and gates the
   rest of B/D's history-dependent parts → D tail as polish. Re-smoke after A and B.
