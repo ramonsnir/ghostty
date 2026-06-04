@@ -69,7 +69,20 @@ encode path sees the mirrored modes; human smoke in vim (arrows, mouse, paste).
 
 ---
 
-## Phase B — Selection + copy, host-authoritative (R1; partial R3 dependency).
+## Phase B1 — DONE + smoke-validated (commit `07da2b0b9`).
+
+Host-authoritative mouse-DRAG selection + copy. **Smoke-confirmed:** click-drag
+shows a highlight; ⌘C copies the selected text and pastes elsewhere. GUI forwards
+`SelectionDrag`/`SelectionClear` (viewport coords); host selects on its real
+terminal → highlight rides the mirror's `row.selection`; host ships
+`SelectionText`; GUI copy/`hasSelection` read the cache (no sync round-trip).
+`.exec` untouched. **Deferred to B2:** double-click word / triple-click line /
+select-all (boundary-snap + select-all needs history/R3); rich copy formats
+(plain-text only) + trailing-space trim under `.client`; URL/regex-link text;
+accessibility readout. **Unverified:** right-click → Copy was routed but not
+smoke-tested (user doesn't use it) — confirm in B2.
+
+## Phase B2 (remaining selection) — Selection tail, host-authoritative (R1; select-all needs R3).
 
 Make selection a host-driven operation: GUI gesture machinery stays GUI-side but
 forwards intent (drag coords, click-count for word/line, select-all) to the host;
