@@ -13,6 +13,7 @@ const inputpkg = @import("../input.zig");
 const apprt = @import("../apprt.zig");
 const render = @import("../terminal/render.zig");
 const RenderStateCore = render.RenderState;
+const renderer = @import("../renderer.zig");
 
 const posix = std.posix;
 
@@ -2434,5 +2435,230 @@ test "host search to client mirror end-to-end (real thread -> wire -> rehydrate 
         for (mirror.items(.highlights)) |hls| {
             try testing.expectEqual(@as(usize, 0), hls.items.len);
         }
+    }
+}
+
+test "host Server applies the AUTHORITATIVE wire grid on resize, not the raw screen_w/h derived grid (Slice 9, grid_matches_wire)" {
+    // Slice 9 — DISTINGUISHING test (fails before the fix, passes after) that
+    // drives the resize THROUGH THE REAL SERVER PATH (socket -> Server.dispatch
+    // .resize arm -> Termio mailbox -> live terminal on the IO thread), then
+    // observes the host-applied grid via the reattach Attached{cols,rows}
+    // (Server.liveDims reads session.io.terminal.cols/rows).
+    //
+    // What the fix guarantees: the host resizes to the AUTHORITATIVE wire
+    // {cols, rows} the GUI rendered at, reconstructed via Resize.toSize()
+    // (screen = cols*cell + padding so size.grid() reproduces {cols, rows}).
+    // The previous host code instead rebuilt the Size from the raw wire
+    // screen_w/h and let size.grid() = (screen - padding)/cell RE-DERIVE the
+    // grid from pixels. For a well-formed frame those agree (the client derives
+    // both from one renderer.Size), so to expose the divergence we send an
+    // INCONSISTENT frame: authoritative {100, 40} but a screen_w/h consistent
+    // with a much smaller {20, 10} grid (cell 8x16, no padding). This models a
+    // peer that sends a transient/garbled screen_w/h while the cols/rows it
+    // actually rendered at remain authoritative.
+    //
+    //   BEFORE the fix: host derives grid from screen_w/h -> applies 20x10
+    //                   (Attached reports 20x10 != 100x40) -> FAIL.
+    //   AFTER  the fix: host applies the wire {100, 40}
+    //                   (Attached reports 100x40) -> PASS.
+    //
+    // A revert of ONLY Server.zig:564 (back to raw screen_w/h) also fails here,
+    // because the assertion is taken off the live terminal AFTER the Server
+    // dispatch + Termio mailbox actually applied the resize.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "rs" });
+    _ = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // AUTHORITATIVE wire grid the GUI rendered at: 100x40, cell 8x16, no padding.
+    const auth_cols: u16 = 100;
+    const auth_rows: u16 = 40;
+    const cw: u32 = 8;
+    const ch: u32 = 16;
+    // INCONSISTENT screen_w/h: consistent with a SMALLER 20x10 grid (not 1x1, so
+    // the shrink stays a legitimate non-degenerate resize either way). If the
+    // host (pre-fix) derives from these pixels it lands on 20x10, not 100x40.
+    const raw_cols: u32 = 20;
+    const raw_rows: u32 = 10;
+    try clientSend(alloc, client, .resize, protocol.Resize{
+        .session_id = session_id,
+        .cols = auth_cols,
+        .rows = auth_rows,
+        .cell_width = cw,
+        .cell_height = ch,
+        .screen_w = raw_cols * cw, // -> size.grid() = 20 cols (pre-fix path)
+        .screen_h = raw_rows * ch, // -> size.grid() = 10 rows (pre-fix path)
+    });
+
+    // Let the resize flow through the Termio mailbox into the live terminal.
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // Detach + reattach on a fresh client; the reattach Attached reports the
+    // LIVE host grid (Server.liveDims -> terminal.cols/rows), i.e. the grid the
+    // Server actually applied. It MUST equal the authoritative wire grid.
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+
+    const client2 = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client2);
+    try connectUnix(client2, sock_path);
+    setRecvTimeout(client2);
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+
+    try clientSend(alloc, client2, .hello, protocol.Hello{ .identity_bundle_id = "rs2" });
+    _ = (try pollNext(&rdr2, alloc, client2, &payload, 50)).?;
+    try clientSend(alloc, client2, .attach, protocol.Attach{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var got = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                try testing.expectEqual(session_id, a.session_id);
+                // grid_matches_wire: the applied grid is the authoritative wire
+                // grid, NOT the raw-screen-derived 20x10.
+                try testing.expectEqual(auth_cols, a.cols);
+                try testing.expectEqual(auth_rows, a.rows);
+                got = true;
+                break;
+            }
+        }
+        try testing.expect(got);
+    }
+
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host resize preserves scrollback content (Slice 9, acceptance)" {
+    // Slice 9 ACCEPTANCE: a resize through the host fix function (Resize.toSize
+    // -> Termio's size.grid() -> terminal.resize, byte-for-byte what
+    // Termio.resize applies, Termio.zig:469-486) must PRESERVE scrollback. This
+    // is deterministic (no IO thread / no child): we drive the host terminal
+    // directly, mirroring the Slice 7 scroll_viewport test.
+    //
+    // The frame here is a WELL-FORMED one a real Client.resize would emit:
+    // cols/rows are derived from the same screen the client puts in screen_w/h
+    // (so cols == grid(screen).columns). We resize 80x24 -> 80x50 (a taller
+    // window). The early scrollback line must remain reachable at the top of
+    // history -- a resize must never erase scrollback (upstream .exec behavior;
+    // this asserts the .client/host path matches it).
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 80, .rows = 24 });
+    defer session.destroy();
+
+    // Feed 120 lines "L000".."L119" so ~96 land in scrollback (viewport=24).
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var i: usize = 0;
+        while (i < 120) : (i += 1) {
+            var lb: [8]u8 = undefined;
+            const line = try std.fmt.bufPrint(&lb, "L{d:0>3}", .{i});
+            try session.io.terminal.printString(line);
+            session.io.terminal.carriageReturn();
+            try session.io.terminal.linefeed();
+        }
+    }
+
+    // Sanity: the oldest line is reachable by scrolling to the top of history.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.scrollViewport(.top);
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        try testing.expect(try snapshotContainsMarker(alloc, &snap, "L000"));
+        session.io.terminal.scrollViewport(.bottom);
+    }
+
+    // Build a WELL-FORMED Resize frame the way Client.resize does: derive the
+    // wire cols/rows from the SAME screen we put in screen_w/h, so the frame is
+    // internally consistent (cols == grid(screen_w/h).columns), exactly what a
+    // real client emits. Target grid: 80x50 (cell 8x16, no padding).
+    const cw: u32 = 8;
+    const ch: u32 = 16;
+    const target_cols: u16 = 80;
+    const target_rows: u16 = 50;
+    const wire = protocol.Resize{
+        .session_id = 1,
+        .cols = target_cols,
+        .rows = target_rows,
+        .cell_width = cw,
+        .cell_height = ch,
+        .screen_w = @as(u32, target_cols) * cw, // consistent with cols
+        .screen_h = @as(u32, target_rows) * ch, // consistent with rows
+    };
+
+    // Round-trip the frame and apply the EXACT size the Server .resize arm
+    // builds (Resize.toSize) through Termio's grid derivation to the terminal.
+    {
+        const framed = try protocol.encodeFrame(alloc, .resize, wire);
+        defer alloc.free(framed);
+        var rdr: protocol.FrameReader = .{};
+        defer rdr.deinit(alloc);
+        try rdr.push(alloc, framed);
+        const f = (try rdr.next(alloc)).?;
+        var dec = try protocol.Resize.decode(alloc, f.payload);
+        defer dec.deinit(alloc);
+
+        const size = dec.toSize();
+        const grid = size.grid();
+        // grid_matches_wire: the reconstructed grid is the authoritative wire grid.
+        try testing.expectEqual(target_cols, grid.columns);
+        try testing.expectEqual(target_rows, grid.rows);
+
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.resize(alloc, grid.columns, grid.rows);
+    }
+
+    // ACCEPTANCE: the oldest scrollback line must still be reachable after the
+    // resize -- a resize must never erase the terminal content + scrollback.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.scrollViewport(.top);
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        try testing.expect(try snapshotContainsMarker(alloc, &snap, "L000"));
     }
 }

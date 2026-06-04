@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const RenderState = @import("RenderState.zig");
+const renderer = @import("../renderer.zig");
 const terminalpkg = @import("../terminal/main.zig");
 const point = terminalpkg.point;
 const apprt = @import("../apprt.zig");
@@ -559,6 +560,51 @@ pub const Resize = struct {
             .padding_b = try readInt(r, u32),
             .screen_w = try readInt(r, u32),
             .screen_h = try readInt(r, u32),
+        };
+    }
+
+    /// Reconstruct the `renderer.Size` the host resize path applies (Slice 9).
+    /// The host derives the terminal grid via `Termio.resize` -> `size.grid()`
+    /// = (screen - padding) / cell. This helper builds a Size whose `grid()`
+    /// yields exactly the AUTHORITATIVE wire {cols, rows} the GUI rendered at,
+    /// by setting `screen` = cols*cell + padding so the (screen-padding)/cell
+    /// derivation reproduces {cols, rows} exactly, while keeping the wire
+    /// cell/padding for the downstream pixel math (terminal width_px/height_px,
+    /// size reports).
+    ///
+    /// Why trust the wire {cols, rows} over the raw wire screen_w/h: the grid
+    /// the GUI actually rendered at IS {cols, rows} (the client computes it via
+    /// the very same `size.grid()` before sending — see `Client.resize`), so it
+    /// is the authoritative source of truth. For a well-formed frame the two
+    /// agree exactly (screen_w/h and cols/rows both come from one client-side
+    /// `renderer.Size`, so re-deriving the grid from screen_w/h would yield the
+    /// same integers — the previous host code did exactly that and was correct
+    /// for every frame a healthy client emits). Deriving from {cols, rows}
+    /// instead makes the host authoritative-grid driven rather than
+    /// pixel-derived: if a peer ever sends an INCONSISTENT frame (cols/rows that
+    /// disagree with screen_w/h — e.g. a transient/garbled mid-drag screen, a
+    /// buggy peer, or a future protocol change), the host resizes to the grid
+    /// the peer says it rendered at instead of collapsing to a re-derived
+    /// (possibly near-1x1) grid. The raw wire screen_w/h is intentionally NOT
+    /// used for the grid derivation. `.exec`'s own resize path is untouched —
+    /// this helper is host/.client only.
+    pub fn toSize(self: Resize) renderer.Size {
+        // Guard a degenerate cell so `size.grid()`'s float division (and the
+        // screen reconstruction below) can't divide/scale by zero.
+        const cell_w: u32 = if (self.cell_width == 0) 1 else self.cell_width;
+        const cell_h: u32 = if (self.cell_height == 0) 1 else self.cell_height;
+        return .{
+            .screen = .{
+                .width = @as(u32, self.cols) * cell_w + self.padding_l + self.padding_r,
+                .height = @as(u32, self.rows) * cell_h + self.padding_t + self.padding_b,
+            },
+            .cell = .{ .width = cell_w, .height = cell_h },
+            .padding = .{
+                .left = self.padding_l,
+                .right = self.padding_r,
+                .top = self.padding_t,
+                .bottom = self.padding_b,
+            },
         };
     }
 

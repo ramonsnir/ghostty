@@ -571,13 +571,16 @@ pub fn resize(
     self.grid_size = grid_size;
     self.screen_size = size.terminal();
 
-    // CAUTION: screen_w/screen_h carry the FULL padded screen (size.screen),
-    // NOT size.terminal(). size.terminal() is screen.subPadding(padding) —
-    // already padding-stripped — and the host reconstructs a renderer.Size by
-    // setting .screen = {screen_w, screen_h} and re-deriving grid/terminal via
-    // subPadding. Sending the padding-removed value alongside the padding_*
-    // fields would subtract padding twice, yielding a too-small grid/terminal
-    // on every resize with nonzero padding. size.screen round-trips exactly.
+    // screen_w/screen_h carry the FULL padded screen (size.screen), NOT
+    // size.terminal() (which is screen.subPadding(padding), already
+    // padding-stripped). Send the full padded screen so the wire fields stay
+    // self-consistent with the padding_* fields. The host no longer derives
+    // the grid from screen_w/h: as of Slice 9 it reconstructs the grid from the
+    // AUTHORITATIVE wire {cols, rows} via Resize.toSize() (screen = cols*cell +
+    // padding), so screen_w/h round-trips for completeness / size reports but
+    // is not the basis for the grid derivation — the historic
+    // double-subtract-padding hazard on screen_w/h no longer applies to the
+    // grid.
     try self.sendFrame(td, .resize, protocol.Resize{
         .session_id = self.session_id.load(.acquire),
         .cols = grid_size.columns,
