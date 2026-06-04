@@ -320,9 +320,21 @@ important thing to re-verify when resuming:
 ## Status: open items & next steps
 
 - **cwd-inherit on new tab + shell command-tracking are BROKEN under `.client`.**
-  The host's shell has no shell integration ("shell could not be detected"), so
-  no OSC 7 pwd updates and no command marks. **Next up:** make the host inject
-  shell integration the way `.exec` does.
+  Symptom: the host logs `shell could not be detected, no automatic shell
+  integration will be injected`, so the child shell emits no OSC 7 pwd and no
+  command marks. **Root cause (verified empirically — not what it first looks
+  like):** the resources dir resolves fine — the host logs `found Ghostty
+  resources dir` when `GHOSTTY_RESOURCES_DIR` is set, and the integration scripts
+  are present under `zig-out/share/ghostty/shell-integration/`. The real gap is
+  that `src/host/Session.zig` builds a **bare default `Config{}`** and passes
+  `.command = self.config.command` (null) to `Exec.init`; with no resolved login
+  shell, `shell_integration.setup`'s `.detect` can't classify it (the child ends
+  up a generic `/usr/bin/login … sh` rather than the user's `/bin/zsh`), so
+  nothing is injected. The GUI's `.exec` path works because its `Config` has
+  already resolved the user's login-shell command; the headless host skips that.
+  **Next up:** make the host resolve the user's login shell (+ the
+  shell-integration-relevant config) so `.detect` + injection fire — a host-side
+  slice, NOT a resources-dir or protocol fix.
 - **Scrollback paging is NOT done.** The mirror is viewport-only and scroll is a
   host round-trip (Slice 7), so there is no local scrollback buffer; smooth
   scrolling and select+copy across history are limited. The `scroll_to_row`
