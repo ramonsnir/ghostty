@@ -384,6 +384,42 @@ important thing to re-verify when resuming:
 
 ## Status: open items & next steps
 
+> **META (read this first): `.client` systematically breaks every GUI feature
+> that reads or writes the in-process `io.terminal` / `core_surface`.** The real
+> terminal lives host-side; the GUI holds only a viewport `RenderState` mirror.
+> So any feature whose GUI code path touches the local terminal — links, search,
+> pwd/cwd-inherit, selection, … — is inert or wrong under `.client` until it is
+> explicitly re-routed (host-computed, or GUI-against-the-mirror). These have
+> been found reactively via smoke; **a systematic audit of all
+> `io.terminal`/`core_surface` consumers is needed so the rest are found
+> proactively** (see "Selection" + the audit task below). Do not assume an
+> untested GUI feature works under `.client`.
+
+- **Selection + copy BROKEN under `.client` (mouse).** Mouse drag sets the
+  selection on the GUI's LOCAL `io.terminal` (`Surface.zig` `screens.active.select`),
+  but the renderer draws `row.selection` from the host-fed mirror (empty — the
+  host has no mouse), so NO highlight shows; and `selectionString`
+  (`Surface.zig:2205`) reads the local terminal, which has no cell content under
+  `.client`, so copy yields nothing. Two designs: (A) apply the selection as a
+  GUI-side highlight on the mirror rows + extract copy text from the mirror cells
+  (viewport-scoped); (B) round-trip selection coords to the host (handles
+  scrollback). NOT YET BUILT — substantial slice.
+- **SECOND reattach scrollback-loss path (distinct from Slice 12).** Observed:
+  after a reattach with ZERO degenerate-resize drops (so the Slice-12 guard did
+  not fire), scrollback was lost on ALL tabs (the host child shells survived;
+  only the scrollback VIEW was gone). Slice 12 only closed the degenerate-resize
+  path. Suspects (reproduce-first, like Slice 12): a well-formed reattach Resize
+  to a different size reflowing scrollback away, OR the scroll-to-view-history
+  path (Slice 7) not retrieving host scrollback after reattach. Needs a host-level
+  full-reattach-sequence test (scrollback -> detach -> re-Attach -> pushFullFrames
+  + well-formed Resize -> assert history still reachable).
+- **TASK — systematic `.client` feature audit (proactive, not reactive).**
+  Enumerate every consumer of `io.terminal` / `self.renderer_state.terminal` /
+  `core_surface.*` in `src/Surface.zig`, `src/apprt/embedded.zig`, and the macOS
+  apprt; classify each as works-under-`.client` / broken / already-re-routed
+  (links 3b/3c, pwd Slice 10+pwd-sync, child_exit 5d, scroll 7). Output a
+  prioritized gap list so features are fixed before a user hits them.
+
 - **cwd-inherit / shell command-tracking under `.client`: FIXED at the host
   level; pending a live re-smoke.** Was broken because `src/host/Session.zig`
   used `Config.default()` (which does NOT call `finalize()`), leaving `command`
