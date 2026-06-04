@@ -57,6 +57,12 @@ class BaseTerminalController: NSWindowController,
     /// True when any surface in this controller currently has an active bell.
     @Published private(set) var bell: Bool = false
 
+    /// (ramon fork) True when the tree is zoomed AND some leaf OUTSIDE the zoomed
+    /// subtree has an active bell. Drives the hidden-split bell badge in TerminalView,
+    /// since hidden splits aren't in the SwiftUI hierarchy and can't show their own
+    /// bell border while zoomed away.
+    @Published private(set) var zoomedHiddenBell: Bool = false
+
     /// Whether the terminal surface should focus when the mouse is over it.
     var focusFollowsMouse: Bool {
         self.derivedConfig.focusFollowsMouse
@@ -91,6 +97,9 @@ class BaseTerminalController: NSWindowController,
 
     /// Cancellable for aggregating bell state across all surfaces in this controller.
     private var bellStateCancellable: AnyCancellable?
+
+    /// (ramon fork) Cancellable deriving `zoomedHiddenBell` from the tree + per-surface bells.
+    private var zoomedHiddenBellCancellable: AnyCancellable?
 
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
@@ -146,6 +155,11 @@ class BaseTerminalController: NSWindowController,
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
+
+        // (ramon fork) Derive the hidden-split bell badge state. Must run AFTER the
+        // `surfaceTree` assignment above so the combineLatest produces an initial
+        // tuple at init (both upstreams replay their current value on subscribe).
+        setupZoomedHiddenBellPublisher()
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
@@ -1102,9 +1116,15 @@ class BaseTerminalController: NSWindowController,
         // closed surfaces.
         if let titleSurface = focusedSurface ?? lastFocusedSurface,
            surfaceTree.contains(titleSurface) {
-            // If we have a surface, we want to listen for title changes.
+            // If we have a surface, we want to listen for title changes. We combine
+            // with the window-level aggregate bell (`self.$bell`, maintained by
+            // setupBellNotificationPublisher) rather than this surface's own `$bell`
+            // so the 🔔 prefix reflects ANY surface in the tab ringing, not just the
+            // focused one. combineLatest emits on either title-text OR aggregate-bell
+            // change, and replays the current aggregate on resubscribe so an active
+            // 🔔 persists across focus changes.
             titleSurface.$title
-                .combineLatest(titleSurface.$bell)
+                .combineLatest($bell)
                 .map { [weak self] in self?.computeTitle(title: $0, bell: $1) ?? "" }
                 .sink { [weak self] in self?.titleDidChange(to: $0) }
                 .store(in: &focusedSurfaceCancellables)
@@ -1132,9 +1152,9 @@ class BaseTerminalController: NSWindowController,
         guard let window else { return }
 
         if let titleOverride {
-            window.title = computeTitle(
-                title: titleOverride,
-                bell: focusedSurface?.bell ?? false)
+            // Use the window-level aggregate bell so the override title's 🔔 reflects
+            // ANY surface in the tab ringing (matching the computed-title listener).
+            window.title = computeTitle(title: titleOverride, bell: self.bell)
             return
         }
 
@@ -1841,6 +1861,24 @@ extension BaseTerminalController {
                     userInfo: [Notification.Name.terminalWindowHasBellKey: hasBell]
                 )
             }
+    }
+
+    /// (ramon fork) Derives `zoomedHiddenBell`: true iff the tree is zoomed and some
+    /// leaf outside the zoomed subtree has an active bell.
+    private func setupZoomedHiddenBellPublisher() {
+        zoomedHiddenBellCancellable = $surfaceTree
+            .combineLatest(
+                surfaceValuesPublisher(valueKeyPath: \.bell, publisherKeyPath: \.$bell))
+            // Read the tree from the tuple, NOT `self.surfaceTree`. `@Published` emits
+            // in `willSet`, so during a `$surfaceTree`-triggered cycle the stored
+            // property still holds the OLD tree; the tuple's first element is the
+            // freshly-emitted NEW tree (and the current tree on a bell-only change).
+            .map { tree, bells in
+                tree.hasBellOutsideZoom(bells: bells)
+            }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] hidden in self?.zoomedHiddenBell = hidden }
     }
 
     /// Creates a publisher for values on all surfaces in this controller's tree.
