@@ -384,6 +384,11 @@ important thing to re-verify when resuming:
 
 ## Status: open items & next steps
 
+> **Remediation plan:** the audit's 37 gaps are sequenced into a phased program
+> (A: consume the ModeFrame mirror → B: host-authoritative selection/copy →
+> C: history transport → D: the R1 tail) in
+> **`.claude/docs/ptyhost-remediation.md`** — read it to decide what to fund.
+
 > **META (read this first): `.client` systematically breaks every GUI feature
 > that reads or writes the in-process `io.terminal` / `core_surface`.** The real
 > terminal lives host-side; the GUI holds only a viewport `RenderState` mirror.
