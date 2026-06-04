@@ -1111,6 +1111,173 @@ test "client handleFrame .mode_frame replaces the mode mirror" {
     try testing.expect(client.mode.alt_screen_active);
 }
 
+// PHASE A (audit R2): handleFrame's .mode_frame arm now APPLIES the decoded
+// modes onto the local terminal that `setLocalTerminal` registered — the SAME
+// terminal the GUI's key/mouse/paste encode paths read (`io.terminal` in
+// Surface.zig). This proves that after a ModeFrame the terminal reflects the
+// host's real modes/flags/kitty, i.e. exactly what
+// key_encode.Options.fromTerminal / paste.Options.fromTerminal / the
+// mouse-reporting gates would read — so vim arrows / mouse / bracketed paste /
+// kitty keyboard work under .client. The companion case proves a null-terminal
+// Client (no setLocalTerminal) is a safe no-op.
+//
+// IMPORTANT (R2-DANGLING-TERMINAL): the registration MUST mirror what
+// Surface.init does — `client.setLocalTerminal(&term)` on the final-address
+// Client, NOT `client.initTerminal(&term)`. `initTerminal` deliberately no
+// longer captures the terminal (it runs pre-move in Termio.init and would
+// stash a dead stack address). Registering via `setLocalTerminal` against a
+// stable test-local `term` and asserting that SAME `term` mutates is the
+// regression guard: if the apply ever wrote anywhere other than the registered
+// pointer, these asserts fail.
+test "client handleFrame .mode_frame applies host modes onto the local terminal (R2)" {
+    const alloc = testing.allocator;
+
+    // The local terminal the encode paths read off of (== io.terminal). Starts
+    // at all input-mode defaults (never fed VT under .client).
+    var term = try terminalpkg.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer term.deinit(alloc);
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    // Register the terminal exactly as Surface.init does on the final-address
+    // Client (`c.setLocalTerminal(&self.io.terminal)`).
+    client.setLocalTerminal(&term);
+
+    // Sanity: defaults before any ModeFrame (the bug's stuck state).
+    try testing.expect(!term.modes.get(.cursor_keys));
+    try testing.expect(!term.modes.get(.bracketed_paste));
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(term.flags.mouse_event)); // .none
+    try testing.expect(!term.flags.modify_other_keys_2);
+    try testing.expectEqual(@as(u5, 0), term.screens.active.kitty_keyboard.current().int());
+
+    // A ModeFrame with non-default values across every applied cluster. The
+    // mouse_event / mouse_format u8s are enum indices: .normal is index 2 in
+    // mouse.Event {none,x10,normal,button,any}; .sgr is index 2 in mouse.Format
+    // {x10,utf8,sgr,urxvt,sgr_pixels}. These are the exact bytes fromTerminal's
+    // @intFromEnum would have written, so @enumFromInt round-trips them.
+    // kitty_flags=0b10011 -> disambiguate + report_all + report_associated.
+    const mouse_event_normal: u8 = 2;
+    const mouse_format_sgr: u8 = 2;
+    const kitty: u5 = 0b10011;
+    const mf: protocol.ModeFrame = .{
+        .session_id = 9,
+        .alt_esc_prefix = false, // default is true on the wire-source mode; set explicitly off
+        .cursor_keys = true,
+        .keypad_keys = true,
+        .backarrow_key_mode = true,
+        .ignore_keypad_with_numlock = false,
+        .bracketed_paste = true,
+        .disable_keyboard = true,
+        .mouse_alternate_scroll = false,
+        .mouse_event = mouse_event_normal,
+        .mouse_format = mouse_format_sgr,
+        .mouse_shift_capture = 2, // tri-state: 2 == .true
+        .modify_other_keys_2 = true,
+        .kitty_flags = kitty,
+        .alt_screen_active = true, // intentionally NOT applied (documented residual)
+    };
+    const p = try mf.encode(alloc);
+    defer alloc.free(p);
+    try client.handleFrame(alloc, .mode_frame, p);
+
+    // The bool modes now reflect the frame — what fromTerminal reads.
+    try testing.expect(!term.modes.get(.alt_esc_prefix));
+    try testing.expect(term.modes.get(.cursor_keys));
+    try testing.expect(term.modes.get(.keypad_keys));
+    try testing.expect(term.modes.get(.backarrow_key_mode));
+    try testing.expect(!term.modes.get(.ignore_keypad_with_numlock));
+    try testing.expect(term.modes.get(.bracketed_paste));
+    try testing.expect(term.modes.get(.disable_keyboard));
+    try testing.expect(!term.modes.get(.mouse_alternate_scroll));
+
+    // The mouse + modify_other_keys cluster on t.flags.
+    try testing.expectEqual(mouse_event_normal, @intFromEnum(term.flags.mouse_event));
+    try testing.expectEqual(mouse_format_sgr, @intFromEnum(term.flags.mouse_format));
+    try testing.expect(term.flags.mouse_shift_capture == .true);
+    try testing.expect(term.flags.modify_other_keys_2);
+
+    // Kitty keyboard on the ACTIVE screen — exactly what fromTerminal reads via
+    // t.screens.active.kitty_keyboard.current().int().
+    try testing.expectEqual(kitty, term.screens.active.kitty_keyboard.current().int());
+
+    // The flat mirror still updates wholesale (unchanged behavior).
+    try testing.expectEqual(@as(u64, 9), client.mode.session_id);
+}
+
+test "client handleFrame .mode_frame with null terminal is a safe no-op (R2)" {
+    const alloc = testing.allocator;
+
+    // No setLocalTerminal => client.local_terminal stays null (the decode-test
+    // default). `initTerminal` no longer registers a terminal, so even calling
+    // it would leave this null.
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    try testing.expect(client.local_terminal == null);
+
+    const mf: protocol.ModeFrame = .{
+        .session_id = 1,
+        .cursor_keys = true,
+        .bracketed_paste = true,
+        .kitty_flags = 0b11111,
+    };
+    const p = try mf.encode(alloc);
+    defer alloc.free(p);
+    // Must not crash / deref null; the flat mirror still updates.
+    try client.handleFrame(alloc, .mode_frame, p);
+    try testing.expect(client.mode.cursor_keys);
+    try testing.expect(client.mode.bracketed_paste);
+}
+
+// PHASE A (audit blocker R2-1/R2-2): the .mode_frame apply must NOT abort the
+// GUI on a malformed / desynced / version-skewed host frame. The mouse_event /
+// mouse_format / mouse_shift_capture wire u8s and the kitty_flags u8 are
+// UNTRUSTED; out-of-range values that have no valid named enum / overflow the u5
+// must degrade to error.InvalidFrame (a clean connection close in the read
+// loop), mirroring the protocol layer's decode convention — never a checked
+// panic / ReleaseFast UB. We feed each offending field through the real apply
+// path (a registered terminal, so the casts execute) and assert the error.
+test "client handleFrame .mode_frame rejects out-of-range wire bytes (R2-1/R2-2)" {
+    const alloc = testing.allocator;
+
+    var term = try terminalpkg.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer term.deinit(alloc);
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+    client.setLocalTerminal(&term);
+
+    // mouse.Event is exhaustive u3 with valid 0..4; 200 has no field.
+    {
+        const mf: protocol.ModeFrame = .{ .session_id = 1, .mouse_event = 200 };
+        const p = try mf.encode(alloc);
+        defer alloc.free(p);
+        try testing.expectError(error.InvalidFrame, client.handleFrame(alloc, .mode_frame, p));
+    }
+    // mouse.Format is exhaustive u3 with valid 0..4; 7 has no field.
+    {
+        const mf: protocol.ModeFrame = .{ .session_id = 1, .mouse_format = 7 };
+        const p = try mf.encode(alloc);
+        defer alloc.free(p);
+        try testing.expectError(error.InvalidFrame, client.handleFrame(alloc, .mode_frame, p));
+    }
+    // mouse_shift_capture is exhaustive enum(u2){null,false,true}; 3 is
+    // representable but unnamed.
+    {
+        const mf: protocol.ModeFrame = .{ .session_id = 1, .mouse_shift_capture = 3 };
+        const p = try mf.encode(alloc);
+        defer alloc.free(p);
+        try testing.expectError(error.InvalidFrame, client.handleFrame(alloc, .mode_frame, p));
+    }
+    // kitty_flags carries a u5; any high bit (>31) would overflow the narrowing
+    // cast.
+    {
+        const mf: protocol.ModeFrame = .{ .session_id = 1, .kitty_flags = 200 };
+        const p = try mf.encode(alloc);
+        defer alloc.free(p);
+        try testing.expectError(error.InvalidFrame, client.handleFrame(alloc, .mode_frame, p));
+    }
+}
+
 test "client handleFrame .attached sets session_id" {
     const alloc = testing.allocator;
     var client = try Client.init(alloc, .{});

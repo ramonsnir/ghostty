@@ -784,6 +784,20 @@ pub fn init(
                 self.renderer_state.mirror = &c.render_state;
                 self.renderer_state.link_cells = &c.osc8_links;
 
+                // PHASE A (audit R2 — lifetime-critical): point the Client at
+                // the FINAL-address local terminal so `handleFrame`'s
+                // `.mode_frame` arm applies the host's real input modes onto the
+                // SAME terminal the encode paths read. `&self.io.terminal` is
+                // the final `&Termio.terminal` (post-move), valid for the life
+                // of the Surface — the exact terminal `key_encode`/`paste`/the
+                // mouse gates read off `io.terminal`. This MUST be done here on
+                // the moved backend (`self.io.backend.client`), NOT in
+                // `Client.initTerminal`: that runs pre-move and would capture
+                // the dead stack-local terminal address (same hazard as
+                // mirror/link_cells above). Set before the read thread spawns in
+                // `threadEnter`, so the first `.mode_frame` already targets it.
+                c.setLocalTerminal(&self.io.terminal);
+
                 // The `.client` backend never consumed `env` (the host owns the
                 // subprocess and its environment); `.exec` would have taken
                 // ownership of it inside `Exec.init`. Free it now, on the
