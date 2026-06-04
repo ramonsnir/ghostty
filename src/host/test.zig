@@ -937,6 +937,161 @@ test "host scroll_viewport repins the host terminal -> next captured GridFrame d
     }
 }
 
+test "protocol SelectionDrag/Clear/Text round-trip (host client) Slice B1" {
+    const alloc = testing.allocator;
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // SelectionDrag: fixed-width, all fields incl. rectangle flag.
+    {
+        const orig: protocol.SelectionDrag = .{
+            .session_id = 77,
+            .anchor_x = 3,
+            .anchor_y = 1,
+            .head_x = 9,
+            .head_y = 4,
+            .rectangle = true,
+        };
+        const framed = try protocol.encodeFrame(alloc, .selection_drag, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.selection_drag, tag);
+        const dec = try protocol.SelectionDrag.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+
+    // SelectionClear: bare session id.
+    {
+        const orig: protocol.SelectionClear = .{ .session_id = 88 };
+        const framed = try protocol.encodeFrame(alloc, .selection_clear, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.selection_clear, tag);
+        const dec = try protocol.SelectionClear.decode(alloc, payload.items);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+    }
+
+    // SelectionText present=true (text is the trailing field).
+    {
+        const orig: protocol.SelectionText = .{
+            .session_id = 5,
+            .present = true,
+            .text = "hello selection",
+        };
+        const framed = try protocol.encodeFrame(alloc, .selection_text, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.selection_text, tag);
+        var dec = try protocol.SelectionText.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+        try testing.expectEqual(true, dec.present);
+        try testing.expectEqualStrings(orig.text, dec.text);
+    }
+
+    // SelectionText cleared (present=false, empty text) round-trips.
+    {
+        const orig: protocol.SelectionText = .{ .session_id = 6, .present = false };
+        const framed = try protocol.encodeFrame(alloc, .selection_text, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.selection_text, tag);
+        var dec = try protocol.SelectionText.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 6), dec.session_id);
+        try testing.expectEqual(false, dec.present);
+        try testing.expectEqualStrings("", dec.text);
+    }
+}
+
+// Captures the most recent on_selection_text callback for the host selectDrag
+// test. Single-threaded synchronous test, so a plain struct is sufficient.
+const SelTextCapture = struct {
+    present: bool = false,
+    text: std.ArrayListUnmanaged(u8) = .empty,
+    fired: bool = false,
+
+    fn cb(ctx: *anyopaque, _: *Session, present: bool, text: []const u8) void {
+        const self: *SelTextCapture = @ptrCast(@alignCast(ctx));
+        self.present = present;
+        self.fired = true;
+        self.text.clearRetainingCapacity();
+        // testing.allocator is fine here; deinit below frees it.
+        self.text.appendSlice(testing.allocator, text) catch unreachable;
+    }
+};
+
+test "host selectDrag selects the right cells -> row.selection + selectionString -> selection_text (client) Slice B1" {
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    // Write known content on the first row so we can assert the selected text.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("ABCDEFGHIJ");
+    }
+
+    var capture: SelTextCapture = .{};
+    defer capture.text.deinit(alloc);
+    session.on_selection_text_ctx = &capture;
+    session.on_selection_text = SelTextCapture.cb;
+
+    // Drag-select columns 2..5 (inclusive) of viewport row 0 -> "CDEF".
+    try session.selectDrag(.{ .x = 2, .y = 0 }, .{ .x = 5, .y = 0 }, false);
+
+    // selectDrag STAGES the selection text (findings SEL-1 / SEL-LOCK-1); it does
+    // NOT fire the broadcast callback synchronously under registry_mutex anymore.
+    // The owning thread's renderTick drains + emits it off the app-global lock.
+    try testing.expect(!capture.fired);
+    try testing.expect(session.sel_text_dirty);
+
+    // (a) renderTick drains the staged text and fires the callback off
+    // registry_mutex, alongside the forced GridFrame (selection_dirty).
+    _ = try session.renderTick();
+    try testing.expect(capture.fired);
+    try testing.expect(capture.present);
+    try testing.expectEqualStrings("CDEF", capture.text.items);
+    // Staging consumed: the pending flag/text are cleared after the drain.
+    try testing.expect(!session.sel_text_dirty);
+    try testing.expect(session.sel_text == null);
+
+    // (b) The captured Snapshot carries row.selection on row 0 spanning [2,5].
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        const sel = snap.row_data[0].selection;
+        try testing.expect(sel != null);
+        try testing.expectEqual(@as(u16, 2), sel.?[0]);
+        try testing.expectEqual(@as(u16, 5), sel.?[1]);
+    }
+
+    // selection_dirty was set so a render tick would force-push the frame.
+    // (Verified indirectly: the snapshot above already carries the selection.)
+
+    // Clearing drops the selection and stages a cleared selection_text; the
+    // renderTick drain then emits it (present=false) off registry_mutex.
+    capture.fired = false;
+    try session.selectClear();
+    try testing.expect(!capture.fired);
+    try testing.expect(session.sel_text_dirty);
+    _ = try session.renderTick();
+    try testing.expect(capture.fired);
+    try testing.expect(!capture.present);
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        try testing.expect(snap.row_data[0].selection == null);
+    }
+}
+
 test "host SurfaceEvent frame round-trip across representative variants (Slice 6)" {
     // encode -> partial-read -> decode -> equal, across a void variant, a bool,
     // an enum, the set_title fixed buffer, a WriteReq-bearing one (pwd_change),

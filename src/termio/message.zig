@@ -62,6 +62,17 @@ pub const Message = union(enum) {
     /// Jump forward/backward n prompts.
     jump_to_prompt: isize,
 
+    /// Slice B1: GUI->host drag-select. Carries only the VIEWPORT geometry of
+    /// the current drag selection (anchor + head cells + rectangle flag); the
+    /// Client fills in the session_id when building the wire frame. Under .exec
+    /// this is a no-op (the Surface drives the local terminal selection
+    /// directly); under .client the Client sends a `selection_drag` frame.
+    selection_drag: SelectionDrag,
+
+    /// Slice B1: GUI->host clear the selection. .exec no-op; .client sends a
+    /// `selection_clear` frame.
+    selection_clear: void,
+
     /// Send this when a synchronized output mode is started. This will
     /// start the timer so that the output mode is disabled after a
     /// period of time so that a bad actor can't hang the terminal.
@@ -95,6 +106,17 @@ pub const Message = union(enum) {
 
     /// The types of size reports that we support.
     pub const SizeReport = terminal.size_report.Style;
+
+    /// Slice B1: the VIEWPORT geometry of a drag selection. Plain scalars (no
+    /// protocol import here) — the Client maps these onto the wire
+    /// `protocol.SelectionDrag`, filling session_id from its atomic load.
+    pub const SelectionDrag = struct {
+        anchor_x: u16,
+        anchor_y: u16,
+        head_x: u16,
+        head_y: u16,
+        rectangle: bool,
+    };
 };
 
 test {

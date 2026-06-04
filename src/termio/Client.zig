@@ -218,6 +218,19 @@ session_id: std.atomic.Value(u64) = .init(0),
 /// Set on `.child_exited`.
 child_exited: ?ChildExited = null,
 
+// --- Slice B1: cached host selection text ---
+//
+// The host owns the real terminal + scrollback, so under .client the GUI's
+// local terminal selection is meaningless. The host ships the current selection
+// TEXT in a `selection_text` frame whenever its selection changes; we cache it
+// here so ⌘C / copy_on_select / hasSelection can read it with NO sync round-trip.
+// Both fields are guarded by `renderMutex()` (handleFrame holds it on write; the
+// Surface read accessors take the renderer mutex, which IS this lock under
+// .client). The selection HIGHLIGHT itself rides the grid_frame's row.selection;
+// this cache is purely the copy/enablement text.
+selection_text: std.ArrayListUnmanaged(u8) = .empty,
+selection_present: bool = false,
+
 // --- last-known sizes so the first Resize after Attach is correct ---
 grid_size: renderer.GridSize = .{},
 screen_size: renderer.ScreenSize = .{ .width = 0, .height = 0 },
@@ -375,6 +388,7 @@ pub fn deinit(self: *Client) void {
     self.render_state.deinit(self.gpa);
     self.images.deinit(self.gpa);
     self.osc8_links.deinit(self.gpa);
+    self.selection_text.deinit(self.gpa);
     self.reader.deinit(self.gpa);
     // `config.socket_path` is OWNED (duped from the caller's borrowed slice in
     // `init`); free it here. Freeing the empty-default dupe (`&.{}` -> a
@@ -724,6 +738,36 @@ pub fn jumpToPrompt(
     });
 }
 
+/// Slice B1: send a `selection_drag` frame. The host maps the viewport coords
+/// to pins on ITS terminal, runs select(), and ships row.selection (highlight)
+/// on the next GridFrame plus a `selection_text` with the selected text. Same
+/// fire-and-forget write path as scrollViewport.
+pub fn selectionDrag(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+    drag: termio.Message.SelectionDrag,
+) !void {
+    try self.sendFrame(td, .selection_drag, protocol.SelectionDrag{
+        .session_id = self.session_id.load(.acquire),
+        .anchor_x = drag.anchor_x,
+        .anchor_y = drag.anchor_y,
+        .head_x = drag.head_x,
+        .head_y = drag.head_y,
+        .rectangle = drag.rectangle,
+    });
+}
+
+/// Slice B1: send a `selection_clear` frame. The host runs select(null) and
+/// ships a cleared selection_text + a row.selection-free GridFrame.
+pub fn selectionClear(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+) !void {
+    try self.sendFrame(td, .selection_clear, protocol.SelectionClear{
+        .session_id = self.session_id.load(.acquire),
+    });
+}
+
 pub fn childExitedAbnormally(
     self: *Client,
     gpa: Allocator,
@@ -943,10 +987,45 @@ pub fn handleFrame(
             }
         },
 
+        .selection_text => {
+            // Slice B1: the host's current selection text. Replace the cache
+            // wholesale (present=false clears it). We hold the guard mutex here
+            // (handleFrame took it), the SAME lock the Surface read accessors
+            // take via the renderer mutex under .client, so the copy/enablement
+            // reads see a consistent {present, text}. NOT visible render state
+            // (the highlight rides grid_frame's row.selection), so no renderer
+            // wakeup is needed.
+            var st = try protocol.SelectionText.decode(alloc, payload);
+            defer st.deinit(alloc);
+            self.selection_present = st.present;
+            self.selection_text.clearRetainingCapacity();
+            if (st.present) {
+                try self.selection_text.appendSlice(self.gpa, st.text);
+            }
+        },
+
         // Everything else is either a request-direction frame (the GUI sends
         // these, never receives them) or a liveness frame we don't model yet.
         else => log.debug("client ignoring frame tag={}", .{tag}),
     }
+}
+
+/// Slice B1: does the host have a selection cached? Caller MUST hold the guard
+/// returned by `renderMutex()` (the Surface read sites take the renderer mutex,
+/// which IS that lock under .client). Drives `Surface.hasSelection` (Copy-menu
+/// enablement) under .client.
+pub fn hasCachedSelection(self: *const Client) bool {
+    return self.selection_present;
+}
+
+/// Slice B1: a freshly-allocated NUL-terminated copy of the cached host
+/// selection text, or null when no selection is present. Caller owns the result
+/// and MUST hold the guard returned by `renderMutex()` (same lock discipline as
+/// hasCachedSelection). Mirrors `Screen.selectionString`'s `[:0]const u8` return
+/// so the Surface copy path is uniform across backends.
+pub fn copyCachedSelectionText(self: *const Client, alloc: Allocator) !?[:0]const u8 {
+    if (!self.selection_present) return null;
+    return try alloc.dupeZ(u8, self.selection_text.items);
 }
 
 /// Rehydrate a `terminal.Style` from a host-side `StylePod` projection — the
@@ -1569,4 +1648,64 @@ test "client: child_exited frame with null surface_mailbox is a no-op push" {
     try testing.expect(client.child_exited != null);
     try testing.expectEqual(@as(u32, 0), client.child_exited.?.exit_code);
     try testing.expectEqual(@as(u64, 5), client.child_exited.?.runtime_ms);
+}
+
+// Slice B1: decoding a selection_text frame caches the host selection so
+// hasCachedSelection / copyCachedSelectionText return it (the GUI copy path
+// reads this, no sync round-trip), and a cleared frame resets the cache.
+test "client: selection_text frame caches host selection text + clear resets" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // Initially empty.
+    try testing.expect(!client.hasCachedSelection());
+    try testing.expectEqual(@as(?[:0]const u8, null), try client.copyCachedSelectionText(alloc));
+
+    // Present=true frame -> cache holds the text.
+    {
+        const st: protocol.SelectionText = .{
+            .session_id = 1,
+            .present = true,
+            .text = "hi there",
+        };
+        const payload = try st.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .selection_text, payload);
+    }
+    try testing.expect(client.hasCachedSelection());
+    {
+        const got = (try client.copyCachedSelectionText(alloc)).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("hi there", got);
+    }
+
+    // A second present frame replaces (not appends) the cached text.
+    {
+        const st: protocol.SelectionText = .{
+            .session_id = 1,
+            .present = true,
+            .text = "x",
+        };
+        const payload = try st.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .selection_text, payload);
+    }
+    {
+        const got = (try client.copyCachedSelectionText(alloc)).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("x", got);
+    }
+
+    // present=false clears the cache.
+    {
+        const st: protocol.SelectionText = .{ .session_id = 1, .present = false };
+        const payload = try st.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .selection_text, payload);
+    }
+    try testing.expect(!client.hasCachedSelection());
+    try testing.expectEqual(@as(?[:0]const u8, null), try client.copyCachedSelectionText(alloc));
 }

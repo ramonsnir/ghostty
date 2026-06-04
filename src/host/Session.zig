@@ -232,6 +232,45 @@ on_search_event: ?*const fn (ctx: *anyopaque, self: *Session, event: SearchEvent
 on_surface_event_ctx: ?*anyopaque = null,
 on_surface_event: ?*const fn (ctx: *anyopaque, self: *Session, msg: *const apprt.surface.Message) void = null,
 
+/// Slice B1 selection-text channel. Set by the Server so a selection change
+/// (set or cleared) can be framed as a `selection_text` event to subscribers.
+///
+/// LOCK DISCIPLINE (findings SEL-1 / SEL-LOCK-1): this callback BROADCASTS to
+/// every subscriber via `conn.writeFramed` (a BLOCKING socket write, see the
+/// BLOCKING-WRITE CONTRACT in Server.zig). It MUST therefore be invoked the same
+/// way `on_render`/`on_child_exited` are — from `renderTick` on the OWNING
+/// thread, holding only the session-local `e.mutex`, NEVER from a dispatch arm
+/// under the app-global `registry_mutex` (that would head-of-line-block input/
+/// attach/close for EVERY other session behind one slow GUI peer). selectDrag/
+/// selectClear consequently do NOT call this directly; they stash the result in
+/// the `sel_text_*` pending fields below and let renderTick drain + emit it
+/// alongside the forced GridFrame (which already carries the row.selection
+/// mirror highlight), so the highlight and the copy text ship together off
+/// registry_mutex. The `text` slice passed here is BORROWED (owned by the
+/// pending buffer, freed by renderTick after the callback returns), so the
+/// callback must copy/serialize before returning. null in the standalone path.
+on_selection_text_ctx: ?*anyopaque = null,
+on_selection_text: ?*const fn (ctx: *anyopaque, self: *Session, present: bool, text: []const u8) void = null,
+
+/// Pending selection-text result staged by selectDrag/selectClear (under
+/// render_mutex) for renderTick to drain + broadcast on the owning thread
+/// (findings SEL-1 / SEL-LOCK-1 — keep the blocking subscriber writes off the
+/// app-global registry_mutex). `sel_text_dirty` marks that a selection-text
+/// update is pending; `sel_text_present` is the SelectionText.present bit; and
+/// `sel_text` is the extracted text (owned by `self.alloc`, null when not
+/// present). All three are written/read under render_mutex. Mirrors the
+/// search_dirty / selection_dirty force-push flags.
+sel_text_dirty: bool = false,
+sel_text_present: bool = false,
+sel_text: ?[:0]const u8 = null,
+
+/// Set by selectDrag/selectClear to force the next renderTick to push a frame
+/// even when no cells changed (a pure selection change mutates row.selection,
+/// which Row.eql compares — but a select that lands on the same cells, or a
+/// clear, must still ship). Cleared after the push in renderTick. Mirrors
+/// search_dirty.
+selection_dirty: bool = false,
+
 started: bool = false,
 
 /// The thread id that called runRenderLoop, recorded so destroy() can assert
@@ -543,6 +582,94 @@ pub fn scrollViewport(
 /// scrollViewport.
 pub fn jumpToPrompt(self: *Session, delta: isize) void {
     self.io.queueMessage(.{ .jump_to_prompt = delta }, .unlocked);
+}
+
+/// --- Slice B1: host-authoritative drag-select + copy ---
+///
+/// Set the host terminal's selection from VIEWPORT coordinates (the GUI's
+/// resolved drag anchor/head). Maps each viewport coord to a pin on ITS active
+/// screen and runs `select(Selection.init(anchor, head, rectangle))`. After the
+/// change: (a) the next renderTick ships the GridFrame with row.selection (the
+/// highlight — forced via `selection_dirty`), and (b) we extract the selection
+/// text on the host and emit a `selection_text` event so the GUI can copy with
+/// no sync round-trip.
+///
+/// Runs on the per-connection READ thread (via Server.dispatch's .selection_drag
+/// arm), concurrently with the owning thread's renderTick -> captureSnapshotLocked
+/// (which reads the selection under `render_mutex`). We therefore hold
+/// `render_mutex` for the pin mapping + select() + selectionString, mirroring
+/// hoverLink/clearSearchHighlightsLocked.
+///
+/// SELECTION-TEXT DELIVERY (findings SEL-1 / SEL-LOCK-1): we do NOT emit the
+/// `selection_text` frame here. This runs under the app-global `registry_mutex`
+/// (held by the dispatch arm for the F3 TOCTOU window), and the frame is a
+/// BLOCKING broadcast to every subscriber — emitting it here would
+/// head-of-line-block input/attach/close for EVERY session behind one slow GUI
+/// peer, on a hot path (a frame per mouse-move). Instead we STAGE the extracted
+/// text in the `sel_text_*` pending fields (under the same render_mutex) and let
+/// renderTick drain + broadcast it on the OWNING thread, off registry_mutex,
+/// alongside the forced GridFrame (which carries the row.selection highlight) —
+/// so the highlight and the copy text ship together.
+pub fn selectDrag(
+    self: *Session,
+    anchor_vp: terminalpkg.point.Coordinate,
+    head_vp: terminalpkg.point.Coordinate,
+    rectangle: bool,
+) !void {
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+
+        const screen = self.io.terminal.screens.active;
+        const anchor_pin = screen.pages.pin(.{ .viewport = anchor_vp }) orelse {
+            // A coord outside the live viewport (a desynced/garbled drag): drop
+            // it rather than clearing or panicking. The previous selection (and
+            // its cached text) stays as-is.
+            return;
+        };
+        const head_pin = screen.pages.pin(.{ .viewport = head_vp }) orelse return;
+
+        try screen.select(terminalpkg.Selection.init(anchor_pin, head_pin, rectangle));
+        // Force the next frame even if the selected cells didn't change.
+        self.selection_dirty = true;
+
+        // Extract the selection text under the lock (reads cells). selectionString
+        // returns a [:0] buffer owned by self.alloc. Stage it (not the callback)
+        // so renderTick broadcasts it off registry_mutex (SEL-1 / SEL-LOCK-1).
+        if (screen.selection) |sel| {
+            const text = try screen.selectionString(self.alloc, .{ .sel = sel, .trim = false });
+            self.stagePendingSelectionTextLocked(true, text);
+        } else {
+            self.stagePendingSelectionTextLocked(false, null);
+        }
+    }
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// Clear the host terminal's selection (`select(null)`). Forces a render so the
+/// highlight-free GridFrame ships and stages a cleared `selection_text` update so
+/// the GUI drops its cached copy text. Same thread/lock discipline as selectDrag;
+/// the cleared selection_text is broadcast by renderTick on the owning thread
+/// (off registry_mutex — findings SEL-1 / SEL-LOCK-1).
+pub fn selectClear(self: *Session) !void {
+    self.render_mutex.lock();
+    defer self.render_mutex.unlock();
+    try self.io.terminal.screens.active.select(null);
+    self.selection_dirty = true;
+    self.stagePendingSelectionTextLocked(false, null);
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// Stage a pending selection-text update for renderTick to broadcast on the
+/// owning thread (findings SEL-1 / SEL-LOCK-1). CALLER MUST HOLD render_mutex.
+/// Frees any prior un-drained pending text and takes ownership of `text` (owned
+/// by `self.alloc`, null when `present` is false). Marks `sel_text_dirty` so the
+/// next renderTick emits the frame even if it coalesces multiple updates.
+fn stagePendingSelectionTextLocked(self: *Session, present: bool, text: ?[:0]const u8) void {
+    if (self.sel_text) |old| self.alloc.free(old);
+    self.sel_text = text;
+    self.sel_text_present = present;
+    self.sel_text_dirty = true;
 }
 
 /// Clear the active search: tear down the search thread and drop stored
@@ -949,14 +1076,42 @@ pub fn renderTick(self: *Session) !usize {
     // callback that fires after capture but before the clear can no longer have
     // its flag dropped without its matches being in the captured snapshot).
     var force_push = false;
+    // Slice B1 (findings SEL-1 / SEL-LOCK-1): drain any pending selection-text
+    // update staged by selectDrag/selectClear in the SAME render_mutex critical
+    // section that captures the snapshot, so the selection_text we broadcast and
+    // the row.selection highlight in this frame share one point-in-time read. The
+    // drained text is owned by self.alloc and freed after the callback runs.
+    var sel_text_pending = false;
+    var sel_text_present = false;
+    var sel_text: ?[:0]const u8 = null;
     var snapshot = blk: {
         self.render_mutex.lock();
         defer self.render_mutex.unlock();
         force_push = self.search_dirty;
         self.search_dirty = false;
-        break :blk try self.captureSnapshotLocked(self.alloc);
+        // Slice B1: a pure selection change (or clear) must also force the
+        // frame even when no cells differ — row.selection is captured below.
+        if (self.selection_dirty) force_push = true;
+        self.selection_dirty = false;
+        // Capture FIRST (it can error: OOM in rs.update/highlights). Only AFTER
+        // it succeeds do we take ownership of the staged sel_text — otherwise a
+        // capture error would propagate out of this block before the outer
+        // `defer free` registers, leaking the taken buffer AND losing the staged
+        // text (sel_text_dirty already cleared). Capturing first keeps self the
+        // owner on the error path (freed in deinit; dirty flag stays set).
+        const snap = try self.captureSnapshotLocked(self.alloc);
+        sel_text_pending = self.sel_text_dirty;
+        self.sel_text_dirty = false;
+        if (sel_text_pending) {
+            sel_text_present = self.sel_text_present;
+            sel_text = self.sel_text; // take ownership; clear so we free once
+            self.sel_text = null;
+            self.sel_text_present = false;
+        }
+        break :blk snap;
     };
     errdefer snapshot.deinit(self.alloc);
+    defer if (sel_text) |t| self.alloc.free(t);
 
     const changed = try RenderState.printDiff(self.alloc, self.prev_snapshot, snapshot);
 
@@ -1005,6 +1160,19 @@ pub fn renderTick(self: *Session) !usize {
         }
     }
 
+    // Slice B1 (findings SEL-1 / SEL-LOCK-1): broadcast the staged selection_text
+    // on this OWNING thread, off registry_mutex, holding only e.mutex inside the
+    // callback (same discipline as on_render above). Emit on its own dirty flag —
+    // independent of the grid gate — so a cleared selection (which can coincide
+    // with changed==0) still drops the GUI's cached copy text. The `text` slice
+    // is BORROWED by the callback (freed by the deferred free above after this
+    // returns), matching the callback's documented copy-before-return contract.
+    if (sel_text_pending) {
+        if (self.on_selection_text) |cb| {
+            cb(self.on_selection_text_ctx.?, self, sel_text_present, if (sel_text) |t| t else "");
+        }
+    }
+
     self.total_changed_rows += changed;
     return changed;
 }
@@ -1050,6 +1218,13 @@ pub fn destroy(self: *Session) void {
 
     self.io.deinit();
     if (self.prev_snapshot) |*s| s.deinit(self.alloc);
+
+    // Slice B1: free any selection text staged by selectDrag/selectClear that
+    // renderTick never drained (e.g. teardown raced an in-flight drag).
+    if (self.sel_text) |t| {
+        self.alloc.free(t);
+        self.sel_text = null;
+    }
 
     self.poll_timer.deinit();
     self.render_stop.deinit();

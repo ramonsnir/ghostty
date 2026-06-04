@@ -129,6 +129,33 @@ pub const Backend = union(Kind) {
         }
     }
 
+    /// Slice B1: drag-select routing. Under .exec the Surface drives the local
+    /// terminal's selection directly, so this is a no-op (the message is never
+    /// enqueued under .exec — but be defensive). Under .client it forwards the
+    /// viewport geometry to the host via a `selection_drag` frame.
+    pub fn selectionDrag(
+        self: *Backend,
+        td: *termio.Termio.ThreadData,
+        drag: termio.Message.SelectionDrag,
+    ) !void {
+        switch (self.*) {
+            .exec => {},
+            .client => |*client| try client.selectionDrag(td, drag),
+        }
+    }
+
+    /// Slice B1: selection-clear routing. .exec no-op; .client sends a
+    /// `selection_clear` frame.
+    pub fn selectionClear(
+        self: *Backend,
+        td: *termio.Termio.ThreadData,
+    ) !void {
+        switch (self.*) {
+            .exec => {},
+            .client => |*client| try client.selectionClear(td),
+        }
+    }
+
     pub fn childExitedAbnormally(
         self: *Backend,
         gpa: Allocator,

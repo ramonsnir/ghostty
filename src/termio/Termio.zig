@@ -618,6 +618,24 @@ pub fn jumpToPrompt(self: *Termio, td: *ThreadData, delta: isize) !void {
     try self.backend.jumpToPrompt(td, delta);
 }
 
+/// Slice B1: route a drag-select to the backend. .exec is a no-op (the Surface
+/// drives the local terminal selection directly); .client sends a
+/// `selection_drag` frame so the host runs select() on ITS terminal and the
+/// next GridFrame carries row.selection (the highlight) plus a `selection_text`.
+pub fn selectionDrag(
+    self: *Termio,
+    td: *ThreadData,
+    drag: termio.Message.SelectionDrag,
+) !void {
+    try self.backend.selectionDrag(td, drag);
+}
+
+/// Slice B1: route a selection clear to the backend. .exec no-op; .client sends
+/// a `selection_clear` frame.
+pub fn selectionClear(self: *Termio, td: *ThreadData) !void {
+    try self.backend.selectionClear(td);
+}
+
 /// Called when focus is gained or lost (when focus events are enabled)
 pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.lock();
