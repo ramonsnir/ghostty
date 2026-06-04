@@ -26,9 +26,9 @@ authoritative description; do not spend time hunting for the plan file.
 
 ## Commit range
 
-All work sits in **`eedccf9b5..5df356e80`** on `ptyhost/phase-2b`. Base
+All work sits in **`eedccf9b5..040cb33ca`** on `ptyhost/phase-2b`. Base
 `eedccf9b5` = "bell: add fork-only bell-features-focused". To rebuild context:
-`git log eedccf9b5..5df356e80` then `git show <hash>`.
+`git log eedccf9b5..040cb33ca` then `git show <hash>`.
 
 | Hash | What it landed |
 |---|---|
@@ -54,6 +54,13 @@ All work sits in **`eedccf9b5..5df356e80`** on `ptyhost/phase-2b`. Base
 | `5bd1a864f` | Slice 7 — scroll-via-host |
 | `5673098ff` | Slice 8 — push `GridFrame` on cursor-only moves (cursor tracking) |
 | `5df356e80` | Slice 9 — resize to authoritative wire grid (scrollback survives resize) |
+| `30d8d8707` | Slice 10 — `finalize()` the host session config (login shell + shell-integration resolve) |
+| `086980e09` | Slice 11 — cwd-inherit: carry `working_directory` through the `.client` spawn |
+| `4cc4320f4` | Slice 12 — drop the degenerate reattach Resize so scrollback survives |
+| `805cbe7eb` | Phase A — apply the host `ModeFrame` onto the `.client` local terminal (TUI input: arrows/paste/mouse) |
+| `07da2b0b9` | Phase B1 — host-authoritative drag-select + copy under `.client` |
+| `e4a8e0927` | Reattach-scrollback #1 — force-push the `GridFrame` on explicit scroll/jump (`viewport_dirty`) |
+| `040cb33ca` | Reattach-scrollback #2 — saturating `remaining_rows` in `PageList.resizeCols` (host crash on reattach resize-flood) |
 
 ## Architecture & key decisions
 
