@@ -35,6 +35,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const renderer = @import("../renderer.zig");
+const CoreSurface = @import("../Surface.zig");
 
 const Session = @import("Session.zig");
 const RenderState = @import("RenderState.zig");
@@ -554,6 +555,53 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         .resize => {
             var resize = try protocol.Resize.decode(alloc, frame.payload);
             defer resize.deinit(alloc);
+
+            // Slice 12: DROP a degenerate resize. On reattach the GUI can
+            // momentarily report a 0 / near-0 grid for a restored tab before
+            // layout/font-metrics settle (tab-dependent, restore-timing). The
+            // host must NEVER resize the terminal to a degenerate grid: applying
+            // one reflows the screen down to ~1 row — DISCARDING scrollback —
+            // and, with real history present, underflow-panics
+            // PageList.resizeCols (`self.rows - cursor.y - 1`) during the
+            // column reflow, aborting the IO thread.
+            //
+            // We gate on the RESOLVED grid (the (cols,rows) Termio.resize will
+            // actually apply via `Resize.toSize().grid()`), not the raw wire
+            // {cols, rows}. Gating on the wire value alone only caught a literal
+            // {0,0} frame, but `size.grid()`'s `@max(1,…)` floor
+            // (src/renderer/size.zig:260-261) maps {0,0} to a 1x1 collapse grid
+            // and a wire {1,1} (or any other tiny transient) sails straight
+            // through to the same panic. Resolving first closes that gap.
+            //
+            // The floor is the GUI's OWN minimum terminal size —
+            // CoreSurface.min_window_{width,height}_cells (10x4, src/Surface.zig)
+            // — which every apprt embedder enforces as the minimum window size.
+            // A grid below that floor is, by the app's own definition, not a
+            // legitimate terminal; it can only be a transient/garbled reattach
+            // frame. Dropping it (vs clamping) is cleanest: the terminal is
+            // never touched, so no reflow/discard, and the next well-formed
+            // Resize carries the real restored size. Well-formed frames (>= the
+            // floor) are unaffected and still apply the authoritative wire grid
+            // below, so Slice 9 is not regressed. .exec untouched.
+            const resolved = resize.toSize().grid();
+            if (resolved.columns < CoreSurface.min_window_width_cells or
+                resolved.rows < CoreSurface.min_window_height_cells)
+            {
+                log.debug(
+                    "dropping degenerate resize session={d} wire={d}x{d} resolved={d}x{d} (floor {d}x{d})",
+                    .{
+                        resize.session_id,
+                        resize.cols,
+                        resize.rows,
+                        resolved.columns,
+                        resolved.rows,
+                        CoreSurface.min_window_width_cells,
+                        CoreSurface.min_window_height_cells,
+                    },
+                );
+                return;
+            }
+
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(resize.session_id)) |e| {
