@@ -29,7 +29,22 @@ design-heavy work (R3) is reached only if the effort is deemed worth it.
 
 ---
 
-## Phase A — Consume the ModeFrame mirror (R2). HIGHEST LEVERAGE, LOWEST EFFORT.
+## Phase A — DONE + smoke-validated (commit `805cbe7eb`).
+
+Applied the host ModeFrame onto the `.client` local terminal in `handleFrame`'s
+`.mode_frame` arm (under the shared mutex; `.exec` untouched). **Smoke-confirmed:**
+vim arrow keys (app cursor mode), multi-line bracketed paste, and mouse reporting
+(htop, `vim :set mouse=a`) all work. Residuals: (1) the alt-screen wheel→arrow
+translation (needs `active_key`, deliberately not mutated — MEDIUM); (2) **latent
+LOW** — the render-tick push gate (`src/host/Session.zig`) has no `mode_changed`
+term, so a mode change that does NOT coincide with a cell redraw won't propagate;
+in practice apps set modes alongside a redraw so it hasn't manifested, but it is
+the same class as the Slice-8 cursor-push gap and should get a `mode_changed`
+term if a mode-only desync is ever observed.
+
+(historical detail of Phase A below kept for reference.)
+
+## Phase A (detail) — Consume the ModeFrame mirror (R2). HIGHEST LEVERAGE, LOWEST EFFORT.
 
 **One change unblocks the most.** On each `.mode_frame`, apply the decoded
 `Client.mode` onto the GUI's `io.terminal.modes`/`flags` (or have the encode
