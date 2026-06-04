@@ -236,6 +236,18 @@ pub const Config = struct {
     /// one (Attach.session_id == null).
     session_id: ?u64 = null,
 
+    /// SLICE 11: spawn-opt working directory for a FRESH session (cwd-inherit,
+    /// the `.client` analog of `.exec`'s `working_directory`). The caller's
+    /// slice (e.g. `config.@"working-directory".value()` in `Surface.init`) is
+    /// borrowed only for the duration of `init`, which DUPES it (when non-null)
+    /// into Client-owned memory — EXACTLY like `socket_path` — because the read
+    /// thread reads it LATER in `connectAndAttach` (to build the Attach frame),
+    /// long after the borrowed source may have been freed. The stored copy is
+    /// owned by the Client and freed in `deinit`. `null` => no cwd opt (the host
+    /// uses its $HOME default, today's behavior). Only meaningful on a spawn
+    /// (session_id == null); the host ignores it on reattach.
+    working_directory: ?[]const u8 = null,
+
     /// SLICE 3d: the renderer-state mutex (`renderer.State.mutex`) the GUI
     /// renderer reads the mirror under. When supplied, the Client guards its
     /// mirror writes under THIS same lock, reconciling the writer/reader lock
@@ -274,8 +286,18 @@ pub fn init(alloc: Allocator, cfg: Config) !Client {
     const socket_path = try alloc.dupe(u8, cfg.socket_path);
     errdefer alloc.free(socket_path);
 
+    // SLICE 11: dupe the optional spawn-opt cwd into Client-owned memory too
+    // (same lifetime reasoning as socket_path — the read thread reads it later
+    // in connectAndAttach). `null` stays null (no dupe, host default).
+    const working_directory: ?[]const u8 = if (cfg.working_directory) |wd|
+        try alloc.dupe(u8, wd)
+    else
+        null;
+    errdefer if (working_directory) |wd| alloc.free(wd);
+
     var owned_cfg = cfg;
     owned_cfg.socket_path = socket_path;
+    owned_cfg.working_directory = working_directory;
 
     return .{
         .gpa = alloc,
@@ -328,6 +350,10 @@ pub fn deinit(self: *Client) void {
     // zero-length owned slice) is safe. `mode` is POD; the remaining `config`
     // fields hold no owned heap memory.
     self.gpa.free(self.config.socket_path);
+    // SLICE 11: `config.working_directory` is OWNED when non-null (duped in
+    // `init`); free it here. `null` (the default / no-cwd-opt case) frees
+    // nothing.
+    if (self.config.working_directory) |wd| self.gpa.free(wd);
 }
 
 /// Call to initialize the terminal state as necessary for this backend.
@@ -489,8 +515,15 @@ pub fn connectAndAttach(
     // caught that connectAndAttach skipped the Hello.
     try sendFrameRaw(client_td, loop, alloc, .hello, protocol.Hello{});
 
+    // SLICE 11: carry the spawn-opt cwd in the Attach. The host applies it only
+    // on a fresh spawn (session_id == null) and ignores it on reattach; `null`
+    // here preserves the host's $HOME default. `working_directory` is borrowed
+    // by-reference into the frame for the encode — sendFrameRaw encodes
+    // synchronously here on the IO thread before returning, and the slice is
+    // Client-owned (duped in init), so no ownership transfer is needed.
     try sendFrameRaw(client_td, loop, alloc, .attach, protocol.Attach{
         .session_id = self.config.session_id,
+        .working_directory = self.config.working_directory,
     });
 
     // SLICE 3d (finding 3d-lifetime-1): RESOLVE the effective guard mutex now,

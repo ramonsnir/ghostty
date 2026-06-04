@@ -470,15 +470,17 @@ test "host protocol frame round-trip + partial read" {
         try testing.expectEqual(orig, dec);
     }
 
-    // Attach (present + null).
+    // Attach (present + null), no working_directory.
     {
         const orig: protocol.Attach = .{ .session_id = 99 };
         const framed = try protocol.encodeFrame(alloc, .attach, orig);
         defer alloc.free(framed);
         const tag = try feedOneByteAtATime(alloc, framed, &payload);
         try testing.expectEqual(protocol.FrameType.attach, tag);
-        const dec = try protocol.Attach.decode(alloc, payload.items);
+        var dec = try protocol.Attach.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
         try testing.expectEqual(orig.session_id, dec.session_id);
+        try testing.expectEqual(@as(?[]const u8, null), dec.working_directory);
     }
     {
         const orig: protocol.Attach = .{ .session_id = null };
@@ -486,8 +488,49 @@ test "host protocol frame round-trip + partial read" {
         defer alloc.free(framed);
         const tag = try feedOneByteAtATime(alloc, framed, &payload);
         try testing.expectEqual(protocol.FrameType.attach, tag);
-        const dec = try protocol.Attach.decode(alloc, payload.items);
+        var dec = try protocol.Attach.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
         try testing.expectEqual(@as(?u64, null), dec.session_id);
+        try testing.expectEqual(@as(?[]const u8, null), dec.working_directory);
+    }
+    // Attach with working_directory (spawn-opt present).
+    {
+        const orig: protocol.Attach = .{
+            .session_id = null,
+            .working_directory = "/Users/ramon/git/ghostty",
+        };
+        const framed = try protocol.encodeFrame(alloc, .attach, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.attach, tag);
+        var dec = try protocol.Attach.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(?u64, null), dec.session_id);
+        try testing.expect(dec.working_directory != null);
+        try testing.expectEqualStrings(
+            orig.working_directory.?,
+            dec.working_directory.?,
+        );
+    }
+    // Attach reattach (session_id present) WITH a working_directory: still
+    // round-trips on the wire (the host ignores it on reattach, but the codec
+    // must carry both fields together).
+    {
+        const orig: protocol.Attach = .{
+            .session_id = 42,
+            .working_directory = "/tmp/proj",
+        };
+        const framed = try protocol.encodeFrame(alloc, .attach, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.attach, tag);
+        var dec = try protocol.Attach.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+        try testing.expectEqualStrings(
+            orig.working_directory.?,
+            dec.working_directory.?,
+        );
     }
 
     // Attached.
@@ -2660,5 +2703,62 @@ test "host resize preserves scrollback content (Slice 9, acceptance)" {
         var snap = try session.captureSnapshotLocked(alloc);
         defer snap.deinit(alloc);
         try testing.expect(try snapshotContainsMarker(alloc, &snap, "L000"));
+    }
+}
+
+// SLICE 11 (cwd-inherit): a spawn-opt working_directory on Session.Options must
+// override the config's finalize-time default ($HOME) so the fresh child
+// terminal starts there. We assert at the config boundary (deterministic): after
+// create, the session config's working-directory equals the requested path —
+// this is the exact value Exec.init reads (Session.zig:~337) to set the child's
+// cwd, so a correct config value proves the spawn directory.
+test "host session create honors spawn-opt working_directory" {
+    const alloc = testing.allocator;
+
+    // Use a real, existing directory so the value is plausible end-to-end.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+
+    const session = try Session.create(alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .working_directory = dir,
+    });
+    defer session.destroy();
+
+    // The config's working-directory is now an explicit `.path` equal to the
+    // requested dir (NOT the finalize $HOME default). This is the exact slice
+    // Exec.init consumes to set the child cwd.
+    const wd = session.config.@"working-directory" orelse
+        return error.WorkingDirectoryUnset;
+    const wd_path = wd.value() orelse return error.WorkingDirectoryNotPath;
+    try testing.expectEqualStrings(dir, wd_path);
+}
+
+// SLICE 11 (negative): a NULL working_directory must preserve pre-Slice-11
+// behavior — the host's finalize default stands and is NOT clobbered with an
+// explicit path. finalize() resolves the default to either `.home` (no explicit
+// path) or leaves it null; in neither case should it become an explicit `.path`
+// equal to some spawn-opt (there was none). We assert the absence of a
+// spawn-opt override: value() is null (the .home/.inherit/null cases), i.e. no
+// explicit path was injected.
+test "host session create with null working_directory keeps default" {
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{
+        .cols = 80,
+        .rows = 24,
+        // working_directory defaults to null (no spawn-opt).
+    });
+    defer session.destroy();
+
+    // No explicit path was injected: either the field is null, or finalize set
+    // it to .home / .inherit (both => value() == null). The key property is that
+    // Slice 11 did NOT fabricate a `.path`, so today's $HOME-default behavior is
+    // intact.
+    if (session.config.@"working-directory") |wd| {
+        try testing.expectEqual(@as(?[]const u8, null), wd.value());
     }
 }

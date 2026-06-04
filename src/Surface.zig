@@ -695,6 +695,15 @@ pub fn init(
                 .socket_path = sock,
                 .render_mutex = mutex,
                 .session_id = termio.Client.sessionIdFromConfig(req_session_id),
+                // SLICE 11 (cwd-inherit): pass the SAME working-directory the
+                // `.exec` arm passes to `Exec.init` below (line ~718). The GUI
+                // already computes the new tab's cwd into
+                // `config.@"working-directory"` (the cwd-inherit path .exec uses);
+                // threading it here makes a fresh `.client` session spawn in that
+                // dir instead of the host's $HOME default. `null` (unset) keeps
+                // today's behavior. Client.init DUPES it into Client-owned
+                // memory, so the borrowed `wd.value()` need not outlive this call.
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
             });
             // Note: Client.init dupes socket_path into Client-owned memory
             // (freed in Client.deinit), so the value owns heap state immediately

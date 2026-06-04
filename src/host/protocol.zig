@@ -280,9 +280,10 @@ fn writeBytes(w: anytype, bytes: []const u8) !void {
 /// allocation guard is `fbs.buffer.len - fbs.pos`, i.e. the bytes remaining in
 /// the WHOLE payload — NOT a field-local bound. This is tight ONLY because the
 /// length-prefixed slice must be the LAST decoded field of its frame (so
-/// "remaining payload" == "bytes for this slice"). Both current callers honor
-/// this: Hello.decode (identity_bundle_id is last) and Input.decode (bytes is
-/// last). If a future frame places a writeBytes-encoded slice BEFORE other
+/// "remaining payload" == "bytes for this slice"). All current callers honor
+/// this: Hello.decode (identity_bundle_id is last), Input.decode (bytes is
+/// last), and Attach.decode (working_directory is the last field, after the
+/// optional session_id). If a future frame places a writeBytes-encoded slice BEFORE other
 /// fields, this guard would become permissive (it would accept an over-claimed
 /// length up to the trailing fields' size — the actual over-read is still
 /// caught by readNoEof below, but the speculative alloc would no longer be
@@ -386,11 +387,20 @@ pub const HelloAck = struct {
 };
 
 /// Attach to an existing session (session_id present) or spawn a fresh one
-/// (null). Phase 2a carries no spawn_opts; the host uses default Options.
-/// FOLLOWUP (Phase 2b): add a `spawn_opts` field carrying initial dims / cwd /
-/// command so the GUI can drive the spawn.
+/// (null). Phase 2a carried no spawn_opts; the host used default Options.
+///
+/// SPAWN-OPT (Phase 2b, Slice 11): `working_directory` is a spawn-opt — it is
+/// only meaningful when `session_id == null` (a fresh spawn). On a REATTACH
+/// (session_id present) the host IGNORES it (the existing session keeps its
+/// cwd). When null the host uses its default ($HOME via passwd), preserving
+/// pre-Slice-11 behavior. It is the LAST encoded field so its length-prefixed
+/// `readBytes` honors the trailing-field invariant (see `readBytes`).
 pub const Attach = struct {
     session_id: ?u64 = null,
+
+    /// Optional spawn-opt cwd for a FRESH session. Owned by this struct when
+    /// non-null (freed by deinit; decode allocates it). `null` => host default.
+    working_directory: ?[]const u8 = null,
 
     pub fn encode(self: Attach, alloc: Allocator) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
@@ -402,18 +412,32 @@ pub const Attach = struct {
         } else {
             try w.writeByte(0);
         }
+        // Optional working_directory: present-byte then a length-prefixed
+        // string. LAST field so readBytes' trailing-field invariant holds.
+        if (self.working_directory) |wd| {
+            try w.writeByte(1);
+            try writeBytes(w, wd);
+        } else {
+            try w.writeByte(0);
+        }
         return buf.toOwnedSlice(alloc);
     }
 
-    pub fn decode(_: Allocator, payload: []const u8) !Attach {
+    pub fn decode(alloc: Allocator, payload: []const u8) !Attach {
         var fbs = std.io.fixedBufferStream(payload);
         const r = fbs.reader();
-        const present = (try r.readByte()) != 0;
-        if (!present) return .{ .session_id = null };
-        return .{ .session_id = try readInt(r, u64) };
+        const sid_present = (try r.readByte()) != 0;
+        const session_id: ?u64 = if (sid_present) try readInt(r, u64) else null;
+        const wd_present = (try r.readByte()) != 0;
+        const working_directory: ?[]const u8 = if (wd_present)
+            try readBytes(alloc, &fbs, r)
+        else
+            null;
+        return .{ .session_id = session_id, .working_directory = working_directory };
     }
 
-    pub fn deinit(self: *Attach, _: Allocator) void {
+    pub fn deinit(self: *Attach, alloc: Allocator) void {
+        if (self.working_directory) |wd| alloc.free(wd);
         self.* = undefined;
     }
 };
