@@ -552,16 +552,19 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             defer self.registry_mutex.unlock();
             if (self.sessions.get(resize.session_id)) |e| {
                 if (sessionLive(e)) {
-                    const size: renderer.Size = .{
-                        .screen = .{ .width = resize.screen_w, .height = resize.screen_h },
-                        .cell = .{ .width = resize.cell_width, .height = resize.cell_height },
-                        .padding = .{
-                            .left = resize.padding_l,
-                            .right = resize.padding_r,
-                            .top = resize.padding_t,
-                            .bottom = resize.padding_b,
-                        },
-                    };
+                    // Slice 9: reconstruct the size from the AUTHORITATIVE wire
+                    // {cols, rows} (via Resize.toSize) rather than the raw
+                    // screen_w/h. Termio.resize derives the grid via
+                    // size.grid() = (screen - padding) / cell; toSize() sets
+                    // screen = cols*cell + padding so that derivation reproduces
+                    // the grid the GUI actually rendered at. For a well-formed
+                    // frame this equals what the raw screen_w/h would derive
+                    // (both come from one client-side renderer.Size); driving
+                    // off {cols, rows} makes the host authoritative-grid driven,
+                    // so an inconsistent/transient peer frame can't collapse the
+                    // terminal to a re-derived (near-1x1) grid that would discard
+                    // rows and erase scrollback. See toSize().
+                    const size: renderer.Size = resize.toSize();
                     e.session.io.queueMessage(.{ .resize = size }, .unlocked);
                 }
             }
