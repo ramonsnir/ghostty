@@ -271,6 +271,29 @@ sel_text: ?[:0]const u8 = null,
 /// search_dirty.
 selection_dirty: bool = false,
 
+/// Set by scrollViewport/jumpToPrompt to force the next renderTick to push a
+/// frame even when the captured rows DON'T differ from the last pushed snapshot.
+///
+/// REATTACH-SCROLLBACK MECHANISM (2nd, NOT Slice 12's degenerate resize): a
+/// viewport scroll is an explicit GUI navigation, but renderTick's push gate is
+/// `changed>0 || force_push || cursor_changed`, where `changed` is the row-diff
+/// vs `prev_snapshot` (the last frame the TICK path pushed). After a
+/// detach/reattach, pushFullFrames sends the new subscriber a full frame
+/// directly but does NOT update `prev_snapshot`, so `prev_snapshot` reflects an
+/// arbitrarily older tick push. A subsequent scroll whose resulting viewport
+/// equals that stale `prev_snapshot` (e.g. a scroll-to-top when the last tick
+/// push already showed the top, or a no-op re-scroll) yields `changed==0` and
+/// the frame is SUPPRESSED — so the GUI scrolls and sees nothing change, i.e.
+/// "scrolling up shows nothing after reattach". The host terminal's viewport is
+/// CORRECT (it holds the scrollback); only the push to the GUI is gated out.
+///
+/// Forcing the push on every scroll/jump (user intent => always deliver the
+/// resulting frame) closes that gap without touching the idle-spam suppression
+/// (which only suppresses POLL-TIMER ticks that changed nothing — those never
+/// set this flag). Written/read under render_mutex; cleared after the push in
+/// renderTick. Mirrors search_dirty / selection_dirty.
+viewport_dirty: bool = false,
+
 started: bool = false,
 
 /// The thread id that called runRenderLoop, recorded so destroy() can assert
@@ -575,12 +598,30 @@ pub fn scrollViewport(
     self: *Session,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
+    // Force the resulting frame to ship even if the scrolled viewport's rows
+    // happen to equal the last TICK-pushed snapshot (`prev_snapshot`), which can
+    // be arbitrarily stale relative to what a freshly-(re)attached subscriber
+    // holds (pushFullFrames does not update prev_snapshot). A scroll is explicit
+    // GUI navigation; the GUI is waiting for the post-scroll frame. See the
+    // `viewport_dirty` field doc (2nd reattach-scrollback mechanism).
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+        self.viewport_dirty = true;
+    }
     self.io.queueMessage(.{ .scroll_viewport = scroll }, .unlocked);
 }
 
 /// Jump the host terminal's viewport to a prompt by `delta`. Same routing as
-/// scrollViewport.
+/// scrollViewport (and the same force-push: a prompt jump is explicit GUI
+/// navigation whose resulting frame must reach the GUI even when the rows match
+/// a stale prev_snapshot).
 pub fn jumpToPrompt(self: *Session, delta: isize) void {
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+        self.viewport_dirty = true;
+    }
     self.io.queueMessage(.{ .jump_to_prompt = delta }, .unlocked);
 }
 
@@ -1093,6 +1134,11 @@ pub fn renderTick(self: *Session) !usize {
         // frame even when no cells differ — row.selection is captured below.
         if (self.selection_dirty) force_push = true;
         self.selection_dirty = false;
+        // 2nd reattach-scrollback mechanism: a scroll/jump must ship its frame
+        // even when the scrolled viewport's rows equal the (possibly stale)
+        // prev_snapshot — otherwise the GUI scrolls and sees nothing change.
+        if (self.viewport_dirty) force_push = true;
+        self.viewport_dirty = false;
         // Capture FIRST (it can error: OOM in rs.update/highlights). Only AFTER
         // it succeeds do we take ownership of the staged sel_text — otherwise a
         // capture error would propagate out of this block before the outer
