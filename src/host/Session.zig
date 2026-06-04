@@ -241,6 +241,19 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
     var config = try Config.default(alloc);
     errdefer config.deinit();
 
+    // Resolve the login shell + other finalize-time defaults, exactly as the
+    // GUI's config load paths do (Config.default does NOT finalize on its own).
+    // Without this the `command` stays null, Exec falls back to a bare `sh`, and
+    // shell_integration's `.detect` can't classify the shell -> no integration
+    // injected -> no OSC 7 pwd / command marks under .client (broken cwd-inherit
+    // on new tab). finalize()'s passwd branch sets command to the user's login
+    // shell (e.g. /bin/zsh), which `.detect` then recognizes.
+    config.finalize() catch |err| {
+        // Non-fatal: a finalize failure (e.g. passwd lookup) just leaves the
+        // bare default (sh, no integration) — degrade, don't fail the session.
+        log.warn("config.finalize failed, shell integration may be disabled err={}", .{err});
+    };
+
     const size: renderer.Size = .{
         .screen = .{
             .width = @as(u32, opts.cols) * opts.cell_width,
