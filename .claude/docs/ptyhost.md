@@ -63,6 +63,7 @@ All work sits in **`eedccf9b5..040cb33ca`** on `ptyhost/phase-2b`. Base
 | `040cb33ca` | Reattach-scrollback #2 — saturating `remaining_rows` in `PageList.resizeCols` (host crash on reattach resize-flood) |
 | `4c5e080f3` | Phase B2 — host-authoritative word/line/select-all selection + copy (`selection_point` frame); select-all copy spans scrollback w/o R3 |
 | `97b0dc4d9` | Phase D (clear+reset) — forward ⌘K clear-screen (`clear_screen` frame) + terminal reset (`reset` frame) to the host; reset force-pushes the ModeFrame |
+| `51883807d` | Phase D — host-authoritative `at_prompt` bit (`at_prompt` frame) so `confirm-close-surface=true` warns only when a command runs (`+5d05037f9` GUI-side test) |
 
 ## Architecture & key decisions
 
@@ -394,24 +395,42 @@ important thing to re-verify when resuming:
 ## Status: open items & next steps
 
 > **RESUME SNAPSHOT (crash-survival; update when state changes).**
-> - **HEAD:** `97b0dc4d9` (code) on branch `ptyhost/phase-2b`
+> - **HEAD:** `5d05037f9` (code) on branch `ptyhost/phase-2b`
 >   (working dir `~/git/ghostty-phase2b`, a worktree separate from the shared
 >   `~/git/ghostty`).
 > - **DONE + live-smoke validated:** Phases 1, 2a, 2b-1 (all slices incl.
 >   resize/cursor/SurfaceEvent/scroll/cwd-inherit/Slice-12), Phase A (TUI input),
 >   Phase B1 (drag-select + copy), Phase B2 (word/line/select-all + copy; select-all
 >   copies the full buffer incl. scrollback), the reattach-scrollback bug (BOTH
->   mechanisms — push-gate `e4a8e0927` + `resizeCols` crash `040cb33ca`), and Phase D
->   clear+reset (⌘K clear-screen + terminal reset forwarded to the host). Reattach
->   is responsive AND shows scrollback.
+>   mechanisms — push-gate `e4a8e0927` + `resizeCols` crash `040cb33ca`), Phase D
+>   clear+reset (⌘K clear-screen + terminal reset forwarded to the host), and Phase D
+>   confirm-close accuracy (host `at_prompt` bit; `confirm-close-surface=true` warns
+>   only when a command runs — validated both ways). Reattach is responsive AND shows
+>   scrollback.
+>
+> - **⚠️ BUILD GOTCHA (cost a long debug session — read this):** `macos/build.nu`
+>   compiles into DerivedData, then `xcodebuild` CODESIGNS the output bundle at
+>   `macos/build/ReleaseLocal/Ghostty.app`. If that output bundle carries xattrs /
+>   "resource fork…detritus" (left by a prior manual `ditto`/`xattr -cr`/`codesign`
+>   round), xcodebuild's codesign FAILS (`** BUILD FAILED **`, the recurring
+>   `app build exit: 65`) and the freshly-linked binary is NEVER copied over — so the
+>   app you launch is **SILENTLY STALE** (runs old behavior even though `zig build`
+>   and the compile both succeeded). This masqueraded as "the fix doesn't work" for
+>   hours. **FIX: `rm -rf macos/build/ReleaseLocal` before `macos/build.nu …` so it
+>   produces a clean bundle and exits 0.** Then VERIFY freshness: check the binary
+>   mtime, and launch the binary DIRECTLY (not via `open`) with `GHOSTTY_LOG=stderr`
+>   redirected to a file. Core libghostty `log.*` is invisible unless `GHOSTTY_LOG`
+>   is set (it gates both the unified-log/os_log path under subsystem=<bundle id> and
+>   the stderr path); with it set you can confirm the version line + your own logs.
+>
 > - **NEXT (per remediation plan):** the rest of Phase D's R1 tail (cursor-click-to-move
->   at prompt, `cursorIsAtPrompt`→confirm-close, IME candidate-panel anchor,
->   accessibility viewport rect, minor cosmetics) — small independent host-forwards/
->   mirror-reads → Phase C (history transport — needed only for history-spanning ops:
->   cross-scrollback selection HIGHLIGHT, write_screen, accessibility read over
->   history; NOT needed for reattach scrollback or select-all copy). B2 deferrals
->   (right-click copy — DE-PRIORITIZED; copy_url, search seed, autoscroll, rich-copy)
->   and the ⌘K-on-alt-screen guard residual are smaller follow-ups.
+>   at prompt, IME candidate-panel anchor, accessibility viewport rect, minor
+>   cosmetics) — small independent host-forwards/mirror-reads → Phase C (history
+>   transport — needed only for history-spanning ops: cross-scrollback selection
+>   HIGHLIGHT, write_screen, accessibility read over history; NOT needed for reattach
+>   scrollback or select-all copy). B2 deferrals (right-click copy — DE-PRIORITIZED;
+>   copy_url, search seed, autoscroll, rich-copy) and the ⌘K-on-alt-screen guard
+>   residual are smaller follow-ups.
 > - **PROCESS NOTE:** workflow review/plan agents MUST be pinned `model: 'opus'`
 >   (the `Explore` agentType silently overrides to a cheaper model). Workflows also
 >   keep dying on the 180s no-output watchdog during heavy Opus reads — for these
