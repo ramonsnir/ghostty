@@ -148,6 +148,11 @@ this macOS); `nushell` for `build.nu`.
 7. **Commit** to `ramon-fork`.
 
 ## ⚠️ Safety
+**Never `git push` (and don't offer to).** The only remote, `origin`, is *upstream*
+`ghostty-org/ghostty` — there is **no personal fork remote**. Pushing `ramon-fork`
+(or the `ptyhost/*` branches) would shove personal work at the official repo. All
+fork commits stay **local-only**; "commit to ramon-fork" never implies a push.
+
 NEVER run `osascript -e 'quit app "Ghostty"'` — the fork and the official build are
 both *named* "Ghostty", so it's ambiguous and can quit the user's real, working
 Ghostty.
