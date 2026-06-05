@@ -46,12 +46,16 @@ is responsive and shows scrollback. Verified live and by host integration tests.
   restarts. There is no launchd supervision and **no SIGTERM/graceful shutdown**
   (killing the host kills every shell). Host crash-hardening is therefore the
   highest-stakes property; see Durability below (it is in good shape).
-- **Unknown / garbage-collected `session_id` on reattach → silent fresh spawn.** If
-  the persisted id no longer maps to a live host session, the GUI spawns a *new*
-  blank shell with **no error or indication** (`Server.zig` handleAttach "degrade to
-  spawn-fresh"). A lost session is visually indistinguishable from a new one — the
-  sharpest edge against "well." (The orphaned host session, if any, keeps running
-  with no GUI attached.)
+- **Unknown `session_id` on reattach → fresh spawn (now logged; no false match).**
+  If the persisted id no longer maps to a live host session, the GUI spawns a new
+  blank shell (`Server.zig` handleAttach "degrade to spawn-fresh"). Session ids are
+  **random 64-bit** (not a counter that resets to 1 each host launch), so a stale id
+  from a dead host instance never false-matches a fresh one — an unknown id always
+  degrades cleanly instead of binding a tab to the wrong/younger session. The Client
+  detects the miss (it asked for one id and got a different one back) and **logs it**
+  ("prior session closed or host restarted"); a user-visible indication (vs. a log)
+  is the remaining polish. The orphaned host session, if any, keeps running with no
+  GUI attached.
 - **Restorable-state versioning is tolerant (NOT a cliff).** `TerminalRestorableState`
   is `version = 8` but **`minimumVersion = 5`** (`TerminalRestorable.swift`; only the
   protocol *default* is `minimumVersion { version }`, and the concrete type overrides
@@ -216,8 +220,9 @@ have their own `cursorEql` term. A freshly (re)attached GUI bypasses the gate vi
   `screen_w/h`. Degenerate frames (resolved grid below the 10×4 min-window floor) are
   **dropped** in `Server.dispatch` — a transient reattach frame must never reflow the
   real terminal.
-- **Reattach** is keyed on `session_id` (host ids start at 1; 0 = unattached). Forward
-  via `ghostty_surface_config_s.session_id`; reverse via `ghostty_surface_session_id()`;
+- **Reattach** is keyed on `session_id` (random non-zero u64 per session; 0 =
+  unattached — see `allocSessionId`). Forward via `ghostty_surface_config_s.session_id`;
+  reverse via `ghostty_surface_session_id()`;
   persisted Swift-side as `sessionID` in `TerminalRestorable` (v8).
 - **Protocol** (`src/host/protocol.zig`): length-prefixed binary frames; a `Hello`
   handshake is required before any stateful frame. **Frozen-ABI discipline:** keep
