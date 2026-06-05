@@ -1080,10 +1080,19 @@ pub fn needsConfirmQuit(self: *Surface) bool {
     return switch (self.config.confirm_close_surface) {
         .always => true,
         .false => false,
-        .true => true: {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            break :true !self.io.terminal.cursorIsAtPrompt();
+        // Confirm unless the shell is idle at a prompt. Under .exec read the local
+        // terminal directly (byte-for-byte unchanged). Under .client the local
+        // terminal is the empty mirror — cursorIsAtPrompt() there is meaningless
+        // (always false => always confirm), so read the host-authoritative bit the
+        // Client caches from `at_prompt` frames (Phase D); this makes the warning
+        // meaningful (only when a command is actually running) instead of always-on.
+        .true => switch (self.io.backend) {
+            .exec => exec: {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                break :exec !self.io.terminal.cursorIsAtPrompt();
+            },
+            .client => |*c| !c.cursorIsAtPrompt(),
         },
     };
 }

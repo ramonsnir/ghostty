@@ -828,7 +828,7 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -1019,6 +1019,8 @@ fn spawnSession(self: *Server, working_directory: ?[]const u8) !*SessionEntry {
     session.on_surface_event = onSurfaceEvent;
     session.on_selection_text_ctx = e;
     session.on_selection_text = onSelectionText;
+    session.on_at_prompt_ctx = e;
+    session.on_at_prompt = onAtPrompt;
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -1216,6 +1218,25 @@ fn onSelectionText(ctx: *anyopaque, session: *Session, present: bool, text: []co
     }
 }
 
+/// Phase D at-prompt callback (runs on the session owning thread from renderTick,
+/// off registry_mutex — same blocking-write discipline as onSelectionText). Frames
+/// the authoritative at-prompt bit to every subscriber so the GUI can cache it for
+/// needsConfirmQuit.
+fn onAtPrompt(ctx: *anyopaque, session: *Session, at_prompt: bool) void {
+    _ = session;
+    const e: *SessionEntry = @ptrCast(@alignCast(ctx));
+
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    for (e.subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.writeFramed(.at_prompt, protocol.AtPrompt{
+            .session_id = e.session_id,
+            .at_prompt = at_prompt,
+        });
+    }
+}
+
 /// Slice 6 SurfaceEvent callback (runs on the session owning thread, invoked
 /// SYNCHRONOUSLY from Session's app-queue drain while `msg` — including any owned
 /// WriteReq bytes — is still alive). Builds a `surface_event` frame from the
@@ -1340,6 +1361,11 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
         break :blk .{
             .snapshot = snap,
             .mode = protocol.ModeFrame.fromTerminal(e.session_id, &session.io.terminal),
+            // Phase D: seed the at-prompt bit so a freshly-(re)attached GUI has it
+            // immediately (the steady-state push only fires on a FLIP, which may
+            // not happen for a long time after attach). Read in the same critical
+            // section as the snapshot/mode for a coherent point-in-time view.
+            .at_prompt = session.io.terminal.cursorIsAtPrompt(),
         };
     };
     var snapshot = captured.snapshot;
@@ -1354,6 +1380,10 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
         if (conn.closed.load(.acquire)) continue;
         conn.writeFramed(.mode_frame, mode);
         conn.writeFramed(.grid_frame, grid);
+        conn.writeFramed(.at_prompt, protocol.AtPrompt{
+            .session_id = e.session_id,
+            .at_prompt = captured.at_prompt,
+        });
     }
 }
 

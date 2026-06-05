@@ -144,6 +144,13 @@ pub const FrameType = enum(u8) {
     // the host runs terminal.fullReset() on ITS real terminal. Appended at the
     // END so all prior tag integers stay stable.
     reset,
+    // host->GUI (Phase D): the authoritative "cursor is at a shell prompt" bit,
+    // computed by the host's REAL terminal (cursorIsAtPrompt — full shell
+    // integration + parser state). The GUI's .client local terminal is the empty
+    // mirror and can't compute this, so it caches this bit for needsConfirmQuit
+    // (confirm-close warns only when a command is actually running). Pushed on
+    // change + seeded on attach. Appended at the END so prior tags stay stable.
+    at_prompt,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -939,6 +946,38 @@ pub const ClearScreen = struct {
 /// terminal.fullReset() on its real terminal. Same shape as Detach/Close/
 /// SelectionClear/ClearSearch.
 pub const Reset = SessionIdFrame(.reset);
+
+/// host->GUI (Phase D): the authoritative at-a-prompt bit from the host's real
+/// terminal (cursorIsAtPrompt). The GUI caches it so needsConfirmQuit under
+/// .client warns only when a command is actually running, instead of always
+/// (the empty mirror's cursorIsAtPrompt is meaningless). Fixed-width:
+/// [u64 session_id][u8 at_prompt] = 9 payload bytes.
+pub const AtPrompt = struct {
+    session_id: u64,
+    at_prompt: bool = false,
+
+    pub fn encode(self: AtPrompt, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeBool(w, self.at_prompt);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !AtPrompt {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .at_prompt = try readBool(r),
+        };
+    }
+
+    pub fn deinit(self: *AtPrompt, _: Allocator) void {
+        self.* = undefined;
+    }
+};
 
 /// host->GUI: the current selection TEXT so the GUI copies with no sync
 /// round-trip. `present`=false means the selection was cleared (text is empty).
