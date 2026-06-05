@@ -1139,6 +1139,46 @@ test "protocol SelectionPoint round-trip + toMode + bounds (host client) Slice B
     }
 }
 
+test "protocol ClearScreen round-trip + bounds (host client) Phase D" {
+    const alloc = testing.allocator;
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // history true + false both round-trip (fixed-width [u64][u8]).
+    inline for (.{ true, false }) |hist| {
+        const orig: protocol.ClearScreen = .{ .session_id = 123, .history = hist };
+        const framed = try protocol.encodeFrame(alloc, .clear_screen, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.clear_screen, tag);
+        const dec = try protocol.ClearScreen.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+
+    // A too-short payload (missing the history byte) errors rather than panics.
+    {
+        const orig: protocol.ClearScreen = .{ .session_id = 7, .history = true };
+        const framed = try protocol.encodeFrame(alloc, .clear_screen, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.clear_screen, tag);
+        const truncated = payload.items[0 .. payload.items.len - 1];
+        try testing.expectError(error.EndOfStream, protocol.ClearScreen.decode(alloc, truncated));
+    }
+
+    // Reset: bare session id round-trips.
+    {
+        const orig: protocol.Reset = .{ .session_id = 555 };
+        const framed = try protocol.encodeFrame(alloc, .reset, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.reset, tag);
+        const dec = try protocol.Reset.decode(alloc, payload.items);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+    }
+}
+
 test "host selectPoint word + line snap on the real terminal -> selection_text (client) Slice B2" {
     const alloc = testing.allocator;
 

@@ -5360,9 +5360,18 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            self.renderer_state.terminal.fullReset();
+            // Phase D: under .client the local terminal is the empty mirror, so a
+            // local fullReset is a no-op against the real shell. Forward a `reset`
+            // message; the host runs fullReset on ITS real terminal. .exec keeps
+            // the original direct, synchronous local reset (byte-for-byte).
+            switch (self.io.backend) {
+                .exec => {
+                    self.renderer_state.mutex.lock();
+                    defer self.renderer_state.mutex.unlock();
+                    self.renderer_state.terminal.fullReset();
+                },
+                .client => self.queueIo(.{ .reset = {} }, .unlocked),
+            }
         },
 
         .start_search => {

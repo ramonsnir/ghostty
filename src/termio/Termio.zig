@@ -544,6 +544,15 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    // Phase D: under .client the local terminal is the empty viewport mirror, so
+    // clearing it locally is a silent no-op. Forward the clear to the host, which
+    // runs THIS same clearScreen on its real .exec terminal (the host replays the
+    // identical .exec body below on the real shell). The .exec path falls through
+    // unchanged.
+    switch (self.backend) {
+        .client => |*client| return try client.clearScreen(td, history),
+        .exec => {},
+    }
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -634,6 +643,21 @@ pub fn selectionDrag(
 /// a `selection_clear` frame.
 pub fn selectionClear(self: *Termio, td: *ThreadData) !void {
     try self.backend.selectionClear(td);
+}
+
+/// Phase D: terminal full reset. Under .client the local terminal is the empty
+/// mirror, so the GUI forwards a `reset` frame and the host replays this on its
+/// real .exec terminal. Under .exec (incl. the HOST replaying a forwarded reset)
+/// run fullReset on the local terminal under the renderer_state mutex — the same
+/// op Surface's .exec `.reset` action performs directly.
+pub fn reset(self: *Termio, td: *ThreadData) !void {
+    switch (self.backend) {
+        .client => |*client| return try client.reset(td),
+        .exec => {},
+    }
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.terminal.fullReset();
 }
 
 /// Slice B2: route a word/line/all select-point to the backend. .exec is a
