@@ -253,6 +253,13 @@ pub const Highlight = struct {
     range: [2]u16,
 };
 
+/// Number of valid highlight tags — MUST stay in lock-step with the cardinality
+/// of `HighlightTag` in `src/renderer/generic.zig` (currently `search_match`=0,
+/// `search_match_selected`=1). `deserialize` rejects any wire tag >= this so the
+/// render-time `@enumFromInt(hl.tag)` can never hit an illegal value (UB in the
+/// ReleaseFast lib). If HighlightTag gains a variant, bump this.
+const highlight_tag_count: u8 = 2;
+
 /// A single row in the snapshot.
 pub const Row = struct {
     cells: []Cell,
@@ -1005,12 +1012,28 @@ pub const Snapshot = struct {
                 const tag = try r.readByte();
                 const r0 = try readInt(r, u16);
                 const r1 = try readInt(r, u16);
+                // The highlight tag is an untrusted wire byte. The renderer maps
+                // it via `@enumFromInt` onto a 2-value enum (HighlightTag in
+                // renderer/generic.zig); a value >= highlight_tag_count would be
+                // illegal behavior there — a checked panic in safe builds and
+                // UNDEFINED BEHAVIOR in the ReleaseFast production lib, on the
+                // render hot path. DROP an out-of-range highlight here (still
+                // reading r0/r1 to stay byte-aligned) so the stored mirror only
+                // ever holds valid tags; a corrupt/desynced/version-skewed frame
+                // loses just that one highlight, not the whole grid. (The only
+                // PRODUCER, the host search flatten, always emits valid tags, so
+                // this never fires for well-formed frames / the difftest.)
+                if (tag >= highlight_tag_count) continue;
                 try h_list.append(alloc, .{ .tag = tag, .range = .{ r0, r1 } });
             }
-            if (hcount > 0) try hspans.append(alloc, .{
+            // Use the COUNT ACTUALLY APPENDED (not hcount) for the span len, since
+            // invalid tags above were skipped — otherwise the span would over-read
+            // into the next row's highlights in the shared pool.
+            const happended = h_list.items.len - h_start;
+            if (happended > 0) try hspans.append(alloc, .{
                 .row = y,
                 .off = h_start,
-                .len = hcount,
+                .len = happended,
             });
 
             // raw page.Row (u64 bitcast), read at the same position serialize

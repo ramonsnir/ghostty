@@ -153,6 +153,57 @@ test "RenderState round-trip (serialize->deserialize->equal) host" {
     try testing.expect(found_grapheme);
 }
 
+test "host deserialize drops an out-of-range highlight tag (untrusted-wire @enumFromInt UB guard)" {
+    // Reproduce-first guard for a render-hot-path crash: the renderer maps the
+    // wire highlight tag via `@enumFromInt(hl.tag)` onto a 2-value enum, so a
+    // corrupt / version-skewed frame carrying tag >= 2 is illegal behavior (UB in
+    // the ReleaseFast lib). deserialize must DROP an out-of-range tag (keeping the
+    // rest of the frame) so the stored mirror only ever holds valid tags. Also
+    // checks the span bookkeeping: dropping a highlight must NOT shift the next
+    // row's highlights (the shared-pool offset uses the actually-appended count).
+    const alloc = testing.allocator;
+
+    var term = try terminalpkg.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer term.deinit(alloc);
+
+    var rs: RenderStateCore = .empty;
+    defer rs.deinit(alloc);
+    try rs.update(alloc, &term);
+
+    var snap = try RenderState.Snapshot.fromRenderState(alloc, &rs);
+    defer snap.deinit(alloc);
+    try testing.expect(snap.row_data.len >= 2);
+
+    // Inject highlights directly onto two rows. snap.deinit frees the
+    // highlight_pool (not these per-row slices), so pointing row.highlights at
+    // these stack arrays is safe. Row 0: valid(1), INVALID(2), valid(0). Row 1: a
+    // single valid highlight that must survive intact at the right offset.
+    var hl0 = [_]RenderState.Highlight{
+        .{ .tag = 1, .range = .{ 0, 2 } },
+        .{ .tag = 2, .range = .{ 3, 5 } }, // out of range -> must be dropped
+        .{ .tag = 0, .range = .{ 6, 8 } },
+    };
+    var hl1 = [_]RenderState.Highlight{
+        .{ .tag = 1, .range = .{ 1, 4 } },
+    };
+    snap.row_data[0].highlights = &hl0;
+    snap.row_data[1].highlights = &hl1;
+
+    const bytes = try snap.serialize(alloc);
+    defer alloc.free(bytes);
+    var restored = try RenderState.Snapshot.deserialize(alloc, bytes);
+    defer restored.deinit(alloc);
+
+    // Row 0: the tag==2 highlight is dropped; the two valid ones remain in order.
+    try testing.expectEqual(@as(usize, 2), restored.row_data[0].highlights.len);
+    try testing.expectEqual(@as(u8, 1), restored.row_data[0].highlights[0].tag);
+    try testing.expectEqual(@as(u8, 0), restored.row_data[0].highlights[1].tag);
+    // Row 1: intact (the drop didn't corrupt the next row's pool offset).
+    try testing.expectEqual(@as(usize, 1), restored.row_data[1].highlights.len);
+    try testing.expectEqual(@as(u8, 1), restored.row_data[1].highlights[0].tag);
+    try testing.expectEqual([2]u16{ 1, 4 }, restored.row_data[1].highlights[0].range);
+}
+
 test "host cursor-only move pushes (Slice 8): rows identical, cursor differs => printDiff==0 but cursorEql=false; identical => no push" {
     const alloc = testing.allocator;
 
