@@ -2854,7 +2854,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (x_compare >= hl.range[0] and
                             x_compare <= hl.range[1])
                         {
-                            const tag: HighlightTag = @enumFromInt(hl.tag);
+                            // hl.tag originates from an untrusted wire byte under
+                            // .client (host RenderState.Highlight.tag is a u8). A
+                            // bare @enumFromInt on an out-of-range value is illegal
+                            // behavior — a checked panic in safe builds and UB in
+                            // ReleaseFast, on this render hot path. The host
+                            // deserialize already drops out-of-range tags, but
+                            // validate here too (defense-in-depth on the actual UB
+                            // site): an unknown tag simply doesn't highlight.
+                            const tag = std.meta.intToEnum(HighlightTag, hl.tag) catch
+                                continue;
                             break :selected switch (tag) {
                                 .search_match => .search,
                                 .search_match_selected => .search_selected,
