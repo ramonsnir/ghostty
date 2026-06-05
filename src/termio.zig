@@ -22,6 +22,7 @@ const stream_handler = @import("termio/stream_handler.zig");
 const message = @import("termio/message.zig");
 pub const backend = @import("termio/backend.zig");
 pub const mailbox = @import("termio/mailbox.zig");
+pub const Client = @import("termio/Client.zig");
 pub const Exec = @import("termio/Exec.zig");
 pub const Options = @import("termio/Options.zig");
 pub const Termio = @import("termio/Termio.zig");
@@ -36,4 +37,8 @@ test {
     @import("std").testing.refAllDecls(@This());
 
     _ = @import("termio/shell_integration.zig");
+
+    // Phase 2b Slice 2: the .client decode-fidelity differential test. Named
+    // "client decode fidelity ...", reachable via -Dtest-filter=client.
+    _ = @import("termio/client_difftest.zig");
 }

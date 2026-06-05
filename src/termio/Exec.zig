@@ -470,6 +470,36 @@ pub fn queueWrite(
     }
 }
 
+/// Scroll the LOCAL terminal viewport. Byte-for-byte identical to the
+/// pre-Slice-7 `Termio.scrollViewport`: take the renderer_state mutex and call
+/// `terminal.scrollViewport`. `td.renderer_state.terminal` is `&Termio.terminal`
+/// and `td.renderer_state.mutex` is the same lock Termio used, so this is the
+/// same locked synchronous local scroll as before.
+pub fn scrollViewport(
+    self: *Exec,
+    td: *termio.Termio.ThreadData,
+    scroll: terminal.Terminal.ScrollViewport,
+) void {
+    _ = self;
+    td.renderer_state.mutex.lock();
+    defer td.renderer_state.mutex.unlock();
+    td.renderer_state.terminal.scrollViewport(scroll);
+}
+
+/// Jump the LOCAL terminal viewport to a prompt. Byte-for-byte identical to the
+/// pre-Slice-7 `Termio.jumpToPrompt`: `screens.active.scroll(.delta_prompt)`
+/// under the renderer_state mutex.
+pub fn jumpToPrompt(
+    self: *Exec,
+    td: *termio.Termio.ThreadData,
+    delta: isize,
+) void {
+    _ = self;
+    td.renderer_state.mutex.lock();
+    defer td.renderer_state.mutex.unlock();
+    td.renderer_state.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+}
+
 fn ttyWrite(
     td_: ?*ThreadData,
     _: *xev.Loop,

@@ -5,6 +5,13 @@ runs side-by-side with an official Ghostty. Single working branch: **`ramon-fork
 Upstream conventions still apply (`AGENTS.md`, `macos/AGENTS.md`); this file only
 covers what's specific to the fork.
 
+> **PTY-host (emulation-on-host) work** lives on the **`ptyhost/phase-2b`** branch,
+> not `ramon-fork`. If you are resuming or touching that work (the `.client` termio
+> backend, `ghostty-host`, reattach-across-restart), read
+> **`.claude/docs/ptyhost.md`** first — it has the architecture decisions,
+> invariants/gotchas, the commit range, and open items. It is `git add -f`'d (the
+> rest of `.claude/` is local-only).
+
 ## Functional changes — new keybind actions (also in the command palette)
 All act on the focused surface. flip/toggle walk **up** to the nearest enclosing
 split of the given orientation (like `resize_split`), so outer splits are

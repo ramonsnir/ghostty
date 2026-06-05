@@ -475,6 +475,13 @@ typedef struct {
   ghostty_env_var_s* env_vars;
   size_t env_var_count;
   const char* initial_input;
+  // Host pty session to (re)attach to. 0 means none: spawn a FRESH host
+  // session (today's behavior). A non-zero value requests that the `.client`
+  // backend attach to the existing host session with this id instead of
+  // spawning a new one. Host session ids start at 1, so 0 is a safe sentinel.
+  // Only consulted when the `.client` backend is selected (i.e. `pty-host` is
+  // set); ignored for the in-process `.exec` backend.
+  uint64_t session_id;
   bool wait_after_command;
   ghostty_surface_context_e context;
 } ghostty_surface_config_s;
@@ -1152,6 +1159,7 @@ GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+GHOSTTY_API uint64_t ghostty_surface_session_id(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);

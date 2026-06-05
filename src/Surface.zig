@@ -660,37 +660,155 @@ pub fn init(
             std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
         );
 
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
-
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
+
+        // SLICE 4 (backend selection): if `pty-host` names a running
+        // ghostty-host socket, run the terminal emulation ON THE HOST via the
+        // `.client` backend; otherwise fork a shell in-process via `.exec`
+        // (today's behavior, byte-for-byte unchanged when `pty-host` is null).
+        //
+        // We branch BEFORE constructing either backend so selecting `.client`
+        // does NOT fork a shell subprocess (no `termio.Exec.init`, which spawns
+        // the pty child). Each arm builds and `errdefer`-deinits exactly one
+        // backend, then hands its tagged union value to `termio.Termio.init`.
+        //
+        // SLICE 3d (lock-domain reconciliation): the `.client` mirror writes
+        // must be guarded by the SAME `*std.Thread.Mutex` the renderer reads
+        // the mirror under (`self.renderer_state.mutex` == `mutex`, created at
+        // the top of this fn). That shared mutex is threaded through
+        // `Client.Config.render_mutex` here, so `renderMutex()` resolves to the
+        // renderer-state mutex (no separate `setRenderMutex` call needed).
+        const backend: termio.Backend = if (config.@"pty-host") |sock| backend: {
+            // Forward-map the surface-config session id (carried on the
+            // apprt surface from `Options.session_id`) into the Client's
+            // Attach: 0 => null (spawn a FRESH host session, today's
+            // behavior); non-zero => reattach to that existing host session.
+            // Read defensively so apprts that don't carry a session id
+            // (e.g. the bare `none` surface) still compile to "fresh".
+            const req_session_id: u64 = if (@hasField(
+                @TypeOf(rt_surface.*),
+                "session_id",
+            )) rt_surface.session_id else 0;
+            const io_client = try termio.Client.init(alloc, .{
+                .socket_path = sock,
+                .render_mutex = mutex,
+                .session_id = termio.Client.sessionIdFromConfig(req_session_id),
+                // SLICE 11 (cwd-inherit): pass the SAME working-directory the
+                // `.exec` arm passes to `Exec.init` below (line ~718). The GUI
+                // already computes the new tab's cwd into
+                // `config.@"working-directory"` (the cwd-inherit path .exec uses);
+                // threading it here makes a fresh `.client` session spawn in that
+                // dir instead of the host's $HOME default. `null` (unset) keeps
+                // today's behavior. Client.init DUPES it into Client-owned
+                // memory, so the borrowed `wd.value()` need not outlive this call.
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+            });
+            // Note: Client.init dupes socket_path into Client-owned memory
+            // (freed in Client.deinit), so the value owns heap state immediately
+            // after init even though connect happens later in threadEnter. Its
+            // value is moved into the Termio backend union below, transferring
+            // ownership (and the cleanup duty) to self.io — so this errdefer/
+            // move is load-bearing, not merely symmetric with Exec.
+            errdefer {
+                var c = io_client;
+                c.deinit();
+            }
+            break :backend .{ .client = io_client };
+        } else backend: {
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+            break :backend .{ .exec = io_exec };
+        };
+
+        // BACKEND-LEAK FIX: the per-arm `errdefer`s above are scoped INSIDE the
+        // `backend:` block-expression, so they are DEAD by the time
+        // `termio.Termio.init` runs — if it (or the inner `DerivedConfig.init`)
+        // throws, the live backend built above (`.client`'s `Client` or
+        // `.exec`'s `Exec`, both holding owned heap state) would leak. `backend`
+        // is the LIVE `termio.Backend` union, whose `deinit` switches on tag and
+        // calls the right backend's `deinit`, so this single errdefer at the
+        // SAME scope as the `Termio.init` call cleans it up on failure.
+        //
+        // No double free on the success path: `Termio.init` MOVES the backend
+        // union into `self.io.backend` (taking ownership), and there is NO
+        // further fallible (`try`) statement in this block after it — the only
+        // thing left is the success-path `switch`/`env.deinit()` below, which
+        // cannot error — so this errdefer can only fire when `Termio.init`
+        // itself throws, before ownership transferred. The outer
+        // `errdefer self.io.deinit()` (registered after this block) covers the
+        // backend only once `self.io` is successfully constructed.
+        var backend_cleanup = backend;
+        errdefer backend_cleanup.deinit();
 
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
+
+        // SLICE 4 (mirror/link wiring — lifetime-critical): point the renderer
+        // at the host-supplied draw-source mirror, but ONLY for `.client`
+        // (`.exec` leaves both null and renders from the in-process terminal).
+        //
+        // These pointers MUST reference the Client at its FINAL address —
+        // `self.io.backend.client`, where `termio.Termio.init` just MOVED the
+        // backend union value. Taking the address of the pre-move local
+        // (`io_client` above) would dangle the moment the union is copied into
+        // `self.io`. This is the exact lifetime reasoning Slice 3d applied to
+        // the shared mutex (`&self.owned_mutex` is only ever taken on the
+        // final-address `*Client`). The shared render mutex was already wired
+        // via `Config.render_mutex`, so `renderMutex()` resolves to the same
+        // lock the renderer holds when reading `mirror`/`link_cells`.
+        switch (self.io.backend) {
+            .client => |*c| {
+                self.renderer_state.mirror = &c.render_state;
+                self.renderer_state.link_cells = &c.osc8_links;
+
+                // PHASE A (audit R2 — lifetime-critical): point the Client at
+                // the FINAL-address local terminal so `handleFrame`'s
+                // `.mode_frame` arm applies the host's real input modes onto the
+                // SAME terminal the encode paths read. `&self.io.terminal` is
+                // the final `&Termio.terminal` (post-move), valid for the life
+                // of the Surface — the exact terminal `key_encode`/`paste`/the
+                // mouse gates read off `io.terminal`. This MUST be done here on
+                // the moved backend (`self.io.backend.client`), NOT in
+                // `Client.initTerminal`: that runs pre-move and would capture
+                // the dead stack-local terminal address (same hazard as
+                // mirror/link_cells above). Set before the read thread spawns in
+                // `threadEnter`, so the first `.mode_frame` already targets it.
+                c.setLocalTerminal(&self.io.terminal);
+
+                // The `.client` backend never consumed `env` (the host owns the
+                // subprocess and its environment); `.exec` would have taken
+                // ownership of it inside `Exec.init`. Free it now, on the
+                // success path, to avoid a leak. This is safe relative to the
+                // block-scoped `errdefer env.deinit()` registered above: there
+                // are no further `try` statements in this block, so that
+                // errdefer cannot fire after this point (no double free).
+                env.deinit();
+            },
+            .exec => {},
+        }
     }
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
@@ -962,11 +1080,38 @@ pub fn needsConfirmQuit(self: *Surface) bool {
     return switch (self.config.confirm_close_surface) {
         .always => true,
         .false => false,
-        .true => true: {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            break :true !self.io.terminal.cursorIsAtPrompt();
+        // Confirm unless the shell is idle at a prompt. Under .exec read the local
+        // terminal directly (byte-for-byte unchanged). Under .client the local
+        // terminal is the empty mirror — cursorIsAtPrompt() there is meaningless
+        // (always false => always confirm), so read the host-authoritative bit the
+        // Client caches from `at_prompt` frames (Phase D); this makes the warning
+        // meaningful (only when a command is actually running) instead of always-on.
+        .true => switch (self.io.backend) {
+            .exec => exec: {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                break :exec !self.io.terminal.cursorIsAtPrompt();
+            },
+            .client => |*c| !c.cursorIsAtPrompt(),
         },
+    };
+}
+
+/// Returns the host-assigned pty-host session id for this surface, or 0 if the
+/// surface is not attached to a pty host (the `.exec` backend, or a `.client`
+/// backend that has not yet received its `Attached` frame).
+///
+/// Slice 5b (reverse half of reattach): the GUI reads this PULL getter at
+/// restorable-state ENCODE time to persist the id so it can reattach after a
+/// restart. It reads the Client's lock-free atomic (`session_id.load(.acquire)`,
+/// paired with the `handleFrame` store-release), so it is safe to call from the
+/// apprt/main thread without taking any lock. Host ids start at 1, so 0 is an
+/// unambiguous "unattached" sentinel. The `.exec` backend never dereferences a
+/// client union, returning 0 directly.
+pub fn sessionId(self: *Surface) u64 {
+    return switch (self.io.backend) {
+        .client => |*c| c.session_id.load(.acquire),
+        .exec => 0,
     };
 }
 
@@ -1232,7 +1377,21 @@ fn selectionScrollTick(self: *Surface) !void {
 
     // We modified our viewport and selection so we need to queue
     // a render.
-    try self.io.terminal.screens.active.select(selection);
+    //
+    // Slice B1: under .client the gesture above ran its TIMING/autoscroll
+    // against the local mirror (which is empty/blank, so autoscroll PAST the
+    // viewport edge is degraded in B1 — the host owns scrollback; in-viewport
+    // drag works). Route the resolved selection to the host instead of the
+    // empty local terminal. .exec is byte-for-byte unchanged.
+    switch (self.io.backend) {
+        .exec => try self.io.terminal.screens.active.select(selection),
+        // B1: only ship a cell drag (count==1) to the host; word/line
+        // (count>=2) boundary-snaps against the empty local mirror and would
+        // ship wrong coords. Matches the gating on the press/cursor-pos seams;
+        // the autoscroll word/line case stays degraded until B2.
+        .client => if (self.mouse.selection_gesture.left_click_count == 1)
+            self.sendSelectionToHost(selection),
+    }
     try self.queueRender();
 }
 
@@ -1328,6 +1487,14 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+
+        // Slice 1: `.client` is never selected (Surface.zig hardcodes
+        // `.exec`), so this path is unreachable in practice. We return an
+        // empty arg slice (-> empty command string) rather than touch the
+        // stub backend; real command lookup lands with the Client impl in
+        // Slice 2. The slice element type must match `exec.subprocess.args`
+        // ([]const [:0]const u8) so `std.mem.join` still type-checks.
+        .client => &[_][:0]const u8{},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -2050,18 +2217,37 @@ pub fn dumpTextLocked(
 pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.screens.active.selection != null;
+    // Slice B1: under .client the real selection lives host-side; read the
+    // host-shipped cache (guarded by the renderer mutex we hold) instead of the
+    // empty local mirror. Drives Copy-menu enablement.
+    return self.hasSelectionLocked();
+}
+
+/// Like `hasSelection` but assumes the caller already holds the renderer mutex.
+fn hasSelectionLocked(self: *const Surface) bool {
+    return switch (self.io.backend) {
+        .exec => self.io.terminal.screens.active.selection != null,
+        .client => |*c| c.hasCachedSelection(),
+    };
 }
 
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const sel = self.io.terminal.screens.active.selection orelse return null;
-    return try self.io.terminal.screens.active.selectionString(alloc, .{
-        .sel = sel,
-        .trim = false,
-    });
+    // Slice B1: under .client return a copy of the host-shipped selection text
+    // cache (the real cells live host-side; the local mirror is empty). .exec
+    // reads the local terminal as before.
+    switch (self.io.backend) {
+        .exec => {
+            const sel = self.io.terminal.screens.active.selection orelse return null;
+            return try self.io.terminal.screens.active.selectionString(alloc, .{
+                .sel = sel,
+                .trim = false,
+            });
+        },
+        .client => |*c| return try c.copyCachedSelectionText(alloc),
+    }
 }
 
 /// Returns the pwd of the terminal, if any. This is always copied because
@@ -2222,6 +2408,11 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     };
 }
 
+/// Slice B1 note: this reads cells from the LOCAL terminal via ScreenFormatter,
+/// so under .client it would yield empty. The B1 copy path (⌘C / copy_on_select)
+/// routes through `copyCachedSelectionToClipboards` instead (host-resolved text).
+/// This function stays the .exec path; the B2 word/line/url callers that still
+/// pass a real Selection remain broken under .client (documented, deferred).
 fn copySelectionToClipboards(
     self: *Surface,
     sel: terminal.Selection,
@@ -2332,6 +2523,103 @@ fn copySelectionToClipboards(
     for (clipboards) |clipboard| self.rt_surface.setClipboard(
         clipboard,
         contents.items,
+        false,
+    ) catch |err| {
+        log.err(
+            "error setting clipboard string clipboard={} err={}",
+            .{ clipboard, err },
+        );
+    };
+}
+
+/// Slice B1: route a resolved drag selection (or null => clear) to the host.
+/// `.client` only — the caller must already have gated on `isClient()`. Given a
+/// Selection computed by the GUI gesture against the (positional) local pins,
+/// map its start/end pins back to VIEWPORT coordinates and enqueue a
+/// `.selection_drag` mailbox message (the IO thread sends the wire frame); a
+/// null selection enqueues `.selection_clear`. Same routing shape as
+/// `scrollViewport` under `.client`.
+///
+/// The selection's start/end pins were created from `.viewport = {x,y}` against
+/// the local mirror, which has the SAME grid dimensions as the host viewport
+/// (resize is mirrored), so the viewport coords recovered here equal the cells
+/// the user is dragging over on the host. Must be called with the renderer mutex
+/// held (it reads `pointFromPin` against the active screen).
+fn sendSelectionToHost(self: *Surface, sel_: ?terminal.Selection) void {
+    const sel = sel_ orelse {
+        self.queueIo(.{ .selection_clear = {} }, .locked);
+        return;
+    };
+
+    const screen = self.io.terminal.screens.active;
+    const start_pt = screen.pages.pointFromPin(.viewport, sel.start()) orelse {
+        // The pin fell outside the local viewport; conservatively treat as a
+        // clear rather than shipping a garbage coord.
+        self.queueIo(.{ .selection_clear = {} }, .locked);
+        return;
+    };
+    const end_pt = screen.pages.pointFromPin(.viewport, sel.end()) orelse {
+        self.queueIo(.{ .selection_clear = {} }, .locked);
+        return;
+    };
+    const start_vp = start_pt.coord();
+    const end_vp = end_pt.coord();
+
+    self.queueIo(.{ .selection_drag = .{
+        .anchor_x = @intCast(start_vp.x),
+        .anchor_y = @intCast(start_vp.y),
+        .head_x = @intCast(end_vp.x),
+        .head_y = @intCast(end_vp.y),
+        .rectangle = sel.rectangle,
+    } }, .locked);
+}
+
+/// Slice B2: `.client` only — forward a single click POINT (viewport coords)
+/// plus a granularity `mode` (word/line/all) to the host, which EXPANDS it via
+/// selectWord/selectLine/selectAll on ITS terminal. The resulting selection
+/// rides the existing mirror path: the next GridFrame carries row.selection (the
+/// viewport highlight) and a `selection_text` frame carries the copy text — no
+/// new host->GUI frame. For `mode_all` the host ignores x/y (the GUI sends 0,0).
+/// Same `.locked` queue routing as `sendSelectionToHost` — the caller already
+/// holds the renderer mutex.
+fn sendSelectionPointToHost(self: *Surface, x: u16, y: u16, mode: u8) void {
+    self.queueIo(.{ .selection_point = .{
+        .x = x,
+        .y = y,
+        .mode = mode,
+    } }, .locked);
+}
+
+/// Slice B1: copy the host-cached selection text (already resolved host-side)
+/// to the given clipboards. `.client` only — used by ⌘C / copy_on_select when
+/// the local terminal is the empty mirror. Plain text only (B1 common case; the
+/// host emits plain selection text). No-op (returns) when no selection is
+/// cached. Must be called with the renderer mutex held (reads the Client cache,
+/// which is guarded by the same lock under `.client`).
+///
+/// B1 fidelity note (finding SEL-2): emits a single `text/plain` MIME — the
+/// requested copy format (vt/html/mixed) is NOT honored (B2), and the host
+/// supplies the text with trim=false, so clipboard_trim_trailing_spaces is also
+/// NOT applied here (unlike the .exec copySelectionToClipboards path). Both are
+/// accepted divergences for B1, documented here and at the copy_to_clipboard arm.
+fn copyCachedSelectionToClipboards(
+    self: *Surface,
+    clipboards: []const apprt.Clipboard,
+) !void {
+    const c = switch (self.io.backend) {
+        .client => |*c| c,
+        .exec => return,
+    };
+    const text = (try c.copyCachedSelectionText(self.alloc)) orelse return;
+    defer self.alloc.free(text);
+
+    const contents = [_]apprt.ClipboardContent{.{
+        .mime = "text/plain",
+        .data = text,
+    }};
+    for (clipboards) |clipboard| self.rt_surface.setClipboard(
+        clipboard,
+        &contents,
         false,
     ) catch |err| {
         log.err(
@@ -2532,6 +2820,14 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
         preedit_ != null)
     {
         if (self.config.selection_clear_on_typing) {
+            // Slice B1: under .client also route the host clear (the local
+            // mirror is empty; the real selection + highlight + cached copy
+            // text live host-side). Mutex held above; use the locked variants.
+            // See the matching note in keyCallback's selection-clear-on-typing
+            // branch. .exec unchanged.
+            if (self.io.backend == .client) {
+                if (self.hasSelectionLocked()) self.sendSelectionToHost(null);
+            }
             self.setSelection(null) catch {};
         }
     }
@@ -2819,10 +3115,22 @@ pub fn keyCallback(
         if (self.config.selection_clear_on_typing or
             event.key == .escape)
         {
+            // Slice B1: under .client the real selection lives host-side, so
+            // clearing only the empty local mirror would leave the host
+            // selection (and thus the orange highlight + the cached copy text)
+            // stranded on a non-modifier keypress / Escape — reachable with the
+            // default selection_clear_on_typing=true. Route the host clear too,
+            // mirroring the single-click-clear press path (mutex already held,
+            // so hasSelectionLocked()/sendSelectionToHost(null) without
+            // re-locking). .exec is unchanged (setSelection drives the local
+            // terminal as before).
+            if (self.io.backend == .client) {
+                if (self.hasSelectionLocked()) self.sendSelectionToHost(null);
+            }
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3622,7 +3930,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -3892,13 +4200,43 @@ pub fn mouseButtonCallback(
         // the left button is released. This is to avoid the clipboard
         // being updated on every mouse move which would be noisy.
         if (self.config.copy_on_select != .false) {
-            const prev_ = self.io.terminal.screens.active.selection;
-            if (prev_) |prev| {
-                try self.setSelection(terminal.Selection.init(
-                    prev.start(),
-                    prev.end(),
-                    prev.rectangle,
-                ));
+            switch (self.io.backend) {
+                .exec => {
+                    const prev_ = self.io.terminal.screens.active.selection;
+                    if (prev_) |prev| {
+                        try self.setSelection(terminal.Selection.init(
+                            prev.start(),
+                            prev.end(),
+                            prev.rectangle,
+                        ));
+                    }
+                },
+                // Slice B1: the local terminal's selection is null (empty
+                // mirror); the host shipped the resolved selection text in its
+                // `selection_text` reply. Copy the CACHED text to the selection
+                // clipboard (mirroring setSelection's copy_on_select target
+                // choice) rather than re-selecting the empty local terminal.
+                // hasSelectionLocked() (not hasSelection()) because the
+                // enclosing release block already holds the renderer mutex
+                // (locked at the top of this `button == .left and action ==
+                // .release` block); hasSelection() would re-lock the
+                // non-reentrant std.Thread.Mutex and self-deadlock.
+                .client => if (self.hasSelectionLocked()) {
+                    const clipboard: apprt.Clipboard = switch (self.config.copy_on_select) {
+                        .false => unreachable,
+                        .clipboard => .standard,
+                        .true => if (self.rt_surface.supportsClipboard(.selection))
+                            .selection
+                        else
+                            .standard,
+                    };
+                    const clipboards: []const apprt.Clipboard = switch (self.config.copy_on_select) {
+                        .false => unreachable,
+                        .clipboard => &.{ .standard, .selection },
+                        .true => &.{clipboard},
+                    };
+                    try self.copyCachedSelectionToClipboards(clipboards);
+                },
             }
         }
 
@@ -4042,14 +4380,69 @@ pub fn mouseButtonCallback(
         // We set the selection directly rather than use `setSelection` because
         // we want to avoid copying the selection to the selection clipboard.
         // For left mouse clicks we only set the clipboard on release.
-        if (press_selection) |selection| {
-            try self.io.terminal.screens.active.select(selection);
-            try self.queueRender();
-        } else if (self.mouse.selection_gesture.left_click_count == 1 and
-            self.io.terminal.screens.active.selection != null)
-        {
-            try self.io.terminal.screens.active.select(null);
-            try self.queueRender();
+        //
+        // Slice B1: under .client route the press commit/clear to the host. A
+        // single-click .cell press yields a null `press_selection` (the common
+        // case — it clears any prior selection), which we route as a host clear
+        // when there is a cached selection. A multi-click (count>=2) press
+        // selection is word/line granularity — those need host content to be
+        // meaningful and are DEFERRED to B2 (left as a local no-op under
+        // .client, already broken). .exec is byte-for-byte unchanged.
+        switch (self.io.backend) {
+            .exec => {
+                if (press_selection) |selection| {
+                    try self.io.terminal.screens.active.select(selection);
+                    try self.queueRender();
+                } else if (self.mouse.selection_gesture.left_click_count == 1 and
+                    self.io.terminal.screens.active.selection != null)
+                {
+                    try self.io.terminal.screens.active.select(null);
+                    try self.queueRender();
+                }
+            },
+            .client => {
+                if (self.mouse.selection_gesture.left_click_count == 1) {
+                    if (press_selection) |selection| {
+                        // A count==1 .cell press selection is positional, so it
+                        // maps cleanly to host viewport coords.
+                        self.sendSelectionToHost(selection);
+                        try self.queueRender();
+                    } else if (self.hasSelectionLocked()) {
+                        // hasSelectionLocked() (not hasSelection()) because the
+                        // enclosing `click:` press block already holds the
+                        // renderer mutex (locked above); hasSelection() would
+                        // re-lock the non-reentrant std.Thread.Mutex and
+                        // self-deadlock on this same thread.
+                        self.sendSelectionToHost(null);
+                        try self.queueRender();
+                    }
+                } else {
+                    // Slice B2: a multi-click press (count 2 = word, 3 = line)
+                    // is word/line granularity that only the host can compute
+                    // (the `.client` local terminal is the empty mirror). We
+                    // forward the click POINT + granularity to the host, which
+                    // snaps it to a word/line boundary via selectWord/selectLine
+                    // and ships the result back via the existing mirror path
+                    // (row.selection highlight on the next GridFrame + a
+                    // selection_text frame for copy). The count==2 URL override
+                    // (linkAtPin above) only matters for .exec — the .client
+                    // mirror has no link data, so we always do plain word-select
+                    // here (OSC8/regex link selection text is R3-deferred).
+                    //
+                    // Recover the viewport coords from the in-scope `pin` (the
+                    // `pt_viewport` local is scoped to the `pin:` block above and
+                    // is unreachable here) the SAME way sendSelectionToHost does.
+                    const pt = screen.pages.pointFromPin(.viewport, pin) orelse break :click;
+                    const vp = pt.coord();
+                    const mode: u8 = switch (self.mouse.selection_gesture.left_click_count) {
+                        2 => termio.Message.SelectionPoint.mode_word,
+                        3 => termio.Message.SelectionPoint.mode_line,
+                        else => unreachable, // bounded 1..3; 1 handled above
+                    };
+                    self.sendSelectionPointToHost(@intCast(vp.x), @intCast(vp.y), mode);
+                    try self.queueRender();
+                }
+            },
         }
     }
 
@@ -4128,23 +4521,37 @@ pub fn mouseButtonCallback(
                 return false;
             },
             .copy => {
-                if (self.io.terminal.screens.active.selection) |sel| {
-                    try self.copySelectionToClipboards(
-                        sel,
-                        &.{.standard},
-                        .mixed,
-                    );
+                // B1: under .client the real selection is host-side; copy the
+                // host-cached text (plain only — rich formats are B2). .exec
+                // keeps the local-screen mixed-format path.
+                switch (self.io.backend) {
+                    .client => if (self.hasSelectionLocked())
+                        try self.copyCachedSelectionToClipboards(&.{.standard}),
+                    .exec => if (self.io.terminal.screens.active.selection) |sel| {
+                        try self.copySelectionToClipboards(
+                            sel,
+                            &.{.standard},
+                            .mixed,
+                        );
+                    },
                 }
 
                 try self.setSelection(null);
                 try self.queueRender();
             },
-            .@"copy-or-paste" => if (self.io.terminal.screens.active.selection) |sel| {
-                try self.copySelectionToClipboards(
-                    sel,
-                    &.{.standard},
-                    .mixed,
-                );
+            .@"copy-or-paste" => if (self.hasSelectionLocked()) {
+                // B1: copy under .client uses the host-cached text; .exec uses
+                // the local selection. Both then clear + repaint.
+                switch (self.io.backend) {
+                    .client => try self.copyCachedSelectionToClipboards(&.{.standard}),
+                    .exec => if (self.io.terminal.screens.active.selection) |sel| {
+                        try self.copySelectionToClipboards(
+                            sel,
+                            &.{.standard},
+                            .mixed,
+                        );
+                    },
+                }
                 try self.setSelection(null);
                 try self.queueRender();
             } else {
@@ -4518,6 +4925,10 @@ pub fn mousePressureCallback(
             );
         }
 
+        // Slice B1 deferral: deep-press is WORD selection (deepPress derefs cell
+        // content for word boundaries), which is meaningless against the empty
+        // local mirror under .client. Deferred to B2; left as the already-broken
+        // local select under .client. Unchanged for .exec.
         try self.io.terminal.screens.active.select(sel orelse break :select);
         try self.queueRender();
     }
@@ -4722,8 +5133,30 @@ pub fn cursorPosCallback(
             },
         }
 
-        // Update our selection based on the gesture state
-        try self.io.terminal.screens.active.select(drag_selection);
+        // Update our selection based on the gesture state.
+        //
+        // Slice B1: this is the PRIMARY drag-select path. For .cell behavior
+        // (left_click_count == 1) the gesture's pin math is purely positional
+        // (no content deref), so the computed `drag_selection`'s start/end pins
+        // carry the correct viewport x/y even against the empty local mirror
+        // under .client. Route those to the host instead of selecting the empty
+        // local terminal. .exec unchanged.
+        //
+        // count>=2 (word/line) drags: B2 — no-op under .client, matching the
+        // count==1 gate on the press path (mouseButtonCallback). The word/line
+        // gesture (SelectionGesture.drag -> dragSelectionWord/Line) snaps its
+        // boundaries against the active screen's CONTENT, which under .client is
+        // the empty local mirror — so the resulting selection would be snapped
+        // to blank cells and ship wrong-boundary coords to the host (finding
+        // SEL-3). Leaving it a no-op (rather than shipping bad coords) keeps the
+        // .client drag seam cell-granularity only until B2 adds host-side
+        // word/line resolution.
+        switch (self.io.backend) {
+            .exec => try self.io.terminal.screens.active.select(drag_selection),
+            .client => if (self.mouse.selection_gesture.left_click_count == 1) {
+                self.sendSelectionToHost(drag_selection);
+            },
+        }
     }
 }
 
@@ -4757,11 +5190,36 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
     return .{ .x = grid.x, .y = grid.y };
 }
 
+/// Centralized scroll seam (Slice 7). All apprt-thread scroll sites that used
+/// to call `self.io.terminal.scrollViewport(...)` directly route through here.
+///
+/// - .exec: scroll the LOCAL terminal synchronously, byte-for-byte identical to
+///   the prior direct call. PRECONDITION: the render_state mutex must be held
+///   (every direct call site already holds it — keystroke scroll-to-bottom,
+///   mouse-wheel scroll, scrollToBottom's documented precondition).
+/// - .client: the local terminal is the host-fed mirror and scrolling it is a
+///   silent no-op (the host overwrites it next GridFrame), so instead enqueue a
+///   `.scroll_viewport` message; the IO thread sends a `scroll_viewport` frame
+///   (Client.scrollViewport) and the scrolled viewport arrives on the next
+///   GridFrame. Fire-and-forget — no blocking round-trip on this thread. We pass
+///   `.locked` because callers hold the render_state mutex (queueMessage's
+///   MutexState governs only mailbox.send's lock handling, not the local
+///   terminal).
+fn scrollViewport(
+    self: *Surface,
+    scroll: terminal.Terminal.ScrollViewport,
+) void {
+    switch (self.io.backend) {
+        .exec => self.io.terminal.scrollViewport(scroll),
+        .client => self.queueIo(.{ .scroll_viewport = scroll }, .locked),
+    }
+}
+
 /// Scroll to the bottom of the viewport.
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
@@ -4911,9 +5369,18 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
-            self.renderer_state.mutex.lock();
-            defer self.renderer_state.mutex.unlock();
-            self.renderer_state.terminal.fullReset();
+            // Phase D: under .client the local terminal is the empty mirror, so a
+            // local fullReset is a no-op against the real shell. Forward a `reset`
+            // message; the host runs fullReset on ITS real terminal. .exec keeps
+            // the original direct, synchronous local reset (byte-for-byte).
+            switch (self.io.backend) {
+                .exec => {
+                    self.renderer_state.mutex.lock();
+                    defer self.renderer_state.mutex.unlock();
+                    self.renderer_state.terminal.fullReset();
+                },
+                .client => self.queueIo(.{ .reset = {} }, .unlocked),
+            }
         },
 
         .start_search => {
@@ -5019,6 +5486,33 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .copy_to_clipboard => |format| {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
+
+            // Slice B1: under .client the selection lives host-side. Copy the
+            // host-cached selection text (plain only — the host emits plain
+            // text; rich `format`s like vt/html are B2) and clear via the host
+            // (selection_clear). .exec keeps the existing local-terminal path.
+            //
+            // Two intentional .client/.exec fidelity gaps (finding SEL-2, both
+            // accepted for B1): (1) the requested `format` is ignored — always
+            // plain text/plain, never vt/html/mixed (B2 adds rich formats); and
+            // (2) clipboard_trim_trailing_spaces is NOT honored — the host
+            // extracts selectionString with trim=false and the GUI copies it
+            // verbatim, so a selection with trailing blanks differs from .exec
+            // (which trims per config). Both are deferred, not bugs.
+            switch (self.io.backend) {
+                .exec => {},
+                .client => {
+                    if (!self.hasSelectionLocked()) return false;
+                    try self.copyCachedSelectionToClipboards(&.{.standard});
+                    if (self.config.selection_clear_on_copy) {
+                        self.sendSelectionToHost(null);
+                        self.queueRender() catch |err| {
+                            log.warn("failed to queue render after clear selection err={}", .{err});
+                        };
+                    }
+                    return true;
+                },
+            }
 
             if (self.io.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
@@ -5217,6 +5711,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             }, .unlocked);
         },
 
+        // Slice 7 NOTE: scroll_to_row (.row) and scroll_to_selection (.pin)
+        // operate on the local terminal's scroll positions (a raw row index, a
+        // selection pin), which have NO representation in the
+        // terminal.Terminal.ScrollViewport union (top/bottom/delta) and so are
+        // not expressible as a scroll_viewport frame. Under .client these scroll
+        // the host-fed mirror (ineffective — the host overwrites it next
+        // GridFrame), so they stay GUI-local for now. Carrying row/pin scrolls
+        // to the host is a future frame beyond Slice 7's viewport-only scope.
         .scroll_to_row => |n| {
             {
                 self.renderer_state.mutex.lock();
@@ -5576,10 +6078,31 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const sel = self.io.terminal.screens.active.selectAll();
-            if (sel) |s| {
-                try self.setSelection(s);
-                try self.queueRender();
+            switch (self.io.backend) {
+                .exec => {
+                    const sel = self.io.terminal.screens.active.selectAll();
+                    if (sel) |s| {
+                        try self.setSelection(s);
+                        try self.queueRender();
+                    }
+                },
+                .client => {
+                    // Slice B2: select-all is host-authoritative. The local
+                    // mirror is the EMPTY viewport-only terminal, so we forward
+                    // a `mode_all` select-point (x/y ignored host-side); the
+                    // host's selectAll() covers the FULL screen INCLUDING
+                    // SCROLLBACK and selectionString extracts the full text, so
+                    // COPY works without R3. The visual HIGHLIGHT, however, is
+                    // viewport-scoped: the mirror only carries viewport rows, so
+                    // row.selection highlights stop at the viewport edge.
+                    // Cross-scrollback highlight rendering is R3-DEFERRED.
+                    self.sendSelectionPointToHost(
+                        0,
+                        0,
+                        termio.Message.SelectionPoint.mode_all,
+                    );
+                    try self.queueRender();
+                },
             }
         },
 

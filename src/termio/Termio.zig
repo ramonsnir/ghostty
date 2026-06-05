@@ -468,8 +468,10 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update the size of our pty. The backend takes the full size: Exec
+    // derives grid/terminal from it, while Client sends a Resize frame whose
+    // wire fields (cell/padding/full screen) reconstruct the size host-side.
+    try self.backend.resize(td, size);
 
     // Enter the critical area that we want to keep small
     {
@@ -542,6 +544,15 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    // Phase D: under .client the local terminal is the empty viewport mirror, so
+    // clearing it locally is a silent no-op. Forward the clear to the host, which
+    // runs THIS same clearScreen on its real .exec terminal (the host replays the
+    // identical .exec body below on the real shell). The .exec path falls through
+    // unchanged.
+    switch (self.backend) {
+        .client => |*client| return try client.clearScreen(td, history),
+        .exec => {},
+    }
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -595,25 +606,71 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
     try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
-/// Scroll the viewport
+/// Scroll the viewport. Delegates to the backend: .exec scrolls the LOCAL
+/// terminal synchronously (byte-for-byte identical to the prior direct
+/// `self.terminal.scrollViewport` under renderer_state.mutex — Exec.scrollViewport
+/// performs the same locked call); .client sends a `scroll_viewport` frame so
+/// the host repins its terminal and the next GridFrame reflects it.
 pub fn scrollViewport(
     self: *Termio,
+    td: *ThreadData,
     scroll: terminalpkg.Terminal.ScrollViewport,
-) void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-    self.terminal.scrollViewport(scroll);
+) !void {
+    try self.backend.scrollViewport(td, scroll);
 }
 
-/// Jump the viewport to the prompt.
-pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
-    }
+/// Jump the viewport to the prompt. Delegates to the backend (same .exec local
+/// / .client frame split as scrollViewport). The post-scroll renderer wakeup is
+/// handled by the IO thread's after-drain notify (Thread.zig), matching how the
+/// other mailbox-driven scroll messages already trigger a redraw.
+pub fn jumpToPrompt(self: *Termio, td: *ThreadData, delta: isize) !void {
+    try self.backend.jumpToPrompt(td, delta);
+}
 
-    try self.renderer_wakeup.notify();
+/// Slice B1: route a drag-select to the backend. .exec is a no-op (the Surface
+/// drives the local terminal selection directly); .client sends a
+/// `selection_drag` frame so the host runs select() on ITS terminal and the
+/// next GridFrame carries row.selection (the highlight) plus a `selection_text`.
+pub fn selectionDrag(
+    self: *Termio,
+    td: *ThreadData,
+    drag: termio.Message.SelectionDrag,
+) !void {
+    try self.backend.selectionDrag(td, drag);
+}
+
+/// Slice B1: route a selection clear to the backend. .exec no-op; .client sends
+/// a `selection_clear` frame.
+pub fn selectionClear(self: *Termio, td: *ThreadData) !void {
+    try self.backend.selectionClear(td);
+}
+
+/// Phase D: terminal full reset. Under .client the local terminal is the empty
+/// mirror, so the GUI forwards a `reset` frame and the host replays this on its
+/// real .exec terminal. Under .exec (incl. the HOST replaying a forwarded reset)
+/// run fullReset on the local terminal under the renderer_state mutex — the same
+/// op Surface's .exec `.reset` action performs directly.
+pub fn reset(self: *Termio, td: *ThreadData) !void {
+    switch (self.backend) {
+        .client => |*client| return try client.reset(td),
+        .exec => {},
+    }
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.terminal.fullReset();
+}
+
+/// Slice B2: route a word/line/all select-point to the backend. .exec is a
+/// no-op (the Surface drives the local terminal selection directly); .client
+/// sends a `selection_point` frame so the host runs selectWord/selectLine/
+/// selectAll on ITS terminal, with the result riding the existing selection_text
+/// + GridFrame row.selection path.
+pub fn selectionPoint(
+    self: *Termio,
+    td: *ThreadData,
+    pt: termio.Message.SelectionPoint,
+) !void {
+    try self.backend.selectionPoint(td, pt);
 }
 
 /// Called when focus is gained or lost (when focus events are enabled)

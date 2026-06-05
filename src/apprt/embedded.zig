@@ -421,6 +421,13 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// Host pty session to (re)attach to, carried from the surface init
+    /// Options so the core `Surface.init` can read it off `rt_surface` when
+    /// it builds the `.client` backend config. 0 means none/fresh (today's
+    /// behavior); non-zero requests reattach to that existing host session.
+    /// See `Options.session_id`. Only meaningful for the `.client` backend.
+    session_id: u64 = 0,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -457,6 +464,15 @@ pub const Surface = struct {
         /// Input to send to the command after it is started.
         initial_input: ?[*:0]const u8 = null,
 
+        /// Host pty session to (re)attach to. 0 (the default) means none:
+        /// spawn a FRESH host session (today's behavior). A non-zero value
+        /// requests that the `.client` backend attach to the existing host
+        /// session with this id instead of spawning a new one. Host session
+        /// ids are random non-zero u64s (see `allocSessionId` in
+        /// `src/host/Server.zig`), so 0 is a safe "none/fresh" sentinel. Only consulted when the
+        /// `.client` backend is selected (`pty-host` set); ignored by `.exec`.
+        session_id: u64 = 0,
+
         /// Wait after the command exits
         wait_after_command: bool = false,
 
@@ -476,6 +492,10 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            // Carry the requested host session id through to the core
+            // Surface.init, which reads it off `rt_surface` when building the
+            // `.client` backend config (0 => fresh; non-zero => reattach).
+            .session_id = opts.session_id,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1593,6 +1613,16 @@ pub const CAPI = struct {
     /// Returns true if the surface needs to confirm quitting.
     export fn ghostty_surface_needs_confirm_quit(surface: *Surface) bool {
         return surface.core_surface.needsConfirmQuit();
+    }
+
+    /// Returns the host-assigned pty-host session id for this surface, or 0 if
+    /// the surface is not attached to a pty host (the in-process `.exec`
+    /// backend, or a pty-host client that has not yet been assigned an id).
+    /// Slice 5b: the GUI reads this at restorable-state encode time to persist
+    /// the id and reattach after a restart. Reads a lock-free atomic, so it is
+    /// safe to call from the apprt/main thread.
+    export fn ghostty_surface_session_id(surface: *Surface) u64 {
+        return surface.core_surface.sessionId();
     }
 
     /// Returns true if the surface process has exited.

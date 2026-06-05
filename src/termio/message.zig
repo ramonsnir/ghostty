@@ -50,6 +50,11 @@ pub const Message = union(enum) {
         history: bool,
     },
 
+    /// Phase D: terminal full reset. Under .exec this message is never enqueued
+    /// (Surface resets the local terminal directly); under .client the Client
+    /// sends a `reset` frame so the host runs fullReset on its real terminal.
+    reset: void,
+
     /// Scroll the viewport
     scroll_viewport: terminal.Terminal.ScrollViewport,
 
@@ -61,6 +66,24 @@ pub const Message = union(enum) {
 
     /// Jump forward/backward n prompts.
     jump_to_prompt: isize,
+
+    /// Slice B1: GUI->host drag-select. Carries only the VIEWPORT geometry of
+    /// the current drag selection (anchor + head cells + rectangle flag); the
+    /// Client fills in the session_id when building the wire frame. Under .exec
+    /// this is a no-op (the Surface drives the local terminal selection
+    /// directly); under .client the Client sends a `selection_drag` frame.
+    selection_drag: SelectionDrag,
+
+    /// Slice B1: GUI->host clear the selection. .exec no-op; .client sends a
+    /// `selection_clear` frame.
+    selection_clear: void,
+
+    /// Slice B2: GUI->host word/line/all select-point. Carries a single click
+    /// POINT (viewport coords) plus a granularity mode; the Client fills in the
+    /// session_id when building the wire frame. Under .exec this is a no-op (the
+    /// Surface drives the local terminal selection directly); under .client the
+    /// Client sends a `selection_point` frame.
+    selection_point: SelectionPoint,
 
     /// Send this when a synchronized output mode is started. This will
     /// start the timer so that the output mode is disabled after a
@@ -95,6 +118,37 @@ pub const Message = union(enum) {
 
     /// The types of size reports that we support.
     pub const SizeReport = terminal.size_report.Style;
+
+    /// Slice B1: the VIEWPORT geometry of a drag selection. Plain scalars (no
+    /// protocol import here) — the Client maps these onto the wire
+    /// `protocol.SelectionDrag`, filling session_id from its atomic load.
+    pub const SelectionDrag = struct {
+        anchor_x: u16,
+        anchor_y: u16,
+        head_x: u16,
+        head_y: u16,
+        rectangle: bool,
+    };
+
+    /// Slice B2: a single click POINT (viewport coords) plus a granularity mode
+    /// for word/line/all select. Plain scalars (no protocol import here) — the
+    /// Client maps these onto the wire `protocol.SelectionPoint`, filling
+    /// session_id from its atomic load. `mode` matches protocol.SelectionPoint's
+    /// mode_word/mode_line/mode_all constants.
+    pub const SelectionPoint = struct {
+        x: u16,
+        y: u16,
+        mode: u8,
+
+        /// Granularity mode constants. Kept in lock-step with
+        /// `protocol.SelectionPoint.mode_word/mode_line/mode_all` (the Client
+        /// copies `mode` onto the wire frame verbatim). Mirrored here so GUI
+        /// call sites (Surface.zig) can name the mode without importing the
+        /// host protocol module.
+        pub const mode_word: u8 = 0;
+        pub const mode_line: u8 = 1;
+        pub const mode_all: u8 = 2;
+    };
 };
 
 test {
