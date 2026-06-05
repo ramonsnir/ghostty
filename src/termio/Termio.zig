@@ -636,6 +636,19 @@ pub fn selectionClear(self: *Termio, td: *ThreadData) !void {
     try self.backend.selectionClear(td);
 }
 
+/// Slice B2: route a word/line/all select-point to the backend. .exec is a
+/// no-op (the Surface drives the local terminal selection directly); .client
+/// sends a `selection_point` frame so the host runs selectWord/selectLine/
+/// selectAll on ITS terminal, with the result riding the existing selection_text
+/// + GridFrame row.selection path.
+pub fn selectionPoint(
+    self: *Termio,
+    td: *ThreadData,
+    pt: termio.Message.SelectionPoint,
+) !void {
+    try self.backend.selectionPoint(td, pt);
+}
+
 /// Called when focus is gained or lost (when focus events are enabled)
 pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.lock();

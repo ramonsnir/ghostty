@@ -123,6 +123,15 @@ pub const FrameType = enum(u8) {
     // The GUI caches {present, text}. The selection HIGHLIGHT itself rides the
     // existing grid_frame as row.selection — this frame carries only the text.
     selection_text,
+    // --- Slice B2: host-authoritative word/line/all select ---
+    // GUI->host: a single click POINT (viewport coords) plus a granularity mode
+    // (word/line/all) that the host EXPANDS via selectWord/selectLine/selectAll
+    // on ITS terminal. Distinct from selection_drag (which carries a two-coord
+    // span) because these are a point + granularity that the host snaps to a
+    // boundary. The resulting selection rides the existing selection_text +
+    // grid_frame row.selection path (no new host->GUI frame). Appended at the
+    // END of the enum so all prior tag integers (incl selection_text) stay stable.
+    selection_point,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -824,6 +833,63 @@ pub const SelectionDrag = struct {
 /// GUI->host: clear the host selection (`screens.active.select(null)`). Same
 /// shape as Detach/Close.
 pub const SelectionClear = SessionIdFrame(.selection_clear);
+
+/// GUI->host (Slice B2): a single click POINT in VIEWPORT coords plus a
+/// granularity `mode` (word/line/all) that the host EXPANDS via
+/// selectWord/selectLine/selectAll. Distinct from SelectionDrag (a two-coord
+/// span); here the host snaps a single point to a word/line boundary, or for
+/// `all` ignores the point entirely and selects the full screen incl scrollback.
+/// `mode` is a u8 (not a native enum) so an unknown byte from a desynced peer is
+/// droppable (toMode() returns null) rather than an illegal cast. Fixed-width:
+/// [u64 session_id][u16 x][u16 y][u8 mode] = 13 payload bytes (LE in-frame).
+pub const SelectionPoint = struct {
+    session_id: u64,
+    x: u16 = 0,
+    y: u16 = 0,
+    mode: u8 = 0,
+
+    pub const mode_word: u8 = 0;
+    pub const mode_line: u8 = 1;
+    pub const mode_all: u8 = 2;
+
+    /// Recover the granularity enum. Returns null for an unknown mode byte (a
+    /// desynced/buggy peer) so the dispatcher can drop it rather than panic.
+    /// Mirrors ScrollViewport.toTarget's null-on-garbage pattern.
+    pub fn toMode(self: SelectionPoint) ?enum { word, line, all } {
+        return switch (self.mode) {
+            mode_word => .word,
+            mode_line => .line,
+            mode_all => .all,
+            else => null,
+        };
+    }
+
+    pub fn encode(self: SelectionPoint, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeInt(w, u16, self.x);
+        try writeInt(w, u16, self.y);
+        try w.writeByte(self.mode);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !SelectionPoint {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .x = try readInt(r, u16),
+            .y = try readInt(r, u16),
+            .mode = try r.readByte(),
+        };
+    }
+
+    pub fn deinit(self: *SelectionPoint, _: Allocator) void {
+        self.* = undefined;
+    }
+};
 
 /// host->GUI: the current selection TEXT so the GUI copies with no sync
 /// round-trip. `present`=false means the selection was cleared (text is empty).

@@ -1092,6 +1092,143 @@ test "host selectDrag selects the right cells -> row.selection + selectionString
     }
 }
 
+test "protocol SelectionPoint round-trip + toMode + bounds (host client) Slice B2" {
+    const alloc = testing.allocator;
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // Fixed-width round-trip across all three granularity modes.
+    inline for (.{
+        protocol.SelectionPoint.mode_word,
+        protocol.SelectionPoint.mode_line,
+        protocol.SelectionPoint.mode_all,
+    }) |mode| {
+        const orig: protocol.SelectionPoint = .{
+            .session_id = 42,
+            .x = 7,
+            .y = 3,
+            .mode = mode,
+        };
+        const framed = try protocol.encodeFrame(alloc, .selection_point, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.selection_point, tag);
+        const dec = try protocol.SelectionPoint.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+        try testing.expect(dec.toMode() != null);
+    }
+
+    // toMode() returns null for an unknown mode byte (desynced/garbage peer) so
+    // the dispatcher drops it rather than panicking on an illegal enum cast.
+    {
+        const bad: protocol.SelectionPoint = .{ .session_id = 1, .mode = 99 };
+        try testing.expect(bad.toMode() == null);
+    }
+
+    // decode of a too-short payload errors (no panic): drop the 1-byte mode.
+    {
+        const orig: protocol.SelectionPoint = .{ .session_id = 9, .x = 1, .y = 2, .mode = 0 };
+        const framed = try protocol.encodeFrame(alloc, .selection_point, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.selection_point, tag);
+        // Lop off the trailing mode byte -> short payload.
+        const truncated = payload.items[0 .. payload.items.len - 1];
+        try testing.expectError(error.EndOfStream, protocol.SelectionPoint.decode(alloc, truncated));
+    }
+}
+
+test "host selectPoint word + line snap on the real terminal -> selection_text (client) Slice B2" {
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    // "hello world": cols 0-4 "hello", 5 space, 6-10 "world".
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("hello world");
+    }
+
+    var capture: SelTextCapture = .{};
+    defer capture.text.deinit(alloc);
+    session.on_selection_text_ctx = &capture;
+    session.on_selection_text = SelTextCapture.cb;
+
+    // WORD: a click at col 8 (inside "world") snaps to the whole word.
+    try session.selectPoint(8, 0, protocol.SelectionPoint.mode_word);
+    // Staged, not broadcast synchronously (SEL-1 / SEL-LOCK-1) — same as selectDrag.
+    try testing.expect(!capture.fired);
+    try testing.expect(session.sel_text_dirty);
+    _ = try session.renderTick();
+    try testing.expect(capture.fired);
+    try testing.expect(capture.present);
+    try testing.expectEqualStrings("world", capture.text.items);
+    // Staging consumed after the drain.
+    try testing.expect(!session.sel_text_dirty);
+    try testing.expect(session.sel_text == null);
+    // The viewport highlight rides row.selection on row 0.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var snap = try session.captureSnapshotLocked(alloc);
+        defer snap.deinit(alloc);
+        const sel = snap.row_data[0].selection;
+        try testing.expect(sel != null);
+        try testing.expectEqual(@as(u16, 6), sel.?[0]);
+        try testing.expectEqual(@as(u16, 10), sel.?[1]);
+    }
+
+    // LINE: a click anywhere on row 0 snaps to the whole line; the text contains
+    // the full line content.
+    capture.fired = false;
+    try session.selectPoint(0, 0, protocol.SelectionPoint.mode_line);
+    _ = try session.renderTick();
+    try testing.expect(capture.fired);
+    try testing.expect(capture.present);
+    try testing.expect(std.mem.indexOf(u8, capture.text.items, "hello world") != null);
+}
+
+test "host selectPoint all spans SCROLLBACK -> copy text without R3 (client) Slice B2" {
+    const alloc = testing.allocator;
+
+    // Small viewport, lots of lines -> the oldest lines live in scrollback,
+    // OUTSIDE the viewport mirror. This proves select-all COPY works without R3
+    // (the host's selectAll + selectionString cover the full screen); only the
+    // HIGHLIGHT is viewport-limited (deferred).
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 4 });
+    defer session.destroy();
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        var i: usize = 0;
+        while (i < 30) : (i += 1) {
+            var lb: [8]u8 = undefined;
+            const line = try std.fmt.bufPrint(&lb, "L{d:0>2}", .{i});
+            try session.io.terminal.printString(line);
+            session.io.terminal.carriageReturn();
+            try session.io.terminal.linefeed();
+        }
+    }
+
+    var capture: SelTextCapture = .{};
+    defer capture.text.deinit(alloc);
+    session.on_selection_text_ctx = &capture;
+    session.on_selection_text = SelTextCapture.cb;
+
+    // mode_all ignores x/y; selects the full screen incl scrollback.
+    try session.selectPoint(0, 0, protocol.SelectionPoint.mode_all);
+    _ = try session.renderTick();
+    try testing.expect(capture.fired);
+    try testing.expect(capture.present);
+    // The oldest line (L00) is in SCROLLBACK (viewport shows only the last 4),
+    // yet it is present in the select-all copy text. And a recent line too.
+    try testing.expect(std.mem.indexOf(u8, capture.text.items, "L00") != null);
+    try testing.expect(std.mem.indexOf(u8, capture.text.items, "L29") != null);
+}
+
 test "host SurfaceEvent frame round-trip across representative variants (Slice 6)" {
     // encode -> partial-read -> decode -> equal, across a void variant, a bool,
     // an enum, the set_title fixed buffer, a WriteReq-bearing one (pwd_change),

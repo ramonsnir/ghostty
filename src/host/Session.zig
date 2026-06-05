@@ -32,6 +32,7 @@ const Config = configpkg.Config;
 const internal_os = @import("../os/main.zig");
 const Surface = @import("../Surface.zig");
 
+const protocol = @import("protocol.zig");
 const RenderState = @import("RenderState.zig");
 /// The core terminal RenderState (the transient flatten target). Distinct from
 /// the host `RenderState` module above, which is the pointer-free Snapshot
@@ -698,6 +699,70 @@ pub fn selectClear(self: *Session) !void {
     try self.io.terminal.screens.active.select(null);
     self.selection_dirty = true;
     self.stagePendingSelectionTextLocked(false, null);
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// Slice B2: host-authoritative word/line/all select. `mode` is the wire
+/// granularity byte (protocol.SelectionPoint.mode_word/line/all); for word/line
+/// (x, y) is a VIEWPORT coord that the host snaps to a boundary via
+/// selectWord/selectLine, for all (x, y) are ignored and selectAll covers the
+/// full screen INCLUDING scrollback. Copies selectDrag's lock/stage/wakeup
+/// discipline EXACTLY (findings SEL-1 / SEL-LOCK-1): the row.selection highlight
+/// rides the forced GridFrame and the copy text rides a staged selection_text,
+/// both drained + broadcast by renderTick on the owning thread off
+/// registry_mutex. An out-of-viewport word/line point is DROPPED (prior
+/// selection kept), mirroring selectDrag's `orelse return`.
+pub fn selectPoint(self: *Session, x: u16, y: u16, mode: u8) !void {
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+
+        const screen = self.io.terminal.screens.active;
+
+        // Map the wire mode byte to the granularity; an unknown byte is a
+        // desynced/garbage peer — drop rather than panic (the dispatch arm
+        // already guards, this is belt-and-suspenders).
+        const SP = protocol.SelectionPoint;
+        const sel: ?terminalpkg.Selection = switch (mode) {
+            SP.mode_word => blk: {
+                const pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse {
+                    // Out-of-viewport (desynced/garbled): drop, keep prior
+                    // selection + its cached text (same as selectDrag).
+                    return;
+                };
+                break :blk screen.selectWord(
+                    pin,
+                    self.config.@"selection-word-chars".codepoints,
+                );
+            },
+            SP.mode_line => blk: {
+                const pin = screen.pages.pin(.{ .viewport = .{ .x = x, .y = y } }) orelse return;
+                // Defaults match the .exec triple-click line select.
+                break :blk screen.selectLine(.{ .pin = pin });
+            },
+            // selectAll needs no point; it covers the full screen incl scrollback.
+            SP.mode_all => screen.selectAll(),
+            else => return, // unknown mode byte: drop (belt-and-suspenders)
+        };
+
+        // selectWord/selectLine/selectAll return null on an empty cell / blank
+        // screen — treat as no selection.
+        if (sel) |s| {
+            try screen.select(s);
+        } else {
+            try screen.select(null);
+        }
+        // Force the next frame even if the selected cells didn't change.
+        self.selection_dirty = true;
+
+        // Extract + stage the selection text under the lock (SEL-1 / SEL-LOCK-1).
+        if (screen.selection) |s2| {
+            const text = try screen.selectionString(self.alloc, .{ .sel = s2, .trim = false });
+            self.stagePendingSelectionTextLocked(true, text);
+        } else {
+            self.stagePendingSelectionTextLocked(false, null);
+        }
+    }
     self.renderer_wakeup.notify() catch {};
 }
 

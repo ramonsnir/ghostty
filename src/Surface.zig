@@ -2565,6 +2565,22 @@ fn sendSelectionToHost(self: *Surface, sel_: ?terminal.Selection) void {
     } }, .locked);
 }
 
+/// Slice B2: `.client` only — forward a single click POINT (viewport coords)
+/// plus a granularity `mode` (word/line/all) to the host, which EXPANDS it via
+/// selectWord/selectLine/selectAll on ITS terminal. The resulting selection
+/// rides the existing mirror path: the next GridFrame carries row.selection (the
+/// viewport highlight) and a `selection_text` frame carries the copy text — no
+/// new host->GUI frame. For `mode_all` the host ignores x/y (the GUI sends 0,0).
+/// Same `.locked` queue routing as `sendSelectionToHost` — the caller already
+/// holds the renderer mutex.
+fn sendSelectionPointToHost(self: *Surface, x: u16, y: u16, mode: u8) void {
+    self.queueIo(.{ .selection_point = .{
+        .x = x,
+        .y = y,
+        .mode = mode,
+    } }, .locked);
+}
+
 /// Slice B1: copy the host-cached selection text (already resolved host-side)
 /// to the given clipboards. `.client` only — used by ⌘C / copy_on_select when
 /// the local terminal is the empty mirror. Plain text only (B1 common case; the
@@ -4391,8 +4407,32 @@ pub fn mouseButtonCallback(
                         self.sendSelectionToHost(null);
                         try self.queueRender();
                     }
+                } else {
+                    // Slice B2: a multi-click press (count 2 = word, 3 = line)
+                    // is word/line granularity that only the host can compute
+                    // (the `.client` local terminal is the empty mirror). We
+                    // forward the click POINT + granularity to the host, which
+                    // snaps it to a word/line boundary via selectWord/selectLine
+                    // and ships the result back via the existing mirror path
+                    // (row.selection highlight on the next GridFrame + a
+                    // selection_text frame for copy). The count==2 URL override
+                    // (linkAtPin above) only matters for .exec — the .client
+                    // mirror has no link data, so we always do plain word-select
+                    // here (OSC8/regex link selection text is R3-deferred).
+                    //
+                    // Recover the viewport coords from the in-scope `pin` (the
+                    // `pt_viewport` local is scoped to the `pin:` block above and
+                    // is unreachable here) the SAME way sendSelectionToHost does.
+                    const pt = screen.pages.pointFromPin(.viewport, pin) orelse break :click;
+                    const vp = pt.coord();
+                    const mode: u8 = switch (self.mouse.selection_gesture.left_click_count) {
+                        2 => termio.Message.SelectionPoint.mode_word,
+                        3 => termio.Message.SelectionPoint.mode_line,
+                        else => unreachable, // bounded 1..3; 1 handled above
+                    };
+                    self.sendSelectionPointToHost(@intCast(vp.x), @intCast(vp.y), mode);
+                    try self.queueRender();
                 }
-                // count>=2 (word/line): B2 — no-op under .client.
             },
         }
     }
@@ -6020,14 +6060,31 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            // Slice B1 deferral: under .client this selects the EMPTY local
-            // mirror (no host highlight, copy yields nothing). select-all is B2
-            // (it also needs R3 scrollback history host-side). Left as the
-            // already-broken local no-op under .client; unchanged for .exec.
-            const sel = self.io.terminal.screens.active.selectAll();
-            if (sel) |s| {
-                try self.setSelection(s);
-                try self.queueRender();
+            switch (self.io.backend) {
+                .exec => {
+                    const sel = self.io.terminal.screens.active.selectAll();
+                    if (sel) |s| {
+                        try self.setSelection(s);
+                        try self.queueRender();
+                    }
+                },
+                .client => {
+                    // Slice B2: select-all is host-authoritative. The local
+                    // mirror is the EMPTY viewport-only terminal, so we forward
+                    // a `mode_all` select-point (x/y ignored host-side); the
+                    // host's selectAll() covers the FULL screen INCLUDING
+                    // SCROLLBACK and selectionString extracts the full text, so
+                    // COPY works without R3. The visual HIGHLIGHT, however, is
+                    // viewport-scoped: the mirror only carries viewport rows, so
+                    // row.selection highlights stop at the viewport edge.
+                    // Cross-scrollback highlight rendering is R3-DEFERRED.
+                    self.sendSelectionPointToHost(
+                        0,
+                        0,
+                        termio.Message.SelectionPoint.mode_all,
+                    );
+                    try self.queueRender();
+                },
             }
         },
 
