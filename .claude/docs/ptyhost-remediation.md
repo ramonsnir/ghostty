@@ -82,7 +82,27 @@ select-all (boundary-snap + select-all needs history/R3); rich copy formats
 accessibility readout. **Unverified:** right-click → Copy was routed but not
 smoke-tested (user doesn't use it) — confirm in B2.
 
-## Phase B2 (remaining selection) — Selection tail, host-authoritative (R1; select-all needs R3).
+## Phase B2 — DONE + smoke-validated (commit `4c5e080f3`).
+
+Host-authoritative word / line / select-all selection + copy. New `selection_point`
+protocol frame (GUI->host: viewport point + granularity mode word/line/all); the host
+runs selectWord/selectLine/selectAll on its REAL terminal and ships the result via the
+existing mirror path (row.selection highlight + `selection_text` for copy), copying
+selectDrag's lock/stage/wakeup discipline. **Smoke-confirmed:** double-click word,
+triple-click line, and **select-all + ⌘C yielding the full buffer INCLUDING scrollback**
+(the select-all-copy-without-R3 result: host selectAll + selectionString span history;
+only the cross-scrollback visual HIGHLIGHT is viewport-limited / R3-deferred). Opus
+plan+impl, main-loop tests, independent Opus review (exec-unchanged / lock-safety /
+protocol all clean).
+
+**Deferred (explicitly, not silently):** right-click→Copy (B1 routed it but it is
+non-functional — DE-PRIORITIZED by the user, low value); `copy_url`/regex-link
+selection text; `search_selection` seed; selection autoscroll; rich-copy (HTML/VT
+color) metadata; deep-press word select; cross-scrollback selection HIGHLIGHT (R3).
+
+(historical detail of Phase B2 below kept for reference.)
+
+## Phase B2 (detail) — Selection tail, host-authoritative (R1; select-all needs R3).
 
 Make selection a host-driven operation: GUI gesture machinery stays GUI-side but
 forwards intent (drag coords, click-count for word/line, select-all) to the host;
