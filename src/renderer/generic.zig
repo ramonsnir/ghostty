@@ -1174,9 +1174,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer state.mutex.unlock();
 
                 // If we're in a synchronized output state, we pause all rendering.
-                if (state.terminal.modes.get(.synchronized_output)) {
-                    log.debug("synchronized output started, skipping render", .{});
-                    return;
+                //
+                // Phase 2b: under a client mirror, synchronized-output pausing
+                // is a HOST-SIDE concern (the host pauses and simply doesn't
+                // ship frames); the client renders exactly what arrives and must
+                // not read the (foreign / sentinel) live Terminal modes here.
+                if (state.mirror == null) {
+                    if (state.terminal.modes.get(.synchronized_output)) {
+                        log.debug("synchronized output started, skipping render", .{});
+                        return;
+                    }
                 }
 
                 // If scroll-to-bottom on output is enabled, check if the final line
@@ -1184,7 +1191,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // y offset changed, new content was added to the screen.
                 // Update this BEFORE we update our render state so we can
                 // draw the new scrolled data immediately.
-                if (self.config.scroll_to_bottom_on_output) scroll: {
+                //
+                // Phase 2b: SKIPPED under a client mirror — this is one of the
+                // two host-side WRITES (it mutates the live Terminal viewport via
+                // scrollViewport). Scroll-to-bottom is computed host-side and is
+                // already reflected in the shipped mirror's viewport; the renderer
+                // must never mutate the mirror's foreign/absent Terminal.
+                if (state.mirror == null and self.config.scroll_to_bottom_on_output) scroll: {
                     const br = state.terminal.screens.active.pages.getBottomRight(.screen) orelse break :scroll;
 
                     // If the pin hasn't changed, then don't scroll.
@@ -1199,12 +1212,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
-                // Update our terminal state
-                try self.terminal_state.update(self.alloc, state.terminal);
+                // Update our terminal state.
+                //
+                // Phase 2b: under a client mirror, copy the host-supplied mirror
+                // into our LOCAL terminal_state (an owned snapshot taken while the
+                // mutex is held), so the downstream draw pipeline (which runs
+                // AFTER we unlock) never aliases or mutates host-owned memory.
+                // Under .exec this is the unchanged `update(state.terminal)` path.
+                //
+                // LOCK DOMAINS RECONCILED (Slice 3d): this copyFrom reads the
+                // mirror under renderer_state.mutex, and termio.Client writes it
+                // (in handleFrame) under the SAME mutex — shared by pointer via
+                // Client.Config.render_mutex, so writer/reader are serialized on
+                // one lock (see the lock invariant on renderer.State.mirror).
+                // Dormant today: state.mirror is always null under .exec.
+                if (state.mirror) |mirror| {
+                    try self.terminal_state.copyFrom(self.alloc, mirror);
+                } else {
+                    try self.terminal_state.update(self.alloc, state.terminal);
+                }
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
-                if (self.terminal_state.dirty != .false) {
+                //
+                // Phase 2b: SKIPPED under a client mirror — this is the second
+                // host-side WRITE (it marks the live Terminal's search dirty flag
+                // so the IO thread re-runs viewport search). Search viewport
+                // dirtiness is host-side state; 3b ships search highlights on the
+                // GridFrame rows instead.
+                if (state.mirror == null and self.terminal_state.dirty != .false) {
                     state.terminal.flags.search_viewport_dirty = true;
                 }
 
@@ -1213,7 +1249,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // naturally limits the number of calls to this method (it
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
-                const scrollbar = state.terminal.screens.active.pages.scrollbar();
+                //
+                // Phase 2b: under a client mirror, reading the live Terminal is
+                // wrong-source and the mirror/GridFrame does not carry scrollbar
+                // extent yet, so use the default (empty) scrollbar. 3b will
+                // restore this host-side (host-shipped scrollbar extent).
+                const scrollbar: terminal.Scrollbar = if (state.mirror == null)
+                    state.terminal.screens.active.pages.scrollbar()
+                else
+                    .zero;
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {
@@ -1228,7 +1272,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                //
+                // Phase 2b: SKIPPED under a client mirror — Kitty graphics read
+                // the live Terminal (wrong-source), and the client image mirror
+                // is empty this phase. Host-shipped image state is a later-phase
+                // restore.
+                if (state.mirror == null and self.images.kittyRequiresUpdate(state.terminal)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lock();
@@ -1246,6 +1295,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Get our OSC8 links we're hovering if we have a mouse.
                 // This requires terminal state because of URLs.
                 const links: terminal.RenderState.CellSet = osc8: {
+                    // Phase 2b / Slice 3c: under a client mirror,
+                    // RenderState.linkCells dereferences row.pin, which is the
+                    // deliberately-poisoned `invalid_pin` sentinel and MUST NOT
+                    // be dereferenced. So instead of computing OSC8 links here
+                    // we use the HOST-computed set (shipped on a LinkFrame,
+                    // decoded by termio.Client into a CellSet, threaded in via
+                    // `state.link_cells`). We CLONE it into the per-frame arena
+                    // so the downstream regex `renderCellMap` can extend it
+                    // without mutating the Client-owned set (and so its arena
+                    // lifetime matches the linkCells path). `usesLivePinPaths()`
+                    // is the shared gate predicate (see renderer/State.zig); the
+                    // wiring test pins it too. Regex links are added for BOTH
+                    // backends below (renderCellMap, against the mirror cells).
+                    if (!state.usesLivePinPaths()) {
+                        const host_set = state.link_cells orelse break :osc8 .empty;
+                        const cloned = host_set.clone(arena_alloc) catch |err| {
+                            log.warn("error cloning host OSC8 link set err={}", .{err});
+                            break :osc8 .empty;
+                        };
+                        break :osc8 cloned;
+                    }
+
                     // If our mouse isn't hovering, we have no links.
                     const vp = state.mouse.point orelse break :osc8 .empty;
 
@@ -1292,7 +1363,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             };
 
             // Clear our highlight state and update.
-            if (self.search_matches_dirty or self.terminal_state.dirty != .false) {
+            //
+            // Phase 2b: 3b will restore search highlights host-side (shipped on
+            // the GridFrame rows). The whole block is SKIPPED under a client
+            // mirror because updateHighlightsFlattened dereferences row.pin,
+            // which is the poisoned `invalid_pin` sentinel in the mirror and
+            // must not be dereferenced. `usesLivePinPaths()` is the shared gate
+            // predicate (see renderer/State.zig); the wiring test pins it too.
+            if (state.usesLivePinPaths() and
+                (self.search_matches_dirty or self.terminal_state.dirty != .false))
+            {
                 self.search_matches_dirty = false;
 
                 // Clear the prior highlights
@@ -2774,7 +2854,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (x_compare >= hl.range[0] and
                             x_compare <= hl.range[1])
                         {
-                            const tag: HighlightTag = @enumFromInt(hl.tag);
+                            // hl.tag originates from an untrusted wire byte under
+                            // .client (host RenderState.Highlight.tag is a u8). A
+                            // bare @enumFromInt on an out-of-range value is illegal
+                            // behavior — a checked panic in safe builds and UB in
+                            // ReleaseFast, on this render hot path. The host
+                            // deserialize already drops out-of-range tags, but
+                            // validate here too (defense-in-depth on the actual UB
+                            // site): an unknown tag simply doesn't highlight.
+                            const tag = std.meta.intToEnum(HighlightTag, hl.tag) catch
+                                continue;
                             break :selected switch (tag) {
                                 .search_match => .search,
                                 .search_match_selected => .search_selected,

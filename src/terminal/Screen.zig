@@ -5818,6 +5818,40 @@ test "Screen: resize (no reflow) less rows" {
     }
 }
 
+test "Screen: resize reflow shrink cols+rows with cursor below new rows (PageList.resizeCols underflow regression)" {
+    // Reproduce-first regression for an integer-overflow panic in
+    // PageList.resizeCols (`remaining_rows = self.rows - c.y - 1`). Path: a
+    // resize that BOTH shrinks columns (-> the `.lt` reflow branch) and shrinks
+    // rows. The `.lt` branch runs resizeWithoutReflow FIRST (so self.rows is
+    // already the new, smaller count) and only then resizeCols, which reads the
+    // OLD cursor y. Screen.resize always passes `.pin = self.cursor.page_pin`,
+    // so resizeCols' `orelse break :cursor null` out-of-range guard is bypassed
+    // and the raw c.y is used: when c.y >= new self.rows the unsigned subtraction
+    // underflows and panics. This is exactly the reattach crash — the GUI's
+    // post-reattach resize flood shrank a tab whose shell cursor sat near the old
+    // bottom, taking down the whole host (all sessions). The fix makes the
+    // subtraction saturating (`-|`), matching the already-saturating downstream
+    // grow loop; remaining_rows is 0 when the cursor is at/below the new bottom,
+    // which is correct (no rows beneath it to preserve). Pre-fix: panic here.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 8, .max_scrollback = 100 });
+    defer s.deinit();
+    // 8 lines, no trailing newline -> cursor lands on the last row (y == 7),
+    // which will exceed the new row count (3) after the shrink.
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST\n6UVWX\n7YZ01\n8abcd");
+    try testing.expectEqual(@as(usize, 7), s.cursor.y);
+
+    // Shrink BOTH cols (10 -> 5, forces the `.lt` reflow branch) and rows
+    // (8 -> 3, so the old cursor y=7 >= new rows=3). Pre-fix this panicked.
+    try s.resize(.{ .cols = 5, .rows = 3, .reflow = true });
+    try testing.expectEqual(@as(usize, 5), s.pages.cols);
+    try testing.expectEqual(@as(usize, 3), s.pages.rows);
+    // Cursor is clamped into the new active area (no underflow, no panic).
+    try testing.expect(s.cursor.y < 3);
+}
+
 test "Screen: resize (no reflow) less rows trims blank lines" {
     const testing = std.testing;
     const alloc = testing.allocator;

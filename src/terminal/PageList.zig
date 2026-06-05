@@ -1059,7 +1059,17 @@ fn resizeCols(
         break :cursor .{
             .tracked_pin = c.pin orelse try self.trackPin(p),
             .untrack = c.pin == null,
-            .remaining_rows = self.rows - c.y - 1,
+            // Saturating subtraction (matches the saturating `-|` consumers of
+            // `remaining_rows` in the preserved-cursor grow loop below). When a
+            // caller passes an explicit cursor pin (Screen.resize always does),
+            // the `orelse break :cursor null` out-of-range guard above is
+            // bypassed, so c.y may exceed self.rows here — notably in the `.lt`
+            // branch, where resizeWithoutReflow has ALREADY shrunk self.rows
+            // before this runs, while c.y is still the pre-resize cursor row.
+            // A cursor at/below the new bottom has zero rows beneath it to
+            // preserve, so 0 is correct; a plain `-` underflowed and panicked
+            // (reattach resize-flood host crash; see Screen.zig regression test).
+            .remaining_rows = self.rows -| c.y -| 1,
             .wrapped_rows = wrapped,
         };
     } else null;

@@ -177,6 +177,13 @@ extension Ghostty {
         /// of the SwiftUI view hierarchy, for example when changing splits
         var scrollbar: Ghostty.Action.Scrollbar?
 
+        /// (phase 2b) The PTY-host session id this surface is attached to, if any.
+        /// Captured from the base config at init and persisted via the `sessionID`
+        /// Codable key so that on GUI relaunch we can ask the host to reattach to
+        /// the same live session. nil when the host is not in use (e.g. `.exec`
+        /// backend) or for surfaces restored from pre-2b (v5/v7) archives.
+        private(set) var sessionID: String?
+
         // Notification identifiers associated with this surface
         var notificationIdentifiers: Set<String> = []
 
@@ -348,6 +355,12 @@ extension Ghostty {
 
             // Setup our surface. This will also initialize all the terminal IO.
             let surface_cfg = baseConfig ?? SurfaceConfiguration()
+
+            // (phase 2b) Remember the host session id (if any) so it round-trips
+            // through restorable state. nil unless a `.client`-backed reattach
+            // config carried one in.
+            self.sessionID = surface_cfg.sessionID
+
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }
@@ -1851,6 +1864,7 @@ extension Ghostty {
             case uuid
             case title
             case isUserSetTitle
+            case sessionID
         }
 
         required convenience init(from decoder: Decoder) throws {
@@ -1867,6 +1881,13 @@ extension Ghostty {
             config.workingDirectory = try container.decode(String?.self, forKey: .pwd)
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
+
+            // (phase 2b) Carry the host PTY session id through to the surface
+            // config so the `.client` backend can attempt to reattach. Absent
+            // in v5/v7 archives (and whenever the host was not in use), so this
+            // reads nil there and we fall back to a fresh spawn — today's
+            // layout-only restore.
+            config.sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -1886,6 +1907,19 @@ extension Ghostty {
             try container.encode(id.uuidString, forKey: .uuid)
             try container.encode(title, forKey: .title)
             try container.encode(titleFromTerminal != nil, forKey: .isUserSetTitle)
+            // (phase 2b) Persist the host session id for reattach. Prefer the
+            // LIVE host-assigned id (Slice 5b's ghostty_surface_session_id) over
+            // the init-time `sessionID`, so a FRESHLY-spawned `.client` session
+            // (whose id the host assigned at attach) is the one that round-trips
+            // — not the nil/old value it started with. Falls back to the stored
+            // `sessionID` if the surface is gone or returns 0 (`.exec` /
+            // unattached). Only emitted when an id is present, so `.exec`
+            // archives stay byte-for-byte unchanged.
+            let liveSessionID: String? = surface.flatMap { s in
+                let id = ghostty_surface_session_id(s)
+                return id != 0 ? String(id) : nil
+            }
+            try container.encodeIfPresent(liveSessionID ?? sessionID, forKey: .sessionID)
         }
     }
 }

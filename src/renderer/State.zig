@@ -14,7 +14,61 @@ const renderer = @import("../renderer.zig");
 mutex: *std.Thread.Mutex,
 
 /// The terminal data.
+///
+/// Under the `.exec` backend this is the live Terminal and is the source the
+/// renderer's `updateFrame` reads to populate its local draw state via
+/// `RenderState.update`. Always present.
 terminal: *terminalpkg.Terminal,
+
+/// Optional host-supplied draw-source mirror (Phase 2b / `.client` backend).
+///
+/// Under the `.client` backend the GUI process does not own a live Terminal;
+/// instead a `termio.Client` decodes host frames into a `RenderState` mirror
+/// (`Client.render_state`) held under the Client mutex. When this is non-null,
+/// `updateFrame` populates its local draw state from this mirror (via
+/// `RenderState.copyFrom`) INSTEAD of from `terminal`, and the host-side
+/// writes / pin-dereferencing paths in `updateFrame` are gated off (see the
+/// `state.mirror == null` guards there).
+///
+/// `null` under `.exec` — in which case `updateFrame` behaves exactly as it
+/// did before Phase 2b (byte-for-byte). Slice 4 is what threads a non-null
+/// mirror through here; today this is always null in Surface.zig.
+///
+/// LOCK INVARIANT (RECONCILED in Slice 3d): `updateFrame` reads this mirror
+/// (via `RenderState.copyFrom`) while holding `renderer_state.mutex`. The
+/// `termio.Client` WRITES the mirror in `handleFrame` under the SAME
+/// `*std.Thread.Mutex` — Slice 3d had the Client guard its mirror under the
+/// renderer-state mutex (shared by pointer via `Client.Config.render_mutex` /
+/// `Client.setRenderMutex`), so writer (read thread) and reader (render thread)
+/// are fully serialized on one lock. There is no recursive-lock / lock-order
+/// inversion: `updateFrame` reads the mirror DIRECTLY and never calls a Client
+/// method while holding the mutex. What remains for Slice 4: (1) select
+/// `.client` at `Surface.zig` (it is hardcoded `.exec` today), (2) thread a
+/// non-null `mirror`/`link_cells` pointer through here from `Surface.zig`, and
+/// (3) ensure the shared mutex is set on the Client (the plumbing —
+/// `Client.Config.render_mutex = renderer_state.mutex` — is already in place in
+/// `Surface.init`). This field is still always null today (`.exec`).
+mirror: ?*terminalpkg.RenderState = null,
+
+/// Optional host-computed OSC8 link-cell set (Phase 2b / Slice 3c, `.client`
+/// backend). Under `.client` the mirror's pins are poisoned, so the GUI cannot
+/// run `RenderState.linkCells`; instead the host computes the OSC8 link cells
+/// (its pins are live) and ships them on a LinkFrame, the `termio.Client`
+/// decodes them into its `osc8_links` CellSet, and this points at that set.
+/// `updateFrame`'s osc8 block reads THIS instead of calling `linkCells` when
+/// `usesLivePinPaths()` is false (see `generic.zig`). Regex links are NOT here
+/// — `Set.renderCellMap` matches the mirror's cell text and runs for both
+/// backends.
+///
+/// `null` under `.exec` (the `linkCells` path is used, byte-for-byte
+/// unchanged). Like `mirror`, Slice 4 is what threads a non-null value through
+/// here from `Surface.zig`; today this is always null.
+///
+/// LOCK NOTE (RECONCILED in Slice 3d): same as `mirror` — the Client writes
+/// `osc8_links` under the renderer-state mutex (shared by pointer), the SAME
+/// lock the renderer reads it under, so the two are serialized. Slice 4 only
+/// has to thread a non-null pointer through here (see the mirror field's note).
+link_cells: ?*const terminalpkg.RenderState.CellSet = null,
 
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
@@ -29,6 +83,30 @@ preedit: ?Preedit = null,
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.
 mouse: Mouse = .{},
+
+/// Whether `updateFrame` may take the pin-dereferencing render paths.
+///
+/// Two paths in the renderer's `updateFrame` index `row_data.items(.pin)`
+/// and dereference `pin.node`: the OSC8 hover-link resolution
+/// (`RenderState.linkCells`) and the search-highlight flatten
+/// (`RenderState.updateHighlightsFlattened`). Under the `.client` backend the
+/// mirror's pins are the deliberately-poisoned `invalid_pin` sentinel, so
+/// dereferencing them is UB; those paths MUST be skipped.
+///
+/// This is the single source of truth for that gate: `updateFrame` calls it at
+/// both gate sites (see `generic.zig`), and the wiring test in
+/// `termio/client_difftest.zig` calls it to pin the *actual* predicate the
+/// renderer evaluates (rather than re-deriving the boolean inline). If the
+/// gate is ever inverted/removed at a call site, the shared predicate keeps
+/// the test honest. `.exec` (mirror == null) returns true (today's behavior);
+/// a `.client` mirror returns false.
+///
+/// NOTE: Phase 2b/3b restores search highlights host-side (shipped on the
+/// GridFrame rows) and 3c restores OSC8 links host-side (host-computed
+/// LinkFrame); both will replace these gated GUI-side paths.
+pub fn usesLivePinPaths(self: *const @This()) bool {
+    return self.mirror == null;
+}
 
 pub const Mouse = struct {
     /// The point on the viewport where the mouse currently is. We use
