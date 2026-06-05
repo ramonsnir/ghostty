@@ -1315,7 +1315,15 @@ pub fn renderTick(self: *Session) !usize {
     errdefer snapshot.deinit(self.alloc);
     defer if (sel_text) |t| self.alloc.free(t);
 
-    const changed = try RenderState.printDiff(self.alloc, self.prev_snapshot, snapshot);
+    // Phase-1 stdout-diff harness (on_render == null): the printed render diff
+    // IS the product, so emit it. Server mode (on_render != null): we only need
+    // the changed-row count for the push gate below — printing the full screen
+    // to stdout ~10 Hz per session is pure noise (it bypasses std.log, so no
+    // log level can suppress it), so count without printing.
+    const changed = if (self.on_render == null)
+        try RenderState.printDiff(self.alloc, self.prev_snapshot, snapshot)
+    else
+        RenderState.countChanges(self.prev_snapshot, snapshot);
 
     // Slice 8: a cursor-only move (arrow keys) changes NO rows, so
     // `changed`==0 and the row-diff gate below would suppress the push,
