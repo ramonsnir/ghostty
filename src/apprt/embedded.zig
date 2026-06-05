@@ -468,8 +468,8 @@ pub const Surface = struct {
         /// spawn a FRESH host session (today's behavior). A non-zero value
         /// requests that the `.client` backend attach to the existing host
         /// session with this id instead of spawning a new one. Host session
-        /// ids start at 1 (see `src/host/Server.zig` `next_session_id = 1`),
-        /// so 0 is a safe "none/fresh" sentinel. Only consulted when the
+        /// ids are random non-zero u64s (see `allocSessionId` in
+        /// `src/host/Server.zig`), so 0 is a safe "none/fresh" sentinel. Only consulted when the
         /// `.client` backend is selected (`pty-host` set); ignored by `.exec`.
         session_id: u64 = 0,
 

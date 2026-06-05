@@ -2244,8 +2244,9 @@ test "host Server rejects a stateful frame before the Hello handshake (PROTO-1)"
     }
 
     // Client 2: proper handshake then spawn. If the pre-Hello Attach above had
-    // (wrongly) spawned a session, next_session_id would now be 2; a correct
-    // gate leaves it at 1.
+    // (wrongly) spawned a session, the registry would hold 2 sessions; a correct
+    // gate leaves exactly 1 (this client's). (session_ids are random per spawn,
+    // so we assert the COUNT, not a specific id value.)
     {
         const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
         defer posix.close(client);
@@ -2272,11 +2273,49 @@ test "host Server rejects a stateful frame before the Hello handshake (PROTO-1)"
                 break;
             }
         }
-        try testing.expectEqual(@as(u64, 1), session_id);
+        try testing.expect(session_id != 0); // got a real attached session
+        // The pre-Hello Attach spawned nothing: exactly one session in the registry.
+        {
+            server.registry_mutex.lock();
+            defer server.registry_mutex.unlock();
+            try testing.expectEqual(@as(usize, 1), server.sessions.count());
+        }
 
         // Tidy up so deinit teardown is quiet.
         try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
         std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+test "host allocSessionId yields random, nonzero, unique ids (not a sequential counter)" {
+    // Regression for the cross-host-restart false-reattach bug: a sequential
+    // counter restarts at 1 every host launch, so a session_id the GUI persisted
+    // from a dead host could collide with a fresh id and bind a tab to the wrong
+    // (younger) session — or two tabs to one. Random ids make a stale id never
+    // match a live one. This locks in the random scheme.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/h.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+
+    var seen = std.AutoHashMap(u64, void).init(alloc);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const id = server.allocSessionId();
+        try testing.expect(id != 0); // never the unattached sentinel
+        // A random u64 is essentially never < 0x1_0000; the OLD sequential
+        // counter handed out 1,2,3,... — so this is what guards against a
+        // regression back to sequential (collision-prone) ids.
+        try testing.expect(id > 0xFFFF);
+        try testing.expect(!seen.contains(id)); // distinct across draws
+        try seen.put(id, {});
     }
 }
 
