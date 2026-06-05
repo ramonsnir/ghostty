@@ -62,6 +62,7 @@ All work sits in **`eedccf9b5..040cb33ca`** on `ptyhost/phase-2b`. Base
 | `e4a8e0927` | Reattach-scrollback #1 — force-push the `GridFrame` on explicit scroll/jump (`viewport_dirty`) |
 | `040cb33ca` | Reattach-scrollback #2 — saturating `remaining_rows` in `PageList.resizeCols` (host crash on reattach resize-flood) |
 | `4c5e080f3` | Phase B2 — host-authoritative word/line/select-all selection + copy (`selection_point` frame); select-all copy spans scrollback w/o R3 |
+| `97b0dc4d9` | Phase D (clear+reset) — forward ⌘K clear-screen (`clear_screen` frame) + terminal reset (`reset` frame) to the host; reset force-pushes the ModeFrame |
 
 ## Architecture & key decisions
 
@@ -393,21 +394,24 @@ important thing to re-verify when resuming:
 ## Status: open items & next steps
 
 > **RESUME SNAPSHOT (crash-survival; update when state changes).**
-> - **HEAD:** `4c5e080f3` (code) on branch `ptyhost/phase-2b`
+> - **HEAD:** `97b0dc4d9` (code) on branch `ptyhost/phase-2b`
 >   (working dir `~/git/ghostty-phase2b`, a worktree separate from the shared
 >   `~/git/ghostty`).
 > - **DONE + live-smoke validated:** Phases 1, 2a, 2b-1 (all slices incl.
 >   resize/cursor/SurfaceEvent/scroll/cwd-inherit/Slice-12), Phase A (TUI input),
 >   Phase B1 (drag-select + copy), Phase B2 (word/line/select-all + copy; select-all
->   copies the full buffer incl. scrollback), and the reattach-scrollback bug (BOTH
->   mechanisms — push-gate `e4a8e0927` + `resizeCols` crash `040cb33ca`). Reattach
+>   copies the full buffer incl. scrollback), the reattach-scrollback bug (BOTH
+>   mechanisms — push-gate `e4a8e0927` + `resizeCols` crash `040cb33ca`), and Phase D
+>   clear+reset (⌘K clear-screen + terminal reset forwarded to the host). Reattach
 >   is responsive AND shows scrollback.
-> - **NEXT (per remediation plan):** Phase C (history transport — needed only for
->   history-spanning ops: cross-scrollback selection HIGHLIGHT, write_screen,
->   accessibility read over history; NOT needed for reattach scrollback or
->   select-all copy) → Phase D (R1 tail: reset, ⌘K clear, cursor-click-to-move,
->   IME anchor, accessibility geometry). B2 deferrals (right-click copy — DE-PRIORITIZED;
->   copy_url, search seed, autoscroll, rich-copy) are smaller follow-ups.
+> - **NEXT (per remediation plan):** the rest of Phase D's R1 tail (cursor-click-to-move
+>   at prompt, `cursorIsAtPrompt`→confirm-close, IME candidate-panel anchor,
+>   accessibility viewport rect, minor cosmetics) — small independent host-forwards/
+>   mirror-reads → Phase C (history transport — needed only for history-spanning ops:
+>   cross-scrollback selection HIGHLIGHT, write_screen, accessibility read over
+>   history; NOT needed for reattach scrollback or select-all copy). B2 deferrals
+>   (right-click copy — DE-PRIORITIZED; copy_url, search seed, autoscroll, rich-copy)
+>   and the ⌘K-on-alt-screen guard residual are smaller follow-ups.
 > - **PROCESS NOTE:** workflow review/plan agents MUST be pinned `model: 'opus'`
 >   (the `Explore` agentType silently overrides to a cheaper model). Workflows also
 >   keep dying on the 180s no-output watchdog during heavy Opus reads — for these

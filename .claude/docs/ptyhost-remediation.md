@@ -164,10 +164,18 @@ select across it, reattach keeps it).
 
 Mostly small host-forwards or mirror-reads, each independent:
 
-- **Terminal Reset** + **Clear screen/scrollback (⌘K)** — currently act on the
-  empty local terminal / early-return on a stale gate; must reach the host shell
-  (forward a reset/clear action; clear must repaint). (MED-HIGH user impact —
-  arguably promote above D if ⌘K is common for you.)
+- **Terminal Reset** + **Clear screen/scrollback (⌘K)** — DONE + smoke-validated
+  (commit `97b0dc4d9`). Both forward to the host (new `clear_screen` +`reset`
+  frames) and run on its real terminal, mirroring the scrollViewport pattern;
+  `.exec` byte-for-byte unchanged. ⌘K reproduces upstream's #905 at-prompt
+  heuristic exactly (first press scroll-preserves the screen into scrollback, a
+  second press wipes — confirmed `history=true atPrompt=true` reaches the host).
+  Reset force-pushes the post-reset GridFrame+ModeFrame (a modes-only reset
+  doesn't dirty cells — Opus-review catch, same push-gate class as Slice 8). One
+  pre-existing residual: Surface's ⌘K alt-screen guard reads the empty `.client`
+  mirror (always `.primary`), so ⌘K on the alt-screen forwards instead of
+  returning unconsumed; the host correctly no-ops it, so the only effect is a
+  swallowed ⌘K there — a proper fix consults the mirrored mode. Deferred.
 - **Cursor-click-to-move at prompt** (incl. kitty click_events / OSC133) — forward
   to host.
 - **`cursorIsAtPrompt`** → drives `confirm_close_surface` (always prompts) — needs
