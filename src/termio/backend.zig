@@ -156,6 +156,22 @@ pub const Backend = union(Kind) {
         }
     }
 
+    /// Slice B2: word/line/all select-point routing. Under .exec the Surface
+    /// drives the local terminal's selection directly, so this is an inert
+    /// no-op (the message is never enqueued under .exec — but be defensive).
+    /// Under .client it forwards the click point + granularity to the host via
+    /// a `selection_point` frame.
+    pub fn selectionPoint(
+        self: *Backend,
+        td: *termio.Termio.ThreadData,
+        pt: termio.Message.SelectionPoint,
+    ) !void {
+        switch (self.*) {
+            .exec => {},
+            .client => |*client| try client.selectionPoint(td, pt),
+        }
+    }
+
     pub fn childExitedAbnormally(
         self: *Backend,
         gpa: Allocator,

@@ -776,6 +776,30 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             }
         },
 
+        .selection_point => {
+            var sp = try protocol.SelectionPoint.decode(alloc, frame.payload);
+            defer sp.deinit(alloc);
+            // Drop a desynced/garbage mode byte BEFORE locking or touching the
+            // session, mirroring ScrollViewport.toTarget's null-on-garbage drop.
+            // selectPoint also guards internally (belt-and-suspenders).
+            if (sp.toMode() == null) {
+                log.debug("dropping selection_point with unknown mode={d}", .{sp.mode});
+                return;
+            }
+            // Same lock discipline as .selection_drag: selectPoint maps a viewport
+            // pin + expands the selection (selectWord/selectLine/selectAll) and
+            // STAGES the selection_text under render_mutex; renderTick broadcasts
+            // it off registry_mutex (findings SEL-1 / SEL-LOCK-1).
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(sp.session_id)) |e| {
+                if (sessionLive(e)) {
+                    e.session.selectPoint(sp.x, sp.y, sp.mode) catch |err|
+                        log.warn("selectPoint failed err={}", .{err});
+                }
+            }
+        },
+
         .ping => {
             conn.writeFramed(.pong, protocol.Pong{});
         },

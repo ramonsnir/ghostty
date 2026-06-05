@@ -768,6 +768,25 @@ pub fn selectionClear(
     });
 }
 
+/// Slice B2: send a `selection_point` frame. The host maps the viewport point
+/// to a pin on ITS terminal and runs selectWord/selectLine (or selectAll, which
+/// ignores the point), then ships row.selection (highlight) on the next
+/// GridFrame plus a `selection_text` with the selected text. For mode_all the
+/// GUI sends x=0,y=0 and the host ignores them. Same fire-and-forget write path
+/// as selectionDrag.
+pub fn selectionPoint(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+    pt: termio.Message.SelectionPoint,
+) !void {
+    try self.sendFrame(td, .selection_point, protocol.SelectionPoint{
+        .session_id = self.session_id.load(.acquire),
+        .x = pt.x,
+        .y = pt.y,
+        .mode = pt.mode,
+    });
+}
+
 pub fn childExitedAbnormally(
     self: *Client,
     gpa: Allocator,
