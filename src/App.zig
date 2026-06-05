@@ -228,7 +228,21 @@ pub fn focusedSurface(self: *const App) ?*Surface {
 /// the apprt to call this.
 pub fn needsConfirmQuit(self: *const App) bool {
     for (self.surfaces.items) |v| {
-        if (v.core().needsConfirmQuit()) return true;
+        const surface = v.core();
+
+        // Fork (.client / pty-host): quitting the GUI only DETACHES from the
+        // host. The session — live shell, its children, and screen state —
+        // keeps running in ghostty-host and reattaches on relaunch, so an app
+        // quit loses no work and must not warn (the upstream "the process will
+        // be killed" text is simply false for a hosted surface). This is the
+        // app-QUIT aggregate only; closing a single tab still confirms via the
+        // per-surface Surface.needsConfirmQuit (that path orphans the session,
+        // and there is no orphan-recovery UI yet). .exec is byte-for-byte
+        // unchanged: its in-process child dies on quit, so it still warns.
+        switch (surface.io.backend) {
+            .client => continue,
+            .exec => if (surface.needsConfirmQuit()) return true,
+        }
     }
 
     return false;
