@@ -126,7 +126,23 @@ selection already exists from Slice 3b's highlight plumbing). **Risk:** Medium
 
 ---
 
-## Phase C — History / scrollback transport (R3). DESIGN-HEAVY; deepest root.
+## Phase C — History / scrollback transport (R3). VERDICT: SKIP (not worth it for this usage).
+
+> **A post-A/B/D Opus audit concluded Phase C is not worth funding for this user.**
+> Its headline payoffs are already delivered WITHOUT it: reattach-scrollback works
+> (push-gate + resizeCols fixes, `e4a8e0927`+`040cb33ca`) and select-all COPY spans
+> the full scrollback (B2, `4c5e080f3`). What C still uniquely buys — cross-scrollback
+> selection HIGHLIGHT, `write_screen` history dumps, accessibility read-over-history,
+> and smooth scrollback PAGING — is not load-bearing for interactive shells, TUIs
+> (which own their own scrollback), or CLI agents, while its cost/blast-radius is the
+> highest remaining (new history frame + host paging + backpressure + breaking the
+> viewport-only invariant everything else assumes). Build C ONLY if a future need for
+> true scrollback paging or accessibility-over-history arises. Details below kept for
+> that day.
+
+(original Phase C plan retained below for reference.)
+
+## Phase C (detail) — History / scrollback transport (R3). DESIGN-HEAVY; deepest root.
 
 Design a new frame to carry off-viewport rows (history). Options: a
 `ScrollbackChunk`-style lazy paging frame (range request → rows), and/or a
