@@ -269,6 +269,18 @@ on_at_prompt: ?*const fn (ctx: *anyopaque, self: *Session, at_prompt: bool) void
 /// purely the change-detector for the steady-state push.
 prev_at_prompt: ?bool = null,
 
+/// The last input-mode set seen by renderTick (renderTick-only state). null until
+/// the first tick. Closes the final push-gate gap (audit, same class as Slice-8
+/// cursor / Slice-3b search): a mode flip (e.g. a lone `ESC[?2004h` / mouse-enable
+/// / app-cursor toggle) that dirties NO cells and doesn't move the cursor would
+/// otherwise be suppressed by the `changed>0 || force_push || cursor_changed` gate
+/// — the ModeFrame ships only inside onRender, which fires only when that gate
+/// passes — leaving the GUI's input encoding stale until the next redraw. When the
+/// mode set differs from this, renderTick force-pushes so onRender ships the
+/// current ModeFrame. session_id is irrelevant to the comparison (constant per
+/// session), so this is built with id 0. Written/read under render_mutex.
+prev_mode: ?protocol.ModeFrame = null,
+
 /// Pending selection-text result staged by selectDrag/selectClear (under
 /// render_mutex) for renderTick to drain + broadcast on the owning thread
 /// (findings SEL-1 / SEL-LOCK-1 — keep the blocking subscriber writes off the
@@ -1270,6 +1282,19 @@ pub fn renderTick(self: *Session) !usize {
         // prev_snapshot — otherwise the GUI scrolls and sees nothing change.
         if (self.viewport_dirty) force_push = true;
         self.viewport_dirty = false;
+        // Final push-gate term (audit): a mode-only flip dirties no cells and
+        // doesn't move the cursor, so without this it would be suppressed and the
+        // GUI's ModeFrame (shipped only inside onRender) would go stale. Compare
+        // the current mode set to the last seen (id 0 — session_id is constant and
+        // irrelevant to the comparison) and force the push on a change, so onRender
+        // ships the current ModeFrame. fromTerminal requires render_mutex (held).
+        {
+            const mode_now = protocol.ModeFrame.fromTerminal(0, &self.io.terminal);
+            if (self.prev_mode == null or !std.meta.eql(self.prev_mode.?, mode_now)) {
+                force_push = true;
+                self.prev_mode = mode_now;
+            }
+        }
         // Capture FIRST (it can error: OOM in rs.update/highlights). Only AFTER
         // it succeeds do we take ownership of the staged sel_text — otherwise a
         // capture error would propagate out of this block before the outer

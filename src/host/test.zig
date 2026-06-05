@@ -204,6 +204,55 @@ test "host deserialize drops an out-of-range highlight tag (untrusted-wire @enum
     try testing.expectEqual([2]u16{ 1, 4 }, restored.row_data[1].highlights[0].range);
 }
 
+test "host mode-only change force-pushes the frame (push-gate mode term)" {
+    // A mode flip (e.g. bracketed-paste enable) dirties NO cells and doesn't move
+    // the cursor, so the `changed>0 || force_push || cursor_changed` gate would
+    // suppress the push and the GUI's ModeFrame (shipped only inside onRender)
+    // would go stale. The mode-term force-push closes that gap. Mirrors the Slice-8
+    // cursor-push test but for modes, driven through the real renderTick/onRender.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    const Counter = struct {
+        n: usize = 0,
+        fn cb(ctx: *anyopaque, _: *Session, _: *const RenderState.Snapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n += 1;
+        }
+    };
+    var counter: Counter = .{};
+    session.on_render_ctx = &counter;
+    session.on_render = Counter.cb;
+
+    // First tick seeds prev_mode/prev_snapshot and pushes.
+    _ = try session.renderTick();
+    try testing.expect(counter.n >= 1);
+
+    // Idle tick: nothing changed (no shell output in this unattached session) -> no push.
+    counter.n = 0;
+    _ = try session.renderTick();
+    try testing.expectEqual(@as(usize, 0), counter.n);
+
+    // Flip a mode WITHOUT touching cells or the cursor.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.modes.set(.bracketed_paste, true);
+    }
+    const changed = try session.renderTick();
+    // The mode flip dirties no rows ...
+    try testing.expectEqual(@as(usize, 0), changed);
+    // ... yet the frame (carrying the fresh ModeFrame) still ships.
+    try testing.expectEqual(@as(usize, 1), counter.n);
+
+    // And it doesn't spam: another idle tick with the mode now stable -> no push.
+    counter.n = 0;
+    _ = try session.renderTick();
+    try testing.expectEqual(@as(usize, 0), counter.n);
+}
+
 test "host cursor-only move pushes (Slice 8): rows identical, cursor differs => printDiff==0 but cursorEql=false; identical => no push" {
     const alloc = testing.allocator;
 
