@@ -52,10 +52,18 @@ is responsive and shows scrollback. Verified live and by host integration tests.
   spawn-fresh"). A lost session is visually indistinguishable from a new one — the
   sharpest edge against "well." (The orphaned host session, if any, keeps running
   with no GUI attached.)
-- **Restorable-state version cliff.** `TerminalRestorable.version == minimumVersion
-  == 8` (`macos/Sources/.../TerminalRestorable.swift`). Any future bump of that
-  version makes macOS **discard all restore state on the next relaunch**, silently
-  dropping reattach for the entire window set. Bump it only deliberately.
+- **Restorable-state versioning is tolerant (NOT a cliff).** `TerminalRestorableState`
+  is `version = 8` but **`minimumVersion = 5`** (`TerminalRestorable.swift`; only the
+  protocol *default* is `minimumVersion { version }`, and the concrete type overrides
+  it). The decoder accepts v5–8, and the Codable layer is additive-tolerant — newer
+  fields are optionals / `decodeIfPresent` (e.g. `sessionID` at
+  `SurfaceView_AppKit.swift`), so an older blob simply leaves them `nil` (those
+  surfaces spawn fresh; everything else restores). So older schemas load fine across
+  the additive changes made so far. The real sensitivity is only if a future change
+  **raises `minimumVersion`** or makes a **non-additive** change (renamed/retyped/
+  required field) — keep changes additive+optional and `minimumVersion` low. (This is
+  the macOS state-restoration schema version — unrelated to the host *protocol*
+  version negotiated in `Hello`.)
 - **Connect failure (host down / bad socket) → visible error, never a silent local
   fallback.** The IO thread paints an error into the surface
   (`src/termio/Thread.zig`); it never quietly forks a local shell, so a degraded

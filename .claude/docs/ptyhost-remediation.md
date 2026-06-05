@@ -33,9 +33,14 @@ These are not crashes, but they are the sharpest remaining edges against the goa
   (`Server.zig` handleAttach "degrade to spawn-fresh"); a lost session looks identical
   to a new one. Options: surface it (a distinct visual/log so the user knows reattach
   missed), and/or list/recover orphaned host sessions.
-- **Restorable-state version cliff.** `TerminalRestorable.version == minimumVersion ==
-  8`, so any future version bump silently discards all reattach state on the next
-  relaunch. At minimum document/guard the bump; consider tolerating older state.
+- **Restorable-state versioning** (macOS state-restoration schema; *not* the host
+  protocol version). Already tolerant: `version = 8` but `minimumVersion = 5`, and
+  newer fields are optional / `decodeIfPresent`, so older schemas (v5–8) load and
+  missing newer fields default to nil. Keep future changes **additive + optional** and
+  `minimumVersion` low. A chained "decode-at-version → migrate-up" mechanism is only
+  needed for a **non-additive** change (rename/retype/remove a required field), which
+  hasn't happened — add the migration seam when such a change is actually required, not
+  speculatively.
 - **Host lifecycle is manual / unguarded.** No launchd supervision, no SIGTERM/graceful
   shutdown, no per-identity socket namespacing, no orphan GC, and no panic isolation
   (one panic anywhere in the upstream emulator the host runs takes down all sessions).
