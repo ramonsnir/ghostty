@@ -1778,3 +1778,22 @@ test "client: selection_text frame caches host selection text + clear resets" {
     try testing.expect(!client.hasCachedSelection());
     try testing.expectEqual(@as(?[:0]const u8, null), try client.copyCachedSelectionText(alloc));
 }
+
+test "client: at_prompt frame updates cached cursorIsAtPrompt (Phase D)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // Safe default before any frame: not at a prompt => needsConfirmQuit warns.
+    try testing.expect(!client.cursorIsAtPrompt());
+
+    inline for (.{ true, false, true }) |v| {
+        const ap: protocol.AtPrompt = .{ .session_id = 1, .at_prompt = v };
+        const payload = try ap.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .at_prompt, payload);
+        try testing.expectEqual(v, client.cursorIsAtPrompt());
+    }
+}
