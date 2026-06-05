@@ -61,6 +61,7 @@ All work sits in **`eedccf9b5..040cb33ca`** on `ptyhost/phase-2b`. Base
 | `07da2b0b9` | Phase B1 — host-authoritative drag-select + copy under `.client` |
 | `e4a8e0927` | Reattach-scrollback #1 — force-push the `GridFrame` on explicit scroll/jump (`viewport_dirty`) |
 | `040cb33ca` | Reattach-scrollback #2 — saturating `remaining_rows` in `PageList.resizeCols` (host crash on reattach resize-flood) |
+| `4c5e080f3` | Phase B2 — host-authoritative word/line/select-all selection + copy (`selection_point` frame); select-all copy spans scrollback w/o R3 |
 
 ## Architecture & key decisions
 
@@ -392,18 +393,26 @@ important thing to re-verify when resuming:
 ## Status: open items & next steps
 
 > **RESUME SNAPSHOT (crash-survival; update when state changes).**
-> - **HEAD:** `040cb33ca` (code) / `59fb43fed` (docs) on branch `ptyhost/phase-2b`
+> - **HEAD:** `4c5e080f3` (code) on branch `ptyhost/phase-2b`
 >   (working dir `~/git/ghostty-phase2b`, a worktree separate from the shared
 >   `~/git/ghostty`).
 > - **DONE + live-smoke validated:** Phases 1, 2a, 2b-1 (all slices incl.
 >   resize/cursor/SurfaceEvent/scroll/cwd-inherit/Slice-12), Phase A (TUI input),
->   Phase B1 (drag-select + copy), and the reattach-scrollback bug (BOTH
+>   Phase B1 (drag-select + copy), Phase B2 (word/line/select-all + copy; select-all
+>   copies the full buffer incl. scrollback), and the reattach-scrollback bug (BOTH
 >   mechanisms — push-gate `e4a8e0927` + `resizeCols` crash `040cb33ca`). Reattach
 >   is responsive AND shows scrollback.
-> - **NEXT (per remediation plan):** Phase B2 (word/line/select-all selection) →
->   Phase C (history transport — needed only for history-spanning ops, NOT
->   reattach scrollback) → Phase D (R1 tail: reset, ⌘K clear, cursor-click-to-move,
->   IME anchor, accessibility geometry).
+> - **NEXT (per remediation plan):** Phase C (history transport — needed only for
+>   history-spanning ops: cross-scrollback selection HIGHLIGHT, write_screen,
+>   accessibility read over history; NOT needed for reattach scrollback or
+>   select-all copy) → Phase D (R1 tail: reset, ⌘K clear, cursor-click-to-move,
+>   IME anchor, accessibility geometry). B2 deferrals (right-click copy — DE-PRIORITIZED;
+>   copy_url, search seed, autoscroll, rich-copy) are smaller follow-ups.
+> - **PROCESS NOTE:** workflow review/plan agents MUST be pinned `model: 'opus'`
+>   (the `Explore` agentType silently overrides to a cheaper model). Workflows also
+>   keep dying on the 180s no-output watchdog during heavy Opus reads — for these
+>   slices, main-loop build/test + a single foreground Opus review agent has been
+>   more reliable than a multi-phase background workflow.
 > - **To resume building:** edit Zig in `src/`, macOS in `macos/Sources/`; then
 >   `zig build test -Demit-macos-app=false -Demit-xcframework=false -Dtest-filter=<name>`
 >   → `zig build -Demit-macos-app=false -Doptimize=ReleaseFast` (rebuild lib) →
@@ -419,8 +428,9 @@ important thing to re-verify when resuming:
 > (A: consume the ModeFrame mirror → B: host-authoritative selection/copy →
 > C: history transport → D: the R1 tail) in
 > **`.claude/docs/ptyhost-remediation.md`** — read it to decide what to fund.
-> Phase A + B1 are DONE; the reattach-scrollback bug (once filed under C) is
-> RESOLVED and was NOT R3.
+> Phases A, B1, and B2 are DONE + smoke-validated; the reattach-scrollback bug
+> (once filed under C) is RESOLVED and was NOT R3. Selection/copy (drag, word,
+> line, select-all incl. scrollback copy) now works under `.client`.
 
 > **META (read this first): `.client` systematically breaks every GUI feature
 > that reads or writes the in-process `io.terminal` / `core_surface`.** The real
@@ -433,15 +443,17 @@ important thing to re-verify when resuming:
 > proactively** (see "Selection" + the audit task below). Do not assume an
 > untested GUI feature works under `.client`.
 
-- **Selection + copy BROKEN under `.client` (mouse).** Mouse drag sets the
-  selection on the GUI's LOCAL `io.terminal` (`Surface.zig` `screens.active.select`),
-  but the renderer draws `row.selection` from the host-fed mirror (empty — the
-  host has no mouse), so NO highlight shows; and `selectionString`
-  (`Surface.zig:2205`) reads the local terminal, which has no cell content under
-  `.client`, so copy yields nothing. Two designs: (A) apply the selection as a
-  GUI-side highlight on the mirror rows + extract copy text from the mirror cells
-  (viewport-scoped); (B) round-trip selection coords to the host (handles
-  scrollback). NOT YET BUILT — substantial slice.
+- **Selection + copy under `.client`: RESOLVED (B1 `07da2b0b9` + B2 `4c5e080f3`).**
+  Design (B) won: the GUI forwards selection intent to the host (drag coords via
+  `selection_drag`; word/line/all click point + granularity via `selection_point`),
+  the host runs select/selectWord/selectLine/selectAll + selectionString on its REAL
+  terminal, and the result rides the mirror path — `row.selection` highlight on the
+  GridFrame + a `selection_text` frame the GUI caches for copy. Drag, double-click
+  word, triple-click line, and select-all all smoke-validated; **select-all copy
+  spans scrollback without R3** (host has the full buffer). Remaining residuals:
+  cross-scrollback selection HIGHLIGHT is viewport-limited (R3); right-click→Copy is
+  non-functional (DE-PRIORITIZED); copy_url/regex-link text, search_selection seed,
+  autoscroll, rich-copy (HTML/VT color) are smaller follow-ups (see remediation B2).
 - **SECOND reattach scrollback-loss path (distinct from Slice 12): RESOLVED
   (`e4a8e0927` + `040cb33ca`).** It was TWO independent mechanisms, neither R3:
   **(1)** the render-tick push gate (`Session.zig`) suppressed the post-reattach
