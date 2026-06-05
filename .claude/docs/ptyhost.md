@@ -391,10 +391,36 @@ important thing to re-verify when resuming:
 
 ## Status: open items & next steps
 
+> **RESUME SNAPSHOT (crash-survival; update when state changes).**
+> - **HEAD:** `040cb33ca` (code) / `59fb43fed` (docs) on branch `ptyhost/phase-2b`
+>   (working dir `~/git/ghostty-phase2b`, a worktree separate from the shared
+>   `~/git/ghostty`).
+> - **DONE + live-smoke validated:** Phases 1, 2a, 2b-1 (all slices incl.
+>   resize/cursor/SurfaceEvent/scroll/cwd-inherit/Slice-12), Phase A (TUI input),
+>   Phase B1 (drag-select + copy), and the reattach-scrollback bug (BOTH
+>   mechanisms — push-gate `e4a8e0927` + `resizeCols` crash `040cb33ca`). Reattach
+>   is responsive AND shows scrollback.
+> - **NEXT (per remediation plan):** Phase B2 (word/line/select-all selection) →
+>   Phase C (history transport — needed only for history-spanning ops, NOT
+>   reattach scrollback) → Phase D (R1 tail: reset, ⌘K clear, cursor-click-to-move,
+>   IME anchor, accessibility geometry).
+> - **To resume building:** edit Zig in `src/`, macOS in `macos/Sources/`; then
+>   `zig build test -Demit-macos-app=false -Demit-xcframework=false -Dtest-filter=<name>`
+>   → `zig build -Demit-macos-app=false -Doptimize=ReleaseFast` (rebuild lib) →
+>   `macos/build.nu --configuration ReleaseLocal --action build` → sign + restart
+>   the DEV app (NEVER the installed Release host). See "Build, run, test, smoke".
+> - **Smoke harness:** dev host runs as `ghostty-host --listen=/tmp/ghostty-host.sock`
+>   (log `/tmp/ghostty-host.log`); GUI launched with `--config-file=/tmp/ptyhost-smoke.conf`
+>   (which sets `pty-host` to select the `.client` backend). Both are the
+>   ReleaseLocal identity — safe to quit/relaunch; the installed Release fork
+>   hosting this session is NOT.
+
 > **Remediation plan:** the audit's 37 gaps are sequenced into a phased program
 > (A: consume the ModeFrame mirror → B: host-authoritative selection/copy →
 > C: history transport → D: the R1 tail) in
 > **`.claude/docs/ptyhost-remediation.md`** — read it to decide what to fund.
+> Phase A + B1 are DONE; the reattach-scrollback bug (once filed under C) is
+> RESOLVED and was NOT R3.
 
 > **META (read this first): `.client` systematically breaks every GUI feature
 > that reads or writes the in-process `io.terminal` / `core_surface`.** The real
@@ -416,15 +442,19 @@ important thing to re-verify when resuming:
   GUI-side highlight on the mirror rows + extract copy text from the mirror cells
   (viewport-scoped); (B) round-trip selection coords to the host (handles
   scrollback). NOT YET BUILT — substantial slice.
-- **SECOND reattach scrollback-loss path (distinct from Slice 12).** Observed:
-  after a reattach with ZERO degenerate-resize drops (so the Slice-12 guard did
-  not fire), scrollback was lost on ALL tabs (the host child shells survived;
-  only the scrollback VIEW was gone). Slice 12 only closed the degenerate-resize
-  path. Suspects (reproduce-first, like Slice 12): a well-formed reattach Resize
-  to a different size reflowing scrollback away, OR the scroll-to-view-history
-  path (Slice 7) not retrieving host scrollback after reattach. Needs a host-level
-  full-reattach-sequence test (scrollback -> detach -> re-Attach -> pushFullFrames
-  + well-formed Resize -> assert history still reachable).
+- **SECOND reattach scrollback-loss path (distinct from Slice 12): RESOLVED
+  (`e4a8e0927` + `040cb33ca`).** It was TWO independent mechanisms, neither R3:
+  **(1)** the render-tick push gate (`Session.zig`) suppressed the post-reattach
+  scroll's `GridFrame` when the scrolled rows matched a stale `prev_snapshot`
+  (`pushFullFrames` doesn't update it) — fixed by a `viewport_dirty` force-push set
+  in `scrollViewport`/`jumpToPrompt`, consumed in `renderTick` (toggle-proven via
+  the `2nd mechanism repro` host test). **(2)** the GUI's post-reattach resize-flood
+  drove a shrink-cols+shrink-rows resize whose OLD cursor `y` exceeded the new row
+  count, underflowing `PageList.resizeCols` (`self.rows - c.y - 1`) and CRASHING
+  THE WHOLE HOST — every session down (the "all tabs frozen" symptom) — fixed by
+  saturating subtraction `self.rows -| c.y -| 1` (reproduce-first Screen test
+  panics at `PageList.zig:1062` pre-fix, passes post-fix; full resize/reflow corpus
+  green). Both live-smoke validated: reattach is responsive and shows scrollback.
 - **TASK — systematic `.client` feature audit (proactive, not reactive).**
   Enumerate every consumer of `io.terminal` / `self.renderer_state.terminal` /
   `core_surface.*` in `src/Surface.zig`, `src/apprt/embedded.zig`, and the macOS
@@ -432,8 +462,9 @@ important thing to re-verify when resuming:
   (links 3b/3c, pwd Slice 10+pwd-sync, child_exit 5d, scroll 7). Output a
   prioritized gap list so features are fixed before a user hits them.
 
-- **cwd-inherit / shell command-tracking under `.client`: FIXED at the host
-  level; pending a live re-smoke.** Was broken because `src/host/Session.zig`
+- **cwd-inherit / shell command-tracking under `.client`: FIXED + live-smoke
+  validated** (new tab opens in the source tab's cwd). Was broken because
+  `src/host/Session.zig`
   used `Config.default()` (which does NOT call `finalize()`), leaving `command`
   null → `Exec` fell back to a bare `sh` → `shell_integration.setup`'s `.detect`
   couldn't classify it → nothing injected → no OSC 7 pwd / command marks. Fix:
