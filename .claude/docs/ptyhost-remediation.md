@@ -178,8 +178,15 @@ Mostly small host-forwards or mirror-reads, each independent:
   swallowed ⌘K there — a proper fix consults the mirrored mode. Deferred.
 - **Cursor-click-to-move at prompt** (incl. kitty click_events / OSC133) — forward
   to host.
-- **`cursorIsAtPrompt`** → drives `confirm_close_surface` (always prompts) — needs
-  a host-supplied at-prompt bit.
+- **`cursorIsAtPrompt`** → drives `confirm_close_surface` — DONE + smoke-validated
+  (commit `51883807d`). The host computes `cursorIsAtPrompt()` on its REAL terminal
+  and pushes an authoritative `at_prompt` bit (pushed on flip + seeded on attach);
+  the GUI caches it (lock-free atomic) and `needsConfirmQuit` reads it under
+  `.client`. Validated in `confirm-close-surface = true` mode: idle prompt closes
+  silently (`at_prompt=true → confirm=false`), a running command prompts
+  (`at_prompt=false → confirm=true`). NOTE: only matters for the `= true` mode;
+  `= always` (the user's `~/.config/ghostty/config`) confirms unconditionally by
+  design and never reaches the at-prompt check.
 - **IME candidate-panel anchor** (`imePoint` reads local cursor at origin) — use the
   mirror cursor coords.
 - **accessibility viewport rect** (`read_text`/`dumpText` geometry) — derive from
