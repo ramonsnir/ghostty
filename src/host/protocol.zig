@@ -132,6 +132,18 @@ pub const FrameType = enum(u8) {
     // grid_frame row.selection path (no new host->GUI frame). Appended at the
     // END of the enum so all prior tag integers (incl selection_text) stay stable.
     selection_point,
+    // --- Phase D (clear): GUI->host emulator-level screen clear ---
+    // GUI->host: ⌘K clear screen (+ optional scrollback). Under .client the
+    // local terminal is the empty mirror, so the GUI forwards the clear and the
+    // host runs Termio.clearScreen on ITS real terminal (clears scrollback /
+    // erases above the cursor / sends FF to the shell at a prompt). Appended at
+    // the END so all prior tag integers stay stable.
+    clear_screen,
+    // GUI->host: terminal full reset (the `reset` keybind / menu). Under .client
+    // the local terminal is the empty mirror, so the GUI forwards the reset and
+    // the host runs terminal.fullReset() on ITS real terminal. Appended at the
+    // END so all prior tag integers stay stable.
+    reset,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -890,6 +902,43 @@ pub const SelectionPoint = struct {
         self.* = undefined;
     }
 };
+
+/// GUI->host (Phase D): ⌘K clear screen. `history`=true also clears scrollback.
+/// The host runs Termio.clearScreen on ITS real terminal (same semantics as the
+/// .exec local clear: alt-screen no-op, clear selection, optional scrollback
+/// erase, erase-above-cursor or full-erase + FF to the shell at a prompt).
+/// Fixed-width: [u64 session_id][u8 history] = 9 payload bytes.
+pub const ClearScreen = struct {
+    session_id: u64,
+    history: bool = false,
+
+    pub fn encode(self: ClearScreen, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeBool(w, self.history);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !ClearScreen {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .history = try readBool(r),
+        };
+    }
+
+    pub fn deinit(self: *ClearScreen, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// GUI->host (Phase D): terminal full reset. Bare session id — the host runs
+/// terminal.fullReset() on its real terminal. Same shape as Detach/Close/
+/// SelectionClear/ClearSearch.
+pub const Reset = SessionIdFrame(.reset);
 
 /// host->GUI: the current selection TEXT so the GUI copies with no sync
 /// round-trip. `present`=false means the selection was cleared (text is empty).

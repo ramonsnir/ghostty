@@ -50,6 +50,11 @@ pub const Message = union(enum) {
         history: bool,
     },
 
+    /// Phase D: terminal full reset. Under .exec this message is never enqueued
+    /// (Surface resets the local terminal directly); under .client the Client
+    /// sends a `reset` frame so the host runs fullReset on its real terminal.
+    reset: void,
+
     /// Scroll the viewport
     scroll_viewport: terminal.Terminal.ScrollViewport,
 

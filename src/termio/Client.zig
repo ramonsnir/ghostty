@@ -725,6 +725,33 @@ pub fn scrollViewport(
     ));
 }
 
+/// Phase D: send a `clear_screen` frame (⌘K). The local mirror is empty, so the
+/// host runs Termio.clearScreen on ITS real terminal (clears scrollback / erases
+/// above the cursor / sends FF to the shell at a prompt). Same fire-and-forget
+/// write path as scrollViewport.
+pub fn clearScreen(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+    history: bool,
+) !void {
+    try self.sendFrame(td, .clear_screen, protocol.ClearScreen{
+        .session_id = self.session_id.load(.acquire),
+        .history = history,
+    });
+}
+
+/// Phase D: send a `reset` frame. The local mirror is empty, so the host runs
+/// terminal.fullReset() on ITS real terminal. Same fire-and-forget write path as
+/// scrollViewport.
+pub fn reset(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+) !void {
+    try self.sendFrame(td, .reset, protocol.Reset{
+        .session_id = self.session_id.load(.acquire),
+    });
+}
+
 /// Send a `jump_to_prompt` frame. Same .client routing rationale as
 /// scrollViewport: the host jumps ITS terminal's viewport to the prompt.
 pub fn jumpToPrompt(

@@ -665,6 +665,29 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             }
         },
 
+        .clear_screen => {
+            var cs = try protocol.ClearScreen.decode(alloc, frame.payload);
+            defer cs.deinit(alloc);
+            // Same registry_mutex discipline as .scroll_viewport / .jump_to_prompt
+            // (F3 TOCTOU): clearScreen only enqueues to the session's io thread.
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(cs.session_id)) |e| {
+                if (sessionLive(e)) e.session.clearScreen(cs.history);
+            }
+        },
+
+        .reset => {
+            var rst = try protocol.Reset.decode(alloc, frame.payload);
+            defer rst.deinit(alloc);
+            // Same registry_mutex discipline: reset only enqueues to the io thread.
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            if (self.sessions.get(rst.session_id)) |e| {
+                if (sessionLive(e)) e.session.reset();
+            }
+        },
+
         .detach => {
             var detach = try protocol.Detach.decode(alloc, frame.payload);
             defer detach.deinit(alloc);

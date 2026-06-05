@@ -293,6 +293,17 @@ selection_dirty: bool = false,
 /// (which only suppresses POLL-TIMER ticks that changed nothing — those never
 /// set this flag). Written/read under render_mutex; cleared after the push in
 /// renderTick. Mirrors search_dirty / selection_dirty.
+///
+/// ALSO REUSED by Phase D `reset` / `clearScreen` as a generic "explicit
+/// emulator op must deliver its next frame" force-push. A `reset` (fullReset)
+/// that only resets MODES (app-cursor-keys / mouse-reporting / bracketed-paste —
+/// the crashed-program case `reset` exists for) changes NO cells and does not
+/// move the cursor, so `changed==0 && !cursor_changed` would suppress the frame
+/// AND its accompanying ModeFrame (shipped only inside onRender, which fires only
+/// when the gate passes) — leaving the GUI's mode mirror corrupted. Forcing the
+/// push guarantees the post-reset GridFrame + ModeFrame reach the GUI. clearScreen
+/// sets it too for symmetry (covers the narrow history-only / already-blank case
+/// where the visible rows don't change).
 viewport_dirty: bool = false,
 
 started: bool = false,
@@ -624,6 +635,39 @@ pub fn jumpToPrompt(self: *Session, delta: isize) void {
         self.viewport_dirty = true;
     }
     self.io.queueMessage(.{ .jump_to_prompt = delta }, .unlocked);
+}
+
+/// Phase D: ⌘K clear screen (+ optional scrollback) on the host's REAL terminal.
+/// Routed exactly like scrollViewport/jumpToPrompt: queue a `.clear_screen`
+/// message to the host's OWN io thread, which drains it via Thread.drainMailbox
+/// -> Termio.clearScreen -> the .exec local-clear body on the real terminal
+/// (clears scrollback / erases above the cursor / sends FF to the real shell at
+/// a prompt). Forces the next frame (`viewport_dirty`) for symmetry with reset
+/// and to cover the narrow history-only / already-blank case where the visible
+/// viewport rows don't change. See the `viewport_dirty` field doc.
+pub fn clearScreen(self: *Session, history: bool) void {
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+        self.viewport_dirty = true;
+    }
+    self.io.queueMessage(.{ .clear_screen = .{ .history = history } }, .unlocked);
+}
+
+/// Phase D: terminal full reset on the host's REAL terminal. Routed like
+/// clearScreen: queue a `.reset` message to the host's own io thread, which
+/// drains it via Termio.reset -> the .exec fullReset on the real terminal.
+/// MUST force the next frame (`viewport_dirty`): a reset that only resets MODES
+/// (the crashed-program case) changes no cells and doesn't move the cursor, so
+/// the push gate would otherwise suppress the GridFrame AND its ModeFrame and
+/// leave the GUI's mode mirror corrupted. See the `viewport_dirty` field doc.
+pub fn reset(self: *Session) void {
+    {
+        self.render_mutex.lock();
+        defer self.render_mutex.unlock();
+        self.viewport_dirty = true;
+    }
+    self.io.queueMessage(.{ .reset = {} }, .unlocked);
 }
 
 /// --- Slice B1: host-authoritative drag-select + copy ---
