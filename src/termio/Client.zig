@@ -212,7 +212,7 @@ images: imagepkg.State = .empty,
 /// Taking the heavy `mutex` (held during full `rehydrate`) per keystroke is
 /// undesirable, so this lock-free acquire/release pair synchronizes the two
 /// sides instead. 0 is a safe "unattached" sentinel because host session ids
-/// start at 1 (`src/host/Server.zig` `next_session_id = 1`).
+/// are random non-zero u64s (`allocSessionId` in `src/host/Server.zig`).
 session_id: std.atomic.Value(u64) = .init(0),
 
 /// Set on `.child_exited`.
@@ -301,8 +301,8 @@ pub const Config = struct {
 /// `Config.session_id` (the `?u64` the Client uses for its `Attach`):
 /// 0 => null (spawn a FRESH host session, today's behavior), any non-zero
 /// id => `Some(id)` (reattach to that existing host session). Host session
-/// ids start at 1 (`src/host/Server.zig` `next_session_id = 1`), so 0 is a
-/// safe "none/fresh" sentinel. Single source of truth for this sentinel
+/// ids are random non-zero u64s (`allocSessionId` in `src/host/Server.zig`),
+/// so 0 is a safe "none/fresh" sentinel. Single source of truth for this sentinel
 /// mapping; `Surface.init` calls this when it builds the `.client` config.
 pub fn sessionIdFromConfig(id: u64) ?u64 {
     return if (id == 0) null else id;
@@ -970,14 +970,27 @@ pub fn handleFrame(
         },
 
         .attached => {
+            const att = try protocol.Attached.decode(alloc, payload);
+            // Reattach-miss signal: if we asked to reattach to a SPECIFIC session
+            // (a non-null, non-zero persisted id) but the host handed back a
+            // DIFFERENT id, our session was gone (closed, or the host restarted)
+            // and the host spawned a FRESH one. With random host ids a stale id
+            // never false-matches, so a differing id reliably means "miss." Surface
+            // it (a blank fresh shell presented as if it were the restored session
+            // is the sharpest "lost work" edge) instead of silently swapping ids.
+            if (self.config.session_id) |requested| {
+                if (requested != 0 and att.session_id != requested) {
+                    log.warn(
+                        "reattach miss: requested session_id={d} not found on host; spawned fresh session_id={d} (prior session closed or host restarted)",
+                        .{ requested, att.session_id },
+                    );
+                }
+            }
             // Atomic store (even though we hold the guard mutex here): the
             // UNLOCKED IO-thread readers in queueWrite/focusGained synchronize
             // against this store, not against the mutex. Independent of the
             // Slice 3d shared-mutex change — the lock-free path is untouched.
-            self.session_id.store(
-                (try protocol.Attached.decode(alloc, payload)).session_id,
-                .release,
-            );
+            self.session_id.store(att.session_id, .release);
         },
 
         .child_exited => {

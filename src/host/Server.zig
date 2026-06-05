@@ -53,10 +53,14 @@ listen_fd: posix.socket_t,
 /// The bound socket path, owned (unlinked on deinit).
 path: []const u8,
 
-/// Registry of live sessions, keyed by host-assigned session_id.
+/// Registry of live sessions, keyed by host-assigned session_id. Ids are RANDOM
+/// 64-bit values (see allocSessionId), not a sequential counter — so a session_id
+/// the GUI persisted from a PREVIOUS host instance cannot collide with a fresh id
+/// after a host restart (which would cause a false reattach: a tab silently binding
+/// to a different/younger session, or two tabs sharing one). 0 is the reserved
+/// "unattached" sentinel.
 sessions: std.AutoHashMap(u64, *SessionEntry),
 registry_mutex: std.Thread.Mutex = .{},
-next_session_id: u64 = 1,
 
 /// All open connections + the reaping queue. BOTH lists are guarded by the one
 /// `conns_mutex` so a read thread's migration (remove from `conns` + append to
@@ -982,13 +986,27 @@ fn subscribe(self: *Server, conn: *Conn, e: *SessionEntry) !void {
     _ = self;
 }
 
+/// Allocate a fresh, unique, non-zero, RANDOM session id. CALLER HOLDS
+/// registry_mutex (reads the registry to reject the astronomically-unlikely live
+/// collision). Random rather than sequential so a stale id from a dead host
+/// instance effectively never matches a live one — an unknown id then always
+/// degrades to a clean fresh spawn instead of a false reattach. 0 is skipped (the
+/// "unattached" sentinel).
+pub fn allocSessionId(self: *Server) u64 {
+    while (true) {
+        const id = std.crypto.random.int(u64);
+        if (id == 0) continue;
+        if (self.sessions.contains(id)) continue;
+        return id;
+    }
+}
+
 /// Spawn a fresh Session, register it, and start its dedicated owning thread.
 /// CALLER MUST HOLD registry_mutex (findings SR-1 / ZM1): the only caller,
 /// handleAttach, holds it across the whole spawn+dereference so a concurrent
 /// Close cannot fetchRemove+free the entry mid-attach.
 fn spawnSession(self: *Server, working_directory: ?[]const u8) !*SessionEntry {
-    const id = self.next_session_id;
-    self.next_session_id += 1;
+    const id = self.allocSessionId();
 
     // SLICE 11: seed the spawn-opt cwd into Session.Options. Session.create
     // dupes it into the session config's arena, so the borrowed slice (from the
