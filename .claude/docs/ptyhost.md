@@ -64,6 +64,8 @@ All work sits in **`eedccf9b5..040cb33ca`** on `ptyhost/phase-2b`. Base
 | `4c5e080f3` | Phase B2 — host-authoritative word/line/select-all selection + copy (`selection_point` frame); select-all copy spans scrollback w/o R3 |
 | `97b0dc4d9` | Phase D (clear+reset) — forward ⌘K clear-screen (`clear_screen` frame) + terminal reset (`reset` frame) to the host; reset force-pushes the ModeFrame |
 | `51883807d` | Phase D — host-authoritative `at_prompt` bit (`at_prompt` frame) so `confirm-close-surface=true` warns only when a command runs (`+5d05037f9` GUI-side test) |
+| `82db39921` | Harden untrusted highlight tag — drop on the wire + `intToEnum` at render (fixes `@enumFromInt` UB / crash on the render hot path) |
+| `05c5e798a` | `mode_changed` push-gate term — a mode-only flip ships its ModeFrame (last push-gate gap closed) |
 
 ## Architecture & key decisions
 
@@ -395,9 +397,25 @@ important thing to re-verify when resuming:
 ## Status: open items & next steps
 
 > **RESUME SNAPSHOT (crash-survival; update when state changes).**
-> - **HEAD:** `5d05037f9` (code) on branch `ptyhost/phase-2b`
+> - **HEAD:** `05c5e798a` (code) on branch `ptyhost/phase-2b`
 >   (working dir `~/git/ghostty-phase2b`, a worktree separate from the shared
 >   `~/git/ghostty`).
+>
+> - **PROACTIVE AUDIT done (post-A/B/D), Phase C verdict = SKIP.** A fresh Opus
+>   audit of remaining `.client` gaps found the daily-driver surface essentially
+>   complete (typing, all TUI input modes, mouse reporting, selection+copy incl.
+>   select-all-across-scrollback, clear/reset, confirm-close, scroll, reattach all
+>   verified routed). It also found TWO latent issues, now FIXED: a render-hot-path
+>   `@enumFromInt` UB on an untrusted highlight tag (`82db39921`) and the missing
+>   `mode_changed` push-gate term (`05c5e798a`). **Phase C (history transport) is
+>   NOT worth it for this usage** — reattach-scrollback and select-all-copy already
+>   work without it; C only buys cross-scrollback selection HIGHLIGHT, write_screen,
+>   accessibility-over-history, and smooth paging (none load-bearing for shells/TUIs/
+>   agents), at high cost + blast radius. Remaining real (but low) gaps:
+>   cursor-click-to-move at the prompt (R1, low-moderate; needs a host click→prompt
+>   forward) and selection autoscroll past the viewport edge (R1/R3, low — select-all
+>   covers whole-buffer copy). Everything else (IME anchor, accessibility geometry,
+>   regex-link text, color-scheme DSR, Quick Look) is near-zero impact for this user.
 > - **DONE + live-smoke validated:** Phases 1, 2a, 2b-1 (all slices incl.
 >   resize/cursor/SurfaceEvent/scroll/cwd-inherit/Slice-12), Phase A (TUI input),
 >   Phase B1 (drag-select + copy), Phase B2 (word/line/select-all + copy; select-all
