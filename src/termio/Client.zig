@@ -218,6 +218,14 @@ session_id: std.atomic.Value(u64) = .init(0),
 /// Set on `.child_exited`.
 child_exited: ?ChildExited = null,
 
+/// Phase D: the host's authoritative at-prompt bit (cursorIsAtPrompt on its real
+/// terminal), updated on every `.at_prompt` frame (pushed on change + seeded on
+/// attach). A lock-free atomic so `Surface.needsConfirmQuit` can read it on the
+/// apprt/main thread at close time without taking any lock. Defaults false =>
+/// "not at a prompt" => confirm-close defaults to warning (the SAFE default
+/// before the first frame arrives).
+at_prompt: std.atomic.Value(bool) = .init(false),
+
 // --- Slice B1: cached host selection text ---
 //
 // The host owns the real terminal + scrollback, so under .client the GUI's
@@ -1050,10 +1058,25 @@ pub fn handleFrame(
             }
         },
 
+        .at_prompt => {
+            // Phase D: the host's authoritative at-prompt bit. Store into the
+            // lock-free atomic that Surface.needsConfirmQuit reads on the apprt
+            // thread. Not visible render state, so no renderer wakeup needed.
+            var ap = try protocol.AtPrompt.decode(alloc, payload);
+            defer ap.deinit(alloc);
+            self.at_prompt.store(ap.at_prompt, .release);
+        },
+
         // Everything else is either a request-direction frame (the GUI sends
         // these, never receives them) or a liveness frame we don't model yet.
         else => log.debug("client ignoring frame tag={}", .{tag}),
     }
+}
+
+/// Phase D: the host's authoritative at-prompt bit (see the `at_prompt` field).
+/// Read by Surface.needsConfirmQuit under .client. Lock-free.
+pub fn cursorIsAtPrompt(self: *const Client) bool {
+    return self.at_prompt.load(.acquire);
 }
 
 /// Slice B1: does the host have a selection cached? Caller MUST hold the guard

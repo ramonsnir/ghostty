@@ -1177,6 +1177,82 @@ test "protocol ClearScreen round-trip + bounds (host client) Phase D" {
         const dec = try protocol.Reset.decode(alloc, payload.items);
         try testing.expectEqual(orig.session_id, dec.session_id);
     }
+
+    // AtPrompt: at_prompt true + false round-trip; short payload errors.
+    inline for (.{ true, false }) |ap| {
+        const orig: protocol.AtPrompt = .{ .session_id = 909, .at_prompt = ap };
+        const framed = try protocol.encodeFrame(alloc, .at_prompt, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.at_prompt, tag);
+        const dec = try protocol.AtPrompt.decode(alloc, payload.items);
+        try testing.expectEqual(orig, dec);
+    }
+    {
+        const orig: protocol.AtPrompt = .{ .session_id = 1, .at_prompt = true };
+        const framed = try protocol.encodeFrame(alloc, .at_prompt, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.at_prompt, tag);
+        const truncated = payload.items[0 .. payload.items.len - 1];
+        try testing.expectError(error.EndOfStream, protocol.AtPrompt.decode(alloc, truncated));
+    }
+}
+
+// Captures the most recent on_at_prompt callback for the Phase D at-prompt test.
+const AtPromptCapture = struct {
+    fired: bool = false,
+    value: bool = false,
+
+    fn cb(ctx: *anyopaque, _: *Session, at_prompt: bool) void {
+        const self: *AtPromptCapture = @ptrCast(@alignCast(ctx));
+        self.fired = true;
+        self.value = at_prompt;
+    }
+};
+
+test "host on_at_prompt fires only on a flip of cursorIsAtPrompt (Phase D)" {
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    var cap: AtPromptCapture = .{};
+    session.on_at_prompt_ctx = &cap;
+    session.on_at_prompt = AtPromptCapture.cb;
+
+    // First tick: a fresh terminal is NOT at a prompt (semantic_content=.output).
+    // prev_at_prompt is null, so the first tick always fires (seeds the GUI).
+    _ = try session.renderTick();
+    try testing.expect(cap.fired);
+    try testing.expectEqual(false, cap.value);
+
+    // No state change -> the bit doesn't flip -> no push (no per-tick spam).
+    cap.fired = false;
+    _ = try session.renderTick();
+    try testing.expect(!cap.fired);
+
+    // Mark the cursor as being at a prompt (what shell-integration OSC 133 does
+    // on the real host terminal). The next tick observes the flip and fires(true).
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.screens.active.cursor.semantic_content = .prompt;
+    }
+    _ = try session.renderTick();
+    try testing.expect(cap.fired);
+    try testing.expectEqual(true, cap.value);
+
+    // Flip back to output (a command starts running) -> fires(false).
+    cap.fired = false;
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.screens.active.cursor.semantic_content = .output;
+    }
+    _ = try session.renderTick();
+    try testing.expect(cap.fired);
+    try testing.expectEqual(false, cap.value);
 }
 
 test "host selectPoint word + line snap on the real terminal -> selection_text (client) Slice B2" {

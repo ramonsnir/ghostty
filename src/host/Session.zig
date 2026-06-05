@@ -253,6 +253,22 @@ on_surface_event: ?*const fn (ctx: *anyopaque, self: *Session, msg: *const apprt
 on_selection_text_ctx: ?*anyopaque = null,
 on_selection_text: ?*const fn (ctx: *anyopaque, self: *Session, present: bool, text: []const u8) void = null,
 
+/// Phase D at-prompt channel. Set by the Server so a CHANGE in the host
+/// terminal's `cursorIsAtPrompt()` is framed as an `at_prompt` event to
+/// subscribers. The GUI caches the bit for needsConfirmQuit (confirm-close warns
+/// only when a command is actually running). Same OWNING-thread / off-registry_mutex
+/// broadcast discipline as on_selection_text (it does a blocking subscriber
+/// write). null in the standalone path.
+on_at_prompt_ctx: ?*anyopaque = null,
+on_at_prompt: ?*const fn (ctx: *anyopaque, self: *Session, at_prompt: bool) void = null,
+
+/// The last at-prompt value pushed (renderTick-only state, single-threaded on
+/// the render loop). null until the first tick. Used to push an `at_prompt` event
+/// only when the bit FLIPS (no per-tick spam). Seeding a freshly-attached GUI is
+/// handled separately by pushFullFrames (it reads the live value), so this is
+/// purely the change-detector for the steady-state push.
+prev_at_prompt: ?bool = null,
+
 /// Pending selection-text result staged by selectDrag/selectClear (under
 /// render_mutex) for renderTick to drain + broadcast on the owning thread
 /// (findings SEL-1 / SEL-LOCK-1 — keep the blocking subscriber writes off the
@@ -1234,9 +1250,15 @@ pub fn renderTick(self: *Session) !usize {
     var sel_text_pending = false;
     var sel_text_present = false;
     var sel_text: ?[:0]const u8 = null;
+    // Phase D: read the authoritative at-prompt bit under the SAME render_mutex
+    // critical section that captures the snapshot (cursorIsAtPrompt reads terminal
+    // cursor/prompt state the io thread mutates under this lock). Pushed below
+    // only when it flips vs. prev_at_prompt.
+    var at_prompt_now = false;
     var snapshot = blk: {
         self.render_mutex.lock();
         defer self.render_mutex.unlock();
+        at_prompt_now = self.io.terminal.cursorIsAtPrompt();
         force_push = self.search_dirty;
         self.search_dirty = false;
         // Slice B1: a pure selection change (or clear) must also force the
@@ -1325,6 +1347,18 @@ pub fn renderTick(self: *Session) !usize {
     if (sel_text_pending) {
         if (self.on_selection_text) |cb| {
             cb(self.on_selection_text_ctx.?, self, sel_text_present, if (sel_text) |t| t else "");
+        }
+    }
+
+    // Phase D: broadcast the at-prompt bit only when it FLIPS (or on the first
+    // tick), on this owning thread off registry_mutex — same discipline as the
+    // selection_text broadcast above. Independent of the grid gate: the bit can
+    // change on a frame that doesn't otherwise ship, and the GUI needs the latest
+    // value for needsConfirmQuit. Steady idle ticks compare equal -> no push.
+    if (self.prev_at_prompt == null or self.prev_at_prompt.? != at_prompt_now) {
+        self.prev_at_prompt = at_prompt_now;
+        if (self.on_at_prompt) |cb| {
+            cb(self.on_at_prompt_ctx.?, self, at_prompt_now);
         }
     }
 
