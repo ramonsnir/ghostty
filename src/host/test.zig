@@ -301,6 +301,49 @@ test "host cursor-only move pushes (Slice 8): rows identical, cursor differs => 
     try testing.expect(snap_b.cursorEql(snap_b2));
 }
 
+test "host countChanges equals printDiff's row count (server-mode count must match Phase-1 print)" {
+    const alloc = testing.allocator;
+
+    var term = try terminalpkg.Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    defer term.deinit(alloc);
+    try term.printString("hello world");
+
+    var rs_a: RenderStateCore = .empty;
+    defer rs_a.deinit(alloc);
+    try rs_a.update(alloc, &term);
+    var snap_a = try RenderState.Snapshot.fromRenderState(alloc, &rs_a);
+    defer snap_a.deinit(alloc);
+
+    // First-frame case (null prev): every non-blank row counts. countChanges
+    // (no I/O) must equal printDiff's return (the load-bearing gate input).
+    try testing.expectEqual(
+        try RenderState.printDiff(alloc, null, snap_a),
+        RenderState.countChanges(null, snap_a),
+    );
+
+    // Changed-rows case: print onto a second row so a real diff exists.
+    try term.linefeed();
+    try term.printString("second line");
+    var rs_b: RenderStateCore = .empty;
+    defer rs_b.deinit(alloc);
+    try rs_b.update(alloc, &term);
+    var snap_b = try RenderState.Snapshot.fromRenderState(alloc, &rs_b);
+    defer snap_b.deinit(alloc);
+    const diff_count = try RenderState.printDiff(alloc, snap_a, snap_b);
+    try testing.expect(diff_count > 0);
+    try testing.expectEqual(diff_count, RenderState.countChanges(snap_a, snap_b));
+
+    // Identical case: zero on both.
+    try testing.expectEqual(
+        @as(usize, 0),
+        RenderState.countChanges(snap_b, snap_b),
+    );
+    try testing.expectEqual(
+        try RenderState.printDiff(alloc, snap_b, snap_b),
+        RenderState.countChanges(snap_b, snap_b),
+    );
+}
+
 test "host session shuts down on child exit with no trailing output" {
     // Regression test for the child-exit shutdown gap: a child that exits
     // delivers .child_exited ONLY via the surface mailbox (none.App.wakeup is

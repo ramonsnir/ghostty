@@ -1116,6 +1116,35 @@ pub const Snapshot = struct {
     }
 };
 
+/// Whether row `y` of `cur` differs from `prev` (the per-row predicate shared
+/// by `countChanges` and `printDiff` so the server-mode count and the Phase-1
+/// print can never drift apart). With no previous snapshot, a row counts as
+/// changed iff it has any non-blank cell.
+fn rowChanged(prev: ?Snapshot, cur: Snapshot, y: usize) bool {
+    const row = cur.row_data[y];
+    if (prev) |p| {
+        if (y >= p.row_data.len) return true;
+        return !row.eql(p.row_data[y]);
+    }
+    for (row.cells) |c| {
+        if (!isBlank(c)) return true;
+    }
+    return false;
+}
+
+/// Count changed rows between `prev` and `cur` WITHOUT printing anything. This
+/// is the I/O-free half of `printDiff`: server mode only needs the count to
+/// feed Session.renderTick's push gate, and the Phase-1 stdout render dump that
+/// `printDiff` emits is pure noise there (it bypasses std.log, so it can't be
+/// filtered by log level — the fix is to not emit it off the harness path).
+pub fn countChanges(prev: ?Snapshot, cur: Snapshot) usize {
+    var changed: usize = 0;
+    for (0..cur.row_data.len) |y| {
+        if (rowChanged(prev, cur, y)) changed += 1;
+    }
+    return changed;
+}
+
 /// Print the diff between an optional previous snapshot and the current one.
 /// Returns the number of changed rows (the diff size). When there is no
 /// previous snapshot, every non-blank row counts as changed.
@@ -1146,20 +1175,10 @@ pub fn printDiff(alloc: Allocator, prev: ?Snapshot, cur: Snapshot) !usize {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(alloc);
 
-    // Determine, per row, whether it changed.
+    // Determine, per row, whether it changed (shared predicate with
+    // countChanges so the count and the print stay in lockstep).
     for (cur.row_data, 0..) |row, y| {
-        const row_changed = blk: {
-            if (prev) |p| {
-                if (y >= p.row_data.len) break :blk true;
-                break :blk !row.eql(p.row_data[y]);
-            }
-            // No previous: a row counts as changed if it has any non-blank cell.
-            for (row.cells) |c| {
-                if (!isBlank(c)) break :blk true;
-            }
-            break :blk false;
-        };
-        if (!row_changed) continue;
+        if (!rowChanged(prev, cur, y)) continue;
         changed += 1;
 
         // Render the row's text into the line buffer and print it.
