@@ -519,13 +519,18 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         .attach => {
             var attach = try protocol.Attach.decode(alloc, frame.payload);
             defer attach.deinit(alloc);
-            // SLICE 11: carry the spawn-opt cwd through to the spawn path.
-            // `working_directory` is borrowed from the decoded frame (freed by
-            // `attach.deinit` above); handleAttach/spawnSession use it
+            // SLICE 11: carry the spawn-opts (cwd + initial_input) through to
+            // the spawn path. Both are borrowed from the decoded frame (freed by
+            // `attach.deinit` above); handleAttach/spawnSession use them
             // synchronously to seed Session.Options before this returns, and
-            // Session.create dupes it into the session config's arena — no
+            // Session.create dupes them into the session config's arena — no
             // lifetime extension needed past this call.
-            try self.handleAttach(conn, attach.session_id, attach.working_directory);
+            try self.handleAttach(
+                conn,
+                attach.session_id,
+                attach.working_directory,
+                attach.initial_input,
+            );
         },
 
         .input => {
@@ -874,6 +879,7 @@ fn handleAttach(
     conn: *Conn,
     session_id: ?u64,
     working_directory: ?[]const u8,
+    initial_input: ?[]const u8,
 ) !void {
     // Reattach to a session whose Session is still valid (alive child OR a
     // child that exited but whose entry has not been Closed — plan §4.8).
@@ -923,10 +929,11 @@ fn handleAttach(
     self.registry_mutex.lock();
     defer self.registry_mutex.unlock();
     // SLICE 11: a FRESH spawn (or a degrade-to-spawn from an unknown/torn-down
-    // id) honors the Attach's spawn-opt cwd; a LIVE reattach above returned
-    // before reaching here, so it never applies the cwd (the existing session
-    // keeps its own). `null` => host default ($HOME), today's behavior.
-    const e = try self.spawnSession(working_directory);
+    // id) honors the Attach's spawn-opts (cwd + initial_input); a LIVE reattach
+    // above returned before reaching here, so it never applies them (the existing
+    // session keeps its own state). `null` => host default ($HOME / no input),
+    // today's behavior.
+    const e = try self.spawnSession(working_directory, initial_input);
     // spawnSession registered `e` in the registry AND started its owner thread.
     // If any subsequent step fails (subscribe OOM, pushFullFrames), tear down
     // the just-spawned session (finding SR-R2-2): the conn was never subscribed
@@ -1005,15 +1012,21 @@ pub fn allocSessionId(self: *Server) u64 {
 /// CALLER MUST HOLD registry_mutex (findings SR-1 / ZM1): the only caller,
 /// handleAttach, holds it across the whole spawn+dereference so a concurrent
 /// Close cannot fetchRemove+free the entry mid-attach.
-fn spawnSession(self: *Server, working_directory: ?[]const u8) !*SessionEntry {
+fn spawnSession(
+    self: *Server,
+    working_directory: ?[]const u8,
+    initial_input: ?[]const u8,
+) !*SessionEntry {
     const id = self.allocSessionId();
 
-    // SLICE 11: seed the spawn-opt cwd into Session.Options. Session.create
-    // dupes it into the session config's arena, so the borrowed slice (from the
-    // decoded Attach frame, still alive in handleClientFrame) only needs to
-    // outlive this call. `null` => the config's $HOME finalize default stands.
+    // SLICE 11: seed the spawn-opts (cwd + initial_input) into Session.Options.
+    // Session.create dupes them into the session config's arena, so the borrowed
+    // slices (from the decoded Attach frame, still alive in handleClientFrame)
+    // only need to outlive this call. `null` => the config's finalize defaults
+    // stand ($HOME cwd / no initial input).
     const session = try Session.create(self.alloc, .{
         .working_directory = working_directory,
+        .initial_input = initial_input,
     });
     errdefer session.destroy();
 
@@ -1384,10 +1397,24 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
             // not happen for a long time after attach). Read in the same critical
             // section as the snapshot/mode for a coherent point-in-time view.
             .at_prompt = session.io.terminal.cursorIsAtPrompt(),
+            // CWD-INHERIT (reattach seed): the steady-state pwd push only fires
+            // on OSC 7 (next prompt), so a freshly-(re)attached GUI wouldn't learn
+            // the session's current cwd until then — a split made right after a
+            // GUI restart+reattach would inherit $HOME. Capture the live pwd here
+            // (same critical section, coherent with the grid) and push it below
+            // so the GUI's mirror is seeded immediately. DUPE it: getPwd()
+            // returns a slice into the terminal buffer, valid only under this
+            // lock, but the writes happen after we release it. null/empty pwd =>
+            // skip (GUI keeps $HOME default). Freed after the write loop.
+            .pwd = if (session.io.terminal.getPwd()) |p|
+                session.alloc.dupe(u8, p) catch null
+            else
+                null,
         };
     };
     var snapshot = captured.snapshot;
     defer snapshot.deinit(session.alloc);
+    defer if (captured.pwd) |p| session.alloc.free(p);
 
     const mode = captured.mode;
     const grid: protocol.GridFrame = .{ .session_id = e.session_id, .snapshot = snapshot };
@@ -1401,6 +1428,15 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
         conn.writeFramed(.at_prompt, protocol.AtPrompt{
             .session_id = e.session_id,
             .at_prompt = captured.at_prompt,
+        });
+        // CWD-INHERIT (reattach seed): push the live pwd captured above so the
+        // GUI mirror has the session's real cwd immediately on attach. The GUI's
+        // pwd_change handler both seeds its local terminal (so new splits inherit
+        // correctly) and updates the window proxy-icon/title. Skipped when no pwd
+        // is known (captured.pwd == null).
+        if (captured.pwd) |p| conn.writeFramed(.surface_event, protocol.SurfaceEvent{
+            .session_id = e.session_id,
+            .payload = .{ .pwd_change = p },
         });
     }
 }

@@ -286,6 +286,20 @@ pub const Config = struct {
     /// (session_id == null); the host ignores it on reattach.
     working_directory: ?[]const u8 = null,
 
+    /// Spawn-opt initial input for a FRESH session (the `.client` analog of the
+    /// input `.exec` would feed via `Termio`'s ThreadEnterState). Carried in the
+    /// Attach — NOT via a post-attach `.input` frame — because a fresh spawn's
+    /// host-assigned session id isn't known until the `Attached` reply arrives,
+    /// so an Input frame queued at threadEnter would carry session_id 0 and the
+    /// host would drop it (the `new_tab_command` "no command" bug). The bytes are
+    /// the escaped `.raw` form from the GUI's `config.input`; the host stores
+    /// them back into its session config.input and un-escapes once on delivery.
+    /// Borrowed for the duration of `init` (which DUPES it into Client-owned
+    /// memory — same lifetime reasoning as socket_path/working_directory); the
+    /// stored copy is freed in `deinit`. `null` => no initial input. Only
+    /// meaningful on a spawn (session_id == null); the host ignores it on reattach.
+    initial_input: ?[]const u8 = null,
+
     /// SLICE 3d: the renderer-state mutex (`renderer.State.mutex`) the GUI
     /// renderer reads the mirror under. When supplied, the Client guards its
     /// mirror writes under THIS same lock, reconciling the writer/reader lock
@@ -333,9 +347,18 @@ pub fn init(alloc: Allocator, cfg: Config) !Client {
         null;
     errdefer if (working_directory) |wd| alloc.free(wd);
 
+    // Dupe the optional spawn-opt initial input too (same lifetime reasoning as
+    // working_directory — the read thread reads it later in connectAndAttach).
+    const initial_input: ?[]const u8 = if (cfg.initial_input) |ii|
+        try alloc.dupe(u8, ii)
+    else
+        null;
+    errdefer if (initial_input) |ii| alloc.free(ii);
+
     var owned_cfg = cfg;
     owned_cfg.socket_path = socket_path;
     owned_cfg.working_directory = working_directory;
+    owned_cfg.initial_input = initial_input;
 
     return .{
         .gpa = alloc,
@@ -407,6 +430,9 @@ pub fn deinit(self: *Client) void {
     // `init`); free it here. `null` (the default / no-cwd-opt case) frees
     // nothing.
     if (self.config.working_directory) |wd| self.gpa.free(wd);
+    // `config.initial_input` is OWNED when non-null (duped in `init`); free it
+    // here. `null` (the no-input default) frees nothing.
+    if (self.config.initial_input) |ii| self.gpa.free(ii);
 }
 
 /// Call to initialize the terminal state as necessary for this backend.
@@ -590,9 +616,15 @@ pub fn connectAndAttach(
     // by-reference into the frame for the encode — sendFrameRaw encodes
     // synchronously here on the IO thread before returning, and the slice is
     // Client-owned (duped in init), so no ownership transfer is needed.
+    // initial_input rides the same Attach as a second spawn-opt: a fresh spawn's
+    // host-assigned session id isn't known until the Attached reply, so a
+    // post-attach `.input` frame would carry session_id 0 and be dropped. Same
+    // borrow-by-reference-for-the-synchronous-encode reasoning as
+    // working_directory (Client-owned, duped in init).
     try sendFrameRaw(client_td, loop, alloc, .attach, protocol.Attach{
         .session_id = self.config.session_id,
         .working_directory = self.config.working_directory,
+        .initial_input = self.config.initial_input,
     });
 
     // SLICE 3d (finding 3d-lifetime-1): RESOLVE the effective guard mutex now,
@@ -1048,6 +1080,24 @@ pub fn handleFrame(
             // path back to the host over the Input channel — no reply frame here.
             var ev = try protocol.SurfaceEvent.decode(alloc, payload);
             defer ev.deinit(alloc);
+
+            // CWD-INHERIT FIX: under .client the terminal emulation (and thus
+            // OSC 7 / `setPwd`) runs on the HOST, so the GUI-side local mirror
+            // terminal's pwd is never updated. `Surface.pwd()` reads exactly
+            // this local terminal (`io.terminal`), and new-split/new-tab cwd
+            // inheritance (`newSurfaceOptions` -> `core_surface.pwd()`) depends
+            // on it — without this, every hosted split/tab defaulted to $HOME.
+            // Mirror the host's pwd onto the local terminal here so the read
+            // accessor returns the live cwd. We hold the guard mutex (taken in
+            // handleFrame), which IS the renderer_state.mutex `Surface.pwd()`
+            // locks, so this write is correctly synchronized with that read. An
+            // empty pwd resets it (matches stream_handler.reportPwd's reset).
+            // OOM is non-fatal: the pwd just stays stale (no crash).
+            if (ev.payload == .pwd_change) {
+                if (self.local_terminal) |t| t.setPwd(ev.payload.pwd_change) catch |err|
+                    log.warn("failed to mirror host pwd onto local terminal err={}", .{err});
+            }
+
             if (self.surface_mailbox) |mb| {
                 const msg = try ev.toMessage(alloc);
                 _ = mb.push(msg, .{ .forever = {} });

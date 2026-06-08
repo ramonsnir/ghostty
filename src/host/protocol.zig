@@ -323,8 +323,9 @@ fn writeBytes(w: anytype, bytes: []const u8) !void {
 /// length-prefixed slice must be the LAST decoded field of its frame (so
 /// "remaining payload" == "bytes for this slice"). All current callers honor
 /// this: Hello.decode (identity_bundle_id is last), Input.decode (bytes is
-/// last), and Attach.decode (working_directory is the last field, after the
-/// optional session_id). If a future frame places a writeBytes-encoded slice BEFORE other
+/// last), and Attach.decode (initial_input is the last field; the now-non-trailing
+/// working_directory before it uses the position-independent `readBytesField`
+/// instead, capped at MAX_FRAME_LEN). If a future frame places a writeBytes-encoded slice BEFORE other
 /// fields, this guard would become permissive (it would accept an over-claimed
 /// length up to the trailing fields' size — the actual over-read is still
 /// caught by readNoEof below, but the speculative alloc would no longer be
@@ -350,6 +351,27 @@ fn readBytes(alloc: Allocator, fbs: anytype, r: anytype) ![]u8 {
     // placement must be guarded at the PRODUCER, not on this attacker-supplied
     // length. Malformed peer input therefore returns error.InvalidFrame (a clean
     // connection close), never a process abort.
+    if (len > remaining) return error.InvalidFrame;
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    try r.readNoEof(out);
+    return out;
+}
+
+/// Like `readBytes` but POSITION-INDEPENDENT: safe for a length-prefixed field
+/// that is NOT the last field of its frame. `readBytes` derives its anti-DoS
+/// speculative-allocation bound from the trailing-field invariant (`len ==
+/// remaining`); a non-trailing field legitimately has `len < remaining` (later
+/// fields follow), so that bound doesn't apply. Here we instead cap the claimed
+/// length at `MAX_FRAME_LEN` (the whole-frame cap — a single field can never
+/// exceed it) AND reject `len > remaining` (a genuine over-read past the payload
+/// end). Both checks happen BEFORE the alloc, so a corrupt length yields a clean
+/// `error.InvalidFrame` (never an unbounded alloc or a stream desync). Used by
+/// `Attach.decode` for `working_directory`, which is followed by `initial_input`.
+fn readBytesField(alloc: Allocator, fbs: anytype, r: anytype) ![]u8 {
+    const len = try readInt(r, u32);
+    if (len > MAX_FRAME_LEN) return error.InvalidFrame;
+    const remaining = fbs.buffer.len - fbs.pos;
     if (len > remaining) return error.InvalidFrame;
     const out = try alloc.alloc(u8, len);
     errdefer alloc.free(out);
@@ -434,14 +456,34 @@ pub const HelloAck = struct {
 /// only meaningful when `session_id == null` (a fresh spawn). On a REATTACH
 /// (session_id present) the host IGNORES it (the existing session keeps its
 /// cwd). When null the host uses its default ($HOME via passwd), preserving
-/// pre-Slice-11 behavior. It is the LAST encoded field so its length-prefixed
+/// pre-Slice-11 behavior.
+///
+/// SPAWN-OPT (initial_input): `initial_input` is a second spawn-opt carrying the
+/// GUI surface's `config.input` (e.g. from the fork's `new_tab_command`) — the
+/// bytes to feed the fresh shell's pty as if typed. Same fresh-spawn-only
+/// semantics as `working_directory` (ignored on reattach). It is carried in the
+/// Attach (rather than as a post-attach `.input` frame) because a fresh spawn's
+/// host-assigned session id isn't known to the GUI until the `Attached` reply
+/// arrives — a `.input` frame queued at threadEnter would carry session_id 0 and
+/// the host would drop it. The bytes are the escaped-`.raw` form straight from
+/// `config.input`; the host stores them back into its session `config.input` and
+/// its normal input-delivery path un-escapes once (see `Session.create`).
+///
+/// FIELD ORDER: `initial_input` is the LAST encoded field, so its length-prefixed
 /// `readBytes` honors the trailing-field invariant (see `readBytes`).
+/// `working_directory` is no longer trailing, so it decodes with the
+/// position-independent `readBytesField` (capped at MAX_FRAME_LEN) instead.
 pub const Attach = struct {
     session_id: ?u64 = null,
 
     /// Optional spawn-opt cwd for a FRESH session. Owned by this struct when
     /// non-null (freed by deinit; decode allocates it). `null` => host default.
     working_directory: ?[]const u8 = null,
+
+    /// Optional spawn-opt initial input for a FRESH session (the GUI's
+    /// `config.input` raw bytes). Owned by this struct when non-null (freed by
+    /// deinit; decode allocates it). `null` => no initial input.
+    initial_input: ?[]const u8 = null,
 
     pub fn encode(self: Attach, alloc: Allocator) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
@@ -454,10 +496,19 @@ pub const Attach = struct {
             try w.writeByte(0);
         }
         // Optional working_directory: present-byte then a length-prefixed
-        // string. LAST field so readBytes' trailing-field invariant holds.
+        // string. No longer the last field, so it is decoded with
+        // readBytesField (see the field-order note above).
         if (self.working_directory) |wd| {
             try w.writeByte(1);
             try writeBytes(w, wd);
+        } else {
+            try w.writeByte(0);
+        }
+        // Optional initial_input: present-byte then a length-prefixed string.
+        // LAST field so readBytes' trailing-field invariant holds.
+        if (self.initial_input) |ii| {
+            try w.writeByte(1);
+            try writeBytes(w, ii);
         } else {
             try w.writeByte(0);
         }
@@ -471,14 +522,37 @@ pub const Attach = struct {
         const session_id: ?u64 = if (sid_present) try readInt(r, u64) else null;
         const wd_present = (try r.readByte()) != 0;
         const working_directory: ?[]const u8 = if (wd_present)
+            // Non-trailing now (initial_input follows) -> position-independent read.
+            try readBytesField(alloc, &fbs, r)
+        else
+            null;
+        errdefer if (working_directory) |wd| alloc.free(wd);
+        // BACKWARD-COMPAT: tolerate a peer that predates the initial_input field
+        // (its payload ends right after working_directory). A missing
+        // present-byte (EndOfStream) is read as "absent", NOT a decode error, so
+        // an OLD GUI can still attach/reattach to a NEW host across a host
+        // restart (the running GUIs reconnect before they are themselves
+        // rebuilt). A NEW GUI -> OLD host degrades the other way for free: the
+        // old decoder reads working_directory and ignores the trailing
+        // initial_input bytes. Either mismatch just means "no initial input."
+        const ii_present = (r.readByte() catch |err| switch (err) {
+            error.EndOfStream => @as(u8, 0),
+            else => return err,
+        }) != 0;
+        const initial_input: ?[]const u8 = if (ii_present)
             try readBytes(alloc, &fbs, r)
         else
             null;
-        return .{ .session_id = session_id, .working_directory = working_directory };
+        return .{
+            .session_id = session_id,
+            .working_directory = working_directory,
+            .initial_input = initial_input,
+        };
     }
 
     pub fn deinit(self: *Attach, alloc: Allocator) void {
         if (self.working_directory) |wd| alloc.free(wd);
+        if (self.initial_input) |ii| alloc.free(ii);
         self.* = undefined;
     }
 };

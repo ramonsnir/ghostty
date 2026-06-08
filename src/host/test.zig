@@ -677,6 +677,43 @@ test "host protocol frame round-trip + partial read" {
             dec.working_directory.?,
         );
     }
+    // Attach with initial_input only (spawn-opt present, no working_directory):
+    // exercises the trailing initial_input field with a null working_directory
+    // before it.
+    {
+        const orig: protocol.Attach = .{
+            .session_id = null,
+            .initial_input = "claude\n",
+        };
+        const framed = try protocol.encodeFrame(alloc, .attach, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.attach, tag);
+        var dec = try protocol.Attach.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(?u64, null), dec.session_id);
+        try testing.expectEqual(@as(?[]const u8, null), dec.working_directory);
+        try testing.expect(dec.initial_input != null);
+        try testing.expectEqualStrings(orig.initial_input.?, dec.initial_input.?);
+    }
+    // Attach with BOTH spawn-opts present: working_directory is now decoded as a
+    // non-trailing field (readBytesField) with initial_input trailing after it.
+    {
+        const orig: protocol.Attach = .{
+            .session_id = null,
+            .working_directory = "/Users/ramon/git/ghostty",
+            .initial_input = "echo hi\n",
+        };
+        const framed = try protocol.encodeFrame(alloc, .attach, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.attach, tag);
+        var dec = try protocol.Attach.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(?u64, null), dec.session_id);
+        try testing.expectEqualStrings(orig.working_directory.?, dec.working_directory.?);
+        try testing.expectEqualStrings(orig.initial_input.?, dec.initial_input.?);
+    }
 
     // Attached.
     {

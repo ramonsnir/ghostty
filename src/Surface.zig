@@ -704,6 +704,28 @@ pub fn init(
                 // today's behavior. Client.init DUPES it into Client-owned
                 // memory, so the borrowed `wd.value()` need not outlive this call.
                 .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                // initial_input (cwd-inherit's sibling spawn-opt): carry the
+                // GUI surface's resolved `config.input` to the host so a fresh
+                // hosted session runs it (e.g. the fork's `new_tab_command`).
+                // We forward the single escaped `.raw` entry verbatim — the only
+                // shape the apprt produces (embedded.zig turns the apprt
+                // `initial_input` into exactly one `.raw` entry); the host
+                // un-escapes it once on delivery. `.path` entries or >1 entries
+                // (only reachable via `--input` on the CLI, not via pty-host
+                // surfaces) are NOT carried — logged below so it isn't silent.
+                // `null` => no initial input. Client.init DUPES it, so the
+                // borrowed slice need not outlive this call.
+                .initial_input = client_initial_input: {
+                    const items = config.input.list.items;
+                    if (items.len == 0) break :client_initial_input null;
+                    if (items.len == 1 and items[0] == .raw)
+                        break :client_initial_input items[0].raw;
+                    log.warn(
+                        "pty-host: config.input has {d} entr{s} that cannot be carried as a spawn-opt (path/multi); initial input will not be delivered to the hosted session",
+                        .{ items.len, if (items.len == 1) "y" else "ies" },
+                    );
+                    break :client_initial_input null;
+                },
             });
             // Note: Client.init dupes socket_path into Client-owned memory
             // (freed in Client.deinit), so the value owns heap state immediately
@@ -797,6 +819,21 @@ pub fn init(
                 // mirror/link_cells above). Set before the read thread spawns in
                 // `threadEnter`, so the first `.mode_frame` already targets it.
                 c.setLocalTerminal(&self.io.terminal);
+
+                // CWD-INHERIT (fresh-spawn pre-prompt seed): the host only
+                // forwards pwd on OSC 7 (mirrored by handleFrame's pwd_change),
+                // and Exec's spawn-cwd setPwd runs on the HOST terminal, not this
+                // mirror. So until the first prompt's OSC 7, `pwd()` here is empty
+                // and a brand-new split/tab would inherit $HOME. Seed the mirror
+                // with the cwd we just asked the host to spawn in so inheritance
+                // is correct immediately — matching `.exec`, where Exec seeds the
+                // spawn cwd on the very terminal `pwd()` reads. A later OSC 7
+                // overwrites this with the live cwd. Safe + single-threaded here
+                // (the read thread isn't spawned until `threadEnter`). A null wd
+                // (host $HOME default) leaves the mirror empty, today's behavior.
+                // (Reattach is handled host-side: pushFullFrames sends live pwd.)
+                if (config.@"working-directory") |wd| if (wd.value()) |path|
+                    self.io.terminal.setPwd(path) catch {};
 
                 // The `.client` backend never consumed `env` (the host owns the
                 // subprocess and its environment); `.exec` would have taken
