@@ -338,10 +338,21 @@ pub fn threadEnter(
     // If we have thread enter state then we're going to validate
     // and set that all up now so that we can error before we actually
     // start the command and pty.
-    const inputs: ?[]const ThreadEnterState.Input = if (self.thread_enter_state) |v|
-        try v.prepareInput()
-    else
-        null;
+    //
+    // EXCEPT under the `.client` (pty-host) backend: there is no local pty to
+    // feed, and the initial input is delivered by the HOST via the Attach
+    // spawn-opt (`Client.Config.initial_input`) — see the delivery-skip note
+    // below. Skipping prepareInput here also avoids opening `.path` input files
+    // on the GUI side (the host opens its own when it prepares the session's
+    // input). The host validates/errors on its own input at its session's
+    // threadEnter, mirroring the pre-spawn validation this does for `.exec`.
+    const inputs: ?[]const ThreadEnterState.Input =
+        if (self.backend != .client) if (self.thread_enter_state) |v|
+            try v.prepareInput()
+        else
+            null
+        else
+            null;
 
     data.* = .{
         .alloc = self.alloc,
@@ -356,7 +367,14 @@ pub fn threadEnter(
     try self.backend.threadEnter(self.alloc, self, data);
     errdefer self.backend.threadExit(data);
 
-    // If we have inputs, then queue them all up.
+    // If we have inputs, then queue them all up. (`inputs` is always null under
+    // `.client` — see the prepareInput note above: queueWrite there would send
+    // an `.input` frame keyed by the host-assigned session id, which is still 0
+    // at this point — the `Attached` reply that carries it hasn't arrived, we're
+    // inside threadEnter before the IO loop runs — so the host would drop the
+    // frame. The initial input is instead carried as an Attach spawn-opt
+    // (`Client.Config.initial_input`) and delivered by the host on the fresh
+    // spawn.)
     for (inputs orelse &.{}) |input| switch (input) {
         .string => |v| self.queueWrite(data, v, false) catch |err| {
             log.warn("failed to queue input string err={}", .{err});

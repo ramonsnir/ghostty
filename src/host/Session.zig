@@ -60,6 +60,18 @@ pub const Options = struct {
     /// (the only path that calls `create`); reattach never reaches here, so the
     /// existing session keeps its cwd.
     working_directory: ?[]const u8 = null,
+
+    /// Spawn-opt initial input carried from the GUI's Attach frame: the bytes to
+    /// feed the fresh shell's pty as if typed (e.g. the fork's `new_tab_command`).
+    /// These are the escaped `.raw` form from the GUI's `config.input`; `create`
+    /// stores them back into THIS session's `config.input` as a single `.raw`
+    /// entry, and the session's own Termio input-delivery path (ThreadEnterState)
+    /// un-escapes them once and writes them to the pty — the SAME machinery the
+    /// GUI uses under `.exec`. Borrowed for the duration of `create` (DUPED into
+    /// the config arena before storing); the caller need not keep it alive past
+    /// `create`. `null` => no initial input. Fresh-spawn only (reattach never
+    /// reaches `create`).
+    initial_input: ?[]const u8 = null,
 };
 
 /// The host's search thread + OS thread handle, mirroring `Surface.Search`
@@ -379,6 +391,26 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
     if (opts.working_directory) |wd| {
         const arena_alloc = config._arena.?.allocator();
         config.@"working-directory" = .{ .path = try arena_alloc.dupe(u8, wd) };
+    }
+
+    // initial_input (cwd-inherit's sibling spawn-opt): if the GUI's Attach
+    // carried initial input, store it into THIS session's config.input as a
+    // single `.raw` entry so the Termio built below picks it up via
+    // ThreadEnterState (created from config.input in Termio.init) and feeds it
+    // to the freshly-spawned pty — the same path `.exec` uses on the GUI side.
+    // The bytes are the GUI's already-ESCAPED `.raw` form, so storing them as
+    // `.raw` makes the standard cloneParsed/string.parse un-escape them EXACTLY
+    // once (a double-escape would mangle backslashes). DUPE (null-terminated, as
+    // ReadableIO.raw is `[:0]const u8`) into the config's OWN arena, freed by
+    // config.deinit. Must run BEFORE the Termio block (ThreadEnterState reads
+    // config.input at Termio.init time). `null` => config.input stays empty
+    // (no ThreadEnterState), today's behavior.
+    if (opts.initial_input) |ii| {
+        const arena_alloc = config._arena.?.allocator();
+        try config.input.list.append(
+            arena_alloc,
+            .{ .raw = try arena_alloc.dupeZ(u8, ii) },
+        );
     }
 
     const size: renderer.Size = .{
