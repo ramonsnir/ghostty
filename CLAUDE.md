@@ -244,10 +244,11 @@ this macOS); `nushell` for `build.nu`.
 - `origin` = *upstream* `ghostty-org/ghostty` (the official repo). **Never push here.**
   A push to `origin` would shove personal work at the official project.
 - `fork` = personal backup `git@github.com:ramonsnir/ghostty.git`. `ramon-fork` tracks
-  `fork/main`, so a plain `git push` from `ramon-fork` backs up the fork there — this is
-  the intended push target.
+  `fork/main` (local branch name ≠ remote branch name), so back it up with
+  **`git push fork HEAD:main`** — a bare `git push` is refused because of the name
+  mismatch. This is the intended push target.
 
-So `git push` (to `fork`) is now allowed and is the backup path; just confirm the
+So pushing to `fork` is now allowed and is the backup path; just confirm the
 remote is `fork` before pushing, and **never** `git push origin`. The `ptyhost/*`
 branches have no remote set — leave them local-only unless explicitly asked to back
 them up to `fork`.
