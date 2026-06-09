@@ -540,33 +540,35 @@ final class WebMonitorServer {
         case .input(let uuid):
             clearAuthFailures(peer)
             let contentType = req.headers["content-type"] ?? ""
-            // Decode the bytes to send.
-            guard let bytes = Self.decodeInput(body: req.body, contentType: contentType) else {
+            // Decode the request into an ordered list of KEY EVENT specs. We
+            // send REAL key events (ghostty_surface_key), NOT pasted text
+            // (ghostty_surface_text) — pasting routes through the clipboard
+            // path, so "\n" lands as a literal newline (never submits) and
+            // control bytes / arrows are not real keypresses; newline-bearing
+            // pastes also trip Mac paste-protection (a dialog invisible to the
+            // phone). A pure mapping turns the request into specs; the
+            // main-thread sender below replays them as presses on the surface.
+            guard let specs = Self.keySpecs(body: req.body, contentType: contentType) else {
                 send(.status(400, "Bad Request"), on: conn)
                 return
             }
             // Empty decoded input is a no-op; report it as a 400 so the
             // client knows nothing landed (S2).
-            guard !bytes.isEmpty else {
+            guard !specs.isEmpty else {
                 send(.status(400, "Bad Request"), on: conn)
                 return
             }
             let result: HTTPResponse = DispatchQueue.main.sync {
                 guard let view = self.surface(forUUID: uuid),
                       let surface = view.surface else { return .status(404, "Not Found") }
-                // ghostty_surface_text takes a RAW BYTE LENGTH — pass the
-                // EXACT byte count (no NUL adjustment; our bytes have no NUL).
-                // The C signature is `const char*` (CChar/Int8), so rebind the
-                // UInt8 buffer's raw memory to CChar before the call — Swift
-                // does NOT implicitly convert UnsafePointer<UInt8> to
-                // UnsafePointer<CChar>.
-                bytes.withUnsafeBytes { raw in
-                    ghostty_surface_text(
-                        surface,
-                        raw.baseAddress?.assumingMemoryBound(to: CChar.self),
-                        UInt(raw.count))
+                // Build a ghostty_input_key_s per spec and replay it as a real
+                // key event. Mirror the macOS keyDown path: send a PRESS then a
+                // RELEASE for each spec. Only value types crossed the main-thread
+                // hop; the surface pointer is fetched and used entirely on main.
+                for spec in specs {
+                    spec.send(to: surface)
                 }
-                return .json(Data(#"{"ok":true,"sent":\#(bytes.count)}"#.utf8))
+                return .json(Data(#"{"ok":true,"sent":\#(specs.count)}"#.utf8))
             }
             send(result, on: conn)
         }
@@ -600,31 +602,124 @@ final class WebMonitorServer {
         return lower == configuredHost.lowercased() || loopback
     }
 
-    /// Decode POST input body into bytes. Keys ONLY off Content-Type: when it is
-    /// `application/json`, the body is parsed as `{"key":...}` and mapped; for
-    /// any other (or missing) Content-Type the body is treated as raw UTF-8
-    /// bytes. We do NOT sniff a leading `{` (S11) — literal text starting with a
-    /// brace must round-trip unchanged. Returns nil only on declared-JSON with a
-    /// missing/unknown key.
-    static func decodeInput(body: Data, contentType: String) -> [UInt8]? {
+    // MARK: - Key event specs (real keypresses, not paste)
+
+    /// A single key event to replay on a surface. PURE/value-type so the
+    /// request->events mapping is unit-testable without AppKit or a surface.
+    /// Mirrors the field set the macOS keyDown path fills into a
+    /// `ghostty_input_key_s`: a keycode (`ghostty_input_key_e`, 0 when unset for
+    /// text-bearing events), modifiers, optional `text` (the UTF-8 the key
+    /// produces — set for printable characters so the event encodes text exactly
+    /// like a typed key), and the `unshiftedCodepoint` (the base-layout scalar).
+    struct KeySpec: Equatable {
+        var keycode: ghostty_input_key_e
+        var mods: ghostty_input_mods_e
+        var text: String?
+        var unshiftedCodepoint: UInt32
+
+        init(
+            keycode: ghostty_input_key_e = ghostty_input_key_e(0),
+            mods: ghostty_input_mods_e = GHOSTTY_MODS_NONE,
+            text: String? = nil,
+            unshiftedCodepoint: UInt32 = 0
+        ) {
+            self.keycode = keycode
+            self.mods = mods
+            self.text = text
+            self.unshiftedCodepoint = unshiftedCodepoint
+        }
+
+        /// Build a `ghostty_input_key_s` for this spec at the given action and
+        /// hand it to `ghostty_surface_key`. MUST be called on the main thread
+        /// (it touches the surface pointer). Text is only attached for a PRESS
+        /// (a RELEASE carries no text), matching the keyDown path which only
+        /// encodes UTF-8 when there is text and no single control char.
+        func send(to surface: ghostty_surface_t) {
+            // Press, then matching release — the same two-event shape AppKit's
+            // keyDown/keyUp produces for a typed key.
+            sendOne(action: GHOSTTY_ACTION_PRESS, to: surface)
+            sendOne(action: GHOSTTY_ACTION_RELEASE, to: surface)
+        }
+
+        private func sendOne(action: ghostty_input_action_e, to surface: ghostty_surface_t) {
+            var key_ev = ghostty_input_key_s()
+            key_ev.action = action
+            key_ev.keycode = UInt32(keycode.rawValue)
+            key_ev.mods = mods
+            key_ev.consumed_mods = GHOSTTY_MODS_NONE
+            key_ev.unshifted_codepoint = unshiftedCodepoint
+            key_ev.composing = false
+            // Encode text only on PRESS, and only when it is not a single
+            // control character (control chars are encoded by Ghostty itself,
+            // matching SurfaceView.keyAction).
+            if action == GHOSTTY_ACTION_PRESS,
+               let text, text.count > 0,
+               let codepoint = text.utf8.first, codepoint >= 0x20 {
+                text.withCString { ptr in
+                    key_ev.text = ptr
+                    _ = ghostty_surface_key(surface, key_ev)
+                }
+            } else {
+                key_ev.text = nil
+                _ = ghostty_surface_key(surface, key_ev)
+            }
+        }
+    }
+
+    /// Decode a POST /input request into an ordered list of key-event specs.
+    /// Keys ONLY off Content-Type (S11 — never sniffs a leading `{`): when it is
+    /// `application/json` the body is parsed as `{"key":...}` and mapped via
+    /// `keySpecs(forKey:)`; for any other (or missing) Content-Type the body is
+    /// treated as raw UTF-8 text and mapped via `keySpecs(forText:)`. Returns nil
+    /// on declared-JSON with a missing/unknown key, or on a body that is not
+    /// valid UTF-8 text. An empty raw body decodes to an empty (non-nil) list;
+    /// the route's `!specs.isEmpty` guard turns that into a 400.
+    static func keySpecs(body: Data, contentType: String) -> [KeySpec]? {
         if contentType.lowercased().contains("application/json") {
             guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let key = obj["key"] as? String else { return nil }
-            switch key {
-            case "enter": return [0x0d]
-            case "ctrl-c": return [0x03]
-            case "esc": return [0x1b]
-            case "tab": return [0x09]
-            case "up": return [0x1b, 0x5b, 0x41]
-            case "down": return [0x1b, 0x5b, 0x42]
-            case "right": return [0x1b, 0x5b, 0x43]
-            case "left": return [0x1b, 0x5b, 0x44]
-            case "y": return [UInt8(ascii: "y")]
-            case "n": return [UInt8(ascii: "n")]
-            default: return nil
-            }
+            return keySpecs(forKey: key)
         }
-        return [UInt8](body)
+        guard let text = String(data: body, encoding: .utf8) else { return nil }
+        return keySpecs(forText: text)
+    }
+
+    /// PURE: map a named key command to a single key-event spec. Unknown -> nil.
+    /// Named keys carry a `ghostty_input_key_e` keycode (so Ghostty synthesizes
+    /// the real keypress/escape sequence); `y`/`n` are just printable text.
+    static func keySpecs(forKey key: String) -> [KeySpec]? {
+        switch key {
+        case "enter": return [KeySpec(keycode: GHOSTTY_KEY_ENTER)]
+        case "esc": return [KeySpec(keycode: GHOSTTY_KEY_ESCAPE)]
+        case "tab": return [KeySpec(keycode: GHOSTTY_KEY_TAB)]
+        case "ctrl-c": return [KeySpec(keycode: GHOSTTY_KEY_C, mods: GHOSTTY_MODS_CTRL)]
+        case "up": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_UP)]
+        case "down": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_DOWN)]
+        case "left": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_LEFT)]
+        case "right": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_RIGHT)]
+        case "y": return keySpecs(forText: "y")
+        case "n": return keySpecs(forText: "n")
+        default: return nil
+        }
+    }
+
+    /// PURE: map literal text to one key-event spec per Character. Printable
+    /// characters become a text-bearing spec (`text` = that character,
+    /// `unshiftedCodepoint` = its first Unicode scalar, keycode unset) — a
+    /// text-bearing event encodes its text exactly as the keyDown path does for
+    /// typed characters. A newline (`\n` or `\r`) becomes a REAL Enter key event
+    /// (`GHOSTTY_KEY_ENTER`), NOT a text-bearing control char: a text spec for a
+    /// control codepoint (< 0x20) would carry no text and submit nothing, so the
+    /// trailing "\n" the page appends on Send must map to Enter to actually
+    /// submit (this is the core of the paste->key-event fix).
+    static func keySpecs(forText text: String) -> [KeySpec] {
+        text.map { ch in
+            if ch == "\n" || ch == "\r" {
+                return KeySpec(keycode: GHOSTTY_KEY_ENTER)
+            }
+            let scalar = ch.unicodeScalars.first?.value ?? 0
+            return KeySpec(text: String(ch), unshiftedCodepoint: scalar)
+        }
     }
 
     // MARK: - Main-thread helpers (AppKit / surface access)
@@ -1264,7 +1359,12 @@ final class WebMonitorServer {
       function doSend(withNewline) {
         var v = inp.value;
         if (!v) return;
-        sendText(withNewline ? (v + "\\n") : v);
+        // Type the text (text/plain -> server turns it into typed key events),
+        // then for Send (withNewline) ALSO fire a separate Enter key event
+        // (sendKey -> {key:"enter"}). NO trailing "\n" is ever appended; the
+        // newline/submit is a real Enter key, not a pasted character.
+        sendText(v);
+        if (withNewline) sendKey("enter");
         inp.value = "";
         inp.focus();
         syncSendEnabled();
