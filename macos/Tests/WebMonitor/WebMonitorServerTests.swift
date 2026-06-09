@@ -1,12 +1,14 @@
 import Foundation
 import Testing
+import GhosttyKit
 @testable import Ghostty
 
 /// Unit tests for the pure / value units of the fork-only web monitor server.
 /// These cover the security-critical request parsing (Content-Length bounds,
 /// chunked rejection, header detection across partial reads), token comparison,
-/// input decoding (incl. the fixed brace-leading-plaintext behavior and the new
-/// arrow/Tab keys), listen-spec parsing, and the surfaces JSON shaping.
+/// the input -> key-event-spec mapping (real key events, not paste — incl. the
+/// fixed brace-leading-plaintext behavior, ctrl-c as a real Ctrl+C, and the
+/// trailing-newline -> Enter submit), listen-spec parsing, and surfaces JSON shaping.
 struct WebMonitorServerTests {
 
     // MARK: - tokenAcceptable (startup strength gate)
@@ -62,97 +64,173 @@ struct WebMonitorServerTests {
         #expect(!WebMonitorServer.tokensMatch("tökën-✓", "tökën-✗"))
     }
 
-    // MARK: - decodeInput
+    // MARK: - keySpecs (real key events, not paste)
 
-    @Test func decodeInputNamedKeys() {
-        func key(_ k: String) -> [UInt8]? {
-            WebMonitorServer.decodeInput(
-                body: Data("{\"key\":\"\(k)\"}".utf8),
-                contentType: "application/json")
+    @Test func keySpecsNamedKeysAreRealKeyEvents() {
+        // Named keys map to a single spec carrying a ghostty_input_key_e
+        // keycode (NOT a pasted escape byte sequence) so Ghostty synthesizes
+        // the real keypress.
+        func spec(_ k: String) -> WebMonitorServer.KeySpec? {
+            WebMonitorServer.keySpecs(forKey: k)?.first
         }
-        #expect(key("enter") == [0x0d])
-        #expect(key("ctrl-c") == [0x03])
-        #expect(key("esc") == [0x1b])
-        #expect(key("tab") == [0x09])
-        #expect(key("up") == [0x1b, 0x5b, 0x41])
-        #expect(key("down") == [0x1b, 0x5b, 0x42])
-        #expect(key("right") == [0x1b, 0x5b, 0x43])
-        #expect(key("left") == [0x1b, 0x5b, 0x44])
-        #expect(key("y") == [UInt8(ascii: "y")])
-        #expect(key("n") == [UInt8(ascii: "n")])
+        #expect(spec("enter") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER))
+        #expect(spec("esc") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ESCAPE))
+        #expect(spec("tab") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_TAB))
+        #expect(spec("up") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_UP))
+        #expect(spec("down") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_DOWN))
+        #expect(spec("left") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_LEFT))
+        #expect(spec("right") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_RIGHT))
     }
 
-    @Test func decodeInputUnknownKey() {
-        let r = WebMonitorServer.decodeInput(
+    @Test func keySpecsCtrlCSetsCtrlModifier() {
+        // ctrl-c is a REAL Ctrl+C key event (GHOSTTY_KEY_C + ctrl modifier),
+        // not a pasted 0x03 byte.
+        let s = WebMonitorServer.keySpecs(forKey: "ctrl-c")
+        #expect(s == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_C, mods: GHOSTTY_MODS_CTRL)])
+    }
+
+    @Test func keySpecsYNArePrintableText() {
+        // y/n are just printable text: text-bearing, keycode unset (0),
+        // unshiftedCodepoint = the scalar.
+        #expect(WebMonitorServer.keySpecs(forKey: "y")
+            == [WebMonitorServer.KeySpec(text: "y", unshiftedCodepoint: UInt32(UnicodeScalar("y").value))])
+        #expect(WebMonitorServer.keySpecs(forKey: "n")
+            == [WebMonitorServer.KeySpec(text: "n", unshiftedCodepoint: UInt32(UnicodeScalar("n").value))])
+    }
+
+    @Test func keySpecsUnknownKey() {
+        #expect(WebMonitorServer.keySpecs(forKey: "bogus") == nil)
+    }
+
+    @Test func keySpecsForTextOnePerCharacter() {
+        // Printable text -> one text-bearing spec per Character, keycode unset,
+        // unshiftedCodepoint = each char's first scalar.
+        let s = WebMonitorServer.keySpecs(forText: "hi")
+        #expect(s == [
+            WebMonitorServer.KeySpec(text: "h", unshiftedCodepoint: UInt32(UnicodeScalar("h").value)),
+            WebMonitorServer.KeySpec(text: "i", unshiftedCodepoint: UInt32(UnicodeScalar("i").value)),
+        ])
+        // The keycode stays unset (0) for printable text.
+        #expect(s.first?.keycode.rawValue == 0)
+        #expect(s.first?.text == "h")
+    }
+
+    @Test func keySpecsForTextEmptyIsEmptyList() {
+        #expect(WebMonitorServer.keySpecs(forText: "") == [])
+    }
+
+    @Test func keySpecsEmptyKeyIsUnknown() {
+        // An empty named-key string is not a known key -> nil (treated as a 400
+        // by the route, NOT as empty text).
+        #expect(WebMonitorServer.keySpecs(forKey: "") == nil)
+    }
+
+    @Test func keySpecsPlainLettersCarryNoModsButCtrlCDoes() {
+        // Plain printable letters must carry NO modifier (mods stays at the
+        // default GHOSTTY_MODS_NONE), so they type as ordinary characters.
+        for spec in WebMonitorServer.keySpecs(forText: "yn") {
+            #expect(spec.mods == GHOSTTY_MODS_NONE)
+        }
+        #expect(WebMonitorServer.keySpecs(forKey: "y")?.first?.mods == GHOSTTY_MODS_NONE)
+        #expect(WebMonitorServer.keySpecs(forKey: "n")?.first?.mods == GHOSTTY_MODS_NONE)
+        // Named non-modifier keys are also mods-free.
+        #expect(WebMonitorServer.keySpecs(forKey: "enter")?.first?.mods == GHOSTTY_MODS_NONE)
+        #expect(WebMonitorServer.keySpecs(forKey: "up")?.first?.mods == GHOSTTY_MODS_NONE)
+        // ...whereas ctrl-c is the ONLY key here that carries a modifier.
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-c")?.first?.mods == GHOSTTY_MODS_CTRL)
+    }
+
+    @Test func keySpecsForTextNewlineIsRealEnter() {
+        // The trailing "\n" the page appends on Send must become a REAL Enter
+        // key event (so the line actually submits), NOT a dead text-bearing
+        // control char. \r maps the same way.
+        #expect(WebMonitorServer.keySpecs(forText: "\n") == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
+        #expect(WebMonitorServer.keySpecs(forText: "\r") == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
+        // "hi\n" -> two printable specs then an Enter.
+        #expect(WebMonitorServer.keySpecs(forText: "hi\n") == [
+            WebMonitorServer.KeySpec(text: "h", unshiftedCodepoint: UInt32(UnicodeScalar("h").value)),
+            WebMonitorServer.KeySpec(text: "i", unshiftedCodepoint: UInt32(UnicodeScalar("i").value)),
+            WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER),
+        ])
+    }
+
+    // MARK: - keySpecs(body:contentType:) — request decode
+
+    @Test func keySpecsBodyJSONNamedKey() {
+        let r = WebMonitorServer.keySpecs(
+            body: Data("{\"key\":\"enter\"}".utf8),
+            contentType: "application/json")
+        #expect(r == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
+    }
+
+    @Test func keySpecsBodyJSONUnknownKey() {
+        // Declared JSON with an unknown key -> nil (400).
+        let r = WebMonitorServer.keySpecs(
             body: Data("{\"key\":\"bogus\"}".utf8),
             contentType: "application/json")
         #expect(r == nil)
     }
 
-    @Test func decodeInputJSONContentTypeButNonJSONBody() {
+    @Test func keySpecsBodyJSONContentTypeButNonJSONBody() {
         // Declared JSON but the body is not valid JSON / has no key -> nil.
-        let r = WebMonitorServer.decodeInput(
+        let r = WebMonitorServer.keySpecs(
             body: Data("not json".utf8),
             contentType: "application/json")
         #expect(r == nil)
     }
 
-    @Test func decodeInputJSONWithCharsetParam() {
+    @Test func keySpecsBodyJSONWithCharsetParam() {
         // Content-Type with a parameter still counts as JSON (substring match).
-        let r = WebMonitorServer.decodeInput(
+        let r = WebMonitorServer.keySpecs(
             body: Data("{\"key\":\"enter\"}".utf8),
             contentType: "application/json; charset=utf-8")
-        #expect(r == [0x0d])
+        #expect(r == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
     }
 
-    @Test func decodeInputTextTypeWithBraceBodyNotJSON() {
+    @Test func keySpecsBodyTextTypeWithBraceBodyNotJSON() {
         // A non-JSON content type whose body happens to be JSON-shaped must be
-        // treated as raw bytes (keyed off Content-Type only, never sniffed).
-        let body = Data("{\"key\":\"enter\"}".utf8)
-        let r = WebMonitorServer.decodeInput(body: body, contentType: "text/plain; charset=utf-8")
-        #expect(r == [UInt8](body))
+        // treated as literal text (keyed off Content-Type only, never sniffed).
+        // It becomes one printable spec per character, NOT a key command.
+        let r = WebMonitorServer.keySpecs(
+            body: Data("{x}".utf8),
+            contentType: "text/plain; charset=utf-8")
+        #expect(r == WebMonitorServer.keySpecs(forText: "{x}"))
+        #expect(r?.count == 3)
     }
 
-    @Test func decodeInputRawPlaintext() {
-        let r = WebMonitorServer.decodeInput(
-            body: Data("hello".utf8),
+    @Test func keySpecsBodyRawPlaintext() {
+        let r = WebMonitorServer.keySpecs(
+            body: Data("hi".utf8),
             contentType: "text/plain")
-        #expect(r == [UInt8]("hello".utf8))
+        #expect(r == WebMonitorServer.keySpecs(forText: "hi"))
     }
 
-    @Test func decodeInputEmptyPlaintext() {
-        let r = WebMonitorServer.decodeInput(body: Data(), contentType: "text/plain")
-        #expect(r == [])
+    @Test func keySpecsBodyEmptyContract() {
+        // The empty-input contract the route relies on for its 400/no-op:
+        // a raw (non-JSON) empty body decodes to a NON-nil empty list, and the
+        // route's `!specs.isEmpty` guard turns that into a 400.
+        #expect(WebMonitorServer.keySpecs(body: Data(), contentType: "text/plain") == [])
+        #expect(WebMonitorServer.keySpecs(body: Data(), contentType: "") == [])
+        // An empty body declared as JSON is NOT parseable as {"key":...} -> nil
+        // (400 via the guard-let branch instead).
+        #expect(WebMonitorServer.keySpecs(body: Data(), contentType: "application/json") == nil)
     }
 
-    @Test func decodeInputEmptyBodyContract() {
-        // The empty-decoded-input contract that routeRequest's /input handler
-        // relies on for its 400/no-op behavior. For a raw (non-JSON) content
-        // type an empty body decodes to a NON-nil empty byte array (decodeInput
-        // succeeds), and routeRequest's separate `!bytes.isEmpty` guard is what
-        // turns that empty result into a 400 no-op (nothing is fed to the
-        // surface). decodeInput does NOT itself return nil for an empty raw body.
-        #expect(WebMonitorServer.decodeInput(body: Data(), contentType: "text/plain") == [])
-        #expect(WebMonitorServer.decodeInput(body: Data(), contentType: "") == [])
-        // An empty body declared as JSON is NOT parseable as {"key":...}, so it
-        // decodes to nil (decodeInput failure) — also a 400 in routeRequest, but
-        // via the `guard let bytes` branch rather than the empty-bytes branch.
-        #expect(WebMonitorServer.decodeInput(body: Data(), contentType: "application/json") == nil)
+    @Test func keySpecsBodyBraceLeadingPlaintextIsNotSniffed() {
+        // S11: text starting with "{" but sent as text/plain must be treated as
+        // literal text, NOT interpreted as a JSON key command.
+        let r = WebMonitorServer.keySpecs(
+            body: Data("{not a command}".utf8),
+            contentType: "text/plain")
+        #expect(r == WebMonitorServer.keySpecs(forText: "{not a command}"))
     }
 
-    @Test func decodeInputBraceLeadingPlaintextIsNotSniffed() {
-        // FIXED behavior (S11): text starting with "{" but sent as text/plain
-        // must round-trip verbatim, NOT be interpreted as a JSON key command.
-        let body = Data("{not a command}".utf8)
-        let r = WebMonitorServer.decodeInput(body: body, contentType: "text/plain")
-        #expect(r == [UInt8](body))
-    }
-
-    @Test func decodeInputNoContentTypeIsRaw() {
-        let body = Data("{\"key\":\"enter\"}".utf8)
-        let r = WebMonitorServer.decodeInput(body: body, contentType: "")
-        // No declared JSON -> raw bytes, not interpreted.
-        #expect(r == [UInt8](body))
+    @Test func keySpecsBodyNoContentTypeIsText() {
+        // No declared JSON -> literal text, not interpreted.
+        let r = WebMonitorServer.keySpecs(
+            body: Data("{\"key\":\"enter\"}".utf8),
+            contentType: "")
+        #expect(r == WebMonitorServer.keySpecs(forText: "{\"key\":\"enter\"}"))
     }
 
     // MARK: - parseListen
@@ -811,5 +889,22 @@ struct WebMonitorServerTests {
         // silently returning.
         #expect(page.contains("function noActiveSession() { setBanner(\"No active session.\", false); setTimeout(clearBannerIfNotError, 1500); }"))
         #expect(page.contains("if (!current) { noActiveSession(); return; }"))
+    }
+
+    @Test func htmlPageSendTypesTextThenEnterKey() {
+        let page = WebMonitorServer.htmlPage
+        // doSend must NOT append "\n" to the body. Instead it sends the typed
+        // text via the text path, and for Send (withNewline) ALSO fires a
+        // separate Enter key event. So Send = type + Enter, Raw = type only,
+        // and no trailing newline is ever pasted.
+        #expect(page.contains("sendText(v);"))
+        #expect(page.contains("if (withNewline) sendKey(\"enter\");"))
+        // The old behavior — appending a literal "\n" to the typed value — is gone.
+        #expect(!page.contains("v + \"\\\\n\""))
+        // Send fires doSend(true) (type + Enter); Raw fires doSend(false) (type only);
+        // the input's Enter keydown submits via doSend(true).
+        #expect(page.contains("sendBtn.onclick = function () { doSend(true); };"))
+        #expect(page.contains("rawBtn.onclick = function () { doSend(false); };"))
+        #expect(page.contains("if (e.key === \"Enter\") { e.preventDefault(); doSend(true); }"))
     }
 }
