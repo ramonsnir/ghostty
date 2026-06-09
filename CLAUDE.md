@@ -240,10 +240,17 @@ this macOS); `nushell` for `build.nu`.
 7. **Commit** to `ramon-fork`.
 
 ## ⚠️ Safety
-**Never `git push` (and don't offer to).** The only remote, `origin`, is *upstream*
-`ghostty-org/ghostty` — there is **no personal fork remote**. Pushing `ramon-fork`
-(or the `ptyhost/*` branches) would shove personal work at the official repo. All
-fork commits stay **local-only**; "commit to ramon-fork" never implies a push.
+**Two remotes — push ONLY to `fork`, NEVER to `origin`.**
+- `origin` = *upstream* `ghostty-org/ghostty` (the official repo). **Never push here.**
+  A push to `origin` would shove personal work at the official project.
+- `fork` = personal backup `git@github.com:ramonsnir/ghostty.git`. `ramon-fork` tracks
+  `fork/main`, so a plain `git push` from `ramon-fork` backs up the fork there — this is
+  the intended push target.
+
+So `git push` (to `fork`) is now allowed and is the backup path; just confirm the
+remote is `fork` before pushing, and **never** `git push origin`. The `ptyhost/*`
+branches have no remote set — leave them local-only unless explicitly asked to back
+them up to `fork`.
 
 NEVER run `osascript -e 'quit app "Ghostty"'` — the fork and the official build are
 both *named* "Ghostty", so it's ambiguous and can quit the user's real, working
