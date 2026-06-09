@@ -7,7 +7,10 @@ iteration looks like once each gap is closed.
 
 Companion notes: [`NOTES-split-tab-reorg.md`](NOTES-split-tab-reorg.md) covers
 the underlying split/tab reorg work, several capabilities of which unlock
-gaps listed below.
+gaps listed below. The fork's **non-keybinding** features live in their own
+docs: the **web monitor** (watch/drive splits from a phone over HTTP, with its
+own `web-monitor-listen` / `web-monitor-token` config) is in
+[`WEB-MONITOR.md`](WEB-MONITOR.md).
 
 Baseline reference: the user's old Linux tmux config (prefix `C-a`, send-prefix
 `a`, project launchers, sync-panes, etc.), now ported to
