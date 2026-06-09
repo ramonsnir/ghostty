@@ -3157,6 +3157,31 @@ keybind: Keybinds = .{},
 /// an official Ghostty would error on the unknown key.
 @"bell-features-focused": BellFeatures = .{},
 
+/// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
+/// in-app HTTP server that lets you view live terminal surfaces and send input
+/// from a phone (e.g. over Tailscale). Empty/null (the default) DISABLES the
+/// server entirely. This is a BIND address (which port/interface to listen on),
+/// NOT an access-control allowlist: `NWListener` binds the PORT on all
+/// interfaces regardless of the host you give, so the host here does not filter
+/// who can connect. Reachability is controlled by your network (e.g. a tailnet
+/// ACL), and authentication is the `web-monitor-token` alone. Pick a port and,
+/// if you like, a host for the Host-header allowlist (DNS-rebinding defense),
+/// e.g. `100.x.y.z:8787` for your Tailscale IP or `0.0.0.0:8787` for any.
+/// Fork-only key — keep it in `~/.config/ghostty-ramon/config` (an official
+/// Ghostty would error on it). The server also requires `web-monitor-token`.
+@"web-monitor-listen": ?[:0]const u8 = null,
+
+/// (ramon fork) Shared secret required by every web-monitor request (query
+/// `?token=...` or `X-Ghostty-Token` header). The server REFUSES TO START if
+/// this is empty, so it is never accidentally open. Use a long random value.
+/// This token is LOAD-BEARING: it is the ONLY authentication, and a holder can
+/// read live terminal output AND inject input into a live shell (e.g. approve a
+/// CLI-agent prompt), so treat it as a shell-execution credential. There is no
+/// TLS (the tailnet/WireGuard encrypts transport); the defenses are this token
+/// PLUS your tailnet ACL (only tailnet devices can reach the port). If it leaks,
+/// ROTATE it and relaunch. Fork-only key — keep it in `~/.config/ghostty-ramon/config`.
+@"web-monitor-token": ?[:0]const u8 = null,
+
 /// If `audio` is an enabled bell feature, this is a path to an audio file. If
 /// the path is not absolute, it is considered relative to the directory of the
 /// configuration file that it is referenced from, or from the current working
@@ -11142,5 +11167,31 @@ test "bell-features-focused: parse and default" {
             BellFeatures{ .attention = true, .title = true },
             cfg.@"bell-features",
         );
+    }
+}
+
+test "web-monitor: parse and default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expect(cfg.@"web-monitor-listen" == null);
+        try testing.expect(cfg.@"web-monitor-token" == null);
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--web-monitor-listen=100.1.2.3:8787",
+            "--web-monitor-token=secret",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqualStrings("100.1.2.3:8787", cfg.@"web-monitor-listen".?);
+        try testing.expectEqualStrings("secret", cfg.@"web-monitor-token".?);
     }
 }

@@ -209,6 +209,7 @@
 				Features/Update/UpdatePopoverView.swift,
 				Features/Update/UpdateSimulator.swift,
 				Features/Update/UpdateViewModel.swift,
+				"Features/WebMonitor/WebMonitorServer.swift",
 				"Ghostty/FullscreenMode+Extension.swift",
 				Ghostty/Ghostty.Error.swift,
 				Ghostty/Ghostty.Event.swift,

@@ -231,6 +231,26 @@ extension Ghostty {
             return String(cString: ptr)
         }
 
+        // (ramon fork) Web monitor listen address (addr:port); empty = disabled.
+        var webMonitorListen: String {
+            guard let config = self.config else { return "" }
+            var v: UnsafePointer<Int8>?
+            let key = "web-monitor-listen"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "" }
+            guard let ptr = v else { return "" }
+            return String(cString: ptr)
+        }
+
+        // (ramon fork) Web monitor shared secret; empty = server refuses to start.
+        var webMonitorToken: String {
+            guard let config = self.config else { return "" }
+            var v: UnsafePointer<Int8>?
+            let key = "web-monitor-token"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "" }
+            guard let ptr = v else { return "" }
+            return String(cString: ptr)
+        }
+
         var windowPositionX: Int16? {
             guard let config = self.config else { return nil }
             var v: Int16 = 0
