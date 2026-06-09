@@ -243,10 +243,15 @@ this macOS); `nushell` for `build.nu`.
 **Two remotes — push ONLY to `fork`, NEVER to `origin`.**
 - `origin` = *upstream* `ghostty-org/ghostty` (the official repo). **Never push here.**
   A push to `origin` would shove personal work at the official project.
-- `fork` = personal backup `git@github.com:ramonsnir/ghostty.git`. `ramon-fork` tracks
-  `fork/main` (local branch name ≠ remote branch name), so back it up with
-  **`git push fork HEAD:main`** — a bare `git push` is refused because of the name
-  mismatch. This is the intended push target.
+- `fork` = personal backup `git@github.com:ramonsnir/ghostty.git`. Back it up with a
+  **bare `git push fork`** (no refspec). The `fork` remote has a pinned push refspec
+  (`remote.fork.push = refs/heads/ramon-fork:refs/heads/main`), so `git push fork`
+  **always** pushes local `ramon-fork` → `fork/main`, **regardless of which branch is
+  currently checked out** — you can run it from a `ptyhost/*` branch and it still backs
+  up `ramon-fork`, never the feature branch.
+  - **Do NOT add an explicit refspec** like `git push fork HEAD:main` — an explicit
+    refspec overrides the pinned one and, from a feature branch, would overwrite
+    `fork/main` with the wrong branch. Always use the bare `git push fork`.
 
 So pushing to `fork` is now allowed and is the backup path; just confirm the
 remote is `fork` before pushing, and **never** `git push origin`. The `ptyhost/*`
