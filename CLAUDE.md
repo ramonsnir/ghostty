@@ -115,13 +115,105 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`zoomedHiddenBell` protocol requirement + `HiddenSplitBellBadge`). Tests:
   `macos/Tests/Splits/SplitTreeTests.swift` (`hasBellOutsideZoom*`, `zoomedLeaves*`).
 
+- **Web monitor** (fork-only, OFF by default) — a GUI-embedded HTTP server inside the
+  running macOS app that lets you list live terminal surfaces, watch one update, and send
+  input (notably approving CLI-agent prompts) from a phone, e.g. over Tailscale. "Option C":
+  the server lives INSIDE the app — one binary, one rebuild/restart, NO second process. A
+  SINGLE `NWListener` serves BOTH the embedded mobile HTML page AND the JSON API on ONE
+  port. Two fork-only scalar string config keys (default null/off, so an official Ghostty
+  sharing `~/.config/ghostty/config` never trips): `web-monitor-listen` (`addr:port`; empty
+  = disabled) and `web-monitor-token` (shared secret). The server starts only if
+  `web-monitor-listen` is non-empty AND REFUSES TO START (logs a warning) if the token is
+  empty or weak (`tokenAcceptable`: under 16 chars), so it is never accidentally open. EVERY
+  request must present the token (comparison length-checked + constant-time); the query
+  `?token=...` form is accepted ONLY on the `GET /` bootstrap (so the page opens from a plain
+  link), while every `/api/*` route REQUIRES the `X-Ghostty-Token` header (the page stashes
+  the token in `sessionStorage` after first load and sends it via the header thereafter). **No IP allowlist:** there is no per-peer IP filter — `web-monitor-listen`
+  is purely a BIND address (it binds the PORT on all interfaces regardless of host; see the
+  bind caveat below). **Security model (no TLS — the tailnet/WireGuard encrypts transport):**
+  the TOKEN is the sole authentication and is LOAD-BEARING — a holder can read live output
+  AND inject input into a live shell, so it is a shell-execution credential; rotate it (and
+  relaunch) if it leaks. Defense in depth: (a) your TAILNET ACL (only tailnet devices reach
+  the port — load-bearing); (b) a HOST-HEADER allowlist (`hostHeaderAllowed`) that rejects
+  Host values not equal to the configured host:port or loopback, to blunt DNS-rebinding; (c)
+  a per-peer FAILED-TOKEN backoff (5 strikes → 429) so brute force is not free — the
+  per-peer counter DECAYS after ~60s idle (so it is a speed bump, not a permanent lockout)
+  and the backing dict is capped (a spray of distinct source IPs can't grow it unbounded);
+  (d) per-connection lifetime bounds: a ~10s idle/read watchdog PLUS an ABSOLUTE ~15s
+  deadline (`DispatchSourceTimer`, armed once in `handle()`, never rearmed) that cancels a
+  connection which never completes a request, and a 32-concurrent-connection cap —
+  slowloris/trickle defense that also bounds connection bookkeeping.
+  HTTP API: `GET /` (the page), `GET /api/surfaces` (JSON `[{id,title,pwd}]`),
+  `GET /api/surface/{uuid}/screen?mode=viewport|scrollback` (plain text), and
+  `POST /api/surface/{uuid}/input` (raw bytes via `Content-Type: text/plain`, OR JSON
+  `{"key":...}` via `Content-Type: application/json`). **Input decode keys ONLY off
+  Content-Type** (never sniffs a leading `{`), so literal text starting with `{` round-trips
+  verbatim. Supported keys: `enter`(CR), `esc`, `tab`, `ctrl-c`, `y`, `n`, and arrows
+  `up`/`down`/`left`/`right` (CSI `1b 5b 41..44`); anything else under
+  `Content-Type: application/json` → nil → 400. Otherwise input is literal UTF-8 text.
+  Empty decoded input → 400 (no silent no-op). Unknown id/path → 404, wrong method → 405,
+  bad/negative/oversized Content-Length → 400, `Transfer-Encoding` (chunked) → 411
+  (unsupported), oversized request → 413, Host not allowed → 403, throttled → 429.
+  **Threading (correctness-critical):** the listener and ALL connections run on a DEDICATED
+  background SERIAL queue (`com.mitchellh.ghostty-ramon.webmonitor`), guaranteed never
+  `DispatchQueue.main`, which is what makes the `DispatchQueue.main.sync` hops deadlock-safe.
+  `stop()` tears down with `queue.async` (NOT `.sync`): handlers on the queue themselves hop
+  to main, so a `queue.sync` from main at teardown would be a lock-order inversion;
+  `NWListener`/`NWConnection.cancel()` are thread-safe so async teardown is correct. Every
+  handler that touches AppKit / `TerminalController.all` / `SurfaceView` / `ghostty_surface_*`
+  hops to main via `DispatchQueue.main.sync` and returns ONLY value types (String/Data) —
+  NEVER a `ghostty_surface_t` pointer or `SurfaceView` across the hop. Screen text REUSES
+  `cachedVisibleContents` (viewport) / `cachedScreenContents` (scrollback) (~500ms TTL;
+  they free their own text), so the JS polls at **700ms** (≥ the cache TTL). **Live updates
+  are POLL-based; server-push (SSE/WebSocket) is a possible future option, intentionally out
+  of scope for v1**, as is keep-alive (each poll is a fresh `Connection: close` TCP + token
+  check, deliberate for simplicity). Input goes via `ghostty_surface_text` with the EXACT raw
+  byte length (no NUL adjustment). **Token handling on the page:** the token arrives in the
+  initial `?token=` URL, is stashed in `sessionStorage`, scrubbed from the visible URL via
+  `history.replaceState`, and thereafter sent ONLY in the `X-Ghostty-Token` header (it still
+  appears in the initial URL/history — rotate if that leaks). The page sets screen text via
+  **`textContent`, never `innerHTML`** (no HTML/JS injection); shows a "connection lost /
+  reconnecting" banner on fetch error/non-ok and a "session closed" + return-to-list on 404;
+  has Enter-to-send (+ trailing `\n`) with a separate Raw (no-newline) send, autofocus, a
+  wrap toggle (default `white-space: pre` + horizontal scroll to preserve columns), a
+  font-size control, scroll-preservation (only auto-sticks to bottom when already near it),
+  loading/empty session states, periodic + on-foreground refresh (`visibilitychange`), and a
+  distinct no-token notice that early-returns (no 401-spamming). A mid-session token rotation
+  (poll → 401) ALSO stops the poll timer and shows the same persistent reopen-with-`?token=`
+  notice rather than 401-spamming. View prefs (mode / wrap / font size) persist in
+  `localStorage`. **Routing is a PURE decision function** `decideRoute(...) -> RouteDecision`
+  (no AppKit, no socket, no mutation) with `routeRequest` a thin shell that maps the decision
+  onto the side effects (failure-count mutation, main-thread hops, `send`); this and
+  `hostHeaderAllowed(_:configuredHost:configuredPort:)` are `internal` + unit-tested, so the
+  security-load-bearing router (Host allowlist, token gate, backoff, method/path table) and
+  the DNS-rebinding Host check are exercised directly rather than by a tautology. **Network.framework bind
+  caveat:** `NWListener` cannot cleanly bind a single arbitrary non-localhost IP, so we bind
+  the PORT on all interfaces — the host in `web-monitor-listen` is NOT an access filter.
+  **Liveness/errors:** bind failure / port-in-use (`stateUpdateHandler .failed`) and the
+  empty-token / invalid-listen refusals are surfaced once via a `UNUserNotificationCenter`
+  notification (the modern UserNotifications framework the rest of the app uses) AND logged. **Console.app:** subsystem = the app bundle id (e.g. `com.mitchellh.ghostty-ramon`),
+  category = `web-monitor`. Live config-reload is out of scope: changing listen/token needs a
+  relaunch. Zero new SPM deps (Foundation + Network + AppKit only). Both keys are fork-only —
+  keep them in `~/.config/ghostty-ramon/config`. Wiring: `src/config/Config.zig`
+  (`web-monitor-listen` + `web-monitor-token` fields + parse/default test),
+  `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen`/`webMonitorToken`
+  getters), `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` (the server + page;
+  pure testable units `tokensMatch`/`decodeInput`/`parseListen`/`RequestParser`/
+  `surfacesJSONData`/`HTTPResponse`/`decideRoute`+`RouteDecision`/`hostHeaderAllowed` are
+  `internal` for `@testable import`),
+  `macos/Sources/App/macOS/AppDelegate.swift` (start in `applicationDidFinishLaunching`,
+  stop in `applicationWillTerminate`), `macos/Ghostty.xcodeproj/project.pbxproj` (iOS-target
+  exclusion of the new macOS-only file). Tests:
+  `macos/Tests/WebMonitor/WebMonitorServerTests.swift` (auto-discovered by the
+  `GhosttyTests` filesystem-synchronized group, like `macos/Tests/Splits/SplitTreeTests.swift`).
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
 - **Single-instance guard** in `AppDelegate.applicationWillFinishLaunching`: if another process with the same bundle id is already running from a different bundle URL, that one is activated and this process exits. Stops two copies of the same fork identity from racing each other (e.g. dock-attention bouncing one while you click the other).
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 ## Iteration lifecycle (macOS)
 Toolchain: full **Xcode** (not just Command Line Tools) + Metal toolchain + accepted

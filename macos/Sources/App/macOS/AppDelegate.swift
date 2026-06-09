@@ -98,6 +98,10 @@ class AppDelegate: NSObject,
     /// The ghostty global state. Only one per process.
     let ghostty: Ghostty.App
 
+    /// (ramon fork) The embedded web monitor HTTP server, if enabled via config.
+    /// Reads config at launch; changing web-monitor-listen/token needs a relaunch.
+    private var webMonitor: WebMonitorServer?
+
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
 
@@ -228,6 +232,18 @@ class AppDelegate: NSObject,
 
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
+
+        // (ramon fork) Start the embedded web monitor if configured. It reads
+        // config only here (changing listen/token requires a relaunch); the
+        // server refuses to start if the token is empty.
+        let webMonitorListen = ghostty.config.webMonitorListen
+        if !webMonitorListen.isEmpty {
+            let server = WebMonitorServer(
+                listen: webMonitorListen,
+                token: ghostty.config.webMonitorToken)
+            server.start()
+            self.webMonitor = server
+        }
 
         // Start our update checker.
         updateController.startUpdater()
@@ -425,6 +441,9 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // (ramon fork) Stop the embedded web monitor if running.
+        webMonitor?.stop()
+
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
         // more selective and only remove surface-targeted notifications.
