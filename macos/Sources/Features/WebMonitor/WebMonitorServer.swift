@@ -11,8 +11,12 @@
 // shell-execution credential. Defense in depth here is: (a) the tailnet ACL —
 // only devices on your tailnet can reach the bound port; (b) a Host-header
 // allowlist to blunt DNS-rebinding (a browser tricked into pointing at this
-// port via an attacker hostname will send a Host we reject); (c) a per-peer
-// failed-token backoff so brute force is not free. If the token leaks, ROTATE
+// port via an attacker hostname will send a Host we reject) — this is a
+// DNS-rebinding guard ONLY, NOT an authentication boundary: a request with no
+// Host header is still subject to the token gate (the token, not the Host
+// check, is what authenticates); (c) a per-peer failed-token backoff so brute
+// force is not free — it counts CONSECUTIVE wrong-token failures and is
+// cleared on a token-valid request. If the token leaks, ROTATE
 // it (and relaunch). Live updates are POLL-based; server-push (SSE/WebSocket)
 // is a possible future option, intentionally out of scope for v1.
 //
@@ -93,6 +97,13 @@ final class WebMonitorServer {
         if failedAuth.count >= Self.failedAuthMaxEntries {
             let cutoff = Date().addingTimeInterval(-Self.failedAuthWindow)
             failedAuth = failedAuth.filter { $0.value.last > cutoff }
+            // If a spray of fresh distinct IPs within the window pruned nothing,
+            // the dict can still be at/over the cap. Drop the oldest entry
+            // (smallest `.last`) so the size stays strictly bounded.
+            while failedAuth.count >= Self.failedAuthMaxEntries,
+                  let oldest = failedAuth.min(by: { $0.value.last < $1.value.last })?.key {
+                failedAuth[oldest] = nil
+            }
         }
         let prev = failedAuthCount(peer)
         failedAuth[peer] = (count: prev + 1, last: Date())
@@ -826,6 +837,13 @@ final class WebMonitorServer {
     }
 
     private func send(_ response: HTTPResponse, on conn: NWConnection) {
+        // Disarm the idle + absolute-deadline timers as a property of send()
+        // itself: once we're writing the response the connection will be
+        // cancelled on completion, so the watchdogs must not still fire.
+        // Idempotent (cancelConnectionTimer tolerates missing keys), so this
+        // is safe even though current callers already pre-cancel — it keeps
+        // future callers correct without relying on each one to remember.
+        cancelConnectionTimer(ObjectIdentifier(conn))
         let body = response.body
         var head = "HTTP/1.1 \(response.statusCode) \(response.reason)\r\n"
         head += "Content-Type: \(response.contentType)\r\n"
@@ -857,6 +875,11 @@ final class WebMonitorServer {
       button, input, select { font-family: inherit; font-size: 14px; }
       button { background: #2a2e3b; color: #d6dae3; border: 1px solid #3a3f4f; border-radius: 6px; padding: 8px 10px; }
       button:active { background: #3a3f4f; }
+      /* Brief local tap acknowledgement (~150ms), independent of the network
+         round-trip, so a quick-key tap visibly registers even on high latency. */
+      button.tapped { background: #4a8fe7; color: #fff; border-color: #4a8fe7; }
+      button.danger.tapped { background: #c25555; color: #fff; border-color: #c25555; }
+      button:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
       #list { padding: 8px; }
       .row { padding: 12px; margin: 6px 0; background: #1b1e27; border: 1px solid #2a2e3b; border-radius: 8px; }
       .row .t { color: #d6dae3; font-weight: bold; }
@@ -1261,14 +1284,24 @@ final class WebMonitorServer {
       inp.addEventListener("input", syncSendEnabled);
       syncSendEnabled();
 
+      // Brief local visual ack on tap, independent of the network round-trip,
+      // so the user sees the press registered even under latency. Re-arms the
+      // timer on rapid repeat taps so the flash always lasts ~150ms from the
+      // last tap; does not change what bytes are sent.
+      function flashTap(b) {
+        b.classList.add("tapped");
+        if (b._tapTimer) clearTimeout(b._tapTimer);
+        b._tapTimer = setTimeout(function () { b.classList.remove("tapped"); }, 150);
+      }
+
       Array.prototype.forEach.call(document.querySelectorAll("[data-key]"), function (b) {
-        b.onclick = function () { sendKey(b.getAttribute("data-key")); };
+        b.onclick = function () { flashTap(b); sendKey(b.getAttribute("data-key")); };
       });
 
       // Raw-digit quick-keys (1/2/3/4): send the bare digit with NO newline via
       // the text/plain raw path, so Claude Code permission menus answer in one tap.
       Array.prototype.forEach.call(document.querySelectorAll("[data-raw]"), function (b) {
-        b.onclick = function () { sendText(b.getAttribute("data-raw")); };
+        b.onclick = function () { flashTap(b); sendText(b.getAttribute("data-raw")); };
       });
 
       // Pause the 700ms poll while hidden (wasteful, and mobile throttles it

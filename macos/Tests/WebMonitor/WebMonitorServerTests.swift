@@ -413,6 +413,24 @@ struct WebMonitorServerTests {
             "MyHost.Tailnet:8787", configuredHost: "myhost.tailnet", configuredPort: 8787))
     }
 
+    @Test func hostHeaderMalformedUnbalancedBracket() {
+        // "[" prefix but no closing "]" — must not trap on the missing index and
+        // must reject (the leftover "[::1:8787" matches neither host nor loopback).
+        #expect(!WebMonitorServer.hostHeaderAllowed(
+            "[::1:8787", configuredHost: "100.1.2.3", configuredPort: 8787))
+        #expect(!WebMonitorServer.hostHeaderAllowed(
+            "[::1:8787", configuredHost: "::1", configuredPort: 8787))
+    }
+
+    @Test func hostHeaderMalformedStrayDoubleColon() {
+        // A stray "::" in a non-bracketed host: split on the last ':' leaves a
+        // garbage host "a::b" — must not trap and must reject.
+        #expect(!WebMonitorServer.hostHeaderAllowed(
+            "a::b:8787", configuredHost: "100.1.2.3", configuredPort: 8787))
+        #expect(!WebMonitorServer.hostHeaderAllowed(
+            "a::b:8787", configuredHost: "::1", configuredPort: 8787))
+    }
+
     // MARK: - surfacesJSONData (pure shaping)
 
     @Test func surfacesJSONEmpty() {
@@ -431,6 +449,20 @@ struct WebMonitorServerTests {
         #expect(arr?[0]["title"] == "Title One")
         #expect(arr?[0]["pwd"] == "/home/x")
         #expect(arr?[1]["title"] == "")
+    }
+
+    @Test func surfacesJSONEscapesHostileChars() throws {
+        // JSON-hostile: double quote, backslash, newline, and a multibyte emoji.
+        // Proper escaping means the bytes round-trip back byte-identical.
+        let hostileTitle = "a\"b\\c\nd\u{1F600}e"
+        let hostilePwd = "/tmp/\"quoted\"\\back\nslash\u{1F4A9}"
+        let d = WebMonitorServer.surfacesJSONData([
+            (id: "id-1", title: hostileTitle, pwd: hostilePwd),
+        ])
+        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: String]]
+        #expect(arr?.count == 1)
+        #expect(arr?[0]["title"] == hostileTitle)
+        #expect(arr?[0]["pwd"] == hostilePwd)
     }
 
     // MARK: - decideRoute (the PURE, security-load-bearing router)
@@ -592,6 +624,18 @@ struct WebMonitorServerTests {
     @Test func decideRouteUnknownActionIsNotFound() {
         let id = UUID()
         #expect(decide("GET", "/api/surface/\(id.uuidString)/bogus") == .notFound)
+    }
+
+    @Test func decideRouteSurfaceMissingActionIsNotFound() {
+        // /api/surface/{uuid} with no trailing action component (3 comps, not 4).
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)") == .notFound)
+    }
+
+    @Test func decideRouteSurfaceExtraComponentIsNotFound() {
+        // /api/surface/{uuid}/screen/extra has an extra trailing component (5 comps, not 4).
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/screen/extra") == .notFound)
     }
 
     @Test func decideRouteUnknownPathIsNotFound() {
