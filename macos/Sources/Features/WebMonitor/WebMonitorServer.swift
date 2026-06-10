@@ -1218,7 +1218,7 @@ final class WebMonitorServer {
       header { padding: 10px 12px; background: #1b1e27; position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
       header b { color: #f0a35e; }
       button, input, select { font-family: inherit; font-size: 14px; }
-      button { background: #2a2e3b; color: #d6dae3; border: 1px solid #3a3f4f; border-radius: 6px; padding: 8px 10px; }
+      button { background: #2a2e3b; color: #d6dae3; border: 1px solid #3a3f4f; border-radius: 6px; padding: 8px 10px; touch-action: manipulation; }
       button:active { background: #3a3f4f; }
       /* Brief local tap acknowledgement (~150ms), independent of the network
          round-trip, so a quick-key tap visibly registers even on high latency. */
@@ -1785,8 +1785,44 @@ final class WebMonitorServer {
         b._tapTimer = setTimeout(function () { b.classList.remove("tapped"); }, 150);
       }
 
+      // Press-and-hold auto-repeat (initial delay, then fast repeat) for the
+      // navigation keys where tapping repeatedly is tedious: scroll, arrows,
+      // backspace. Pointer events cover touch + mouse; preventDefault on
+      // pointerdown + touch-action:none stop the hold from scrolling the page,
+      // and the synthetic click is suppressed (we fire on pointerdown).
+      function addRepeat(el, fire) {
+        el.style.touchAction = "none";
+        var delayT = null, repT = null, active = false;
+        function once() { flashTap(el); fire(); }
+        function start(e) {
+          if (active) return;
+          active = true;
+          if (e && e.preventDefault) e.preventDefault();
+          once();
+          delayT = setTimeout(function () { repT = setInterval(once, 90); }, 350);
+        }
+        function stop() {
+          active = false;
+          if (delayT) { clearTimeout(delayT); delayT = null; }
+          if (repT) { clearInterval(repT); repT = null; }
+        }
+        el.addEventListener("pointerdown", start);
+        el.addEventListener("pointerup", stop);
+        el.addEventListener("pointercancel", stop);
+        el.addEventListener("pointerleave", stop);
+        el.addEventListener("click", function (e) { e.preventDefault(); });
+      }
+
+      // Arrows + backspace auto-repeat on hold; the rest (enter/y/n/esc/tab/
+      // ctrl-c) are single-fire — you never want those repeating.
+      var repeatKeys = { up: 1, down: 1, left: 1, right: 1, backspace: 1 };
       Array.prototype.forEach.call(document.querySelectorAll("[data-key]"), function (b) {
-        b.onclick = function () { flashTap(b); sendKey(b.getAttribute("data-key")); };
+        var k = b.getAttribute("data-key");
+        if (repeatKeys[k]) {
+          addRepeat(b, function () { sendKey(k); });
+        } else {
+          b.onclick = function () { flashTap(b); sendKey(k); };
+        }
       });
 
       // Raw-digit quick-keys (1/2/3/4): send the bare digit with NO newline via
@@ -1805,8 +1841,8 @@ final class WebMonitorServer {
           body: JSON.stringify({ dy: dy })
         }).catch(function () {});
       }
-      document.getElementById("scrollup").onclick = function () { flashTap(this); sendScroll(3); };
-      document.getElementById("scrolldown").onclick = function () { flashTap(this); sendScroll(-3); };
+      addRepeat(document.getElementById("scrollup"), function () { sendScroll(3); });
+      addRepeat(document.getElementById("scrolldown"), function () { sendScroll(-3); });
 
       // Pause the 700ms poll while hidden (wasteful, and mobile throttles it
       // anyway); re-poll / re-list immediately when the page returns to the
