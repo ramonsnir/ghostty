@@ -5,7 +5,15 @@
 // phone over Tailscale. Fork-only, OFF by default, token-gated.
 //
 // SECURITY MODEL (no TLS — WireGuard/the tailnet already encrypts transport):
-// the only authentication is the shared `web-monitor-token`. That token is
+// the only authentication is the shared `web-monitor-token`. Every request must
+// present it. The query form (`?token=...`) is accepted ONLY on the BOOTSTRAP
+// routes — `GET /` (the page) AND the vendored static assets `GET /xterm.js` /
+// `GET /xterm.css` — because a browser reaches those from a plain link or a
+// `<script>`/`<link>` tag, neither of which can set the X-Ghostty-Token header.
+// Every OTHER (non-bootstrap) route REQUIRES the header and ignores any query
+// token. The assets are public, non-secret static files, so accepting the query
+// token on them leaks nothing beyond what the page URL already carries. That
+// token is
 // LOAD-BEARING: a holder can read live terminal output AND inject input into a
 // live shell (e.g. approve a CLI-agent prompt), so it must be treated as a
 // shell-execution credential. Defense in depth here is: (a) the tailnet ACL —
@@ -68,6 +76,23 @@ final class WebMonitorServer {
     /// connections are rejected in `handle()` so a flood cannot grow
     /// `connectionRefs` (and its timers) without bound. Mutated only on `queue`.
     private static let maxConcurrentConnections = 32
+
+    /// Live raw-output stream backends, one per `/stream` connection. The host
+    /// client pipes a session's raw PTY bytes back onto the NWConnection. Keyed
+    /// by connection identity so the connection's `.cancelled/.failed` state
+    /// handler can tear the client down (and the client's `onClose` cancels the
+    /// connection). Mutated only on `queue`. This is a LONG-LIVED connection, so
+    /// it is exempted from the idle/absolute watchdogs (see `routeStream`).
+    private var streamClients: [ObjectIdentifier: WebMonitorHostClient] = [:]
+
+    /// Connections currently in STREAMING mode (a `/stream` response: HTTP head
+    /// already written, raw byte chunks flowing). A streaming connection is
+    /// long-lived and is EXEMPT from the idle/absolute watchdogs (cancelled in
+    /// `routeStream`); it is also NOT routed through the one-shot `send()`
+    /// (which writes a Content-Length body and cancels on completion). Tracked
+    /// so teardown is idempotent and the set can be cleaned up alongside
+    /// `streamClients`. Mutated only on `queue`.
+    private var streamingConns: Set<ObjectIdentifier> = []
 
     /// Per-peer failed-token counter (keyed by remote IP string). Cheap brute
     /// force speed bump; resets on a successful auth. Mutated only on `queue`.
@@ -204,6 +229,9 @@ final class WebMonitorServer {
             self.connectionTimers.removeAll()
             for (_, timer) in self.connectionDeadlineTimers { timer.cancel() }
             self.connectionDeadlineTimers.removeAll()
+            for (_, client) in self.streamClients { client.stop() }
+            self.streamClients.removeAll()
+            self.streamingConns.removeAll()
             for (_, conn) in self.connectionRefs { conn.cancel() }
             self.connectionRefs.removeAll()
         }
@@ -264,6 +292,14 @@ final class WebMonitorServer {
             case .cancelled, .failed:
                 self?.connectionRefs[key] = nil
                 self?.cancelConnectionTimer(key)
+                // Tear down any /stream backend bound to this connection so a
+                // disconnected peer stops the host-client read loop (and frees
+                // its socket). Runs on `queue` (NWConnection state callbacks use
+                // the start(queue:) queue), so this dict access is race-free.
+                if let client = self?.streamClients.removeValue(forKey: key) {
+                    client.stop()
+                }
+                self?.streamingConns.remove(key)
             default:
                 break
             }
@@ -406,7 +442,31 @@ final class WebMonitorServer {
         case methodNotAllowed                    // 405
         case notFound                            // 404
         case screen(uuid: UUID, scrollback: Bool) // GET /api/surface/{uuid}/screen
+        case stream(uuid: UUID)                  // GET /api/surface/{uuid}/stream (raw byte stream)
         case input(uuid: UUID)                   // POST /api/surface/{uuid}/input
+        case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
+    }
+
+    /// The static asset routes (vendored xterm.js / xterm.css), served from the
+    /// app bundle. Keyed by request path -> (resource name, extension, MIME).
+    /// These are bootstrap routes (see `isBootstrapPath`): like `GET /`, they
+    /// accept the token via `?token=` because a `<script src>` / `<link href>`
+    /// tag cannot set the X-Ghostty-Token header.
+    static let assetRoutes: [String: (name: String, ext: String, contentType: String)] = [
+        "/xterm.js": ("xterm", "js", "application/javascript; charset=utf-8"),
+        "/xterm.css": ("xterm", "css", "text/css; charset=utf-8"),
+    ]
+
+    /// Paths that accept the token via the `?token=` query string (not just the
+    /// X-Ghostty-Token header). This is the SET of routes a browser can reach
+    /// from a plain link or an HTML tag that cannot send a custom header: the
+    /// `GET /` bootstrap page AND the `<script>`/`<link>` asset routes it pulls
+    /// in. SECURITY: every OTHER (non-bootstrap) route still REQUIRES the header
+    /// and ignores any query token (see the token gate in `decideRoute`). The
+    /// assets are public, non-secret static files, so accepting the query token
+    /// on them leaks nothing beyond what the page URL already carries.
+    static func isBootstrapPath(_ path: String) -> Bool {
+        path == "/" || assetRoutes[path] != nil
     }
 
     /// Decide the route. PURE: no AppKit, no socket, no mutation.
@@ -431,17 +491,24 @@ final class WebMonitorServer {
         // Per-peer failed-token backoff (cheap brute-force speed bump).
         if peerFailureCount >= failedAuthThreshold { return .throttled }
 
-        // Token check — gates EVERY request (including GET /). The query
-        // token (`?token=`) is accepted ONLY for the GET / bootstrap so the
-        // page can be opened from a plain link; every /api/* route requires
-        // the token via the X-Ghostty-Token header and IGNORES any query token.
+        // Token check — gates EVERY request (including GET / and the asset
+        // routes). The query token (`?token=`) is accepted ONLY for the
+        // BOOTSTRAP paths (GET / and the <script>/<link> asset routes, which
+        // cannot send a custom header) so the page + its assets load from a
+        // plain link; every /api/* route requires the token via the
+        // X-Ghostty-Token header and IGNORES any query token.
         let headerToken = headers["x-ghostty-token"] ?? ""
-        let presented = (path == "/") ? (query["token"] ?? headerToken) : headerToken
+        let presented = isBootstrapPath(path) ? (query["token"] ?? headerToken) : headerToken
         guard tokensMatch(presented, token) else { return .unauthorized }
 
         // Route on (method, path).
         if path == "/" {
             return method == "GET" ? .page : .methodNotAllowed
+        }
+        if let asset = assetRoutes[path] {
+            return method == "GET"
+                ? .asset(name: asset.name, ext: asset.ext, contentType: asset.contentType)
+                : .methodNotAllowed
         }
         if path == "/api/surfaces" {
             return method == "GET" ? .surfacesList : .methodNotAllowed
@@ -455,6 +522,11 @@ final class WebMonitorServer {
             case "screen":
                 guard method == "GET" else { return .methodNotAllowed }
                 return .screen(uuid: uuid, scrollback: (query["mode"] ?? "viewport") == "scrollback")
+            case "stream":
+                // Long-lived raw-byte stream (xterm.js source). Header-token only,
+                // like every other /api/* route (it is NOT a bootstrap path).
+                guard method == "GET" else { return .methodNotAllowed }
+                return .stream(uuid: uuid)
             case "input":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .input(uuid: uuid)
@@ -537,6 +609,10 @@ final class WebMonitorServer {
             }
             send(result, on: conn)
 
+        case .stream(let uuid):
+            clearAuthFailures(peer)
+            routeStream(uuid: uuid, on: conn)
+
         case .input(let uuid):
             clearAuthFailures(peer)
             let contentType = req.headers["content-type"] ?? ""
@@ -571,7 +647,127 @@ final class WebMonitorServer {
                 return .json(Data(#"{"ok":true,"sent":\#(specs.count)}"#.utf8))
             }
             send(result, on: conn)
+
+        case .asset(let name, let ext, let contentType):
+            clearAuthFailures(peer)
+            // Vendored static file (xterm.js / xterm.css) read from the app
+            // bundle. Pure file IO — no AppKit / surface access — so it stays
+            // on the connection `queue` (no main-thread hop). A missing
+            // resource (e.g. a build that did not bundle the vendor files) is a
+            // 404 rather than a crash.
+            send(Self.assetResponse(name: name, ext: ext, contentType: contentType), on: conn)
         }
+    }
+
+    // MARK: - Streaming /stream route (raw PTY byte stream for xterm.js)
+
+    /// The HTTP response head for a streaming `/stream` response: a 200 with an
+    /// unbounded `application/octet-stream` body (NO Content-Length — the body
+    /// runs until the connection closes) and `Connection: close`. PURE +
+    /// `internal` so the exact wire bytes are unit-testable. Followed by raw
+    /// byte chunks written directly onto the connection as they arrive from the
+    /// host client (see `routeStream`).
+    static func streamResponseHead() -> Data {
+        var head = "HTTP/1.1 200 OK\r\n"
+        head += "Content-Type: application/octet-stream\r\n"
+        // Defense in depth against an intermediary that might buffer/transform:
+        // no caching, no MIME sniffing. (Over a tailnet there is normally no
+        // proxy, but these are cheap and correct.)
+        head += "Cache-Control: no-store, no-transform\r\n"
+        head += "X-Content-Type-Options: nosniff\r\n"
+        head += "Connection: close\r\n"
+        head += "\r\n"
+        return Data(head.utf8)
+    }
+
+    /// Resolve a surface UUID to its host session id + the configured pty-host
+    /// socket path, then open a `WebMonitorHostClient` and pipe its raw PTY
+    /// bytes onto `conn` as a streaming response. Falls back to 501 (so the
+    /// page can degrade to the `/screen` poll) when no pty-host is configured,
+    /// or 404 when the surface is gone / has no live session id.
+    ///
+    /// THREADING: the AppKit / `ghostty_surface_*` access (surface lookup,
+    /// `ghostty_surface_session_id`, the config getter) happens inside a single
+    /// `DispatchQueue.main.sync` that returns ONLY value types (a session id +
+    /// the socket-path String) — never a surface pointer / SurfaceView across
+    /// the hop. Everything after (the host client, the NWConnection writes) runs
+    /// on the connection `queue`. The host client's `onBytes`/`onClose` fire on
+    /// ITS own background queue; they only call thread-safe `NWConnection`
+    /// methods, so no further hop is needed.
+    private func routeStream(uuid: UUID, on conn: NWConnection) {
+        let key = ObjectIdentifier(conn)
+
+        // Resolve session id + socket path on main (value types only).
+        struct Resolved { let sessionID: UInt64; let socketPath: String? }
+        let resolved: Resolved? = DispatchQueue.main.sync {
+            guard let view = self.surface(forUUID: uuid),
+                  let surface = view.surface else { return nil }
+            let sid = ghostty_surface_session_id(surface)
+            let path = (NSApp.delegate as? AppDelegate)?.ghostty.config.ptyHost
+            return Resolved(sessionID: sid, socketPath: path)
+        }
+
+        guard let resolved else {
+            send(.status(404, "Not Found"), on: conn)
+            return
+        }
+        // No pty-host configured -> the raw stream is unavailable. 501 so the
+        // page falls back to the /screen viewport poll instead of hanging.
+        guard let socketPath = resolved.socketPath, !socketPath.isEmpty else {
+            send(.status(501, "Not Implemented"), on: conn)
+            return
+        }
+
+        // Enter streaming mode: this connection is long-lived, so exempt it from
+        // BOTH watchdogs (they would otherwise cancel it mid-stream), and mark it
+        // so teardown stays idempotent. We deliberately do NOT route this through
+        // `send()` (that path writes a Content-Length body + cancels on
+        // completion); instead we write the head, then raw chunks, ourselves.
+        cancelConnectionTimer(key)
+        streamingConns.insert(key)
+
+        // Write the streaming HTTP head. On failure the connection is already
+        // gone; the state handler will clean up.
+        conn.send(content: Self.streamResponseHead(), completion: .contentProcessed { _ in })
+
+        // Open the host client and pipe raw bytes onto the connection. onBytes /
+        // onClose fire on the client's own background queue; NWConnection.send /
+        // .cancel are thread-safe, so we call them directly. We hop to `queue`
+        // for the dict cleanup in onClose to keep `streamClients`/`streamingConns`
+        // single-threaded.
+        let client = WebMonitorHostClient(
+            socketPath: socketPath,
+            sessionID: resolved.sessionID,
+            onBytes: { [weak conn] data in
+                conn?.send(content: data, completion: .contentProcessed { err in
+                    // A write error means the peer (phone) hung up; tear the
+                    // connection down so the host client's read loop stops.
+                    if err != nil { conn?.cancel() }
+                })
+            },
+            onClose: { [weak self, weak conn] in
+                // The source (host client) closed: end the HTTP response by
+                // closing the connection. Drop our bookkeeping on `queue`.
+                conn?.cancel()
+                self?.queue.async {
+                    self?.streamClients[key] = nil
+                    self?.streamingConns.remove(key)
+                }
+            })
+        streamClients[key] = client
+        client.start()
+    }
+
+    /// Load a vendored static asset from the app bundle and wrap it in an
+    /// `HTTPResponse`. Returns 404 if the resource is absent or unreadable.
+    /// PURE w.r.t. the connection (no socket, no AppKit); `internal` so the
+    /// missing-resource fallback can be unit-tested without a real bundle file.
+    static func assetResponse(name: String, ext: String, contentType: String) -> HTTPResponse {
+        guard let url = Bundle.main.url(forResource: name, withExtension: ext),
+              let data = try? Data(contentsOf: url) else {
+            return .status(404, "Not Found")
+        }
+        return .asset(data, contentType)
     }
 
     /// DNS-rebinding defense: accept a Host header only when it names the
@@ -899,17 +1095,19 @@ final class WebMonitorServer {
         case html(String)
         case text(String)
         case json(Data)
+        /// Raw bytes with an explicit Content-Type (vendored static assets).
+        case asset(Data, String)
         case status(Int, String)
 
         var statusCode: Int {
             switch self {
-            case .html, .text, .json: return 200
+            case .html, .text, .json, .asset: return 200
             case .status(let c, _): return c
             }
         }
         var reason: String {
             switch self {
-            case .html, .text, .json: return "OK"
+            case .html, .text, .json, .asset: return "OK"
             case .status(_, let r): return r
             }
         }
@@ -918,6 +1116,7 @@ final class WebMonitorServer {
             case .html: return "text/html; charset=utf-8"
             case .text: return "text/plain; charset=utf-8"
             case .json: return "application/json"
+            case .asset(_, let ct): return ct
             case .status: return "text/plain; charset=utf-8"
             }
         }
@@ -926,6 +1125,7 @@ final class WebMonitorServer {
             case .html(let s): return Data(s.utf8)
             case .text(let s): return Data(s.utf8)
             case .json(let d): return d
+            case .asset(let d, _): return d
             case .status(let c, let r): return Data("\(c) \(r)".utf8)
             }
         }
@@ -984,6 +1184,10 @@ final class WebMonitorServer {
       #screenwrap { position: relative; }
       #screen { white-space: pre; background: #0c0e13; padding: 10px; border-radius: 8px; min-height: 50vh; overflow-x: auto; overflow-y: auto; max-height: 70vh; }
       #screen.wrap { white-space: pre-wrap; word-break: break-word; }
+      /* xterm.js live terminal. Shown only when the raw stream is active; the
+         <pre id="screen"> poll viewer is the fallback when xterm is missing or
+         the /stream route is unavailable (501 / error). */
+      #xterm { display: none; background: #0c0e13; padding: 6px; border-radius: 8px; min-height: 50vh; max-height: 70vh; overflow: hidden; }
       #jumpbottom { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 1;
         width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
         background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }
@@ -1020,12 +1224,17 @@ final class WebMonitorServer {
     <div id="list"></div>
     <div id="viewer">
       <div class="bar">
-        <label for="mode">View</label>
-        <select id="mode" aria-label="Screen view mode">
-          <option value="viewport">Viewport</option>
-          <option value="scrollback">Scrollback</option>
-        </select>
-        <button id="refresh">Refresh</button>
+        <!-- The View (viewport/scrollback) mode toggle + Refresh only drive the
+             <pre id="screen"> poll viewer; xterm.js streams live with its own
+             scrollback, so #modetoggle is hidden while the live stream is active. -->
+        <span id="modetoggle">
+          <label for="mode">View</label>
+          <select id="mode" aria-label="Screen view mode">
+            <option value="viewport">Viewport</option>
+            <option value="scrollback">Scrollback</option>
+          </select>
+          <button id="refresh">Refresh</button>
+        </span>
         <label><input id="wrap" type="checkbox"> Wrap</label>
         <label for="fontsize">Size</label>
         <select id="fontsize" aria-label="Font size">
@@ -1037,6 +1246,7 @@ final class WebMonitorServer {
         </select>
       </div>
       <div id="screenwrap">
+        <div id="xterm"></div>
         <pre id="screen"></pre>
         <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
       </div>
@@ -1097,10 +1307,15 @@ final class WebMonitorServer {
       var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
       var modeEl = document.getElementById("mode");
+      var modeToggleEl = document.getElementById("modetoggle");
       var wrapEl = document.getElementById("wrap");
       var fontEl = document.getElementById("fontsize");
       var inp = document.getElementById("inp");
+      var xtermEl = document.getElementById("xterm");
       var current = null, timer = null, listTimer = null;
+      // Active live-stream handle (xterm.js raw byte stream). Held in a module
+      // var so showSurface/Back/teardown can dispose it before starting another.
+      var stream = null;
 
       // Show the no-token / 401 notice together with an in-page token-recovery
       // form. The URL was scrubbed via replaceState, so a phone user who lost
@@ -1146,6 +1361,21 @@ final class WebMonitorServer {
         for (var k in params) p.set(k, params[k]);
         return path + "?" + p.toString();
       }
+      // Load the vendored xterm.js + xterm.css served by the app (assetRoutes,
+      // query-token allowed). These are TAGS, not fetches, so the token rides
+      // in the query string like the GET / bootstrap. If they fail to load,
+      // window.Terminal stays undefined and openStream() degrades to the
+      // <pre id="screen"> poll fallback. Build the URLs with url() so the token
+      // is appended exactly like every other request.
+      (function () {
+        var css = document.createElement("link");
+        css.rel = "stylesheet";
+        css.href = url("/xterm.css", { token: token });
+        document.head.appendChild(css);
+        var js = document.createElement("script");
+        js.src = url("/xterm.js", { token: token });
+        document.head.appendChild(js);
+      })();
       // bannerIsError tracks whether the visible banner is a sticky error
       // (send failure / session closed). Sticky errors persist until the next
       // explicit user action; the poll()/loadList() success paths must NOT wipe
@@ -1279,7 +1509,93 @@ final class WebMonitorServer {
       };
       screenEl.addEventListener("scroll", updateJumpBtn);
 
+      // Dispose any active live stream: cancel the body reader and tear down the
+      // xterm.js instance, then hide the xterm container. Idempotent.
+      function disposeStream() {
+        if (!stream) return;
+        var s = stream; stream = null;
+        try { s.dispose(); } catch (e) {}
+        xtermEl.style.display = "none";
+        xtermEl.replaceChildren();  // drop the old terminal's DOM
+      }
+
+      // Switch this viewer to the plain-text poll fallback (the <pre id="screen">
+      // viewer). Used when xterm.js is unavailable or the /stream route fails.
+      // Shows the poll viewer, starts the 700ms poll, and surfaces a banner.
+      function fallbackToPoll(msg) {
+        disposeStream();
+        screenEl.style.display = "block";
+        modeToggleEl.style.display = "";  // poll viewer active: the mode toggle applies again
+        if (msg) setBanner(msg, false);
+        if (!current) return;
+        poll();
+        if (timer) clearInterval(timer);
+        timer = setInterval(poll, 700);  // >= ~600ms (cache TTL ~500ms)
+      }
+
+      // Open the live raw-byte stream for `uuid` into an xterm.js terminal. Only
+      // attempts the stream if window.Terminal loaded; otherwise returns null so
+      // the caller uses the poll fallback. Pipes response.body bytes into
+      // term.write(). On fetch reject / non-ok / 501 / stream end, surfaces the
+      // connection-lost / "Session closed." banner and falls back to the poll
+      // viewer. Returns a handle with dispose() (cancel reader + term.dispose()).
+      function openStream(uuid) {
+        if (!window.Terminal) return null;
+        var term = new Terminal({
+          convertEol: false,
+          scrollback: 10000,
+          fontSize: parseInt(fontEl.value, 10) || 14
+        });
+        term.open(xtermEl);
+        xtermEl.style.display = "block";
+        screenEl.style.display = "none";  // hide the poll fallback while streaming
+        modeToggleEl.style.display = "none";  // viewport/scrollback toggle is moot under xterm
+
+        var reader = null;
+        var disposed = false;
+        function teardown() {
+          if (disposed) return;
+          disposed = true;
+          if (reader) { try { reader.cancel(); } catch (e) {} }
+          try { term.dispose(); } catch (e) {}
+        }
+
+        fetch(url("/api/surface/" + uuid + "/stream"), { headers: headers({}) })
+          .then(function (r) {
+            // 404 -> session gone; 501 -> no pty-host (stream unavailable); any
+            // other non-ok -> connection problem. All degrade to the poll viewer.
+            if (r.status === 404) { if (stream === handle) { sessionClosedTeardown(); } return; }
+            if (!r.ok || !r.body) {
+              if (stream === handle) fallbackToPoll("Live stream unavailable \\u2014 using snapshot.");
+              return;
+            }
+            reader = r.body.getReader();
+            function pump() {
+              return reader.read().then(function (res) {
+                if (disposed) return;
+                if (res.done) {
+                  // Source closed: the session ended or the host dropped. Fall
+                  // back to a poll so a still-live session keeps updating.
+                  if (stream === handle) fallbackToPoll("Live stream ended \\u2014 using snapshot.");
+                  return;
+                }
+                term.write(res.value);  // res.value is a Uint8Array; xterm accepts it
+                return pump();
+              });
+            }
+            return pump();
+          })
+          .catch(function () {
+            if (disposed) return;
+            if (stream === handle) fallbackToPoll("Connection lost \\u2014 using snapshot.");
+          });
+
+        var handle = { dispose: teardown };
+        return handle;
+      }
+
       function showList() {
+        disposeStream();
         viewer.style.display = "none";
         listEl.style.display = "block";
         backBtn.style.display = "none";
@@ -1294,9 +1610,22 @@ final class WebMonitorServer {
         backBtn.style.display = "inline-block";
         curEl.textContent = title || "";
         setBanner(null);
-        poll();
-        if (timer) clearInterval(timer);
-        timer = setInterval(poll, 700);  // >= ~600ms (cache TTL ~500ms)
+        // Prefer the live xterm.js raw stream (color + scrollback + live). If
+        // xterm.js isn't loaded, openStream returns null and we use the plain
+        // poll viewer. openStream itself falls back to the poll on stream failure.
+        disposeStream();
+        stream = openStream(id);
+        if (stream) {
+          // Streaming: no poll timer (the stream is the live source). Keep the
+          // poll fallback hidden until/unless the stream degrades.
+          if (timer) { clearInterval(timer); timer = null; }
+        } else {
+          screenEl.style.display = "block";
+          modeToggleEl.style.display = "";  // poll viewer: the viewport/scrollback toggle applies
+          poll();
+          if (timer) clearInterval(timer);
+          timer = setInterval(poll, 700);  // >= ~600ms (cache TTL ~500ms)
+        }
         inp.focus();
       }
 
@@ -1410,6 +1739,9 @@ final class WebMonitorServer {
       document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "visible") {
           if (current) {
+            // While the live xterm stream is active there is no poll timer to
+            // re-arm (the stream is the source); leave it to keep streaming.
+            if (stream) return;
             poll();
             if (timer) clearInterval(timer);
             timer = setInterval(poll, 700);

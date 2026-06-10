@@ -251,6 +251,20 @@ extension Ghostty {
             return String(cString: ptr)
         }
 
+        // (ramon fork / Phase 2b) AF_UNIX socket path of a running ghostty-host.
+        // nil/empty when unset (the default in-process .exec backend). The web
+        // monitor's host client connects here to stream a session's raw PTY
+        // output for xterm.js rendering.
+        var ptyHost: String? {
+            guard let config = self.config else { return nil }
+            var v: UnsafePointer<Int8>?
+            let key = "pty-host"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+            guard let ptr = v else { return nil }
+            let s = String(cString: ptr)
+            return s.isEmpty ? nil : s
+        }
+
         var windowPositionX: Int16? {
             guard let config = self.config else { return nil }
             var v: Int16 = 0
