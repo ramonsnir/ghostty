@@ -965,13 +965,37 @@ final class WebMonitorServer {
     /// trailing "\n" the page appends on Send must map to Enter to actually
     /// submit (this is the core of the paste->key-event fix).
     static func keySpecs(forText text: String) -> [KeySpec] {
-        text.map { ch in
-            if ch == "\n" || ch == "\r" {
-                return KeySpec(keycode: 36)  // native macOS Return
-            }
-            let scalar = ch.unicodeScalars.first?.value ?? 0
-            return KeySpec(text: String(ch), unshiftedCodepoint: scalar)
+        // Coalesce consecutive printable characters into ONE multi-char text
+        // event. Sending each character as its own press+release floods the
+        // core's fixed 64-slot IO mailbox (src/termio/mailbox.zig): a ~60-char
+        // message is 120 messages, so the MIDDLE silently overflows and is
+        // dropped (you see only the head + tail). A printable run rides a single
+        // event's `text`, which the core writes verbatim to the PTY (the legacy
+        // encoder's `writeAll(utf8)` — NOT the clipboard/paste path), so a long
+        // message is 1-2 messages instead of 120. Newlines stay REAL Return
+        // keypresses (so each submits) and therefore break a run.
+        var specs: [KeySpec] = []
+        var run = ""
+        func flushRun() {
+            guard !run.isEmpty else { return }
+            // Keep the single-char shape (unshiftedCodepoint set) byte-identical
+            // to before so quick keys like y/n are unchanged; a multi-char run
+            // can't carry one scalar, so leave it 0 (the char rides `text`).
+            let scalars = Array(run.unicodeScalars)
+            let usc: UInt32 = scalars.count == 1 ? scalars[0].value : 0
+            specs.append(KeySpec(text: run, unshiftedCodepoint: usc))
+            run = ""
         }
+        for ch in text {
+            if ch == "\n" || ch == "\r" {
+                flushRun()
+                specs.append(KeySpec(keycode: 36))  // native macOS Return
+            } else {
+                run.append(ch)
+            }
+        }
+        flushRun()
+        return specs
     }
 
     // MARK: - Main-thread helpers (AppKit / surface access)
