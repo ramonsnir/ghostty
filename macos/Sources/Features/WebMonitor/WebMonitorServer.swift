@@ -667,9 +667,14 @@ final class WebMonitorServer {
     /// `internal` so the exact wire bytes are unit-testable. Followed by raw
     /// byte chunks written directly onto the connection as they arrive from the
     /// host client (see `routeStream`).
-    static func streamResponseHead() -> Data {
+    static func streamResponseHead(cols: UInt16, rows: UInt16) -> Data {
         var head = "HTTP/1.1 200 OK\r\n"
         head += "Content-Type: application/octet-stream\r\n"
+        // The host terminal's grid size. The browser xterm.js MUST match it or
+        // cursor-addressed output (TUIs like Claude Code) renders garbled. Read
+        // by the page (same-origin, so the custom headers are readable).
+        head += "X-Ghostty-Cols: \(cols)\r\n"
+        head += "X-Ghostty-Rows: \(rows)\r\n"
         // Defense in depth against an intermediary that might buffer/transform:
         // no caching, no MIME sniffing. (Over a tailnet there is normally no
         // proxy, but these are cheap and correct.)
@@ -698,13 +703,14 @@ final class WebMonitorServer {
         let key = ObjectIdentifier(conn)
 
         // Resolve session id + socket path on main (value types only).
-        struct Resolved { let sessionID: UInt64; let socketPath: String? }
+        struct Resolved { let sessionID: UInt64; let socketPath: String?; let cols: UInt16; let rows: UInt16 }
         let resolved: Resolved? = DispatchQueue.main.sync {
             guard let view = self.surface(forUUID: uuid),
                   let surface = view.surface else { return nil }
             let sid = ghostty_surface_session_id(surface)
             let path = (NSApp.delegate as? AppDelegate)?.ghostty.config.ptyHost
-            return Resolved(sessionID: sid, socketPath: path)
+            let size = ghostty_surface_size(surface)  // host grid, so xterm can match
+            return Resolved(sessionID: sid, socketPath: path, cols: size.columns, rows: size.rows)
         }
 
         guard let resolved else {
@@ -728,7 +734,8 @@ final class WebMonitorServer {
 
         // Write the streaming HTTP head. On failure the connection is already
         // gone; the state handler will clean up.
-        conn.send(content: Self.streamResponseHead(), completion: .contentProcessed { _ in })
+        conn.send(content: Self.streamResponseHead(cols: resolved.cols, rows: resolved.rows),
+                  completion: .contentProcessed { _ in })
 
         // Open the host client and pipe raw bytes onto the connection. onBytes /
         // onClose fire on the client's own background queue; NWConnection.send /
@@ -1197,7 +1204,7 @@ final class WebMonitorServer {
       /* xterm.js live terminal. Shown only when the raw stream is active; the
          <pre id="screen"> poll viewer is the fallback when xterm is missing or
          the /stream route is unavailable (501 / error). */
-      #xterm { display: none; background: #0c0e13; padding: 6px; border-radius: 8px; min-height: 50vh; max-height: 70vh; overflow: hidden; }
+      #xterm { display: none; background: #0c0e13; padding: 6px; border-radius: 8px; min-height: 50vh; max-height: 70vh; overflow: auto; }
       #jumpbottom { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 1;
         width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
         background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }
@@ -1583,6 +1590,11 @@ final class WebMonitorServer {
               return;
             }
             reader = r.body.getReader();
+            // Match xterm.js to the HOST grid (sent as headers) so cursor-
+            // addressed output renders correctly instead of wrapping into garbage.
+            var hc = parseInt(r.headers.get("X-Ghostty-Cols"), 10);
+            var hr = parseInt(r.headers.get("X-Ghostty-Rows"), 10);
+            if (hc > 0 && hr > 0) { try { term.resize(hc, hr); } catch (e) {} }
             function pump() {
               return reader.read().then(function (res) {
                 if (disposed) return;
