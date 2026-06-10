@@ -154,12 +154,13 @@ final class WebMonitorServer {
         // (empty/short) token. The token is a shell-execution credential, so a
         // guessable one is as dangerous as none — require a real, long random
         // token before binding the port.
-        guard Self.tokenAcceptable(token) else {
-            logger.warning("web-monitor: refusing to start — web-monitor-token is empty or too weak (need >= \(Self.minTokenLength, privacy: .public) chars)")
-            Self.notify(
-                title: "Web monitor not started",
-                body: "web-monitor-token is empty or too short; use a long (\(Self.minTokenLength)+ char) random token.")
-            return
+        // Token auth is OPTIONAL. Empty -> run OPEN (access control is the
+        // tailnet / Tailscale ACL alone); warn so it is a deliberate choice, not
+        // a silent surprise. A non-empty but short token is allowed but warned.
+        if token.isEmpty {
+            logger.warning("web-monitor: starting WITHOUT a token — OPEN on the bound port; access control is your Tailscale ACL alone")
+        } else if !Self.tokenAcceptable(token) {
+            logger.warning("web-monitor: web-monitor-token is under \(Self.minTokenLength, privacy: .public) chars — consider a longer random token")
         }
 
         guard let parsed else {
@@ -488,18 +489,19 @@ final class WebMonitorServer {
             return .forbiddenHost
         }
 
-        // Per-peer failed-token backoff (cheap brute-force speed bump).
-        if peerFailureCount >= failedAuthThreshold { return .throttled }
-
-        // Token check — gates EVERY request (including GET / and the asset
-        // routes). The query token (`?token=`) is accepted ONLY for the
-        // BOOTSTRAP paths (GET / and the <script>/<link> asset routes, which
-        // cannot send a custom header) so the page + its assets load from a
-        // plain link; every /api/* route requires the token via the
-        // X-Ghostty-Token header and IGNORES any query token.
-        let headerToken = headers["x-ghostty-token"] ?? ""
-        let presented = isBootstrapPath(path) ? (query["token"] ?? headerToken) : headerToken
-        guard tokensMatch(presented, token) else { return .unauthorized }
+        // Token auth is OPTIONAL. When web-monitor-token is EMPTY the server is
+        // OPEN — access control is the tailnet / Tailscale ACL alone (the bound
+        // port + Host-header allowlist still apply). When a token IS configured
+        // it gates every route, with the per-peer brute-force backoff. The query
+        // token (`?token=`) is accepted ONLY for the BOOTSTRAP paths (GET / and
+        // the <script>/<link> asset routes, which cannot send a custom header);
+        // every /api/* route requires the X-Ghostty-Token header.
+        if !token.isEmpty {
+            if peerFailureCount >= failedAuthThreshold { return .throttled }
+            let headerToken = headers["x-ghostty-token"] ?? ""
+            let presented = isBootstrapPath(path) ? (query["token"] ?? headerToken) : headerToken
+            guard tokensMatch(presented, token) else { return .unauthorized }
+        }
 
         // Route on (method, path).
         if path == "/" {
@@ -1365,21 +1367,21 @@ final class WebMonitorServer {
         if (e.key === "Enter") { e.preventDefault(); tokenConnect.onclick(); }
       });
 
-      if (!token) {
-        showTokenRecovery("No token. Open this page with ?token=YOUR_TOKEN once, or paste it below.");
-        return; // Do not fire any fetch — every request would 401 (M7).
-      }
+      // Token is OPTIONAL: when the server runs open (empty web-monitor-token)
+      // we proceed without one. If a token IS required and we lack it, requests
+      // return 401 and the 401 handlers below show the in-page recovery UI.
 
       function headers(extra) {
-        var h = { "X-Ghostty-Token": token };
+        var h = {};
+        if (token) h["X-Ghostty-Token"] = token;  // omitted when running open
         if (extra) for (var k in extra) h[k] = extra[k];
         return h;
       }
       function url(path, params) {
         if (!params) return path;
-        var p = new URLSearchParams();
-        for (var k in params) p.set(k, params[k]);
-        return path + "?" + p.toString();
+        var p = new URLSearchParams(), any = false;
+        for (var k in params) { if (params[k] != null && params[k] !== "") { p.set(k, params[k]); any = true; } }
+        return any ? (path + "?" + p.toString()) : path;
       }
       // Load the vendored xterm.js + xterm.css served by the app (assetRoutes,
       // query-token allowed). These are TAGS, not fetches, so the token rides

@@ -755,6 +755,26 @@ struct WebMonitorServerTests {
         #expect(d == .surfacesList)
     }
 
+    @Test func decideRouteOpenWhenNoTokenConfigured() {
+        // Empty configured token => OPEN: routes resolve with NO token presented
+        // (access control is the tailnet alone). Host-header allowlist still applies.
+        func open(_ path: String, peerFailures: Int = 0) -> WebMonitorServer.RouteDecision {
+            WebMonitorServer.decideRoute(
+                method: "GET", path: path, query: [:],
+                headers: ["host": "\(Self.host):\(Self.port)"],
+                configuredHost: Self.host, configuredPort: Self.port,
+                token: "", peerFailureCount: peerFailures)
+        }
+        #expect(open("/") == .page)
+        #expect(open("/api/surfaces") == .surfacesList)
+        // Not throttled when open — the backoff only applies to a configured token.
+        #expect(open("/", peerFailures: WebMonitorServer.failedAuthThreshold + 5) == .page)
+        // A bad Host is still rejected even when open.
+        #expect(WebMonitorServer.decideRoute(
+            method: "GET", path: "/", query: [:], headers: ["host": "evil.example.com:8787"],
+            configuredHost: Self.host, configuredPort: Self.port, token: "", peerFailureCount: 0) == .forbiddenHost)
+    }
+
     @Test func decideRouteHeaderTokenAcceptedOnPage() {
         // The header token is ALSO accepted on GET / (the query token is only an
         // additional convenience there, not the sole accepted form). With no
@@ -834,12 +854,13 @@ struct WebMonitorServerTests {
         #expect(page.contains("function start()"))
     }
 
-    @Test func htmlPageTokenRecoveryShownOnNoTokenAndUnauthorized() {
+    @Test func htmlPageTokenRecoveryShownOnUnauthorized() {
         let page = WebMonitorServer.htmlPage
-        // Both the no-token startup and the 401 paths route through
-        // showTokenRecovery so the form is offered in every locked-out state.
+        // Token auth is OPTIONAL: with no token the page proceeds (open server),
+        // so there is NO no-token startup block. The recovery form is offered
+        // only when a token IS required and a request comes back 401.
         #expect(page.contains("function showTokenRecovery"))
-        #expect(page.contains("showTokenRecovery(\"No token."))
+        #expect(!page.contains("showTokenRecovery(\"No token."))   // open mode: no startup gate
         #expect(page.contains("showTokenRecovery(\"Unauthorized."))
     }
 
