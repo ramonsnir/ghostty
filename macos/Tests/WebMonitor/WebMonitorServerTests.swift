@@ -706,6 +706,25 @@ struct WebMonitorServerTests {
         #expect(decide("GET", "/api/surface/\(id.uuidString)/input") == .methodNotAllowed)
     }
 
+    @Test func decideRouteScrollPost() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/scroll") == .scroll(uuid: id))
+    }
+
+    @Test func decideRouteScrollGetMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/scroll") == .methodNotAllowed)
+    }
+
+    @Test func scrollDeltaYDecode() {
+        #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{"dy":3}"#.utf8)) == 3)
+        #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{"dy":-5}"#.utf8)) == -5)
+        #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{"dy":0}"#.utf8)) == nil)     // zero -> nil
+        #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{"dy":999}"#.utf8)) == 30)    // clamped
+        #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{}"#.utf8)) == nil)           // missing
+        #expect(WebMonitorServer.scrollDeltaY(body: Data("not json".utf8)) == nil)
+    }
+
     @Test func decideRouteUnknownActionIsNotFound() {
         let id = UUID()
         #expect(decide("GET", "/api/surface/\(id.uuidString)/bogus") == .notFound)
