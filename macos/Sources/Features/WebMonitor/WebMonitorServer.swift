@@ -1690,7 +1690,7 @@ final class WebMonitorServer {
         if (!v) return;
         // Type the text (text/plain -> server turns it into typed key events),
         // then for Send (withNewline) ALSO fire a separate Enter key event
-        // (sendKey -> {key:"enter"}). NO trailing "\n" is ever appended; the
+        // (sendKey -> {key:"enter"}). NO trailing newline is ever appended; the
         // newline/submit is a real Enter key, not a pasted character.
         sendText(v);
         if (withNewline) sendKey("enter");
