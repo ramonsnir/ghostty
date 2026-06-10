@@ -99,6 +99,86 @@ pub const SearchEvent = union(enum) {
     selected: ?usize,
 };
 
+/// H1 (Phase 2b): the cap of the per-session RAW-output ring buffer (recent
+/// raw pty bytes kept for replay when a RAW subscriber connects). 256 KiB is
+/// large enough to cover a screenful + a bit of scrollback context for the web
+/// monitor's xterm.js to render on connect, yet bounded so a chatty session
+/// cannot grow host memory without limit.
+pub const RAW_RING_BYTES: usize = 256 * 1024;
+
+/// H1 (Phase 2b): a bounded byte ring of recent RAW pty output, used to replay
+/// recent context to a RAW subscriber on connect. Allocation-light on the hot
+/// path: the backing buffer is allocated ONCE (lazily, on first append) at the
+/// fixed cap and never grows; `append` only memcpys and advances indices,
+/// evicting the oldest bytes past the cap. All access is serialized by the
+/// owning Session's `render_mutex` (the observer fires under it, and `snapshot`
+/// takes it), so the ring itself carries no lock.
+pub const RawRing = struct {
+    /// The backing storage, allocated to `RAW_RING_BYTES` on first use. `&.{}`
+    /// until then (a never-written session keeps zero ring memory).
+    buf: []u8 = &.{},
+    /// Index of the oldest byte (the read start).
+    start: usize = 0,
+    /// Number of valid bytes currently stored (<= buf.len once allocated).
+    len: usize = 0,
+
+    pub fn deinit(self: *RawRing, alloc: Allocator) void {
+        if (self.buf.len > 0) alloc.free(self.buf);
+        self.* = .{};
+    }
+
+    /// Append `bytes` to the ring, evicting the oldest bytes once the cap is
+    /// reached. Allocates the fixed backing buffer once on first call.
+    pub fn append(self: *RawRing, alloc: Allocator, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        if (self.buf.len == 0) {
+            self.buf = try alloc.alloc(u8, RAW_RING_BYTES);
+            self.start = 0;
+            self.len = 0;
+        }
+        const cap = self.buf.len;
+
+        // If the incoming chunk is at least the whole capacity, only its last
+        // `cap` bytes can survive — copy those into a freshly-aligned ring.
+        if (bytes.len >= cap) {
+            @memcpy(self.buf[0..cap], bytes[bytes.len - cap ..]);
+            self.start = 0;
+            self.len = cap;
+            return;
+        }
+
+        // Write position is just past the last valid byte (wrapping).
+        var w = (self.start + self.len) % cap;
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 1) {
+            self.buf[w] = bytes[i];
+            w = (w + 1) % cap;
+        }
+        if (self.len + bytes.len <= cap) {
+            self.len += bytes.len;
+        } else {
+            // Overwrote `(len + bytes.len) - cap` of the oldest bytes; the ring
+            // is now full and start advances to the new oldest byte.
+            const overflow = self.len + bytes.len - cap;
+            self.start = (self.start + overflow) % cap;
+            self.len = cap;
+        }
+    }
+
+    /// Copy the ring's contents (oldest -> newest) into a freshly-allocated,
+    /// contiguous slice. Caller owns the result. Empty ring => an empty slice.
+    pub fn snapshot(self: *const RawRing, alloc: Allocator) ![]u8 {
+        const out = try alloc.alloc(u8, self.len);
+        errdefer alloc.free(out);
+        var i: usize = 0;
+        const cap = self.buf.len;
+        while (i < self.len) : (i += 1) {
+            out[i] = self.buf[(self.start + i) % cap];
+        }
+        return out;
+    }
+};
+
 alloc: Allocator,
 opts: Options,
 
@@ -273,6 +353,27 @@ on_selection_text: ?*const fn (ctx: *anyopaque, self: *Session, present: bool, t
 /// write). null in the standalone path.
 on_at_prompt_ctx: ?*anyopaque = null,
 on_at_prompt: ?*const fn (ctx: *anyopaque, self: *Session, at_prompt: bool) void = null,
+
+/// H1 (Phase 2b) RAW-output channel. The bounded ring of recent raw pty bytes
+/// (for replay on RAW-subscribe) plus the broadcast callback set by the Server.
+///
+/// The Termio `output_observer` (set in `start`, ctx = this Session) fires on
+/// the IO thread UNDER `render_mutex` for every raw `buf` BEFORE emulation; the
+/// observer (1) appends `buf` to `raw_ring` (under `render_mutex`, which it
+/// already holds) and (2) invokes `on_raw_output` so the Server broadcasts a
+/// `raw_output` frame to this session's RAW subscribers. `on_raw_output`
+/// BORROWS `buf` (valid only during the call — it aliases the IO read buffer),
+/// so the callback must serialize/copy before returning, exactly like
+/// `on_surface_event`. null in the standalone path (ring still fills, no
+/// broadcast). Mirrors the GridFrame broadcast's e.mutex discipline (the Server
+/// callback locks e.mutex and writes to subscribers). Because the observer runs
+/// on the IO thread (not the render-loop owning thread), a wedged RAW subscriber
+/// head-of-line-blocks the IO thread — accepted under the same SR-4 single/local
+/// fast-peer contract as the existing subscribers (the web monitor peer is
+/// LOCAL/fast).
+raw_ring: RawRing = .{},
+on_raw_output_ctx: ?*anyopaque = null,
+on_raw_output: ?*const fn (ctx: *anyopaque, self: *Session, buf: []const u8) void = null,
 
 /// The last at-prompt value pushed (renderTick-only state, single-threaded on
 /// the render loop). null until the first tick. Used to push an `at_prompt` event
@@ -576,6 +677,14 @@ pub fn start(self: *Session) !void {
         pollTimerCallback,
     );
 
+    // H1 (Phase 2b): arm the RAW-output observer on Termio so each raw pty
+    // `buf` (BEFORE emulation) is teed to `rawOutputObserver`. Set here (not in
+    // create) so it is live for the very first read once the IO thread starts.
+    // ctx = this stable Session pointer. The GUI's `.exec` Termio never sets
+    // this; it stays null there (zero behavior change).
+    self.io.output_observer = rawOutputObserver;
+    self.io.output_observer_ctx = self;
+
     self.io_thr = try std.Thread.spawn(
         .{},
         termio.Thread.threadMain,
@@ -584,6 +693,36 @@ pub fn start(self: *Session) !void {
     self.io_thr.?.setName("io") catch {};
 
     self.started = true;
+}
+
+/// H1 (Phase 2b): the Termio RAW-output observer. Runs on the IO thread UNDER
+/// `render_mutex` (held by Termio.processOutput) for every raw `buf` BEFORE
+/// emulation. Appends `buf` to the bounded `raw_ring` (for replay-on-connect)
+/// and broadcasts it as a `raw_output` frame to RAW subscribers via the Server
+/// callback. `buf` BORROWS the IO read buffer (valid only during this call), so
+/// the broadcast callback copies/serializes before returning. A ring-append OOM
+/// is logged and dropped (raw streaming is best-effort; an alloc failure must
+/// not abort the IO thread / kill all sessions).
+fn rawOutputObserver(ctx: *anyopaque, buf: []const u8) void {
+    const self: *Session = @ptrCast(@alignCast(ctx));
+    // We are already under render_mutex (the observer is invoked from
+    // Termio.processOutputLocked, whose caller holds renderer_state.mutex ==
+    // &self.render_mutex), so append directly without re-locking.
+    self.raw_ring.append(self.alloc, buf) catch |err|
+        log.warn("raw_ring append failed err={}", .{err});
+    if (self.on_raw_output) |cb| {
+        cb(self.on_raw_output_ctx.?, self, buf);
+    }
+}
+
+/// H1 (Phase 2b): copy a snapshot of the RAW-output ring (oldest -> newest) for
+/// replay to a freshly-subscribed RAW peer. Caller owns the returned slice
+/// (`self.alloc`). Takes `render_mutex` so it is coherent against the IO
+/// thread's concurrent observer appends.
+pub fn rawRingSnapshot(self: *Session) ![]u8 {
+    self.render_mutex.lock();
+    defer self.render_mutex.unlock();
+    return self.raw_ring.snapshot(self.alloc);
 }
 
 /// Send input bytes to the child (queues a write via the termio mailbox).
@@ -1472,6 +1611,11 @@ pub fn destroy(self: *Session) void {
 
     self.io.deinit();
     if (self.prev_snapshot) |*s| s.deinit(self.alloc);
+
+    // H1 (Phase 2b): free the RAW-output ring. stop() above joined the IO
+    // thread, so the observer (the only writer) can no longer fire — this is
+    // the sole owner now.
+    self.raw_ring.deinit(self.alloc);
 
     // Slice B1: free any selection text staged by selectDrag/selectClear that
     // renderTick never drained (e.g. teardown raced an in-flight drag).

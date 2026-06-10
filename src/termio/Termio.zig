@@ -67,6 +67,17 @@ terminal_stream: StreamHandler.Stream,
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
 
+/// H1 (Phase 2b): an OPTIONAL, ADDITIVE observer of the RAW pty output bytes.
+/// When non-null, `processOutputLocked` invokes it with each `buf` BEFORE
+/// feeding the emulator — the raw bytes that own the emulation (color,
+/// scrollback, etc.). The headless host's Session sets it (ctx = the Session) so
+/// it can ring-buffer + broadcast a `raw_output` frame; the GUI (`.exec`) NEVER
+/// sets it, so it stays null and the output path is byte-identical to before
+/// (zero behavior change). Called UNDER `renderer_state.mutex` (held by
+/// processOutput), on the IO thread.
+output_observer: ?*const fn (ctx: *anyopaque, buf: []const u8) void = null,
+output_observer_ctx: ?*anyopaque = null,
+
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
@@ -725,6 +736,13 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    // H1 (Phase 2b): tee the RAW pty bytes to the optional observer BEFORE
+    // emulation. The GUI (.exec) never sets this (stays null) => zero behavior
+    // change; the headless host sets it to ring-buffer + broadcast raw_output.
+    // No allocation / no fallible work here — the observer is responsible for
+    // bounding its own work on this hot path.
+    if (self.output_observer) |cb| cb(self.output_observer_ctx.?, buf);
+
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
 
