@@ -907,4 +907,355 @@ struct WebMonitorServerTests {
         #expect(page.contains("rawBtn.onclick = function () { doSend(false); };"))
         #expect(page.contains("if (e.key === \"Enter\") { e.preventDefault(); doSend(true); }"))
     }
+
+    // MARK: - Static asset routes (vendored xterm.js / xterm.css)
+
+    @Test func assetRoutesMapShape() {
+        // The two vendored assets are routed with the expected resource name /
+        // extension and a correct MIME type.
+        let js = WebMonitorServer.assetRoutes["/xterm.js"]
+        #expect(js?.name == "xterm")
+        #expect(js?.ext == "js")
+        #expect(js?.contentType == "application/javascript; charset=utf-8")
+        let css = WebMonitorServer.assetRoutes["/xterm.css"]
+        #expect(css?.name == "xterm")
+        #expect(css?.ext == "css")
+        #expect(css?.contentType == "text/css; charset=utf-8")
+        // Nothing else is an asset route.
+        #expect(WebMonitorServer.assetRoutes["/other.js"] == nil)
+    }
+
+    @Test func isBootstrapPathCoversPageAndAssets() {
+        // The bootstrap set is exactly GET / plus the two asset routes; these
+        // accept the ?token= query form. Everything else must NOT be bootstrap
+        // (so it requires the X-Ghostty-Token header).
+        #expect(WebMonitorServer.isBootstrapPath("/"))
+        #expect(WebMonitorServer.isBootstrapPath("/xterm.js"))
+        #expect(WebMonitorServer.isBootstrapPath("/xterm.css"))
+        #expect(!WebMonitorServer.isBootstrapPath("/api/surfaces"))
+        #expect(!WebMonitorServer.isBootstrapPath("/anything/else"))
+    }
+
+    @Test func decideRouteAssetJS() {
+        let d = decide("GET", "/xterm.js")
+        #expect(d == .asset(name: "xterm", ext: "js", contentType: "application/javascript; charset=utf-8"))
+    }
+
+    @Test func decideRouteAssetCSS() {
+        let d = decide("GET", "/xterm.css")
+        #expect(d == .asset(name: "xterm", ext: "css", contentType: "text/css; charset=utf-8"))
+    }
+
+    @Test func decideRouteAssetPostMethodNotAllowed() {
+        #expect(decide("POST", "/xterm.js") == .methodNotAllowed)
+    }
+
+    @Test func decideRouteAssetAcceptsQueryToken() {
+        // A <script>/<link> tag cannot send the X-Ghostty-Token header, so the
+        // asset routes accept the token via ?token= like GET /.
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/xterm.js", query: ["token": Self.tok],
+            headers: ["host": "\(Self.host):\(Self.port)"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .asset(name: "xterm", ext: "js", contentType: "application/javascript; charset=utf-8"))
+    }
+
+    @Test func decideRouteAssetAcceptsHeaderToken() {
+        // The header token is also accepted on the asset routes.
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/xterm.css", query: [:],
+            headers: ["host": "\(Self.host):\(Self.port)", "x-ghostty-token": Self.tok],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .asset(name: "xterm", ext: "css", contentType: "text/css; charset=utf-8"))
+    }
+
+    @Test func decideRouteAssetWrongTokenUnauthorized() {
+        // The token still gates the asset routes (they are not unauthenticated).
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/xterm.js", query: ["token": "wrong"],
+            headers: ["host": "\(Self.host):\(Self.port)"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .unauthorized)
+    }
+
+    @Test func decideRouteAssetBadHostForbidden() {
+        // The Host-header (DNS-rebinding) defense applies to the asset routes too.
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/xterm.js", query: ["token": Self.tok],
+            headers: ["host": "evil.example.com:8787"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .forbiddenHost)
+    }
+
+    @Test func assetResponseMissingResourceIs404() {
+        // In the unit-test bundle the vendored files are not present, so the
+        // bundle lookup misses and we return a clean 404 (never a crash). This
+        // pins the missing-resource fallback path.
+        let r = WebMonitorServer.assetResponse(
+            name: "definitely-not-a-bundled-resource", ext: "js",
+            contentType: "application/javascript; charset=utf-8")
+        #expect(r.statusCode == 404)
+    }
+
+    @Test func httpResponseAssetCarriesContentTypeAndBytes() {
+        // The .asset response variant serves arbitrary bytes with an explicit
+        // Content-Type (200 OK), distinct from text/json.
+        let bytes = Data([0x2f, 0x2f, 0x20, 0x6a, 0x73])  // "// js"
+        let r = WebMonitorServer.HTTPResponse.asset(bytes, "application/javascript; charset=utf-8")
+        #expect(r.statusCode == 200)
+        #expect(r.reason == "OK")
+        #expect(r.contentType == "application/javascript; charset=utf-8")
+        #expect(r.body == bytes)
+    }
+}
+
+/// Unit tests for the pure framing/codec helpers of `WebMonitorHostClient`,
+/// the Swift client for the `ghostty-host` length-prefixed wire protocol
+/// (see `src/host/protocol.zig`). These pin the exact wire layout: BE u32
+/// length prefix, LE in-frame scalars, the four frame tag values, and the
+/// partial-read-tolerant `FrameReader` reassembly.
+struct WebMonitorHostClientTests {
+
+    typealias C = WebMonitorHostClient
+
+    // MARK: - Frame tag values (FrameType enum ordinals in protocol.zig)
+
+    @Test func frameTagValuesMatchProtocol() {
+        #expect(C.FrameTag.hello.rawValue == 0)
+        #expect(C.FrameTag.helloAck.rawValue == 1)
+        #expect(C.FrameTag.subscribeRaw.rawValue == 31)
+        #expect(C.FrameTag.rawOutput.rawValue == 32)
+    }
+
+    // MARK: - encodeFrame (BE length prefix + tag + payload)
+
+    @Test func encodeFrameLayout() {
+        let payload = Data([0xaa, 0xbb, 0xcc])
+        let frame = C.encodeFrame(tag: .rawOutput, payload: payload)
+        // len = 1 (tag) + 3 (payload) = 4, big-endian.
+        #expect(Array(frame) == [0x00, 0x00, 0x00, 0x04, 32, 0xaa, 0xbb, 0xcc])
+    }
+
+    @Test func encodeFrameEmptyPayload() {
+        let frame = C.encodeFrame(tag: .hello, payload: Data())
+        // len = 1 (just the tag).
+        #expect(Array(frame) == [0x00, 0x00, 0x00, 0x01, 0])
+    }
+
+    // MARK: - encodeHello
+
+    @Test func encodeHelloLayout() {
+        let frame = C.encodeHello()
+        // BE len prefix (4) + tag(1) + u16 major LE + u16 minor LE + u32 id-len LE.
+        // payload = [major=1 LE][minor=0 LE][id-len=0 LE] = 8 bytes; len = 9.
+        #expect(Array(frame) == [
+            0x00, 0x00, 0x00, 0x09,        // BE length = 9
+            0,                             // tag hello
+            0x01, 0x00,                    // major = 1 (LE)
+            0x00, 0x00,                    // minor = 0 (LE)
+            0x00, 0x00, 0x00, 0x00,        // identity_bundle_id length = 0 (LE)
+        ])
+    }
+
+    // MARK: - encodeSubscribeRaw (u64 LE session_id)
+
+    @Test func encodeSubscribeRawLayout() {
+        let frame = C.encodeSubscribeRaw(0x0102030405060708)
+        #expect(Array(frame) == [
+            0x00, 0x00, 0x00, 0x09,        // BE length = 1 + 8
+            31,                            // tag subscribe_raw
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // u64 LE
+        ])
+    }
+
+    @Test func encodeSubscribeRawZero() {
+        let frame = C.encodeSubscribeRaw(0)
+        #expect(Array(frame) == [0x00, 0x00, 0x00, 0x09, 31, 0, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    // MARK: - decodeHelloAckMajor
+
+    @Test func decodeHelloAckMajorReadsLE() {
+        // major = 1 (LE), then minor + pid + epoch (we only need major).
+        var p = Data()
+        C.appendU16LE(&p, 1)
+        C.appendU16LE(&p, 7)
+        #expect(C.decodeHelloAckMajor(p) == 1)
+    }
+
+    @Test func decodeHelloAckMajorTooShortIsNil() {
+        #expect(C.decodeHelloAckMajor(Data([0x01])) == nil)
+        #expect(C.decodeHelloAckMajor(Data()) == nil)
+    }
+
+    // MARK: - decodeRawOutput (u64 LE session_id + [u32 LE len][bytes])
+
+    @Test func decodeRawOutputRoundTrips() {
+        var p = Data()
+        C.appendU64LE(&p, 0xdeadbeef)
+        let raw = Data("hello\u{1b}[31mworld".utf8)
+        C.appendU32LE(&p, UInt32(raw.count))
+        p.append(raw)
+        let decoded = C.decodeRawOutput(p)
+        #expect(decoded?.sessionID == 0xdeadbeef)
+        #expect(decoded?.bytes == raw)
+    }
+
+    @Test func decodeRawOutputPreservesEmbeddedNulAndEsc() {
+        // Raw PTY bytes are binary: embedded NUL (0x00) and ESC (0x1b) must
+        // survive the decode verbatim (no C-string truncation at the NUL, no
+        // escape-sequence mangling). Length is carried out-of-band by the u32
+        // LE prefix, so the NUL is just another byte.
+        var p = Data()
+        C.appendU64LE(&p, 0x00ff)
+        let raw = Data([0x1b, 0x5b, 0x33, 0x31, 0x6d,  // ESC [ 3 1 m
+                        0x00,                            // embedded NUL
+                        0x41, 0x00, 0x42,                // A NUL B
+                        0x1b, 0x00])                     // ESC NUL (trailing)
+        C.appendU32LE(&p, UInt32(raw.count))
+        p.append(raw)
+        let decoded = C.decodeRawOutput(p)
+        #expect(decoded?.sessionID == 0x00ff)
+        #expect(decoded?.bytes == raw)
+        #expect(decoded?.bytes.count == raw.count)  // not truncated at the NUL
+    }
+
+    @Test func decodeRawOutputEmptyBytes() {
+        var p = Data()
+        C.appendU64LE(&p, 42)
+        C.appendU32LE(&p, 0)
+        let decoded = C.decodeRawOutput(p)
+        #expect(decoded?.sessionID == 42)
+        #expect(decoded?.bytes.isEmpty == true)
+    }
+
+    @Test func decodeRawOutputTruncatedIsNil() {
+        // Claims 10 bytes but only 2 follow -> nil (not a crash/over-read).
+        var p = Data()
+        C.appendU64LE(&p, 1)
+        C.appendU32LE(&p, 10)
+        p.append(Data([0x41, 0x42]))
+        #expect(C.decodeRawOutput(p) == nil)
+        // Too short even for the session_id + length header.
+        #expect(C.decodeRawOutput(Data([0x00, 0x01])) == nil)
+    }
+
+    // MARK: - FrameReader (partial-read reassembly)
+
+    @Test func frameReaderYieldsCompleteFrame() throws {
+        var reader = C.FrameReader()
+        reader.push(C.encodeSubscribeRaw(99))
+        let f = try reader.next()
+        #expect(f?.tag == C.FrameTag.subscribeRaw.rawValue)
+        #expect(C.readU64LE(f!.payload, at: f!.payload.startIndex) == 99)
+        #expect(try reader.next() == nil)  // nothing more buffered
+    }
+
+    @Test func frameReaderPartialThenComplete() throws {
+        let frame = C.encodeSubscribeRaw(7)
+        var reader = C.FrameReader()
+        // Feed only the first 3 bytes (less than the 4-byte length prefix).
+        reader.push(frame.prefix(3))
+        #expect(try reader.next() == nil)
+        // Feed the rest; now a full frame is available.
+        reader.push(frame.suffix(from: frame.index(frame.startIndex, offsetBy: 3)))
+        let f = try reader.next()
+        #expect(f?.tag == C.FrameTag.subscribeRaw.rawValue)
+        #expect(C.readU64LE(f!.payload, at: f!.payload.startIndex) == 7)
+    }
+
+    @Test func frameReaderTwoFramesInOnePush() throws {
+        var combined = C.encodeSubscribeRaw(1)
+        combined.append(C.encodeSubscribeRaw(2))
+        var reader = C.FrameReader()
+        reader.push(combined)
+        let f1 = try reader.next()
+        let f2 = try reader.next()
+        #expect(C.readU64LE(f1!.payload, at: f1!.payload.startIndex) == 1)
+        #expect(C.readU64LE(f2!.payload, at: f2!.payload.startIndex) == 2)
+        #expect(try reader.next() == nil)
+    }
+
+    @Test func frameReaderCompleteFramePlusTrailingPartial() throws {
+        // One complete frame followed by a trailing PARTIAL frame whose 4-byte
+        // length prefix is fully present but whose payload is incomplete: the
+        // reader yields the complete frame, then nothing, until the remaining
+        // payload bytes arrive.
+        let first = C.encodeSubscribeRaw(11)
+        let second = C.encodeSubscribeRaw(22)
+        // Hold back the last 2 bytes of `second` (mid-payload, past its prefix).
+        let cut = second.index(second.endIndex, offsetBy: -2)
+        var combined = first
+        combined.append(second[second.startIndex..<cut])
+
+        var reader = C.FrameReader()
+        reader.push(combined)
+        let f1 = try reader.next()
+        #expect(C.readU64LE(f1!.payload, at: f1!.payload.startIndex) == 11)
+        // Second frame's prefix is buffered but its payload isn't complete yet.
+        #expect(try reader.next() == nil)
+        // Deliver the rest; the second frame now completes.
+        reader.push(second[cut..<second.endIndex])
+        let f2 = try reader.next()
+        #expect(C.readU64LE(f2!.payload, at: f2!.payload.startIndex) == 22)
+        #expect(try reader.next() == nil)
+    }
+
+    @Test func frameReaderDecodesRawOutputEndToEnd() throws {
+        // Build a raw_output frame by hand and reassemble + decode it.
+        let raw = Data("\u{1b}[32mok\u{1b}[0m".utf8)
+        var payload = Data()
+        C.appendU64LE(&payload, 5)
+        C.appendU32LE(&payload, UInt32(raw.count))
+        payload.append(raw)
+        let frame = C.encodeFrame(tag: .rawOutput, payload: payload)
+
+        var reader = C.FrameReader()
+        // Split the frame across two pushes to exercise reassembly.
+        let mid = frame.index(frame.startIndex, offsetBy: frame.count / 2)
+        reader.push(frame[frame.startIndex..<mid])
+        #expect(try reader.next() == nil)
+        reader.push(frame[mid..<frame.endIndex])
+        let f = try reader.next()
+        #expect(f?.tag == C.FrameTag.rawOutput.rawValue)
+        let decoded = C.decodeRawOutput(f!.payload)
+        #expect(decoded?.sessionID == 5)
+        #expect(decoded?.bytes == raw)
+    }
+
+    @Test func frameReaderRejectsOversizedLength() {
+        var reader = C.FrameReader()
+        // BE length prefix larger than maxFrameLen (64 MiB) -> throws.
+        reader.push(Data([0xff, 0xff, 0xff, 0xff]))
+        // do/catch (not #expect(throws:)) to avoid the @Sendable-closure
+        // requirement capturing the mutable `var reader` (see SplitTreeTests).
+        var threw = false
+        do { _ = try reader.next() } catch { threw = true }
+        #expect(threw)
+    }
+
+    @Test func frameReaderRejectsZeroLength() {
+        var reader = C.FrameReader()
+        // A length of 0 cannot even cover the mandatory tag byte.
+        reader.push(Data([0x00, 0x00, 0x00, 0x00]))
+        var threw = false
+        do { _ = try reader.next() } catch { threw = true }
+        #expect(threw)
+    }
+
+    // MARK: - scalar codec round-trips
+
+    @Test func u32BERoundTrip() {
+        var d = Data()
+        C.appendU32BE(&d, 0x01020304)
+        #expect(Array(d) == [0x01, 0x02, 0x03, 0x04])
+        #expect(C.readU32BE(d, at: d.startIndex) == 0x01020304)
+    }
+
+    @Test func u64LERoundTrip() {
+        var d = Data()
+        C.appendU64LE(&d, 0x1122334455667788)
+        #expect(Array(d) == [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11])
+        #expect(C.readU64LE(d, at: d.startIndex) == 0x1122334455667788)
+    }
 }
