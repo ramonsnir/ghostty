@@ -445,6 +445,7 @@ final class WebMonitorServer {
         case screen(uuid: UUID, scrollback: Bool) // GET /api/surface/{uuid}/screen
         case stream(uuid: UUID)                  // GET /api/surface/{uuid}/stream (raw byte stream)
         case input(uuid: UUID)                   // POST /api/surface/{uuid}/input
+        case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
     }
 
@@ -532,6 +533,9 @@ final class WebMonitorServer {
             case "input":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .input(uuid: uuid)
+            case "scroll":
+                guard method == "POST" else { return .methodNotAllowed }
+                return .scroll(uuid: uuid)
             default:
                 return .notFound
             }
@@ -647,6 +651,24 @@ final class WebMonitorServer {
                     spec.send(to: surface)
                 }
                 return .json(Data(#"{"ok":true,"sent":\#(specs.count)}"#.utf8))
+            }
+            send(result, on: conn)
+
+        case .scroll(let uuid):
+            clearAuthFailures(peer)
+            guard let dy = Self.scrollDeltaY(body: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            let result: HTTPResponse = DispatchQueue.main.sync {
+                guard let view = self.surface(forUUID: uuid),
+                      let surface = view.surface else { return .status(404, "Not Found") }
+                // Discrete (non-precision) wheel scroll: scroll_mods = 0, y = ticks.
+                // The host routes it per the app's mode (mouse-mode SGR wheel,
+                // alternate-scroll arrows for less/man, or scrollback) exactly like
+                // a real wheel — so a TUI scrolls and the result streams back.
+                ghostty_surface_mouse_scroll(surface, 0, dy, 0)
+                return .json(Data(#"{"ok":true}"#.utf8))
             }
             send(result, on: conn)
 
@@ -892,6 +914,15 @@ final class WebMonitorServer {
         }
         guard let text = String(data: body, encoding: .utf8) else { return nil }
         return keySpecs(forText: text)
+    }
+
+    /// PURE: decode a scroll request body {"dy": <number>} into a wheel-tick
+    /// delta (positive = scroll back / up). Clamped to a sane range; nil on bad
+    /// input or a zero delta.
+    static func scrollDeltaY(body: Data) -> Double? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let dy = (obj["dy"] as? NSNumber)?.doubleValue, dy != 0 else { return nil }
+        return max(-30, min(30, dy))
     }
 
     /// PURE: map a named key command to a single key-event spec. Unknown -> nil.
@@ -1290,6 +1321,13 @@ final class WebMonitorServer {
         <button data-key="down" aria-label="Down">&darr;</button>
         <button data-key="left" aria-label="Left">&larr;</button>
         <button data-key="right" aria-label="Right">&rarr;</button>
+      </div>
+      <!-- Remote-control scroll: forwarded to the host as mouse-wheel input, so
+           a TUI (Claude Code/less/vim) scrolls and the result streams back, and
+           you can reach history beyond the browser's buffer. -->
+      <div class="bar">
+        <button id="scrollup" title="Scroll up — mouse wheel to the remote terminal">&#8679; Scroll</button>
+        <button id="scrolldown" title="Scroll down — mouse wheel to the remote terminal">&#8681; Scroll</button>
       </div>
       <!-- Compose input is LAST so the on-screen keyboard (which docks below the
            focused field) cannot hide the quick-key rows above it. -->
@@ -1756,6 +1794,19 @@ final class WebMonitorServer {
       Array.prototype.forEach.call(document.querySelectorAll("[data-raw]"), function (b) {
         b.onclick = function () { flashTap(b); sendText(b.getAttribute("data-raw")); };
       });
+
+      // Remote-control scroll: POST a wheel delta to /scroll. The host turns it
+      // into a real mouse-wheel event (positive dy = scroll up/back).
+      function sendScroll(dy) {
+        if (!current) { noActiveSession(); return; }
+        fetch(url("/api/surface/" + current + "/scroll"), {
+          method: "POST",
+          headers: headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ dy: dy })
+        }).catch(function () {});
+      }
+      document.getElementById("scrollup").onclick = function () { flashTap(this); sendScroll(3); };
+      document.getElementById("scrolldown").onclick = function () { flashTap(this); sendScroll(-3); };
 
       // Pause the 700ms poll while hidden (wasteful, and mobile throttles it
       // anyway); re-poll / re-list immediately when the page returns to the
