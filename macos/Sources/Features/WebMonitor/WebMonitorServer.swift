@@ -1265,8 +1265,7 @@ final class WebMonitorServer {
                autocapitalize="off" autocorrect="off" autocomplete="off"
                spellcheck="false" inputmode="text" enterkeyhint="send"
                aria-label="Input to send to the terminal">
-        <button id="send" title="Type the text and press Enter (submit)">Send &#9166;</button>
-        <button id="sendraw" title="Type the text WITHOUT pressing Enter (does not submit)">No &#9166;</button>
+        <button id="send" title="Type into the terminal (does NOT submit — tap Enter below to send the line)">Send</button>
       </div>
       <div class="bar">
         <button data-key="enter">Enter</button>
@@ -1697,30 +1696,27 @@ final class WebMonitorServer {
         else { setBanner("Send failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
       }
 
-      function doSend(withNewline) {
+      function doSend() {
         var v = inp.value;
         if (!v) return;
-        // Type the text (text/plain -> server turns it into typed key events),
-        // then for Send (withNewline) ALSO fire a separate Enter key event
-        // (sendKey -> {key:"enter"}). NO trailing newline is ever appended; the
-        // newline/submit is a real Enter key, not a pasted character.
+        // Type the text into the terminal (text/plain -> server turns it into
+        // typed key events). Does NOT press Enter: submitting is a separate,
+        // explicit action (the Enter quick-key below), so you can type/review a
+        // reply on the live screen and then send it deliberately.
         sendText(v);
-        if (withNewline) sendKey("enter");
         inp.value = "";
         inp.focus();
         syncSendEnabled();
       }
       var sendBtn = document.getElementById("send");
-      var rawBtn = document.getElementById("sendraw");
-      sendBtn.onclick = function () { doSend(true); };
-      rawBtn.onclick = function () { doSend(false); };
+      sendBtn.onclick = doSend;
+      // Return in the text field types the text too (does NOT submit) — Enter is
+      // the explicit Enter quick-key.
       inp.addEventListener("keydown", function (e) {
-        if (e.key === "Enter") { e.preventDefault(); doSend(true); }
+        if (e.key === "Enter") { e.preventDefault(); doSend(); }
       });
       function syncSendEnabled() {
-        var empty = !inp.value;
-        sendBtn.disabled = empty;
-        rawBtn.disabled = empty;
+        sendBtn.disabled = !inp.value;
       }
       inp.addEventListener("input", syncSendEnabled);
       syncSendEnabled();
