@@ -1261,13 +1261,6 @@ final class WebMonitorServer {
         <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
       </div>
       <div class="bar">
-        <input id="inp" type="text" placeholder="type and Send (Enter sends)"
-               autocapitalize="off" autocorrect="off" autocomplete="off"
-               spellcheck="false" inputmode="text" enterkeyhint="send"
-               aria-label="Input to send to the terminal">
-        <button id="send" title="Type into the terminal (does NOT submit — tap Enter below to send the line)">Send</button>
-      </div>
-      <div class="bar">
         <button data-key="enter">Enter</button>
         <button data-key="y">y</button>
         <button data-key="n">n</button>
@@ -1288,6 +1281,15 @@ final class WebMonitorServer {
         <button data-key="down" aria-label="Down">&darr;</button>
         <button data-key="left" aria-label="Left">&larr;</button>
         <button data-key="right" aria-label="Right">&rarr;</button>
+      </div>
+      <!-- Compose input is LAST so the on-screen keyboard (which docks below the
+           focused field) cannot hide the quick-key rows above it. -->
+      <div class="bar">
+        <input id="inp" type="text" placeholder="type a reply, then Send (tap Enter above to submit)"
+               autocapitalize="off" autocorrect="off" autocomplete="off"
+               spellcheck="false" inputmode="text" enterkeyhint="send"
+               aria-label="Input to send to the terminal">
+        <button id="send" title="Type into the terminal (does NOT submit — tap Enter above to send the line)">Send</button>
       </div>
     </div>
     <script>
