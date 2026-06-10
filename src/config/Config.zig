@@ -2918,7 +2918,10 @@ keybind: Keybinds = .{},
 /// This slice always spawns a FRESH session on the host (reattach-by-session
 /// is a follow-on). This is a fork-only key, so keep it in
 /// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
-@"pty-host": ?[]const u8 = null,
+// NOTE: `[:0]const u8` (NOT `[]const u8`) so the C config getter
+// (ghostty_config_get) can return it as a NUL-terminated string — the web
+// monitor reads this via the `ptyHost` Swift getter to find the host socket.
+@"pty-host": ?[:0]const u8 = null,
 
 /// Sets the reporting format for OSC sequences that request color information.
 /// Ghostty currently supports OSC 10 (foreground), OSC 11 (background), and
