@@ -109,17 +109,27 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.keySpecs(forKey: "bogus") == nil)
     }
 
-    @Test func keySpecsForTextOnePerCharacter() {
-        // Printable text -> one text-bearing spec per Character, keycode unset,
-        // unshiftedCodepoint = each char's first scalar.
+    @Test func keySpecsForTextCoalescesPrintableRun() {
+        // A printable run becomes ONE multi-char text event (keycode unset), not
+        // one event per character — otherwise a long message floods the 64-slot
+        // IO mailbox and the middle is dropped. A multi-char run carries no single
+        // scalar, so unshiftedCodepoint is 0; the text rides `text`.
         let s = WebMonitorServer.keySpecs(forText: "hi")
-        #expect(s == [
-            WebMonitorServer.KeySpec(text: "h", unshiftedCodepoint: UInt32(UnicodeScalar("h").value)),
-            WebMonitorServer.KeySpec(text: "i", unshiftedCodepoint: UInt32(UnicodeScalar("i").value)),
-        ])
-        // The keycode stays unset (0) for printable text.
+        #expect(s == [WebMonitorServer.KeySpec(text: "hi")])
         #expect(s.first?.keycode == 0)
-        #expect(s.first?.text == "h")
+        #expect(s.first?.text == "hi")
+        // A long message is still a single event (the whole point of the fix).
+        let long = String(repeating: "a", count: 80)
+        let sl = WebMonitorServer.keySpecs(forText: long)
+        #expect(sl.count == 1)
+        #expect(sl.first?.text == long)
+    }
+
+    @Test func keySpecsForTextSingleCharKeepsScalar() {
+        // A single-char run keeps its scalar in unshiftedCodepoint, byte-identical
+        // to the pre-coalescing shape, so quick keys (y/n) are unchanged.
+        #expect(WebMonitorServer.keySpecs(forText: "y") ==
+            [WebMonitorServer.KeySpec(text: "y", unshiftedCodepoint: UInt32(UnicodeScalar("y").value))])
     }
 
     @Test func keySpecsForTextEmptyIsEmptyList() {
@@ -153,11 +163,18 @@ struct WebMonitorServerTests {
         // control char. \r maps the same way.
         #expect(WebMonitorServer.keySpecs(forText: "\n") == [WebMonitorServer.KeySpec(keycode: 36)])
         #expect(WebMonitorServer.keySpecs(forText: "\r") == [WebMonitorServer.KeySpec(keycode: 36)])
-        // "hi\n" -> two printable specs then an Enter.
+        // "hi\n" -> one coalesced printable run then an Enter (the newline
+        // breaks the run and becomes a real Return).
         #expect(WebMonitorServer.keySpecs(forText: "hi\n") == [
-            WebMonitorServer.KeySpec(text: "h", unshiftedCodepoint: UInt32(UnicodeScalar("h").value)),
-            WebMonitorServer.KeySpec(text: "i", unshiftedCodepoint: UInt32(UnicodeScalar("i").value)),
+            WebMonitorServer.KeySpec(text: "hi"),
             WebMonitorServer.KeySpec(keycode: 36),
+        ])
+        // A newline in the MIDDLE splits the run into two text events around a
+        // Return (multi-line paste types each line and submits between them).
+        #expect(WebMonitorServer.keySpecs(forText: "ab\ncd") == [
+            WebMonitorServer.KeySpec(text: "ab"),
+            WebMonitorServer.KeySpec(keycode: 36),
+            WebMonitorServer.KeySpec(text: "cd"),
         ])
     }
 
@@ -197,12 +214,12 @@ struct WebMonitorServerTests {
     @Test func keySpecsBodyTextTypeWithBraceBodyNotJSON() {
         // A non-JSON content type whose body happens to be JSON-shaped must be
         // treated as literal text (keyed off Content-Type only, never sniffed).
-        // It becomes one printable spec per character, NOT a key command.
+        // It is the typed text, NOT a key command — one coalesced printable run.
         let r = WebMonitorServer.keySpecs(
             body: Data("{x}".utf8),
             contentType: "text/plain; charset=utf-8")
         #expect(r == WebMonitorServer.keySpecs(forText: "{x}"))
-        #expect(r?.count == 3)
+        #expect(r == [WebMonitorServer.KeySpec(text: "{x}")])
     }
 
     @Test func keySpecsBodyRawPlaintext() {
