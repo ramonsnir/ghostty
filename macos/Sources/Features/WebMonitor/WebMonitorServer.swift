@@ -808,13 +808,18 @@ final class WebMonitorServer {
     /// produces — set for printable characters so the event encodes text exactly
     /// like a typed key), and the `unshiftedCodepoint` (the base-layout scalar).
     struct KeySpec: Equatable {
-        var keycode: ghostty_input_key_e
+        /// NATIVE macOS virtual keycode. ghostty_input_key_s.keycode is matched
+        /// against input.keycodes `entry.native` to resolve the physical key
+        /// (embedded.zig KeyEvent.keyEvent), so this must be the platform keycode
+        /// (NSEvent.keyCode space: Return=36, Esc=53, …), NOT a GHOSTTY_KEY_* enum
+        /// value. 0 = none (text-bearing event; the char rides `text`).
+        var keycode: UInt32
         var mods: ghostty_input_mods_e
         var text: String?
         var unshiftedCodepoint: UInt32
 
         init(
-            keycode: ghostty_input_key_e = ghostty_input_key_e(0),
+            keycode: UInt32 = 0,
             mods: ghostty_input_mods_e = GHOSTTY_MODS_NONE,
             text: String? = nil,
             unshiftedCodepoint: UInt32 = 0
@@ -840,7 +845,7 @@ final class WebMonitorServer {
         private func sendOne(action: ghostty_input_action_e, to surface: ghostty_surface_t) {
             var key_ev = ghostty_input_key_s()
             key_ev.action = action
-            key_ev.keycode = UInt32(keycode.rawValue)
+            key_ev.keycode = keycode
             key_ev.mods = mods
             key_ev.consumed_mods = GHOSTTY_MODS_NONE
             key_ev.unshifted_codepoint = unshiftedCodepoint
@@ -885,14 +890,19 @@ final class WebMonitorServer {
     /// the real keypress/escape sequence); `y`/`n` are just printable text.
     static func keySpecs(forKey key: String) -> [KeySpec]? {
         switch key {
-        case "enter": return [KeySpec(keycode: GHOSTTY_KEY_ENTER)]
-        case "esc": return [KeySpec(keycode: GHOSTTY_KEY_ESCAPE)]
-        case "tab": return [KeySpec(keycode: GHOSTTY_KEY_TAB)]
-        case "ctrl-c": return [KeySpec(keycode: GHOSTTY_KEY_C, mods: GHOSTTY_MODS_CTRL)]
-        case "up": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_UP)]
-        case "down": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_DOWN)]
-        case "left": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_LEFT)]
-        case "right": return [KeySpec(keycode: GHOSTTY_KEY_ARROW_RIGHT)]
+        // NATIVE macOS virtual keycodes (NSEvent.keyCode space) — see KeySpec.keycode.
+        case "enter": return [KeySpec(keycode: 36)]
+        case "esc": return [KeySpec(keycode: 53)]
+        case "tab": return [KeySpec(keycode: 48)]
+        case "backspace": return [KeySpec(keycode: 51)]
+        case "ctrl-c": return [KeySpec(keycode: 8, mods: GHOSTTY_MODS_CTRL,
+                                       unshiftedCodepoint: UInt32(UnicodeScalar("c").value))]
+        case "ctrl-u": return [KeySpec(keycode: 32, mods: GHOSTTY_MODS_CTRL,
+                                       unshiftedCodepoint: UInt32(UnicodeScalar("u").value))]
+        case "up": return [KeySpec(keycode: 126)]
+        case "down": return [KeySpec(keycode: 125)]
+        case "left": return [KeySpec(keycode: 123)]
+        case "right": return [KeySpec(keycode: 124)]
         case "y": return keySpecs(forText: "y")
         case "n": return keySpecs(forText: "n")
         default: return nil
@@ -911,7 +921,7 @@ final class WebMonitorServer {
     static func keySpecs(forText text: String) -> [KeySpec] {
         text.map { ch in
             if ch == "\n" || ch == "\r" {
-                return KeySpec(keycode: GHOSTTY_KEY_ENTER)
+                return KeySpec(keycode: 36)  // native macOS Return
             }
             let scalar = ch.unicodeScalars.first?.value ?? 0
             return KeySpec(text: String(ch), unshiftedCodepoint: scalar)
@@ -1255,8 +1265,8 @@ final class WebMonitorServer {
                autocapitalize="off" autocorrect="off" autocomplete="off"
                spellcheck="false" inputmode="text" enterkeyhint="send"
                aria-label="Input to send to the terminal">
-        <button id="send">Send</button>
-        <button id="sendraw" title="Send without trailing newline">Raw</button>
+        <button id="send" title="Type the text and press Enter (submit)">Send &#9166;</button>
+        <button id="sendraw" title="Type the text WITHOUT pressing Enter (does not submit)">No &#9166;</button>
       </div>
       <div class="bar">
         <button data-key="enter">Enter</button>
@@ -1264,6 +1274,8 @@ final class WebMonitorServer {
         <button data-key="n">n</button>
         <button data-key="esc">Esc</button>
         <button data-key="tab">Tab</button>
+        <button data-key="backspace" title="Backspace / delete char">&#9003;</button>
+        <button data-key="ctrl-u" title="Clear line (Ctrl-U)">Clear</button>
         <button data-key="ctrl-c" class="danger">Ctrl-C</button>
       </div>
       <div class="bar">

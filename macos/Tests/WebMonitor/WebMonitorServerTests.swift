@@ -73,20 +73,27 @@ struct WebMonitorServerTests {
         func spec(_ k: String) -> WebMonitorServer.KeySpec? {
             WebMonitorServer.keySpecs(forKey: k)?.first
         }
-        #expect(spec("enter") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER))
-        #expect(spec("esc") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ESCAPE))
-        #expect(spec("tab") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_TAB))
-        #expect(spec("up") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_UP))
-        #expect(spec("down") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_DOWN))
-        #expect(spec("left") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_LEFT))
-        #expect(spec("right") == WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ARROW_RIGHT))
+        // NATIVE macOS virtual keycodes (NSEvent.keyCode space), NOT GHOSTTY_KEY_*.
+        #expect(spec("enter") == WebMonitorServer.KeySpec(keycode: 36))
+        #expect(spec("esc") == WebMonitorServer.KeySpec(keycode: 53))
+        #expect(spec("tab") == WebMonitorServer.KeySpec(keycode: 48))
+        #expect(spec("backspace") == WebMonitorServer.KeySpec(keycode: 51))
+        #expect(spec("up") == WebMonitorServer.KeySpec(keycode: 126))
+        #expect(spec("down") == WebMonitorServer.KeySpec(keycode: 125))
+        #expect(spec("left") == WebMonitorServer.KeySpec(keycode: 123))
+        #expect(spec("right") == WebMonitorServer.KeySpec(keycode: 124))
     }
 
     @Test func keySpecsCtrlCSetsCtrlModifier() {
         // ctrl-c is a REAL Ctrl+C key event (GHOSTTY_KEY_C + ctrl modifier),
         // not a pasted 0x03 byte.
         let s = WebMonitorServer.keySpecs(forKey: "ctrl-c")
-        #expect(s == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_C, mods: GHOSTTY_MODS_CTRL)])
+        #expect(s == [WebMonitorServer.KeySpec(keycode: 8, mods: GHOSTTY_MODS_CTRL,
+                                               unshiftedCodepoint: UInt32(UnicodeScalar("c").value))])
+        // ctrl-u (clear line) is a real Ctrl+U key event.
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-u")
+            == [WebMonitorServer.KeySpec(keycode: 32, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("u").value))])
     }
 
     @Test func keySpecsYNArePrintableText() {
@@ -111,7 +118,7 @@ struct WebMonitorServerTests {
             WebMonitorServer.KeySpec(text: "i", unshiftedCodepoint: UInt32(UnicodeScalar("i").value)),
         ])
         // The keycode stays unset (0) for printable text.
-        #expect(s.first?.keycode.rawValue == 0)
+        #expect(s.first?.keycode == 0)
         #expect(s.first?.text == "h")
     }
 
@@ -144,13 +151,13 @@ struct WebMonitorServerTests {
         // The trailing "\n" the page appends on Send must become a REAL Enter
         // key event (so the line actually submits), NOT a dead text-bearing
         // control char. \r maps the same way.
-        #expect(WebMonitorServer.keySpecs(forText: "\n") == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
-        #expect(WebMonitorServer.keySpecs(forText: "\r") == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
+        #expect(WebMonitorServer.keySpecs(forText: "\n") == [WebMonitorServer.KeySpec(keycode: 36)])
+        #expect(WebMonitorServer.keySpecs(forText: "\r") == [WebMonitorServer.KeySpec(keycode: 36)])
         // "hi\n" -> two printable specs then an Enter.
         #expect(WebMonitorServer.keySpecs(forText: "hi\n") == [
             WebMonitorServer.KeySpec(text: "h", unshiftedCodepoint: UInt32(UnicodeScalar("h").value)),
             WebMonitorServer.KeySpec(text: "i", unshiftedCodepoint: UInt32(UnicodeScalar("i").value)),
-            WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER),
+            WebMonitorServer.KeySpec(keycode: 36),
         ])
     }
 
@@ -160,7 +167,7 @@ struct WebMonitorServerTests {
         let r = WebMonitorServer.keySpecs(
             body: Data("{\"key\":\"enter\"}".utf8),
             contentType: "application/json")
-        #expect(r == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
+        #expect(r == [WebMonitorServer.KeySpec(keycode: 36)])
     }
 
     @Test func keySpecsBodyJSONUnknownKey() {
@@ -184,7 +191,7 @@ struct WebMonitorServerTests {
         let r = WebMonitorServer.keySpecs(
             body: Data("{\"key\":\"enter\"}".utf8),
             contentType: "application/json; charset=utf-8")
-        #expect(r == [WebMonitorServer.KeySpec(keycode: GHOSTTY_KEY_ENTER)])
+        #expect(r == [WebMonitorServer.KeySpec(keycode: 36)])
     }
 
     @Test func keySpecsBodyTextTypeWithBraceBodyNotJSON() {
