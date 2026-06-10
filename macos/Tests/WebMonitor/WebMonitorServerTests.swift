@@ -898,21 +898,20 @@ struct WebMonitorServerTests {
         #expect(page.contains("if (!current) { noActiveSession(); return; }"))
     }
 
-    @Test func htmlPageSendTypesTextThenEnterKey() {
+    @Test func htmlPageSendTypesTextOnlyEnterKeySubmits() {
         let page = WebMonitorServer.htmlPage
-        // doSend must NOT append "\n" to the body. Instead it sends the typed
-        // text via the text path, and for Send (withNewline) ALSO fires a
-        // separate Enter key event. So Send = type + Enter, Raw = type only,
-        // and no trailing newline is ever pasted.
+        // Send TYPES the text only — it does NOT submit. Submitting is the
+        // separate, explicit Enter quick-key. So doSend just sendText(v) with no
+        // Enter coupling, and no trailing newline is ever pasted.
         #expect(page.contains("sendText(v);"))
-        #expect(page.contains("if (withNewline) sendKey(\"enter\");"))
-        // The old behavior — appending a literal "\n" to the typed value — is gone.
-        #expect(!page.contains("v + \"\\\\n\""))
-        // Send fires doSend(true) (type + Enter); Raw fires doSend(false) (type only);
-        // the input's Enter keydown submits via doSend(true).
-        #expect(page.contains("sendBtn.onclick = function () { doSend(true); };"))
-        #expect(page.contains("rawBtn.onclick = function () { doSend(false); };"))
-        #expect(page.contains("if (e.key === \"Enter\") { e.preventDefault(); doSend(true); }"))
+        #expect(!page.contains("withNewline"))            // Send/Enter are decoupled now
+        #expect(!page.contains("rawBtn"))                 // the redundant "No Enter" button is gone
+        #expect(!page.contains("v + \"\\\\n\""))          // never append a literal newline
+        #expect(page.contains("sendBtn.onclick = doSend;"))
+        // Return in the field types too (does NOT submit).
+        #expect(page.contains("if (e.key === \"Enter\") { e.preventDefault(); doSend(); }"))
+        // Submitting is the explicit Enter quick-key (sends a real Enter key event).
+        #expect(page.contains("data-key=\"enter\""))
     }
 
     // MARK: - Static asset routes (vendored xterm.js / xterm.css)
