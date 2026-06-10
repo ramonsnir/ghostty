@@ -525,15 +525,32 @@ struct WebMonitorServerTests {
 
     @Test func surfacesJSONShape() throws {
         let d = WebMonitorServer.surfacesJSONData([
-            (id: "id-1", title: "Title One", pwd: "/home/x"),
-            (id: "id-2", title: "", pwd: ""),
+            .init(id: "id-1", title: "Title One", pwd: "/home/x",
+                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 0, splitCount: 2),
+            .init(id: "id-2", title: "", pwd: "",
+                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 1, splitCount: 2),
         ])
-        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: String]]
+        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
         #expect(arr?.count == 2)
-        #expect(arr?[0]["id"] == "id-1")
-        #expect(arr?[0]["title"] == "Title One")
-        #expect(arr?[0]["pwd"] == "/home/x")
-        #expect(arr?[1]["title"] == "")
+        #expect(arr?[0]["id"] as? String == "id-1")
+        #expect(arr?[0]["title"] as? String == "Title One")
+        #expect(arr?[0]["pwd"] as? String == "/home/x")
+        #expect(arr?[1]["title"] as? String == "")
+    }
+
+    @Test func surfacesJSONCarriesLayout() throws {
+        // The grouping fields (window/tab/tabTitle/splitIndex/splitCount) let the
+        // phone list show how panes are organized on the Mac.
+        let d = WebMonitorServer.surfacesJSONData([
+            .init(id: "a", title: "A", pwd: "", window: 1, tab: 2,
+                  tabTitle: "Editor", splitIndex: 0, splitCount: 3),
+        ])
+        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
+        #expect(arr?[0]["window"] as? Int == 1)
+        #expect(arr?[0]["tab"] as? Int == 2)
+        #expect(arr?[0]["tabTitle"] as? String == "Editor")
+        #expect(arr?[0]["splitIndex"] as? Int == 0)
+        #expect(arr?[0]["splitCount"] as? Int == 3)
     }
 
     @Test func surfacesJSONEscapesHostileChars() throws {
@@ -542,12 +559,13 @@ struct WebMonitorServerTests {
         let hostileTitle = "a\"b\\c\nd\u{1F600}e"
         let hostilePwd = "/tmp/\"quoted\"\\back\nslash\u{1F4A9}"
         let d = WebMonitorServer.surfacesJSONData([
-            (id: "id-1", title: hostileTitle, pwd: hostilePwd),
+            .init(id: "id-1", title: hostileTitle, pwd: hostilePwd,
+                  window: 0, tab: 0, tabTitle: "", splitIndex: 0, splitCount: 1),
         ])
-        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: String]]
+        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
         #expect(arr?.count == 1)
-        #expect(arr?[0]["title"] == hostileTitle)
-        #expect(arr?[0]["pwd"] == hostilePwd)
+        #expect(arr?[0]["title"] as? String == hostileTitle)
+        #expect(arr?[0]["pwd"] as? String == hostilePwd)
     }
 
     // MARK: - decideRoute (the PURE, security-load-bearing router)
@@ -828,6 +846,21 @@ struct WebMonitorServerTests {
     }
 
     // MARK: - Embedded page: jump-to-bottom affordance
+
+    @Test func htmlPageGroupsListByTabWithWindowOmission() {
+        let page = WebMonitorServer.htmlPage
+        // The list is grouped by window+tab, with a multi-line header (location
+        // line + wrapping title line).
+        #expect(page.contains("grouphdr"))
+        #expect(page.contains("\"loc\""))
+        #expect(page.contains("\"ttl\""))
+        // "Window N" is only prefixed when more than one window group exists.
+        #expect(page.contains("multiWin"))
+        #expect(page.contains("Object.keys(winSet).length > 1"))
+        // Multi-split tabs badge each pane "split i/n".
+        #expect(page.contains("\"badge\""))
+        #expect(page.contains("\"split \""))
+    }
 
     @Test func htmlPageHasJumpToBottomButton() {
         let page = WebMonitorServer.htmlPage

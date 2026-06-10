@@ -980,21 +980,75 @@ final class WebMonitorServer {
         return nil
     }
 
+    /// One surface, enriched with its place in the window/tab/split layout so
+    /// the phone list can show how panes are organized on the Mac. PURE value
+    /// type — populated on main, shaped to JSON by `surfacesJSONData` (testable).
+    struct SurfaceRow {
+        let id: String
+        let title: String
+        let pwd: String
+        /// Window-group index in encounter order (each AppKit tab group = one
+        /// "window"; standalone windows each get their own index).
+        let window: Int
+        /// Tab index WITHIN the window group (visual tab order from the tab group).
+        let tab: Int
+        /// The tab/window title (usually mirrors the active pane).
+        let tabTitle: String
+        /// This pane's position among its tab's splits (DFS leaf order) and the
+        /// tab's total split count, so the UI can badge "split 2/3".
+        let splitIndex: Int
+        let splitCount: Int
+    }
+
     /// MUST be called on main. Iterates AppKit surfaces (thin) and defers the
     /// pure dict/JSON shaping to `surfacesJSONData` so the shaping is testable.
+    /// Each `TerminalController` is one tab; its `surfaceTree` is that tab's
+    /// split layout — so we group by the window's tab group and number the tabs.
     private func surfacesJSON() -> Data {
-        var rows: [(id: String, title: String, pwd: String)] = []
+        var rows: [SurfaceRow] = []
+        // Assign a stable window-group index per tab group (or standalone window)
+        // in the order we first encounter it.
+        var groupIndex: [ObjectIdentifier: Int] = [:]
+        func windowIndex(_ c: TerminalController) -> Int {
+            let key: ObjectIdentifier
+            if let tg = c.window?.tabGroup { key = ObjectIdentifier(tg) }
+            else if let w = c.window { key = ObjectIdentifier(w) }
+            else { return 0 }
+            if let i = groupIndex[key] { return i }
+            let i = groupIndex.count
+            groupIndex[key] = i
+            return i
+        }
         for c in TerminalController.all {
-            for view in c.surfaceTree {
-                rows.append((view.id.uuidString, view.title, view.pwd ?? ""))
+            let win = windowIndex(c)
+            let tabIdx: Int
+            if let tg = c.window?.tabGroup, let w = c.window,
+               let idx = tg.windows.firstIndex(of: w) {
+                tabIdx = idx
+            } else {
+                tabIdx = 0
+            }
+            let tabTitle = c.window?.title ?? ""
+            let leaves = Array(c.surfaceTree)
+            for (splitIdx, view) in leaves.enumerated() {
+                rows.append(SurfaceRow(
+                    id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
+                    window: win, tab: tabIdx, tabTitle: tabTitle,
+                    splitIndex: splitIdx, splitCount: leaves.count))
             }
         }
         return Self.surfacesJSONData(rows)
     }
 
     /// Pure JSON shaping for the surfaces list (testable; no AppKit).
-    static func surfacesJSONData(_ rows: [(id: String, title: String, pwd: String)]) -> Data {
-        let arr: [[String: String]] = rows.map { ["id": $0.id, "title": $0.title, "pwd": $0.pwd] }
+    static func surfacesJSONData(_ rows: [SurfaceRow]) -> Data {
+        let arr: [[String: Any]] = rows.map {
+            [
+                "id": $0.id, "title": $0.title, "pwd": $0.pwd,
+                "window": $0.window, "tab": $0.tab, "tabTitle": $0.tabTitle,
+                "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
+            ]
+        }
         return (try? JSONSerialization.data(withJSONObject: arr)) ?? Data("[]".utf8)
     }
 
@@ -1226,8 +1280,17 @@ final class WebMonitorServer {
       button.danger.tapped { background: #c25555; color: #fff; border-color: #c25555; }
       button:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
       #list { padding: 8px; }
-      .row { padding: 12px; margin: 6px 0; background: #1b1e27; border: 1px solid #2a2e3b; border-radius: 8px; }
+      .grouphdr { padding: 10px 6px 5px; margin-top: 10px; border-bottom: 1px solid #2a2e3b; }
+      .grouphdr:first-child { margin-top: 0; }
+      .grouphdr .loc { color: #8b93a7; font-size: 11px; font-weight: bold; letter-spacing: .04em;
+                       text-transform: uppercase; }
+      .grouphdr .ttl { color: #c8cedb; font-size: 13px; margin-top: 2px; word-break: break-word; }
+      .row { padding: 12px; margin: 6px 0 6px 10px; background: #1b1e27; border: 1px solid #2a2e3b;
+             border-left: 3px solid #3a4250; border-radius: 8px; }
       .row .t { color: #d6dae3; font-weight: bold; }
+      .row .badge { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 10px;
+                    background: #2a2e3b; color: #b6bccb; font-size: 11px; font-weight: normal;
+                    vertical-align: middle; }
       .row .p { color: #b6bccb; font-size: 12px; margin-top: 4px; word-break: break-all; }
       .empty { padding: 12px; color: #b6bccb; }
       #viewer { display: none; padding: 8px; }
@@ -1473,17 +1536,54 @@ final class WebMonitorServer {
             listEl.innerHTML = "<div class='empty'>No active sessions.</div>";
             return;
           }
+          // Group the panes by window + tab so the list mirrors the Mac layout.
+          var groups = [], byKey = {};
+          rows.forEach(function (row) {
+            var wi = row.window || 0, ti = row.tab || 0;
+            var key = wi + ":" + ti;
+            var g = byKey[key];
+            if (!g) {
+              g = byKey[key] = { window: wi, tab: ti, tabTitle: row.tabTitle || "", rows: [] };
+              groups.push(g);
+            }
+            g.rows.push(row);
+          });
+          groups.sort(function (a, b) { return (a.window - b.window) || (a.tab - b.tab); });
+          // Only label the window when there's more than one window group.
+          var winSet = {}; groups.forEach(function (g) { winSet[g.window] = 1; });
+          var multiWin = Object.keys(winSet).length > 1;
           // Build the new rows off-screen, then swap them in atomically so the
           // visible list never blanks to a placeholder between refreshes.
           var frag = document.createDocumentFragment();
-          rows.forEach(function (row) {
-            var d = document.createElement("div");
-            d.className = "row";
-            var t = document.createElement("div"); t.className = "t"; t.textContent = row.title || "(untitled)";
-            var p = document.createElement("div"); p.className = "p"; p.textContent = row.pwd || "";
-            d.appendChild(t); d.appendChild(p);
-            d.onclick = function () { showSurface(row.id, row.title); };
-            frag.appendChild(d);
+          groups.forEach(function (g) {
+            var h = document.createElement("div"); h.className = "grouphdr";
+            // Location line: omit "Window N" entirely when everything is in one
+            // window, so the common case reads as just "Tab 1", "Tab 2", ...
+            var loc = document.createElement("div"); loc.className = "loc";
+            loc.textContent = (multiWin ? ("Window " + (g.window + 1) + " \\u00b7 ") : "") + "Tab " + (g.tab + 1);
+            h.appendChild(loc);
+            // Tab title on its own line so a long title wraps instead of crowding.
+            if (g.tabTitle) {
+              var ttl = document.createElement("div"); ttl.className = "ttl";
+              ttl.textContent = g.tabTitle;
+              h.appendChild(ttl);
+            }
+            frag.appendChild(h);
+            g.rows.forEach(function (row) {
+              var d = document.createElement("div");
+              d.className = "row";
+              var t = document.createElement("div"); t.className = "t";
+              t.textContent = row.title || "(untitled)";
+              if ((row.splitCount || 1) > 1) {
+                var b = document.createElement("span"); b.className = "badge";
+                b.textContent = "split " + ((row.splitIndex || 0) + 1) + "/" + row.splitCount;
+                t.appendChild(b);
+              }
+              var p = document.createElement("div"); p.className = "p"; p.textContent = row.pwd || "";
+              d.appendChild(t); d.appendChild(p);
+              d.onclick = function () { showSurface(row.id, row.title); };
+              frag.appendChild(d);
+            });
           });
           listEl.replaceChildren(frag);
         }).catch(function (e) {
