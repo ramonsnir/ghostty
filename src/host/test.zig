@@ -1044,6 +1044,189 @@ test "host protocol frame round-trip + partial read" {
         const dec = try protocol.JumpToPrompt.decode(alloc, payload.items);
         try testing.expectEqual(orig, dec);
     }
+
+    // --- H1 (Phase 2b): RAW PTY output streaming frames. ---
+
+    // SubscribeRaw (GUI->host): bare session id, SessionIdFrame shape.
+    {
+        const orig: protocol.SubscribeRaw = .{ .session_id = 314 };
+        const framed = try protocol.encodeFrame(alloc, .subscribe_raw, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.subscribe_raw, tag);
+        const dec = try protocol.SubscribeRaw.decode(alloc, payload.items);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+    }
+
+    // RawOutput (host->GUI): session_id + trailing length-prefixed bytes. Test
+    // empty (the empty-ring replay case), a typical chunk WITH embedded escape
+    // bytes (raw pty content includes CSI / NUL), and a longer chunk.
+    for ([_][]const u8{
+        "",
+        "\x1b[31mhello\x1b[0m\r\n\x00",
+        "raw bytes that include a leading { and a trailing newline\n" ** 4,
+    }) |b| {
+        const orig: protocol.RawOutput = .{ .session_id = 271, .bytes = b };
+        const framed = try protocol.encodeFrame(alloc, .raw_output, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.raw_output, tag);
+        var dec = try protocol.RawOutput.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+        try testing.expectEqualStrings(orig.bytes, dec.bytes);
+    }
+}
+
+test "host RawOutput/SubscribeRaw decode robustness (truncated/oversized -> error, no panic) H1" {
+    const alloc = testing.allocator;
+
+    // SubscribeRaw: a payload shorter than the u64 session_id must error
+    // (readInt EndOfStream), never panic.
+    {
+        const short = [_]u8{ 1, 2, 3 }; // < 8 bytes
+        try testing.expectError(error.EndOfStream, protocol.SubscribeRaw.decode(alloc, &short));
+    }
+
+    // RawOutput: a payload shorter than the u64 session_id -> error.
+    {
+        const short = [_]u8{ 0, 0, 0, 0 };
+        try testing.expectError(error.EndOfStream, protocol.RawOutput.decode(alloc, &short));
+    }
+
+    // RawOutput: a well-formed session_id but a length prefix that OVER-claims
+    // the trailing bytes (more than actually remain) -> error.InvalidFrame from
+    // readBytes' bound check, BEFORE any over-allocation. (8 bytes session_id +
+    // u32 len = 1000 + only 2 bytes of actual data.)
+    {
+        var bad: [14]u8 = undefined;
+        std.mem.writeInt(u64, bad[0..8], 42, .little);
+        std.mem.writeInt(u32, bad[8..12], 1000, .little); // claim 1000 bytes
+        bad[12] = 'a';
+        bad[13] = 'b';
+        try testing.expectError(error.InvalidFrame, protocol.RawOutput.decode(alloc, &bad));
+    }
+
+    // RawOutput: a length prefix that exactly equals the remaining bytes decodes
+    // cleanly (the well-formed trailing-field case).
+    {
+        var ok: [13]u8 = undefined;
+        std.mem.writeInt(u64, ok[0..8], 7, .little);
+        std.mem.writeInt(u32, ok[8..12], 1, .little);
+        ok[12] = 'Z';
+        var dec = try protocol.RawOutput.decode(alloc, &ok);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 7), dec.session_id);
+        try testing.expectEqualStrings("Z", dec.bytes);
+    }
+}
+
+test "host RawRing append/evict/snapshot bounded at the cap (H1)" {
+    const alloc = testing.allocator;
+    const cap = Session.RAW_RING_BYTES;
+
+    // Empty ring: snapshot is empty, no allocation of the backing buffer.
+    {
+        var ring: Session.RawRing = .{};
+        defer ring.deinit(alloc);
+        const snap = try ring.snapshot(alloc);
+        defer alloc.free(snap);
+        try testing.expectEqual(@as(usize, 0), snap.len);
+    }
+
+    // A few small appends accumulate in order, oldest -> newest, no eviction.
+    {
+        var ring: Session.RawRing = .{};
+        defer ring.deinit(alloc);
+        try ring.append(alloc, "abc");
+        try ring.append(alloc, "def");
+        try ring.append(alloc, "g");
+        const snap = try ring.snapshot(alloc);
+        defer alloc.free(snap);
+        try testing.expectEqualStrings("abcdefg", snap);
+    }
+
+    // Appending past the cap evicts the oldest bytes; the ring holds exactly the
+    // last `cap` bytes. Write cap + 100 distinct bytes across several appends.
+    {
+        var ring: Session.RawRing = .{};
+        defer ring.deinit(alloc);
+
+        const total = cap + 100;
+        const data = try alloc.alloc(u8, total);
+        defer alloc.free(data);
+        for (data, 0..) |*b, i| b.* = @truncate(i);
+
+        // Append in chunks to exercise the wrap path.
+        var off: usize = 0;
+        while (off < total) {
+            const n = @min(@as(usize, 1000), total - off);
+            try ring.append(alloc, data[off .. off + n]);
+            off += n;
+        }
+
+        const snap = try ring.snapshot(alloc);
+        defer alloc.free(snap);
+        // Exactly the cap is retained, and it is the LAST `cap` bytes of `data`.
+        try testing.expectEqual(cap, snap.len);
+        try testing.expectEqualSlices(u8, data[total - cap ..], snap);
+    }
+
+    // A single append LARGER than the cap retains only its last `cap` bytes.
+    {
+        var ring: Session.RawRing = .{};
+        defer ring.deinit(alloc);
+
+        const total = cap * 2 + 7;
+        const data = try alloc.alloc(u8, total);
+        defer alloc.free(data);
+        for (data, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+
+        try ring.append(alloc, data);
+        const snap = try ring.snapshot(alloc);
+        defer alloc.free(snap);
+        try testing.expectEqual(cap, snap.len);
+        try testing.expectEqualSlices(u8, data[total - cap ..], snap);
+    }
+}
+
+test "host Termio output_observer is purely additive: .exec path (null observer) is byte-identical (H1)" {
+    const alloc = testing.allocator;
+
+    // Two synchronous render-sink Sessions (no start() => no IO thread, and the
+    // observer is NOT armed — start() is what sets it). Feed the SAME bytes
+    // directly through processOutput on each; with the observer null on both,
+    // the emulator state must be identical, proving the hook is a no-op when
+    // unset (the .exec contract: GUI never sets output_observer).
+    const a = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer a.destroy();
+    const b = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer b.destroy();
+
+    // Default: no observer (the .exec / pre-start state).
+    try testing.expectEqual(@as(?*const fn (*anyopaque, []const u8) void, null), a.io.output_observer);
+    try testing.expectEqual(@as(?*const fn (*anyopaque, []const u8) void, null), b.io.output_observer);
+
+    const bytes = "\x1b[31mcolor\x1b[0m and \x1b[1mbold\x1b[0m text\r\nsecond line";
+    a.io.processOutput(bytes);
+    b.io.processOutput(bytes);
+
+    // Capture both snapshots and assert they are equal (byte-identical emulator
+    // result with no observer set on either). captureSnapshotLocked requires
+    // render_mutex; single-threaded here, but hold it to honor the contract.
+    var snap_a = blk: {
+        a.render_mutex.lock();
+        defer a.render_mutex.unlock();
+        break :blk try a.captureSnapshotLocked(alloc);
+    };
+    defer snap_a.deinit(alloc);
+    var snap_b = blk: {
+        b.render_mutex.lock();
+        defer b.render_mutex.unlock();
+        break :blk try b.captureSnapshotLocked(alloc);
+    };
+    defer snap_b.deinit(alloc);
+    try testing.expect(snap_a.eql(snap_b));
 }
 
 test "host scroll_viewport repins the host terminal -> next captured GridFrame differs (Slice 7)" {
@@ -2077,6 +2260,137 @@ test "host socket integration: attach, input, gridframe marker, reattach" {
     // Close the session, tearing it down.
     try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
     // Give the close a moment to process before server.deinit teardown.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: subscribe_raw replay + live raw_output delivery (H1)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hraw.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // Handshake + spawn.
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.raw" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // Drive a marker through the child so the host's raw ring captures it BEFORE
+    // we subscribe (exercising replay-on-connect). Wait for the marker to land
+    // on a grid frame so we know the raw bytes have flowed through the observer.
+    const marker = "RAW_REPLAY_MARKER";
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'RAW_REPLAY_MARKER\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+
+    // Now subscribe_raw on a SECOND fresh connection so the only raw_output it
+    // can receive is the replay (its grid stream is separate). The replay frame
+    // must contain the marker bytes captured in the ring.
+    const rawc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rawc);
+    try connectUnix(rawc, sock_path);
+    setRecvTimeout(rawc);
+    var rawrdr: ClientReader = .{};
+    defer rawrdr.deinit(alloc);
+
+    try clientSend(alloc, rawc, .hello, protocol.Hello{ .identity_bundle_id = "test.raw2" });
+    {
+        const tag = (try pollNext(&rawrdr, alloc, rawc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rawc, .subscribe_raw, protocol.SubscribeRaw{ .session_id = session_id });
+
+    // The FIRST raw_output frame is the ring replay; it must carry the marker.
+    {
+        var i: usize = 0;
+        var found_replay = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rawrdr, alloc, rawc, &payload, 4)) orelse continue;
+            if (tag != .raw_output) continue;
+            var ro = try protocol.RawOutput.decode(alloc, payload.items);
+            defer ro.deinit(alloc);
+            try testing.expectEqual(session_id, ro.session_id);
+            if (std.mem.indexOf(u8, ro.bytes, marker) != null) {
+                found_replay = true;
+                break;
+            }
+        }
+        try testing.expect(found_replay);
+    }
+
+    // Now drive NEW output and confirm it arrives LIVE as a raw_output frame on
+    // the raw subscriber (proving the observer broadcast path, not just replay).
+    const live_marker = "RAW_LIVE_MARKER";
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'RAW_LIVE_MARKER\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found_live = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rawrdr, alloc, rawc, &payload, 4)) orelse continue;
+            if (tag != .raw_output) continue;
+            var ro = try protocol.RawOutput.decode(alloc, payload.items);
+            defer ro.deinit(alloc);
+            if (std.mem.indexOf(u8, ro.bytes, live_marker) != null) {
+                found_live = true;
+                break;
+            }
+        }
+        try testing.expect(found_live);
+    }
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
     std.Thread.sleep(50 * std.time.ns_per_ms);
 }
 

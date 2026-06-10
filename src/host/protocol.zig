@@ -42,7 +42,11 @@ const color = terminalpkg.color;
 const osccolor = terminalpkg.osc.color;
 
 pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
-pub const PROTOCOL_VERSION_MINOR: u16 = 0;
+// Bumped to 1 for the additive subscribe_raw / raw_output frames (H1): a peer
+// can negotiate this minor to learn the host can stream a session's RAW PTY
+// output bytes. ADDITIVE only — major unchanged, no existing frame encoding or
+// enum order touched.
+pub const PROTOCOL_VERSION_MINOR: u16 = 1;
 
 /// Maximum on-wire frame length (the value of the BE length prefix, i.e.
 /// tag + payload). Bounds per-connection buffer growth and the speculative
@@ -151,6 +155,17 @@ pub const FrameType = enum(u8) {
     // (confirm-close warns only when a command is actually running). Pushed on
     // change + seeded on attach. Appended at the END so prior tags stay stable.
     at_prompt,
+    // --- H1 (Phase 2b): RAW PTY output streaming ---
+    // GUI->host: subscribe to a session's RAW pty output bytes (the bytes BEFORE
+    // emulation — see Termio.processOutput). Lets the web monitor render color +
+    // scrollback + live updates via a browser xterm.js, which the .client screen
+    // mirror (viewport-only, colorless) cannot provide. payload = session_id (u64).
+    subscribe_raw,
+    // host->GUI: a chunk of a session's RAW pty output bytes, plus the initial
+    // ring-buffer replay sent on subscribe. payload = session_id (u64) + a
+    // length-prefixed byte slice (the raw bytes, the LAST field). Appended at the
+    // END so all prior tag integers stay stable.
+    raw_output,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -1049,6 +1064,51 @@ pub const AtPrompt = struct {
     }
 
     pub fn deinit(self: *AtPrompt, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+// --- H1 (Phase 2b): RAW PTY output streaming frames ---
+
+/// GUI->host: subscribe to a session's RAW pty output bytes. Bare session id,
+/// same shape as Detach/Close/Reset. On receipt the host registers the conn as
+/// a RAW subscriber, replays the session's recent-output ring buffer as one or
+/// more `raw_output` frames, then forwards live `raw_output` as the session
+/// produces it.
+pub const SubscribeRaw = SessionIdFrame(.subscribe_raw);
+
+/// host->GUI: a chunk of a session's RAW pty output bytes (the bytes fed to the
+/// emulator BEFORE emulation — see Termio.processOutput). Carries the initial
+/// ring-buffer replay on subscribe AND the live stream thereafter. Mirrors
+/// `Input`'s layout (session_id + a trailing length-prefixed byte slice) minus
+/// the linefeed bit: `bytes` is the LAST field so the trailing-field `readBytes`
+/// invariant holds. Bounded/checked decode (<= MAX_FRAME_LEN via readBytes;
+/// malformed -> error.InvalidFrame).
+pub const RawOutput = struct {
+    session_id: u64,
+    /// Owned by this struct after decode (freed by deinit). `encode` borrows the
+    /// caller's slice (does not free it).
+    bytes: []const u8 = &.{},
+
+    pub fn encode(self: RawOutput, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeBytes(w, self.bytes);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(alloc: Allocator, payload: []const u8) !RawOutput {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        const session_id = try readInt(r, u64);
+        const bytes = try readBytes(alloc, &fbs, r);
+        return .{ .session_id = session_id, .bytes = bytes };
+    }
+
+    pub fn deinit(self: *RawOutput, alloc: Allocator) void {
+        alloc.free(self.bytes);
         self.* = undefined;
     }
 };

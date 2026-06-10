@@ -120,6 +120,12 @@ pub const SessionEntry = struct {
     /// The dedicated owning thread (start -> runRenderLoop -> park -> destroy).
     thread: ?std.Thread = null,
     subscribers: std.ArrayList(*Conn) = .empty,
+    /// H1 (Phase 2b): connections subscribed to this session's RAW pty output
+    /// (the `subscribe_raw` / `raw_output` channel). Parallel to `subscribers`
+    /// and guarded by the same `mutex`. A conn can be on either, both, or
+    /// neither list. onRawOutput iterates this list (under `mutex`) to broadcast
+    /// `raw_output` frames; teardownEntry clears it alongside `subscribers`.
+    raw_subscribers: std.ArrayList(*Conn) = .empty,
     /// The child's exit, recorded the moment it fires (finding SR3-3). Once
     /// set, the child is permanently dead and this is REPLAYED on every
     /// (re)attach via deliverBufferedExit — it is NOT consumed-once. This
@@ -161,6 +167,27 @@ pub const SessionEntry = struct {
             } else i += 1;
         }
     }
+
+    /// H1 (Phase 2b): register `conn` as a RAW-output subscriber (idempotent).
+    fn addRawSubscriber(self: *SessionEntry, conn: *Conn) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.raw_subscribers.items) |c| if (c == conn) return;
+        try self.raw_subscribers.append(self.server.alloc, conn);
+    }
+
+    /// H1 (Phase 2b): drop `conn` from the RAW-output subscriber list. Mirrors
+    /// removeSubscriber.
+    fn removeRawSubscriber(self: *SessionEntry, conn: *Conn) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var i: usize = 0;
+        while (i < self.raw_subscribers.items.len) {
+            if (self.raw_subscribers.items[i] == conn) {
+                _ = self.raw_subscribers.swapRemove(i);
+            } else i += 1;
+        }
+    }
 };
 
 /// A single GUI connection.
@@ -170,6 +197,9 @@ pub const Conn = struct {
     reader: protocol.FrameReader = .{},
     /// session_ids this conn is subscribed to (so disconnect can unsubscribe).
     subscribed: std.AutoHashMap(u64, void),
+    /// H1 (Phase 2b): session_ids this conn is subscribed to for RAW output (so
+    /// disconnect/teardown can unsubscribe). Parallel to `subscribed`.
+    subscribed_raw: std.AutoHashMap(u64, void),
     /// Serializes writes to this fd across the read thread (Pong/Attached/etc)
     /// and the various render threads (GridFrame/ModeFrame broadcast).
     write_mutex: std.Thread.Mutex = .{},
@@ -319,6 +349,7 @@ fn reapConn(self: *Server, conn: *Conn) void {
     if (conn.thread) |t| t.join();
     posix.close(conn.fd);
     conn.subscribed.deinit();
+    conn.subscribed_raw.deinit();
     conn.reader.deinit(self.alloc);
     self.alloc.destroy(conn);
 }
@@ -368,6 +399,7 @@ fn setupConn(self: *Server, fd: posix.socket_t) !void {
         .server = self,
         .fd = fd,
         .subscribed = std.AutoHashMap(u64, void).init(self.alloc),
+        .subscribed_raw = std.AutoHashMap(u64, void).init(self.alloc),
     };
 
     {
@@ -445,6 +477,7 @@ fn readLoop(conn: *Conn) void {
         // leaks — acceptable on an OOM-dying process.
         posix.close(conn.fd);
         conn.subscribed.deinit();
+        conn.subscribed_raw.deinit();
         conn.reader.deinit(self.alloc);
         self.alloc.destroy(conn);
         return;
@@ -467,6 +500,16 @@ fn unsubscribeAll(self: *Server, conn: *Conn) void {
         self.registry_mutex.lock();
         defer self.registry_mutex.unlock();
         if (self.sessions.get(sid.*)) |e| e.removeSubscriber(conn);
+    }
+    // H1 (Phase 2b): also drop any RAW-output subscriptions, under the same
+    // registry_mutex discipline (so a concurrent handleClose can't free the
+    // entry between the get() and the deref). A conn can hold RAW subscriptions
+    // for sessions it never grid-subscribed to, so iterate this set separately.
+    var rit = conn.subscribed_raw.keyIterator();
+    while (rit.next()) |sid| {
+        self.registry_mutex.lock();
+        defer self.registry_mutex.unlock();
+        if (self.sessions.get(sid.*)) |e| e.removeRawSubscriber(conn);
     }
 }
 
@@ -697,6 +740,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             }
         },
 
+        .subscribe_raw => {
+            var sub = try protocol.SubscribeRaw.decode(alloc, frame.payload);
+            defer sub.deinit(alloc);
+            try self.handleSubscribeRaw(conn, sub.session_id);
+        },
+
         .detach => {
             var detach = try protocol.Detach.decode(alloc, frame.payload);
             defer detach.deinit(alloc);
@@ -705,6 +754,10 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             if (self.sessions.get(detach.session_id)) |e| {
                 e.removeSubscriber(conn);
                 _ = conn.subscribed.remove(detach.session_id);
+                // H1 (Phase 2b): also drop a RAW subscription for this session
+                // (a detach ends both the grid and the raw streams for it).
+                e.removeRawSubscriber(conn);
+                _ = conn.subscribed_raw.remove(detach.session_id);
                 // Child stays alive (Session NOT stopped).
             }
         },
@@ -837,7 +890,7 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt, .raw_output => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -993,6 +1046,53 @@ fn subscribe(self: *Server, conn: *Conn, e: *SessionEntry) !void {
     _ = self;
 }
 
+/// H1 (Phase 2b): register `conn` as a RAW-output subscriber of `e`. Same
+/// OOM-ordering as `subscribe` (insert into `conn.subscribed_raw` FIRST, then
+/// `e.raw_subscribers`): if the second put fails, unsubscribeAll (which iterates
+/// `conn.subscribed_raw`) still cleans up, and no broadcast holds a pointer to a
+/// conn that disconnect won't remove.
+fn subscribeRaw(self: *Server, conn: *Conn, e: *SessionEntry) !void {
+    try conn.subscribed_raw.put(e.session_id, {});
+    errdefer _ = conn.subscribed_raw.remove(e.session_id);
+    try e.addRawSubscriber(conn);
+    _ = self;
+}
+
+/// H1 (Phase 2b): handle a `subscribe_raw` frame. Validate the session exists +
+/// is live (else clean-ignore, mirroring the unknown-id handling in the other
+/// dispatch arms), register the conn as a RAW subscriber, then IMMEDIATELY send
+/// the recent-output ring-buffer replay as one `raw_output` frame so the peer's
+/// xterm.js has scrollback context before the live stream begins. Live
+/// `raw_output` frames follow as the session produces output (via onRawOutput).
+///
+/// Lock discipline mirrors handleAttach: hold registry_mutex across the whole
+/// entry dereference (finding F3 TOCTOU) so a concurrent Close/deinit can't free
+/// `e` mid-use. The ring snapshot is captured under the session's render_mutex
+/// (rawRingSnapshot, a distinct lock) and the replay write happens while
+/// registry_mutex is held — consistent with handleAttach's pushFullFrames write
+/// under the same lock (the SR-4 single/local fast-peer contract).
+fn handleSubscribeRaw(self: *Server, conn: *Conn, session_id: u64) !void {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    const e = self.sessions.get(session_id) orelse return; // unknown id: ignore
+    if (!sessionLive(e)) return; // torn down: ignore
+
+    try self.subscribeRaw(conn, e);
+
+    // Replay the recent raw-output ring so the peer renders scrollback context
+    // immediately. An empty ring (a never-written session) sends an empty
+    // raw_output, which the peer can treat as "subscribed, nothing buffered yet."
+    const replay = e.session.rawRingSnapshot() catch |err| {
+        log.warn("raw ring snapshot failed err={}", .{err});
+        return;
+    };
+    defer self.alloc.free(replay);
+    conn.writeFramed(.raw_output, protocol.RawOutput{
+        .session_id = e.session_id,
+        .bytes = replay,
+    });
+}
+
 /// Allocate a fresh, unique, non-zero, RANDOM session id. CALLER HOLDS
 /// registry_mutex (reads the registry to reject the astronomically-unlikely live
 /// collision). Random rather than sequential so a stale id from a dead host
@@ -1052,6 +1152,8 @@ fn spawnSession(
     session.on_selection_text = onSelectionText;
     session.on_at_prompt_ctx = e;
     session.on_at_prompt = onAtPrompt;
+    session.on_raw_output_ctx = e;
+    session.on_raw_output = onRawOutput;
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -1264,6 +1366,35 @@ fn onAtPrompt(ctx: *anyopaque, session: *Session, at_prompt: bool) void {
         conn.writeFramed(.at_prompt, protocol.AtPrompt{
             .session_id = e.session_id,
             .at_prompt = at_prompt,
+        });
+    }
+}
+
+/// H1 (Phase 2b) RAW-output callback. Runs on the session's IO THREAD (invoked
+/// from Termio.processOutputLocked via Session.rawOutputObserver, under the
+/// session's render_mutex), with `buf` BORROWING the IO read buffer (valid only
+/// during this call). Frames a `raw_output` to every RAW subscriber, mirroring
+/// onSurfaceEvent's broadcast shape — `writeFramed` -> `encode` copies `buf`
+/// synchronously per subscriber, before this returns.
+///
+/// LOCK DISCIPLINE: holds ONLY the session-local `e.mutex` here (NOT
+/// registry_mutex). Unlike onRender/onSelectionText (which run on the owning
+/// render-loop thread), this runs on the IO thread, so a wedged RAW subscriber's
+/// blocking write head-of-line-blocks the IO thread (the pty drain) for THIS
+/// session only — accepted under the same SR-4 single/local fast-peer contract
+/// as the existing subscribers (the web monitor peer is LOCAL/fast). NOT
+/// buffered beyond the ring (the ring already covers replay-on-reconnect).
+fn onRawOutput(ctx: *anyopaque, session: *Session, buf: []const u8) void {
+    _ = session;
+    const e: *SessionEntry = @ptrCast(@alignCast(ctx));
+
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    for (e.raw_subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.writeFramed(.raw_output, protocol.RawOutput{
+            .session_id = e.session_id,
+            .bytes = buf,
         });
     }
 }
@@ -1484,10 +1615,15 @@ fn handleClose(self: *Server, conn: *Conn, session_id: u64) !void {
 /// thread is the sole party that touches render_stop after this point.
 fn teardownEntry(self: *Server, e: *SessionEntry) void {
     // Drop subscribers so the render-tick push (onRender) stops touching them.
+    // H1 (Phase 2b): drop RAW subscribers in the SAME critical section so the
+    // IO-thread onRawOutput broadcast (which iterates e.raw_subscribers under
+    // e.mutex) stops touching them too, before any Conn is freed.
     {
         e.mutex.lock();
         e.subscribers.deinit(self.alloc);
         e.subscribers = .empty;
+        e.raw_subscribers.deinit(self.alloc);
+        e.raw_subscribers = .empty;
         e.mutex.unlock();
     }
 
