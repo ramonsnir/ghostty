@@ -641,8 +641,11 @@ final class WebMonitorServer {
                 return
             }
             let result: HTTPResponse = DispatchQueue.main.sync {
-                guard let view = self.surface(forUUID: uuid),
+                guard let (controller, view) = self.controllerAndView(forUUID: uuid),
                       let surface = view.surface else { return .status(404, "Not Found") }
+                // If the target is hidden under a zoom, reveal it first so it gets
+                // sized — otherwise the keypress lands on a stale/unsized surface.
+                self.revealIfZoomedAway(controller, view)
                 // Build a ghostty_input_key_s per spec and replay it as a real
                 // key event. Mirror the macOS keyDown path: send a PRESS then a
                 // RELEASE for each spec. Only value types crossed the main-thread
@@ -661,8 +664,11 @@ final class WebMonitorServer {
                 return
             }
             let result: HTTPResponse = DispatchQueue.main.sync {
-                guard let view = self.surface(forUUID: uuid),
+                guard let (controller, view) = self.controllerAndView(forUUID: uuid),
                       let surface = view.surface else { return .status(404, "Not Found") }
+                // A zoomed-away split keeps a stale/zero size and ignores scroll;
+                // reveal it so the wheel lands on a properly-sized surface.
+                self.revealIfZoomedAway(controller, view)
                 // Discrete (non-precision) wheel scroll: scroll_mods = 0, y = ticks.
                 // The host routes it per the app's mode (mouse-mode SGR wheel,
                 // alternate-scroll arrows for less/man, or scrollback) exactly like
@@ -972,12 +978,37 @@ final class WebMonitorServer {
 
     /// Replicates AppDelegate.findSurface(forUUID:). MUST be called on main.
     private func surface(forUUID uuid: UUID) -> Ghostty.SurfaceView? {
+        return controllerAndView(forUUID: uuid)?.view
+    }
+
+    /// Find the tab controller + surface view that own a UUID. MUST be called on
+    /// main. We need the controller (not just the view) so input/scroll handlers
+    /// can reveal a surface that's hidden under a zoom (see `revealIfZoomedAway`).
+    private func controllerAndView(forUUID uuid: UUID)
+        -> (controller: TerminalController, view: Ghostty.SurfaceView)? {
         for c in TerminalController.all {
             for view in c.surfaceTree where view.id == uuid {
-                return view
+                return (c, view)
             }
         }
         return nil
+    }
+
+    /// If `view` is hidden because its tab is zoomed to a DIFFERENT split,
+    /// un-zoom the tab so the surface re-mounts and starts receiving size
+    /// updates again. A zoomed-away SurfaceView is removed from the view
+    /// hierarchy, so SwiftUI stops calling `updateOSView` → the surface keeps a
+    /// stale/zero cell size and scroll/key events routed by UUID silently no-op.
+    /// Revealing it (the same `SplitTree(root:zoomed:)` reset the zoom toggle
+    /// uses) is also the intuitive result of driving a split from the phone.
+    /// No-op when the tab isn't zoomed or the target is the zoomed split itself.
+    /// MUST be called on main.
+    private func revealIfZoomedAway(_ controller: TerminalController, _ view: Ghostty.SurfaceView) {
+        let tree = controller.surfaceTree
+        guard tree.zoomed != nil else { return }
+        // Inside the zoomed subtree already? Then it's visible + sized — leave it.
+        if tree.zoomedLeaves().contains(where: { $0.id == view.id }) { return }
+        controller.surfaceTree = .init(root: tree.root, zoomed: nil)
     }
 
     /// One surface, enriched with its place in the window/tab/split layout so
@@ -1264,7 +1295,7 @@ final class WebMonitorServer {
     <html lang="en">
     <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
     <title>Ghostty Web Monitor</title>
     <style>
       :root { color-scheme: dark; }
@@ -1295,12 +1326,18 @@ final class WebMonitorServer {
       .empty { padding: 12px; color: #b6bccb; }
       #viewer { display: none; padding: 8px; }
       #screenwrap { position: relative; }
-      #screen { white-space: pre; background: #0c0e13; padding: 10px; border-radius: 8px; min-height: 50vh; overflow-x: auto; overflow-y: auto; max-height: 70vh; }
+      /* dvh (dynamic viewport) tracks the soft keyboard so the terminal shrinks
+         when it opens instead of reserving full-height space and shoving the
+         controls off-screen; the vh line is a fallback for engines without dvh. */
+      #screen { white-space: pre; background: #0c0e13; padding: 10px; border-radius: 8px;
+                min-height: 50vh; min-height: 50dvh; max-height: 70vh; max-height: 70dvh;
+                overflow-x: auto; overflow-y: auto; }
       #screen.wrap { white-space: pre-wrap; word-break: break-word; }
       /* xterm.js live terminal. Shown only when the raw stream is active; the
          <pre id="screen"> poll viewer is the fallback when xterm is missing or
          the /stream route is unavailable (501 / error). */
-      #xterm { display: none; background: #0c0e13; padding: 6px; border-radius: 8px; min-height: 50vh; max-height: 70vh; overflow: auto; }
+      #xterm { display: none; background: #0c0e13; padding: 6px; border-radius: 8px;
+               min-height: 50vh; min-height: 50dvh; max-height: 70vh; max-height: 70dvh; overflow: auto; }
       #jumpbottom { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 1;
         width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
         background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }

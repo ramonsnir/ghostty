@@ -847,6 +847,15 @@ struct WebMonitorServerTests {
 
     // MARK: - Embedded page: jump-to-bottom affordance
 
+    @Test func htmlPageUsesDynamicViewportForKeyboard() {
+        let page = WebMonitorServer.htmlPage
+        // The soft keyboard must shrink the layout (resizes-content) and the
+        // terminal heights must track it (dvh), else the terminal reserves
+        // full-height space and shoves the controls off-screen when typing.
+        #expect(page.contains("interactive-widget=resizes-content"))
+        #expect(page.contains("dvh"))
+    }
+
     @Test func htmlPageGroupsListByTabWithWindowOmission() {
         let page = WebMonitorServer.htmlPage
         // The list is grouped by window+tab, with a multi-line header (location
