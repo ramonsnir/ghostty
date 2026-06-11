@@ -798,6 +798,20 @@ extension Ghostty {
             return bellIsFocused ? config.bellFeaturesFocused : config.bellFeatures
         }
 
+        /// (ramon fork) Explicitly clear the bell from outside the focus/keyDown
+        /// paths — used by the web monitor's clear-bell button so a phone can
+        /// acknowledge a bell (drop the 🔔/border/badge) without focusing the
+        /// surface locally, leaving it free to ring again later. Mirrors the
+        /// bell-clearing the focus path does (state + delivered notifications).
+        func resetBell() {
+            bell = false
+            if !notificationIdentifiers.isEmpty {
+                UNUserNotificationCenter.current()
+                    .removeDeliveredNotifications(withIdentifiers: Array(notificationIdentifiers))
+                self.notificationIdentifiers = []
+            }
+        }
+
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
             // Decide which bell-features set applies based on true focus, and only
             // arm the visual bell (title 🔔 + border + dock badge aggregate) if that

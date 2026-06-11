@@ -543,16 +543,18 @@ struct WebMonitorServerTests {
     @Test func surfacesJSONShape() throws {
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "id-1", title: "Title One", pwd: "/home/x",
-                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 0, splitCount: 2),
+                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 0, splitCount: 2, bell: false),
             .init(id: "id-2", title: "", pwd: "",
-                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 1, splitCount: 2),
+                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 1, splitCount: 2, bell: true),
         ])
         let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
         #expect(arr?.count == 2)
         #expect(arr?[0]["id"] as? String == "id-1")
         #expect(arr?[0]["title"] as? String == "Title One")
         #expect(arr?[0]["pwd"] as? String == "/home/x")
+        #expect(arr?[0]["bell"] as? Bool == false)
         #expect(arr?[1]["title"] as? String == "")
+        #expect(arr?[1]["bell"] as? Bool == true)
     }
 
     @Test func surfacesJSONCarriesLayout() throws {
@@ -560,7 +562,7 @@ struct WebMonitorServerTests {
         // phone list show how panes are organized on the Mac.
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "a", title: "A", pwd: "", window: 1, tab: 2,
-                  tabTitle: "Editor", splitIndex: 0, splitCount: 3),
+                  tabTitle: "Editor", splitIndex: 0, splitCount: 3, bell: false),
         ])
         let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
         #expect(arr?[0]["window"] as? Int == 1)
@@ -577,7 +579,7 @@ struct WebMonitorServerTests {
         let hostilePwd = "/tmp/\"quoted\"\\back\nslash\u{1F4A9}"
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "id-1", title: hostileTitle, pwd: hostilePwd,
-                  window: 0, tab: 0, tabTitle: "", splitIndex: 0, splitCount: 1),
+                  window: 0, tab: 0, tabTitle: "", splitIndex: 0, splitCount: 1, bell: false),
         ])
         let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
         #expect(arr?.count == 1)
@@ -751,6 +753,16 @@ struct WebMonitorServerTests {
         #expect(decide("GET", "/api/surface/\(id.uuidString)/scroll") == .methodNotAllowed)
     }
 
+    @Test func decideRouteClearBellPost() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/bell") == .clearBell(uuid: id))
+    }
+
+    @Test func decideRouteClearBellGetMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/bell") == .methodNotAllowed)
+    }
+
     @Test func scrollDeltaYDecode() {
         #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{"dy":3}"#.utf8)) == 3)
         #expect(WebMonitorServer.scrollDeltaY(body: Data(#"{"dy":-5}"#.utf8)) == -5)
@@ -871,6 +883,18 @@ struct WebMonitorServerTests {
         // full-height space and shoves the controls off-screen when typing.
         #expect(page.contains("interactive-widget=resizes-content"))
         #expect(page.contains("dvh"))
+    }
+
+    @Test func htmlPageHasClearBellButton() {
+        let page = WebMonitorServer.htmlPage
+        // A clear-bell button + its handler must exist so a phone can acknowledge
+        // a bell (POST .../bell) without focusing the surface locally, and the
+        // list flags surfaces whose bell is still ringing.
+        #expect(page.contains("id=\"clearbell\""))
+        #expect(page.contains("clearBellBtn.onclick"))
+        #expect(page.contains("/bell"))
+        #expect(page.contains("bellflag"))
+        #expect(page.contains("row.bell"))
     }
 
     @Test func htmlPageGroupsListByTabWithWindowOmission() {
