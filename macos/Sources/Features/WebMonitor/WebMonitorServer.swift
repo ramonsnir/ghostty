@@ -966,6 +966,9 @@ final class WebMonitorServer {
         case "right": return [KeySpec(keycode: 124)]
         case "y": return keySpecs(forText: "y")
         case "n": return keySpecs(forText: "n")
+        // Space is a plain printable 0x20 — same byte a Space keypress sends, and
+        // useful in Claude Code (toggle/confirm). Ride the text path like y/n.
+        case "space": return keySpecs(forText: " ")
         default: return nil
         }
     }
@@ -1407,8 +1410,6 @@ final class WebMonitorServer {
       <b>Ghostty</b> Web Monitor
       <button id="back" style="display:none">&larr; Sessions</button>
       <span id="cur"></span>
-      <button id="clearbell" style="display:none"
-              title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
     </header>
     <div id="banner" role="status" aria-live="polite"></div>
     <div id="notice" class="notice" style="display:none" role="alert" aria-live="assertive"></div>
@@ -1421,27 +1422,18 @@ final class WebMonitorServer {
     </div>
     <div id="list"></div>
     <div id="viewer">
-      <div class="bar">
-        <!-- The View (viewport/scrollback) mode toggle + Refresh only drive the
-             <pre id="screen"> poll viewer; xterm.js streams live with its own
-             scrollback, so #modetoggle is hidden while the live stream is active. -->
-        <span id="modetoggle">
-          <label for="mode">View</label>
-          <select id="mode" aria-label="Screen view mode">
-            <option value="viewport">Viewport</option>
-            <option value="scrollback">Scrollback</option>
-          </select>
-          <button id="refresh">Refresh</button>
-        </span>
-        <label><input id="wrap" type="checkbox"> Wrap</label>
-        <label for="fontsize">Size</label>
-        <select id="fontsize" aria-label="Font size">
-          <option value="11">11</option>
-          <option value="13">13</option>
-          <option value="14" selected>14</option>
-          <option value="16">16</option>
-          <option value="18">18</option>
+      <!-- Poll-fallback view controls (viewport/scrollback + Refresh) only drive
+           the <pre id="screen"> poll viewer; the whole bar is hidden while the
+           live xterm stream is active, so it costs no vertical space in the
+           common case. Wrap + font-size controls were dropped to save room
+           (xterm streams at the host grid size with its own scrollback). -->
+      <div class="bar" id="modebar">
+        <label for="mode">View</label>
+        <select id="mode" aria-label="Screen view mode">
+          <option value="viewport">Viewport</option>
+          <option value="scrollback">Scrollback</option>
         </select>
+        <button id="refresh">Refresh</button>
       </div>
       <div id="screenwrap">
         <div id="xterm"></div>
@@ -1450,6 +1442,7 @@ final class WebMonitorServer {
       </div>
       <div class="bar">
         <button data-key="enter">Enter</button>
+        <button data-key="space">Space</button>
         <button data-key="y">y</button>
         <button data-key="n">n</button>
         <button data-key="esc">Esc</button>
@@ -1457,23 +1450,19 @@ final class WebMonitorServer {
         <button data-key="backspace" title="Backspace / delete char">&#9003;</button>
         <button data-key="ctrl-u" title="Clear line (Ctrl-U)">Clear</button>
         <button data-key="ctrl-c" class="danger">Ctrl-C</button>
+        <button id="clearbell"
+                title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
       </div>
-      <div class="bar">
-        <button data-raw="1">1</button>
-        <button data-raw="2">2</button>
-        <button data-raw="3">3</button>
-        <button data-raw="4">4</button>
-      </div>
+      <!-- Arrows + remote-control scroll on ONE row to save vertical space.
+           Scroll is forwarded to the host as mouse-wheel input, so a TUI (Claude
+           Code/less/vim) scrolls and the result streams back, reaching history
+           beyond the browser buffer. The double-line glyphs (⇑⇓) distinguish
+           scroll from the single-line nav arrows (↑↓). -->
       <div class="bar">
         <button data-key="up" aria-label="Up">&uarr;</button>
         <button data-key="down" aria-label="Down">&darr;</button>
         <button data-key="left" aria-label="Left">&larr;</button>
         <button data-key="right" aria-label="Right">&rarr;</button>
-      </div>
-      <!-- Remote-control scroll: forwarded to the host as mouse-wheel input, so
-           a TUI (Claude Code/less/vim) scrolls and the result streams back, and
-           you can reach history beyond the browser's buffer. -->
-      <div class="bar">
         <button id="scrollup" title="Scroll up — mouse wheel to the remote terminal">&#8679; Scroll</button>
         <button id="scrolldown" title="Scroll down — mouse wheel to the remote terminal">&#8681; Scroll</button>
       </div>
@@ -1516,9 +1505,9 @@ final class WebMonitorServer {
       var curEl = document.getElementById("cur");
       var clearBellBtn = document.getElementById("clearbell");
       var modeEl = document.getElementById("mode");
-      var modeToggleEl = document.getElementById("modetoggle");
-      var wrapEl = document.getElementById("wrap");
-      var fontEl = document.getElementById("fontsize");
+      // The whole poll-fallback control bar (View/Refresh); hidden while the live
+      // xterm stream is active so it costs no vertical space in the common case.
+      var modeToggleEl = document.getElementById("modebar");
       var inp = document.getElementById("inp");
       var xtermEl = document.getElementById("xterm");
       var current = null, timer = null, listTimer = null;
@@ -1795,7 +1784,7 @@ final class WebMonitorServer {
         var term = new Terminal({
           convertEol: false,
           scrollback: 10000,
-          fontSize: parseInt(fontEl.value, 10) || 14
+          fontSize: 14
         });
         term.open(xtermEl);
         xtermEl.style.display = "block";
@@ -1855,7 +1844,6 @@ final class WebMonitorServer {
         viewer.style.display = "none";
         listEl.style.display = "block";
         backBtn.style.display = "none";
-        clearBellBtn.style.display = "none";
         curEl.textContent = "";
         jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
       }
@@ -1865,7 +1853,6 @@ final class WebMonitorServer {
         listEl.style.display = "none";
         viewer.style.display = "block";
         backBtn.style.display = "inline-block";
-        clearBellBtn.style.display = "inline-block";
         curEl.textContent = title || "";
         setBanner(null);
         // Prefer the live xterm.js raw stream (color + scrollback + live). If
@@ -1911,18 +1898,11 @@ final class WebMonitorServer {
       // View preferences persist across page loads (localStorage; best-effort).
       function prefGet(k, dflt) { try { var v = localStorage.getItem(k); return v === null ? dflt : v; } catch (e) { return dflt; } }
       function prefSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
-      function applyWrap() { screenEl.classList.toggle("wrap", wrapEl.checked); }
-      function applyFont() { screenEl.style.fontSize = fontEl.value + "px"; }
-      // Restore saved prefs.
+      // Restore the saved poll-fallback view mode (wrap/font controls were removed).
       modeEl.value = prefGet("ghostty_mode", modeEl.value);
-      wrapEl.checked = prefGet("ghostty_wrap", "0") === "1";
-      fontEl.value = prefGet("ghostty_font", fontEl.value);
-      applyWrap(); applyFont();
 
       document.getElementById("refresh").onclick = poll;
       modeEl.onchange = function () { prefSet("ghostty_mode", modeEl.value); poll(true); };
-      wrapEl.onchange = function () { applyWrap(); prefSet("ghostty_wrap", wrapEl.checked ? "1" : "0"); screenEl.scrollTop = screenEl.scrollHeight; updateJumpBtn(); };
-      fontEl.onchange = function () { applyFont(); prefSet("ghostty_font", fontEl.value); screenEl.scrollTop = screenEl.scrollHeight; updateJumpBtn(); };
 
       // A quick-key / Send tapped after the viewed session was torn down (e.g. a
       // 404 cleared `current`) would otherwise be a silent dead tap. Surface a
@@ -2030,12 +2010,6 @@ final class WebMonitorServer {
         } else {
           b.onclick = function () { flashTap(b); sendKey(k); };
         }
-      });
-
-      // Raw-digit quick-keys (1/2/3/4): send the bare digit with NO newline via
-      // the text/plain raw path, so Claude Code permission menus answer in one tap.
-      Array.prototype.forEach.call(document.querySelectorAll("[data-raw]"), function (b) {
-        b.onclick = function () { flashTap(b); sendText(b.getAttribute("data-raw")); };
       });
 
       // Remote-control scroll: POST a wheel delta to /scroll. The host turns it

@@ -105,6 +105,13 @@ struct WebMonitorServerTests {
             == [WebMonitorServer.KeySpec(text: "n", unshiftedCodepoint: UInt32(UnicodeScalar("n").value))])
     }
 
+    @Test func keySpecsSpaceIsPrintableSpace() {
+        // The Space quick-key types a plain 0x20 (same byte a Space keypress
+        // sends), riding the text path like y/n.
+        #expect(WebMonitorServer.keySpecs(forKey: "space")
+            == [WebMonitorServer.KeySpec(text: " ", unshiftedCodepoint: 0x20)])
+    }
+
     @Test func keySpecsUnknownKey() {
         #expect(WebMonitorServer.keySpecs(forKey: "bogus") == nil)
     }
@@ -895,6 +902,17 @@ struct WebMonitorServerTests {
         #expect(page.contains("/bell"))
         #expect(page.contains("bellflag"))
         #expect(page.contains("row.bell"))
+    }
+
+    @Test func htmlPageControlsAreCompact() {
+        let page = WebMonitorServer.htmlPage
+        // Space quick-key (next to Enter) — useful in Claude Code.
+        #expect(page.contains("data-key=\"space\""))
+        // Vertical-space savings: wrap + font-size controls and the 1-4 digit
+        // quick-keys were removed (key+Send covers the digits).
+        #expect(!page.contains("id=\"wrap\""))
+        #expect(!page.contains("id=\"fontsize\""))
+        #expect(!page.contains("data-raw"))
     }
 
     @Test func htmlPageGroupsListByTabWithWindowOmission() {
