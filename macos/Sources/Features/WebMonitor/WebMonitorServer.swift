@@ -446,6 +446,7 @@ final class WebMonitorServer {
         case stream(uuid: UUID)                  // GET /api/surface/{uuid}/stream (raw byte stream)
         case input(uuid: UUID)                   // POST /api/surface/{uuid}/input
         case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
+        case clearBell(uuid: UUID)               // POST /api/surface/{uuid}/bell (acknowledge bell)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
     }
 
@@ -536,6 +537,9 @@ final class WebMonitorServer {
             case "scroll":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .scroll(uuid: uuid)
+            case "bell":
+                guard method == "POST" else { return .methodNotAllowed }
+                return .clearBell(uuid: uuid)
             default:
                 return .notFound
             }
@@ -674,6 +678,17 @@ final class WebMonitorServer {
                 // alternate-scroll arrows for less/man, or scrollback) exactly like
                 // a real wheel — so a TUI scrolls and the result streams back.
                 ghostty_surface_mouse_scroll(surface, 0, dy, 0)
+                return .json(Data(#"{"ok":true}"#.utf8))
+            }
+            send(result, on: conn)
+
+        case .clearBell(let uuid):
+            clearAuthFailures(peer)
+            // Acknowledge a bell from the phone WITHOUT focusing the surface
+            // locally — drop the 🔔/border/badge so it can ring again later.
+            let result: HTTPResponse = DispatchQueue.main.sync {
+                guard let view = self.surface(forUUID: uuid) else { return .status(404, "Not Found") }
+                view.resetBell()
                 return .json(Data(#"{"ok":true}"#.utf8))
             }
             send(result, on: conn)
@@ -1053,6 +1068,9 @@ final class WebMonitorServer {
         /// tab's total split count, so the UI can badge "split 2/3".
         let splitIndex: Int
         let splitCount: Int
+        /// True when this surface has an active (unacknowledged) bell, so the
+        /// phone can flag it and offer to clear it (POST .../bell).
+        let bell: Bool
     }
 
     /// MUST be called on main. Iterates AppKit surfaces (thin) and defers the
@@ -1089,7 +1107,7 @@ final class WebMonitorServer {
                 rows.append(SurfaceRow(
                     id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
                     window: win, tab: tabIdx, tabTitle: tabTitle,
-                    splitIndex: splitIdx, splitCount: leaves.count))
+                    splitIndex: splitIdx, splitCount: leaves.count, bell: view.bell))
             }
         }
         return Self.surfacesJSONData(rows)
@@ -1102,6 +1120,7 @@ final class WebMonitorServer {
                 "id": $0.id, "title": $0.title, "pwd": $0.pwd,
                 "window": $0.window, "tab": $0.tab, "tabTitle": $0.tabTitle,
                 "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
+                "bell": $0.bell,
             ]
         }
         return (try? JSONSerialization.data(withJSONObject: arr)) ?? Data("[]".utf8)
@@ -1346,6 +1365,9 @@ final class WebMonitorServer {
       .row .badge { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 10px;
                     background: #2a2e3b; color: #b6bccb; font-size: 11px; font-weight: normal;
                     vertical-align: middle; }
+      .row .bellflag { margin-left: 8px; font-size: 13px; vertical-align: middle; }
+      #clearbell { background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
+      #clearbell:active { background: #6a5320; }
       .row .p { color: #b6bccb; font-size: 12px; margin-top: 4px; word-break: break-all; }
       .empty { padding: 12px; color: #b6bccb; }
       #viewer { display: none; padding: 8px; }
@@ -1385,6 +1407,8 @@ final class WebMonitorServer {
       <b>Ghostty</b> Web Monitor
       <button id="back" style="display:none">&larr; Sessions</button>
       <span id="cur"></span>
+      <button id="clearbell" style="display:none"
+              title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
     </header>
     <div id="banner" role="status" aria-live="polite"></div>
     <div id="notice" class="notice" style="display:none" role="alert" aria-live="assertive"></div>
@@ -1490,6 +1514,7 @@ final class WebMonitorServer {
       var jumpBtn = document.getElementById("jumpbottom");
       var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
+      var clearBellBtn = document.getElementById("clearbell");
       var modeEl = document.getElementById("mode");
       var modeToggleEl = document.getElementById("modetoggle");
       var wrapEl = document.getElementById("wrap");
@@ -1635,6 +1660,11 @@ final class WebMonitorServer {
               d.className = "row";
               var t = document.createElement("div"); t.className = "t";
               t.textContent = row.title || "(untitled)";
+              if (row.bell) {
+                var bf = document.createElement("span"); bf.className = "bellflag";
+                bf.textContent = "\\uD83D\\uDD14";  // 🔔 — an unacknowledged bell rang here
+                t.appendChild(bf);
+              }
               if ((row.splitCount || 1) > 1) {
                 var b = document.createElement("span"); b.className = "badge";
                 b.textContent = "split " + ((row.splitIndex || 0) + 1) + "/" + row.splitCount;
@@ -1825,6 +1855,7 @@ final class WebMonitorServer {
         viewer.style.display = "none";
         listEl.style.display = "block";
         backBtn.style.display = "none";
+        clearBellBtn.style.display = "none";
         curEl.textContent = "";
         jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
       }
@@ -1834,6 +1865,7 @@ final class WebMonitorServer {
         listEl.style.display = "none";
         viewer.style.display = "block";
         backBtn.style.display = "inline-block";
+        clearBellBtn.style.display = "inline-block";
         curEl.textContent = title || "";
         setBanner(null);
         // Prefer the live xterm.js raw stream (color + scrollback + live). If
@@ -1860,6 +1892,20 @@ final class WebMonitorServer {
         if (timer) { clearInterval(timer); timer = null; }
         showList();
         loadList();
+      };
+
+      // Acknowledge/clear the bell for the viewed split WITHOUT focusing it on
+      // the Mac (so it stays free to ring again later). The server drops the
+      // 🔔/border/badge for that surface.
+      clearBellBtn.onclick = function () {
+        if (!current) { noActiveSession(); return; }
+        fetch(url("/api/surface/" + current + "/bell"), { method: "POST", headers: headers() })
+          .then(function (r) {
+            if (r && r.ok) { setBanner("Bell cleared.", true); setTimeout(clearBannerIfNotError, 1200); }
+            else if (r && r.status === 404) { sessionClosedTeardown(); }
+            else { setBanner("Clear bell failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
+          })
+          .catch(function () { setBanner("Clear bell failed \\u2014 not delivered.", false, true); });
       };
 
       // View preferences persist across page loads (localStorage; best-effort).
