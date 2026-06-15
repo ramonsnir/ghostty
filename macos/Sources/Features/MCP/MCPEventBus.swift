@@ -306,7 +306,7 @@ final class MCPEventBus {
             guard let self, let server else { return }
             guard !waiter.resolved else { return }
             let fullText: String? = DispatchQueue.main.sync {
-                MCPLayout.readText(uuid: spec.uuid, scrollback: false)?.text
+                MCPLayout.readText(uuid: spec.uuid)?.text
             }
             guard var text = fullText, let regex else { return }
             if text.count > scanCap {

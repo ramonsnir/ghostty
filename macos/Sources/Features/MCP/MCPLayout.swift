@@ -125,11 +125,15 @@ enum MCPLayout {
 
     // MARK: - read_surface
 
-    /// Read a surface's text + grid size. MUST be called on main. Reuses the
-    /// cached readers (~500ms TTL). Returns nil if the uuid does not resolve.
-    static func readText(uuid: UUID, scrollback: Bool) -> (text: String, cols: Int, rows: Int)? {
+    /// Read a surface's VISIBLE SCREEN (viewport) text + grid size. MUST be
+    /// called on main. Reuses the cached viewport reader (~500ms TTL). Returns
+    /// nil if the uuid does not resolve. Scrollback is deliberately NOT read:
+    /// under pty-host the GUI is a viewport-only mirror, so `cachedScreenContents`
+    /// would return only the viewport anyway — read_surface advertises viewport
+    /// only rather than a misleading "scrollback" mode.
+    static func readText(uuid: UUID) -> (text: String, cols: Int, rows: Int)? {
         guard let view = surface(forUUID: uuid) else { return nil }
-        let text = scrollback ? view.cachedScreenContents.get() : view.cachedVisibleContents.get()
+        let text = view.cachedVisibleContents.get()
         var cols = 0
         var rows = 0
         if let s = view.surface {

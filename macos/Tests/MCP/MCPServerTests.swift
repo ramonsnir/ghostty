@@ -421,29 +421,18 @@ struct MCPServerTests {
         }
     }
 
-    @Test func dispatchReadSurfaceUnknownModeInvalidParams() {
-        // A valid id but an unrecognized mode must be rejected explicitly (NOT
-        // silently coerced to viewport). The mode check runs before any main hop.
+    @Test func dispatchReadSurfaceViewportOnlyIgnoresModeArg() {
+        // read_surface is viewport-only: there is no `mode` parameter (a
+        // "scrollback" read would be a lie under the pty-host viewport-only
+        // mirror). A valid id with a stray `mode` arg must therefore NOT be
+        // rejected as invalidParams — the arg is ignored and the call proceeds
+        // to the main hop, which returns .toolError for an unresolvable id in
+        // the headless test environment.
         let server = MCPServer(listen: "127.0.0.1:8765", token: "")
-        let args: [String: Any] = ["id": UUID().uuidString, "mode": "full"]
-        switch MCPTools.dispatch(name: "read_surface", arguments: args, server: server) {
-        case .invalidParams(let msg):
-            #expect(msg.contains("mode"))
-        default: Issue.record("expected .invalidParams for unknown mode")
-        }
-        // A typo variant is likewise rejected.
-        let args2: [String: Any] = ["id": UUID().uuidString, "mode": "scrollbck"]
-        switch MCPTools.dispatch(name: "read_surface", arguments: args2, server: server) {
-        case .invalidParams: break
-        default: Issue.record("expected .invalidParams for typo'd mode")
-        }
-        // The recognized modes are NOT rejected as invalidParams (they pass the
-        // mode gate and hit the main hop, which returns .toolError for an
-        // unresolvable id in the headless test environment).
-        for mode in ["viewport", "scrollback"] {
+        for mode in ["viewport", "scrollback", "full", "scrollbck"] {
             let a: [String: Any] = ["id": UUID().uuidString, "mode": mode]
             switch MCPTools.dispatch(name: "read_surface", arguments: a, server: server) {
-            case .invalidParams: Issue.record("recognized mode \(mode) must not be invalidParams")
+            case .invalidParams: Issue.record("stray mode \(mode) must not be invalidParams (viewport-only)")
             default: break
             }
         }

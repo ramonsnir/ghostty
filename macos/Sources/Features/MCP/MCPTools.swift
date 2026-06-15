@@ -30,12 +30,11 @@ enum MCPTools {
         ],
         [
             "name": "read_surface",
-            "description": "Read the text contents of a surface. mode 'viewport' (default) reads the visible screen; 'scrollback' reads the full scrollback+screen. The text comes from a short-lived (~500ms) cache, so a read issued immediately after send_text may not yet reflect the just-sent input — re-read after a brief delay if you need the freshest output.",
+            "description": "Read the text of a surface's VISIBLE SCREEN (the viewport). Scrollback/history is NOT exposed: under this fork's pty-host backend the GUI holds only a viewport-sized mirror (the real scrollback lives on the host), so there is no honest full-history read — only the current screen. The text comes from a short-lived (~500ms) cache, so a read issued immediately after send_text may not yet reflect the just-sent input — re-read after a brief delay if you need the freshest output. To see output that has scrolled off, use the `scroll` tool to bring it into the viewport, then read again.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "id": ["type": "string", "description": "Surface UUID from list_surfaces."],
-                    "mode": ["type": "string", "enum": ["viewport", "scrollback"], "default": "viewport"],
                 ],
                 "required": ["id"],
                 "additionalProperties": false,
@@ -186,17 +185,13 @@ enum MCPTools {
 
         case "read_surface":
             guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
-            // Reject an unrecognized mode explicitly. MCP servers do not enforce
-            // input schemas, so a typo'd mode (e.g. "full") would otherwise be
-            // silently coerced to viewport and return a wrong result.
-            let modeArg = arguments["mode"] as? String
-            switch modeArg {
-            case nil, "viewport", "scrollback": break
-            default: return .invalidParams("invalid mode: \(modeArg ?? ""); expected viewport or scrollback")
-            }
-            let scrollback = modeArg == "scrollback"
+            // Viewport-only: scrollback is intentionally NOT a mode. Under the
+            // pty-host backend the GUI is a viewport-sized mirror, so a
+            // "scrollback" read would silently return only the viewport — a lie.
+            // Rather than expose a broken mode, read_surface always reads the
+            // visible screen. (See MCPLayout.readText / read_surface schema.)
             let result: [String: Any]? = DispatchQueue.main.sync {
-                guard let r = MCPLayout.readText(uuid: uuid, scrollback: scrollback) else { return nil }
+                guard let r = MCPLayout.readText(uuid: uuid) else { return nil }
                 return ["text": r.text, "cols": r.cols, "rows": r.rows]
             }
             guard let result else { return .toolError("unknown surface id") }
