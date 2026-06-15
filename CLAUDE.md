@@ -117,6 +117,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 
 - **Web monitor** (fork-only, OFF by default) — a GUI-embedded HTTP server inside the
   running macOS app that, from a phone (e.g. over Tailscale), lists live terminal surfaces,
+  > **SCOPE — phone workflows ONLY.** The web monitor is the phone-usage feature
+  > (list/render/input/scroll from a handset over Tailscale) and nothing else. Do
+  > **not** build new features on top of it — it is not maintained as a highly-stable
+  > foundation. Other work (e.g. an MCP server / agent control) may *reuse its
+  > architecture and copy code* (the host-protocol client, `keySpecs` input mapping,
+  > `decideRoute`/`RequestParser` patterns, the serial-queue + main-hop threading
+  > model), but should stand on its own and build directly on Ghostty + the host's
+  > existing abstractions — there is already enough tooling there. Keep the web
+  > monitor's surface frozen to what phone usage needs.
   **renders one in full ANSI color with scrollback + live updates** (a browser `xterm.js`
   fed the host's raw PTY byte stream), **sends input** (notably approving CLI-agent prompts),
   and **remote-controls scroll**. The server lives INSIDE the app — one binary, one
@@ -205,6 +214,57 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `macos/Tests/WebMonitor/WebMonitorServerTests.swift` (auto-discovered by the
   `GhosttyTests` filesystem-synchronized group) + host frame/ring/integration tests in
   `src/host/test.zig` (`zig build test -Dtest-filter=host`).
+
+- **MCP server** (fork-only, OFF by default) — a GUI-embedded **MCP server** that lets an
+  orchestrating agent (Claude Code / Codex) **control** the fork (reorganize splits/tabs,
+  open tabs / run commands) and **watch + respond to** live sessions (bell / process-exit /
+  prompt; read the screen; type input / approve CLI-agent prompts). **See `MCP-SERVER.md`
+  for the user-facing config/usage + the full tool list.** The load-bearing facts for an
+  agent working on this code:
+  - **Built on EXISTING abstractions; ZERO host changes.** Read/respond go through the
+    libghostty C API on the GUI surface (`ghostty_surface_read_text` viewport,
+    `ghostty_surface_key` real key events, `ghostty_surface_text`,
+    `ghostty_surface_mouse_scroll`); watch is a Swift event bus over existing GUI state
+    (`ghosttyBellDidRing`, `process_exited`, a `needsConfirmQuit` transition); layout calls
+    the existing `TerminalController`/`SplitTree` handlers. The host (`ghostty-host`) has
+    **no MCP awareness** — the only Zig change is two additive, default-null config keys it
+    ignores. So enabling/changing MCP needs a **GUI relaunch only, never a host restart**.
+  - **Standalone module that COPIES the web monitor, never depends on it** (per the
+    web-monitor scope rule above): the serial-queue + main-hop threading model, the
+    `keySpecs` NATIVE-keycode input mapping (Return=36, Esc=53, …; the `GHOSTTY_KEY_*` enum
+    value silently no-ops — see the web-monitor `fix7` notes), the `decideRoute`/
+    `RequestParser` shape, and the token/Host-header/backoff defenses are all re-homed in
+    `macos/Sources/Features/MCP/`, not imported from `WebMonitor`.
+  - **Config (fork-only, default null/off):** `mcp-listen` (`addr:port`, empty = disabled;
+    purely a BIND address) + `mcp-token`. **Unlike `web-monitor-token`, the MCP token should
+    ALWAYS be set** — it is a SHELL-EXECUTION credential (the tools spawn tabs + run
+    commands), so the recommended bind is **localhost** (`127.0.0.1:8765`) with a token, NOT
+    an open tailnet bind. Empty token ⇒ runs OPEN + logs a warning. Keep both in
+    `~/.config/ghostty-ramon/config`.
+  - **Transport:** in-GUI HTTP JSON-RPC 2.0 on its own `NWListener` (`POST /mcp`:
+    `initialize` / `tools/list` / `tools/call`) + a standalone stdio shim
+    (`macos/mcp-shim`, `ghostty-mcp`, a dumb stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`,
+    built with `swift build`) so `claude mcp add ghostty -- ghostty-mcp` works. The shim's
+    default URL is `http://127.0.0.1:8765/mcp`; `GHOSTTY_MCP_URL`/`GHOSTTY_MCP_TOKEN` override.
+  - **12 tools:** `list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`,
+    `scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
+    `close_surface`, `perform_action` (the keybind-action grammar string). All address a
+    surface by **stable UUID**; `wait_for_event`/`watch_for_pattern` are long-poll
+    (idle-watchdog-exempt, bounded by a clamped `timeoutMs` 1000–120000).
+  - **Two deliberate v1 limits (documented honestly, don't "fix" by guessing):**
+    (a) **`read_surface` is VIEWPORT-ONLY** — under `pty-host` the GUI mirror is
+    viewport-sized (real scrollback is on the host), so there is no honest scrollback read;
+    the `mode` param was REMOVED rather than lie. Reach scrolled-off output via `scroll` +
+    re-read. (b) **`prompt`/`atPrompt` rides the coarse `needsConfirmQuit` bit, NOT OSC 133**
+    — gated by `confirm-close-surface` (`false` ⇒ never fires; `always` ⇒ inverted); prefer
+    `watch_for_pattern` for "agent waiting on me". A real OSC-133 bit needs host plumbing
+    (out of scope). Relative layout verbs focus the target first (anchor-parameterizing
+    `SplitTree` is a follow-up). Wiring: `src/config/Config.zig` (`mcp-listen`/`mcp-token` +
+    parse test); `macos/Sources/Features/MCP/{MCPServer,MCPRPC,MCPTools,MCPInput,MCPLayout,
+    MCPEventBus}.swift`; `Ghostty.Config.swift` (`mcpListen`/`mcpToken`); `AppDelegate.swift`
+    (start on launch); `project.pbxproj` (iOS exclusion); `macos/mcp-shim/*`. Tests:
+    `macos/Tests/MCP/MCPServerTests.swift` + the `mcp` Zig config test
+    (`zig build test -Dtest-filter=mcp`).
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
