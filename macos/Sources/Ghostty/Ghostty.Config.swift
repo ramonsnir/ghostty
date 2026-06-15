@@ -251,6 +251,26 @@ extension Ghostty {
             return String(cString: ptr)
         }
 
+        // (ramon fork) MCP server listen address (addr:port); empty = disabled.
+        var mcpListen: String {
+            guard let config = self.config else { return "" }
+            var v: UnsafePointer<Int8>?
+            let key = "mcp-listen"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "" }
+            guard let ptr = v else { return "" }
+            return String(cString: ptr)
+        }
+
+        // (ramon fork) MCP server shared secret; empty = server runs open (logs a warning).
+        var mcpToken: String {
+            guard let config = self.config else { return "" }
+            var v: UnsafePointer<Int8>?
+            let key = "mcp-token"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "" }
+            guard let ptr = v else { return "" }
+            return String(cString: ptr)
+        }
+
         // (ramon fork / Phase 2b) AF_UNIX socket path of a running ghostty-host.
         // nil/empty when unset (the default in-process .exec backend). The web
         // monitor's host client connects here to stream a session's raw PTY

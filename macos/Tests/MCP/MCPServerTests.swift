@@ -1,0 +1,770 @@
+import Foundation
+import Testing
+import GhosttyKit
+@testable import Ghostty
+
+/// Unit tests for the pure / value units of the fork-only MCP server. They cover
+/// listen parsing, the native-keycode keySpecs table, scroll clamping, the pure
+/// route decision (Host guard / token gate / backoff / method+path), the copied
+/// HTTP request parser, the JSON-RPC parse + envelope layer, the tool schemas +
+/// dispatch, the surfaces JSON shaping, the Host-header guard, and constant-time
+/// token comparison. No live server, no AppKit.
+struct MCPServerTests {
+
+    // MARK: - parseListen
+
+    @Test func parseListenValid() {
+        let p = MCPServer.parseListen("127.0.0.1:8765")
+        #expect(p?.host == "127.0.0.1")
+        #expect(p?.port == 8765)
+    }
+
+    @Test func parseListenIPv6Brackets() {
+        let p = MCPServer.parseListen("[::1]:8765")
+        #expect(p?.host == "::1")
+        #expect(p?.port == 8765)
+    }
+
+    @Test func parseListenRejectsNoColon() {
+        #expect(MCPServer.parseListen("127.0.0.1") == nil)
+    }
+
+    @Test func parseListenRejectsBadPort() {
+        #expect(MCPServer.parseListen("127.0.0.1:abc") == nil)
+        #expect(MCPServer.parseListen("127.0.0.1:99999") == nil)
+    }
+
+    // MARK: - keySpecs(forKey:)
+
+    @Test func keySpecsForKeyNamedKeys() {
+        #expect(MCPInput.keySpecs(forKey: "enter") == [MCPInput.KeySpec(keycode: 36)])
+        #expect(MCPInput.keySpecs(forKey: "esc") == [MCPInput.KeySpec(keycode: 53)])
+        #expect(MCPInput.keySpecs(forKey: "escape") == [MCPInput.KeySpec(keycode: 53)])
+        // The schema enum uses `escape`; it must equal the `esc` alias.
+        #expect(MCPInput.keySpecs(forKey: "escape") == MCPInput.keySpecs(forKey: "esc"))
+        #expect(MCPInput.keySpecs(forKey: "tab") == [MCPInput.KeySpec(keycode: 48)])
+        #expect(MCPInput.keySpecs(forKey: "backspace") == [MCPInput.KeySpec(keycode: 51)])
+        #expect(MCPInput.keySpecs(forKey: "up") == [MCPInput.KeySpec(keycode: 126)])
+        #expect(MCPInput.keySpecs(forKey: "down") == [MCPInput.KeySpec(keycode: 125)])
+        #expect(MCPInput.keySpecs(forKey: "left") == [MCPInput.KeySpec(keycode: 123)])
+        #expect(MCPInput.keySpecs(forKey: "right") == [MCPInput.KeySpec(keycode: 124)])
+        #expect(MCPInput.keySpecs(forKey: "ctrl-c") == [MCPInput.KeySpec(
+            keycode: 8, mods: GHOSTTY_MODS_CTRL, unshiftedCodepoint: UInt32(UnicodeScalar("c").value))])
+        #expect(MCPInput.keySpecs(forKey: "ctrl-u") == [MCPInput.KeySpec(
+            keycode: 32, mods: GHOSTTY_MODS_CTRL, unshiftedCodepoint: UInt32(UnicodeScalar("u").value))])
+    }
+
+    @Test func keySpecsForKeyYNSpace() {
+        // y/n/space ride the text path (keycode 0, text-bearing).
+        let y = MCPInput.keySpecs(forKey: "y")
+        #expect(y?.count == 1)
+        #expect(y?.first?.keycode == 0)
+        #expect(y?.first?.text == "y")
+
+        let n = MCPInput.keySpecs(forKey: "n")
+        #expect(n?.first?.text == "n")
+        #expect(n?.first?.keycode == 0)
+
+        let sp = MCPInput.keySpecs(forKey: "space")
+        #expect(sp?.first?.text == " ")
+        #expect(sp?.first?.keycode == 0)
+    }
+
+    @Test func keySpecsForKeyUnknownNil() {
+        #expect(MCPInput.keySpecs(forKey: "f13") == nil)
+        #expect(MCPInput.keySpecs(forKey: "") == nil)
+    }
+
+    // MARK: - keySpecs(forText:)
+
+    @Test func keySpecsForTextCoalescesRun() {
+        // A printable run is ONE text spec.
+        let one = MCPInput.keySpecs(forText: "hello world")
+        #expect(one.count == 1)
+        #expect(one.first?.text == "hello world")
+        #expect(one.first?.keycode == 0)
+
+        // Embedded newline splits into a Return (keycode 36).
+        let split = MCPInput.keySpecs(forText: "ab\ncd")
+        #expect(split.count == 3)
+        #expect(split[0].text == "ab")
+        #expect(split[1].keycode == 36)
+        #expect(split[1].text == nil)
+        #expect(split[2].text == "cd")
+
+        // Trailing newline -> trailing Return.
+        let trailing = MCPInput.keySpecs(forText: "go\n")
+        #expect(trailing.count == 2)
+        #expect(trailing[0].text == "go")
+        #expect(trailing[1].keycode == 36)
+    }
+
+    // MARK: - scrollDeltaClamped
+
+    @Test func scrollDeltaClampedZeroNil() {
+        #expect(MCPInput.scrollDeltaClamped(0) == nil)
+    }
+
+    @Test func scrollDeltaClampedClampsRange() {
+        #expect(MCPInput.scrollDeltaClamped(100) == 30)
+        #expect(MCPInput.scrollDeltaClamped(-100) == -30)
+        #expect(MCPInput.scrollDeltaClamped(5) == 5)
+    }
+
+    @Test func scrollDeltaClampedPreservesSign() {
+        // Positive stays positive (= scroll back/up; no inversion).
+        #expect((MCPInput.scrollDeltaClamped(3) ?? 0) > 0)
+        #expect((MCPInput.scrollDeltaClamped(-3) ?? 0) < 0)
+    }
+
+    // MARK: - decideRoute
+
+    private func decide(
+        method: String = "POST",
+        path: String = "/mcp",
+        headers: [String: String] = [:],
+        host: String = "127.0.0.1",
+        port: UInt16 = 8765,
+        token: String = "",
+        failures: Int = 0
+    ) -> MCPServer.RouteDecision {
+        MCPServer.decideRoute(
+            method: method, path: path, headers: headers,
+            configuredHost: host, configuredPort: port,
+            token: token, peerFailureCount: failures)
+    }
+
+    @Test func decideRouteForbiddenHost() {
+        #expect(decide(headers: ["host": "evil.example.com:8765"]) == .forbiddenHost)
+    }
+
+    @Test func decideRouteOpenModeNoToken() {
+        // Empty token, POST /mcp -> .mcp (no auth).
+        #expect(decide(token: "") == .mcp)
+    }
+
+    @Test func decideRouteTokenRequiredHeader() {
+        let token = "supersecrettoken1234"
+        // Missing header -> unauthorized.
+        #expect(decide(token: token) == .unauthorized)
+        // Wrong header -> unauthorized.
+        #expect(decide(headers: ["x-ghostty-token": "wrong"], token: token) == .unauthorized)
+        // Correct header -> mcp.
+        #expect(decide(headers: ["x-ghostty-token": token], token: token) == .mcp)
+        // A query ?token= does NOT authorize (decideRoute has no query input;
+        // confirm header-only by leaving the header out).
+        #expect(decide(path: "/mcp", token: token) == .unauthorized)
+    }
+
+    @Test func decideRouteThrottledAtThreshold() {
+        let token = "supersecrettoken1234"
+        #expect(decide(headers: ["x-ghostty-token": token], token: token,
+                       failures: MCPServer.failedAuthThreshold) == .throttled)
+    }
+
+    @Test func decideRouteMethodNotAllowed() {
+        #expect(decide(method: "GET", path: "/mcp") == .methodNotAllowed)
+    }
+
+    @Test func decideRouteNotFound() {
+        #expect(decide(method: "POST", path: "/other") == .notFound)
+        #expect(decide(method: "GET", path: "/") == .notFound)
+    }
+
+    // MARK: - RequestParser
+
+    private func crlf(_ s: String) -> Data { Data(s.replacingOccurrences(of: "\n", with: "\r\n").utf8) }
+
+    @Test func requestParserCompletePost() {
+        let body = #"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+        let raw = "POST /mcp HTTP/1.1\nHost: 127.0.0.1:8765\nContent-Type: application/json\nContent-Length: \(body.utf8.count)\n\n" + body
+        switch MCPServer.RequestParser.parse(crlf(raw), maxRequestBytes: MCPServer.maxRequestBytes) {
+        case .complete(let req):
+            #expect(req.method == "POST")
+            #expect(req.path == "/mcp")
+            #expect(String(data: req.body, encoding: .utf8) == body)
+        default:
+            Issue.record("expected .complete")
+        }
+    }
+
+    @Test func requestParserNeedMore() {
+        // Header terminator present but body not fully arrived.
+        let raw = "POST /mcp HTTP/1.1\nContent-Length: 100\n\nshort"
+        switch MCPServer.RequestParser.parse(crlf(raw), maxRequestBytes: MCPServer.maxRequestBytes) {
+        case .needMore: break
+        default: Issue.record("expected .needMore")
+        }
+    }
+
+    @Test func requestParserBadContentLength() {
+        let raw = "POST /mcp HTTP/1.1\nContent-Length: -5\n\n"
+        switch MCPServer.RequestParser.parse(crlf(raw), maxRequestBytes: MCPServer.maxRequestBytes) {
+        case .badRequest: break
+        default: Issue.record("expected .badRequest")
+        }
+    }
+
+    @Test func requestParserChunkedRejected() {
+        let raw = "POST /mcp HTTP/1.1\nTransfer-Encoding: chunked\n\n"
+        switch MCPServer.RequestParser.parse(crlf(raw), maxRequestBytes: MCPServer.maxRequestBytes) {
+        case .lengthRequired: break
+        default: Issue.record("expected .lengthRequired")
+        }
+    }
+
+    @Test func requestParserTooLarge() {
+        let big = Data(repeating: 0x41, count: MCPServer.maxRequestBytes + 1)
+        switch MCPServer.RequestParser.parse(big, maxRequestBytes: MCPServer.maxRequestBytes) {
+        case .tooLarge: break
+        default: Issue.record("expected .tooLarge")
+        }
+    }
+
+    // MARK: - parseRPC
+
+    @Test func parseRPCParseError() {
+        switch MCPServer.parseRPC(Data("not json".utf8)) {
+        case .parseError: break
+        default: Issue.record("expected .parseError")
+        }
+    }
+
+    @Test func parseRPCInvalidRequest() {
+        // JSON object missing "method".
+        switch MCPServer.parseRPC(Data(#"{"jsonrpc":"2.0","id":1}"#.utf8)) {
+        case .invalid: break
+        default: Issue.record("expected .invalid")
+        }
+    }
+
+    @Test func parseRPCNotification() {
+        switch MCPServer.parseRPC(Data(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.utf8)) {
+        case .notification(let method, _):
+            #expect(method == "notifications/initialized")
+        default:
+            Issue.record("expected .notification")
+        }
+    }
+
+    @Test func parseRPCRequestEchoesId() {
+        // String id preserved as a string through resultEnvelope.
+        switch MCPServer.parseRPC(Data(#"{"jsonrpc":"2.0","id":"abc","method":"x"}"#.utf8)) {
+        case .request(let id, _, _):
+            let env = MCPServer.resultEnvelope(id: id, result: ["ok": true])
+            let obj = try! JSONSerialization.jsonObject(with: env) as! [String: Any]
+            #expect(obj["id"] as? String == "abc")
+        default:
+            Issue.record("expected .request")
+        }
+
+        // Number id preserved as a number.
+        switch MCPServer.parseRPC(Data(#"{"jsonrpc":"2.0","id":7,"method":"x"}"#.utf8)) {
+        case .request(let id, _, _):
+            let env = MCPServer.resultEnvelope(id: id, result: ["ok": true])
+            let obj = try! JSONSerialization.jsonObject(with: env) as! [String: Any]
+            #expect((obj["id"] as? NSNumber)?.intValue == 7)
+        default:
+            Issue.record("expected .request")
+        }
+
+        // null id preserved as null.
+        switch MCPServer.parseRPC(Data(#"{"jsonrpc":"2.0","id":null,"method":"x"}"#.utf8)) {
+        case .request(let id, _, _):
+            let env = MCPServer.resultEnvelope(id: id, result: ["ok": true])
+            let obj = try! JSONSerialization.jsonObject(with: env) as! [String: Any]
+            #expect(obj["id"] is NSNull)
+        default:
+            Issue.record("expected .request")
+        }
+    }
+
+    @Test func errorEnvelopeParseErrorIdNull() {
+        let env = MCPServer.errorEnvelope(id: NSNull(), code: -32700, message: "Parse error")
+        let obj = try! JSONSerialization.jsonObject(with: env) as! [String: Any]
+        #expect(obj["id"] is NSNull)
+        let err = obj["error"] as! [String: Any]
+        #expect((err["code"] as? NSNumber)?.intValue == -32700)
+    }
+
+    @Test func errorEnvelopeInvalidIdNull() {
+        let env = MCPServer.errorEnvelope(id: NSNull(), code: -32600, message: "Invalid Request")
+        let obj = try! JSONSerialization.jsonObject(with: env) as! [String: Any]
+        #expect(obj["id"] is NSNull)
+        let err = obj["error"] as! [String: Any]
+        #expect((err["code"] as? NSNumber)?.intValue == -32600)
+    }
+
+    // MARK: - tools/list schema
+
+    @Test func toolsListHasAllTools() {
+        let tools = MCPTools.toolsListResult["tools"] as! [[String: Any]]
+        let names = Set(tools.compactMap { $0["name"] as? String })
+        let expected: Set<String> = [
+            "list_surfaces", "read_surface", "get_layout", "send_text", "send_key",
+            "scroll", "wait_for_event", "watch_for_pattern", "focus_surface",
+            "new_tab", "close_surface", "perform_action",
+        ]
+        #expect(names == expected)
+        #expect(tools.count == 12)
+        for tool in tools {
+            let schema = tool["inputSchema"] as! [String: Any]
+            #expect(schema["type"] as? String == "object")
+            #expect(schema["additionalProperties"] as? Bool == false)
+        }
+    }
+
+    @Test func toolsListSchemaRequiredFields() {
+        let tools = MCPTools.toolsListResult["tools"] as! [[String: Any]]
+        func schema(_ name: String) -> [String: Any] {
+            (tools.first { $0["name"] as? String == name }!["inputSchema"] as! [String: Any])
+        }
+        func required(_ name: String) -> [String] {
+            (schema(name)["required"] as? [String]) ?? []
+        }
+        #expect(required("read_surface").contains("id"))
+        #expect(Set(required("send_text")) == ["id", "text"])
+        #expect(Set(required("send_key")) == ["id", "key"])
+        #expect(Set(required("scroll")) == ["id", "dy"])
+        #expect(required("focus_surface") == ["id"])
+        #expect(required("close_surface") == ["id"])
+        #expect(Set(required("perform_action")) == ["id", "action"])
+
+        // send_key enum matches §3.2.
+        let props = schema("send_key")["properties"] as! [String: Any]
+        let keyEnum = Set(((props["key"] as! [String: Any])["enum"] as! [String]))
+        #expect(keyEnum == ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "y", "n", "space", "ctrl-c", "ctrl-u"])
+    }
+
+    // MARK: - initialize
+
+    @Test func initializeResultShape() {
+        let r = MCPServer.initializeResult
+        #expect(r["protocolVersion"] as? String == "2024-11-05")
+        let caps = r["capabilities"] as! [String: Any]
+        let tools = caps["tools"] as! [String: Any]
+        #expect(tools["listChanged"] as? Bool == false)
+        let info = r["serverInfo"] as! [String: Any]
+        #expect(info["name"] as? String == "ghostty-mcp")
+    }
+
+    // MARK: - surfacesJSONData
+
+    @Test func surfacesJSONDataShape() {
+        let row = MCPLayout.SurfaceRow(
+            id: "ABC", title: "vim", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 2, splitCount: 3,
+            focused: true, bell: false, exited: false, atPrompt: true)
+        let out = MCPLayout.surfacesJSONData([row])
+        #expect(out.count == 1)
+        let d = out[0]
+        #expect(d["id"] as? String == "ABC")
+        #expect(d["title"] as? String == "vim")
+        #expect(d["pwd"] as? String == "/tmp")
+        #expect(d["window"] as? Int == 0)
+        #expect(d["tab"] as? Int == 1)
+        #expect(d["tabTitle"] as? String == "T")
+        #expect(d["splitIndex"] as? Int == 2)
+        #expect(d["splitCount"] as? Int == 3)
+        #expect(d["focused"] as? Bool == true)
+        #expect(d["bell"] as? Bool == false)
+        #expect(d["exited"] as? Bool == false)
+        #expect(d["atPrompt"] as? Bool == true)
+    }
+
+    // MARK: - dispatch (AppKit-free paths only)
+
+    @Test func dispatchUnknownToolError() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "nope", arguments: [:], server: server) {
+        case .methodNotFound: break
+        default: Issue.record("expected .methodNotFound")
+        }
+    }
+
+    @Test func dispatchSendKeyUnknownKey() {
+        // Resolves the (unknown) key BEFORE any main hop -> .toolError.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let uuid = UUID().uuidString
+        switch MCPTools.dispatch(name: "send_key", arguments: ["id": uuid, "key": "f13"], server: server) {
+        case .toolError(let msg):
+            #expect(msg.contains("unknown key"))
+        default:
+            Issue.record("expected .toolError for unknown key")
+        }
+    }
+
+    @Test func dispatchSendKeyMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "send_key", arguments: ["key": "enter"], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    // Every tool's AppKit-FREE pre-hop guard: a missing/invalid id (and the other
+    // synchronous validations) must fail fast with .invalidParams / .toolError
+    // BEFORE any DispatchQueue.main.sync hop. (The send_key missing-id test above
+    // proves these guards are reachable off the main thread.)
+
+    @Test func dispatchReadSurfaceMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "read_surface", arguments: [:], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+        // Garbage (non-UUID) id is also .invalidParams (uuidArg returns nil).
+        switch MCPTools.dispatch(name: "read_surface", arguments: ["id": "not-a-uuid"], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for garbage id")
+        }
+    }
+
+    @Test func dispatchReadSurfaceUnknownModeInvalidParams() {
+        // A valid id but an unrecognized mode must be rejected explicitly (NOT
+        // silently coerced to viewport). The mode check runs before any main hop.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["id": UUID().uuidString, "mode": "full"]
+        switch MCPTools.dispatch(name: "read_surface", arguments: args, server: server) {
+        case .invalidParams(let msg):
+            #expect(msg.contains("mode"))
+        default: Issue.record("expected .invalidParams for unknown mode")
+        }
+        // A typo variant is likewise rejected.
+        let args2: [String: Any] = ["id": UUID().uuidString, "mode": "scrollbck"]
+        switch MCPTools.dispatch(name: "read_surface", arguments: args2, server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for typo'd mode")
+        }
+        // The recognized modes are NOT rejected as invalidParams (they pass the
+        // mode gate and hit the main hop, which returns .toolError for an
+        // unresolvable id in the headless test environment).
+        for mode in ["viewport", "scrollback"] {
+            let a: [String: Any] = ["id": UUID().uuidString, "mode": mode]
+            switch MCPTools.dispatch(name: "read_surface", arguments: a, server: server) {
+            case .invalidParams: Issue.record("recognized mode \(mode) must not be invalidParams")
+            default: break
+            }
+        }
+    }
+
+    @Test func dispatchSendTextMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "send_text", arguments: ["text": "hi"], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    @Test func dispatchSendTextMissingTextInvalidParams() {
+        // Valid id but no text -> .invalidParams (before any main hop).
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "send_text", arguments: ["id": UUID().uuidString], server: server) {
+        case .invalidParams(let msg):
+            #expect(msg.contains("text"))
+        default:
+            Issue.record("expected .invalidParams for missing text")
+        }
+    }
+
+    @Test func dispatchScrollMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "scroll", arguments: ["dy": 3], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    @Test func dispatchScrollMissingDyInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "scroll", arguments: ["id": UUID().uuidString], server: server) {
+        case .invalidParams(let msg):
+            #expect(msg.contains("dy"))
+        default:
+            Issue.record("expected .invalidParams for missing dy")
+        }
+    }
+
+    @Test func dispatchScrollZeroDyToolError() {
+        // A present-but-zero dy is a valid argument shape but a no-op -> .toolError.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "scroll", arguments: ["id": UUID().uuidString, "dy": 0], server: server) {
+        case .toolError(let msg):
+            #expect(msg.contains("non-zero"))
+        default:
+            Issue.record("expected .toolError for zero dy")
+        }
+    }
+
+    @Test func dispatchFocusSurfaceMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "focus_surface", arguments: [:], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    @Test func dispatchCloseSurfaceMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "close_surface", arguments: [:], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    @Test func dispatchPerformActionMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "perform_action", arguments: ["action": "mark_split"], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    @Test func dispatchPerformActionEmptyActionInvalidParams() {
+        // Valid id but an empty action string -> .invalidParams (before main hop).
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["id": UUID().uuidString, "action": ""]
+        switch MCPTools.dispatch(name: "perform_action", arguments: args, server: server) {
+        case .invalidParams(let msg):
+            #expect(msg.contains("action"))
+        default:
+            Issue.record("expected .invalidParams for empty action")
+        }
+    }
+
+    @Test func dispatchWatchPatternMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "watch_for_pattern", arguments: ["regex": "x"], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    @Test func dispatchWatchPatternEmptyRegexInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["id": UUID().uuidString, "regex": ""]
+        switch MCPTools.dispatch(name: "watch_for_pattern", arguments: args, server: server) {
+        case .invalidParams(let msg):
+            #expect(msg.contains("regex"))
+        default:
+            Issue.record("expected .invalidParams for empty regex")
+        }
+    }
+
+    @Test func dispatchWaitForEventParks() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: ["timeoutMs": 5000], server: server) {
+        case .waitForEvent(let spec):
+            #expect(spec.timeoutMs == 5000)
+            #expect(spec.ids.isEmpty)
+            #expect(spec.types.isEmpty)
+        default:
+            Issue.record("expected .waitForEvent")
+        }
+    }
+
+    @Test func dispatchWaitForEventKnownTypesPark() {
+        // All-known types still parks with the types preserved.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["filter": ["types": ["bell", "exited", "prompt"]]]
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: args, server: server) {
+        case .waitForEvent(let spec):
+            #expect(spec.types == ["bell", "exited", "prompt"])
+        default:
+            Issue.record("expected .waitForEvent")
+        }
+    }
+
+    @Test func eventMatchesPure() {
+        let upper = UUID().uuidString          // Foundation: uppercase
+        let lower = upper.lowercased()
+        // Empty filters match anything.
+        #expect(MCPEventBus.eventMatches(ids: [], types: [], eventId: upper, eventType: "bell"))
+        // Type filter (exact).
+        #expect(MCPEventBus.eventMatches(ids: [], types: ["bell"], eventId: upper, eventType: "bell"))
+        #expect(!MCPEventBus.eventMatches(ids: [], types: ["bell"], eventId: upper, eventType: "exited"))
+        // Id filter matches the uppercase event id.
+        #expect(MCPEventBus.eventMatches(ids: [upper], types: [], eventId: upper, eventType: "bell"))
+        // Id filter is CASE-INSENSITIVE: a lowercase client-supplied id still
+        // matches the uppercase event id (the prior bug: it silently never fired).
+        #expect(MCPEventBus.eventMatches(ids: [lower], types: [], eventId: upper, eventType: "bell"))
+        // A non-matching id does not match.
+        #expect(!MCPEventBus.eventMatches(ids: [UUID().uuidString], types: [], eventId: upper, eventType: "bell"))
+        // Both must hold.
+        #expect(MCPEventBus.eventMatches(ids: [lower], types: ["bell"], eventId: upper, eventType: "bell"))
+        #expect(!MCPEventBus.eventMatches(ids: [lower], types: ["exited"], eventId: upper, eventType: "bell"))
+    }
+
+    @Test func dispatchWaitForEventUnknownTypeInvalidParams() {
+        // A typo'd event type fails fast rather than timing out after 30s.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["filter": ["types": ["bell", "bogus"]]]
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: args, server: server) {
+        case .invalidParams(let msg):
+            #expect(msg.contains("bogus"))
+        default:
+            Issue.record("expected .invalidParams for unknown event type")
+        }
+    }
+
+    // MARK: - timeout clamping
+
+    @Test func clampTimeoutMsPure() {
+        // Within bounds: unchanged.
+        #expect(MCPEventBus.clampTimeoutMs(5_000) == 5_000)
+        #expect(MCPEventBus.clampTimeoutMs(MCPEventBus.timeoutFloorMs) == MCPEventBus.timeoutFloorMs)
+        #expect(MCPEventBus.clampTimeoutMs(MCPEventBus.timeoutCeilingMs) == MCPEventBus.timeoutCeilingMs)
+        // Above ceiling: clamped down (the 24h-park starvation case).
+        #expect(MCPEventBus.clampTimeoutMs(86_400_000) == MCPEventBus.timeoutCeilingMs)
+        // Below floor (incl. zero and negative): clamped up.
+        #expect(MCPEventBus.clampTimeoutMs(0) == MCPEventBus.timeoutFloorMs)
+        #expect(MCPEventBus.clampTimeoutMs(-1) == MCPEventBus.timeoutFloorMs)
+        #expect(MCPEventBus.clampTimeoutMs(10) == MCPEventBus.timeoutFloorMs)
+        // Non-finite (NaN / +inf / -inf) collapses to the in-range default.
+        #expect(MCPEventBus.clampTimeoutMs(.nan) == 30_000)
+        #expect(MCPEventBus.clampTimeoutMs(.infinity) == 30_000)
+        #expect(MCPEventBus.clampTimeoutMs(-.infinity) == 30_000)
+    }
+
+    @Test func clampCeilingBelowShimTimeout() {
+        // The server ceiling MUST stay strictly below the shim's 180s URLSession
+        // timeout so the shim never reports a spurious transport error while the
+        // server still holds a waiter parked.
+        #expect(MCPEventBus.timeoutCeilingMs < 180_000)
+        #expect(MCPEventBus.timeoutFloorMs > 0)
+        #expect(MCPEventBus.timeoutFloorMs < MCPEventBus.timeoutCeilingMs)
+    }
+
+    @Test func dispatchWaitForEventClampsHugeTimeout() {
+        // A degenerate huge timeoutMs would park a connection (idle-watchdog
+        // exempt) up to the 32-conn cap = starvation. It must be clamped.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: ["timeoutMs": 86_400_000], server: server) {
+        case .waitForEvent(let spec):
+            #expect(spec.timeoutMs == MCPEventBus.timeoutCeilingMs)
+        default:
+            Issue.record("expected .waitForEvent with clamped timeout")
+        }
+    }
+
+    @Test func dispatchWaitForEventClampsZeroTimeout() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: ["timeoutMs": 0], server: server) {
+        case .waitForEvent(let spec):
+            #expect(spec.timeoutMs == MCPEventBus.timeoutFloorMs)
+        default:
+            Issue.record("expected .waitForEvent with clamped timeout")
+        }
+    }
+
+    @Test func dispatchWatchPatternClampsHugeTimeout() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["id": UUID().uuidString, "regex": "x", "timeoutMs": 86_400_000]
+        switch MCPTools.dispatch(name: "watch_for_pattern", arguments: args, server: server) {
+        case .watchPattern(let spec):
+            #expect(spec.timeoutMs == MCPEventBus.timeoutCeilingMs)
+        default:
+            Issue.record("expected .watchPattern with clamped timeout")
+        }
+    }
+
+    @Test func dispatchWatchPatternInvalidRegexToolError() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["id": UUID().uuidString, "regex": "([unclosed"]
+        switch MCPTools.dispatch(name: "watch_for_pattern", arguments: args, server: server) {
+        case .toolError(let msg):
+            #expect(msg.contains("invalid regex"))
+        default:
+            Issue.record("expected .toolError for invalid regex")
+        }
+    }
+
+    // MARK: - HTTPResponse.empty
+
+    @Test func httpResponseEmptyBody() {
+        let r = MCPServer.HTTPResponse.empty(202, "Accepted")
+        #expect(r.body == Data())
+        #expect(r.statusCode == 202)
+        #expect(r.reason == "Accepted")
+    }
+
+    // MARK: - Host-header guard
+
+    @Test func hostHeaderAllowedLoopback() {
+        #expect(MCPServer.hostHeaderAllowed("localhost:8765", configuredHost: "127.0.0.1", configuredPort: 8765))
+        #expect(MCPServer.hostHeaderAllowed("127.0.0.1:8765", configuredHost: "100.1.2.3", configuredPort: 8765))
+    }
+
+    @Test func hostHeaderAllowedExactMatch() {
+        #expect(MCPServer.hostHeaderAllowed("100.1.2.3:8765", configuredHost: "100.1.2.3", configuredPort: 8765))
+    }
+
+    @Test func hostHeaderRejectsOther() {
+        #expect(!MCPServer.hostHeaderAllowed("evil.example.com:8765", configuredHost: "127.0.0.1", configuredPort: 8765))
+        // Wrong port rejected.
+        #expect(!MCPServer.hostHeaderAllowed("127.0.0.1:9999", configuredHost: "127.0.0.1", configuredPort: 8765))
+    }
+
+    // MARK: - tokensMatch (constant-time)
+
+    @Test func tokensMatchConstantTime() {
+        #expect(MCPServer.tokensMatch("abc123", "abc123"))
+        #expect(!MCPServer.tokensMatch("abc123", "abc124"))
+        #expect(!MCPServer.tokensMatch("abc", "abcd"))  // length mismatch
+        #expect(!MCPServer.tokensMatch("", "x"))
+        #expect(MCPServer.tokensMatch("", ""))
+    }
+
+    // MARK: - tokenAcceptable (startup token-strength gate)
+
+    @Test func tokenAcceptableLengthFloor() {
+        #expect(!MCPServer.tokenAcceptable("short"))
+        #expect(!MCPServer.tokenAcceptable(String(repeating: "x", count: MCPServer.minTokenLength - 1)))
+        #expect(MCPServer.tokenAcceptable(String(repeating: "x", count: MCPServer.minTokenLength)))
+    }
+
+    // MARK: - get_layout split serializer (nodeJSON direction mapping)
+
+    // nodeJSON's .leaf branch and full recursion need a real SurfaceView (a live
+    // ghostty surface) which is not constructible in a unit test. The only
+    // non-trivial branch logic — the split direction -> string mapping — was
+    // extracted into the pure, ViewType-independent `directionString` helper and
+    // is asserted here. This is the mapping every .split node in get_layout's tree
+    // emits.
+    @Test func nodeJSONDirectionString() {
+        #expect(MCPLayout.directionString(.horizontal) == "horizontal")
+        #expect(MCPLayout.directionString(.vertical) == "vertical")
+    }
+
+    // MARK: - tools/call result shaping (toolContent / toolTextContent)
+
+    @Test func toolTextContentShape() {
+        let r = MCPServer.toolTextContent("hello", isError: true)
+        let content = r["content"] as! [[String: Any]]
+        #expect(content.count == 1)
+        #expect(content[0]["type"] as? String == "text")
+        #expect(content[0]["text"] as? String == "hello")
+        #expect(r["isError"] as? Bool == true)
+    }
+
+    @Test func toolContentJSONEncodesPayload() {
+        let r = MCPServer.toolContent(["ok": true], isError: false)
+        #expect(r["isError"] as? Bool == false)
+        let content = r["content"] as! [[String: Any]]
+        let text = content[0]["text"] as! String
+        // The text block is the JSON-encoded payload.
+        let decoded = try! JSONSerialization.jsonObject(with: Data(text.utf8)) as! [String: Any]
+        #expect(decoded["ok"] as? Bool == true)
+    }
+
+    // MARK: - uuidArg
+
+    @Test func uuidArgValidAndInvalid() {
+        let u = UUID()
+        #expect(MCPTools.uuidArg(["id": u.uuidString]) == u)
+        #expect(MCPTools.uuidArg(["id": "not-a-uuid"]) == nil)
+        #expect(MCPTools.uuidArg([:]) == nil)
+        #expect(MCPTools.uuidArg(["id": 123]) == nil)  // non-string
+    }
+}

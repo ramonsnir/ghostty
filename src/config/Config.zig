@@ -3185,6 +3185,28 @@ keybind: Keybinds = .{},
 /// ROTATE it and relaunch. Fork-only key — keep it in `~/.config/ghostty-ramon/config`.
 @"web-monitor-token": ?[:0]const u8 = null,
 
+/// (ramon fork) Listen address (`addr:port`) for the embedded MCP server, an
+/// in-app HTTP server that lets an orchestrating agent (e.g. Claude Code via the
+/// `ghostty-mcp` stdio shim) read live terminal surfaces and control splits/tabs.
+/// Empty/null (the default) DISABLES the server entirely. This is a BIND address
+/// (which port/interface to listen on), NOT an access-control allowlist:
+/// `NWListener` binds the PORT on all interfaces regardless of the host you give,
+/// so the host here does not filter who can connect. Bind localhost (e.g.
+/// `127.0.0.1:8765`) or a tailnet IP; reachability is your network's job.
+/// Fork-only key — keep it in `~/.config/ghostty-ramon/config` (an official
+/// Ghostty would error on it).
+@"mcp-listen": ?[:0]const u8 = null,
+
+/// (ramon fork) Optional shared secret for the MCP server, presented as the
+/// `X-Ghostty-Token` header on `POST /mcp`. If EMPTY/null the server runs OPEN
+/// (it logs a warning) and access control is the bound localhost/tailnet alone;
+/// if SET it is fully enforced (constant-time compare) with a per-peer
+/// failed-token backoff. This credential is LOAD-BEARING: a holder can spawn
+/// tabs and run shell commands, so treat it as a shell-execution credential and
+/// bind localhost or a tailnet only. If it leaks, ROTATE it and relaunch.
+/// Fork-only key — keep it in `~/.config/ghostty-ramon/config`.
+@"mcp-token": ?[:0]const u8 = null,
+
 /// If `audio` is an enabled bell feature, this is a path to an audio file. If
 /// the path is not absolute, it is considered relative to the directory of the
 /// configuration file that it is referenced from, or from the current working
@@ -11196,5 +11218,31 @@ test "web-monitor: parse and default" {
         try cfg.finalize();
         try testing.expectEqualStrings("100.1.2.3:8787", cfg.@"web-monitor-listen".?);
         try testing.expectEqualStrings("secret", cfg.@"web-monitor-token".?);
+    }
+}
+
+test "mcp: parse and default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expect(cfg.@"mcp-listen" == null);
+        try testing.expect(cfg.@"mcp-token" == null);
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--mcp-listen=127.0.0.1:8765",
+            "--mcp-token=supersecrettoken1234",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqualStrings("127.0.0.1:8765", cfg.@"mcp-listen".?);
+        try testing.expectEqualStrings("supersecrettoken1234", cfg.@"mcp-token".?);
     }
 }
