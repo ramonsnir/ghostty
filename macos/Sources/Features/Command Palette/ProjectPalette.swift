@@ -68,47 +68,9 @@ struct ProjectPaletteView: View {
             )]
         }
 
-        let fm = FileManager.default
-        var seen = Set<String>()
-        var options: [CommandOption] = []
+        let paths = Self.discoverProjectPaths(bases: projectDirectories)
 
-        for base in projectDirectories {
-            let expanded = (base as NSString).expandingTildeInPath
-            let baseURL = URL(fileURLWithPath: expanded)
-            guard let entries = try? fm.contentsOfDirectory(
-                at: baseURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
-
-            for url in entries {
-                guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey]),
-                      values.isDirectory == true else { continue }
-
-                // Dedupe across bases by canonical path.
-                let canonical = url.standardizedFileURL.path
-                guard seen.insert(canonical).inserted else { continue }
-
-                let path = url.path
-                options.append(CommandOption(
-                    title: url.lastPathComponent,
-                    subtitle: path.abbreviatedPath,
-                    leadingIcon: "folder"
-                ) {
-                    var config = Ghostty.SurfaceConfiguration()
-                    config.workingDirectory = path
-                    NotificationCenter.default.post(
-                        name: Ghostty.Notification.ghosttyNewTab,
-                        object: surfaceView,
-                        userInfo: [
-                            Ghostty.Notification.NewSurfaceConfigKey: config,
-                        ]
-                    )
-                })
-            }
-        }
-
-        guard !options.isEmpty else {
+        guard !paths.isEmpty else {
             Ghostty.logger.warning("project selector found no project directories under the configured bases")
             return [emptyStateOption(
                 title: "No projects found",
@@ -116,9 +78,78 @@ struct ProjectPaletteView: View {
             )]
         }
 
-        return options.sorted {
-            $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        return paths.map { path in
+            CommandOption(
+                title: (path as NSString).lastPathComponent,
+                subtitle: path.abbreviatedPath,
+                leadingIcon: "folder"
+            ) {
+                var config = Ghostty.SurfaceConfiguration()
+                config.workingDirectory = path
+                NotificationCenter.default.post(
+                    name: Ghostty.Notification.ghosttyNewTab,
+                    object: surfaceView,
+                    userInfo: [
+                        Ghostty.Notification.NewSurfaceConfigKey: config,
+                    ]
+                )
+            }
         }
+    }
+
+    /// (testable, pure filesystem) Discover the project directories under the
+    /// given base directories: each base's immediate children that are real
+    /// directories OR symlinks resolving to a directory. Deduped across bases
+    /// by path, sorted case-insensitively by the displayed name (last path
+    /// component). Bases are tilde-expanded; unreadable bases are skipped.
+    static func discoverProjectPaths(
+        bases: [String],
+        fileManager fm: FileManager = .default
+    ) -> [String] {
+        var seen = Set<String>()
+        var paths: [String] = []
+
+        for base in bases {
+            let expanded = (base as NSString).expandingTildeInPath
+            let baseURL = URL(fileURLWithPath: expanded)
+            guard let entries = try? fm.contentsOfDirectory(
+                at: baseURL,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            for url in entries {
+                guard Self.isProjectDirectory(url, fileManager: fm) else { continue }
+
+                // Dedupe across bases by canonical path.
+                let canonical = url.standardizedFileURL.path
+                guard seen.insert(canonical).inserted else { continue }
+
+                paths.append(url.path)
+            }
+        }
+
+        return paths.sorted {
+            ($0 as NSString).lastPathComponent
+                .localizedCaseInsensitiveCompare(($1 as NSString).lastPathComponent) == .orderedAscending
+        }
+    }
+
+    /// (testable) Whether a directory entry qualifies as a project: a real
+    /// directory, or a symlink whose final target is a directory. Symlinks to
+    /// files and dangling (broken) symlinks are excluded. `.isDirectoryKey`
+    /// reports on the symlink itself (not its target), so a symlink-to-folder
+    /// would otherwise be dropped — hence the explicit follow.
+    static func isProjectDirectory(_ url: URL, fileManager fm: FileManager = .default) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        if values?.isDirectory == true { return true }
+        guard values?.isSymbolicLink == true else { return false }
+
+        // Follow the symlink: fileExists(atPath:isDirectory:) uses stat (which
+        // follows symlinks), so this is true only when the final target exists
+        // and is a directory — not a file, and not a dangling link.
+        var isDir: ObjCBool = false
+        return fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
     }
 
     /// An informational, no-op row used when there is nothing to show.
