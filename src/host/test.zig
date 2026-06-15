@@ -1121,6 +1121,49 @@ test "host RawOutput/SubscribeRaw decode robustness (truncated/oversized -> erro
     }
 }
 
+test "host SubscribeRender frame round-trip (Layer 1)" {
+    const alloc = testing.allocator;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // SubscribeRender (GUI->host): bare session id, SessionIdFrame shape — same
+    // as SubscribeRaw. Round-trip the tag + payload through the FrameReader.
+    const orig: protocol.SubscribeRender = .{ .session_id = 424242 };
+    const framed = try protocol.encodeFrame(alloc, .subscribe_render, orig);
+    defer alloc.free(framed);
+    const tag = try feedOneByteAtATime(alloc, framed, &payload);
+    try testing.expectEqual(protocol.FrameType.subscribe_render, tag);
+    const dec = try protocol.SubscribeRender.decode(alloc, payload.items);
+    try testing.expectEqual(orig.session_id, dec.session_id);
+}
+
+test "host protocol minor bumped to 2 for subscribe_render (Layer 1)" {
+    try testing.expectEqual(@as(u16, 2), protocol.PROTOCOL_VERSION_MINOR);
+    try testing.expectEqual(@as(u16, 1), protocol.PROTOCOL_VERSION_MAJOR);
+    // raw_output tag integer must be unchanged (wire stability): subscribe_render
+    // was appended AFTER it, so its integer is strictly greater. This guards R-D
+    // (no mid-enum insert silently renumbering the just-shipped raw-tee).
+    try testing.expect(@intFromEnum(protocol.FrameType.subscribe_render) >
+        @intFromEnum(protocol.FrameType.raw_output));
+    // Tighter pin: subscribe_render is the LAST variant and immediately follows
+    // raw_output, so the gap is exactly 1. A future mid-enum insert landing
+    // BETWEEN raw_output and subscribe_render (renumbering subscribe_render while
+    // leaving the `>` assertion green) would break this exact-adjacency check.
+    try testing.expectEqual(
+        @intFromEnum(protocol.FrameType.raw_output) + 1,
+        @intFromEnum(protocol.FrameType.subscribe_render),
+    );
+}
+
+test "host SubscribeRender decode robustness (truncated -> error, no panic) Layer 1" {
+    const alloc = testing.allocator;
+    // A payload shorter than the u64 session_id must error (readInt EndOfStream),
+    // never panic — the dispatch arm propagates the error to readLoop, which
+    // closes the conn cleanly; the session survives.
+    const short = [_]u8{0} ** 4; // < 8 bytes
+    try testing.expectError(error.EndOfStream, protocol.SubscribeRender.decode(alloc, &short));
+}
+
 test "host RawRing append/evict/snapshot bounded at the cap (H1)" {
     const alloc = testing.allocator;
     const cap = Session.RAW_RING_BYTES;
@@ -2388,6 +2431,1183 @@ test "host socket integration: subscribe_raw replay + live raw_output delivery (
             }
         }
         try testing.expect(found_live);
+    }
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: subscribe_render seed + live dual fan-out + read-only (Layer 1)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrnd.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // PRIMARY conn: hello + attach (spawns the session). It is the only conn that
+    // ever drives the session (input); the render-sub below is read-only.
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rnd" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    // Record the primary's grid size from the Attached frame — this is the
+    // read-only baseline (the render-sub must not reflow it).
+    var cols0: u16 = 0;
+    var rows0: u16 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                cols0 = a.cols;
+                rows0 = a.rows;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+        try testing.expect(cols0 != 0);
+        try testing.expect(rows0 != 0);
+    }
+
+    // Drive a marker through the child and wait for it on a grid_frame on the
+    // PRIMARY, so we know the session is live and rendering BEFORE we subscribe.
+    const marker = "RENDER_SEED_MARKER";
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'RENDER_SEED_MARKER\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+
+    // SECOND conn: hello + subscribe_render. It ONLY ever sends hello +
+    // subscribe_render — never attach/input/resize — so by construction it is the
+    // read-only mirror's exact wire behavior (R-A).
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rndc);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rnd2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+
+    // SEED ASSERTION: pushFullFramesTo immediately writes a mode_frame AND a
+    // grid_frame to the render-sub. The seeded grid_frame's snapshot already
+    // carries the marker (it was on screen at subscribe time). Also capture the
+    // seeded grid dims for the read-only baseline cross-check.
+    var seen_seed_mode = false;
+    var seen_seed_grid = false;
+    var seed_cols: u16 = 0;
+    var seed_rows: u16 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse continue;
+            switch (tag) {
+                .mode_frame => seen_seed_mode = true,
+                .grid_frame => {
+                    var gf = try protocol.GridFrame.decode(alloc, payload.items);
+                    defer gf.deinit(alloc);
+                    if (try snapshotContainsMarker(alloc, &gf.snapshot, marker)) {
+                        seen_seed_grid = true;
+                        seed_cols = gf.snapshot.cols;
+                        seed_rows = gf.snapshot.rows;
+                    }
+                },
+                else => {},
+            }
+            if (seen_seed_mode and seen_seed_grid) break;
+        }
+        try testing.expect(seen_seed_mode);
+        try testing.expect(seen_seed_grid);
+    }
+
+    // READ-ONLY NEGATIVE (R-A): the render-sub never sent a resize (no resize on
+    // its wire), so the session grid is UNCHANGED — the seeded grid dims equal the
+    // primary's Attached baseline. Subscribing + receiving frames did not reflow.
+    //
+    // NOTE (R-A, spec §0 + read-only host gate): this asserts that `subscribe_render`
+    // + receiving frames does NOT itself mutate the grid. Layer 1 ALSO enforces
+    // read-only AT THE HOST: a render-ONLY conn (on render_subscribers but not
+    // subscribers) that DID send a `.resize` has it DROPPED by the dispatch arm via
+    // Conn.isRenderOnlySubscriber (a conn-LOCAL, lock-free membership check) —
+    // pinned by the separate
+    // "render-only conn resize is REJECTED host-side (read-only gate)" test below.
+    try testing.expectEqual(cols0, seed_cols);
+    try testing.expectEqual(rows0, seed_rows);
+
+    // LIVE DUAL FAN-OUT: drive a NEW marker on the PRIMARY and assert it arrives
+    // as a grid_frame on BOTH the primary conn and the render-sub conn — proving
+    // onRender's SECOND loop over render_subscribers (not just the seed).
+    const live_marker = "RENDER_LIVE_MARKER";
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'RENDER_LIVE_MARKER\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, live_marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found); // primary
+    }
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, live_marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found); // render-sub (the second onRender loop)
+    }
+
+    // Close the session, tearing it down. The render-sub conn is on
+    // render_subscribers; teardownEntry must clear it under e.mutex BEFORE any
+    // Conn is freed (no broadcast-after-free). A UAF/leak would fail the test
+    // allocator / safety build below.
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: render-only conn resize is REJECTED host-side (read-only gate) (Layer 1)" {
+    // HARD-INVARIANT test for the R-A resolution (spec §0 + the read-only host-side
+    // gate): the prompt's verbatim hard invariant says "a resize frame from such a
+    // conn must not change session grid size". Layer 1 enforces this AT THE HOST via
+    // Conn.isRenderOnlySubscriber: a conn that subscribed_render to this session but
+    // did NOT attach (the web-monitor mirror's exact wire profile — it only ever
+    // sends hello + subscribe_render) is read-only, and the `.resize` dispatch arm
+    // DROPS its resize. So even a compromised/buggy mirror that DID send a `.resize`
+    // can never reflow the real session grid (and discard scrollback). This test
+    // sends a resize from a render-ONLY conn and asserts the session grid stays at
+    // the spawn baseline. A future change that removes the gate (regressing the
+    // invariant) fails here.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndr.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // PRIMARY: hello + attach -> spawn the session, record the baseline grid.
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndr" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    var cols0: u16 = 0;
+    var rows0: u16 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                cols0 = a.cols;
+                rows0 = a.rows;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+        try testing.expect(cols0 != 0);
+        try testing.expect(rows0 != 0);
+    }
+
+    // SECOND conn: hello + subscribe_render (the render-sub). It then sends a
+    // `.resize` to a DIFFERENT grid — something the real read-only mirror would
+    // NEVER do, and which the host now REJECTS via the read-only gate (this conn
+    // is on render_subscribers but never attached, so it is render-only).
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rndc);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rndr2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+
+    // Pick a NEW grid distinct from the spawn baseline (exact cell multiples so
+    // the host's screen_w/h ÷ cell derivation lands on these integers).
+    const new_cols: u16 = if (cols0 == 100) 90 else 100;
+    const new_rows: u16 = if (rows0 == 40) 30 else 40;
+    const cw: u32 = 8;
+    const ch: u32 = 16;
+    try clientSend(alloc, rndc, .resize, protocol.Resize{
+        .session_id = session_id,
+        .cols = new_cols,
+        .rows = new_rows,
+        .cell_width = cw,
+        .cell_height = ch,
+        .screen_w = new_cols * cw,
+        .screen_h = new_rows * ch,
+    });
+
+    // Give the (rejected) resize ample time to flow IF it were going to — so a
+    // regression that drops the gate would actually reflow before we re-read.
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // The host REJECTED the render-only conn's resize: a fresh reattach reports the
+    // UNCHANGED spawn baseline grid, not the new grid the render-sub requested.
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+
+    const client2 = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client2);
+    try connectUnix(client2, sock_path);
+    setRecvTimeout(client2);
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+
+    try clientSend(alloc, client2, .hello, protocol.Hello{ .identity_bundle_id = "test.rndr3" });
+    {
+        const tag = (try pollNext(&rdr2, alloc, client2, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client2, .attach, protocol.Attach{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var got_cols: u16 = 0;
+        var got_rows: u16 = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                got_cols = a.cols;
+                got_rows = a.rows;
+                break;
+            }
+        }
+        // HARD INVARIANT: the render-only conn's resize was REJECTED, so the grid
+        // is still the spawn baseline (NOT the new grid the render-sub requested).
+        // A regression that removes the read-only gate would reflow to new_*,
+        // failing these assertions.
+        try testing.expectEqual(cols0, got_cols);
+        try testing.expectEqual(rows0, got_rows);
+        try testing.expect(got_cols != new_cols or got_rows != new_rows);
+    }
+
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: render-only conn input is DROPPED host-side (read-only gate) (Layer 1)" {
+    // Companion to the resize-rejection test, covering the `.input` arm of the
+    // read-only gate (Conn.isRenderOnlySubscriber). A render-ONLY conn (subscribed
+    // _render but never attached) that sends `.input` must have it DROPPED — a
+    // compromised/buggy mirror can never feed keystrokes to the real session. We
+    // send a unique marker as input from the render-sub and assert it NEVER appears
+    // on the PRIMARY's grid_frames within the scan window; then we send the SAME
+    // marker as input from the PRIMARY (which IS allowed) and assert it DOES appear,
+    // proving the negative above is the gate, not a dead input path.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndinp.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndinp" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // Render-ONLY conn: hello + subscribe_render, then attempt input.
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rndc);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rndinp2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+
+    // The render-sub sends input that, IF accepted, would echo a unique marker on
+    // the session screen. The gate must DROP it.
+    const blocked_marker = "RENDERONLY_INPUT_BLOCKED";
+    try clientSend(alloc, rndc, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'RENDERONLY_INPUT_BLOCKED\\n'\n",
+    });
+
+    // Scan the PRIMARY's grid_frames: the blocked marker must NEVER appear.
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, blocked_marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(!found); // render-only input was dropped by the gate
+    }
+
+    // POSITIVE control: the PRIMARY (attached, full rights) sends the SAME marker
+    // as input — it MUST be accepted and appear, proving the negative above is the
+    // read-only gate and not a broken input path.
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'RENDERONLY_INPUT_BLOCKED\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, blocked_marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found); // primary input accepted
+    }
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: render-only conn close is DROPPED, session survives (read-only gate) (Layer 1)" {
+    // The most safety-critical arm of the read-only gate: a render-ONLY conn must
+    // NEVER be able to CLOSE (destroy) the real session. The gate lives in
+    // handleClose (a conn-local membership check BEFORE fetchRemove). This test
+    // subscribes a render-only conn, has it send `.close`, then proves the session
+    // SURVIVES by reattaching a fresh conn and getting an `.attached` for the SAME
+    // session_id. A regression that removed/inverted the close gate would tear the
+    // session down and the reattach would spawn a DIFFERENT session (different id)
+    // or fail, failing the assertion.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndcls.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndcls" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // Render-ONLY conn: hello + subscribe_render, then attempt `.close`.
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rndc);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rndcls2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+    // The render-only conn attempts to destroy the session. The gate drops it.
+    try clientSend(alloc, rndc, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // PROVE SURVIVAL: detach the primary, then reattach a fresh conn by session_id.
+    // If the close had been (wrongly) honored, the session would be gone and this
+    // reattach would not return an `.attached` for the SAME id.
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+
+    const client2 = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client2);
+    try connectUnix(client2, sock_path);
+    setRecvTimeout(client2);
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+    try clientSend(alloc, client2, .hello, protocol.Hello{ .identity_bundle_id = "test.rndcls3" });
+    {
+        const tag = (try pollNext(&rdr2, alloc, client2, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client2, .attach, protocol.Attach{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var reattached = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                // Same session_id => the render-only `.close` was dropped and the
+                // session survived (a torn-down session would yield a new id or no
+                // reattach).
+                try testing.expectEqual(session_id, a.session_id);
+                reattached = true;
+                break;
+            }
+        }
+        try testing.expect(reattached);
+    }
+
+    // Now a REAL close from the attached (full-rights) conn tears it down.
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: dual-role conn (attached + subscribe_render) KEEPS full mutation rights (Layer 1)" {
+    // The gate's correctness hinge: Conn.isRenderOnlySubscriber returns false for a
+    // conn that is on BOTH subscribed AND subscribed_render (a real GUI that also
+    // mirrors itself), so it KEEPS full mutation rights. If the second
+    // (`!subscribed.contains`) scan regressed, every attached-and-render-subscribed
+    // GUI would silently lose ALL mutation ability. This positive test attaches a
+    // conn, subscribe_renders the SAME session on that same conn, sends a valid
+    // resize, and asserts the session DID reflow to the new grid.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrnddual.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rnddual" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    var cols0: u16 = 0;
+    var rows0: u16 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                cols0 = a.cols;
+                rows0 = a.rows;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+        try testing.expect(cols0 != 0);
+        try testing.expect(rows0 != 0);
+    }
+
+    // SAME conn subscribe_renders => it is on BOTH lists (dual role). It must KEEP
+    // full mutation rights (isRenderOnlySubscriber == false).
+    try clientSend(alloc, client, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+
+    // Send a VALID resize from this dual-role conn to a NEW (well-formed) grid.
+    const new_cols: u16 = if (cols0 == 100) 90 else 100;
+    const new_rows: u16 = if (rows0 == 40) 30 else 40;
+    const cw: u32 = 8;
+    const ch: u32 = 16;
+    try clientSend(alloc, client, .resize, protocol.Resize{
+        .session_id = session_id,
+        .cols = new_cols,
+        .rows = new_rows,
+        .cell_width = cw,
+        .cell_height = ch,
+        .screen_w = new_cols * cw,
+        .screen_h = new_rows * ch,
+    });
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // Reattach a fresh conn and assert the grid REFLOWED to the new size — proving
+    // the dual-role conn KEPT its resize rights (the gate did not fire).
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+
+    const client2 = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client2);
+    try connectUnix(client2, sock_path);
+    setRecvTimeout(client2);
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+    try clientSend(alloc, client2, .hello, protocol.Hello{ .identity_bundle_id = "test.rnddual2" });
+    {
+        const tag = (try pollNext(&rdr2, alloc, client2, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client2, .attach, protocol.Attach{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var got_cols: u16 = 0;
+        var got_rows: u16 = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                got_cols = a.cols;
+                got_rows = a.rows;
+                break;
+            }
+        }
+        // The dual-role conn KEPT mutation rights: the session reflowed to new_*.
+        try testing.expectEqual(new_cols, got_cols);
+        try testing.expectEqual(new_rows, got_rows);
+    }
+
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: detach removes the render subscriber cleanly (Layer 1)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndd.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // hello + attach (spawn).
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndd" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // The SAME conn that attached also subscribe_renders this session (it is on
+    // both `subscribers` and `render_subscribers`). The seed pair arrives.
+    try clientSend(alloc, client, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var seen_grid = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .grid_frame) {
+                seen_grid = true;
+                break;
+            }
+        }
+        try testing.expect(seen_grid);
+    }
+
+    // Detach: the .detach arm runs removeRenderSubscriber + subscribed_render
+    // remove (alongside the grid/raw removal). The session's child stays alive;
+    // server.deinit then teardownEntry's e.mutex clear runs over a now-empty
+    // render_subscribers list. A leak / double-free / UAF would fail the safety
+    // allocator below — the test completing IS the assertion (mirrors §4.5).
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Close to tear the (still-alive) session down before deinit.
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: subscribe_render seeds an IDLE session (no input driven) (Layer 1)" {
+    // ISOLATION test for pushFullFramesTo (the core of Layer 1): subscribe to a
+    // QUIESCENT session — the render-sub drives NO input and the primary drives
+    // NO input after attach — and assert a mode_frame AND a grid_frame still
+    // arrive. Because nothing forces a live onRender tick, the ONLY thing that can
+    // deliver this pair is the explicit pushFullFramesTo seed. If the seed path
+    // were removed/broken, no live tick would substitute for it and this would
+    // fail — closing the gap that the "seed marker still on screen" assertion in
+    // the dual-fan-out test cannot (a coincidental live tick could satisfy that).
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndi.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // PRIMARY conn: hello + attach (spawns the session), then go QUIET.
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndi" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    var cols0: u16 = 0;
+    var rows0: u16 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                cols0 = a.cols;
+                rows0 = a.rows;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+        try testing.expect(cols0 != 0);
+        try testing.expect(rows0 != 0);
+    }
+
+    // Let any initial shell-prompt render activity settle so the session is as
+    // quiescent as a real idle session would be when a mirror subscribes.
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+
+    // SECOND conn (render-ONLY): hello + subscribe_render, then drive NOTHING.
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rndc);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rndi2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+
+    // SEED ASSERTION (idle): a mode_frame AND a grid_frame arrive even though NO
+    // input was driven after attach — they can ONLY be the pushFullFramesTo seed.
+    var seen_seed_mode = false;
+    var seen_seed_grid = false;
+    var seed_cols: u16 = 0;
+    var seed_rows: u16 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse continue;
+            switch (tag) {
+                .mode_frame => seen_seed_mode = true,
+                .grid_frame => {
+                    var gf = try protocol.GridFrame.decode(alloc, payload.items);
+                    defer gf.deinit(alloc);
+                    seen_seed_grid = true;
+                    seed_cols = gf.snapshot.cols;
+                    seed_rows = gf.snapshot.rows;
+                },
+                else => {},
+            }
+            if (seen_seed_mode and seen_seed_grid) break;
+        }
+        try testing.expect(seen_seed_mode);
+        try testing.expect(seen_seed_grid);
+    }
+    // Read-only: the idle seed reports the unchanged baseline grid.
+    try testing.expectEqual(cols0, seed_cols);
+    try testing.expectEqual(rows0, seed_rows);
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: detach STOPS the render stream (Layer 1)" {
+    // EFFECT test for removeRenderSubscriber (complements the cleanliness test):
+    // a render-ONLY conn (never attached, so it is NOT on `subscribers`) subscribes,
+    // gets its seed, then detaches. After detach, driving NEW output on the primary
+    // must NOT produce a grid_frame on the render-sub — proving the .detach arm
+    // actually removed it from render_subscribers. A regression where
+    // removeRenderSubscriber silently failed would keep delivering frames here and
+    // fail the assertion. (The other detach test uses the attaching conn, which
+    // keeps getting frames via the attach path regardless, so it cannot catch this.)
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrnds.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // PRIMARY conn: hello + attach (spawns + drives the session).
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rnds" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                session_id = (try protocol.Attached.decode(alloc, payload.items)).session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // SECOND conn (render-ONLY): hello + subscribe_render. It NEVER attaches, so it
+    // is on render_subscribers only — the ONLY path that delivers grid_frames to it.
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rndc);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rnds2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+    // Drain the seed (and confirm a grid_frame DOES arrive while subscribed).
+    {
+        var i: usize = 0;
+        var seen_grid = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse continue;
+            if (tag == .grid_frame) {
+                seen_grid = true;
+                break;
+            }
+        }
+        try testing.expect(seen_grid);
+    }
+
+    // DETACH the render-only conn -> removeRenderSubscriber drops it.
+    try clientSend(alloc, rndc, .detach, protocol.Detach{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    // Drain anything still in flight from before the detach so the post-detach
+    // scan below only sees frames produced AFTER removeRenderSubscriber ran.
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            _ = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse break;
+        }
+    }
+
+    // Drive NEW output on the PRIMARY (confirm the primary still renders it).
+    const live_marker = "DETACHED_NO_DELIVER";
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'DETACHED_NO_DELIVER\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, live_marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found); // primary still receives (session is live)
+    }
+
+    // EFFECT ASSERTION: the detached render-sub must NOT receive a grid_frame
+    // carrying the new marker. Scan its socket; a marker hit means the detach
+    // failed to stop the stream.
+    {
+        var i: usize = 0;
+        var leaked = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, live_marker)) {
+                leaked = true;
+                break;
+            }
+        }
+        try testing.expect(!leaked);
+    }
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: disconnect (no detach) stops the render stream (Layer 1)" {
+    // EFFECT test for the unsubscribeAll render-cleanup branch (spec §2.10): a
+    // render-ONLY conn (never attached, on render_subscribers only) subscribes,
+    // gets its seed, then the SOCKET IS CLOSED WITHOUT a .detach frame. The host's
+    // readLoop hits EOF and calls unsubscribeAll, whose `conn.subscribed_render`
+    // loop must drop the conn from e.render_subscribers BEFORE the reaper frees it.
+    //
+    // The regression this catches: if the render branch of unsubscribeAll were
+    // no-op'd, the freed *Conn would stay on render_subscribers and the NEXT
+    // onRender would writeFramed to a freed conn -> use-after-free, surfaced by the
+    // safety allocator when we drive fresh output on the primary below. (The detach
+    // test exercises the .detach arm's removeRenderSubscriber; this one exercises
+    // the DIFFERENT disconnect-without-detach path through unsubscribeAll, which was
+    // previously only hit racily at server.deinit and never asserted.)
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndd.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // PRIMARY conn: hello + attach (spawns + drives the session).
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndd" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                session_id = (try protocol.Attached.decode(alloc, payload.items)).session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // SECOND conn (render-ONLY): hello + subscribe_render, then drain the seed so we
+    // know it is registered on render_subscribers (the only list that can deliver to
+    // it). It is NOT wrapped in a defer-close: we close it explicitly mid-test.
+    const rndc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    try connectUnix(rndc, sock_path);
+    setRecvTimeout(rndc);
+    var rndrdr: ClientReader = .{};
+    defer rndrdr.deinit(alloc);
+
+    try clientSend(alloc, rndc, .hello, protocol.Hello{ .identity_bundle_id = "test.rndd2" });
+    {
+        const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rndc, .subscribe_render, protocol.SubscribeRender{ .session_id = session_id });
+    {
+        var i: usize = 0;
+        var seen_grid = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rndrdr, alloc, rndc, &payload, 4)) orelse continue;
+            if (tag == .grid_frame) {
+                seen_grid = true;
+                break;
+            }
+        }
+        try testing.expect(seen_grid); // confirmed on render_subscribers
+    }
+
+    // DISCONNECT without a .detach frame: just close the socket. The host readLoop
+    // sees EOF -> unsubscribeAll runs its subscribed_render branch -> the conn is
+    // removed from render_subscribers before the reaper frees it. Sleep to let the
+    // host-side readLoop observe the EOF and reap.
+    posix.close(rndc);
+    std.Thread.sleep(80 * std.time.ns_per_ms);
+
+    // Drive NEW output on the PRIMARY. If unsubscribeAll's render branch had NOT
+    // removed the now-freed render-sub conn, this onRender tick would writeFramed to
+    // a freed *Conn -> UAF caught by the safety allocator. The primary must still
+    // receive its own frame (session is live and unaffected by the disconnect).
+    const live_marker = "DISCONNECT_NO_UAF";
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "printf 'DISCONNECT_NO_UAF\\n'\n",
+    });
+    {
+        var i: usize = 0;
+        var found = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag != .grid_frame) continue;
+            var gf = try protocol.GridFrame.decode(alloc, payload.items);
+            defer gf.deinit(alloc);
+            if (try snapshotContainsMarker(alloc, &gf.snapshot, live_marker)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found); // primary still renders; no UAF on the dropped sub
+    }
+
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: subscribe_render to unknown/closed session is a clean no-op (Layer 1)" {
+    // CLEAN-IGNORE test for handleSubscribeRender's `orelse return` (unknown id)
+    // and `!sessionLive` (torn-down) branches: a subscribe_render for a session id
+    // the host has never seen must NOT panic/abort — it is silently ignored, the
+    // conn stays open and usable. A regression that dereferenced a missing entry
+    // would crash under the safety build here.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrndu.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rndu" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+
+    // subscribe_render for a session id that does not exist -> clean-ignore (no
+    // seed, no crash). No frame is guaranteed in response; we just assert no panic
+    // and that the conn is still alive enough to attach afterward.
+    try clientSend(alloc, client, .subscribe_render, protocol.SubscribeRender{ .session_id = 0xDEADBEEF });
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+
+    // Conn still usable: a normal attach succeeds, proving the bogus subscribe
+    // neither closed the conn nor wedged the dispatch loop.
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                session_id = (try protocol.Attached.decode(alloc, payload.items)).session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
     }
 
     try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });

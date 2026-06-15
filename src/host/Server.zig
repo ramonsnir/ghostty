@@ -126,6 +126,22 @@ pub const SessionEntry = struct {
     /// neither list. onRawOutput iterates this list (under `mutex`) to broadcast
     /// `raw_output` frames; teardownEntry clears it alongside `subscribers`.
     raw_subscribers: std.ArrayList(*Conn) = .empty,
+    /// Layer 1 (Agent Dashboard): connections subscribed to this session's
+    /// existing RENDER stream (grid_frame + mode_frame) via subscribe_render.
+    /// Parallel to `subscribers`/`raw_subscribers` and guarded by the SAME
+    /// `mutex`. A conn can be on any combination of the three lists. onRender
+    /// iterates this list (under `mutex`) AFTER the `subscribers` loop to
+    /// broadcast the SAME grid/mode frames; teardownEntry clears it alongside the
+    /// other two. READ-ONLY by SUBSCRIPTION SEMANTICS, not host enforcement:
+    /// being on this list grants no mutation authority and `subscribe_render`
+    /// itself never reflows the session. It does NOT, however, revoke any ability
+    /// a bare handshaked conn already has — the host has no per-conn owner model,
+    /// so the `.resize`/`.input`/`.close` arms still act on any handshaked conn
+    /// keyed by session_id (the pre-existing socket-trusted host model; the
+    /// AF_UNIX socket perms + tailnet ACL are the trust boundary). The read-only
+    /// guarantee is a CLIENT-SIDE convention (Layer 2's mirror never sends a
+    /// resize), asserted in test as "subscribe + drive output does not reflow".
+    render_subscribers: std.ArrayList(*Conn) = .empty,
     /// The child's exit, recorded the moment it fires (finding SR3-3). Once
     /// set, the child is permanently dead and this is REPLAYED on every
     /// (re)attach via deliverBufferedExit — it is NOT consumed-once. This
@@ -188,6 +204,28 @@ pub const SessionEntry = struct {
             } else i += 1;
         }
     }
+
+    /// Layer 1: register `conn` as a RENDER-stream subscriber (idempotent).
+    fn addRenderSubscriber(self: *SessionEntry, conn: *Conn) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.render_subscribers.items) |c| if (c == conn) return;
+        try self.render_subscribers.append(self.server.alloc, conn);
+    }
+
+    /// Layer 1: drop `conn` from the RENDER-stream subscriber list. Mirrors
+    /// removeRawSubscriber.
+    fn removeRenderSubscriber(self: *SessionEntry, conn: *Conn) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var i: usize = 0;
+        while (i < self.render_subscribers.items.len) {
+            if (self.render_subscribers.items[i] == conn) {
+                _ = self.render_subscribers.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
 };
 
 /// A single GUI connection.
@@ -200,6 +238,10 @@ pub const Conn = struct {
     /// H1 (Phase 2b): session_ids this conn is subscribed to for RAW output (so
     /// disconnect/teardown can unsubscribe). Parallel to `subscribed`.
     subscribed_raw: std.AutoHashMap(u64, void),
+    /// Layer 1: session_ids this conn is subscribed to for the RENDER stream (so
+    /// disconnect/teardown can unsubscribe). Parallel to `subscribed`/
+    /// `subscribed_raw`.
+    subscribed_render: std.AutoHashMap(u64, void),
     /// Serializes writes to this fd across the read thread (Pong/Attached/etc)
     /// and the various render threads (GridFrame/ModeFrame broadcast).
     write_mutex: std.Thread.Mutex = .{},
@@ -213,6 +255,37 @@ pub const Conn = struct {
     /// ModeFrame against an incompatible wire schema. Only touched on the read
     /// thread (dispatch), so no lock needed.
     handshaked: bool = false,
+
+    /// Layer 1 (read-only gate, LOCK-FREE on the hot path): true when THIS conn
+    /// is a RENDER subscriber of `session_id` but has NOT grid-attached to it —
+    /// i.e. the exact wire profile of the web-monitor mirror, which only ever
+    /// sends `hello` + `subscribe_render` and NEVER attaches. The session-
+    /// MUTATING dispatch arms (resize/input/close/focus/scroll/jump/clear/reset/
+    /// selection) drop the frame when this returns true, so a compromised or
+    /// buggy mirror client (the surface exposed to a remote phone over a tailnet)
+    /// can never reflow the real session grid, feed input, or close the session.
+    ///
+    /// CORRECTNESS / NO-LOCK rationale: this checks the conn-LOCAL maps
+    /// `subscribed`/`subscribed_render`, which are mutated ONLY by this conn's
+    /// single readLoop thread (subscribe/subscribeRender/detach all run in
+    /// dispatch on that thread). The gate also runs in dispatch on that same
+    /// thread, so the conn's own membership cannot change mid-dispatch and no
+    /// lock is needed. Crucially this does NOT acquire `e.mutex`: the previously
+    /// lock-free `.input`/`.resize`/`.focus`/… hot paths stay lock-free, so a
+    /// wedged remote render subscriber blocking inside `onRender` (which holds
+    /// `e.mutex` while writing to render subscribers) can NOT stall local-GUI
+    /// keystroke/resize dispatch. (An earlier version scanned the SessionEntry
+    /// subscriber lists under `e.mutex`, which coupled the input path to a slow
+    /// remote mirror — removed; see the onRender liveness note.)
+    ///
+    /// Conservative by design: a conn that has ALSO grid-attached (in
+    /// `subscribed`) is a real GUI and keeps full mutation rights — the gate
+    /// only fires for the render-ONLY profile, so the attach/own model and the
+    /// `.exec` path are byte-for-byte unchanged.
+    fn isRenderOnlySubscriber(self: *Conn, session_id: u64) bool {
+        if (!self.subscribed_render.contains(session_id)) return false;
+        return !self.subscribed.contains(session_id);
+    }
 
     /// Write a full framed message to this conn's fd, looping on short writes.
     fn writeFramed(self: *Conn, tag: protocol.FrameType, frame: anytype) void {
@@ -350,6 +423,7 @@ fn reapConn(self: *Server, conn: *Conn) void {
     posix.close(conn.fd);
     conn.subscribed.deinit();
     conn.subscribed_raw.deinit();
+    conn.subscribed_render.deinit();
     conn.reader.deinit(self.alloc);
     self.alloc.destroy(conn);
 }
@@ -400,6 +474,7 @@ fn setupConn(self: *Server, fd: posix.socket_t) !void {
         .fd = fd,
         .subscribed = std.AutoHashMap(u64, void).init(self.alloc),
         .subscribed_raw = std.AutoHashMap(u64, void).init(self.alloc),
+        .subscribed_render = std.AutoHashMap(u64, void).init(self.alloc),
     };
 
     {
@@ -478,6 +553,7 @@ fn readLoop(conn: *Conn) void {
         posix.close(conn.fd);
         conn.subscribed.deinit();
         conn.subscribed_raw.deinit();
+        conn.subscribed_render.deinit();
         conn.reader.deinit(self.alloc);
         self.alloc.destroy(conn);
         return;
@@ -510,6 +586,15 @@ fn unsubscribeAll(self: *Server, conn: *Conn) void {
         self.registry_mutex.lock();
         defer self.registry_mutex.unlock();
         if (self.sessions.get(sid.*)) |e| e.removeRawSubscriber(conn);
+    }
+    // Layer 1: also drop any RENDER subscriptions, under the same registry_mutex
+    // discipline. A conn can hold render subscriptions for sessions it never
+    // grid-subscribed to, so iterate this set separately.
+    var rndit = conn.subscribed_render.keyIterator();
+    while (rndit.next()) |sid| {
+        self.registry_mutex.lock();
+        defer self.registry_mutex.unlock();
+        if (self.sessions.get(sid.*)) |e| e.removeRenderSubscriber(conn);
     }
 }
 
@@ -586,6 +671,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(input.session_id)) |e| {
+                // Layer 1 read-only gate: a render-ONLY conn (the mirror) must
+                // never feed input to the real session.
+                if (conn.isRenderOnlySubscriber(input.session_id)) {
+                    log.debug("dropping input from render-only conn session={d}", .{input.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     // NOTE (finding SI-1, Phase-2b FOLLOWUP): input.linefeed is
                     // decoded but intentionally NOT applied here. The Termio
@@ -657,6 +748,14 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(resize.session_id)) |e| {
+                // Layer 1 read-only gate (HARD INVARIANT: "a resize frame from
+                // such a conn must not change session grid size"): drop a resize
+                // from a render-ONLY conn so a compromised/buggy mirror can never
+                // reflow (and discard scrollback of) the real session.
+                if (conn.isRenderOnlySubscriber(resize.session_id)) {
+                    log.debug("dropping resize from render-only conn session={d}", .{resize.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     // Slice 9: reconstruct the size from the AUTHORITATIVE wire
                     // {cols, rows} (via Resize.toSize) rather than the raw
@@ -682,6 +781,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(focus.session_id)) |e| {
+                // Layer 1 read-only gate: a render-ONLY conn must not drive focus.
+                if (conn.isRenderOnlySubscriber(focus.session_id)) {
+                    log.debug("dropping focus from render-only conn session={d}", .{focus.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     e.session.io.queueMessage(.{ .focused = focus.focused }, .unlocked);
                 }
@@ -700,6 +804,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
                 self.registry_mutex.lock();
                 defer self.registry_mutex.unlock();
                 if (self.sessions.get(sv.session_id)) |e| {
+                    // Layer 1 read-only gate: a render-ONLY conn must not repin
+                    // the real session's viewport.
+                    if (conn.isRenderOnlySubscriber(sv.session_id)) {
+                        log.debug("dropping scroll_viewport from render-only conn session={d}", .{sv.session_id});
+                        return;
+                    }
                     if (sessionLive(e)) e.session.scrollViewport(target);
                 }
             } else {
@@ -713,6 +823,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(jp.session_id)) |e| {
+                // Layer 1 read-only gate: a render-ONLY conn must not repin.
+                if (conn.isRenderOnlySubscriber(jp.session_id)) {
+                    log.debug("dropping jump_to_prompt from render-only conn session={d}", .{jp.session_id});
+                    return;
+                }
                 if (sessionLive(e)) e.session.jumpToPrompt(@intCast(jp.delta));
             }
         },
@@ -725,6 +840,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(cs.session_id)) |e| {
+                // Layer 1 read-only gate: a render-ONLY conn must not clear the
+                // real session's screen/scrollback.
+                if (conn.isRenderOnlySubscriber(cs.session_id)) {
+                    log.debug("dropping clear_screen from render-only conn session={d}", .{cs.session_id});
+                    return;
+                }
                 if (sessionLive(e)) e.session.clearScreen(cs.history);
             }
         },
@@ -736,6 +857,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(rst.session_id)) |e| {
+                // Layer 1 read-only gate: a render-ONLY conn must not reset the
+                // real session's terminal.
+                if (conn.isRenderOnlySubscriber(rst.session_id)) {
+                    log.debug("dropping reset from render-only conn session={d}", .{rst.session_id});
+                    return;
+                }
                 if (sessionLive(e)) e.session.reset();
             }
         },
@@ -744,6 +871,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             var sub = try protocol.SubscribeRaw.decode(alloc, frame.payload);
             defer sub.deinit(alloc);
             try self.handleSubscribeRaw(conn, sub.session_id);
+        },
+
+        .subscribe_render => {
+            var sub = try protocol.SubscribeRender.decode(alloc, frame.payload);
+            defer sub.deinit(alloc);
+            try self.handleSubscribeRender(conn, sub.session_id);
         },
 
         .detach => {
@@ -758,6 +891,9 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
                 // (a detach ends both the grid and the raw streams for it).
                 e.removeRawSubscriber(conn);
                 _ = conn.subscribed_raw.remove(detach.session_id);
+                // Layer 1: also drop a RENDER subscription for this session.
+                e.removeRenderSubscriber(conn);
+                _ = conn.subscribed_render.remove(detach.session_id);
                 // Child stays alive (Session NOT stopped).
             }
         },
@@ -784,6 +920,12 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(set.session_id)) |e| {
+                // Layer 1 read-only gate: a render-ONLY conn must not drive the
+                // real session's search state.
+                if (conn.isRenderOnlySubscriber(set.session_id)) {
+                    log.debug("dropping set_search from render-only conn session={d}", .{set.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     e.session.setSearch(set.query) catch |err|
                         log.warn("setSearch failed err={}", .{err});
@@ -797,6 +939,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(nav.session_id)) |e| {
+                // Layer 1 read-only gate.
+                if (conn.isRenderOnlySubscriber(nav.session_id)) {
+                    log.debug("dropping search_nav from render-only conn session={d}", .{nav.session_id});
+                    return;
+                }
                 if (sessionLive(e)) e.session.navSearch(nav.dir);
             }
         },
@@ -807,6 +954,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(clear.session_id)) |e| {
+                // Layer 1 read-only gate.
+                if (conn.isRenderOnlySubscriber(clear.session_id)) {
+                    log.debug("dropping clear_search from render-only conn session={d}", .{clear.session_id});
+                    return;
+                }
                 if (sessionLive(e)) e.session.clearSearch();
             }
         },
@@ -834,6 +986,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(drag.session_id)) |e| {
+                // Layer 1 read-only gate.
+                if (conn.isRenderOnlySubscriber(drag.session_id)) {
+                    log.debug("dropping selection_drag from render-only conn session={d}", .{drag.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     e.session.selectDrag(
                         .{ .x = drag.anchor_x, .y = drag.anchor_y },
@@ -854,6 +1011,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(clear.session_id)) |e| {
+                // Layer 1 read-only gate.
+                if (conn.isRenderOnlySubscriber(clear.session_id)) {
+                    log.debug("dropping selection_clear from render-only conn session={d}", .{clear.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     e.session.selectClear() catch |err|
                         log.warn("selectClear failed err={}", .{err});
@@ -878,6 +1040,11 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
             self.registry_mutex.lock();
             defer self.registry_mutex.unlock();
             if (self.sessions.get(sp.session_id)) |e| {
+                // Layer 1 read-only gate.
+                if (conn.isRenderOnlySubscriber(sp.session_id)) {
+                    log.debug("dropping selection_point from render-only conn session={d}", .{sp.session_id});
+                    return;
+                }
                 if (sessionLive(e)) {
                     e.session.selectPoint(sp.x, sp.y, sp.mode) catch |err|
                         log.warn("selectPoint failed err={}", .{err});
@@ -1058,6 +1225,16 @@ fn subscribeRaw(self: *Server, conn: *Conn, e: *SessionEntry) !void {
     _ = self;
 }
 
+/// Layer 1: register `conn` as a RENDER-stream subscriber of `e`. Same
+/// OOM-ordering as `subscribe`/`subscribeRaw` (insert into
+/// `conn.subscribed_render` FIRST, then `e.render_subscribers`).
+fn subscribeRender(self: *Server, conn: *Conn, e: *SessionEntry) !void {
+    try conn.subscribed_render.put(e.session_id, {});
+    errdefer _ = conn.subscribed_render.remove(e.session_id);
+    try e.addRenderSubscriber(conn);
+    _ = self;
+}
+
 /// H1 (Phase 2b): handle a `subscribe_raw` frame. Validate the session exists +
 /// is live (else clean-ignore, mirroring the unknown-id handling in the other
 /// dispatch arms), register the conn as a RAW subscriber, then IMMEDIATELY send
@@ -1091,6 +1268,36 @@ fn handleSubscribeRaw(self: *Server, conn: *Conn, session_id: u64) !void {
         .session_id = e.session_id,
         .bytes = replay,
     });
+}
+
+/// Layer 1: handle a `subscribe_render` frame. Validate the session exists + is
+/// live (else clean-ignore, mirroring the unknown-id handling in the other
+/// dispatch arms / handleSubscribeRaw), register the conn as a RENDER subscriber,
+/// then IMMEDIATELY seed one full mode_frame+grid_frame at the current size so
+/// the preview renders without waiting a tick. Live grid_frame/mode_frame follow
+/// via onRender. READ-ONLY: no resize, no ownership.
+///
+/// Lock discipline mirrors handleSubscribeRaw/handleAttach: hold registry_mutex
+/// across the whole dereference (F3 TOCTOU) so a concurrent Close/deinit can't
+/// free `e` mid-use; the seed write happens under that held lock (SR-4 single/
+/// local fast-peer contract).
+///
+/// SEED-vs-LIVE ORDERING (inherited, accepted window — same as handleSubscribeRaw's
+/// add-then-replay): subscribeRender appends the conn to e.render_subscribers
+/// (releasing e.mutex) BEFORE pushFullFramesTo writes the seed. onRender runs on
+/// the session owning thread under e.mutex independently and takes no
+/// registry_mutex, so it can write a NEWER grid_frame/mode_frame to this conn
+/// before the OLDER seed arrives. This is harmless: grid_frame/mode_frame are
+/// ABSOLUTE full-state snapshots (not deltas), so the worst case is newer→older→
+/// newer, self-healing on the next tick. If ever tightened, do it in BOTH tees
+/// together.
+fn handleSubscribeRender(self: *Server, conn: *Conn, session_id: u64) !void {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    const e = self.sessions.get(session_id) orelse return; // unknown id: ignore
+    if (!sessionLive(e)) return; // torn down: ignore
+    try self.subscribeRender(conn, e);
+    try self.pushFullFramesTo(conn, e);
 }
 
 /// Allocate a fresh, unique, non-zero, RANDOM session id. CALLER HOLDS
@@ -1229,7 +1436,10 @@ fn sessionOwnerThread(e: *SessionEntry) void {
 
 /// Render-tick push callback (runs on the session owning thread). Serializes a
 /// ModeFrame then a GridFrame (ModeFrame applied before/atomically-with the
-/// GridFrame, plan §2.1) and writes both to every subscriber.
+/// GridFrame, plan §2.1) and writes both to every GRID subscriber AND, in a
+/// second loop within the same e.mutex critical section, to every read-only
+/// RENDER subscriber (Layer 1) — same mode/grid locals, reusing the same
+/// per-conn closed-check.
 fn onRender(ctx: *anyopaque, session: *Session, snapshot: *const RenderState.Snapshot) void {
     const e: *SessionEntry = @ptrCast(@alignCast(ctx));
 
@@ -1259,6 +1469,37 @@ fn onRender(ctx: *anyopaque, session: *Session, snapshot: *const RenderState.Sna
     e.mutex.lock();
     defer e.mutex.unlock();
     for (e.subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.writeFramed(.mode_frame, mode);
+        conn.writeFramed(.grid_frame, grid);
+    }
+    // Layer 1: fan the SAME mode+grid frames out to read-only RENDER subscribers.
+    // Same e.mutex critical section, same mode/grid locals built once above, same
+    // per-conn closed-check (no broadcast-after-free). A conn on BOTH lists would
+    // receive the pair twice; in practice the mirror conn is on render_subscribers
+    // only (it never attaches), so no duplication occurs.
+    //
+    // LIVENESS / HEAD-OF-LINE WARNING (findings SR-4 / SF2 — see the BLOCKING-WRITE
+    // CONTRACT on Conn.writeAll): these writeFramed calls are BLOCKING posix writes
+    // done while holding e.mutex. The SR-4 contract already accepts this for the
+    // local GUI `subscribers` (a single fast local peer), but a RENDER subscriber is
+    // by design a REMOTE web-monitor mirror (a phone over a tailnet) — far more
+    // likely to stall than a local GUI. A wedged render-sub therefore
+    // head-of-line-blocks delivery to the primary GUI subscribers, stalls this
+    // session's render thread, and delays teardownEntry (which needs e.mutex). This
+    // is a deliberate, consistent extension of the raw-tee's onRawOutput pattern
+    // Layer 1 was told to mirror (no NEW lock-order inversion), but it weakens the
+    // SR-4 single-fast-local-peer assumption. HARD FOLLOW-UP (before Layer 2 ships a
+    // real network-fed phone client): give render subscribers a non-blocking /
+    // bounded-buffer-and-DROP delivery (or write outside e.mutex via a per-conn
+    // queue), so a slow remote mirror cannot degrade the local GUI or the session.
+    //
+    // NOTE: the read-only gate (Conn.isRenderOnlySubscriber) is conn-local and
+    // does NOT take e.mutex, so a render-sub wedged inside this loop holding
+    // e.mutex can NOT stall the (lock-free) local-GUI .input/.resize dispatch.
+    // The remaining liveness exposure above is confined to other e.mutex users
+    // (primary subscriber delivery, this session's render thread, teardown).
+    for (e.render_subscribers.items) |conn| {
         if (conn.closed.load(.acquire)) continue;
         conn.writeFramed(.mode_frame, mode);
         conn.writeFramed(.grid_frame, grid);
@@ -1572,6 +1813,51 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
     }
 }
 
+/// Layer 1: seed a single freshly-subscribed RENDER conn with one full
+/// mode_frame + grid_frame at the session's CURRENT size, so a newly attached
+/// preview tile renders immediately without waiting a render tick. Mirrors the
+/// raw-tee's direct single-conn seed (handleSubscribeRaw writes the ring replay
+/// straight to the one conn) and onRender's mode+grid content (NOT
+/// pushFullFrames' 4-frame attach seed — a read-only mirror gets no at_prompt /
+/// pwd_change). Captures the snapshot + ModeFrame in ONE render_mutex critical
+/// section (finding SI-3) so mode and grid share one point-in-time read. The
+/// write happens while registry_mutex is held by the caller
+/// (handleSubscribeRender), consistent with handleSubscribeRaw's seed write.
+fn pushFullFramesTo(self: *Server, conn: *Conn, e: *SessionEntry) !void {
+    _ = self;
+    const session = e.session;
+    const captured = blk: {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        const snap = session.captureSnapshotLocked(session.alloc) catch |err| {
+            log.warn("render-tee seed snapshot failed err={}", .{err});
+            return;
+        };
+        break :blk .{
+            .snapshot = snap,
+            .mode = protocol.ModeFrame.fromTerminal(e.session_id, &session.io.terminal),
+        };
+    };
+    var snapshot = captured.snapshot;
+    defer snapshot.deinit(session.alloc);
+    const grid: protocol.GridFrame = .{ .session_id = e.session_id, .snapshot = snapshot };
+    // Single-conn seed; skip if the conn closed between subscribe and seed.
+    if (conn.closed.load(.acquire)) return;
+    // LIVENESS / HEAD-OF-LINE WARNING (findings SR-4 / SF2): these are BLOCKING
+    // writes done while the caller (handleSubscribeRender) holds registry_mutex (the
+    // app-global lock), mirroring handleSubscribeRaw's seed write. A wedged REMOTE
+    // render subscriber (a phone-over-tailnet mirror) therefore head-of-line-blocks
+    // registry-wide work (every session lookup/attach/close) for the duration of the
+    // seed write. Same HARD FOLLOW-UP as onRender's render loop: before Layer 2 ships
+    // a real network-fed client, seed via a non-blocking / bounded-buffer path so a
+    // slow remote mirror cannot stall the registry. NOTE: the seed is BEST-EFFORT —
+    // writeFramed swallows write errors and a snapshot-capture failure logs + returns
+    // above, so the conn stays registered on render_subscribers regardless (a later
+    // live onRender tick still delivers); the subscription never hinges on this write.
+    conn.writeFramed(.mode_frame, captured.mode);
+    conn.writeFramed(.grid_frame, grid);
+}
+
 fn deliverBufferedExit(self: *Server, e: *SessionEntry) void {
     _ = self;
     e.mutex.lock();
@@ -1593,11 +1879,17 @@ fn deliverBufferedExit(self: *Server, e: *SessionEntry) void {
 }
 
 fn handleClose(self: *Server, conn: *Conn, session_id: u64) !void {
-    _ = conn;
     var entry: ?*SessionEntry = null;
     {
         self.registry_mutex.lock();
         defer self.registry_mutex.unlock();
+        // Layer 1 read-only gate: a render-ONLY conn (the mirror) must never
+        // close (destroy) the real session. Conn-local membership check (no
+        // e.mutex), BEFORE fetchRemove tears it down.
+        if (conn.isRenderOnlySubscriber(session_id)) {
+            log.debug("dropping close from render-only conn session={d}", .{session_id});
+            return;
+        }
         if (self.sessions.fetchRemove(session_id)) |kv| entry = kv.value;
     }
     // fetchRemove hands the entry to exactly one caller, so Close-vs-Close and
@@ -1624,6 +1916,10 @@ fn teardownEntry(self: *Server, e: *SessionEntry) void {
         e.subscribers = .empty;
         e.raw_subscribers.deinit(self.alloc);
         e.raw_subscribers = .empty;
+        // Layer 1: drop RENDER subscribers in the SAME critical section so the
+        // onRender render-loop stops touching them before any Conn is freed.
+        e.render_subscribers.deinit(self.alloc);
+        e.render_subscribers = .empty;
         e.mutex.unlock();
     }
 

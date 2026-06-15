@@ -46,7 +46,13 @@ pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
 // can negotiate this minor to learn the host can stream a session's RAW PTY
 // output bytes. ADDITIVE only — major unchanged, no existing frame encoding or
 // enum order touched.
-pub const PROTOCOL_VERSION_MINOR: u16 = 1;
+// Bumped to 2 for the additive subscribe_render frame (Layer 1 / render-tee): a
+// peer can negotiate this minor to learn the host can stream a session's
+// existing grid_frame/mode_frame render stream to a READ-ONLY subscriber
+// (no attach, no resize, no ownership). ADDITIVE only — major unchanged, no
+// existing frame encoding or enum order touched; the render stream REUSES the
+// existing grid_frame/mode_frame payload tags.
+pub const PROTOCOL_VERSION_MINOR: u16 = 2;
 
 /// Maximum on-wire frame length (the value of the BE length prefix, i.e.
 /// tag + payload). Bounds per-connection buffer growth and the speculative
@@ -166,6 +172,15 @@ pub const FrameType = enum(u8) {
     // length-prefixed byte slice (the raw bytes, the LAST field). Appended at the
     // END so all prior tag integers stay stable.
     raw_output,
+    // --- Layer 1 (Agent Dashboard): READ-ONLY render subscription ---
+    // GUI->host: subscribe to a session's existing render stream (the SAME
+    // grid_frame + mode_frame an attached client receives) WITHOUT attaching,
+    // resizing, or owning the session. On receipt the host registers the conn
+    // as a RENDER subscriber, seeds it with one full grid_frame+mode_frame pair
+    // at the session's CURRENT size, then forwards live grid_frame/mode_frame as
+    // the session renders. payload = session_id (u64). Appended at the END so all
+    // prior tag integers (incl raw_output) stay stable.
+    subscribe_render,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -1076,6 +1091,14 @@ pub const AtPrompt = struct {
 /// more `raw_output` frames, then forwards live `raw_output` as the session
 /// produces it.
 pub const SubscribeRaw = SessionIdFrame(.subscribe_raw);
+
+/// GUI->host (Layer 1): subscribe to a session's existing RENDER stream
+/// (grid_frame + mode_frame). Bare session id, same shape as
+/// Detach/Close/Reset/SubscribeRaw. On receipt the host registers the conn as a
+/// RENDER subscriber, seeds it with one full grid_frame+mode_frame at the
+/// session's current size (pushFullFramesTo), then forwards live grid_frame/
+/// mode_frame. READ-ONLY: it never drives resize, never owns the session.
+pub const SubscribeRender = SessionIdFrame(.subscribe_render);
 
 /// host->GUI: a chunk of a session's RAW pty output bytes (the bytes fed to the
 /// emulator BEFORE emulation — see Termio.processOutput). Carries the initial
