@@ -1,0 +1,2 @@
+# SwiftPM build artifacts (ModuleCache .pcm blobs, .lock, etc.)
+.build/

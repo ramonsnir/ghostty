@@ -102,6 +102,10 @@ class AppDelegate: NSObject,
     /// Reads config at launch; changing web-monitor-listen/token needs a relaunch.
     private var webMonitor: WebMonitorServer?
 
+    /// (ramon fork) The embedded MCP server, if enabled via config. Reads config
+    /// at launch; changing mcp-listen/mcp-token needs a relaunch.
+    private var mcpServer: MCPServer?
+
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
 
@@ -243,6 +247,16 @@ class AppDelegate: NSObject,
                 token: ghostty.config.webMonitorToken)
             server.start()
             self.webMonitor = server
+        }
+
+        // (ramon fork) Start the embedded MCP server if configured. Reads config
+        // only here (changing listen/token requires a relaunch). Runs OPEN if
+        // mcp-token is empty (logs a warning); a token, if set, is fully enforced.
+        let mcpListen = ghostty.config.mcpListen
+        if !mcpListen.isEmpty {
+            let server = MCPServer(listen: mcpListen, token: ghostty.config.mcpToken)
+            server.start()
+            self.mcpServer = server
         }
 
         // Start our update checker.
@@ -443,6 +457,9 @@ class AppDelegate: NSObject,
     func applicationWillTerminate(_ notification: Notification) {
         // (ramon fork) Stop the embedded web monitor if running.
         webMonitor?.stop()
+
+        // (ramon fork) Stop the embedded MCP server if running.
+        mcpServer?.stop()
 
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be
