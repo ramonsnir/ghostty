@@ -1068,6 +1068,16 @@ struct WebMonitorServerTests {
         #expect(css?.name == "xterm")
         #expect(css?.ext == "css")
         #expect(css?.contentType == "text/css; charset=utf-8")
+        // The vendored JetBrains Mono Nerd Font (woff2, Regular + Bold) served so
+        // the page matches Ghostty's own font.
+        let fontReg = WebMonitorServer.assetRoutes["/jetbrains-mono-regular.woff2"]
+        #expect(fontReg?.name == "JetBrainsMonoNerdFont-Regular")
+        #expect(fontReg?.ext == "woff2")
+        #expect(fontReg?.contentType == "font/woff2")
+        let fontBold = WebMonitorServer.assetRoutes["/jetbrains-mono-bold.woff2"]
+        #expect(fontBold?.name == "JetBrainsMonoNerdFont-Bold")
+        #expect(fontBold?.ext == "woff2")
+        #expect(fontBold?.contentType == "font/woff2")
         // Nothing else is an asset route.
         #expect(WebMonitorServer.assetRoutes["/other.js"] == nil)
     }
@@ -1079,6 +1089,10 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.isBootstrapPath("/"))
         #expect(WebMonitorServer.isBootstrapPath("/xterm.js"))
         #expect(WebMonitorServer.isBootstrapPath("/xterm.css"))
+        // The font assets are reached from @font-face src url() (no custom header
+        // possible), so they too accept ?token= via the bootstrap set.
+        #expect(WebMonitorServer.isBootstrapPath("/jetbrains-mono-regular.woff2"))
+        #expect(WebMonitorServer.isBootstrapPath("/jetbrains-mono-bold.woff2"))
         #expect(!WebMonitorServer.isBootstrapPath("/api/surfaces"))
         #expect(!WebMonitorServer.isBootstrapPath("/anything/else"))
     }
@@ -1086,6 +1100,11 @@ struct WebMonitorServerTests {
     @Test func decideRouteAssetJS() {
         let d = decide("GET", "/xterm.js")
         #expect(d == .asset(name: "xterm", ext: "js", contentType: "application/javascript; charset=utf-8"))
+    }
+
+    @Test func decideRouteAssetFont() {
+        let d = decide("GET", "/jetbrains-mono-regular.woff2")
+        #expect(d == .asset(name: "JetBrainsMonoNerdFont-Regular", ext: "woff2", contentType: "font/woff2"))
     }
 
     @Test func decideRouteAssetCSS() {

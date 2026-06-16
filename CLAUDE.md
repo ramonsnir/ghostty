@@ -157,6 +157,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `term.resize()`s `xterm.js` to that grid so cursor-addressed TUIs render aligned. **Without
     `pty-host`** (or if the stream can't start → 501) the page falls back to the plain-text
     snapshot poll.
+  - **Font:** the page + the `xterm.js` terminal render in **JetBrains Mono Nerd Font** (the
+    GUI's own default font), vendored as woff2 (Regular + Bold, from `src/font/res/`, TTF→woff2
+    ~2.2MB→~900KB each) at `vendor/JetBrainsMonoNerdFont-{Regular,Bold}.woff2` and served via two
+    `assetRoutes` (`/jetbrains-mono-{regular,bold}.woff2`, `font/woff2`, bootstrap/`?token=` like
+    xterm.css). The phone has no such system font, so shipping it is REQUIRED. The `@font-face` is
+    injected **client-side** (page asset-loader IIFE) — NOT in the static `<style>` — so the woff2
+    `src` URLs carry `?token=` via `url()` exactly like the xterm assets; `font-display:swap` +
+    an eager `document.fonts.load()` nudge, and the existing resize-to-host-grid re-measures
+    xterm metrics so a slightly-late font swap self-corrects. Font is a faithful match to Ghostty,
+    not config-driven (changing `font-family` in ghostty config won't follow); regenerate the
+    woff2 if you want a different face. NOT exempt from the iOS-target exclusion set in
+    `project.pbxproj` (listed alongside xterm.{js,css}). GUI-only — relaunch, no host restart.
   - **HTTP API:** `GET /` (page); `GET /xterm.js`, `GET /xterm.css` (vendored assets, `?token=`
     accepted like the bootstrap); `GET /api/surfaces` (`[{id,title,pwd}]`); `GET
     /api/surface/{uuid}/stream` (raw-byte xterm source; needs `pty-host`); `GET

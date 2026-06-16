@@ -44,7 +44,9 @@ web-monitor-listen = 100.x.y.z:8787    # your Tailscale IP : port  (BIND address
    via the `X-Ghostty-Token` header).
 2. You get a **list of live surfaces** (title + cwd). Tap one to open it.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
-   (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up).
+   (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up),
+   in the **same JetBrains Mono Nerd Font Ghostty uses** (vendored as woff2 and served by the
+   app, so it renders correctly on a phone that doesn't have the font installed).
    It scrolls horizontally if the host grid is wider than the phone; use the **font-size**
    control to fit. If the stream is unavailable it falls back to a plain-text snapshot poll.
 4. **Input:**
@@ -106,6 +108,7 @@ real scrollback can't come from the GUI. Instead:
 |---|---|
 | `GET /` | the embedded mobile page (`?token=` accepted here when a token is set) |
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
+| `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
 | `GET /api/surfaces` | JSON `[{id,title,pwd}]` of live surfaces |
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
@@ -140,6 +143,7 @@ Committed on `ramon-fork` (not pushed).
 | Server + embedded `xterm.js` page (routing, `/stream`, `/scroll`, assets) | `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` |
 | Host-protocol client (subscribe to `raw_output`) | `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift` |
 | Vendored xterm.js | `macos/Sources/Features/WebMonitor/vendor/xterm.{js,css}` |
+| Vendored JetBrains Mono Nerd Font (woff2) | `macos/Sources/Features/WebMonitor/vendor/JetBrainsMonoNerdFont-{Regular,Bold}.woff2` |
 | Unit tests | `macos/Tests/WebMonitor/WebMonitorServerTests.swift` |
 | Host raw-output tee + frames + ring buffer | `src/host/{Session,Server,protocol}.zig`, `src/termio/Termio.zig` (output observer) |
 | Config keys + `pty-host` (`[:0]`-terminated so it's C-gettable) | `src/config/Config.zig` |

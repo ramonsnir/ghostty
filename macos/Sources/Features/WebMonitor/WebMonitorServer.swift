@@ -458,6 +458,13 @@ final class WebMonitorServer {
     static let assetRoutes: [String: (name: String, ext: String, contentType: String)] = [
         "/xterm.js": ("xterm", "js", "application/javascript; charset=utf-8"),
         "/xterm.css": ("xterm", "css", "text/css; charset=utf-8"),
+        // JetBrains Mono Nerd Font (Regular + Bold), vendored as woff2 so the page
+        // renders in the SAME font as Ghostty itself (the GUI defaults to this Nerd
+        // Font build). The phone has no such system font, so we MUST ship it; the
+        // @font-face that references these is injected client-side (see the page's
+        // asset-loader IIFE) so the token rides the query string like xterm.css.
+        "/jetbrains-mono-regular.woff2": ("JetBrainsMonoNerdFont-Regular", "woff2", "font/woff2"),
+        "/jetbrains-mono-bold.woff2": ("JetBrainsMonoNerdFont-Bold", "woff2", "font/woff2"),
     ]
 
     /// Paths that accept the token via the `?token=` query string (not just the
@@ -1345,7 +1352,7 @@ final class WebMonitorServer {
     <title>Ghostty Web Monitor</title>
     <style>
       :root { color-scheme: dark; }
-      body { margin: 0; background: #11131a; color: #d6dae3; font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+      body { margin: 0; background: #11131a; color: #d6dae3; font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; font-size: 14px; }
       header { padding: 10px 12px; background: #1b1e27; position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
       header b { color: #f0a35e; }
       button, input, select { font-family: inherit; font-size: 14px; }
@@ -1573,6 +1580,22 @@ final class WebMonitorServer {
         var js = document.createElement("script");
         js.src = url("/xterm.js", { token: token });
         document.head.appendChild(js);
+        // Inject the JetBrains Mono @font-face HERE (not in static <style>) so the
+        // woff2 src URLs carry ?token= via url(), exactly like the xterm assets the
+        // browser pulls in. font-display:swap renders fallback first, then swaps.
+        var ff = document.createElement("style");
+        ff.textContent =
+          '@font-face{font-family:"JetBrains Mono";font-weight:400;font-style:normal;font-display:swap;' +
+            'src:url("' + url("/jetbrains-mono-regular.woff2", { token: token }) + '") format("woff2");}' +
+          '@font-face{font-family:"JetBrains Mono";font-weight:700;font-style:normal;font-display:swap;' +
+            'src:url("' + url("/jetbrains-mono-bold.woff2", { token: token }) + '") format("woff2");}';
+        document.head.appendChild(ff);
+        // Eagerly start the download so the font is ready before the user opens a
+        // surface; xterm.js caches char metrics at term.open(), and the later
+        // resize-to-host-grid re-measures, so a slightly-late swap self-corrects.
+        if (document.fonts && document.fonts.load) {
+          try { document.fonts.load('14px "JetBrains Mono"'); document.fonts.load('bold 14px "JetBrains Mono"'); } catch (e) {}
+        }
       })();
       // bannerIsError tracks whether the visible banner is a sticky error
       // (send failure / session closed). Sticky errors persist until the next
@@ -1784,7 +1807,8 @@ final class WebMonitorServer {
         var term = new Terminal({
           convertEol: false,
           scrollback: 10000,
-          fontSize: 14
+          fontSize: 14,
+          fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace'
         });
         term.open(xtermEl);
         xtermEl.style.display = "block";
