@@ -54,14 +54,46 @@ extension Ghostty {
         weak var globalPreviousSurface: SurfaceView?
 
         /// (ramon fork) Record that `surface` just gained focus, updating the
-        /// two-deep MRU pair above. Called from the AppKit focus path
-        /// (`SurfaceView.focusDidChange(true)`). Re-focusing the current surface
-        /// is a no-op so the toggle stays correct.
+        /// two-deep MRU pair above. Re-focusing the current surface is a no-op
+        /// so the toggle stays correct.
         func recordFocusedSurface(_ surface: SurfaceView) {
             guard globalCurrentSurface !== surface else { return }
             globalPreviousSurface = globalCurrentSurface
             globalCurrentSurface = surface
         }
+
+        #if os(macOS)
+        /// (ramon fork) Coalescing guard for `setNeedsFocusHistoryUpdate`.
+        private var focusHistoryUpdateScheduled = false
+
+        /// (ramon fork) Schedule a refresh of the two-deep focus history that
+        /// drives `goto_last_surface`. Called from the AppKit focus paths
+        /// (`SurfaceView.focusDidChange(true)` and `windowDidBecomeKey`).
+        ///
+        /// The update is coalesced onto the next runloop and reads the SETTLED
+        /// focus state — the first responder of the key window — rather than
+        /// trusting the surface that happened to fire the trigger. This is what
+        /// makes it timing-robust: a single user action can produce several
+        /// focus transitions in one runloop (e.g. the command palette's
+        /// jump-to-another-tab does makeKeyAndOrderFront, then moveFocus, then
+        /// restores focus to the surface it was overlaid on), and only the
+        /// final, truly-focused surface — never a momentarily-focused
+        /// intermediate — gets recorded. Records nothing when the app is
+        /// inactive or the key window's first responder is not a surface (e.g.
+        /// the command palette text field is up).
+        func setNeedsFocusHistoryUpdate() {
+            guard !focusHistoryUpdateScheduled else { return }
+            focusHistoryUpdateScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.focusHistoryUpdateScheduled = false
+                guard NSApp.isActive,
+                      let surface = NSApp.keyWindow?.firstResponder as? SurfaceView
+                else { return }
+                self.recordFocusedSurface(surface)
+            }
+        }
+        #endif
 
         /// The readiness value of the state.
         @Published var readiness: Readiness = .loading

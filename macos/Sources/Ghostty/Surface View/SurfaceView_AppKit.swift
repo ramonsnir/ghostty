@@ -336,6 +336,18 @@ extension Ghostty {
                 selector: #selector(windowDidChangeScreen),
                 name: NSWindow.didChangeScreenNotification,
                 object: nil)
+            // (ramon fork) Record the global focus history when our window
+            // becomes key. This complements the becomeFirstResponder path
+            // (which is gated on isKeyWindow): clicking into a surface in a
+            // background window — or the present/jump path that calls
+            // makeKeyAndOrderFront — makes us first responder slightly before
+            // the window flips to key, so the becomeFirstResponder record is
+            // gated out and must be recovered here once the window is key.
+            center.addObserver(
+                self,
+                selector: #selector(windowDidBecomeKey(notification:)),
+                name: NSWindow.didBecomeKeyNotification,
+                object: nil)
 
             // Listen for local events that we need to know of outside of
             // single surface handlers.
@@ -448,10 +460,17 @@ extension Ghostty {
                     self.notificationIdentifiers = []
                 }
 
-                // (ramon fork) Record this surface in the app-wide two-deep
-                // focus history that drives `goto_last_surface`.
+                // (ramon fork) Refresh the app-wide two-deep focus history that
+                // drives `goto_last_surface`. We don't record `self` directly:
+                // becomeFirstResponder fires even on a background tab-window
+                // (macOS native tabs are separate NSWindows), so the command
+                // palette restoring focus to the surface it was overlaid on
+                // when it dismisses would otherwise pollute the history.
+                // Instead we coalesce onto the next runloop and read the truly
+                // focused surface (the key window's first responder) once all
+                // in-flight focus changes from this event have settled.
                 if let appState = Ghostty.App.appState(fromView: self) {
-                    appState.recordFocusedSurface(self)
+                    appState.setNeedsFocusHistoryUpdate()
                 }
             }
         }
@@ -840,6 +859,21 @@ extension Ghostty {
             // Issue: https://github.com/ghostty-org/ghostty/issues/2731
             DispatchQueue.main.async { [weak self] in
                 self?.viewDidChangeBackingProperties()
+            }
+        }
+
+        // (ramon fork) When our window becomes key, refresh the app-wide focus
+        // history that drives `goto_last_surface`. This is needed in addition
+        // to the becomeFirstResponder path because activating a window (a tab
+        // switch, or clicking into a surface in a background window) makes a
+        // surface the focused one without necessarily changing first responder.
+        // The actual surface to record is resolved on the next runloop from the
+        // key window's first responder (see `setNeedsFocusHistoryUpdate`).
+        @objc private func windowDidBecomeKey(notification: SwiftUI.Notification) {
+            guard let window = self.window else { return }
+            guard let object = notification.object as? NSWindow, window == object else { return }
+            if let appState = Ghostty.App.appState(fromView: self) {
+                appState.setNeedsFocusHistoryUpdate()
             }
         }
 
