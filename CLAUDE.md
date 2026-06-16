@@ -5,12 +5,13 @@ runs side-by-side with an official Ghostty. Single working branch: **`ramon-fork
 Upstream conventions still apply (`AGENTS.md`, `macos/AGENTS.md`); this file only
 covers what's specific to the fork.
 
-> **PTY-host (emulation-on-host) work** lives on the **`ptyhost/phase-2b`** branch,
-> not `ramon-fork`. If you are resuming or touching that work (the `.client` termio
-> backend, `ghostty-host`, reattach-across-restart), read
-> **`.claude/docs/ptyhost.md`** first — it has the architecture decisions,
-> invariants/gotchas, the commit range, and open items. It is `git add -f`'d (the
-> rest of `.claude/` is local-only).
+> **PTY-host (emulation-on-host) work** is now **merged into `ramon-fork`** (it
+> formerly lived on a `ptyhost/phase-2b` branch, since merged and deleted — the
+> code came in via `3eb0ba26a Merge branch 'ptyhost/phase-2b' into ramon-fork`).
+> If you are resuming or touching that work (the `.client` termio backend,
+> `ghostty-host`, reattach-across-restart), read **`.claude/docs/ptyhost.md`**
+> first — it has the architecture decisions, invariants/gotchas, and open items.
+> It is `git add -f`'d (the rest of `.claude/` is local-only).
 
 ## Functional changes — new keybind actions (also in the command palette)
 All act on the focused surface. flip/toggle walk **up** to the nearest enclosing
@@ -337,16 +338,17 @@ this macOS); `nushell` for `build.nu`.
   **bare `git push fork`** (no refspec). The `fork` remote has a pinned push refspec
   (`remote.fork.push = refs/heads/ramon-fork:refs/heads/main`), so `git push fork`
   **always** pushes local `ramon-fork` → `fork/main`, **regardless of which branch is
-  currently checked out** — you can run it from a `ptyhost/*` branch and it still backs
-  up `ramon-fork`, never the feature branch.
+  currently checked out** — you can run it from any local feature branch and it still
+  backs up `ramon-fork`, never the feature branch.
   - **Do NOT add an explicit refspec** like `git push fork HEAD:main` — an explicit
     refspec overrides the pinned one and, from a feature branch, would overwrite
     `fork/main` with the wrong branch. Always use the bare `git push fork`.
 
 So pushing to `fork` is now allowed and is the backup path; just confirm the
-remote is `fork` before pushing, and **never** `git push origin`. The `ptyhost/*`
-branches have no remote set — leave them local-only unless explicitly asked to back
-them up to `fork`.
+remote is `fork` before pushing, and **never** `git push origin`. Any local-only
+feature branches (the old `ptyhost/*` ones are gone, merged into `ramon-fork`) have
+no remote set — leave them local-only unless explicitly asked to back them up to
+`fork`, and remember a bare `git push fork` backs up `ramon-fork`, not them.
 
 NEVER run `osascript -e 'quit app "Ghostty"'` — the fork and the official build are
 both *named* "Ghostty", so it's ambiguous and can quit the user's real, working
