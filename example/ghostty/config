@@ -1,0 +1,39 @@
+# Appearance
+#theme = Gruvbox Dark Hard
+font-family = "JetBrains Mono"
+font-size = 14
+# Disable ligatures (e.g. render `<=` as two glyphs, not one).
+font-feature = -calt
+font-feature = -liga
+font-feature = -dlig
+background-opacity = 0.97
+cursor-style = block
+cursor-style-blink = false
+bell-features = system,attention,title,border
+
+# Long-running agent output: don't lose history
+scrollback-limit = 1000000
+
+# Quality of life
+# Guard against accidentally closing terminals. Was `false` (no prompt ever,
+# even with a running process) — which is how state got lost. `always` prompts
+# on every close/quit, including idle shells. Switch to `true` if you only want
+# a prompt when a process is actively running (won't protect idle shells).
+confirm-close-surface = always
+window-save-state = always
+# Longer window to undo (Cmd+Z) an accidental close of a split/tab/window.
+undo-timeout = 30s
+macos-option-as-alt = true
+mouse-hide-while-typing = true
+
+# Tab navigation — PageUp/PageDown go to previous/next tab.
+# Both ctrl and alt(option) so the new keyboard's lone (left) control isn't required.
+keybind = ctrl+page_up=previous_tab
+keybind = ctrl+page_down=next_tab
+keybind = alt+page_up=previous_tab
+keybind = alt+page_down=next_tab
+
+# Quick terminal — global dropdown for ad-hoc commands
+#keybind = global:cmd+grave_accent=toggle_quick_terminal
+quick-terminal-position = top
+quick-terminal-animation-duration = 0.1

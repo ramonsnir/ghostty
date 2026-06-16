@@ -286,6 +286,25 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
 - **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
+- **Config files & secrets** (tracked example copies): the repo keeps reference
+  copies of both live config files under **`example/`** — `example/ghostty/config`
+  (mirror of the shared `~/.config/ghostty/config`) and `example/ghostty-ramon/config`
+  (mirror of the fork-only `~/.config/ghostty-ramon/config`). These are the starting
+  point for setting the fork up on a new Mac (clone, build, copy these two into
+  `~/.config/`). **Keep them byte-for-byte identical to the on-disk files** — whenever
+  you change either live config, re-copy it into `example/` in the same commit. **They
+  must contain NO secrets and NO per-machine values.** Secrets + machine-specific
+  values instead live in the **untracked** `~/.config/ghostty-ramon/local`, which the
+  tracked fork config pulls in via an optional include
+  (`config-file = ?~/.config/ghostty-ramon/local` — the `?` suppresses the
+  file-not-found error, and config-file entries load *after* the file that defines
+  them, so `local` cleanly supplies/overrides values). What lives in `local` today:
+  `mcp-token` (a shell-execution credential) and `web-monitor-listen` (this Mac's
+  Tailscale IP). When adding a new secret or per-machine key, put it in `local`, not in
+  the tracked config. On a new machine, create `local` by hand (generate a fresh
+  `mcp-token` with `openssl rand -hex 24`, set that Mac's own Tailscale IP); if `local`
+  is absent the fork still launches (web monitor + MCP just disabled / token-less).
+
 ## Iteration lifecycle (macOS)
 Toolchain: full **Xcode** (not just Command Line Tools) + Metal toolchain + accepted
 license; **Homebrew `zig@0.15`** (the official 0.15.2 tarball has a broken linker on

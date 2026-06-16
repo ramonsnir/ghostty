@@ -1,0 +1,188 @@
+# Ghostty fork (ramon) — fork-only config
+#
+# Loaded ONLY by the forked build ("Ghostty (ramon)", bundle id
+# com.mitchellh.ghostty-ramon), layered on top of the shared
+# ~/.config/ghostty/config. Put fork-only settings here — especially keybinds
+# for the fork's new commands — so an official Ghostty (which also reads
+# ~/.config/ghostty/config) never sees them and never shows config errors.
+#
+# Anything here extends/overrides the shared config for the fork only.
+#
+# SECRETS / PER-MACHINE values do NOT live in this file — they live in the
+# untracked ~/.config/ghostty-ramon/local, pulled in below. This file is meant
+# to stay portable and secret-free (it is mirrored, byte-for-byte, into the
+# repo's example/ directory). See CLAUDE.md "Config files & secrets".
+config-file = ?~/.config/ghostty-ramon/local
+
+# --- Fork split/tab commands (edit combos to taste) ----------------------
+# One active example below to confirm this file loads; uncomment/edit the rest.
+
+# Flip the nearest enclosing split of the given orientation:
+keybind = ctrl+cmd+shift+f=flip_split:horizontal
+#keybind = ctrl+cmd+shift+v=flip_split:vertical
+
+# Toggle a split's orientation (current -> the other):
+#keybind = ctrl+cmd+shift+h=toggle_split_direction:horizontal
+#keybind = ctrl+cmd+shift+u=toggle_split_direction:vertical
+
+# Eject the focused pane into its own tab:
+#keybind = ctrl+cmd+shift+t=move_split_to_new_tab
+
+# Merge a neighboring tab into this one
+# (next/previous x left-right(horizontal)/up-down(vertical)):
+#keybind = ctrl+cmd+shift+right=merge_tabs:next_horizontal
+#keybind = ctrl+cmd+shift+down=merge_tabs:next_vertical
+#keybind = ctrl+cmd+shift+left=merge_tabs:previous_horizontal
+#keybind = ctrl+cmd+shift+up=merge_tabs:previous_vertical
+
+# --- tmux-shaped prefix layer for fork-specific actions -----------------
+
+# Mark / pull split (tmux prefix q / Q / j).
+# `mark_split` toggles on re-press; `shift+q` is the explicit "clear from
+# anywhere" chord. Sequence trigger keys are case-insensitive, so the
+# uppercase variant must be written as `shift+q`.
+keybind = ctrl+a>q=mark_split
+keybind = ctrl+a>shift+q=clear_split_mark
+# Pull lives on `m` ("move marked here"), not `j`: `ctrl+a>j` is the vim-style
+# resize-down chord below, and the later definition would clobber this one.
+keybind = ctrl+a>m=pull_marked_split:auto
+
+# Eject focused pane into its own tab (tmux prefix !).
+keybind = ctrl+a>shift+!=move_split_to_new_tab
+
+# One-key project launchers — open a new tab with cwd set to the project.
+# `n` is taken by `next_tab`, so ExampleOS uses the explicit `shift+n`.
+keybind = ctrl+a>g=new_tab:~/git/ghostty
+keybind = ctrl+a>shift+n=new_tab:~/git/ExampleOS
+keybind = ctrl+a>i=new_tab:~/git/another-project
+keybind = ctrl+a>s=new_tab:~/git/acme-foods
+
+# Open a new tab and run a command in it as the first input (fork's
+# new_tab_command). The shell stays interactive afterward; `~` is expanded
+# by the shell, not the apprt.
+keybind = ctrl+a>ctrl+shift+l=new_tab_command:~/git/ExampleOS/scripts/claude-accounts.sh list
+
+# Dynamic project selector (tmux-sessionizer style): opens a fuzzy palette of
+# the immediate subdirs of each `project-directory`; selecting one opens it in
+# a new tab. Unlike the one-key launchers above, no per-project list to keep.
+project-directory = ~/git
+keybind = ctrl+a>f=toggle_project_selector
+
+# --- tmux pane/split bindings --------------------------------------------
+# %  / "   split right / split down   (shift required to type both symbols)
+# @ is also accepted as a personal alias for %.
+keybind = ctrl+a>shift+%=new_split:right
+keybind = ctrl+a>shift+@=new_split:right
+keybind = ctrl+a>shift+"=new_split:down
+# arrows: navigate panes
+keybind = ctrl+a>left=goto_split:left
+keybind = ctrl+a>right=goto_split:right
+keybind = ctrl+a>up=goto_split:up
+keybind = ctrl+a>down=goto_split:down
+# o / ;   next / last pane (; is a straight key — no shift needed)
+keybind = ctrl+a>o=goto_split:next
+keybind = ctrl+a>;=goto_split:previous
+# x       kill pane (uses confirm-close-surface)
+keybind = ctrl+a>x=close_surface
+# z       zoom toggle
+keybind = ctrl+a>z=toggle_split_zoom
+# space   re-equalize (tmux's "next layout" is the closest useful thing)
+keybind = ctrl+a>space=equalize_splits
+# { / }   swap focused pane with previous / next (tmux's swap-pane -U / -D)
+keybind = ctrl+a>shift+{=swap_split:previous
+keybind = ctrl+a>shift+}=swap_split:next
+# Resize panes — vim-style h/j/k/l for small steps, shift+H/J/K/L for big.
+# `repeatable:` keeps the prefix armed for 500ms after the first hit, so
+# `ctrl+a>L L L L` keeps resizing without re-issuing the prefix (tmux bind -r).
+# Avoid ctrl+arrow (macOS Mission Control claims those before Ghostty sees them).
+keybind = repeatable:ctrl+a>h=resize_split:left,2
+keybind = repeatable:ctrl+a>j=resize_split:down,2
+keybind = repeatable:ctrl+a>k=resize_split:up,2
+keybind = repeatable:ctrl+a>l=resize_split:right,2
+keybind = repeatable:ctrl+a>shift+h=resize_split:left,10
+keybind = repeatable:ctrl+a>shift+j=resize_split:down,10
+keybind = repeatable:ctrl+a>shift+k=resize_split:up,10
+keybind = repeatable:ctrl+a>shift+l=resize_split:right,10
+
+# --- tmux window/tab bindings --------------------------------------------
+# c       new tab (inherits cwd, like tmux new-window)
+keybind = ctrl+a>c=new_tab
+# n / p   next / previous tab
+keybind = ctrl+a>n=next_tab
+keybind = ctrl+a>p=previous_tab
+# &       kill tab (shift+7)
+keybind = ctrl+a>shift+&=close_tab
+# ,       rename tab
+keybind = ctrl+a>,=prompt_tab_title
+# w       overview (closest to tmux's window list)
+keybind = ctrl+a>w=toggle_tab_overview
+# 1..9    goto tab N
+keybind = ctrl+a>1=goto_tab:1
+keybind = ctrl+a>2=goto_tab:2
+keybind = ctrl+a>3=goto_tab:3
+keybind = ctrl+a>4=goto_tab:4
+keybind = ctrl+a>5=goto_tab:5
+keybind = ctrl+a>6=goto_tab:6
+keybind = ctrl+a>7=goto_tab:7
+keybind = ctrl+a>8=goto_tab:8
+keybind = ctrl+a>9=goto_tab:9
+
+# --- tmux misc -----------------------------------------------------------
+# ctrl+a  go back to the last focused split (tmux last-pane, but GLOBAL —
+# across any tabs and windows). Two-deep toggle: press again to return.
+keybind = ctrl+a>ctrl+a=goto_last_surface
+# :       command palette (closest to tmux's `:` command prompt)
+keybind = ctrl+a>shift+:=toggle_command_palette
+# r       reload config
+keybind = ctrl+a>r=reload_config
+
+# --- Bell: quieter when in focus -----------------------------------------
+# Fork-only key (an official Ghostty would error on it). The shared
+# ~/.config/ghostty/config keeps `bell-features = system,attention,title,border`
+# as the OUT-OF-FOCUS behavior. `bell-features-focused` governs the bell only
+# when the ringing surface is TRULY in focus (focused split AND its window is
+# key AND the app is frontmost) — so a background window, another macOS Space,
+# or a non-focused split still uses the full out-of-focus set above.
+#
+# In focus: sound only (system beep), no dock attention, no title 🔔.
+# `border` is intentionally omitted, not written as `no-border`: this key is
+# parsed from the BellFeatures defaults (border=false), independently of
+# `bell-features`, so border is already off here and a focused ring never
+# arms the visual bell at all.
+bell-features-focused = system,no-attention,no-title
+
+# --- PTY host: emulation-on-host (always-on) -----------------------------
+# Fork-only key (an official Ghostty would error on it). Non-null selects the
+# out-of-process `.client` backend: terminal emulation + the live shell run in
+# a long-lived `ghostty-host` daemon, so a session SURVIVES A GUI QUIT/RELAUNCH
+# (rebuild, reinstall, app restart) and reattaches by session id.
+#
+# The daemon is supervised by the LaunchAgent
+# ~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist (RunAtLoad +
+# KeepAlive), listening on this socket. Caveats: it survives GUI restarts, NOT
+# a host crash or machine reboot (sessions live only in host RAM, no
+# persistence); already-open .exec tabs can't be migrated — only tabs opened
+# after this is in effect are hosted.
+pty-host = /Users/ramon/.ghostty-ramon-host.sock
+
+# --- Web monitor (fork-only) -------------------------------------------------
+# GUI-embedded HTTP server: watch/drive splits from a phone over Tailscale.
+# Full notes in WEB-MONITOR.md (repo root). Read at LAUNCH — relaunch the app
+# after changing these. `web-monitor-listen` is the BIND address (this Mac's
+# Tailscale IP), NOT an allowlist; the token is the security boundary — treat it
+# as a shell-execution credential and rotate (+ relaunch) if a device is lost.
+# `web-monitor-listen` (this Mac's Tailscale IP) lives in the untracked
+# ~/.config/ghostty-ramon/local — it differs per machine. Empty/absent = off.
+# web-monitor-token =   # removed: running open on the tailnet (Tailscale ACL is the boundary)
+
+# --- MCP server (fork-only) --------------------------------------------------
+# GUI-embedded MCP server for agent control: reorganize splits/tabs, open
+# tabs/run commands, and watch + respond to live sessions (bell/exit, read
+# screen, type input). Read at LAUNCH — relaunch the app after changing these.
+# `mcp-listen` is the BIND address; localhost-only so it is reachable only from
+# this Mac (e.g. a local Claude Code/Codex via the stdio shim, macos/mcp-shim).
+# Unlike the web monitor, the token is ALWAYS set: it is a SHELL-EXECUTION
+# credential (can spawn tabs + run commands) — rotate (+ relaunch) if leaked.
+# `mcp-token` lives in the untracked ~/.config/ghostty-ramon/local (it is a
+# secret + unique per machine); generate a fresh one with `openssl rand -hex 24`.
+mcp-listen = 127.0.0.1:8765
