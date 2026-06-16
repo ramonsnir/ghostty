@@ -216,6 +216,7 @@
 				Features/Update/UpdateSimulator.swift,
 				Features/Update/UpdateViewModel.swift,
 				"Features/WebMonitor/WebMonitorHostClient.swift",
+				"Features/WebMonitor/WebMonitorPush.swift",
 				"Features/WebMonitor/WebMonitorServer.swift",
 				"Features/WebMonitor/vendor/JetBrainsMonoNerdFont-Bold.woff2",
 				"Features/WebMonitor/vendor/JetBrainsMonoNerdFont-Regular.woff2",

@@ -19,13 +19,16 @@ read at launch.
 
 ```ini
 # Web monitor (fork-only). Empty/unset listen => disabled.
-web-monitor-listen = 100.x.y.z:8787    # your Tailscale IP : port  (BIND address)
+# Bind loopback; `tailscale serve` puts HTTPS in front (see "Notify on bell" below).
+web-monitor-listen = 127.0.0.1:8787
 # web-monitor-token = <16+ char secret>   # OPTIONAL — omit to run OPEN on the tailnet
 ```
 
-- **`web-monitor-listen`** — `addr:port` to bind. Use **your Tailscale IP** so it's reachable
-  only on your tailnet (and so the built-in Host-header check matches). It's purely a *bind
-  address*, **not** an IP allowlist. Empty/unset ⇒ the monitor is disabled.
+- **`web-monitor-listen`** — `addr:port` to bind. Use **`127.0.0.1:8787`**: a loopback bind
+  fronted by `tailscale serve` for HTTPS (see **Notify on bell** for the one-line command).
+  HTTPS is required for push notifications, and a loopback bind makes the line
+  **machine-independent** — identical on every laptop (only the `ts.net` hostname differs). It's
+  purely a *bind address*, **not** an IP allowlist. Empty/unset ⇒ the monitor is disabled.
 - **`web-monitor-token`** — *optional.* **Empty/unset ⇒ the server runs OPEN** (access control
   is your Tailscale ACL alone); it logs a one-line warning so that's a deliberate choice. If
   you *do* set a token (≥16 chars; `openssl rand -hex 24`), it's enforced on every request and
@@ -39,9 +42,10 @@ web-monitor-listen = 100.x.y.z:8787    # your Tailscale IP : port  (BIND address
 
 ## Using it from the phone
 
-1. On your tailnet, open **`http://100.x.y.z:8787/`** (no token needed when running open; if a
-   token is set, open `…/?token=<secret>` once — it's then stashed in `sessionStorage` and sent
-   via the `X-Ghostty-Token` header).
+1. On your tailnet, open **`https://<machine>.<tailnet>.ts.net:8787/`** (set up via
+   `tailscale serve`, see **Notify on bell**). No token needed when running open; if a token is
+   set, open `…/?token=<secret>` once — it's then stashed in `sessionStorage` and sent via the
+   `X-Ghostty-Token` header.
 2. You get a **list of live surfaces** (title + cwd). Tap one to open it.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
    (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up),
@@ -65,10 +69,73 @@ web-monitor-listen = 100.x.y.z:8787    # your Tailscale IP : port  (BIND address
 
 ---
 
+## Notify on bell (background push notifications)
+
+Get a **push notification on your phone when any split rings a bell** — even with the
+browser tab closed and the phone locked. Use it to step away from the laptop and still get
+pinged when a long command finishes or a CLI agent wants approval. The header has a **🔔
+Notify** toggle: **arm it when you walk away, mute it when you're back** (it's a single
+server-side switch, so muting from any device mutes all bells).
+
+This is real **Web Push** (VAPID + service worker), done in-process with **zero new
+dependencies** — we self-generate a VAPID keypair (CryptoKit), so **no Firebase/Google
+project is involved**.
+
+### Requirement: HTTPS via `tailscale serve`
+
+Browsers only register a service worker (needed for background push) on a **secure context**,
+so the plain-HTTP-over-Tailscale-IP setup above **can't** do push. Put **`tailscale serve`** in
+front to terminate TLS with the auto-provisioned `*.ts.net` certificate. One-time setup:
+
+This setup is the same on every machine (the config line is loopback, hence identical; only
+your `ts.net` hostname differs):
+
+1. In the **Tailscale admin** → DNS, enable **MagicDNS** and **HTTPS Certificates** (once per
+   tailnet).
+2. Bind the monitor to **loopback** so `tailscale serve` can proxy to it
+   (`~/.config/ghostty-ramon/config`):
+   ```ini
+   web-monitor-listen = 127.0.0.1:8787
+   ```
+   (`tailscale serve` only proxies to `127.0.0.1`. It rewrites `Host` to the loopback backend,
+   so the monitor's existing Host-header allowlist already accepts it — no extra config.)
+3. Start the proxy — serve HTTPS on the **same 8787**, proxying to the loopback 8787
+   (persists across reboots):
+   ```sh
+   tailscale serve --bg --https=8787 8787
+   ```
+   Your monitor is now at **`https://<machine>.<tailnet>.ts.net:8787/`**. Using 8787 for both
+   the bind and the HTTPS port is fine — they're on different addresses (loopback vs the tailnet
+   IP), so they don't collide. This keeps `443` (and any other port/path) free for serving other
+   things from the same machine (`tailscale serve status` lists all rules).
+4. On Android Chrome, open that **https** URL (append `?token=…` once if a token is set), tap
+   **🔔 Notify**, and **grant** the notification permission. Done — bells now push to that device.
+
+If the page is opened over plain HTTP (no `tailscale serve`), the toggle shows **"🔔 n/a"** and
+explains it needs HTTPS, rather than failing silently.
+
+> **Second laptop / fresh machine:** identical steps. Copy the same
+> `web-monitor-listen = 127.0.0.1:8787` line, run the same `tailscale serve --bg --https=8787
+> 8787`, and open *that* machine's `https://<machine>.<tailnet>.ts.net:8787/`. Each device you
+> want pinged subscribes itself by tapping **🔔 Notify** on the page (subscriptions are
+> per-browser and stored server-side per machine).
+
+### Notes
+
+- The toggle is a **global arm/mute flag**; the VAPID keypair, the device subscriptions, and the
+  flag persist (UserDefaults), so they survive a relaunch. Default is **muted**.
+- Bells are **debounced ~3s per surface** so a chatty bell doesn't spam.
+- An expired subscription (push endpoint returns 404/410) is dropped automatically.
+- This is **GUI-only** — no host change, so enabling/changing it is a relaunch, never a
+  `ghostty-host` restart.
+
+---
+
 ## Security model (read once)
 
-- **No TLS** — the tailnet (WireGuard) encrypts transport. **Do not** expose the port beyond
-  your tailnet.
+- **No TLS in the server itself** — it speaks plain HTTP to loopback; `tailscale serve`
+  terminates HTTPS at the node's edge and the tailnet (WireGuard) encrypts the hop to your
+  phone. **Do not** expose the port beyond your tailnet (never `tailscale funnel` it).
 - **Auth is the optional token.** Open (no token) ⇒ the **tailnet/Tailscale ACL is the entire
   boundary** — appropriate on a private tailnet. With a token set, it gates every route
   (constant-time compare; `?token=` only on the bootstrap GET `/` + asset routes, header for
@@ -114,6 +181,11 @@ real scrollback can't come from the GUI. Instead:
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
 | `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → real mouse wheel to the host |
+| `GET /sw.js` | the Web Push service worker (bootstrap; `?token=` accepted) |
+| `GET /api/push/config` | JSON `{vapidPublicKey, enabled, subscriptions}` |
+| `POST /api/push/subscribe` | register a browser `PushSubscription` |
+| `POST /api/push/unsubscribe` | `{endpoint}` → drop a subscription |
+| `POST /api/push/enabled` | `{enabled:bool}` → arm/mute the Notify toggle |
 
 ---
 
@@ -140,7 +212,8 @@ Committed on `ramon-fork` (not pushed).
 
 | Piece | File |
 |---|---|
-| Server + embedded `xterm.js` page (routing, `/stream`, `/scroll`, assets) | `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` |
+| Server + embedded `xterm.js` page (routing, `/stream`, `/scroll`, assets, Notify toggle) | `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` |
+| Web Push crypto (VAPID/RFC 8292 + RFC 8291 `aes128gcm`) + subscription store / bell→push | `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` |
 | Host-protocol client (subscribe to `raw_output`) | `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift` |
 | Vendored xterm.js | `macos/Sources/Features/WebMonitor/vendor/xterm.{js,css}` |
 | Vendored JetBrains Mono Nerd Font (woff2) | `macos/Sources/Features/WebMonitor/vendor/JetBrainsMonoNerdFont-{Regular,Bold}.woff2` |

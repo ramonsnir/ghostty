@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import CryptoKit
 import GhosttyKit
 @testable import Ghostty
 
@@ -1172,6 +1173,164 @@ struct WebMonitorServerTests {
         #expect(r.reason == "OK")
         #expect(r.contentType == "application/javascript; charset=utf-8")
         #expect(r.body == bytes)
+    }
+
+    // MARK: - Web Push: base64url
+
+    @Test func base64urlRoundTrip() {
+        let data = Data([0, 1, 2, 250, 251, 252, 253, 254, 255, 65, 66])
+        let encoded = WebPushCrypto.base64url(data)
+        // URL-safe alphabet, no padding.
+        #expect(!encoded.contains("+"))
+        #expect(!encoded.contains("/"))
+        #expect(!encoded.contains("="))
+        #expect(WebPushCrypto.base64urlDecode(encoded) == data)
+    }
+
+    @Test func base64urlDecodesUnpaddedVector() {
+        // The RFC 8291 §5 auth secret is a 16-byte value in unpadded base64url.
+        #expect(WebPushCrypto.base64urlDecode("BTBZMqHH6r4Tts7J_aSIgg")?.count == 16)
+    }
+
+    // MARK: - Web Push: message encryption (RFC 8291 §5 worked example)
+
+    @Test func encryptMatchesRFC8291Example() throws {
+        // The canonical worked example from RFC 8291 Section 5. Feeding the exact
+        // application-server private key + salt the RFC used makes the otherwise-
+        // random encryption deterministic, so the full aes128gcm body must match
+        // the RFC's published output byte-for-byte.
+        let plaintext = Data("When I grow up, I want to be a watermelon".utf8)
+        let p256dh = WebPushCrypto.base64urlDecode(
+            "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4")!
+        let auth = WebPushCrypto.base64urlDecode("BTBZMqHH6r4Tts7J_aSIgg")!
+        let asPrivateRaw = WebPushCrypto.base64urlDecode("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw")!
+        let serverKey = try P256.KeyAgreement.PrivateKey(rawRepresentation: asPrivateRaw)
+        let salt = WebPushCrypto.base64urlDecode("DGv6ra1nlYgDCS1FRnbzlw")!
+
+        let body = try WebPushCrypto.encrypt(
+            payload: plaintext, p256dh: p256dh, authSecret: auth, serverKey: serverKey, salt: salt)
+
+        let expected = "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN"
+        #expect(WebPushCrypto.base64url(body) == expected)
+    }
+
+    @Test func encryptRejectsBadSubscriptionKey() {
+        // A p256dh that is not a valid uncompressed P-256 point must throw, not crash.
+        let serverKey = P256.KeyAgreement.PrivateKey()
+        #expect(throws: (any Error).self) {
+            _ = try WebPushCrypto.encrypt(
+                payload: Data("x".utf8), p256dh: Data([0x04, 0x00, 0x01]),
+                authSecret: Data(count: 16), serverKey: serverKey, salt: Data(count: 16))
+        }
+    }
+
+    // MARK: - Web Push: VAPID JWT (RFC 8292)
+
+    @Test func vapidAuthorizationHeaderStructureAndSignature() throws {
+        let key = P256.Signing.PrivateKey()
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let header = WebPushCrypto.vapidAuthorizationHeader(
+            endpoint: "https://fcm.googleapis.com/fcm/send/abc123",
+            privateKey: key, now: now)
+        let value = try #require(header)
+
+        // "vapid t=<jwt>,k=<pubkey>"
+        #expect(value.hasPrefix("vapid t="))
+        let rest = String(value.dropFirst("vapid t=".count))
+        let comps = rest.components(separatedBy: ",k=")
+        #expect(comps.count == 2)
+        let jwt = comps[0]
+        // k = the VAPID public key (uncompressed point) as base64url.
+        #expect(WebPushCrypto.base64urlDecode(comps[1]) == key.publicKey.x963Representation)
+
+        // JWT = header.claims.signature
+        let parts = jwt.components(separatedBy: ".")
+        #expect(parts.count == 3)
+        let headerJSON = String(decoding: WebPushCrypto.base64urlDecode(parts[0])!, as: UTF8.self)
+        #expect(headerJSON == #"{"typ":"JWT","alg":"ES256"}"#)
+        let claimsJSON = String(decoding: WebPushCrypto.base64urlDecode(parts[1])!, as: UTF8.self)
+        #expect(claimsJSON.contains(#""aud":"https://fcm.googleapis.com""#))
+        #expect(claimsJSON.contains("\"exp\":\(1_000_000 + 12 * 3600)"))
+
+        // The signature must actually verify against the public key (ES256/SHA-256).
+        let signingInput = Data((parts[0] + "." + parts[1]).utf8)
+        let sig = try P256.Signing.ECDSASignature(rawRepresentation: WebPushCrypto.base64urlDecode(parts[2])!)
+        #expect(key.publicKey.isValidSignature(sig, for: signingInput))
+    }
+
+    @Test func vapidAuthorizationHeaderRejectsBadEndpoint() {
+        let key = P256.Signing.PrivateKey()
+        #expect(WebPushCrypto.vapidAuthorizationHeader(endpoint: "not a url", privateKey: key) == nil)
+    }
+
+    // MARK: - Web Push: request-body parsing
+
+    @Test func pushSubscriptionParsesBrowserJSON() {
+        let body = Data(#"{"endpoint":"https://x/abc","expirationTime":null,"keys":{"p256dh":"AAA","auth":"BBB"}}"#.utf8)
+        let sub = WebMonitorServer.pushSubscription(fromBody: body)
+        #expect(sub == WebPushSubscription(endpoint: "https://x/abc", p256dh: "AAA", auth: "BBB"))
+    }
+
+    @Test func pushSubscriptionRejectsMissingFields() {
+        #expect(WebMonitorServer.pushSubscription(fromBody: Data(#"{"endpoint":"https://x"}"#.utf8)) == nil)
+        #expect(WebMonitorServer.pushSubscription(fromBody: Data(#"{"keys":{"p256dh":"A","auth":"B"}}"#.utf8)) == nil)
+        #expect(WebMonitorServer.pushSubscription(fromBody: Data(#"{"endpoint":"","keys":{"p256dh":"A","auth":"B"}}"#.utf8)) == nil)
+        #expect(WebMonitorServer.pushSubscription(fromBody: Data("not json".utf8)) == nil)
+    }
+
+    @Test func pushEndpointParsing() {
+        #expect(WebMonitorServer.pushEndpoint(fromBody: Data(#"{"endpoint":"https://x/abc"}"#.utf8)) == "https://x/abc")
+        #expect(WebMonitorServer.pushEndpoint(fromBody: Data(#"{"endpoint":""}"#.utf8)) == nil)
+        #expect(WebMonitorServer.pushEndpoint(fromBody: Data("{}".utf8)) == nil)
+    }
+
+    @Test func pushEnabledFlagParsing() {
+        #expect(WebMonitorServer.pushEnabledFlag(fromBody: Data(#"{"enabled":true}"#.utf8)) == true)
+        #expect(WebMonitorServer.pushEnabledFlag(fromBody: Data(#"{"enabled":false}"#.utf8)) == false)
+        #expect(WebMonitorServer.pushEnabledFlag(fromBody: Data(#"{"enabled":"yes"}"#.utf8)) == nil)
+        #expect(WebMonitorServer.pushEnabledFlag(fromBody: Data("{}".utf8)) == nil)
+    }
+
+    // MARK: - Web Push: decideRoute (new routes)
+
+    @Test func decideRouteServiceWorkerBootstrap() {
+        // /sw.js is a bootstrap path: query token accepted (like GET / and assets).
+        #expect(decide("GET", "/sw.js", query: ["token": Self.tok]) == .serviceWorker)
+        #expect(decide("GET", "/sw.js") == .serviceWorker)  // header token also fine
+        #expect(decide("POST", "/sw.js") == .methodNotAllowed)
+    }
+
+    @Test func decideRoutePushConfig() {
+        #expect(decide("GET", "/api/push/config") == .pushConfig)
+        #expect(decide("POST", "/api/push/config") == .methodNotAllowed)
+    }
+
+    @Test func decideRoutePushSubscribeUnsubscribeEnabled() {
+        #expect(decide("POST", "/api/push/subscribe") == .pushSubscribe)
+        #expect(decide("GET", "/api/push/subscribe") == .methodNotAllowed)
+        #expect(decide("POST", "/api/push/unsubscribe") == .pushUnsubscribe)
+        #expect(decide("GET", "/api/push/unsubscribe") == .methodNotAllowed)
+        #expect(decide("POST", "/api/push/enabled") == .pushEnabled)
+        #expect(decide("GET", "/api/push/enabled") == .methodNotAllowed)
+    }
+
+    @Test func decideRoutePushApiRejectsQueryToken() {
+        // /api/push/* is NOT a bootstrap path: a query token must be ignored, so a
+        // request presenting ONLY ?token= (no header) is unauthorized.
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/api/push/config", query: ["token": Self.tok],
+            headers: ["host": "\(Self.host):\(Self.port)"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .unauthorized)
+    }
+
+    @Test func decideRoutePushConfigRequiresHeaderToken() {
+        // Missing token entirely on the (header-only) push API ⇒ unauthorized.
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/api/push/config", query: [:],
+            headers: ["host": "\(Self.host):\(Self.port)"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .unauthorized)
     }
 }
 

@@ -58,6 +58,12 @@ final class WebMonitorServer {
     /// allowlist (DNS-rebinding defense), never as an IP allowlist.
     private let parsed: (host: String, port: UInt16)?
 
+    /// Web Push subsystem: owns the VAPID keypair + subscription store + enable
+    /// flag, observes bells, and fans each bell out as an encrypted push. The
+    /// `/api/push/*` routes + the served service worker drive it. Lifecycle is
+    /// tied to the server (`start()`/`stop()` below).
+    let push = WebPushManager()
+
     private var listener: NWListener?
     private var connectionRefs: [ObjectIdentifier: NWConnection] = [:]
     /// Per-connection idle/read watchdog timers (slowloris defense; also bounds
@@ -150,6 +156,11 @@ final class WebMonitorServer {
     // MARK: - Lifecycle
 
     func start() {
+        // Start the Web Push subsystem (bell observer). Independent of the HTTP
+        // listener binding — it just no-ops until a device subscribes and the
+        // toggle is armed.
+        push.start()
+
         // Token-strength gate at startup: never accidentally open with a weak
         // (empty/short) token. The token is a shell-execution credential, so a
         // guessable one is as dangerous as none — require a real, long random
@@ -215,6 +226,9 @@ final class WebMonitorServer {
     }
 
     func stop() {
+        // Tear down the Web Push observer (hops to main itself).
+        push.stop()
+
         // Teardown is invoked from applicationWillTerminate on the MAIN thread,
         // but `connectionRefs` is otherwise mutated only on the dedicated serial
         // `queue` (handle / stateUpdateHandler). Hop onto that queue so ALL
@@ -448,6 +462,11 @@ final class WebMonitorServer {
         case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
         case clearBell(uuid: UUID)               // POST /api/surface/{uuid}/bell (acknowledge bell)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
+        case serviceWorker                       // GET /sw.js (bootstrap; Web Push SW)
+        case pushConfig                          // GET /api/push/config (VAPID pubkey + enabled)
+        case pushSubscribe                       // POST /api/push/subscribe
+        case pushUnsubscribe                     // POST /api/push/unsubscribe
+        case pushEnabled                         // POST /api/push/enabled (arm/mute the toggle)
     }
 
     /// The static asset routes (vendored xterm.js / xterm.css), served from the
@@ -476,7 +495,10 @@ final class WebMonitorServer {
     /// assets are public, non-secret static files, so accepting the query token
     /// on them leaks nothing beyond what the page URL already carries.
     static func isBootstrapPath(_ path: String) -> Bool {
-        path == "/" || assetRoutes[path] != nil
+        // `/sw.js` is bootstrap too: the browser fetches the service worker via
+        // navigator.serviceWorker.register("/sw.js?token=…"), which (like a
+        // <script>/<link> tag) cannot set the X-Ghostty-Token header.
+        path == "/" || path == "/sw.js" || assetRoutes[path] != nil
     }
 
     /// Decide the route. PURE: no AppKit, no socket, no mutation.
@@ -521,8 +543,25 @@ final class WebMonitorServer {
                 ? .asset(name: asset.name, ext: asset.ext, contentType: asset.contentType)
                 : .methodNotAllowed
         }
+        if path == "/sw.js" {
+            return method == "GET" ? .serviceWorker : .methodNotAllowed
+        }
         if path == "/api/surfaces" {
             return method == "GET" ? .surfacesList : .methodNotAllowed
+        }
+
+        // /api/push/{action} — Web Push registration + the arm/mute toggle.
+        if path == "/api/push/config" {
+            return method == "GET" ? .pushConfig : .methodNotAllowed
+        }
+        if path == "/api/push/subscribe" {
+            return method == "POST" ? .pushSubscribe : .methodNotAllowed
+        }
+        if path == "/api/push/unsubscribe" {
+            return method == "POST" ? .pushUnsubscribe : .methodNotAllowed
+        }
+        if path == "/api/push/enabled" {
+            return method == "POST" ? .pushEnabled : .methodNotAllowed
         }
 
         // /api/surface/{uuid}/{action}
@@ -708,7 +747,80 @@ final class WebMonitorServer {
             // resource (e.g. a build that did not bundle the vendor files) is a
             // 404 rather than a crash.
             send(Self.assetResponse(name: name, ext: ext, contentType: contentType), on: conn)
+
+        case .serviceWorker:
+            clearAuthFailures(peer)
+            // The Web Push service worker. Pure static JS (no AppKit / surface
+            // access), served like an asset on the connection queue.
+            send(.asset(Data(Self.serviceWorkerJS.utf8), "text/javascript; charset=utf-8"), on: conn)
+
+        case .pushConfig:
+            clearAuthFailures(peer)
+            // The page needs the VAPID public key (applicationServerKey) + the
+            // current armed/muted state + whether THIS server already has any
+            // subscription. push.* are self-serialized — no main hop.
+            let json: [String: Any] = [
+                "vapidPublicKey": push.vapidPublicKeyBase64,
+                "enabled": push.isEnabled(),
+                "subscriptions": push.subscriptionCount(),
+            ]
+            send(.json((try? JSONSerialization.data(withJSONObject: json)) ?? Data("{}".utf8)), on: conn)
+
+        case .pushSubscribe:
+            clearAuthFailures(peer)
+            guard let sub = Self.pushSubscription(fromBody: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            push.addSubscription(sub)
+            send(.json(Data(#"{"ok":true}"#.utf8)), on: conn)
+
+        case .pushUnsubscribe:
+            clearAuthFailures(peer)
+            guard let endpoint = Self.pushEndpoint(fromBody: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            push.removeSubscription(endpoint: endpoint)
+            send(.json(Data(#"{"ok":true}"#.utf8)), on: conn)
+
+        case .pushEnabled:
+            clearAuthFailures(peer)
+            guard let on = Self.pushEnabledFlag(fromBody: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            push.setEnabled(on)
+            send(.json(Data("{\"ok\":true,\"enabled\":\(on)}".utf8)), on: conn)
         }
+    }
+
+    // MARK: - Push request-body parsing (pure, testable)
+
+    /// Parse a browser `PushSubscription` JSON (`{endpoint, keys:{p256dh,auth}}`,
+    /// the shape of `PushSubscription.toJSON()`) into our value type. Returns nil
+    /// if any required field is missing/empty. PURE.
+    static func pushSubscription(fromBody body: Data) -> WebPushSubscription? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let endpoint = obj["endpoint"] as? String, !endpoint.isEmpty,
+              let keys = obj["keys"] as? [String: Any],
+              let p256dh = keys["p256dh"] as? String, !p256dh.isEmpty,
+              let auth = keys["auth"] as? String, !auth.isEmpty else { return nil }
+        return WebPushSubscription(endpoint: endpoint, p256dh: p256dh, auth: auth)
+    }
+
+    /// Parse `{endpoint:"…"}` (unsubscribe). PURE.
+    static func pushEndpoint(fromBody body: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let endpoint = obj["endpoint"] as? String, !endpoint.isEmpty else { return nil }
+        return endpoint
+    }
+
+    /// Parse `{enabled:true|false}` (the arm/mute toggle). PURE.
+    static func pushEnabledFlag(fromBody body: Data) -> Bool? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let enabled = obj["enabled"] as? Bool else { return nil }
+        return enabled
     }
 
     // MARK: - Streaming /stream route (raw PTY byte stream for xterm.js)
@@ -1340,6 +1452,40 @@ final class WebMonitorServer {
         conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
     }
 
+    // MARK: - Web Push service worker
+
+    // The service worker that receives background push messages and shows the
+    // notification — runs even with the tab closed / phone locked (the whole
+    // point). It needs NO token: it never calls our API, it only renders the
+    // push payload the OS hands it. On tap it focuses an existing monitor tab
+    // (which still holds its sessionStorage token) or opens the page. Served at
+    // `/sw.js` (a bootstrap route, so the register() fetch may carry `?token=`).
+    static let serviceWorkerJS = """
+    self.addEventListener('push', function (event) {
+      var data = {};
+      try { data = event.data ? event.data.json() : {}; } catch (e) {}
+      var title = data.title || 'Ghostty';
+      var opts = {
+        body: data.body || '',
+        tag: data.surface || 'ghostty-bell',
+        renotify: true,
+        data: { surface: data.surface || '' }
+      };
+      event.waitUntil(self.registration.showNotification(title, opts));
+    });
+    self.addEventListener('notificationclick', function (event) {
+      event.notification.close();
+      event.waitUntil(
+        clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (cls) {
+          for (var i = 0; i < cls.length; i++) {
+            if ('focus' in cls[i]) { return cls[i].focus(); }
+          }
+          if (clients.openWindow) { return clients.openWindow('/'); }
+        })
+      );
+    });
+    """
+
     // MARK: - Embedded mobile HTML page
 
     // Not `private` so the embedded page can be asserted on in unit tests.
@@ -1410,6 +1556,8 @@ final class WebMonitorServer {
          left gap separate it so it is not a one-tap fat-finger neighbor. */
       button.danger { margin-left: 12px; background: #5a2a2a; color: #ffd9d9; border-color: #7a3a3a; }
       button.danger:active { background: #7a3a3a; }
+      /* The push toggle when ARMED — amber, matching the bell motif elsewhere. */
+      #notify.armed { background: #4a3a1a; border-color: #f0a35e; color: #f0c060; }
     </style>
     </head>
     <body>
@@ -1417,6 +1565,11 @@ final class WebMonitorServer {
       <b>Ghostty</b> Web Monitor
       <button id="back" style="display:none">&larr; Sessions</button>
       <span id="cur"></span>
+      <!-- Push-on-bell toggle. ARM when you step away from the laptop, MUTE when
+           you are back. Disabled (n/a) unless the origin is a secure context
+           (HTTPS via `tailscale serve`) and the browser supports Push. -->
+      <button id="notify" style="margin-left:auto"
+              title="Push a notification to this device when any split rings a bell">&#128276; Notify</button>
     </header>
     <div id="banner" role="status" aria-live="polite"></div>
     <div id="notice" class="notice" style="display:none" role="alert" aria-live="assertive"></div>
@@ -2070,6 +2223,90 @@ final class WebMonitorServer {
         }
       });
 
+      // ---- Web Push (notify-on-bell) ----------------------------------------
+      // ARM = subscribe this device + flip the server's global enable flag so a
+      // bell on ANY split pushes a background notification (works tab-closed /
+      // phone-locked). MUTE = flip the flag off. Requires a secure context
+      // (HTTPS via `tailscale serve`) + browser Push support, else disabled.
+      var notifyBtn = document.getElementById("notify");
+      var pushVapidKey = null, pushEnabled = false;
+
+      function pushSupported() {
+        return ("serviceWorker" in navigator) && ("PushManager" in window) && window.isSecureContext;
+      }
+      // base64url -> Uint8Array (applicationServerKey wants raw bytes).
+      function vapidKeyBytes(b64) {
+        var pad = "=".repeat((4 - b64.length % 4) % 4);
+        var s = (b64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+        var raw = atob(s), arr = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        return arr;
+      }
+      function refreshNotifyButton() {
+        if (!pushSupported()) {
+          notifyBtn.disabled = true;
+          notifyBtn.textContent = "\\uD83D\\uDD14 n/a";
+          notifyBtn.title = window.isSecureContext
+            ? "Push notifications are not supported by this browser"
+            : "Needs HTTPS \\u2014 put `tailscale serve` in front of the monitor";
+          return;
+        }
+        notifyBtn.disabled = false;
+        notifyBtn.classList.toggle("armed", pushEnabled);
+        notifyBtn.textContent = pushEnabled ? "\\uD83D\\uDD14 On" : "\\uD83D\\uDD14 Off";
+        notifyBtn.title = pushEnabled
+          ? "Notifications ARMED \\u2014 tap to mute"
+          : "Tap to get a push on this device when any split rings a bell";
+      }
+      function loadPushConfig() {
+        if (!pushSupported()) { refreshNotifyButton(); return; }
+        fetch(url("/api/push/config"), { headers: headers() }).then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        }).then(function (cfg) {
+          pushVapidKey = cfg.vapidPublicKey;
+          pushEnabled = !!cfg.enabled;
+          refreshNotifyButton();
+        }).catch(function () { /* leave the button in its default state */ });
+      }
+      function setServerPushEnabled(on) {
+        return fetch(url("/api/push/enabled"), {
+          method: "POST",
+          headers: headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ enabled: on })
+        }).then(function () { pushEnabled = on; refreshNotifyButton(); });
+      }
+      notifyBtn.onclick = function () {
+        flashTap(notifyBtn);
+        if (!pushSupported()) return;
+        if (pushEnabled) { setServerPushEnabled(false).catch(function () {}); return; }
+        // Arm: permission -> register SW -> subscribe -> register sub -> enable.
+        Notification.requestPermission().then(function (perm) {
+          if (perm !== "granted") { setBanner("Notification permission denied", false, true); return; }
+          return navigator.serviceWorker.register(url("/sw.js", { token: token })).then(function (reg) {
+            return reg.pushManager.getSubscription().then(function (existing) {
+              return existing || reg.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: vapidKeyBytes(pushVapidKey)
+              });
+            });
+          }).then(function (sub) {
+            return fetch(url("/api/push/subscribe"), {
+              method: "POST",
+              headers: headers({ "Content-Type": "application/json" }),
+              body: JSON.stringify(sub)
+            });
+          }).then(function () {
+            return setServerPushEnabled(true);
+          }).then(function () {
+            setBanner("Notifications armed for this device", true);
+          });
+        }).catch(function (e) {
+          setBanner("Could not enable notifications: " + (e && e.message ? e.message : e), false, true);
+        });
+      };
+      refreshNotifyButton();
+
       // Start (or restart, after token recovery) the fetches: refresh the list
       // now and keep the (cheap) session list fresh while browsing it. The list
       // timer is armed only once; re-running start() after recovery just kicks
@@ -2079,6 +2316,7 @@ final class WebMonitorServer {
           listTimer = setInterval(function () { if (!current) loadList(); }, 3000);
         }
         loadList();
+        loadPushConfig();
       }
 
       start();

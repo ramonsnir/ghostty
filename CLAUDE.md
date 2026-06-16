@@ -210,6 +210,32 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     socket/mutation); it + `hostHeaderAllowed`, `keySpecs`, `scrollDeltaY`, `parseListen`,
     `RequestParser`, `surfacesJSONData`, `HTTPResponse`, and the host-client framing helpers are
     `internal` + unit-tested.
+  - **Push notifications on bell (Notify toggle, fork-only, GUI-only):** a background **Web
+    Push** so a bell pushes to a subscribed phone with the tab CLOSED / phone LOCKED — the
+    "I stepped away" feature. The page header has a **🔔 Notify** toggle = a single SERVER-SIDE
+    arm/mute flag (mute at the laptop, arm when away). Full Web Push, ZERO new deps: a
+    self-generated **VAPID** P-256 keypair (RFC 8292 ES256 JWT) — **NO Firebase/Google project**;
+    Chrome returns an `fcm.googleapis.com` endpoint we POST to directly with **RFC 8291
+    `aes128gcm`** payload encryption (ephemeral ECDH + HKDF-SHA256 + AES-128-GCM), ALL via
+    **CryptoKit**. `WebPushCrypto` (encrypt + JWT + base64url) is PURE and unit-tested against
+    the **RFC 8291 §5 worked example** (byte-for-byte) + a VAPID sign/verify round-trip.
+    `WebPushManager` persists the keypair + device subscriptions + the enable flag in
+    **UserDefaults** (per-bundle-id; default MUTED), observes `.ghosttyBellDidRing` like
+    `MCPEventBus`, and fans each bell out via `URLSession` (debounced ~3s/surface; 404/410 ⇒
+    drop the dead subscription). **HARD REQUIREMENT: a SECURE CONTEXT** — service workers only
+    register over HTTPS, so the plain-HTTP-over-Tailscale-IP setup CANNOT push. The chosen TLS
+    path is **`tailscale serve`** in front: bind the monitor to **`127.0.0.1:<port>`** and
+    `tailscale serve --bg <port>` proxies `https://<machine>.<tailnet>.ts.net` → loopback.
+    `tailscale serve` only proxies to `127.0.0.1` and rewrites `Host` to the loopback backend
+    (original in `X-Forwarded-Host`), so the existing loopback rule in `hostHeaderAllowed`
+    already accepts it and the token still gates — **NO Zig/config changes were needed; this is
+    entirely Swift + page-side.** Routes (all on the same listener): `GET /sw.js` (the service
+    worker — a BOOTSTRAP path, `?token=` accepted, since `serviceWorker.register()` can't set the
+    header), `GET /api/push/config` (`{vapidPublicKey, enabled, subscriptions}`), `POST
+    /api/push/{subscribe,unsubscribe,enabled}` (header-token like every `/api/*`). The page's
+    Notify button is disabled with a "needs HTTPS" note when `!window.isSecureContext`. The body
+    parsers (`pushSubscription`/`pushEndpoint`/`pushEnabledFlag` `fromBody:`) + the route
+    decisions are `internal` + unit-tested.
   - **Liveness/errors** via `UNUserNotificationCenter` + log (Console.app subsystem = bundle id,
     category = `web-monitor`). No live config-reload (relaunch to change listen/token). Zero new
     SPM deps (Foundation + Network + AppKit; `xterm.js` is a vendored static asset, bundled via
@@ -219,7 +245,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     + `web-monitor-token` + `pty-host` — the last is now `?[:0]const u8` so `ghostty_config_get` can
     return it as a C string for the `ptyHost` getter); `macos/Sources/Ghostty/Ghostty.Config.swift`
     (`webMonitorListen`/`webMonitorToken`/`ptyHost`); `macos/Sources/Features/WebMonitor/WebMonitorServer.swift`
-    (server + xterm page + routes); `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift`
+    (server + xterm page + routes + Notify toggle + `/sw.js` + `/api/push/*`);
+    `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`);
+    `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift`
     (host-protocol client); `macos/Sources/Features/WebMonitor/vendor/xterm.{js,css}`;
     `src/host/{Session,Server,protocol}.zig` + `src/termio/Termio.zig` (raw-tee + ring + frames +
     observer); `macos/Sources/App/macOS/AppDelegate.swift` (start/stop);
