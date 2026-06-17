@@ -171,6 +171,38 @@ struct SplitTreeTests {
         #expect(target === view1)
     }
 
+    // Fork: spatial navigation cycles at the edge. With three panes in a row,
+    // moving right from the rightmost wraps to the leftmost, and moving left
+    // from the leftmost wraps to the rightmost.
+    @Test func focusTargetSpatialWrapsAtRightEdge() throws {
+        let v1 = MockView()
+        let v2 = MockView()
+        let v3 = MockView()
+        var tree = SplitTree<MockView>(view: v1)
+        tree = try tree.inserting(view: v2, at: v1, direction: .right)
+        tree = try tree.inserting(view: v3, at: v2, direction: .right)
+        // Row is v1 | v2 | v3 left-to-right.
+        #expect(tree.focusTarget(for: .spatial(.right), from: .leaf(view: v3)) === v1)
+        #expect(tree.focusTarget(for: .spatial(.left), from: .leaf(view: v1)) === v3)
+    }
+
+    @Test func focusTargetSpatialWrapsAtVerticalEdge() throws {
+        let v1 = MockView()
+        let v2 = MockView()
+        var tree = SplitTree<MockView>(view: v1)
+        tree = try tree.inserting(view: v2, at: v1, direction: .down)
+        // Column is v1 over v2.
+        #expect(tree.focusTarget(for: .spatial(.down), from: .leaf(view: v2)) === v1)
+        #expect(tree.focusTarget(for: .spatial(.up), from: .leaf(view: v1)) === v2)
+    }
+
+    // A single pane has nothing to wrap to.
+    @Test func focusTargetSpatialNoWrapWhenSinglePane() throws {
+        let view1 = MockView()
+        let tree = SplitTree<MockView>(view: view1)
+        #expect(tree.focusTarget(for: .spatial(.right), from: .leaf(view: view1)) == nil)
+    }
+
     // MARK: - Equalized
 
     @Test func equalizedAdjustsRatioByLeafCount() throws {

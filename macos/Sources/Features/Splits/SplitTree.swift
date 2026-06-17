@@ -202,10 +202,18 @@ extension SplitTree {
         case .spatial(let spatialDirection):
             // Get spatial representation and find best candidate
             let spatial = root.spatial()
-            let nodes = spatial.slots(in: spatialDirection, from: currentNode)
+            var nodes = spatial.slots(in: spatialDirection, from: currentNode)
 
-            // If we have no nodes in the direction specified then we don't do
-            // anything.
+            // Fork: cycle. If nothing lies in the requested direction we wrap
+            // around to the extreme slot on the opposite side, so repeated
+            // moves loop through all splits (e.g. left -> center -> right ->
+            // left -> ...) instead of stopping at the edge.
+            if nodes.isEmpty {
+                nodes = spatial.wrapSlots(in: spatialDirection, from: currentNode)
+            }
+
+            // If we still have no nodes (only one pane in the tree) then we
+            // don't do anything.
             if nodes.isEmpty {
                 return nil
             }
@@ -1218,6 +1226,57 @@ extension SplitTree.Spatial {
         }
 
         return result
+    }
+
+    /// Returns the candidate slots to wrap to when there are no slots in
+    /// `direction` (the reference node already borders that edge). These are
+    /// the leaf slots at the extreme *opposite* end — e.g. for `.right` the
+    /// leftmost leaves — so that directional navigation cycles around the
+    /// layout instead of stopping at the edge.
+    ///
+    /// Only leaf slots are considered (split slots span their children and
+    /// would distort the extreme). Among the extreme slots, the one closest to
+    /// the reference on the perpendicular axis comes first, which keeps the
+    /// wrap on the same row/column in a grid.
+    func wrapSlots(in direction: Direction, from referenceNode: SplitTree.Node) -> [Slot] {
+        guard let refSlot = slots.first(where: { $0.node == referenceNode }) else { return [] }
+
+        let leaves = slots.filter { slot in
+            if case .leaf = slot.node, slot.node != referenceNode { return true }
+            return false
+        }
+        guard !leaves.isEmpty else { return [] }
+
+        // The extreme edge value on the opposite side of `direction`.
+        let extreme: CGFloat = switch direction {
+        case .right: leaves.map { $0.bounds.minX }.min()!
+        case .left:  leaves.map { $0.bounds.maxX }.max()!
+        case .down:  leaves.map { $0.bounds.minY }.min()!
+        case .up:    leaves.map { $0.bounds.maxY }.max()!
+        }
+
+        let atExtreme = leaves.filter { slot in
+            switch direction {
+            case .right: slot.bounds.minX == extreme
+            case .left:  slot.bounds.maxX == extreme
+            case .down:  slot.bounds.minY == extreme
+            case .up:    slot.bounds.maxY == extreme
+            }
+        }
+
+        // Prefer the extreme slot nearest the reference on the perpendicular axis.
+        return atExtreme.sorted { a, b in
+            let da: CGFloat, db: CGFloat
+            switch direction {
+            case .left, .right:
+                da = abs(a.bounds.minY - refSlot.bounds.minY)
+                db = abs(b.bounds.minY - refSlot.bounds.minY)
+            case .up, .down:
+                da = abs(a.bounds.minX - refSlot.bounds.minX)
+                db = abs(b.bounds.minX - refSlot.bounds.minX)
+            }
+            return da < db
+        }
     }
 
     /// Returns whether the given node borders the specified side of the spatial bounds.
