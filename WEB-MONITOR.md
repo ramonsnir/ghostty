@@ -92,28 +92,36 @@ your `ts.net` hostname differs):
 
 1. In the **Tailscale admin** → DNS, enable **MagicDNS** and **HTTPS Certificates** (once per
    tailnet).
-2. Set the monitor's listen line (`~/.config/ghostty-ramon/config`, or your machine-local
-   `~/.config/ghostty-ramon/local`):
+2. Set the monitor's **internal (loopback)** listen line (`~/.config/ghostty-ramon/config`, or
+   your machine-local `~/.config/ghostty-ramon/local`). Use a port **distinct from the external
+   HTTPS port** (see the box below for why) — the convention is the `1`-prefixed twin, `18787`:
    ```ini
-   web-monitor-listen = 127.0.0.1:8787
+   web-monitor-listen = 127.0.0.1:18787
    ```
    (`tailscale serve` only proxies to `127.0.0.1`. It rewrites `Host` to the loopback backend,
    so the monitor's existing Host-header allowlist already accepts it — no extra config.)
-   > **Note:** the monitor actually binds the **port on all interfaces** (`*:8787`); it uses
-   > only the port from this line, not the host. So the host part is cosmetic for binding — but
-   > the wildcard bind is exactly why step 3 must serve HTTPS on a **different** port (see below).
-3. Start the proxy — serve HTTPS on **port 443** (the default; the URL then has no port suffix),
-   proxying to the loopback 8787 (persists across reboots):
+   > **Why internal ≠ external.** The monitor binds the **port on all interfaces** (`*:18787`);
+   > it uses only the port from this line, not the host. If you served HTTPS on that *same* port,
+   > `tailscale serve --https=18787` would grab the tailnet IP's `:18787` first and the monitor's
+   > wildcard bind would then fail with `EADDRINUSE` — the monitor never starts and the proxy
+   > 502s. So keep the external HTTPS port and the internal bind port different.
+   >
+   > **Per-identity offset (code, `WebMonitorServer.portOffset`).** All three fork builds share
+   > this config line, so the loopback port is shifted per identity so they coexist —
+   > Release `+0` (18787), ReleaseLocal `+1` (18788), Debug `+2` (18789). Mirrors `MCPServer`.
+3. Start the proxy — serve each external HTTPS port to its identity's loopback port (persists
+   across reboots). For the installed **Release** build, keep the friendly external port `8787`:
    ```sh
-   tailscale serve --bg --https=443 127.0.0.1:8787
+   tailscale serve --bg --https=8787 127.0.0.1:18787      # Release
    ```
-   Your monitor is now at **`https://<machine>.<tailnet>.ts.net/`**.
-   > **Do NOT reuse the monitor's port (8787) as the HTTPS serve port.** Because the monitor
-   > binds `*:8787` (all interfaces, incl. the tailnet IP), `tailscale serve --https=8787` would
-   > grab the tailnet IP's `:8787` first, and the monitor's wildcard bind then fails with
-   > `EADDRINUSE` — the monitor never starts and the proxy 502s. Use a *different* HTTPS port
-   > (443 is the natural choice). `tailscale serve status` lists all rules; clear a stale one
-   > with `tailscale serve --https=<port> off`.
+   Your monitor is now at **`https://<machine>.<tailnet>.ts.net:8787/`**. To also reach the dev
+   builds from the phone, add their pairs (each external maps to the offset loopback port):
+   ```sh
+   tailscale serve --bg --https=8788 127.0.0.1:18788      # ReleaseLocal (+1)
+   tailscale serve --bg --https=8789 127.0.0.1:18789      # Debug (+2)
+   ```
+   `tailscale serve status` lists all rules; clear a stale one with
+   `tailscale serve --https=<port> off`.
 4. On Android Chrome, open that **https** URL (append `?token=…` once if a token is set), tap
    **🔔 Notify**, and **grant** the notification permission. Done — bells now push to that device.
 
@@ -121,10 +129,10 @@ If the page is opened over plain HTTP (no `tailscale serve`), the toggle shows *
 explains it needs HTTPS, rather than failing silently.
 
 > **Second laptop / fresh machine:** identical steps. Copy the same
-> `web-monitor-listen = 127.0.0.1:8787` line, run the same `tailscale serve --bg --https=443
-> 127.0.0.1:8787`, and open *that* machine's `https://<machine>.<tailnet>.ts.net/`. Each device
-> you want pinged subscribes itself by tapping **🔔 Notify** on the page (subscriptions are
-> per-browser and stored server-side per machine).
+> `web-monitor-listen = 127.0.0.1:18787` line, run the same `tailscale serve --bg --https=8787
+> 127.0.0.1:18787` (Release), and open *that* machine's `https://<machine>.<tailnet>.ts.net:8787/`.
+> Each device you want pinged subscribes itself by tapping **🔔 Notify** on the page
+> (subscriptions are per-browser and stored server-side per machine).
 
 ### Notes
 

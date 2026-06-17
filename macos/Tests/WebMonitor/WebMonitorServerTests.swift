@@ -305,6 +305,37 @@ struct WebMonitorServerTests {
         #expect(r?.port == 8787)
     }
 
+    // MARK: - Per-identity loopback-port offset
+
+    @Test func portOffsetByBundleID() {
+        // Release (canonical id) keeps the configured port.
+        #expect(WebMonitorServer.portOffset(forBundleID: "com.mitchellh.ghostty-ramon") == 0)
+        // Dev builds shift up so they coexist with Release.
+        #expect(WebMonitorServer.portOffset(forBundleID: "com.mitchellh.ghostty-ramon.local") == 1)
+        #expect(WebMonitorServer.portOffset(forBundleID: "com.mitchellh.ghostty-ramon.debug") == 2)
+        // Unknown / missing bundle id ⇒ no shift.
+        #expect(WebMonitorServer.portOffset(forBundleID: nil) == 0)
+        #expect(WebMonitorServer.portOffset(forBundleID: "com.example.other") == 0)
+    }
+
+    @Test func applyPortOffsetShifts() {
+        let base = WebMonitorServer.parseListen("127.0.0.1:18787")
+        #expect(WebMonitorServer.applyPortOffset(base, offset: 0)?.port == 18787)
+        #expect(WebMonitorServer.applyPortOffset(base, offset: 1)?.port == 18788)
+        #expect(WebMonitorServer.applyPortOffset(base, offset: 2)?.port == 18789)
+        // Host is preserved.
+        #expect(WebMonitorServer.applyPortOffset(base, offset: 1)?.host == "127.0.0.1")
+    }
+
+    @Test func applyPortOffsetEdgeCases() {
+        // Nothing to parse ⇒ nil through.
+        #expect(WebMonitorServer.applyPortOffset(nil, offset: 1) == nil)
+        // Overflow near the ceiling ⇒ original kept, never wrapped.
+        let high = WebMonitorServer.parseListen("127.0.0.1:65535")
+        #expect(WebMonitorServer.applyPortOffset(high, offset: 1)?.port == 65535)
+        #expect(WebMonitorServer.applyPortOffset(high, offset: 2)?.port == 65535)
+    }
+
     // MARK: - RequestParser
 
     private static let cap = WebMonitorServer.maxRequestBytes

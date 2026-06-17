@@ -224,8 +224,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `MCPEventBus`, and fans each bell out via `URLSession` (debounced ~3s/surface; 404/410 ⇒
     drop the dead subscription). **HARD REQUIREMENT: a SECURE CONTEXT** — service workers only
     register over HTTPS, so the plain-HTTP-over-Tailscale-IP setup CANNOT push. The chosen TLS
-    path is **`tailscale serve`** in front: bind the monitor to **`127.0.0.1:<port>`** and
-    `tailscale serve --bg <port>` proxies `https://<machine>.<tailnet>.ts.net` → loopback.
+    path is **`tailscale serve`** in front: bind the monitor to a **loopback INTERNAL port**
+    (`web-monitor-listen = 127.0.0.1:18787`) and `tailscale serve --bg --https=<external>
+    127.0.0.1:<internal>` proxies `https://<machine>.<tailnet>.ts.net:<external>` → loopback.
+    **The external HTTPS port and the internal bind port MUST DIFFER** — the monitor binds the
+    port on ALL interfaces (`*:<internal>`, host part ignored), so serving HTTPS on that same
+    port makes `tailscaled` grab the tailnet IP's `:<port>` first and the monitor's wildcard
+    bind then fails with `EADDRINUSE` (never starts → proxy 502s). Convention: external `8787`,
+    internal `18787` (the `1`-prefixed twin). **Per-identity offset** (`WebMonitorServer.portOffset`,
+    mirrors `MCPServer`) shifts the shared loopback port so the three builds coexist: Release `+0`
+    (18787), ReleaseLocal `+1` (18788), Debug `+2` (18789); `tailscale serve` maps each external
+    (8787/8788/8789) to its identity's loopback port. Pure helpers `portOffset(forBundleID:)` /
+    `applyPortOffset(_:offset:)` are unit-tested (`WebMonitorServerTests`).
     `tailscale serve` only proxies to `127.0.0.1` and rewrites `Host` to the loopback backend
     (original in `X-Forwarded-Host`), so the existing loopback rule in `hostHeaderAllowed`
     already accepts it and the token still gates — **NO Zig/config changes were needed; this is
@@ -365,6 +375,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   is absent the fork still launches (web monitor + MCP just disabled / token-less).
 
 ## Iteration lifecycle (macOS)
+
+**Always work on a git worktree, never directly on the main tree's `ramon-fork`
+checkout.** Create a worktree for each task (`git worktree add ../ghostty-<task>
+-b <branch> ramon-fork`), do all editing/testing there, and keep the main tree's
+`ramon-fork` checkout clean. **Release builds must ALWAYS come from `ramon-fork`
+on the main tree** — never build a Release (the installed `/Applications/Ghostty
+(ramon).app`) from a worktree branch. So when the work is done: **merge the
+worktree branch into `ramon-fork`, switch the main tree to `ramon-fork`, and
+rebuild there.** (The reason the worktree exists is precisely so the installed
+Release that hosts this session keeps building from a stable `ramon-fork`.)
+
 Toolchain: full **Xcode** (not just Command Line Tools) + Metal toolchain + accepted
 license; **Homebrew `zig@0.15`** (the official 0.15.2 tarball has a broken linker on
 this macOS); `nushell` for `build.nu`.
