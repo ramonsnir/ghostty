@@ -549,6 +549,21 @@ struct WebMonitorServerTests {
             "evil.example.com:8787", configuredHost: "100.1.2.3", configuredPort: 8787))
     }
 
+    @Test func hostHeaderTailscaleServeMagicDNSAllowed() {
+        // tailscale serve forwards the original `<machine>.<tailnet>.ts.net:<external>`
+        // Host (external port != our internal bind port), so it must be accepted
+        // regardless of the configured (loopback) host/port.
+        #expect(WebMonitorServer.hostHeaderAllowed(
+            "ramons-macbook-pro-1.tailf8e7e3.ts.net:8787",
+            configuredHost: "127.0.0.1", configuredPort: 18787))
+        // Case-insensitive, and the default-443 (no explicit port) form.
+        #expect(WebMonitorServer.hostHeaderAllowed(
+            "Machine.Tailnet.TS.NET", configuredHost: "127.0.0.1", configuredPort: 18787))
+        // A look-alike that only ends with the suffix as a different TLD is rejected.
+        #expect(!WebMonitorServer.hostHeaderAllowed(
+            "evil-ts.net:8787", configuredHost: "127.0.0.1", configuredPort: 18787))
+    }
+
     @Test func hostHeaderCaseInsensitive() {
         #expect(WebMonitorServer.hostHeaderAllowed(
             "MyHost.Tailnet:8787", configuredHost: "myhost.tailnet", configuredPort: 8787))

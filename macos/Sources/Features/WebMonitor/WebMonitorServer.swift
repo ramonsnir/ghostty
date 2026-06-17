@@ -994,9 +994,19 @@ final class WebMonitorServer {
             h = String(host[host.startIndex..<colon])
             portStr = String(host[host.index(after: colon)...])
         }
+        let lower = h.lowercased()
+        // Tailscale serve terminates TLS and forwards the ORIGINAL tailnet Host
+        // — `<machine>.<tailnet>.ts.net:<external port>` — NOT a rewritten
+        // loopback Host, and its external port deliberately differs from our
+        // internal bind port. Reaching that endpoint already requires tailnet
+        // membership (the Tailscale ACL is the access boundary, matching the
+        // open-on-tailnet posture), and a DNS-rebinding attacker cannot make a
+        // browser emit a `*.ts.net` Host against our loopback bind. So accept any
+        // MagicDNS host on any port; the strict port + host check below still
+        // guards the direct loopback / configured-host paths.
+        if lower.hasSuffix(".ts.net") { return true }
         let port = portStr.flatMap { UInt16($0) } ?? 80
         guard port == configuredPort else { return false }
-        let lower = h.lowercased()
         let loopback = (lower == "localhost" || lower == "127.0.0.1" || lower == "::1")
         return lower == configuredHost.lowercased() || loopback
     }
