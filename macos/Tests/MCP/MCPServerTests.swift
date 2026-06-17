@@ -367,6 +367,23 @@ struct MCPServerTests {
         #expect(keyEnum == ["enter", "escape", "tab", "backspace", "up", "down", "left", "right", "y", "n", "space", "ctrl-c", "ctrl-u"])
     }
 
+    // The list_surfaces description must keep documenting the new optional
+    // per-row fields AND their honesty caveats (host-restart for processName/
+    // command, the coarse idleSeconds semantics) so a future schema edit cannot
+    // silently drop the prose the agent reads to interpret the rows.
+    @Test func toolsListSurfacesDescriptionDocumentsNewFields() {
+        let tools = MCPTools.toolsListResult["tools"] as! [[String: Any]]
+        let desc = tools.first { $0["name"] as? String == "list_surfaces" }!["description"] as! String
+        #expect(desc.contains("processName"))
+        #expect(desc.contains("command"))
+        #expect(desc.contains("idleSeconds"))
+        // The host-restart caveat for processName/command.
+        #expect(desc.contains("pty-host"))
+        #expect(desc.contains("host is restarted"))
+        // The coarse idleSeconds "repaints while working" nuance.
+        #expect(desc.contains("repaint"))
+    }
+
     // MARK: - initialize
 
     @Test func initializeResultShape() {
@@ -386,7 +403,8 @@ struct MCPServerTests {
             id: "ABC", title: "vim", pwd: "/tmp",
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
-            focused: true, bell: false, exited: false, atPrompt: true)
+            focused: true, bell: false, exited: false, atPrompt: true,
+            processName: "claude", command: "claude --resume", idleSeconds: 0.0)
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -401,6 +419,26 @@ struct MCPServerTests {
         #expect(d["focused"] as? Bool == true)
         #expect(d["bell"] as? Bool == false)
         #expect(d["exited"] as? Bool == false)
+        #expect(d["atPrompt"] as? Bool == true)
+        #expect(d["processName"] as? String == "claude")
+        #expect(d["command"] as? String == "claude --resume")
+        #expect(d["idleSeconds"] as? Double == 0.0)
+    }
+
+    // fork: the three optional fields are OMITTED (not null/empty) when unknown.
+    @Test func surfacesJSONDataOmitsNilProcessFields() {
+        let row = MCPLayout.SurfaceRow(
+            id: "ABC", title: "vim", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 2, splitCount: 3,
+            focused: true, bell: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil)
+        let d = MCPLayout.surfacesJSONData([row])[0]
+        #expect(d["processName"] == nil)
+        #expect(d["command"] == nil)
+        #expect(d["idleSeconds"] == nil)
+        // The always-present fields are unaffected.
+        #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)
     }
 

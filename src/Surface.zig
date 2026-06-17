@@ -1165,6 +1165,78 @@ pub fn sessionId(self: *Surface) u64 {
     };
 }
 
+/// fork: the focused foreground process NAME (e.g. "claude"), or null if unknown.
+/// A freshly-allocated NUL-terminated copy owned by the caller (frees via the
+/// embedded String free path), mirroring `ttyName`'s return shape so the
+/// libghostty export round-trips identically.
+///
+/// Under `.client` the GUI mirror cannot resolve a host-process pid, so this
+/// reads the strings the host PUSHES (resolved from the real foreground pid) and
+/// caches in the Client — null until a `process_info` frame has arrived (old host
+/// / pre-first-frame). Read under the renderer mutex (the lock the Client accessor
+/// requires, the same one `handleFrame` holds on write). Under `.exec` the pid is
+/// local, so resolve name/cmdline directly from `getProcessInfo(.foreground_pid)`.
+pub fn foregroundProcessName(self: *Surface, alloc: Allocator) ?[:0]u8 {
+    switch (self.io.backend) {
+        .client => |*c| {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            const name = c.foregroundProcessName();
+            if (name.len == 0) return null;
+            return alloc.dupeZ(u8, name) catch null;
+        },
+        .exec => |*exec| {
+            // NOTE (dev-only cost): foregroundProcessName + foregroundCommand are
+            // separate exports, so a list_surfaces poll resolves twice per .exec
+            // surface (each discards the half it doesn't return). The fork always
+            // runs .client (this cheaply reads the host-pushed cache), so .exec is
+            // never the hot path; accepted rather than adding a combined getter.
+            const pid = exec.getProcessInfo(.foreground_pid) orelse return null;
+            const info = internal_os.proc_info.resolve(alloc, pid) orelse return null;
+            defer alloc.free(info.name);
+            defer alloc.free(info.command);
+            if (info.name.len == 0) return null;
+            return alloc.dupeZ(u8, info.name) catch null;
+        },
+    }
+}
+
+/// fork: the focused foreground COMMAND line (e.g. "claude --resume"), or null if
+/// unknown. Same return/ownership/lock contract as `foregroundProcessName`.
+pub fn foregroundCommand(self: *Surface, alloc: Allocator) ?[:0]u8 {
+    switch (self.io.backend) {
+        .client => |*c| {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            const cmd = c.foregroundCommand();
+            if (cmd.len == 0) return null;
+            return alloc.dupeZ(u8, cmd) catch null;
+        },
+        .exec => |*exec| {
+            // See foregroundProcessName's .exec note: separate exports resolve
+            // twice per surface under .exec (the non-fork path), accepted.
+            const pid = exec.getProcessInfo(.foreground_pid) orelse return null;
+            const info = internal_os.proc_info.resolve(alloc, pid) orelse return null;
+            defer alloc.free(info.name);
+            defer alloc.free(info.command);
+            if (info.command.len == 0) return null;
+            return alloc.dupeZ(u8, info.command) catch null;
+        },
+    }
+}
+
+/// fork: ms since this surface's screen last changed (an applied grid_frame), or
+/// null when unknown. ~0 while a TUI repaints/works; grows while it waits for
+/// input. Lock-free. `.client` reads the Client's last-activity stamp; `.exec`
+/// has no host frame stream (the local terminal mutates in place), so idle is a
+/// best-effort signal we don't track there — return null.
+pub fn idleMillis(self: *Surface) ?i64 {
+    return switch (self.io.backend) {
+        .client => |*c| c.idleMillis(),
+        .exec => null,
+    };
+}
+
 /// Layer 2 (Agent Dashboard): true when this surface is a READ-ONLY render
 /// mirror of an existing host session (the `.client` backend in `.mirror`
 /// role). A mirror owns NO pty and must NEVER close anything real on a

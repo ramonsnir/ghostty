@@ -944,6 +944,55 @@ pub const RenderState = struct {
         }
     }
 
+    /// Convert the viewport contents to clean UTF-8 text suitable for an
+    /// external reader (accessibility / agent screen reads / search): unlike
+    /// `string` (link search), empty cells become spaces (never `\x00`, so the
+    /// result is a valid C string), trailing blanks on each row are trimmed,
+    /// wide-character spacer-tail cells are skipped (no spurious space), and
+    /// every row is newline-terminated. Wrapped rows are NOT unwrapped.
+    ///
+    /// This is the read path for the `.client` (pty-host) backend, whose local
+    /// Terminal is unfed — the host-supplied render mirror is the only screen
+    /// state present in this process. Viewport-only by construction (the mirror
+    /// carries no scrollback).
+    pub fn dumpText(
+        self: *const RenderState,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const row_slice = self.row_data.slice();
+        const row_cells = row_slice.items(.cells);
+
+        for (row_cells) |cells| {
+            const cells_slice = cells.slice();
+            const raws = cells_slice.items(.raw);
+            const graphemes = cells_slice.items(.grapheme);
+
+            // Trim trailing blanks (empty or spacer-tail cells) so a read
+            // doesn't return a screen padded out to the full column width.
+            var end: usize = raws.len;
+            while (end > 0) : (end -= 1) {
+                const c = raws[end - 1];
+                if (c.wide == .spacer_tail) continue;
+                if (c.codepoint() != 0 and c.codepoint() != ' ') break;
+            }
+
+            var x: usize = 0;
+            while (x < end) : (x += 1) {
+                const c = raws[x];
+                // The tail of a wide character is already represented by the
+                // wide cell that precedes it; emitting anything here would add
+                // a spurious space.
+                if (c.wide == .spacer_tail) continue;
+                const cp = c.codepoint();
+                try writer.print("{u}", .{if (cp == 0) ' ' else cp});
+                if (c.hasGrapheme()) {
+                    for (graphemes[x]) |g| try writer.print("{u}", .{g});
+                }
+            }
+            try writer.writeAll("\n");
+        }
+    }
+
     /// A set of coordinates representing cells.
     pub const CellSet = std.AutoArrayHashMapUnmanaged(point.Coordinate, void);
 
@@ -1568,6 +1617,65 @@ test "string" {
 
     const expected = "AB\x00\x00\x00\n\x00\x00\x00\x00\x00\n";
     try testing.expectEqualStrings(expected, result);
+}
+
+test "dumpText trims trailing blanks and never emits NUL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 5,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("AB");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var w = std.Io.Writer.Allocating.init(alloc);
+    defer w.deinit();
+
+    try state.dumpText(&w.writer);
+
+    const result = try w.toOwnedSlice();
+    defer alloc.free(result);
+
+    // Trailing blanks trimmed; blank row collapses to just a newline; no NUL.
+    try testing.expectEqualStrings("AB\n\n", result);
+}
+
+test "dumpText preserves interior spaces" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 6,
+        .rows = 1,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A B C "); // trailing space should be trimmed
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var w = std.Io.Writer.Allocating.init(alloc);
+    defer w.deinit();
+
+    try state.dumpText(&w.writer);
+
+    const result = try w.toOwnedSlice();
+    defer alloc.free(result);
+
+    try testing.expectEqualStrings("A B C\n", result);
 }
 
 test "linkCells with scrollback spanning pages" {

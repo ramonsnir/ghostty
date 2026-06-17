@@ -52,7 +52,23 @@ pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
 // (no attach, no resize, no ownership). ADDITIVE only — major unchanged, no
 // existing frame encoding or enum order touched; the render stream REUSES the
 // existing grid_frame/mode_frame payload tags.
-pub const PROTOCOL_VERSION_MINOR: u16 = 2;
+// Bumped to 3 for the additive host->GUI `process_info` frame: the host pushes
+// the focused session's resolved foreground process name + full command line
+// (under `.client` the GUI mirror cannot read the foreground process locally —
+// the PTY lives in the host — so the host resolves and ships the strings).
+// ADDITIVE only — major unchanged, no existing frame encoding or enum order
+// touched (`process_info` is appended at the END of FrameType).
+//
+// FORWARD/BACKWARD COMPAT is NOT provided by tolerant decoding: `FrameReader.next`
+// returns `error.InvalidFrameType` for an unknown tag and the Client read loop
+// treats that as FATAL (it logs + tears down the read thread). So an old GUI
+// must NEVER be sent the new tag. Compat therefore rests ENTIRELY on the HOST
+// gating emission of `process_info` on the connection's negotiated minor
+// (>= 3) — see Server.zig `Conn.negotiated_minor`. NEW GUI + OLD host: the old
+// host never knows the frame and never sends it (process info reads null until
+// the host is restarted). OLD GUI + NEW host: the host sees minor<=2 and never
+// emits, so the old GUI never sees an unknown tag.
+pub const PROTOCOL_VERSION_MINOR: u16 = 3;
 
 /// Maximum on-wire frame length (the value of the BE length prefix, i.e.
 /// tag + payload). Bounds per-connection buffer growth and the speculative
@@ -184,6 +200,17 @@ pub const FrameType = enum(u8) {
     // the session renders. payload = session_id (u64). Appended at the END so all
     // prior tag integers (incl raw_output) stay stable.
     subscribe_render,
+    // --- minor 3: foreground process name + command (host->GUI) ---
+    // host->GUI: the focused session's RESOLVED foreground process name + full
+    // command line. Under `.client` the GUI mirror cannot read the foreground
+    // process locally (the PTY lives in the host); the host owns the pid (via
+    // tcgetpgrp / getProcessInfo) and resolves name+command (libproc/sysctl),
+    // then pushes the strings here. payload = session_id (u64) + a length-prefixed
+    // `name` + a length-prefixed `command` (the LAST field). Emitted ONLY to conns
+    // that negotiated minor >= 3 (see the minor-bump comment + Server gating).
+    // Appended at the END so all prior tag integers (incl subscribe_render) stay
+    // stable.
+    process_info,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -1171,6 +1198,57 @@ pub const SelectionText = struct {
 
     pub fn deinit(self: *SelectionText, alloc: Allocator) void {
         alloc.free(self.text);
+        self.* = undefined;
+    }
+};
+
+/// host->GUI (minor 3): the focused session's RESOLVED foreground process name +
+/// full command line. Under `.client` the GUI mirror cannot read the foreground
+/// process locally (the PTY lives in the host), so the host resolves the strings
+/// (libproc/sysctl from the foreground pid) and pushes them. The GUI caches them
+/// and surfaces them (e.g. via the MCP `list_surfaces` `processName`/`command`
+/// fields).
+///
+/// TWO trailing length-prefixed slices: `name` is NOT the last field, so it must
+/// use the position-independent `readBytesField` (which caps at MAX_FRAME_LEN +
+/// rejects len > remaining); only `command` — the LAST field — may use `readBytes`
+/// (whose anti-DoS bound relies on the trailing-field invariant `len == remaining`,
+/// see the readBytes doc above). Both strings may be empty. Owned after decode
+/// (freed by deinit). Emitted ONLY to conns that negotiated minor >= 3.
+pub const ProcessInfo = struct {
+    session_id: u64,
+    /// Owned by this struct after decode (freed by deinit). NOT the last field on
+    /// the wire, so decoded via `readBytesField`.
+    name: []const u8 = &.{},
+    /// Owned by this struct after decode (freed by deinit). The LAST field on the
+    /// wire, so decoded via `readBytes` (trailing-field invariant).
+    command: []const u8 = &.{},
+
+    pub fn encode(self: ProcessInfo, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeBytes(w, self.name);
+        try writeBytes(w, self.command);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(alloc: Allocator, payload: []const u8) !ProcessInfo {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        const session_id = try readInt(r, u64);
+        // `name` is non-trailing (command follows) -> readBytesField.
+        const name = try readBytesField(alloc, &fbs, r);
+        errdefer alloc.free(name);
+        // `command` is the LAST field -> readBytes (trailing-field invariant).
+        const command = try readBytes(alloc, &fbs, r);
+        return .{ .session_id = session_id, .name = name, .command = command };
+    }
+
+    pub fn deinit(self: *ProcessInfo, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.command);
         self.* = undefined;
     }
 };
