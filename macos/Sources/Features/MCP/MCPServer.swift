@@ -109,7 +109,14 @@ final class MCPServer {
     init(listen: String, token: String) {
         self.listenSpec = listen
         self.token = token
-        self.parsed = Self.parseListen(listen)
+        // All three fork identities (Release, ReleaseLocal, Debug) share
+        // ~/.config/ghostty-ramon/config, so they read the SAME mcp-listen port
+        // and would fight over it when run side-by-side. Shift the dev builds'
+        // port up by a per-identity offset so they coexist; Release (the
+        // canonical bundle id) keeps the configured port unchanged.
+        self.parsed = Self.applyPortOffset(
+            Self.parseListen(listen),
+            offset: Self.portOffset(forBundleID: Bundle.main.bundleIdentifier))
         self.bus = MCPEventBus()
     }
 
@@ -222,6 +229,33 @@ final class MCPServer {
         guard !host.isEmpty else { return nil }
         guard let port = UInt16(portPart) else { return nil }
         return (host, port)
+    }
+
+    /// Per-build-identity listen-port offset, keyed off the bundle id suffix —
+    /// the same identity scheme as the icon / display-name swaps. The three
+    /// fork identities share one config file (hence one configured port), so
+    /// without this they would all bind the same port and only the first to
+    /// launch would get it. Release (canonical `…ghostty-ramon`) ⇒ 0 (keeps the
+    /// configured port); ReleaseLocal (`.local`) ⇒ +1; Debug (`.debug`) ⇒ +2.
+    static func portOffset(forBundleID bundleID: String?) -> UInt16 {
+        guard let bundleID else { return 0 }
+        if bundleID.hasSuffix(".debug") { return 2 }
+        if bundleID.hasSuffix(".local") { return 1 }
+        return 0
+    }
+
+    /// Apply `offset` to a parsed listen spec's port. Pure + testable. Returns
+    /// the spec unchanged when there's nothing to parse, the offset is 0, or the
+    /// shift would overflow a UInt16 port (in which case the original — which
+    /// also can't usefully bind near the ceiling — is kept rather than wrapped).
+    static func applyPortOffset(
+        _ parsed: (host: String, port: UInt16)?,
+        offset: UInt16
+    ) -> (host: String, port: UInt16)? {
+        guard let parsed, offset > 0 else { return parsed }
+        let shifted = Int(parsed.port) + Int(offset)
+        guard shifted <= Int(UInt16.max) else { return parsed }
+        return (parsed.host, UInt16(shifted))
     }
 
     // MARK: - Connection handling (background queue)

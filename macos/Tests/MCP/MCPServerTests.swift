@@ -34,6 +34,37 @@ struct MCPServerTests {
         #expect(MCPServer.parseListen("127.0.0.1:99999") == nil)
     }
 
+    // MARK: - per-identity port offset
+
+    @Test func portOffsetByBundleID() {
+        // Release (canonical id) keeps the configured port.
+        #expect(MCPServer.portOffset(forBundleID: "com.mitchellh.ghostty-ramon") == 0)
+        // Dev builds shift up so they coexist with Release.
+        #expect(MCPServer.portOffset(forBundleID: "com.mitchellh.ghostty-ramon.local") == 1)
+        #expect(MCPServer.portOffset(forBundleID: "com.mitchellh.ghostty-ramon.debug") == 2)
+        // Unknown / missing bundle id ⇒ no shift.
+        #expect(MCPServer.portOffset(forBundleID: nil) == 0)
+        #expect(MCPServer.portOffset(forBundleID: "com.example.other") == 0)
+    }
+
+    @Test func applyPortOffsetShifts() {
+        let base = MCPServer.parseListen("127.0.0.1:8765")
+        #expect(MCPServer.applyPortOffset(base, offset: 0)?.port == 8765)
+        #expect(MCPServer.applyPortOffset(base, offset: 1)?.port == 8766)
+        #expect(MCPServer.applyPortOffset(base, offset: 2)?.port == 8767)
+        // Host is preserved.
+        #expect(MCPServer.applyPortOffset(base, offset: 1)?.host == "127.0.0.1")
+    }
+
+    @Test func applyPortOffsetEdgeCases() {
+        // Nothing to parse ⇒ nil through.
+        #expect(MCPServer.applyPortOffset(nil, offset: 1) == nil)
+        // Overflow near the ceiling ⇒ original kept, never wrapped.
+        let high = MCPServer.parseListen("127.0.0.1:65535")
+        #expect(MCPServer.applyPortOffset(high, offset: 1)?.port == 65535)
+        #expect(MCPServer.applyPortOffset(high, offset: 2)?.port == 65535)
+    }
+
     // MARK: - keySpecs(forKey:)
 
     @Test func keySpecsForKeyNamedKeys() {
