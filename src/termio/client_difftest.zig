@@ -165,11 +165,28 @@ fn assertRawStyleFidelity(
         const r_style = rc.items(.style);
         try testing.expectEqual(rc.len, mc.len);
         for (0..rc.len) |x| {
-            const populated = r_raw[x].style_id > 0 or
-                r_raw[x].content_tag == .bg_color_rgb or
-                r_raw[x].content_tag == .bg_color_palette;
-            if (!populated) continue;
-            if (!m_style[x].eql(r_style[x])) {
+            // For bg_color cells the reference RenderState's `.style` slot is
+            // UNDEFINED on a NON-managed row (the renderer only populates style
+            // inside `if (row.managedMemory())`, render.zig:506; a bg-only row is
+            // not managed). Reading it would compare against garbage — the exact
+            // class of bug that produced the load-dependent grid_frame decode
+            // failure. So for bg_color cells, the EXPECTED style is derived from
+            // the cell CONTENT (what the renderer draws and what fromRenderState
+            // now projects), and the mirror — rehydrated from that same
+            // content-derived StylePod — must match it. For style_id>0 cells the
+            // row is always managed, so r_style[x] is well-defined; compare it.
+            const expected: Style = switch (r_raw[x].content_tag) {
+                .bg_color_rgb => .{ .bg_color = .{ .rgb = .{
+                    .r = r_raw[x].content.color_rgb.r,
+                    .g = r_raw[x].content.color_rgb.g,
+                    .b = r_raw[x].content.color_rgb.b,
+                } } },
+                .bg_color_palette => .{ .bg_color = .{
+                    .palette = r_raw[x].content.color_palette,
+                } },
+                else => if (r_raw[x].style_id > 0) r_style[x] else continue,
+            };
+            if (!m_style[x].eql(expected)) {
                 std.debug.print(
                     "\n[client difftest:{s}] raw cell.style mismatch y={d} x={d}\n",
                     .{ name, y, x },
@@ -792,6 +809,23 @@ const TestListener = struct {
     /// accepted fd is closed by `deinit` after `join`.
     fn start(self: *TestListener) !void {
         self.accept_thread = try std.Thread.spawn(.{}, acceptOne, .{self});
+    }
+
+    /// Like `start`, but the accept thread accepts ONE connection and then
+    /// RETURNS IMMEDIATELY, storing the accepted fd in `accepted_fd` WITHOUT
+    /// draining or closing it. The test takes ownership of when to close the
+    /// peer end (after `joinAccept` publishes `accepted_fd`), so it can force an
+    /// EOF on the CLIENT's read thread by closing the server side first — the
+    /// genuine session-gone trigger the mirror's read loop keys on. Used by
+    /// B-test-4 (the `.mirror` read-loop EOF integration test). The accepted fd
+    /// is NOT closed by `deinit` in this mode (the test owns it); `deinit` only
+    /// closes `listen_fd`, so the test MUST close `accepted_fd` itself.
+    fn startHolding(self: *TestListener) !void {
+        self.accept_thread = try std.Thread.spawn(.{}, acceptHold, .{self});
+    }
+
+    fn acceptHold(self: *TestListener) void {
+        self.accepted_fd = posix.accept(self.listen_fd, null, null, 0) catch null;
     }
 
     /// Like `start`, but the accept thread CAPTURES every byte it reads into
@@ -2317,4 +2351,561 @@ test "client owns empty default socket_path (no UAF, no double-free)" {
     var client = try Client.init(alloc, .{});
     defer client.deinit();
     try testing.expectEqual(@as(usize, 0), client.config.socket_path.len);
+}
+
+// =============================================================================
+// Layer 2 (Agent Dashboard) — render-mirror role tests (Part B).
+// =============================================================================
+
+// B-test-1 (mirror render equality): a `role = .mirror` Client consumes the SAME
+// framed grid_frame the existing producer emits, identically to attach. Guards
+// that adding the `role` field did not perturb the decode/rehydrate path: a mirror
+// folds frames into `render_state` cell-for-cell like an attached client. We reuse
+// the exact difftest pipeline (reference RenderState + buildFramed producer +
+// FrameReader -> handleFrame), the only difference being the Client is built with
+// `role = .mirror`.
+test "client mirror role decodes grid_frame identically to attach (Layer 2)" {
+    const alloc = testing.allocator;
+    const cols: u16 = 24;
+    const rows: u16 = 6;
+    const bytes = "mirror render equality\r\n\x1b[31mred\x1b[0m \x1b[1mbold\x1b[0m line2\r\nthird";
+
+    // REFERENCE: the renderer's literal input (never routed through the client).
+    var term_ref = try buildTerminal(alloc, cols, rows, bytes, .{});
+    defer term_ref.deinit(alloc);
+    var rs_ref: RenderStateCore = .empty;
+    defer rs_ref.deinit(alloc);
+    try rs_ref.update(alloc, &term_ref);
+
+    // HOST PRODUCER: the literal framed GridFrame wire bytes (same as attach gets).
+    const framed = try buildFramed(alloc, cols, rows, bytes, .{});
+    defer alloc.free(framed);
+
+    // CLIENT DECODE under role = .mirror.
+    var client = try Client.init(alloc, .{ .role = .mirror });
+    defer client.deinit();
+    try testing.expectEqual(Client.Role.mirror, client.config.role);
+
+    try client.reader.push(alloc, framed[0..3]);
+    try client.reader.push(alloc, framed[3..]);
+    while (try client.reader.next(alloc)) |frame| {
+        try client.handleFrame(alloc, frame.tag, frame.payload);
+    }
+
+    // The mirror's rehydrated render_state is cell-identical to the reference.
+    var mirror_snap = try Snapshot.fromRenderState(alloc, &client.render_state);
+    defer mirror_snap.deinit(alloc);
+    var mm: Snapshot.Mismatch = .{};
+    if (!mirror_snap.eqlRenderState(&rs_ref, &mm)) {
+        std.debug.print(
+            "\n[mirror decode] cell fidelity mismatch: field='{s}'\n",
+            .{mm.field},
+        );
+        return error.CellFidelityMismatch;
+    }
+    var ref_snap = try Snapshot.fromRenderState(alloc, &rs_ref);
+    defer ref_snap.deinit(alloc);
+    try testing.expect(ref_snap.eql(mirror_snap));
+}
+
+// B-test-2 (CRITICAL — mirror outbound frame set): the headline read-only-mirror
+// invariant. Drive the REAL connect lifecycle for a `role = .mirror` Client (with a
+// non-zero session_id) against a capturing TestListener, then call EVERY
+// session-mutating send method. Assert the captured wire is EXACTLY
+// {hello, subscribe_render} — NO attach, NO resize/input/focus/scroll/clear/reset/
+// jump/selection frame is ever emitted. For CONTRAST, a `role = .attach` Client over
+// the same harness emits {hello, attach} AND a resize produces a `.resize` frame,
+// proving the suppression is role-scoped (not a global disablement of the send path).
+test "client mirror outbound frame set is exactly {hello, subscribe_render} (Layer 2)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    // --- MIRROR: capture every wire byte and assert only hello+subscribe_render. ---
+    {
+        var listener = try TestListener.init(alloc);
+        defer listener.deinit(alloc);
+        var captured: std.ArrayList(u8) = .empty;
+        defer captured.deinit(alloc);
+        try listener.startCapturing(alloc, &captured);
+
+        var loop = try xev.Loop.init(.{});
+        defer loop.deinit();
+
+        const mirror_sid: u64 = 0xABCDEF;
+        var client = try Client.init(alloc, .{
+            .socket_path = listener.path,
+            .role = .mirror,
+            .session_id = mirror_sid,
+        });
+        defer client.deinit();
+
+        var td: termio.Termio.ThreadData = undefined;
+        td.alloc = alloc;
+        td.loop = &loop;
+        td.backend = .{ .client = undefined };
+        // Mirror connect: enqueues Hello + subscribe_render (NOT attach).
+        try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+        // The mirror branch seeds the session_id atomic from the config id (no
+        // .attached reply ever arrives for a render-sub).
+        try testing.expectEqual(mirror_sid, client.session_id.load(.acquire));
+
+        // Call EVERY session-mutating send method. Each must SUPPRESS (early-return
+        // under .mirror) and enqueue NO frame.
+        try client.focusGained(&td, true);
+        try client.resize(&td, .{
+            .screen = .{ .width = 800, .height = 400 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 },
+        });
+        try client.queueWrite(alloc, &td, "rm -rf /\n", true);
+        try client.scrollViewport(&td, .{ .delta = -5 });
+        try client.scrollViewport(&td, .top);
+        try client.clearScreen(&td, true);
+        try client.reset(&td);
+        try client.jumpToPrompt(&td, -2);
+        try client.selectionDrag(&td, .{
+            .anchor_x = 0,
+            .anchor_y = 0,
+            .head_x = 3,
+            .head_y = 0,
+            .rectangle = false,
+        });
+        try client.selectionClear(&td);
+        try client.selectionPoint(&td, .{ .x = 1, .y = 1, .mode = 0 });
+
+        // Flush the enqueued writes, then tear down so the listener reads EOF.
+        var pumps: usize = 0;
+        while (pumps < 16) : (pumps += 1) try loop.run(.no_wait);
+        client.threadExit(&td);
+        td.backend.deinit(alloc);
+        listener.joinAccept();
+
+        // Decode the captured wire: the tag MULTISET must be exactly
+        // {hello, subscribe_render}.
+        var reader: protocol.FrameReader = .{};
+        defer reader.deinit(alloc);
+        try reader.push(alloc, captured.items);
+
+        var n_hello: usize = 0;
+        var n_subscribe_render: usize = 0;
+        var n_other: usize = 0;
+        var got_subscribe_sid: u64 = 0;
+        while (try reader.next(alloc)) |frame| {
+            switch (frame.tag) {
+                .hello => n_hello += 1,
+                .subscribe_render => {
+                    n_subscribe_render += 1;
+                    got_subscribe_sid = (try protocol.SubscribeRender.decode(
+                        alloc,
+                        frame.payload,
+                    )).session_id;
+                },
+                else => n_other += 1,
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), n_hello);
+        try testing.expectEqual(@as(usize, 1), n_subscribe_render);
+        // The headline invariant: NOTHING else on the wire — no attach, no
+        // resize/input/focus/scroll/clear/reset/jump/selection frame.
+        try testing.expectEqual(@as(usize, 0), n_other);
+        // The subscribe targeted the configured session.
+        try testing.expectEqual(mirror_sid, got_subscribe_sid);
+    }
+
+    // --- CONTRAST: an .attach Client over the same harness emits {hello, attach}
+    //     and resize DOES produce a .resize frame (role-scoped, not global). ---
+    {
+        var listener = try TestListener.init(alloc);
+        defer listener.deinit(alloc);
+        var captured: std.ArrayList(u8) = .empty;
+        defer captured.deinit(alloc);
+        try listener.startCapturing(alloc, &captured);
+
+        var loop = try xev.Loop.init(.{});
+        defer loop.deinit();
+
+        var client = try Client.init(alloc, .{
+            .socket_path = listener.path,
+            // role defaults to .attach; session_id null => fresh-spawn Attach.
+        });
+        defer client.deinit();
+        try testing.expectEqual(Client.Role.attach, client.config.role);
+
+        var td: termio.Termio.ThreadData = undefined;
+        td.alloc = alloc;
+        td.loop = &loop;
+        td.backend = .{ .client = undefined };
+        try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+        // Under .attach, resize is NOT suppressed: it emits a .resize frame.
+        try client.resize(&td, .{
+            .screen = .{ .width = 800, .height = 400 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 0, .right = 0, .top = 0, .bottom = 0 },
+        });
+
+        var pumps: usize = 0;
+        while (pumps < 16) : (pumps += 1) try loop.run(.no_wait);
+        client.threadExit(&td);
+        td.backend.deinit(alloc);
+        listener.joinAccept();
+
+        var reader: protocol.FrameReader = .{};
+        defer reader.deinit(alloc);
+        try reader.push(alloc, captured.items);
+
+        var n_hello: usize = 0;
+        var n_attach: usize = 0;
+        var n_resize: usize = 0;
+        var n_subscribe_render: usize = 0;
+        while (try reader.next(alloc)) |frame| {
+            switch (frame.tag) {
+                .hello => n_hello += 1,
+                .attach => n_attach += 1,
+                .resize => n_resize += 1,
+                .subscribe_render => n_subscribe_render += 1,
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), n_hello);
+        try testing.expectEqual(@as(usize, 1), n_attach);
+        // The gate is role-scoped: .attach STILL sends a resize.
+        try testing.expectEqual(@as(usize, 1), n_resize);
+        // And an attach client NEVER subscribe_renders.
+        try testing.expectEqual(@as(usize, 0), n_subscribe_render);
+    }
+}
+
+// B-test-3 (session-gone signal): the unit-testable core of B3. With a mirror Client
+// wired to a capturing surface_mailbox, `markMirrorEnded` pushes EXACTLY one
+// child_exited surface message, sets `mirror_ended`, and a SECOND call is a no-op
+// (fire-once). This is the contract the read-loop liveness timeout / EOF / read-error
+// paths all converge on; the full poll path is integration-level.
+test "client mirror markMirrorEnded pushes one child_exited, fire-once (Layer 2)" {
+    const CoreSurface = @import("../Surface.zig");
+
+    const alloc = testing.allocator;
+
+    const queue = try App.Mailbox.Queue.create(alloc);
+    defer queue.destroy(alloc);
+    var rt_app: apprt.App = undefined;
+    const surface_sentinel: *CoreSurface = @ptrFromInt(@alignOf(CoreSurface));
+
+    var client = try Client.init(alloc, .{ .role = .mirror, .session_id = 7 });
+    defer client.deinit();
+    client.surface_mailbox = .{
+        .surface = surface_sentinel,
+        .app = .{ .rt_app = &rt_app, .mailbox = queue },
+    };
+
+    try testing.expect(!client.mirror_ended);
+
+    // FIRST call: declares the session gone.
+    client.markMirrorEnded();
+    try testing.expect(client.mirror_ended);
+    // Parity with the real .child_exited arm: the local field is set too.
+    try testing.expect(client.child_exited != null);
+
+    // Exactly ONE child_exited surface message was pushed.
+    const msg = queue.pop() orelse return error.NoMessagePushed;
+    try testing.expect(msg == .surface_message);
+    try testing.expect(msg.surface_message.surface == surface_sentinel);
+    try testing.expect(msg.surface_message.message == .child_exited);
+    try testing.expectEqual(@as(?App.Message, null), queue.pop());
+
+    // SECOND call: fire-once -> NOTHING further is pushed.
+    client.markMirrorEnded();
+    try testing.expect(client.mirror_ended);
+    try testing.expectEqual(@as(?App.Message, null), queue.pop());
+}
+
+// B-test-4 (CRITICAL — the ACTUAL production session-gone trigger end-to-end): drive a
+// REAL `.mirror` Client read loop (the thread `connectAndAttach` spawns) to a GENUINE
+// socket EOF and assert `markMirrorEnded` fires. B-test-3 only calls `markMirrorEnded`
+// DIRECTLY; B-test-2 drives a real mirror read loop but tears down via the quit pipe
+// (NOT EOF). So the `is_mirror`-gated dispatch at the EOF / read-error sites in
+// `ReadThread.threadMainPosix` was entirely uncovered end-to-end — a regression that
+// dropped the `is_mirror` guard on the EOF branch, or mis-derived `is_mirror` from
+// `config.role`, would not have been caught. Here we:
+//   1. build a `role = .mirror` Client wired to a capturing surface_mailbox,
+//   2. `connectAndAttach` it against a TestListener that ACCEPTS and HOLDS the peer fd
+//      (the read thread is spawned and parks in poll(MIRROR_POLL_TIMEOUT_MS)),
+//   3. CLOSE THE SERVER PEER FD -> the client's blocking read returns n==0 (EOF) — the
+//      genuine session-gone signal a dead host emits,
+//   4. wait for the read thread to exit (threadExit joins it),
+//   5. assert `mirror_ended == true` AND exactly ONE synthetic `child_exited` surface
+//      message was delivered to the mailbox (proving the EOF arm fired markMirrorEnded).
+// CONTRAST is provided by B-test-2 (a mirror torn down via the quit pipe, NOT EOF) and
+// by the .attach role keeping poll(-1) + its existing EOF handling unchanged.
+test "client mirror read loop fires markMirrorEnded on a GENUINE socket EOF (Layer 2)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const CoreSurface = @import("../Surface.zig");
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+    // Accept + HOLD the peer fd (no drain, no close): the test owns when to close it,
+    // so it can force the EOF on the client read thread by closing the server side.
+    try listener.startHolding();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    // Capturing surface mailbox so markMirrorEnded's synthetic child_exited push is
+    // observable (same wiring as B-test-3; the test bypasses threadEnter so we set
+    // surface_mailbox directly).
+    const queue = try App.Mailbox.Queue.create(alloc);
+    defer queue.destroy(alloc);
+    var rt_app: apprt.App = undefined;
+    const surface_sentinel: *CoreSurface = @ptrFromInt(@alignOf(CoreSurface));
+
+    var client = try Client.init(alloc, .{
+        .socket_path = listener.path,
+        .role = .mirror,
+        .session_id = 0x515E,
+    });
+    defer client.deinit();
+    client.surface_mailbox = .{
+        .surface = surface_sentinel,
+        .app = .{ .rt_app = &rt_app, .mailbox = queue },
+    };
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+
+    // Spawn the real read thread (mirror branch: Hello + subscribe_render, then the
+    // read loop parks in poll(MIRROR_POLL_TIMEOUT_MS)).
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+    try testing.expect(!client.mirror_ended);
+
+    // The accept thread has stored the peer fd by now (or will shortly). Join it to
+    // publish accepted_fd, then CLOSE the server side -> the client's read() returns
+    // n==0 (EOF), the genuine session-gone trigger.
+    listener.joinAccept();
+    const peer = listener.accepted_fd orelse return error.NoAcceptedFd;
+    posix.close(peer);
+    listener.accepted_fd = null; // owned + closed here; keep deinit from touching it
+
+    // DETERMINISM (test-only happens-before): the read thread's poll loop checks the
+    // QUIT pipe BEFORE re-reading the socket (`if (pollfds[1].revents & POLL.IN) return;`,
+    // Client.zig). If we wrote the quit byte (via threadExit) immediately after the
+    // peer-close, then under CPU load a SINGLE poll wake could see BOTH the socket EOF
+    // (POLLHUP/POLLIN) AND the quit byte ready — the quit branch would win and the loop
+    // would return WITHOUT re-reading the n==0 EOF that fires markMirrorEnded, leaving
+    // `mirror_ended == false` (flaky ~2/10 under load). That is a pure TEST ordering
+    // defect (production tears the surface down on either path), so we BOUNDED-POLL on
+    // `mirror_ended` becoming true FIRST — i.e. force the EOF observation to happen-
+    // before the quit byte. The poll is bounded-iteration (no fixed wall-clock pass),
+    // so the OUTCOME is timing-INDEPENDENT: the EOF arm WILL fire (the peer is closed,
+    // the socket is always readable=EOF), so this converges well within the budget on
+    // any load; if it ever did not, the assert below fails deterministically rather than
+    // flaking on a race with threadExit. The read of `mirror_ended` is unlocked (a plain
+    // bool the read thread sets under renderMutex); the subsequent threadExit join is the
+    // definitive happens-before that publishes the field + mailbox message to this thread.
+    {
+        const max_iters: usize = 1000; // 1000 * 1ms = up to 1s; converges in a few ms.
+        var i: usize = 0;
+        while (i < max_iters and !client.mirror_ended) : (i += 1) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    // Tear down the client. threadExit writes the quit byte and JOINS the read thread;
+    // by the time it returns the read thread has long since observed the EOF and run
+    // markMirrorEnded (we polled mirror_ended true above, so the EOF arm fired BEFORE the
+    // quit byte is even written). The join is the happens-before that definitively
+    // publishes mirror_ended + the pushed mailbox message to this thread.
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+
+    // The EOF arm fired markMirrorEnded: the session is declared gone...
+    try testing.expect(client.mirror_ended);
+    try testing.expect(client.child_exited != null);
+    // ...and exactly ONE synthetic child_exited surface message was delivered.
+    const msg = queue.pop() orelse return error.NoChildExitedDelivered;
+    try testing.expect(msg == .surface_message);
+    try testing.expect(msg.surface_message.surface == surface_sentinel);
+    try testing.expect(msg.surface_message.message == .child_exited);
+    // No SECOND delivery (fire-once held across the real EOF path; the quit-pipe return
+    // that follows the EOF must NOT re-fire).
+    try testing.expectEqual(@as(?App.Message, null), queue.pop());
+}
+
+// B-test-5 (Layer-2 fix M2, client side): a MIRROR that receives a REAL
+// `.child_exited` frame (the host now forwards child_exited to render_subscribers
+// when the agent process exits while the host stays alive — see
+// src/host/Server.zig onChildExited) must route it through `markMirrorEnded`, NOT
+// the attach close-path. The contract:
+//   - `mirror_ended` is set (fire-once),
+//   - EXACTLY ONE synthetic child_exited{0,0} surface message is delivered (the
+//     "ended signal" Surface.childExited's isMirror() guard turns into a persistent
+//     terminated tile WITHOUT self.close()),
+//   - the synthetic exit is 0/0, NOT the frame's real fields — a mirror does not
+//     forward the real exit and never drives the close-path.
+// A regression dropping the `role == .mirror` branch in the `.child_exited` arm
+// would instead push the frame's real exit_code/runtime_ms (the attach close-path),
+// which Surface.childExited would act on -> wrong behavior for a read-only preview.
+test "client mirror handleFrame .child_exited fires markMirrorEnded, not the attach close path (Layer 2 FIX M2)" {
+    const CoreSurface = @import("../Surface.zig");
+    const alloc = testing.allocator;
+
+    const queue = try App.Mailbox.Queue.create(alloc);
+    defer queue.destroy(alloc);
+    var rt_app: apprt.App = undefined;
+    const surface_sentinel: *CoreSurface = @ptrFromInt(@alignOf(CoreSurface));
+
+    var client = try Client.init(alloc, .{ .role = .mirror, .session_id = 9 });
+    defer client.deinit();
+    client.surface_mailbox = .{
+        .surface = surface_sentinel,
+        .app = .{ .rt_app = &rt_app, .mailbox = queue },
+    };
+    try testing.expect(!client.mirror_ended);
+
+    // A REAL host child_exited with non-trivial fields. The mirror must IGNORE these
+    // values and emit a synthetic 0/0 via markMirrorEnded.
+    const ce: protocol.ChildExited = .{ .session_id = 9, .exit_code = 137, .runtime_ms = 99999 };
+    const p = try ce.encode(alloc);
+    defer alloc.free(p);
+    try client.handleFrame(alloc, .child_exited, p);
+
+    // The mirror declared the session gone (fire-once flag set).
+    try testing.expect(client.mirror_ended);
+    // markMirrorEnded sets the local field to the SYNTHETIC 0/0 (NOT the frame's
+    // 137/99999) — proving we took the mirror branch, not the attach assignment.
+    try testing.expect(client.child_exited != null);
+    try testing.expectEqual(@as(u32, 0), client.child_exited.?.exit_code);
+    try testing.expectEqual(@as(u64, 0), client.child_exited.?.runtime_ms);
+
+    // EXACTLY ONE child_exited surface message (the ended signal), carrying 0/0.
+    const msg = queue.pop() orelse return error.NoEndedSignalDelivered;
+    try testing.expect(msg == .surface_message);
+    try testing.expect(msg.surface_message.surface == surface_sentinel);
+    try testing.expect(msg.surface_message.message == .child_exited);
+    try testing.expectEqual(@as(u32, 0), msg.surface_message.message.child_exited.exit_code);
+    try testing.expectEqual(@as(u64, 0), msg.surface_message.message.child_exited.runtime_ms);
+    try testing.expectEqual(@as(?App.Message, null), queue.pop());
+
+    // A SECOND child_exited frame is a no-op (fire-once) — a duplicate from the host
+    // (or a later EOF) must not re-fire the signal.
+    try client.handleFrame(alloc, .child_exited, p);
+    try testing.expectEqual(@as(?App.Message, null), queue.pop());
+}
+
+// B-test-6 (CONTRAST — the .attach role is UNCHANGED by fix M2): an ATTACH client
+// receiving `.child_exited` still takes the close-path: it records the frame's REAL
+// exit_code/runtime_ms and pushes a child_exited surface message carrying those real
+// fields (so Surface.childExited runs the normal close/show-exited flow). This proves
+// the mirror branch is strictly role-scoped and the attach path is byte-for-byte the
+// prior behavior (a real attach client still closes on child exit).
+test "client attach .child_exited frame keeps the real-exit close-path (Layer 2 contrast)" {
+    const CoreSurface = @import("../Surface.zig");
+    const alloc = testing.allocator;
+
+    const queue = try App.Mailbox.Queue.create(alloc);
+    defer queue.destroy(alloc);
+    var rt_app: apprt.App = undefined;
+    const surface_sentinel: *CoreSurface = @ptrFromInt(@alignOf(CoreSurface));
+
+    var client = try Client.init(alloc, .{ .role = .attach, .session_id = 9 });
+    defer client.deinit();
+    client.surface_mailbox = .{
+        .surface = surface_sentinel,
+        .app = .{ .rt_app = &rt_app, .mailbox = queue },
+    };
+    try testing.expect(!client.mirror_ended);
+
+    const ce: protocol.ChildExited = .{ .session_id = 9, .exit_code = 137, .runtime_ms = 99999 };
+    const p = try ce.encode(alloc);
+    defer alloc.free(p);
+    try client.handleFrame(alloc, .child_exited, p);
+
+    // Attach NEVER sets mirror_ended; it records the REAL exit and forwards it.
+    try testing.expect(!client.mirror_ended);
+    try testing.expect(client.child_exited != null);
+    try testing.expectEqual(@as(u32, 137), client.child_exited.?.exit_code);
+    try testing.expectEqual(@as(u64, 99999), client.child_exited.?.runtime_ms);
+
+    const msg = queue.pop() orelse return error.NoChildExitedDelivered;
+    try testing.expect(msg == .surface_message);
+    try testing.expect(msg.surface_message.message == .child_exited);
+    // The REAL fields ride the surface message (the close-path), not synthetic 0/0.
+    try testing.expectEqual(@as(u32, 137), msg.surface_message.message.child_exited.exit_code);
+    try testing.expectEqual(@as(u64, 99999), msg.surface_message.message.child_exited.runtime_ms);
+}
+
+// FIX 4a (Surface session-gone guard key): `Surface.childExited`'s FIRST branch is
+// `if (self.mirrorChildExitShouldDim()) return;` — for a MIRROR it returns WITHOUT
+// self.close() (dims the tile); for a real attach/exec surface it falls through to
+// the normal close/show-exited flow. A regression dropping that guard would make
+// EVERY mirror self-CLOSE on a routine ghostty-host restart (EOF) instead of dimming.
+//
+// `Surface.childExited` is file-private and a FULL `*Surface` is heavy to construct in
+// a unit test, but the guard predicate `Surface.mirrorChildExitShouldDim()` (== the
+// guard key `childExited` calls: `if (self.mirrorChildExitShouldDim()) return;`) only
+// dereferences `self.io.backend` — it reads nothing else off the Surface. So we build
+// a Surface whose ONLY initialized field is `io.backend` (everything else is undefined
+// and never touched by the predicate) with the just-built Client moved into the union,
+// then INVOKE the actual `Surface.isMirror()` / `Surface.mirrorChildExitShouldDim()`
+// switch. This exercises the real predicate's backend-union switch mapping
+// (`.client => |*c| c.config.role == .mirror`, `.exec => false`), NOT just the Client
+// field that feeds it — so a regression that flipped the switch (e.g. returning false
+// for a `.client` mirror, or true on the `.exec` arm) IS now caught here.
+//
+// The end-to-end "no self.close()" is ALSO proven structurally (FIX 2's early `return`
+// precedes self.close()) and by B-test-4 (a mirror EOF fires markMirrorEnded -> the
+// surface gets the synthetic child_exited). Placed in the CLIENT suite (name contains
+// `client`) so it runs under -Dtest-filter=client.
+test "client mirror Surface.childExited dims (never closes); attach uses the close flow (Layer 2 FIX 4a)" {
+    const CoreSurface = @import("../Surface.zig");
+    const alloc = testing.allocator;
+
+    // MIRROR: io.backend = .client{ role = .mirror } -> isMirror()/
+    // mirrorChildExitShouldDim() return true -> childExited returns WITHOUT self.close().
+    {
+        const client_mirror = try Client.init(alloc, .{ .role = .mirror, .session_id = 0xD1A });
+        // Move the Client INTO a Surface's backend union (isMirror takes `|*c|` into it),
+        // and deinit it from there after exercising the predicate. Only io.backend is
+        // initialized; the predicate touches nothing else.
+        var surface: CoreSurface = undefined;
+        surface.io.backend = .{ .client = client_mirror };
+        defer surface.io.backend.client.deinit();
+
+        try testing.expect(surface.isMirror());
+        try testing.expect(surface.mirrorChildExitShouldDim());
+    }
+
+    // ATTACH (and, equivalently, .exec which never builds a Client): io.backend =
+    // .client{ role = .attach } -> predicate false -> childExited runs the normal
+    // close/show-exited flow.
+    {
+        const client_attach = try Client.init(alloc, .{ .role = .attach, .session_id = 0xD1A });
+        var surface: CoreSurface = undefined;
+        surface.io.backend = .{ .client = client_attach };
+        defer surface.io.backend.client.deinit();
+
+        try testing.expect(!surface.isMirror());
+        try testing.expect(!surface.mirrorChildExitShouldDim());
+    }
+}
+
+// FIX 4a (contrast — the OTHER arm of isMirror's backend switch): the `.exec` backend
+// ALWAYS returns false from isMirror()/mirrorChildExitShouldDim(), so an `.exec`
+// surface (or a `.client` attach) runs the normal close/show-exited flow on childExited.
+// We can't cheaply build a real `termio.Exec`, but we CAN pin the `.exec` arm of the
+// switch by constructing a Surface with the `.exec` union tag set and asserting the
+// predicate returns false WITHOUT touching the (undefined) Exec payload — the switch
+// arm is `.exec => false`, a constant that never dereferences the payload. This catches
+// a regression that made isMirror() return true on the `.exec` arm.
+test "client Surface.isMirror() is false for the .exec backend arm (Layer 2 FIX 4a)" {
+    const CoreSurface = @import("../Surface.zig");
+    var surface: CoreSurface = undefined;
+    // Set ONLY the union tag to .exec; the `.exec => false` arm is a constant and never
+    // reads the (undefined) Exec payload.
+    surface.io.backend = .{ .exec = undefined };
+    try testing.expect(!surface.isMirror());
+    try testing.expect(!surface.mirrorChildExitShouldDim());
 }

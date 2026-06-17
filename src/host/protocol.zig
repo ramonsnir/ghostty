@@ -80,6 +80,9 @@ pub const FrameType = enum(u8) {
     focus,
     grid_frame,
     mode_frame,
+    // host->client. Layer 2 (M2): ALSO delivered to render_subscribers (not just
+    // attach subscribers) via the bounded render path, so a render MIRROR learns the
+    // child exited while the host stays alive. Additive — same frame, new destination.
     child_exited,
     ping,
     pong,

@@ -484,6 +484,13 @@ typedef struct {
   uint64_t session_id;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  // Layer 2 (Agent Dashboard): when true AND session_id is non-zero AND the
+  // `.client` backend is selected (pty-host set), this surface is a READ-ONLY
+  // render MIRROR of the existing session_id: it subscribe_renders the session
+  // and renders its live grid, and NEVER drives resize/input/etc. Default false
+  // = a normal attach/spawn surface (today's behavior). Appended last so the ABI
+  // stays additive; old zero-initialized callers get the safe default.
+  bool mirror;
 } ghostty_surface_config_s;
 
 typedef struct {

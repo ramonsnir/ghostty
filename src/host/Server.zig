@@ -88,6 +88,18 @@ host_start_epoch: i64,
 accept_thread: ?std.Thread = null,
 running: std.atomic.Value(bool) = .init(true),
 
+/// TEST-ONLY: when set true BEFORE a peer connects, `setupConn` shrinks the
+/// accepted conn's socket SEND buffer to a tiny size instead of raising it to
+/// SOCKET_BUF. Combined with the test client setting a tiny SO_RCVBUF on its end,
+/// this lets a render-drain thread GENUINELY block inside the blocking writeAll
+/// after only a few KB (rather than absorbing CAP small frames into a ~1 MiB
+/// kernel buffer). That makes the wedge tests actually exercise the BLOCKER fix
+/// (renderOutTeardown's shutdown(.send)-before-join interrupting an in-flight
+/// blocking write) and the bounded-drop overflow (the ring fills because the drain
+/// thread is parked). Never set in production. Read once per accept on the accept
+/// thread; writers (tests) set it before connecting, so no lock is needed.
+test_tiny_sockbuf: bool = false,
+
 /// A registered session plus its subscriber connections and buffered exit.
 ///
 /// ## Lifecycle / ownership (fixes F1/F3/spawn-fail/owner-fail/notify-race)
@@ -245,6 +257,11 @@ pub const Conn = struct {
     /// Serializes writes to this fd across the read thread (Pong/Attached/etc)
     /// and the various render threads (GridFrame/ModeFrame broadcast).
     write_mutex: std.Thread.Mutex = .{},
+    /// Layer 2 prereq A: bounded outbound ring + drain thread for this conn's
+    /// RENDER-subscriber frames. Lazily started on first render enqueue; torn
+    /// down (fd .send shut, thread joined, bufs freed) in reapConn / the OOM
+    /// inline free. Empty until this conn subscribes_render to something.
+    render_out: RenderOut = .{},
     thread: ?std.Thread = null,
     closed: std.atomic.Value(bool) = .init(false),
     /// True once a compatible-major Hello has been accepted on this conn. Until
@@ -329,7 +346,236 @@ pub const Conn = struct {
             off += n;
         }
     }
+
+    /// Layer 2 prereq A: enqueue a render frame for the drain thread. Encodes to
+    /// owned bytes, pushes onto the bounded ring, and DROPS the oldest buffer on
+    /// overflow (safe: grid/mode are absolute). Never blocks on the socket. The
+    /// caller holds e.mutex (onRender) or registry_mutex (seed); this takes only
+    /// the leaf render_out.mutex. Best-effort: an encode failure logs + drops the
+    /// frame (the next tick re-sends full state).
+    fn renderOutPush(self: *Conn, tag: protocol.FrameType, frame: anytype) void {
+        if (self.closed.load(.acquire)) return;
+        const alloc = self.server.alloc;
+        const bytes = protocol.encodeFrame(alloc, tag, frame) catch |err| {
+            log.warn("render enqueue encode failed tag={s} err={}", .{ @tagName(tag), err });
+            return;
+        };
+        self.render_out.mutex.lock();
+        defer self.render_out.mutex.unlock();
+        // Drop-OLDEST until there is room for one more (per-buffer, not per-pair).
+        while (self.render_out.bufs.items.len >= RenderOut.CAP) {
+            const old = self.render_out.bufs.orderedRemove(0);
+            alloc.free(old);
+            self.render_out.dropped += 1;
+        }
+        self.render_out.bufs.append(alloc, bytes) catch {
+            alloc.free(bytes); // OOM appending: drop THIS buffer too (best-effort).
+            return;
+        };
+        self.render_out.cond.signal();
+    }
+
+    /// Layer 2 prereq A: ensure this conn's render drain thread is running
+    /// (idempotent). Spawns on first render enqueue. The CALLER holds e.mutex
+    /// (onRender) or registry_mutex (the seed); the thread-spawn under that lock
+    /// is acceptable — Thread.spawn is brief and the new thread takes only its own
+    /// leaf render_out.mutex, introducing no lock-order edge. We take the leaf
+    /// mutex here to flip `started` so the differing caller locks don't race the
+    /// guard.
+    fn renderOutEnsure(self: *Conn) void {
+        self.render_out.mutex.lock();
+        defer self.render_out.mutex.unlock();
+        if (self.render_out.started) return;
+        self.render_out.thread = std.Thread.spawn(.{}, renderDrainLoop, .{self}) catch |err| {
+            log.warn("render drain thread spawn failed err={}; render frames will drop", .{err});
+            return; // leave started=false; renderOutPush still buffers (capped) but
+            // nothing drains. Teardown frees bufs regardless -> no leak.
+        };
+        self.render_out.started = true;
+    }
+
+    /// Layer 2 prereq A: stop + join the render drain thread and free the ring.
+    /// MUST shut the fd's SEND half BEFORE join so a drain thread blocked in a
+    /// blocking write to a wedged-but-connected peer is interrupted (EPIPE/
+    /// ENOTCONN) and can observe `stop` — otherwise the reaper would hang
+    /// (mirroring deinit's posix.shutdown-before-wait). Idempotent and safe when
+    /// no thread was ever started.
+    fn renderOutTeardown(self: *Conn) void {
+        {
+            self.render_out.mutex.lock();
+            self.render_out.stop = true;
+            self.render_out.cond.signal();
+            self.render_out.mutex.unlock();
+        }
+        // Interrupt any in-flight blocking write to a wedged peer BEFORE join.
+        // .send is sufficient (we only block on writes); harmless if already shut.
+        // Reading `thread` here without the ring mutex is safe ONLY because every
+        // producer (renderOutEnsure, the sole writer of `thread`) is quiesced by the
+        // time teardown runs: unsubscribeAll has removed this conn from every
+        // e.render_subscribers and the read thread is joined, so no onRender/seed can
+        // be concurrently in renderOutEnsure. Do not call teardown while producers
+        // may still enqueue.
+        if (self.render_out.thread != null) {
+            posix.shutdown(self.fd, .send) catch {};
+        }
+        if (self.render_out.thread) |t| {
+            t.join();
+            self.render_out.thread = null;
+        }
+        // Diagnostics for a wedged remote mirror: a non-zero drop count means a
+        // render subscriber could not keep up and stale grid/mode snapshots were
+        // coalesced away (safe — they are absolute full-state). Logged once at
+        // teardown so the field is not dead telemetry.
+        if (self.render_out.dropped > 0) {
+            log.debug("render drain teardown: dropped {d} stale render frame(s) for a slow subscriber", .{self.render_out.dropped});
+        }
+        for (self.render_out.bufs.items) |b| self.server.alloc.free(b);
+        self.render_out.bufs.deinit(self.server.alloc);
+        self.render_out.bufs = .empty;
+    }
+
+    /// TEST-ONLY mirror of the render-out ring bound, so a test can assert
+    /// `renderOutLenForTest() <= RENDER_OUT_CAP_FOR_TEST` without reaching into the
+    /// file-private RenderOut struct.
+    pub const RENDER_OUT_CAP_FOR_TEST: usize = RenderOut.CAP;
+
+    /// TEST-ONLY: number of render frames dropped on ring overflow for this conn,
+    /// read under the leaf mutex. Lets a test assert the bounded-drop path fired
+    /// (a regression making the ring unbounded would never drop -> this stays 0).
+    pub fn renderOutDroppedForTest(self: *Conn) u64 {
+        self.render_out.mutex.lock();
+        defer self.render_out.mutex.unlock();
+        return self.render_out.dropped;
+    }
+
+    /// TEST-ONLY: current depth of the render outbound ring, read under the leaf
+    /// mutex. A test can assert this never exceeds RenderOut.CAP (the bound).
+    pub fn renderOutLenForTest(self: *Conn) usize {
+        self.render_out.mutex.lock();
+        defer self.render_out.mutex.unlock();
+        return self.render_out.bufs.items.len;
+    }
+
+    /// TEST-ONLY: pause/resume this conn's render drain thread. Paused, the drain
+    /// thread parks WITHOUT consuming the ring, so a test can deterministically fill
+    /// it past CAP (forcing drop-oldest in renderOutPush) and assert
+    /// renderOutLenForTest()==CAP / renderOutDroppedForTest()>0 with NO dependence on
+    /// socket backpressure. Resuming signals the cond so the drain resumes and the
+    /// ring drains to the (now-readable) peer. Production never calls this; with
+    /// drain_paused false the drain loop predicate is byte-for-byte the original.
+    pub fn setDrainPausedForTest(self: *Conn, paused: bool) void {
+        self.render_out.mutex.lock();
+        defer self.render_out.mutex.unlock();
+        self.render_out.drain_paused.store(paused, .release);
+        // Wake the drain thread so it re-evaluates the gate (resume, or re-park).
+        self.render_out.cond.signal();
+    }
 };
+
+/// Layer 2 (Agent Dashboard, prereq A): a per-Conn bounded outbound ring for
+/// RENDER-subscriber frames (grid_frame/mode_frame), drained by a dedicated
+/// thread OFF e.mutex/registry_mutex. grid/mode are ABSOLUTE full-state
+/// snapshots, so when the ring is full we DROP the oldest buffer (drop-OLDEST
+/// coalescing) rather than block the producer — a wedged remote mirror can no
+/// longer stall the session render thread, head-of-line-block the primary GUI
+/// `subscribers`, or delay teardownEntry. Scope: render_subscribers ONLY; the
+/// GUI `subscribers` (SR-4) and `raw_subscribers` paths are unchanged.
+///
+/// LOCKING: `mutex` is a strict LEAF. Producers (onRender under e.mutex; the
+/// seed under registry_mutex) lock it only to push pre-encoded bytes; the drain
+/// thread locks it only to pop. No other lock is taken while holding it, so
+/// there is no cycle with e.mutex/registry_mutex/write_mutex.
+const RenderOut = struct {
+    /// Each entry is an OWNED, already-encoded framed message ([]u8 from
+    /// protocol.encodeFrame), so the ring never aliases the transient
+    /// Snapshot/ModeFrame the producer built.
+    const CAP: usize = 4; // ~2 mode+grid PAIRS; drops are per-buffer (safe: absolute).
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    /// FIFO ring of owned framed buffers; len <= CAP.
+    bufs: std.ArrayList([]u8) = .empty,
+    /// Set by renderOutTeardown to ask the drain thread to flush-then-exit.
+    stop: bool = false,
+    /// The drain thread, spawned lazily on the first enqueue (renderOutEnsure).
+    thread: ?std.Thread = null,
+    /// Guards lazy spawn (flipped under `mutex`).
+    started: bool = false,
+    /// Count of buffers dropped on overflow (debug/telemetry only).
+    dropped: u64 = 0,
+    /// TEST-ONLY drain gate. When true, renderDrainLoop parks instead of
+    /// popping/writing, so a test can DETERMINISTICALLY overflow the ring (push
+    /// CAP+N frames with no consumer) without depending on real socket
+    /// backpressure / sleeps. Defaults false in production: when false the drain
+    /// loop's predicate is byte-for-byte the original, so there is ZERO production
+    /// behavior change. Settable ONLY from tests (Conn.setDrainPausedForTest).
+    /// Atomic so the test thread may flip it while the drain thread reads it.
+    drain_paused: std.atomic.Value(bool) = .init(false),
+};
+
+/// Layer 2 prereq A: drain thread for a Conn's RENDER outbound ring. Pops one
+/// owned framed buffer at a time and writes it with the BLOCKING writeAll OFF
+/// e.mutex/registry_mutex, so a wedged remote mirror stalls ONLY this thread,
+/// never the session render thread / primary subscribers / teardown. Exits when
+/// stop is set and the ring is empty, or when the conn is closed. Touches ONLY
+/// this conn (its ring + its fd) — never e/SessionEntry/registry — so it is safe
+/// to run after the session is torn down. renderOutTeardown shuts the fd .send
+/// half before join so a write blocked on a wedged peer is interrupted.
+fn renderDrainLoop(conn: *Conn) void {
+    const alloc = conn.server.alloc;
+    while (true) {
+        var buf: ?[]u8 = null;
+        {
+            conn.render_out.mutex.lock();
+            defer conn.render_out.mutex.unlock();
+            // TEST-ONLY pause gate: when paused, do NOT pop/write; park on cond
+            // until unpaused, stopped, or a fresh signal. `stop` ALWAYS wins (so
+            // teardown can join even while paused — preserves the BLOCKER-fix
+            // discipline: renderOutTeardown sets stop+signals before join). In
+            // PRODUCTION drain_paused is always false, so this reduces to the
+            // original `bufs.len == 0 and !stop` wait — ZERO production change.
+            while ((conn.render_out.bufs.items.len == 0 or conn.render_out.drain_paused.load(.acquire)) and
+                !conn.render_out.stop)
+            {
+                conn.render_out.cond.wait(&conn.render_out.mutex);
+            }
+            if (!conn.render_out.stop and conn.render_out.drain_paused.load(.acquire)) {
+                // Woken but still paused (a push signaled while paused): re-park.
+                // PROVABLY DEAD in production: drain_paused is always false there, so
+                // exiting the while above with stop==false implies !paused, making this
+                // guard false. Reachable ONLY in the test-paused case (a push signals
+                // the cond while paused) — correct, harmless re-park. `!stop` keeps the
+                // stop-wins discipline so teardown is never wedged.
+                continue;
+            }
+            // On stop (or unpaused with work): flush-then-exit (the original
+            // flush-on-stop semantics): pop while non-empty, else return. Teardown
+            // frees any remainder regardless, so a paused-at-stop ring leaks nothing.
+            if (conn.render_out.bufs.items.len > 0) {
+                buf = conn.render_out.bufs.orderedRemove(0);
+            } else {
+                return; // stop && empty -> done.
+            }
+        }
+        if (buf) |b| {
+            defer alloc.free(b);
+            conn.writeAll(b); // respects conn.closed; sets it on write error.
+        }
+        // If the conn went closed, free remaining buffers (no point writing) so
+        // we exit promptly and leak nothing.
+        if (conn.closed.load(.acquire)) {
+            conn.render_out.mutex.lock();
+            defer conn.render_out.mutex.unlock();
+            for (conn.render_out.bufs.items) |b| alloc.free(b);
+            conn.render_out.bufs.clearRetainingCapacity();
+            if (conn.render_out.stop) return;
+            // else loop back: the next iteration blocks benignly on `cond` until
+            // renderOutTeardown sets `stop` and signals. This is NOT a busy-loop —
+            // the ring is now empty and no producer can re-enqueue (the conn is
+            // off every e.render_subscribers post-unsubscribeAll), so cond.wait
+            // parks until teardown wakes it exactly once.
+        }
+    }
+}
 
 /// Build a sockaddr.un from a path, validating length.
 fn makeAddr(path: []const u8) !posix.sockaddr.un {
@@ -382,6 +628,19 @@ pub fn start(self: *Server) !void {
     self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
 }
 
+/// TEST-ONLY: return the first render subscriber Conn of `session_id`, or null.
+/// The caller can read its render-out drop counter / ring depth to assert the
+/// bounded-drop path. Taken under registry_mutex -> e.mutex (canonical order).
+pub fn firstRenderSubscriberForTest(self: *Server, session_id: u64) ?*Conn {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    const e = self.sessions.get(session_id) orelse return null;
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    if (e.render_subscribers.items.len == 0) return null;
+    return e.render_subscribers.items[0];
+}
+
 /// Reaps disconnected connections: joins their (already-exited) read thread,
 /// closes the fd, frees the Conn. The SOLE owner of conn joins + frees. Woken
 /// by `reaper_signal`. Exits only once deinit has cleared `reaper_running` AND
@@ -420,6 +679,7 @@ fn reaperLoop(self: *Server) void {
 /// enqueueing it) so no render tick can reference it.
 fn reapConn(self: *Server, conn: *Conn) void {
     if (conn.thread) |t| t.join();
+    conn.renderOutTeardown(); // Layer 2 prereq A: stop+join drain (shuts .send first)
     posix.close(conn.fd);
     conn.subscribed.deinit();
     conn.subscribed_raw.deinit();
@@ -453,17 +713,35 @@ fn acceptLoop(self: *Server) void {
 /// already closed (a connect-then-instant-close client) — that would panic the
 /// host. The buffer size is a hint, so ignore every failure.
 fn setSockBuf(fd: posix.socket_t, opt: u32) void {
+    setSockBufTo(fd, opt, SOCKET_BUF);
+}
+
+/// As setSockBuf but with an explicit size (used by the test-only tiny-buffer
+/// path to genuinely wedge a drain thread's blocking write).
+fn setSockBufTo(fd: posix.socket_t, opt: u32, size: c_int) void {
     _ = std.posix.system.setsockopt(
         fd,
         posix.SOL.SOCKET,
         opt,
-        std.mem.asBytes(&SOCKET_BUF),
+        std.mem.asBytes(&size),
         @sizeOf(c_int),
     );
 }
 
 fn setupConn(self: *Server, fd: posix.socket_t) !void {
     // Raise socket buffers (best-effort; never fatal — see setSockBuf).
+    //
+    // NOTE: `test_tiny_sockbuf` does NOT shrink here. Shrinking at accept time
+    // would also shrink the PRIMARY GUI conn's SEND buffer, and onRender's
+    // retained-by-design blocking write to a primary subscriber (the SR-4
+    // single-fast-local-peer contract, deliberately unchanged by prereq A) runs
+    // WHILE HOLDING e.mutex. A test whose primary reader falls behind would then
+    // wedge that write with e.mutex held, and a subsequent
+    // firstRenderSubscriberForTest (registry_mutex -> e.mutex) would deadlock the
+    // test thread — the wedge tests could themselves hang teardown. The shrink is
+    // therefore applied ONLY to a conn once it becomes a RENDER subscriber, in
+    // subscribeRender (so the primary keeps its full SOCKET_BUF and never
+    // backpressures onRender). See subscribeRender.
     setSockBuf(fd, posix.SO.SNDBUF);
     setSockBuf(fd, posix.SO.RCVBUF);
 
@@ -550,6 +828,15 @@ fn readLoop(conn: *Conn) void {
         // OOM fallback: free our own Conn inline (we are its sole owner now
         // that it's off `conns`). We can't join our own thread handle, so it
         // leaks — acceptable on an OOM-dying process.
+        // Layer 2 prereq A: stop+join drain BEFORE closing the fd, mirroring
+        // reapConn. renderOutTeardown does posix.shutdown(self.fd, .send) on the
+        // LIVE fd, which (unlike close()) reliably interrupts a drain thread
+        // parked in a blocking write to a wedged peer — on POSIX/Darwin close()
+        // does NOT reliably wake another thread blocked in write() on the same
+        // fd, so closing first would leave the shutdown a no-op on a stale fd and
+        // the t.join() could hang. Shut-before-close keeps the OOM path's join
+        // bounded too. Closing afterward is then a plain release of the fd.
+        conn.renderOutTeardown();
         posix.close(conn.fd);
         conn.subscribed.deinit();
         conn.subscribed_raw.deinit();
@@ -1229,10 +1516,22 @@ fn subscribeRaw(self: *Server, conn: *Conn, e: *SessionEntry) !void {
 /// OOM-ordering as `subscribe`/`subscribeRaw` (insert into
 /// `conn.subscribed_render` FIRST, then `e.render_subscribers`).
 fn subscribeRender(self: *Server, conn: *Conn, e: *SessionEntry) !void {
+    if (self.test_tiny_sockbuf) {
+        // TEST-ONLY: shrink THIS render-sub's SEND buffer so a never-reading peer
+        // backpressures the drain thread's blocking writeAll after only a few KB
+        // (rather than absorbing CAP small frames into a ~1 MiB kernel buffer),
+        // making the wedge/bounded-drop tests actually bite. Applied here (not in
+        // setupConn) so ONLY render subscribers shrink — the primary GUI conn
+        // keeps its full SOCKET_BUF, so onRender's blocking write to the primary
+        // (held under e.mutex, SR-4) never wedges and a test's
+        // firstRenderSubscriberForTest can't deadlock on e.mutex. SO_SNDMINBUF on
+        // Darwin is small; the kernel clamps to its floor, still tiny vs.
+        // SOCKET_BUF.
+        setSockBufTo(conn.fd, posix.SO.SNDBUF, 2048);
+    }
     try conn.subscribed_render.put(e.session_id, {});
     errdefer _ = conn.subscribed_render.remove(e.session_id);
     try e.addRenderSubscriber(conn);
-    _ = self;
 }
 
 /// H1 (Phase 2b): handle a `subscribe_raw` frame. Validate the session exists +
@@ -1474,35 +1773,26 @@ fn onRender(ctx: *anyopaque, session: *Session, snapshot: *const RenderState.Sna
         conn.writeFramed(.grid_frame, grid);
     }
     // Layer 1: fan the SAME mode+grid frames out to read-only RENDER subscribers.
-    // Same e.mutex critical section, same mode/grid locals built once above, same
-    // per-conn closed-check (no broadcast-after-free). A conn on BOTH lists would
-    // receive the pair twice; in practice the mirror conn is on render_subscribers
-    // only (it never attaches), so no duplication occurs.
+    // Same e.mutex critical section, same mode/grid locals built once above. A conn
+    // on BOTH lists would receive the pair twice; in practice the mirror conn is on
+    // render_subscribers only (it never attaches), so no duplication occurs.
     //
-    // LIVENESS / HEAD-OF-LINE WARNING (findings SR-4 / SF2 — see the BLOCKING-WRITE
-    // CONTRACT on Conn.writeAll): these writeFramed calls are BLOCKING posix writes
-    // done while holding e.mutex. The SR-4 contract already accepts this for the
-    // local GUI `subscribers` (a single fast local peer), but a RENDER subscriber is
-    // by design a REMOTE web-monitor mirror (a phone over a tailnet) — far more
-    // likely to stall than a local GUI. A wedged render-sub therefore
-    // head-of-line-blocks delivery to the primary GUI subscribers, stalls this
-    // session's render thread, and delays teardownEntry (which needs e.mutex). This
-    // is a deliberate, consistent extension of the raw-tee's onRawOutput pattern
-    // Layer 1 was told to mirror (no NEW lock-order inversion), but it weakens the
-    // SR-4 single-fast-local-peer assumption. HARD FOLLOW-UP (before Layer 2 ships a
-    // real network-fed phone client): give render subscribers a non-blocking /
-    // bounded-buffer-and-DROP delivery (or write outside e.mutex via a per-conn
-    // queue), so a slow remote mirror cannot degrade the local GUI or the session.
-    //
-    // NOTE: the read-only gate (Conn.isRenderOnlySubscriber) is conn-local and
-    // does NOT take e.mutex, so a render-sub wedged inside this loop holding
-    // e.mutex can NOT stall the (lock-free) local-GUI .input/.resize dispatch.
-    // The remaining liveness exposure above is confined to other e.mutex users
-    // (primary subscriber delivery, this session's render thread, teardown).
+    // Layer 2 prereq A (HARD FOLLOW-UP, NOW IMPLEMENTED): the render-sub delivery is
+    // NON-BLOCKING — `renderOutPush` enqueues the pre-encoded frame onto a per-conn
+    // bounded ring (drop-OLDEST on overflow, safe because grid/mode are absolute
+    // snapshots) and a dedicated per-conn drain thread (`renderDrainLoop`) flushes
+    // it with blocking writes OFF e.mutex. So a wedged REMOTE render subscriber (a
+    // phone over a tailnet) can no longer head-of-line-block the primary GUI
+    // `subscribers` above, stall this session's render thread, or delay
+    // teardownEntry. The PRIMARY `subscribers` path above intentionally RETAINS the
+    // SR-4 single-fast-local-peer blocking-write contract (a single fast local GUI);
+    // only `render_subscribers` got the bounded-drop path. The read-only gate
+    // (Conn.isRenderOnlySubscriber) remains conn-local + lock-free.
     for (e.render_subscribers.items) |conn| {
         if (conn.closed.load(.acquire)) continue;
-        conn.writeFramed(.mode_frame, mode);
-        conn.writeFramed(.grid_frame, grid);
+        conn.renderOutEnsure(); // lazy-spawn the drain thread (idempotent)
+        conn.renderOutPush(.mode_frame, mode);
+        conn.renderOutPush(.grid_frame, grid);
     }
 }
 
@@ -1528,6 +1818,34 @@ fn onChildExited(ctx: *anyopaque, session: *Session, exit_code: u32, runtime_ms:
     for (e.subscribers.items) |conn| {
         if (conn.closed.load(.acquire)) continue;
         conn.writeFramed(.child_exited, ce);
+    }
+    // Layer 2 (Agent Dashboard, fix M2): also notify read-only RENDER subscribers
+    // that the child exited. The COMMON Agent-Dashboard case is the agent process
+    // exits while THIS host stays alive — without this a mirror would get no frame,
+    // its socket would stay open (markMirrorEnded only fires on EOF/read-error), and
+    // it would show a stale frozen frame forever and never declare "ended". We REUSE
+    // the existing `child_exited` frame (additive — no new frame type) and deliver it
+    // via the NON-BLOCKING bounded-drop render path (renderOutPush), NOT a blocking
+    // write under e.mutex, so a slow/wedged mirror can never stall onChildExited.
+    // child_exited carries no grid/mode state, so the drop-oldest ring is safe: the
+    // mirror's client converts it to markMirrorEnded (does NOT close — it owns no
+    // pty). The session stays alive host-side; buffered-exit replay for real ATTACH
+    // reconnects is unchanged (above). A conn on BOTH lists is exceptional (a mirror
+    // never attaches); a duplicate child_exited is idempotent client-side (fire-once).
+    //
+    // CAP-HEADROOM (why child_exited survives the drop-oldest ring): child_exited is
+    // the LAST meaningful frame because the session stops rendering after the child
+    // exits — render_stop.notify() fires in the SAME renderTick that drained this exit
+    // (Session.renderTick), so no further renderTick pushes grid frames after it. The
+    // single post-exit tick pushes at most {child_exited, mode_frame, grid_frame} = 3
+    // frames, well within CAP (=4), so even an undrained ring cannot evict child_exited
+    // here. INVARIANT for future changes: keep the per-tick render push count <= CAP-1
+    // so a trailing grid_frame can never drop child_exited (which would silently lose
+    // the "ended" signal — the exact bug this fix repairs).
+    for (e.render_subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.renderOutEnsure(); // lazy-spawn the drain thread (idempotent)
+        conn.renderOutPush(.child_exited, ce);
     }
 }
 
@@ -1843,19 +2161,23 @@ fn pushFullFramesTo(self: *Server, conn: *Conn, e: *SessionEntry) !void {
     const grid: protocol.GridFrame = .{ .session_id = e.session_id, .snapshot = snapshot };
     // Single-conn seed; skip if the conn closed between subscribe and seed.
     if (conn.closed.load(.acquire)) return;
-    // LIVENESS / HEAD-OF-LINE WARNING (findings SR-4 / SF2): these are BLOCKING
-    // writes done while the caller (handleSubscribeRender) holds registry_mutex (the
-    // app-global lock), mirroring handleSubscribeRaw's seed write. A wedged REMOTE
-    // render subscriber (a phone-over-tailnet mirror) therefore head-of-line-blocks
-    // registry-wide work (every session lookup/attach/close) for the duration of the
-    // seed write. Same HARD FOLLOW-UP as onRender's render loop: before Layer 2 ships
-    // a real network-fed client, seed via a non-blocking / bounded-buffer path so a
-    // slow remote mirror cannot stall the registry. NOTE: the seed is BEST-EFFORT —
-    // writeFramed swallows write errors and a snapshot-capture failure logs + returns
-    // above, so the conn stays registered on render_subscribers regardless (a later
-    // live onRender tick still delivers); the subscription never hinges on this write.
-    conn.writeFramed(.mode_frame, captured.mode);
-    conn.writeFramed(.grid_frame, grid);
+    // Layer 2 prereq A: the seed is NON-BLOCKING — `renderOutPush` enqueues onto the
+    // same per-conn bounded ring the live onRender path uses, drained by the conn's
+    // dedicated drain thread OFF the locks. So although the caller
+    // (handleSubscribeRender) holds registry_mutex (the app-global lock) here, a
+    // wedged REMOTE render subscriber can NO LONGER head-of-line-block registry-wide
+    // work (every session lookup/attach/close) for the seed write. The frame ENCODE
+    // (protocol.encodeFrame, O(grid)) still runs under registry_mutex — same cost the
+    // old blocking writeFramed paid, not a regression — but the leaf-mutex append is
+    // O(1) and, crucially, the BLOCKING SOCKET WRITE (the thing that actually stalled)
+    // now happens off-lock on the drain thread. Lazy-spawn the drain thread here too (under
+    // registry_mutex — brief, leaf-only new thread, no lock-order edge). BEST-EFFORT:
+    // a snapshot-capture failure logs + returns above and an enqueue drop is
+    // self-healing, so the conn stays registered regardless (a later live onRender
+    // tick re-delivers); the subscription never hinges on this seed.
+    conn.renderOutEnsure();
+    conn.renderOutPush(.mode_frame, captured.mode);
+    conn.renderOutPush(.grid_frame, grid);
 }
 
 fn deliverBufferedExit(self: *Server, e: *SessionEntry) void {

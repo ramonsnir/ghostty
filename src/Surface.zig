@@ -691,10 +691,23 @@ pub fn init(
                 @TypeOf(rt_surface.*),
                 "session_id",
             )) rt_surface.session_id else 0;
+            // Layer 2 (Agent Dashboard): read the mirror flag defensively (same
+            // @hasField pattern as session_id, so apprts without the field compile
+            // to non-mirror). A mirror is reachable ONLY with a real session to
+            // mirror — a mirror flag with session_id 0 has nothing to subscribe to,
+            // so degrade to a normal (fresh-spawn) .client surface rather than a
+            // dead mirror. (Layer 3 always supplies a non-zero id for a mirror.)
+            const req_mirror: bool = if (@hasField(
+                @TypeOf(rt_surface.*),
+                "mirror",
+            )) rt_surface.mirror else false;
+            const client_role: termio.Client.Role =
+                if (req_mirror and req_session_id != 0) .mirror else .attach;
             const io_client = try termio.Client.init(alloc, .{
                 .socket_path = sock,
                 .render_mutex = mutex,
                 .session_id = termio.Client.sessionIdFromConfig(req_session_id),
+                .role = client_role,
                 // SLICE 11 (cwd-inherit): pass the SAME working-directory the
                 // `.exec` arm passes to `Exec.init` below (line ~718). The GUI
                 // already computes the new tab's cwd into
@@ -1152,6 +1165,29 @@ pub fn sessionId(self: *Surface) u64 {
     };
 }
 
+/// Layer 2 (Agent Dashboard): true when this surface is a READ-ONLY render
+/// mirror of an existing host session (the `.client` backend in `.mirror`
+/// role). A mirror owns NO pty and must NEVER close anything real on a
+/// session-gone signal — `childExited` consults this to render a quiescent
+/// "terminated" tile instead of tearing the surface down. The `.exec` backend
+/// and the non-mirror `.client` attach path both return false.
+pub fn isMirror(self: *Surface) bool {
+    return switch (self.io.backend) {
+        .client => |*c| c.config.role == .mirror,
+        .exec => false,
+    };
+}
+
+/// Layer 2: the decision childExited makes on its FIRST branch — whether this
+/// surface is a read-only mirror (dims, never closes) vs a real attach/exec
+/// surface (runs the normal close/show-exited flow). Extracted as a pure predicate
+/// so the guard key is unit-testable without a live Surface (the real childExited
+/// is file-private and needs a full surface). childExited calls
+/// `if (self.mirrorChildExitShouldDim()) return;` instead of inlining isMirror().
+pub fn mirrorChildExitShouldDim(self: *Surface) bool {
+    return self.isMirror();
+}
+
 /// Called from the app thread to handle mailbox messages to our specific
 /// surface.
 pub fn handleMessage(self: *Surface, msg: Message) !void {
@@ -1435,6 +1471,32 @@ fn selectionScrollTick(self: *Surface) !void {
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
     self.child_exited = true;
+
+    // Layer 2 (Agent Dashboard): a render MIRROR owns no pty and must NEVER
+    // close anything real on a session-gone signal. `markMirrorEnded`
+    // synthesizes a `child_exited` (exit_code/runtime_ms 0) purely to drive
+    // THIS handler; on the default `wait-after-command=false` path the normal
+    // flow would fall through to `self.close()` (and, on the runtime<=
+    // abnormal-threshold branch, would surface an abnormal-exit message), which
+    // would tear down a perfectly valid preview tile on any genuine EOF —
+    // including a routine `ghostty-host` restart that drops live sessions. For
+    // a mirror the operative behavior is: return WITHOUT `self.close()` and
+    // WITHOUT `performAction(.show_child_exited)` (a synthetic exit is not a
+    // real process exit), so the surface PERSISTS as a terminated tile.
+    //
+    // We deliberately do NOT write any "session ended" text into the local
+    // terminal: a `.client` mirror's renderer draws from `renderer_state.mirror`
+    // (= &Client.render_state), which is non-null for every `.client` surface
+    // (set just after the backend-union move), and NEVER from
+    // `renderer_state.terminal` (see src/renderer/generic.zig — the `mirror`
+    // branch). So a write here would be invisible. The frozen last host frame
+    // simply persists on screen; Layer 3 dims/overlays the terminated tile.
+    //
+    // The guard key is the pure `mirrorChildExitShouldDim()` predicate (== isMirror)
+    // so it is unit-testable without a live Surface. The early return is BEFORE the
+    // abnormal-exit branch and `self.close()`, so the architectural signal
+    // (synthetic child_exited, NO close) is intact.
+    if (self.mirrorChildExitShouldDim()) return;
 
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.

@@ -213,19 +213,43 @@ pub const StylePod = struct {
     }
 
     fn read(r: anytype) !StylePod {
+        const fg_color = try Color.read(r);
+        const bg_color = try Color.read(r);
+        const underline_color = try Color.read(r);
+        const bold = (try r.readByte()) != 0;
+        const italic = (try r.readByte()) != 0;
+        const faint = (try r.readByte()) != 0;
+        const blink = (try r.readByte()) != 0;
+        const inverse = (try r.readByte()) != 0;
+        const invisible = (try r.readByte()) != 0;
+        const strikethrough = (try r.readByte()) != 0;
+        const overline = (try r.readByte()) != 0;
+        // `underline` rides the wire as the raw u8 index of `sgr.Attribute.Underline`
+        // (an enum(u3), valid members 0..5). The mirror's `rehydrateStyle`
+        // (src/termio/Client.zig) feeds it straight into `@enumFromInt(pod.underline)`,
+        // which is checked-illegal-behavior for an out-of-range value — a panic in
+        // safe builds and UNDEFINED BEHAVIOR in the ReleaseFast .mirror lib. So a
+        // corrupt / desynced / version-skewed frame carrying underline in {6..255}
+        // MUST fail closed HERE, exactly like the dirty / cursor_visual_style /
+        // ColorTag / codepoint validators do, instead of being projected into UB.
+        // The producer only ever emits 0..5 (via fromStyle's @intFromEnum), so this
+        // never trips on a legitimate host-produced frame.
+        const underline_byte = try r.readByte();
+        _ = std.meta.intToEnum(sgr.Attribute.Underline, underline_byte) catch
+            return error.InvalidUnderline;
         return .{
-            .fg_color = try Color.read(r),
-            .bg_color = try Color.read(r),
-            .underline_color = try Color.read(r),
-            .bold = (try r.readByte()) != 0,
-            .italic = (try r.readByte()) != 0,
-            .faint = (try r.readByte()) != 0,
-            .blink = (try r.readByte()) != 0,
-            .inverse = (try r.readByte()) != 0,
-            .invisible = (try r.readByte()) != 0,
-            .strikethrough = (try r.readByte()) != 0,
-            .overline = (try r.readByte()) != 0,
-            .underline = try r.readByte(),
+            .fg_color = fg_color,
+            .bg_color = bg_color,
+            .underline_color = underline_color,
+            .bold = bold,
+            .italic = italic,
+            .faint = faint,
+            .blink = blink,
+            .inverse = inverse,
+            .invisible = invisible,
+            .strikethrough = strikethrough,
+            .overline = overline,
+            .underline = underline_byte,
         };
     }
 };
@@ -448,15 +472,65 @@ pub const Snapshot = struct {
                 }
                 const raw = raws[x];
 
-                // Style is only populated on the source for styled / bg-color
-                // cells; default otherwise.
+                // Style projection. THREE cases, in priority order:
+                //
+                //   1. bg_color_rgb / bg_color_palette cells: the bg color lives
+                //      in `raw.content` (a blank cell with a background, produced
+                //      by Screen.blankCell -> Style.bgCell). DERIVE the StylePod
+                //      directly from `raw.content`, NEVER from `styles[x]`.
+                //
+                //      WHY (root cause of the rare load-dependent grid_frame decode
+                //      failure / error.InvalidColorTag): the renderer's
+                //      RenderState.update only populates `cells_style[x]` inside its
+                //      `if (row.managedMemory()) { ... }` block (render.zig:506),
+                //      and `managedMemory() == styled or hyperlink or grapheme`
+                //      (page.zig). A bg_color blank cell has style_id==0 and does
+                //      NOT set row.styled (Screen.clearCells even CLEARS it on a
+                //      full-width clear), so a row of only bg_color cells is
+                //      NON-managed: `update` skips the loop and `cells_style[x]` for
+                //      that cell is left UNDEFINED (MultiArrayList.resize does not
+                //      zero new fields). The renderer never reads it (it derives the
+                //      bg from raw.content at draw time, exactly as below), but the
+                //      mirror used to read it via fromStyle(styles[x]) -> garbage
+                //      color union tag -> serialize emits a garbage ColorTag byte ->
+                //      decode trips error.InvalidColorTag. Idle the reused arena
+                //      memory was usually zero (benign), so it only bit under load.
+                //      Deriving from raw.content makes the producer emit a valid,
+                //      correct StylePod for these cells regardless of arena state,
+                //      and matches what the renderer itself populates for a bg_color
+                //      cell on a managed row (render.zig:536-549).
+                //
+                //   2. style_id > 0 cells: always live on a `styled` (== managed)
+                //      row, so `styles[x]` IS populated by update. Read it.
+                //
+                //   3. everything else (default cells): no style; all-default POD.
                 const style_pod: StylePod = blk: {
-                    if (raw.style_id > 0 or
-                        raw.content_tag == .bg_color_rgb or
-                        raw.content_tag == .bg_color_palette)
-                    {
-                        break :blk StylePod.fromStyle(styles[x]);
+                    // Guard the `else => {}` fallthrough below: it is correct ONLY
+                    // while the sole COLOR-carrying content tags are the two handled
+                    // here. If page.ContentTag ever gains another variant whose color
+                    // lives in `raw.content` (like bg_color_*), it would silently
+                    // route through `else` to the `styles[x]` path and could
+                    // reintroduce the exact undefined-style-slot read this fix
+                    // eliminated. This comptime assert fails the build if the tag set
+                    // changes, forcing a deliberate re-audit against render.zig's
+                    // draw-time color mapping (render.zig:536-549).
+                    comptime std.debug.assert(@typeInfo(page.Cell.ContentTag).@"enum".fields.len == 4);
+                    switch (raw.content_tag) {
+                        .bg_color_rgb => break :blk .{ .bg_color = .{
+                            .tag = .rgb,
+                            .rgb = .{
+                                .r = raw.content.color_rgb.r,
+                                .g = raw.content.color_rgb.g,
+                                .b = raw.content.color_rgb.b,
+                            },
+                        } },
+                        .bg_color_palette => break :blk .{ .bg_color = .{
+                            .tag = .palette,
+                            .palette = raw.content.color_palette,
+                        } },
+                        else => {},
                     }
+                    if (raw.style_id > 0) break :blk StylePod.fromStyle(styles[x]);
                     break :blk .{};
                 };
 
@@ -742,24 +816,48 @@ pub const Snapshot = struct {
                     if (mcell.grapheme.len != 0) return fail(out, .{ .field = "cell.grapheme(nonempty)", .y = y, .x = x });
                 }
 
-                // style — GATED on the populated condition (style undefined for
-                // default cells, render.zig:223). When populated, compare the
-                // mirror's StylePod DIRECTLY against the raw
-                // terminal.style.Style the renderer reads (NOT against
-                // fromStyle(styles[x])): this is the cross-path leg that breaks
-                // the self-reference, so a field fromStyle silently drops or
-                // mis-maps fails the diff rather than cancelling on both sides
-                // (finding DR-1). For unpopulated/default cells the renderer
-                // reads no style, so we require the mirror's StylePod be the
-                // all-default value.
-                const populated = x < cells.len and
-                    (r_raw.style_id > 0 or
-                        r_raw.content_tag == .bg_color_rgb or
-                        r_raw.content_tag == .bg_color_palette);
-                if (populated) {
-                    if (!mcell.style.eqlStyle(styles[x])) return fail(out, .{ .field = "cell.style", .y = y, .x = x });
-                } else {
-                    if (!mcell.style.eql(.{})) return fail(out, .{ .field = "cell.style(default)", .y = y, .x = x });
+                // style — validated to match what `fromRenderState` PRODUCES,
+                // case-for-case (the same three-way switch), so the cross-path
+                // legs stay honest:
+                //
+                //   - bg_color cells: the projection derives bg_color from
+                //     `raw.content` (NOT from styles[x], which is UNDEFINED on a
+                //     non-managed bg_color row — see fromRenderState's comment /
+                //     the root-cause note). Validate the mirror against that same
+                //     content-derived StylePod, so the difftest exercises the real
+                //     producer path and never reads the undefined styles[x].
+                //   - style_id > 0 cells (always on a managed row, so styles[x] IS
+                //     populated): compare the mirror's StylePod DIRECTLY against the
+                //     raw terminal.style.Style (NOT fromStyle(styles[x])) — the
+                //     cross-path leg that breaks the self-reference so a dropped /
+                //     mis-mapped field fails the diff (finding DR-1).
+                //   - default cells: the renderer reads no style; require all-default.
+                switch (r_raw.content_tag) {
+                    .bg_color_rgb => {
+                        const want: StylePod = .{ .bg_color = .{
+                            .tag = .rgb,
+                            .rgb = .{
+                                .r = r_raw.content.color_rgb.r,
+                                .g = r_raw.content.color_rgb.g,
+                                .b = r_raw.content.color_rgb.b,
+                            },
+                        } };
+                        if (!mcell.style.eql(want)) return fail(out, .{ .field = "cell.style(bg_rgb)", .y = y, .x = x });
+                    },
+                    .bg_color_palette => {
+                        const want: StylePod = .{ .bg_color = .{
+                            .tag = .palette,
+                            .palette = r_raw.content.color_palette,
+                        } };
+                        if (!mcell.style.eql(want)) return fail(out, .{ .field = "cell.style(bg_palette)", .y = y, .x = x });
+                    },
+                    else => {
+                        if (x < cells.len and r_raw.style_id > 0) {
+                            if (!mcell.style.eqlStyle(styles[x])) return fail(out, .{ .field = "cell.style", .y = y, .x = x });
+                        } else {
+                            if (!mcell.style.eql(.{})) return fail(out, .{ .field = "cell.style(default)", .y = y, .x = x });
+                        }
+                    },
                 }
             }
         }

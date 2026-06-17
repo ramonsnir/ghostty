@@ -428,6 +428,12 @@ pub const Surface = struct {
     /// See `Options.session_id`. Only meaningful for the `.client` backend.
     session_id: u64 = 0,
 
+    /// Layer 2 (Agent Dashboard): see Options.mirror. Carried from init Options
+    /// so the core Surface.init reads it off `rt_surface` when building the
+    /// `.client` backend config. Only meaningful with the `.client` backend + a
+    /// non-zero session_id.
+    mirror: bool = false,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -478,6 +484,12 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Layer 2 (Agent Dashboard): see ghostty.h. true => this surface is a
+        /// READ-ONLY render mirror of `session_id` (requires pty-host + non-zero
+        /// session_id). Default false = normal attach/spawn (today's behavior).
+        /// Appended last to keep the extern layout additive with the C header.
+        mirror: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -496,6 +508,11 @@ pub const Surface = struct {
             // Surface.init, which reads it off `rt_surface` when building the
             // `.client` backend config (0 => fresh; non-zero => reattach).
             .session_id = opts.session_id,
+            // Layer 2 (Agent Dashboard): carry the mirror flag through to the core
+            // Surface.init, which reads it off `rt_surface` when selecting the
+            // `.client` backend role (false => attach; true + non-zero session_id
+            // => mirror).
+            .mirror = opts.mirror,
         };
 
         // Add ourselves to the list of surfaces on the app.

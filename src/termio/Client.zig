@@ -67,6 +67,29 @@ const imagepkg = @import("../renderer/image.zig");
 
 const log = std.log.scoped(.io_client);
 
+/// Layer 2 (mirror role): poll cadence for the read loop. The mirror polls with a
+/// FINITE timeout (not poll(-1)) so the loop stays responsive to the quit pipe and
+/// can re-evaluate periodically; .attach uses poll(-1) unchanged.
+///
+/// SESSION-GONE DETECTION (corrected, vs. the prior silence-heuristic): the mirror
+/// declares the session terminated ONLY on a GENUINE socket signal — EOF (the host
+/// process died / the conn dropped) or a read error. It does NOT terminate on mere
+/// frame SILENCE. The host suppresses grid/mode frames on an idle session (the
+/// renderTick push-gate is `changed>0 || force_push || cursor_changed`) and does
+/// NOT close the per-render-subscriber socket on session-gone (teardownEntry only
+/// clears render_subscribers). A perfectly-alive agent sitting IDLE at a prompt —
+/// the Agent Dashboard's PRIMARY target (an agent "waiting for input" emits no
+/// output by definition) — therefore sends zero frames for arbitrarily long. A
+/// silence timeout would mis-declare exactly that headline case as terminated.
+/// Treating silence as death is wrong; only a genuine socket-level death is. On an
+/// explicit host-side Close of a still-running host process (rare for the
+/// dashboard's live-agent target) the socket stays open and the mirror keeps
+/// showing the last frame — non-destructive (the mirror owns nothing real) and
+/// re-derived on the model's next refresh. A host-side liveness/keepalive frame
+/// that would also cover the keep-open-Close case cleanly is a Layer-3 followup
+/// (it is an additive host protocol change, out of Layer-2 scope).
+const MIRROR_POLL_TIMEOUT_MS: i32 = 1000;
+
 /// SLICE-3-BLOCKING: a clearly-invalid sentinel `PageList.Pin` for client
 /// mirror rows. `render.RenderState.Row.pin` (render.zig:181) is a *List.Node
 /// POINTER into the HOST's PageList — it CANNOT cross the wire and is
@@ -218,6 +241,15 @@ session_id: std.atomic.Value(u64) = .init(0),
 /// Set on `.child_exited`.
 child_exited: ?ChildExited = null,
 
+/// Layer 2 (mirror role): set once when the mirror declares the session gone
+/// (genuine EOF / read error on the socket — NOT a silence timeout). Guarded by
+/// renderMutex(); idempotent fire-once (markMirrorEnded checks it). The renderer
+/// does NOT read this in Layer 2 (it keeps drawing the frozen last frame); the
+/// operative signal is the synthetic child_exited surface message markMirrorEnded
+/// pushes. The flag/lock are forward-compatible for a Layer-3 renderer that draws
+/// an explicit terminated overlay. Never set under .attach.
+mirror_ended: bool = false,
+
 /// Phase D: the host's authoritative at-prompt bit (cursorIsAtPrompt on its real
 /// terminal), updated on every `.at_prompt` frame (pushed on change + seeded on
 /// attach). A lock-free atomic so `Surface.needsConfirmQuit` can read it on the
@@ -258,6 +290,17 @@ pub const ChildExited = struct {
     runtime_ms: u64,
 };
 
+/// Layer 2 (Agent Dashboard): the backend's ROLE.
+///   .attach — existing behavior: Hello + Attach (spawn/reattach), owns the
+///             session's GUI side, drives resize/input/scroll/etc.
+///   .mirror — READ-ONLY render mirror: Hello + subscribe_render(session_id),
+///             consumes grid_frame/mode_frame into the SAME RenderState mirror
+///             the renderer reads, and SUPPRESSES every session-mutating
+///             outbound frame (resize/input/focus/scroll/clear/reset/jump/
+///             selection/attach). Owns NO pty; never drives the real session.
+///             Reachable ONLY under pty-host (a non-zero session_id present).
+pub const Role = enum { attach, mirror };
+
 /// Configuration for the client backend: how to reach the ptyhost.
 pub const Config = struct {
     /// AF_UNIX socket path of the ptyhost. The caller's slice is borrowed only
@@ -273,6 +316,13 @@ pub const Config = struct {
     /// If non-null, attach to this existing session; otherwise spawn a fresh
     /// one (Attach.session_id == null).
     session_id: ?u64 = null,
+
+    /// Layer 2 (Agent Dashboard): the backend ROLE (see `Role`). Default
+    /// `.attach` keeps today's behavior byte-for-byte. `.mirror` makes this a
+    /// read-only render mirror of `session_id` (which must then be non-null).
+    /// A SCALAR copied by value through `init` and the backend-union move — no
+    /// pointer hazard, no post-move pointer to recapture.
+    role: Role = .attach,
 
     /// SLICE 11: spawn-opt working directory for a FRESH session (cwd-inherit,
     /// the `.client` analog of `.exec`'s `working_directory`). The caller's
@@ -610,22 +660,45 @@ pub fn connectAndAttach(
     // caught that connectAndAttach skipped the Hello.
     try sendFrameRaw(client_td, loop, alloc, .hello, protocol.Hello{});
 
-    // SLICE 11: carry the spawn-opt cwd in the Attach. The host applies it only
-    // on a fresh spawn (session_id == null) and ignores it on reattach; `null`
-    // here preserves the host's $HOME default. `working_directory` is borrowed
-    // by-reference into the frame for the encode — sendFrameRaw encodes
-    // synchronously here on the IO thread before returning, and the slice is
-    // Client-owned (duped in init), so no ownership transfer is needed.
-    // initial_input rides the same Attach as a second spawn-opt: a fresh spawn's
-    // host-assigned session id isn't known until the Attached reply, so a
-    // post-attach `.input` frame would carry session_id 0 and be dropped. Same
-    // borrow-by-reference-for-the-synchronous-encode reasoning as
-    // working_directory (Client-owned, duped in init).
-    try sendFrameRaw(client_td, loop, alloc, .attach, protocol.Attach{
-        .session_id = self.config.session_id,
-        .working_directory = self.config.working_directory,
-        .initial_input = self.config.initial_input,
-    });
+    // Layer 2 (mirror role): a READ-ONLY render mirror SUBSCRIBE_RENDERs an
+    // existing session instead of attaching. It NEVER sends Attach (which would
+    // spawn/reattach + own the session). The Hello above is sent for BOTH roles;
+    // ONLY the next frame differs. CRITICAL: do NOT early-return here — the
+    // `_ = self.renderMutex();` resolution + read-thread spawn tail below MUST run
+    // for both roles so `threadExit`'s join is valid.
+    if (self.config.role == .mirror) {
+        // session_id MUST be present (Surface only builds a mirror with a non-zero
+        // id); if absent, log + send nothing (a no-op mirror), never spawn. Seed
+        // the session_id atomic so ghostty_surface_session_id() is correct for the
+        // mirror (no .attached reply arrives for a render-sub). Single-threaded
+        // here (read thread not spawned yet), so the plain store is safe.
+        if (self.config.session_id) |sid| {
+            try sendFrameRaw(client_td, loop, alloc, .subscribe_render, protocol.SubscribeRender{
+                .session_id = sid,
+            });
+            self.session_id.store(sid, .release);
+        } else {
+            log.warn("mirror role with no session_id; not subscribing (no-op mirror)", .{});
+        }
+    } else {
+        // .attach (existing behavior, byte-for-byte):
+        // SLICE 11: carry the spawn-opt cwd in the Attach. The host applies it only
+        // on a fresh spawn (session_id == null) and ignores it on reattach; `null`
+        // here preserves the host's $HOME default. `working_directory` is borrowed
+        // by-reference into the frame for the encode — sendFrameRaw encodes
+        // synchronously here on the IO thread before returning, and the slice is
+        // Client-owned (duped in init), so no ownership transfer is needed.
+        // initial_input rides the same Attach as a second spawn-opt: a fresh spawn's
+        // host-assigned session id isn't known until the Attached reply, so a
+        // post-attach `.input` frame would carry session_id 0 and be dropped. Same
+        // borrow-by-reference-for-the-synchronous-encode reasoning as
+        // working_directory (Client-owned, duped in init).
+        try sendFrameRaw(client_td, loop, alloc, .attach, protocol.Attach{
+            .session_id = self.config.session_id,
+            .working_directory = self.config.working_directory,
+            .initial_input = self.config.initial_input,
+        });
+    }
 
     // SLICE 3d (finding 3d-lifetime-1): RESOLVE the effective guard mutex now,
     // while still single-threaded, BEFORE the read thread exists. `renderMutex()`
@@ -687,6 +760,8 @@ pub fn focusGained(
     td: *termio.Termio.ThreadData,
     focused: bool,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never reports focus.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .focus, protocol.Focus{
         .session_id = self.session_id.load(.acquire),
         .focused = focused,
@@ -698,6 +773,13 @@ pub fn resize(
     td: *termio.Termio.ThreadData,
     size: renderer.Size,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror NEVER drives session size.
+    // Suppress the Resize frame entirely (host also gates via
+    // isRenderOnlySubscriber — defense in depth). The host grid is authoritative;
+    // the mirror renders whatever cols/rows the host pushes. Return BEFORE the
+    // local size record so the mirror is fully inert (Layer 3 scales the tile from
+    // the host grid; it does not resize the mirror).
+    if (self.config.role == .mirror) return;
     // Record the latest known sizes (mirror state), then send a real Resize
     // frame on the write stream using `td` — same pattern as queueWrite /
     // focusGained, and session_id read via the same unlocked atomic load.
@@ -738,6 +820,10 @@ pub fn queueWrite(
     linefeed: bool,
 ) !void {
     _ = alloc;
+    // Layer 2 (mirror role): a READ-ONLY render mirror feeds NO input to the real
+    // session (inline-reply is a future Layer-3 add relaxing ONLY this method,
+    // never resize).
+    if (self.config.role == .mirror) return;
     // One Input frame per call carries the whole buffer; the host applies it
     // to the session's write mailbox. Chunking is a possible optimization but
     // not required for correctness.
@@ -759,6 +845,8 @@ pub fn scrollViewport(
     td: *termio.Termio.ThreadData,
     scroll: terminal.Terminal.ScrollViewport,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .scroll_viewport, protocol.ScrollViewport.fromTarget(
         self.session_id.load(.acquire),
         scroll,
@@ -774,6 +862,8 @@ pub fn clearScreen(
     td: *termio.Termio.ThreadData,
     history: bool,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .clear_screen, protocol.ClearScreen{
         .session_id = self.session_id.load(.acquire),
         .history = history,
@@ -787,6 +877,8 @@ pub fn reset(
     self: *Client,
     td: *termio.Termio.ThreadData,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .reset, protocol.Reset{
         .session_id = self.session_id.load(.acquire),
     });
@@ -799,6 +891,8 @@ pub fn jumpToPrompt(
     td: *termio.Termio.ThreadData,
     delta: isize,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .jump_to_prompt, protocol.JumpToPrompt{
         .session_id = self.session_id.load(.acquire),
         .delta = @intCast(delta),
@@ -814,6 +908,8 @@ pub fn selectionDrag(
     td: *termio.Termio.ThreadData,
     drag: termio.Message.SelectionDrag,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .selection_drag, protocol.SelectionDrag{
         .session_id = self.session_id.load(.acquire),
         .anchor_x = drag.anchor_x,
@@ -830,6 +926,8 @@ pub fn selectionClear(
     self: *Client,
     td: *termio.Termio.ThreadData,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .selection_clear, protocol.SelectionClear{
         .session_id = self.session_id.load(.acquire),
     });
@@ -846,6 +944,8 @@ pub fn selectionPoint(
     td: *termio.Termio.ThreadData,
     pt: termio.Message.SelectionPoint,
 ) !void {
+    // Layer 2 (mirror role): a READ-ONLY render mirror never drives the session.
+    if (self.config.role == .mirror) return;
     try self.sendFrame(td, .selection_point, protocol.SelectionPoint{
         .session_id = self.session_id.load(.acquire),
         .x = pt.x,
@@ -867,6 +967,57 @@ pub fn childExitedAbnormally(
     m.lock();
     defer m.unlock();
     self.child_exited = .{ .exit_code = exit_code, .runtime_ms = runtime_ms };
+}
+
+/// CALLER MUST HOLD renderMutex(). Fire-once core: marks the mirror ended, sets the
+/// local child_exited parity field, pushes the synthetic child_exited surface
+/// message + wakes the renderer. Returns true if it fired (false if already ended).
+/// Lets handleFrame's .child_exited mirror arm — which ALREADY holds renderMutex()
+/// for its whole switch — signal session-gone WITHOUT re-locking the non-recursive
+/// mutex (which would self-deadlock). The mailbox push + renderer notify run UNDER
+/// renderMutex here; that is SAFE and matches the existing real .child_exited /
+/// .grid_frame arms, which already push the mailbox + notify under the same held
+/// lock (the mailbox queue + wakeup eventfd are their own synchronization, not
+/// ordered under renderMutex). See `markMirrorEnded` for the full mirror-role
+/// session-gone semantics; this is the no-self-lock core both callers share.
+fn markMirrorEndedLocked(self: *Client) bool {
+    if (self.mirror_ended) return false; // fire-once
+    self.mirror_ended = true;
+    // Parity with the real .child_exited arm: set the local field too so any code
+    // that later reads self.child_exited on a timed-out/ended mirror sees a value
+    // (the surface-mailbox push is the operative signal). Held under renderMutex().
+    self.child_exited = .{ .exit_code = 0, .runtime_ms = 0 };
+    if (self.surface_mailbox) |mb| _ = mb.push(.{
+        .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
+    }, .{ .forever = {} });
+    if (self.renderer_wakeup) |*w| w.notify() catch {};
+    return true;
+}
+
+/// Layer 2 (mirror role): declare the mirrored session gone and signal the surface
+/// with a quiescent terminated state. Self-locking wrapper: called from the read
+/// thread on a GENUINE socket signal — EOF (host process died / conn dropped),
+/// read-error, or fatal-decode in the mirror branch — where renderMutex is NOT held,
+/// so it takes the guard, then delegates to `markMirrorEndedLocked`. (The
+/// host-forwarded child_exited path, FIX M2, instead calls the locked core directly
+/// from handleFrame, which already holds renderMutex.) NEVER fired on frame silence
+/// (an idle-but-alive agent must not be misdeclared dead; see MIRROR_POLL_TIMEOUT_MS).
+/// Idempotent (fire-once). Does NOT close or mutate anything real — the mirror owns
+/// no pty; this only dims the preview. Synthetic exit_code 0 since a mirror cannot
+/// know the real exit code. Reuses the surface mailbox the real .child_exited arm
+/// uses, but `Surface.childExited` BRANCHES on `Surface.isMirror()`: for a mirror it
+/// RETURNS WITHOUT self.close() (and without the abnormal-exit GUI action) — it writes
+/// NO text into the local terminal, since a `.client` mirror's renderer draws from
+/// `renderer_state.mirror` (the host-fed frame), never from the local terminal, so the
+/// frozen last host frame simply persists (Layer 3 dims it). Thus a genuine EOF — e.g.
+/// a routine ghostty-host restart — leaves a persistent terminated tile instead of
+/// tearing the surface down. `pub` so the difftest harness (a sibling file) can
+/// unit-test the fire-once signal contract directly.
+pub fn markMirrorEnded(self: *Client) void {
+    const m = self.renderMutex();
+    m.lock();
+    defer m.unlock();
+    _ = self.markMirrorEndedLocked();
 }
 
 /// Get information about the process(es) attached to the backend.
@@ -1027,23 +1178,43 @@ pub fn handleFrame(
 
         .child_exited => {
             const ce = try protocol.ChildExited.decode(alloc, payload);
-            self.child_exited = .{
-                .exit_code = ce.exit_code,
-                .runtime_ms = ce.runtime_ms,
-            };
-            // Deliver the exit to the surface so Surface.childExited runs and
-            // the tab closes/shows-exited per wait-after-command — exactly what
-            // .exec does from its IO thread (Exec.zig:291). Without this the
-            // .client tab HANGS on `exit`. `protocol.ChildExited`'s fields match
-            // `apprt.surface.Message.ChildExited` (exit_code: u32, runtime_ms:
-            // u64). No-op when `surface_mailbox` is null (decode/lifecycle tests
-            // bypass threadEnter), same as the renderer_wakeup notify above.
-            if (self.surface_mailbox) |mb| _ = mb.push(.{
-                .child_exited = .{
+            if (self.config.role == .mirror) {
+                // Layer 2 FIX (M2): the host forwarded a child_exited to this render
+                // subscriber because the real agent exited while ghostty-host stays
+                // alive (the host now ALSO broadcasts child_exited to
+                // render_subscribers — see src/host/Server.zig onChildExited). A
+                // mirror owns NO pty and must NOT take the attach close path.
+                // markMirrorEndedLocked (we ALREADY hold renderMutex here, so we
+                // CANNOT call the self-locking markMirrorEnded wrapper without a
+                // self-deadlock) sets the quiescent terminated state + signals the
+                // surface; Surface.childExited's mirror guard renders it WITHOUT
+                // self.close(). Fire-once: a repeat child_exited is a no-op (the
+                // field is set inside the locked core only on first fire, so a repeat
+                // never overwrites it with a stale-but-unmirrored value). `ce` is
+                // decoded above (validates the frame) but intentionally unused here —
+                // a mirror cannot know/forward the real exit code; {0,0} matches the
+                // EOF/timeout path.
+                _ = self.markMirrorEndedLocked();
+            } else {
+                // .attach (existing behavior, byte-for-byte): record + deliver to the
+                // surface so Surface.childExited runs the normal close/show-exited
+                // flow — exactly what .exec does from its IO thread (Exec.zig:291).
+                // Without this a real .client tab HANGS on `exit`.
+                // `protocol.ChildExited`'s fields match
+                // `apprt.surface.Message.ChildExited` (exit_code: u32, runtime_ms:
+                // u64). No-op when `surface_mailbox` is null (decode/lifecycle tests
+                // bypass threadEnter).
+                self.child_exited = .{
                     .exit_code = ce.exit_code,
                     .runtime_ms = ce.runtime_ms,
-                },
-            }, .{ .forever = {} });
+                };
+                if (self.surface_mailbox) |mb| _ = mb.push(.{
+                    .child_exited = .{
+                        .exit_code = ce.exit_code,
+                        .runtime_ms = ce.runtime_ms,
+                    },
+                }, .{ .forever = {} });
+            }
         },
 
         .link_frame => {
@@ -1194,6 +1365,14 @@ fn rehydrateStyle(pod: HostRenderState.StylePod) terminal.Style {
             .invisible = pod.invisible,
             .strikethrough = pod.strikethrough,
             .overline = pod.overline,
+            // `pod.underline` is the raw u8 enum index of sgr.Attribute.Underline
+            // (enum(u3), valid 0..5). `@enumFromInt` on an out-of-range value is
+            // checked-illegal-behavior (panic in safe builds, UB in the ReleaseFast
+            // .mirror lib), so it must never see a garbage byte. It cannot: every
+            // StylePod reaching rehydrateStyle is produced by `Snapshot.deserialize`
+            // (-> StylePod.read), which fails closed with error.InvalidUnderline on
+            // any byte outside 0..5 (RenderState.zig) — the same untrusted-wire
+            // @enumFromInt discipline applied to ColorTag / dirty / cursor_visual_style.
             .underline = @enumFromInt(pod.underline),
         },
     };
@@ -1524,30 +1703,61 @@ const ReadThread = struct {
             .{ .fd = quit, .events = posix.POLL.IN, .revents = undefined },
         };
 
+        // Layer 2 (mirror role): a read-only mirror declares the session gone ONLY
+        // on a genuine socket signal — EOF (n==0) or a read error — NOT on frame
+        // silence (see MIRROR_POLL_TIMEOUT_MS: an idle-but-alive agent sends zero
+        // frames, so silence must not be treated as death). It polls with a FINITE
+        // timeout (not poll(-1)) only to stay responsive to the quit pipe; on a
+        // timeout wake it simply re-loops. The .attach role keeps poll(-1) + its
+        // existing EOF/error handling byte-for-byte unchanged: every mirror-specific
+        // branch below is gated on `is_mirror`.
+        const is_mirror = client.config.role == .mirror;
+        const poll_timeout: i32 = if (is_mirror) MIRROR_POLL_TIMEOUT_MS else -1;
+
         var buf: [1024]u8 = undefined;
         while (true) {
             while (true) {
                 const n = posix.read(fd, &buf) catch |err| switch (err) {
                     error.NotOpenForReading, error.InputOutput => {
                         log.info("client reader exiting", .{});
+                        // Layer 2 (mirror role): a genuine session-gone on a mirror
+                        // (conn dropped / host died). Signal the terminated state.
+                        if (is_mirror) client.markMirrorEnded();
                         return;
                     },
                     error.WouldBlock => break,
                     else => {
                         log.err("client reader error err={}", .{err});
+                        if (is_mirror) client.markMirrorEnded();
                         return;
                     },
                 };
-                if (n == 0) break;
+                if (n == 0) {
+                    // EOF. Under .attach this is the existing reattach/disconnect
+                    // break; under a mirror it is genuine session-gone -> signal.
+                    if (is_mirror) {
+                        client.markMirrorEnded();
+                        return;
+                    }
+                    break;
+                }
 
                 // Push + drain complete frames into the mirror.
                 client.reader.push(client.gpa, buf[0..n]) catch |err| {
                     log.err("client reader push failed err={}", .{err});
+                    // Layer 2 (mirror role): a fatal push failure ends this read
+                    // thread; for a mirror that is session-gone, so signal the
+                    // terminated state (symmetric with the EOF/read-error paths).
+                    if (is_mirror) client.markMirrorEnded();
                     return;
                 };
                 while (true) {
                     const frame = client.reader.next(client.gpa) catch |err| {
                         log.err("client frame decode failed err={}", .{err});
+                        // Layer 2 (mirror role): a fatal decode failure (e.g.
+                        // error.InvalidFrame from a corrupt frame) ends this read
+                        // thread; for a mirror that is session-gone, so signal it.
+                        if (is_mirror) client.markMirrorEnded();
                         return;
                     } orelse break;
                     client.handleFrame(
@@ -1556,17 +1766,34 @@ const ReadThread = struct {
                         frame.payload,
                     ) catch |err| {
                         log.err("client handleFrame failed err={}", .{err});
+                        // Layer 2 (mirror role): a fatal handleFrame failure (e.g.
+                        // error.InvalidFrame via the mouse/kitty intToEnum guards on
+                        // a corrupt mode_frame) ends this read thread; for a mirror
+                        // that is session-gone, so signal the terminated state.
+                        if (is_mirror) client.markMirrorEnded();
                         return;
                     };
                 }
             }
 
-            _ = posix.poll(&pollfds, -1) catch |err| {
+            _ = posix.poll(&pollfds, poll_timeout) catch |err| {
                 log.warn("client reader poll failed, exiting err={}", .{err});
+                // Layer 2 (mirror role): a poll() error (rare) ends this read thread
+                // just like EOF / read-error / fatal-decode; for a mirror that is
+                // session-gone, so signal the terminated state (symmetric with the
+                // other read-thread exit paths — otherwise the tile would freeze on
+                // its last frame and never declare "ended").
+                if (is_mirror) client.markMirrorEnded();
                 return;
             };
 
             if (pollfds[1].revents & posix.POLL.IN != 0) return;
+
+            // Layer 2 (mirror role): a poll TIMEOUT (no socket activity) is NOT a
+            // session-gone signal — an idle-but-alive agent legitimately sends no
+            // frames. We simply re-loop. Genuine session-gone is detected only by
+            // EOF / read-error in the inner read loop above, which call
+            // markMirrorEnded. (No silence-based terminate; see MIRROR_POLL_TIMEOUT_MS.)
         }
     }
 };
