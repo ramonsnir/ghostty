@@ -107,14 +107,14 @@ keybind = ctrl+a>shift+}=swap_split:next
 # `repeatable:` keeps the prefix armed for 500ms after the first hit, so
 # `ctrl+a>L L L L` keeps resizing without re-issuing the prefix (tmux bind -r).
 # Avoid ctrl+arrow (macOS Mission Control claims those before Ghostty sees them).
-keybind = repeatable:ctrl+a>h=resize_split:left,2
-keybind = repeatable:ctrl+a>j=resize_split:down,2
-keybind = repeatable:ctrl+a>k=resize_split:up,2
-keybind = repeatable:ctrl+a>l=resize_split:right,2
-keybind = repeatable:ctrl+a>shift+h=resize_split:left,10
-keybind = repeatable:ctrl+a>shift+j=resize_split:down,10
-keybind = repeatable:ctrl+a>shift+k=resize_split:up,10
-keybind = repeatable:ctrl+a>shift+l=resize_split:right,10
+keybind = repeatable:ctrl+a>h=resize_split:left,10
+keybind = repeatable:ctrl+a>j=resize_split:down,10
+keybind = repeatable:ctrl+a>k=resize_split:up,10
+keybind = repeatable:ctrl+a>l=resize_split:right,10
+keybind = repeatable:ctrl+a>shift+h=resize_split:left,50
+keybind = repeatable:ctrl+a>shift+j=resize_split:down,50
+keybind = repeatable:ctrl+a>shift+k=resize_split:up,50
+keybind = repeatable:ctrl+a>shift+l=resize_split:right,50
 
 # --- tmux window/tab bindings --------------------------------------------
 # c       new tab (inherits cwd, like tmux new-window)
