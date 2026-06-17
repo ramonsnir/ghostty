@@ -174,7 +174,7 @@ extension SplitTree {
     }
 
     /// Find the next view to focus based on the current focused node and direction
-    func focusTarget(for direction: FocusDirection, from currentNode: Node) -> ViewType? {
+    func focusTarget(for direction: FocusDirection, from currentNode: Node, spatialWrap: Bool = true) -> ViewType? {
         guard let root else { return nil }
 
         switch direction {
@@ -207,8 +207,11 @@ extension SplitTree {
             // Fork: cycle. If nothing lies in the requested direction we wrap
             // around to the extreme slot on the opposite side, so repeated
             // moves loop through all splits (e.g. left -> center -> right ->
-            // left -> ...) instead of stopping at the edge.
-            if nodes.isEmpty {
+            // left -> ...) instead of stopping at the edge. This is a GOTO-only
+            // affordance: swap_split passes spatialWrap=false so a spatial swap
+            // at an edge dead-ends (refuses) rather than swapping the focused
+            // pane with the FAR opposite pane, which would be surprising.
+            if nodes.isEmpty && spatialWrap {
                 nodes = spatial.wrapSlots(in: spatialDirection, from: currentNode)
             }
 
@@ -310,7 +313,9 @@ extension SplitTree {
         guard let focusedPath = root.path(to: focusedNode) else {
             throw SplitError.viewNotFound
         }
-        guard let targetView = focusTarget(for: direction, from: focusedNode),
+        // spatialWrap=false: a spatial swap at an edge must dead-end (refuse),
+        // NOT wrap to the far opposite pane (edge-cycling is goto_split-only).
+        guard let targetView = focusTarget(for: direction, from: focusedNode, spatialWrap: false),
               targetView !== view else {
             throw SplitError.viewNotFound
         }
