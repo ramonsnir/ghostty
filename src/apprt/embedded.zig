@@ -1682,11 +1682,54 @@ pub const CAPI = struct {
         surface.core_surface.renderer_state.mutex.lock();
         defer surface.core_surface.renderer_state.mutex.unlock();
 
+        // pty-host (.client) backend: the local Terminal is never fed — the
+        // host owns emulation and ships us a viewport-only render mirror, which
+        // the renderer reads under this same mutex. Read the screen text from
+        // that mirror instead of the (empty) local Terminal. `sel` is ignored:
+        // the mirror IS the viewport and carries no scrollback to select, so
+        // any selection resolves to the full visible viewport. Under `.exec`
+        // (mirror == null) this is byte-identical to the original path.
+        if (surface.core_surface.renderer_state.mirror) |mirror| {
+            return readMirrorTextLocked(mirror, result);
+        }
+
         const core_sel = sel.core(
             surface.core_surface.renderer_state.terminal.screens.active,
         ) orelse return false;
 
         return readTextLocked(surface, core_sel, result);
+    }
+
+    /// Fill `result` with the host render mirror's viewport text. Must be called
+    /// with `renderer_state.mutex` held (the renderer and the host read-thread
+    /// both touch the mirror under it). Returns false only on allocation
+    /// failure. The viewport pixel/offset fields are left empty (-1 / 0): the
+    /// mirror has no local pins to resolve, and text readers don't need them.
+    fn readMirrorTextLocked(
+        mirror: *const terminal.RenderState,
+        result: *Text,
+    ) bool {
+        var buf: std.Io.Writer.Allocating = .init(global.alloc);
+        defer buf.deinit();
+        mirror.dumpText(&buf.writer) catch |err| {
+            log.warn("error reading mirror text err={}", .{err});
+            return false;
+        };
+        const text = buf.toOwnedSliceSentinel(0) catch |err| {
+            log.warn("error reading mirror text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = text.ptr,
+            .text_len = text.len,
+        };
+
+        return true;
     }
 
     fn readTextLocked(
