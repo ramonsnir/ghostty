@@ -31,6 +31,15 @@ mcp-token  = <48-hex secret>                # `openssl rand -hex 24`
 - **`mcp-listen`** — `addr:port` to bind. **Localhost (`127.0.0.1`)** is recommended: the
   agent (a local Claude Code / Codex, via the stdio shim) runs on this same Mac. It's a
   *bind address*, not an allowlist. Empty/unset ⇒ the server is disabled.
+  - **Per-identity port offset (automatic).** All three fork identities share
+    `~/.config/ghostty-ramon/config`, so they read the *same* `mcp-listen` port and would
+    otherwise fight over it side-by-side. The server shifts the port by a per-bundle-id
+    offset so they coexist: **Release** (`…ghostty-ramon`) keeps the configured port,
+    **ReleaseLocal** (`.local`) uses **+1**, **Debug** (`.debug`) uses **+2**. So
+    `mcp-listen = 127.0.0.1:8765` ⇒ Release `8765`, ReleaseLocal `8766`, Debug `8767`. The
+    stdio shim's default URL targets `8765` (Release); point it at a dev build with
+    `GHOSTTY_MCP_URL=http://127.0.0.1:8766/mcp` (or `:8767`). No config needed — it's in
+    `MCPServer.init` (`portOffset`/`applyPortOffset`, overflow-safe, unit-tested).
 - **`mcp-token`** — **always set it.** Unlike the web monitor (which may run open on a
   tailnet), the MCP token is a **shell-execution credential** — the tools can spawn tabs
   and run arbitrary commands. It's enforced on every `/mcp` request (`X-Ghostty-Token`

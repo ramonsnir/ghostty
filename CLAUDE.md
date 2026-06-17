@@ -281,7 +281,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     ALWAYS be set** — it is a SHELL-EXECUTION credential (the tools spawn tabs + run
     commands), so the recommended bind is **localhost** (`127.0.0.1:8765`) with a token, NOT
     an open tailnet bind. Empty token ⇒ runs OPEN + logs a warning. Keep both in
-    `~/.config/ghostty-ramon/config`.
+    `~/.config/ghostty-ramon/config`. **Per-identity port offset (automatic, code not
+    config):** the three fork identities share one config file (hence one `mcp-listen`
+    port) and would fight over it side-by-side, so `MCPServer.init` shifts the port by a
+    per-bundle-id offset — Release `+0` (keeps the configured port), ReleaseLocal `+1`,
+    Debug `+2` (so `:8765` ⇒ 8765 / 8766 / 8767). Pure overflow-safe helpers
+    `portOffset(forBundleID:)` / `applyPortOffset(_:offset:)` in `MCPServer.swift`,
+    unit-tested (`MCPServerTests`). The stdio shim defaults to Release (`8765`); use
+    `GHOSTTY_MCP_URL` to hit a dev build.
   - **Transport:** in-GUI HTTP JSON-RPC 2.0 on its own `NWListener` (`POST /mcp`:
     `initialize` / `tools/list` / `tools/call`) + a standalone stdio shim
     (`macos/mcp-shim`, `ghostty-mcp`, a dumb stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`,
