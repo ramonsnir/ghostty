@@ -40,6 +40,7 @@ const CoreSurface = @import("../Surface.zig");
 const Session = @import("Session.zig");
 const RenderState = @import("RenderState.zig");
 const protocol = @import("protocol.zig");
+const proc_info = @import("../os/main.zig").proc_info;
 
 const log = std.log.scoped(.host_server);
 
@@ -272,6 +273,33 @@ pub const Conn = struct {
     /// ModeFrame against an incompatible wire schema. Only touched on the read
     /// thread (dispatch), so no lock needed.
     handshaked: bool = false,
+
+    /// The peer's advertised protocol MINOR, captured in the `.hello` arm from
+    /// `hello.protocol_version_minor` (0 until then). Gates additive host->GUI
+    /// frames whose tag an older GUI's FrameType enum does not contain — notably
+    /// `process_info` (minor 3): the host emits it ONLY to conns with
+    /// `negotiated_minor >= 3` (see `processInfoAllowed`). This is the WHOLE
+    /// forward-compat mechanism, because `FrameReader.next` rejects an unknown
+    /// tag as `error.InvalidFrameType` and the GUI Client read loop treats that
+    /// as fatal — so an old GUI must NEVER be sent the new tag.
+    ///
+    /// CROSS-THREAD (unlike `handshaked`, which IS read-thread-only): this field
+    /// is WRITTEN on the read/dispatch thread (the `.hello` arm) but READ on the
+    /// session-owning/render thread inside the broadcast paths (`onProcessInfo`,
+    /// `pushFullFrames`) while iterating `e.subscribers`. It is still a plain u16
+    /// with no per-field lock, and that is SAFE because of a happens-before edge,
+    /// not single-thread access: a conn is PUBLISHED into `e.subscribers` only by
+    /// `handleAttach`, which on a given conn runs strictly AFTER that conn's
+    /// `.hello` arm (the `handshaked` gate enforces hello-before-attach on the
+    /// same serial per-conn read thread), and the subscriber-list publish + every
+    /// broadcast read both occur under `e.mutex`. That mutex provides the
+    /// happens-before that makes the value reliably visible on the render thread.
+    /// (A SECOND `.hello` on an already-attached conn would rewrite this on the
+    /// read thread concurrently with a render-thread read under `e.mutex` —
+    /// benign for an aligned u16, but technically a data race; a well-behaved GUI
+    /// sends hello exactly once, matching the pre-existing re-settable
+    /// `handshaked` pattern.)
+    negotiated_minor: u16 = 0,
 
     /// Layer 1 (read-only gate, LOCK-FREE on the hot path): true when THIS conn
     /// is a RENDER subscriber of `session_id` but has NOT grid-attached to it —
@@ -641,6 +669,19 @@ pub fn firstRenderSubscriberForTest(self: *Server, session_id: u64) ?*Conn {
     return e.render_subscribers.items[0];
 }
 
+/// The first regular (grid) subscriber of `session_id`, or null. Lets a test
+/// inspect the negotiated minor captured from that conn's Hello (used to verify
+/// the process_info compat gate). Mirrors firstRenderSubscriberForTest.
+pub fn firstSubscriberForTest(self: *Server, session_id: u64) ?*Conn {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    const e = self.sessions.get(session_id) orelse return null;
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    if (e.subscribers.items.len == 0) return null;
+    return e.subscribers.items[0];
+}
+
 /// Reaps disconnected connections: joins their (already-exited) read thread,
 /// closes the fd, frees the Conn. The SOLE owner of conn joins + frees. Woken
 /// by `reaper_signal`. Exits only once deinit has cleared `reaper_running` AND
@@ -925,6 +966,10 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
                 return;
             }
             conn.handshaked = true;
+            // Capture the peer's advertised minor so additive host->GUI frames
+            // can be gated on it (e.g. process_info needs >= 3). Major already
+            // matched above; the minor is purely a feature-negotiation hint.
+            conn.negotiated_minor = hello.protocol_version_minor;
             conn.writeFramed(.hello_ack, protocol.HelloAck{
                 .host_pid = self.host_pid,
                 .host_start_epoch = self.host_start_epoch,
@@ -1344,7 +1389,7 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt, .raw_output => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt, .raw_output, .process_info => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -1404,6 +1449,11 @@ fn handleAttach(
     // all attaches (and any concurrent Close/deinit) serialize behind one slow
     // GUI — acceptable for Phase 2a (single local GUI); a Phase-2b follow-up is
     // a refcount/pin on SessionEntry so attaches don't serialize on socket I/O.
+    // pushFullFrames ALSO does a bounded sysctl(KERN_PROCARGS2)+libproc proc_name
+    // resolve for the process_info seed under this lock (only when a subscriber
+    // negotiated minor >= 3); far cheaper than the blocking writes and only on
+    // attach (rare), but it lengthens this already-serialized critical section —
+    // same Phase-2b refcount follow-up applies.
     if (session_id) |sid| reattach: {
         self.registry_mutex.lock();
         defer self.registry_mutex.unlock();
@@ -1660,6 +1710,8 @@ fn spawnSession(
     session.on_at_prompt = onAtPrompt;
     session.on_raw_output_ctx = e;
     session.on_raw_output = onRawOutput;
+    session.on_process_info_ctx = e;
+    session.on_process_info = onProcessInfo;
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -1929,6 +1981,41 @@ fn onAtPrompt(ctx: *anyopaque, session: *Session, at_prompt: bool) void {
     }
 }
 
+/// fork (minor 3): does a conn want `process_info`? Pure predicate so the gating
+/// rule is unit-testable independent of constructing a Conn. The frame's tag is
+/// not in an older GUI's FrameType enum, so emit it ONLY to peers that advertised
+/// minor >= 3 (see the Conn.negotiated_minor / protocol minor-3 comments).
+pub fn processInfoAllowed(negotiated_minor: u16) bool {
+    return negotiated_minor >= 3;
+}
+
+/// fork (minor 3) foreground-process callback. Runs on the session OWNING thread
+/// from renderTick, off registry_mutex — same blocking-write discipline as
+/// onAtPrompt. Frames the resolved foreground process name + command to every
+/// subscriber that NEGOTIATED minor >= 3 (the compat gate: an older GUI's
+/// FrameType enum has no `process_info` tag and its read loop treats an unknown
+/// tag as fatal, so it must never be sent one). The `name`/`command` slices are
+/// BORROWED (owned by renderTick, freed after this returns) — `writeFramed` ->
+/// `encode` copies them synchronously per subscriber, before this returns.
+fn onProcessInfo(ctx: *anyopaque, session: *Session, name: []const u8, command: []const u8) void {
+    _ = session;
+    const e: *SessionEntry = @ptrCast(@alignCast(ctx));
+
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    for (e.subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        // Compat gate: skip peers that didn't negotiate minor 3 — they cannot
+        // decode this tag (see processInfoAllowed).
+        if (!processInfoAllowed(conn.negotiated_minor)) continue;
+        conn.writeFramed(.process_info, protocol.ProcessInfo{
+            .session_id = e.session_id,
+            .name = name,
+            .command = command,
+        });
+    }
+}
+
 /// H1 (Phase 2b) RAW-output callback. Runs on the session's IO THREAD (invoked
 /// from Termio.processOutputLocked via Session.rawOutputObserver, under the
 /// session's render_mutex), with `buf` BORROWING the IO read buffer (valid only
@@ -2111,6 +2198,33 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
 
     e.mutex.lock();
     defer e.mutex.unlock();
+
+    // fork (minor 3): process_info reattach seed. The steady-state push fires
+    // ONLY when renderTick observes a foreground-pid CHANGE, and prev_fg_pid is
+    // Session-lifetime state that SURVIVES detach/reattach — so a GUI relaunch to
+    // a session whose foreground pid is unchanged (the headline reattach-while-
+    // `claude`-keeps-running case) would otherwise never re-push, leaving the new
+    // GUI's name/command null indefinitely. Resolve the live foreground pid here
+    // (same reasoning as the at_prompt/pwd seeds above) and push it to the newly-
+    // attaching subscribers below, gated on negotiated_minor >= 3.
+    //
+    // The foreground pid is read via getProcessInfo (touches only the pty fd, no
+    // render_mutex) and resolve() does sysctl(KERN_PROCARGS2)+libproc proc_name —
+    // done OFF render_mutex (already released) so it never blocks the IO thread,
+    // but NOTE it DOES run under both e.mutex and the caller's registry_mutex
+    // (see handleAttach), lengthening that serialized critical section by a
+    // bounded syscall pair on attach (rare). It is resolved LAZILY inside the
+    // loop on the FIRST minor>=3 subscriber and memoized, so an old-GUI-only
+    // attach (all subscribers minor<=2, the OLD-GUI+NEW-host compat case) does
+    // ZERO sysctl/libproc work. null pid / failed resolve => skip (the new GUI is
+    // then seeded by the first post-attach pid change, as before).
+    var proc: ?proc_info.ProcInfo = null;
+    var proc_resolved = false;
+    defer if (proc) |p| {
+        session.alloc.free(p.name);
+        session.alloc.free(p.command);
+    };
+
     for (e.subscribers.items) |conn| {
         if (conn.closed.load(.acquire)) continue;
         conn.writeFramed(.mode_frame, mode);
@@ -2128,6 +2242,23 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
             .session_id = e.session_id,
             .payload = .{ .pwd_change = p },
         });
+        // process_info reattach seed (gated minor >= 3, like onProcessInfo's
+        // steady-state broadcast). Resolve lazily on the first minor>=3 conn so
+        // an old-GUI-only attach does no sysctl/libproc work; skipped when the
+        // pid was unresolvable.
+        if (processInfoAllowed(conn.negotiated_minor)) {
+            if (!proc_resolved) {
+                proc_resolved = true;
+                if (session.io.getProcessInfo(.foreground_pid)) |fg| {
+                    proc = proc_info.resolve(session.alloc, fg);
+                }
+            }
+            if (proc) |p| conn.writeFramed(.process_info, protocol.ProcessInfo{
+                .session_id = e.session_id,
+                .name = p.name,
+                .command = p.command,
+            });
+        }
     }
 }
 

@@ -1818,6 +1818,34 @@ pub const CAPI = struct {
         return .fromSlice(copy);
     }
 
+    /// fork: the focused foreground process NAME (e.g. "claude"), or an empty
+    /// String if unknown. The returned string must be freed by the caller via
+    /// ghostty_string_free. Under the pty-host `.client` backend this is the name
+    /// the HOST resolved and pushed (empty until a host new enough to send it —
+    /// minor 3 — has pushed a frame). Mirrors ghostty_surface_tty_name's shape:
+    /// the Surface getter already returns an app-alloc-owned [:0]u8.
+    export fn ghostty_surface_process_name(surface: *Surface) String {
+        const alloc = surface.app.core_app.alloc;
+        const name = surface.core_surface.foregroundProcessName(alloc) orelse return .empty;
+        return .fromSlice(name);
+    }
+
+    /// fork: the focused foreground COMMAND line (e.g. "claude --resume"), or an
+    /// empty String if unknown. Freed by the caller via ghostty_string_free. Same
+    /// backend semantics as ghostty_surface_process_name.
+    export fn ghostty_surface_command(surface: *Surface) String {
+        const alloc = surface.app.core_app.alloc;
+        const command = surface.core_surface.foregroundCommand(alloc) orelse return .empty;
+        return .fromSlice(command);
+    }
+
+    /// fork: ms since this surface's screen last changed (an applied grid_frame),
+    /// or -1 when unknown / unsupported backend. ~0 while a TUI repaints/works;
+    /// grows while it waits for input.
+    export fn ghostty_surface_idle_ms(surface: *Surface) i64 {
+        return surface.core_surface.idleMillis() orelse -1;
+    }
+
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
         const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {

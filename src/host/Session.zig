@@ -30,6 +30,7 @@ const inputpkg = @import("../input.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const internal_os = @import("../os/main.zig");
+const proc_info = internal_os.proc_info;
 const Surface = @import("../Surface.zig");
 
 const protocol = @import("protocol.zig");
@@ -381,6 +382,31 @@ on_raw_output: ?*const fn (ctx: *anyopaque, self: *Session, buf: []const u8) voi
 /// handled separately by pushFullFrames (it reads the live value), so this is
 /// purely the change-detector for the steady-state push.
 prev_at_prompt: ?bool = null,
+
+/// fork (minor 3): host->GUI foreground process name + command line callback.
+/// Set by the Server (ctx = the SessionEntry). Invoked from renderTick on the
+/// session OWNING thread, off registry_mutex — same blocking-subscriber-write
+/// discipline as `on_at_prompt`/`on_selection_text`. The Server callback builds
+/// a `process_info` frame from `e.session_id` + the two strings and broadcasts
+/// it (gated on the conn's negotiated minor >= 3). The `name`/`command` slices
+/// are BORROWED for the duration of the call (owned by renderTick, freed after
+/// the callback returns), so the callback must serialize/copy before returning,
+/// exactly like `on_at_prompt`. null in the standalone path.
+on_process_info_ctx: ?*anyopaque = null,
+on_process_info: ?*const fn (ctx: *anyopaque, self: *Session, name: []const u8, command: []const u8) void = null,
+
+/// The last foreground pid resolved+pushed (renderTick-only state, single-
+/// threaded on the render loop). null until the first tick observes one. Used to
+/// debounce the foreground-process resolve+push: only a pid CHANGE re-resolves
+/// (sysctl/libproc) and fires `on_process_info`, so steady-state ticks resolve
+/// nothing. Mirrors `prev_at_prompt`'s change-detector role. A foreground pid of
+/// null (no foreground process / unsupported) is itself a value here, so a
+/// flip to/from null is also a change. Advanced only after a SUCCESSFUL
+/// resolve+push (a transient resolve failure is retried next tick), except a
+/// flip TO null, which records immediately (nothing to resolve). SURVIVES
+/// detach/reattach (Session-lifetime), so a freshly-(re)attached GUI is seeded by
+/// Server.pushFullFrames, NOT by this tick (see the renderTick comment).
+prev_fg_pid: ?u64 = null,
 
 /// The last input-mode set seen by renderTick (renderTick-only state). null until
 /// the first tick. Closes the final push-gate gap (audit, same class as Slice-8
@@ -1563,6 +1589,50 @@ pub fn renderTick(self: *Session) !usize {
         self.prev_at_prompt = at_prompt_now;
         if (self.on_at_prompt) |cb| {
             cb(self.on_at_prompt_ctx.?, self, at_prompt_now);
+        }
+    }
+
+    // fork (minor 3): foreground process name + command (host->GUI process_info).
+    // Poll the cheap tcgetpgrp-based foreground pid (no lock — getProcessInfo
+    // touches only the pty fd) and, ONLY when the pid CHANGES vs. prev_fg_pid,
+    // resolve name+command (libproc/sysctl) and push. Debounced so steady-state
+    // ticks resolve nothing. Runs on this owning thread off registry_mutex, same
+    // discipline as the at_prompt push above; no new thread, never blocks the
+    // render path beyond the (cheap) poll + on-change resolve.
+    //
+    // The debounce is pid-ONLY: a process that rewrites its own argv WITHOUT
+    // changing pid (rare — an in-place re-exec) won't re-push, so `command` may
+    // lag for a stable pid. Acceptable (matches "compare to last-pushed pid").
+    //
+    // prev_fg_pid is advanced ONLY after a SUCCESSFUL resolve+push, so a transient
+    // resolve failure (the pid-read/sysctl window races process exit — most likely
+    // exactly on a fresh foreground process) is RETRIED on the next tick rather
+    // than silently pinned to null until the next pid change. The pid-flip-to-null
+    // case (no foreground process) is itself a successful "resolve" (nothing to
+    // push) and advances prev_fg_pid so we don't re-poll a stable null.
+    //
+    // A freshly (re)ATTACHED GUI is seeded by Server.pushFullFrames, NOT by this
+    // tick: prev_fg_pid is Session-lifetime state that SURVIVES detach/reattach,
+    // so on a GUI relaunch to a session whose foreground pid is unchanged this
+    // gate sees fg == prev_fg_pid and never re-pushes. pushFullFrames resolves the
+    // live pid and seeds process_info to the new subscriber (same reasoning as
+    // at_prompt/pwd, which also only push on change).
+    if (self.on_process_info) |cb| {
+        const fg = self.io.getProcessInfo(.foreground_pid);
+        if (fg != self.prev_fg_pid) {
+            if (fg) |pid| {
+                if (proc_info.resolve(self.alloc, pid)) |info| {
+                    defer self.alloc.free(info.name);
+                    defer self.alloc.free(info.command);
+                    self.prev_fg_pid = fg;
+                    cb(self.on_process_info_ctx.?, self, info.name, info.command);
+                }
+                // resolve failed: leave prev_fg_pid unchanged so the next tick retries.
+            } else {
+                // Flip to "no foreground process": nothing to push, but record it
+                // so we don't re-evaluate a stable null every tick.
+                self.prev_fg_pid = fg;
+            }
         }
     }
 

@@ -81,7 +81,11 @@ positional encounter-order indices, **not** durable — only `id` is).
 
 **Discover / read**
 - **`list_surfaces`** — all live panes: `id`, title, pwd, window/tab/split position, focus,
-  bell, exited, `atPrompt` (coarse, see caveat).
+  bell, exited, `atPrompt` (coarse, see caveat), and three optional fields (omitted when
+  unknown): `processName` / `command` (the foreground process + full command line, e.g.
+  `claude` / `claude --resume`) and `idleSeconds` (seconds since the screen last changed).
+  See Known limits for `processName`/`command`'s host-restart requirement and the
+  `idleSeconds` TUI nuance.
 - **`read_surface {id}`** — text of the **visible screen** (viewport). *Scrollback/history
   is not exposed* — see Known limits. To see output that scrolled off, `scroll` it into
   view, then read again.
@@ -169,6 +173,18 @@ only Zig change is two additive, default-null config keys it ignores.
   **never** fires and `atPrompt` is always true; with `always` it's inverted. For
   "is the agent waiting on me?", **`watch_for_pattern` on the prompt text is more reliable**
   than the `prompt` event today.
+- **`processName` / `command` are HOST-GATED and need a host restart.** Under `pty-host`
+  the GUI mirror cannot read the foreground process locally (the PTY lives in the host), so
+  the host resolves the name + command line and pushes them in an additive `process_info`
+  frame (protocol minor 3). A GUI upgrade alone is not enough — the host advertises its minor
+  at connect time, so until `ghostty-host` is restarted to a minor-3 build the fields stay
+  **absent** (omitted). Nothing breaks in the meantime (old host never sends the frame; old
+  GUI never receives an unknown tag).
+- **`idleSeconds` is a coarse activity heuristic.** It's seconds since the surface's screen
+  last changed (the arrival of a render frame): ~0 while a TUI repaints/works, growing while
+  it waits for input. A TUI that repaints on a timer (a clock, a spinner) never goes idle, so
+  treat it as a hint. GUI-only (ships at the next GUI relaunch, no host restart needed); null
+  on backends without a host frame stream.
 - **Relative layout verbs focus the target first** (v1). Anchor-parameterizing the
   `SplitTree` transforms so they don't disturb focus is a follow-up.
 - **No live config reload** — changing `mcp-listen` / `mcp-token` needs a GUI relaunch.

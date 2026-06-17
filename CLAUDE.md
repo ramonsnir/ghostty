@@ -299,6 +299,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `close_surface`, `perform_action` (the keybind-action grammar string). All address a
     surface by **stable UUID**; `wait_for_event`/`watch_for_pattern` are long-poll
     (idle-watchdog-exempt, bounded by a clamped `timeoutMs` 1000–120000).
+    `list_surfaces` rows carry `id, title, pwd, window/tab/split position, focused, bell,
+    exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /
+    `command` (foreground process + full cmdline) and `idleSeconds` (seconds since the screen
+    last changed). **`processName`/`command` are HOST-GATED**: under `.client` the GUI mirror
+    can't read the foreground process (the PTY is in the host), so the host resolves them
+    (libproc/sysctl in `src/os/proc_info.zig`) and PUSHES an additive `process_info` frame
+    (protocol minor 3, gated on the conn's negotiated minor in `Server.zig`) — they stay
+    absent until the **host is restarted** to a minor-3 build, even after a GUI upgrade.
+    **`idleSeconds` is GUI-only** (stamped in `Client.zig` on each applied `grid_frame`; ships
+    at the next GUI relaunch, no host restart) and is a coarse heuristic (a TUI that repaints
+    on a timer never idles; null on backends without a host frame stream).
   - **Two deliberate v1 limits (documented honestly, don't "fix" by guessing):**
     (a) **`read_surface` is VIEWPORT-ONLY** — under `pty-host` the GUI mirror is
     viewport-sized (real scrollback is on the host), so there is no honest scrollback read;
@@ -310,9 +321,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `SplitTree` is a follow-up). Wiring: `src/config/Config.zig` (`mcp-listen`/`mcp-token` +
     parse test); `macos/Sources/Features/MCP/{MCPServer,MCPRPC,MCPTools,MCPInput,MCPLayout,
     MCPEventBus}.swift`; `Ghostty.Config.swift` (`mcpListen`/`mcpToken`); `AppDelegate.swift`
-    (start on launch); `project.pbxproj` (iOS exclusion); `macos/mcp-shim/*`. Tests:
+    (start on launch); `project.pbxproj` (iOS exclusion); `macos/mcp-shim/*`. The
+    `processName`/`command`/`idleSeconds` feature adds: HOST — `src/os/proc_info.zig`
+    (pid→name+cmdline resolver, pure `parseProcArgs2`), the `process_info` frame +
+    `Conn.negotiated_minor` gate (`src/host/{protocol,Server,Session}.zig`, minor bumped to 3);
+    CORE/lib — `src/termio/Client.zig` (cache + `last_activity_ms` stamp on `grid_frame` only +
+    accessors), `src/Surface.zig` (`foregroundProcessName`/`foregroundCommand`/`idleMillis`
+    getters; `.exec` resolves locally via `proc_info`), `src/apprt/embedded.zig` +
+    `include/ghostty.h` (`ghostty_surface_process_name`/`_command`/`_idle_ms` exports);
+    macOS — `Surface View/SurfaceView_AppKit.swift` (the three computed vars), `MCPLayout.swift`
+    (`SurfaceRow` fields + JSON), `MCPTools.swift` (schema doc). Tests:
     `macos/Tests/MCP/MCPServerTests.swift` + the `mcp` Zig config test
-    (`zig build test -Dtest-filter=mcp`).
+    (`zig build test -Dtest-filter=mcp`); the `process_info` frame round-trip/bounds +
+    minor-3 tests in `src/host/test.zig` and the `proc_info parseProcArgs2` tests in
+    `src/os/proc_info.zig` (`zig build test -Dtest-filter=host` / `-Dtest-filter=proc_info`),
+    plus the `process_info`/`idleMillis` Client tests in `src/termio/Client.zig`.
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

@@ -145,6 +145,36 @@ extension Ghostty {
             return ghostty_surface_process_exited(surface)
         }
 
+        // fork: the focused FOREGROUND process name (e.g. "claude"), or nil if
+        // unknown. Under the pty-host `.client` backend this is the name the HOST
+        // resolved and pushed — nil until a host new enough to send it (protocol
+        // minor 3) has pushed a frame (e.g. an old host that hasn't been restarted
+        // after a GUI upgrade). Read by the MCP `list_surfaces` poll.
+        var foregroundProcessName: String? {
+            guard let surface = self.surface else { return nil }
+            let s = Ghostty.AllocatedString(ghostty_surface_process_name(surface)).string
+            return s.isEmpty ? nil : s
+        }
+
+        // fork: the focused foreground COMMAND line (e.g. "claude --resume"), or
+        // nil if unknown. Same backend/host-gating semantics as
+        // `foregroundProcessName`.
+        var foregroundCommand: String? {
+            guard let surface = self.surface else { return nil }
+            let s = Ghostty.AllocatedString(ghostty_surface_command(surface)).string
+            return s.isEmpty ? nil : s
+        }
+
+        // fork: seconds since this surface's screen last changed, or nil when
+        // unknown / unsupported backend. ~0 while a TUI repaints (working); grows
+        // while it waits for input. A coarse heuristic: a TUI that repaints on a
+        // timer (clock, progress spinner) never goes idle.
+        var idleSeconds: Double? {
+            guard let surface = self.surface else { return nil }
+            let ms = ghostty_surface_idle_ms(surface)
+            return ms < 0 ? nil : Double(ms) / 1000.0
+        }
+
         // Returns the inspector instance for this surface, or nil if the
         // surface has been closed or no inspector is active.
         var inspector: Ghostty.Inspector? {

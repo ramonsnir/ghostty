@@ -1383,21 +1383,154 @@ test "host SubscribeRender frame round-trip (Layer 1)" {
     try testing.expectEqual(orig.session_id, dec.session_id);
 }
 
-test "host protocol minor bumped to 2 for subscribe_render (Layer 1)" {
-    try testing.expectEqual(@as(u16, 2), protocol.PROTOCOL_VERSION_MINOR);
+test "host protocol subscribe_render tag stability (Layer 1)" {
+    // The minor is now 3 (process_info, minor-3); see the dedicated minor-3 test.
+    // PROTOCOL_VERSION_MAJOR stays 1.
     try testing.expectEqual(@as(u16, 1), protocol.PROTOCOL_VERSION_MAJOR);
     // raw_output tag integer must be unchanged (wire stability): subscribe_render
     // was appended AFTER it, so its integer is strictly greater. This guards R-D
     // (no mid-enum insert silently renumbering the just-shipped raw-tee).
     try testing.expect(@intFromEnum(protocol.FrameType.subscribe_render) >
         @intFromEnum(protocol.FrameType.raw_output));
-    // Tighter pin: subscribe_render is the LAST variant and immediately follows
-    // raw_output, so the gap is exactly 1. A future mid-enum insert landing
-    // BETWEEN raw_output and subscribe_render (renumbering subscribe_render while
-    // leaving the `>` assertion green) would break this exact-adjacency check.
+    // Tighter pin: subscribe_render immediately follows raw_output, so the gap is
+    // exactly 1. A future mid-enum insert landing BETWEEN raw_output and
+    // subscribe_render (renumbering subscribe_render while leaving the `>`
+    // assertion green) would break this exact-adjacency check. (subscribe_render
+    // is no longer the LAST variant — process_info was appended after it in
+    // minor 3 — but the raw_output↔subscribe_render adjacency is unchanged.)
     try testing.expectEqual(
         @intFromEnum(protocol.FrameType.raw_output) + 1,
         @intFromEnum(protocol.FrameType.subscribe_render),
+    );
+}
+
+test "host ProcessInfo frame round-trip (minor 3)" {
+    const alloc = testing.allocator;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // ProcessInfo (host->GUI): session_id + name + command. Round-trip the tag +
+    // payload through the FrameReader and assert field-equality (incl the two
+    // owned byte slices).
+    {
+        const orig: protocol.ProcessInfo = .{
+            .session_id = 4242,
+            .name = "claude",
+            .command = "claude --resume",
+        };
+        const framed = try protocol.encodeFrame(alloc, .process_info, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.process_info, tag);
+        var dec = try protocol.ProcessInfo.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(orig.session_id, dec.session_id);
+        try testing.expectEqualStrings(orig.name, dec.name);
+        try testing.expectEqualStrings(orig.command, dec.command);
+    }
+
+    // Empty command (e.g. a process whose argv couldn't be resolved) AND empty
+    // name: both length-prefixed slices are len-0. Exercises the two trailing
+    // writeBytes(len=0) + the readBytesField(name)/readBytes(command) ordering.
+    {
+        const orig: protocol.ProcessInfo = .{ .session_id = 1, .name = "", .command = "" };
+        const framed = try protocol.encodeFrame(alloc, .process_info, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.process_info, tag);
+        var dec = try protocol.ProcessInfo.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 1), dec.session_id);
+        try testing.expectEqual(@as(usize, 0), dec.name.len);
+        try testing.expectEqual(@as(usize, 0), dec.command.len);
+    }
+
+    // Empty name + a non-empty command: the non-trailing readBytesField must
+    // correctly consume a len-0 field and leave `command` for readBytes.
+    {
+        const orig: protocol.ProcessInfo = .{ .session_id = 7, .name = "", .command = "node server.js" };
+        const framed = try protocol.encodeFrame(alloc, .process_info, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.process_info, tag);
+        var dec = try protocol.ProcessInfo.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(usize, 0), dec.name.len);
+        try testing.expectEqualStrings("node server.js", dec.command);
+    }
+
+    // A long command line (a few KB) round-trips intact (exercises the dynamic
+    // ArrayList growth in encode + the bounded readBytes alloc in decode).
+    {
+        const long = try alloc.alloc(u8, 4096);
+        defer alloc.free(long);
+        for (long, 0..) |*b, i| b.* = @intCast('a' + (i % 26));
+        const orig: protocol.ProcessInfo = .{
+            .session_id = 0xDEADBEEF,
+            .name = "bigproc",
+            .command = long,
+        };
+        const framed = try protocol.encodeFrame(alloc, .process_info, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.process_info, tag);
+        var dec = try protocol.ProcessInfo.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 0xDEADBEEF), dec.session_id);
+        try testing.expectEqualStrings("bigproc", dec.name);
+        try testing.expectEqualStrings(long, dec.command);
+    }
+}
+
+test "host ProcessInfo decode robustness (truncated/over-claimed -> error, no panic) minor 3" {
+    const alloc = testing.allocator;
+
+    // A payload shorter than the u64 session_id -> error (readInt EndOfStream),
+    // never a panic.
+    {
+        const short = [_]u8{ 1, 2, 3 };
+        try testing.expectError(error.EndOfStream, protocol.ProcessInfo.decode(alloc, &short));
+    }
+
+    // A well-formed session_id but a `name` length prefix that OVER-claims the
+    // remaining bytes -> error.InvalidFrame from readBytesField's bound check,
+    // BEFORE any over-allocation. (8 bytes session_id + u32 name_len = 1000 + only
+    // 2 bytes of actual data.)
+    {
+        var bad: [14]u8 = undefined;
+        std.mem.writeInt(u64, bad[0..8], 42, .little);
+        std.mem.writeInt(u32, bad[8..12], 1000, .little); // name claims 1000 bytes
+        bad[12] = 'a';
+        bad[13] = 'b';
+        try testing.expectError(error.InvalidFrame, protocol.ProcessInfo.decode(alloc, &bad));
+    }
+
+    // A well-formed session_id + a len-0 name, but a `command` length prefix that
+    // OVER-claims -> error.InvalidFrame from readBytes' trailing-field bound check.
+    // (8 bytes session_id + u32 name_len=0 + u32 command_len=500 + 1 byte data.)
+    {
+        var bad: [17]u8 = undefined;
+        std.mem.writeInt(u64, bad[0..8], 9, .little);
+        std.mem.writeInt(u32, bad[8..12], 0, .little); // name len 0
+        std.mem.writeInt(u32, bad[12..16], 500, .little); // command claims 500
+        bad[16] = 'x';
+        try testing.expectError(error.InvalidFrame, protocol.ProcessInfo.decode(alloc, &bad));
+    }
+}
+
+test "host protocol minor bumped to 3 for process_info" {
+    try testing.expectEqual(@as(u16, 3), protocol.PROTOCOL_VERSION_MINOR);
+    try testing.expectEqual(@as(u16, 1), protocol.PROTOCOL_VERSION_MAJOR);
+    // process_info was appended at the END (after subscribe_render), so its tag
+    // integer is strictly greater — guards against a mid-enum insert silently
+    // renumbering the just-shipped frames.
+    try testing.expect(@intFromEnum(protocol.FrameType.process_info) >
+        @intFromEnum(protocol.FrameType.subscribe_render));
+    // Tighter pin: process_info is the LAST variant and immediately follows
+    // subscribe_render, so the gap is exactly 1.
+    try testing.expectEqual(
+        @intFromEnum(protocol.FrameType.subscribe_render) + 1,
+        @intFromEnum(protocol.FrameType.process_info),
     );
 }
 
@@ -2564,6 +2697,108 @@ test "host socket integration: attach, input, gridframe marker, reattach" {
     // Close the session, tearing it down.
     try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
     // Give the close a moment to process before server.deinit teardown.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host socket integration: process_info is SEEDED on reattach (minor 3, unchanged fg pid)" {
+    // Mirrors the at_prompt/pwd reattach-seed reasoning for process_info: the
+    // steady-state on_process_info push fires ONLY on a foreground-pid CHANGE, and
+    // prev_fg_pid is Session-lifetime state that survives detach/reattach. So a
+    // fresh GUI that reattaches to a session whose foreground pid is UNCHANGED (the
+    // headline reattach case) must be seeded by pushFullFrames, not by a tick that
+    // never fires. This proves that seed: detach, reattach, and assert a
+    // process_info frame arrives with a non-empty name resolved from the live
+    // foreground pid (the spawned shell, alive across reattach).
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hpi.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // Hello (defaults advertise PROTOCOL_VERSION_MINOR == 3, so the seed gate
+    // processInfoAllowed(negotiated_minor>=3) passes for this conn).
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.client" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+
+    // Attach (spawn) and learn the session_id.
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // Give the render loop a few ticks so the foreground pid is observed at least
+    // once on the FIRST conn (so prev_fg_pid is set and the next reattach hits the
+    // unchanged-pid path that the steady-state push would NOT cover).
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Detach (child stays alive; prev_fg_pid persists on the Session).
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+
+    // Reattach on a fresh conn. The foreground pid is unchanged (same shell), so
+    // ONLY the pushFullFrames seed can deliver process_info to this new conn.
+    const client2 = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client2);
+    try connectUnix(client2, sock_path);
+    setRecvTimeout(client2);
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+
+    try clientSend(alloc, client2, .hello, protocol.Hello{ .identity_bundle_id = "test.client2" });
+    {
+        const tag = (try pollNext(&rdr2, alloc, client2, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client2, .attach, protocol.Attach{ .session_id = session_id });
+
+    // Scan the reattach burst for the seeded process_info frame. Its name is
+    // resolved from the live foreground pid (the shell), so it must be non-empty.
+    {
+        var i: usize = 0;
+        var found_pi = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
+            if (tag != .process_info) continue;
+            var pi = try protocol.ProcessInfo.decode(alloc, payload.items);
+            defer pi.deinit(alloc);
+            try testing.expectEqual(session_id, pi.session_id);
+            try testing.expect(pi.name.len > 0);
+            found_pi = true;
+            break;
+        }
+        try testing.expect(found_pi);
+    }
+
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
     std.Thread.sleep(50 * std.time.ns_per_ms);
 }
 
@@ -7093,5 +7328,115 @@ test "host reattach: a PLAIN first scroll-up (no prior/redundant scroll) surface
     try testing.expect(try wireGridFrameContains(alloc, &rdr2, client2, &payload2, "L000"));
 
     try clientSend(alloc, client2, .close, protocol.Close{ .session_id = h.session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
+test "host process_info gating predicate (minor 3)" {
+    // The whole forward/backward-compat mechanism for the additive process_info
+    // frame: emit ONLY to peers that negotiated minor >= 3. An older GUI (minor
+    // <= 2) has no `process_info` tag in its FrameType enum and treats an unknown
+    // tag as a fatal decode error, so it must never be sent one.
+    try testing.expect(!Server.processInfoAllowed(0));
+    try testing.expect(!Server.processInfoAllowed(1));
+    try testing.expect(!Server.processInfoAllowed(2));
+    try testing.expect(Server.processInfoAllowed(3));
+    try testing.expect(Server.processInfoAllowed(4)); // forward minors still pass
+}
+
+test "host Hello stores negotiated_minor on the Conn (process_info gate input)" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hpi.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // --- conn A: advertises an OLD minor (2) -> gate must reject process_info ---
+    const client_old = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client_old);
+    try connectUnix(client_old, sock_path);
+    setRecvTimeout(client_old);
+    var rdr_old: ClientReader = .{};
+    defer rdr_old.deinit(alloc);
+
+    try clientSend(alloc, client_old, .hello, protocol.Hello{
+        .identity_bundle_id = "test.old",
+        .protocol_version_minor = 2,
+    });
+    {
+        const tag = (try pollNext(&rdr_old, alloc, client_old, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+
+    // Attach (spawn) so this conn becomes a subscriber we can inspect.
+    try clientSend(alloc, client_old, .attach, protocol.Attach{ .session_id = null });
+    var sid_old: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr_old, alloc, client_old, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                sid_old = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(sid_old != 0);
+    }
+
+    {
+        const conn = server.firstSubscriberForTest(sid_old).?;
+        try testing.expectEqual(@as(u16, 2), conn.negotiated_minor);
+        // The gate would suppress process_info for this old peer.
+        try testing.expect(!Server.processInfoAllowed(conn.negotiated_minor));
+    }
+
+    // --- conn B: advertises the CURRENT minor (default = 3) -> gate accepts ---
+    const client_new = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client_new);
+    try connectUnix(client_new, sock_path);
+    setRecvTimeout(client_new);
+    var rdr_new: ClientReader = .{};
+    defer rdr_new.deinit(alloc);
+
+    try clientSend(alloc, client_new, .hello, protocol.Hello{
+        .identity_bundle_id = "test.new",
+        // protocol_version_minor defaults to PROTOCOL_VERSION_MINOR (>= 3).
+    });
+    {
+        const tag = (try pollNext(&rdr_new, alloc, client_new, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client_new, .attach, protocol.Attach{ .session_id = null });
+    var sid_new: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr_new, alloc, client_new, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                sid_new = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(sid_new != 0);
+    }
+    {
+        const conn = server.firstSubscriberForTest(sid_new).?;
+        try testing.expect(conn.negotiated_minor >= 3);
+        try testing.expect(Server.processInfoAllowed(conn.negotiated_minor));
+    }
+
+    try clientSend(alloc, client_old, .close, protocol.Close{ .session_id = sid_old });
+    try clientSend(alloc, client_new, .close, protocol.Close{ .session_id = sid_new });
     std.Thread.sleep(50 * std.time.ns_per_ms);
 }

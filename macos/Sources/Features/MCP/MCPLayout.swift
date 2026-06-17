@@ -64,6 +64,18 @@ enum MCPLayout {
         /// Additionally forced `false` when the child has exited (so exited and
         /// atPrompt are never both true). The tool schemas disclose this.
         let atPrompt: Bool
+        /// fork: the focused FOREGROUND process name (e.g. "claude"), or nil if
+        /// unknown. Requires the pty-host `.client` backend AND a host new enough
+        /// to push it (protocol minor 3) — nil under `.exec` without a resolvable
+        /// pid, or after a GUI upgrade before the host has been restarted.
+        let processName: String?
+        /// fork: the focused foreground COMMAND line (e.g. "claude --resume"), or
+        /// nil if unknown. Same backend/host-gating semantics as `processName`.
+        let command: String?
+        /// fork: seconds since this surface's screen last changed; ~0 while a TUI
+        /// repaints/works, growing while it waits for input; nil when unknown /
+        /// unsupported backend. Coarse: a TUI that repaints on a timer never idles.
+        let idleSeconds: Double?
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
@@ -104,7 +116,10 @@ enum MCPLayout {
                     window: win, tab: tabIdx, tabTitle: tabTitle,
                     splitIndex: splitIdx, splitCount: leaves.count,
                     focused: view.focused, bell: view.bell,
-                    exited: exited, atPrompt: atPrompt))
+                    exited: exited, atPrompt: atPrompt,
+                    processName: view.foregroundProcessName,
+                    command: view.foregroundCommand,
+                    idleSeconds: view.idleSeconds))
             }
         }
         return rows
@@ -113,13 +128,19 @@ enum MCPLayout {
     /// PURE JSON shaping for the surfaces list (testable; no AppKit).
     static func surfacesJSONData(_ rows: [SurfaceRow]) -> [[String: Any]] {
         return rows.map {
-            [
+            var d: [String: Any] = [
                 "id": $0.id, "title": $0.title, "pwd": $0.pwd,
                 "window": $0.window, "tab": $0.tab, "tabTitle": $0.tabTitle,
                 "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
                 "focused": $0.focused, "bell": $0.bell,
                 "exited": $0.exited, "atPrompt": $0.atPrompt,
             ]
+            // fork: omit the new fields when unknown (null) — honest absence
+            // rather than empty strings / sentinel numbers.
+            if let n = $0.processName { d["processName"] = n }
+            if let c = $0.command { d["command"] = c }
+            if let idle = $0.idleSeconds { d["idleSeconds"] = idle }
+            return d
         }
     }
 

@@ -271,6 +271,44 @@ at_prompt: std.atomic.Value(bool) = .init(false),
 selection_text: std.ArrayListUnmanaged(u8) = .empty,
 selection_present: bool = false,
 
+// --- fork: host-resolved foreground process name + command (minor 3) ---
+//
+// Under .client the GUI mirror cannot read the foreground process locally (the
+// PTY lives in the host). The host resolves the foreground process name + full
+// command line from the foreground pid (libproc/sysctl) and pushes them in a
+// `process_info` frame; we cache them here so a synchronous Surface getter
+// (driven by the MCP `list_surfaces` poll) can read them with NO sync round-trip.
+// Both fields are guarded by `renderMutex()` (handleFrame holds it on write; the
+// Surface read accessors take the renderer mutex, which IS this lock under
+// .client) — same discipline as `selection_text` above. Variable-length strings,
+// so a guarded ArrayList rather than a lock-free atomic.
+fg_process_name: std.ArrayListUnmanaged(u8) = .empty,
+fg_command: std.ArrayListUnmanaged(u8) = .empty,
+
+/// fork: wall-clock ms (std.time.milliTimestamp) of the last APPLIED grid_frame
+/// (a real screen change). Stamped ONLY in the `.grid_frame` arm — NOT on
+/// pong/keepalive/mode/at_prompt/selection_text/etc., because the host suppresses
+/// redundant idle frames and cursor blink is local, so a grid_frame's arrival IS
+/// real activity. Read lock-free by `Surface.idleMillis` (the at_prompt pattern).
+/// 0 = no frame applied yet (=> idle unknown). Coarse signal; ms granularity is
+/// plenty for "seconds since the screen last changed". Wall-clock (not monotonic)
+/// can step on an NTP slew, so `idleMillis` clamps a negative delta to 0 (see
+/// there); a forward step transiently inflates idle — acceptable for a coarse
+/// signal, and self-corrects on the next grid_frame.
+///
+/// COARSENESS / one-time resets: the Client sees only "a grid_frame arrived",
+/// not the host's `changed` count, so a few NON-content frames also stamp here
+/// and momentarily reset idle to ~0: (1) the host's reattach/spawn-fresh SEED
+/// frame (`pushFullFrames`) on a GUI reattach, (2) a `force_push` on a mode/
+/// alternate-screen flip, and (3) a `cursor_changed`-only push (e.g. an arrow
+/// key moving the cursor with no cell change). All are one-time and self-
+/// correcting (idle resumes growing from the next steady tick), and the field
+/// is documented as a coarse "seconds since the screen last changed" signal, so
+/// this is accepted rather than gating on `changed>0` (which the Client cannot
+/// see — it would require a separate host signal). A GUI reattach therefore
+/// shows idle ~0 briefly even if the session was long idle.
+last_activity_ms: std.atomic.Value(i64) = .init(0),
+
 // --- last-known sizes so the first Resize after Attach is correct ---
 grid_size: renderer.GridSize = .{},
 screen_size: renderer.ScreenSize = .{ .width = 0, .height = 0 },
@@ -470,6 +508,8 @@ pub fn deinit(self: *Client) void {
     self.images.deinit(self.gpa);
     self.osc8_links.deinit(self.gpa);
     self.selection_text.deinit(self.gpa);
+    self.fg_process_name.deinit(self.gpa);
+    self.fg_command.deinit(self.gpa);
     self.reader.deinit(self.gpa);
     // `config.socket_path` is OWNED (duped from the caller's borrowed slice in
     // `init`); free it here. Freeing the empty-default dupe (`&.{}` -> a
@@ -1055,6 +1095,11 @@ pub fn handleFrame(
             var gf = try protocol.GridFrame.decode(alloc, payload);
             defer gf.deinit(alloc);
             try self.rehydrate(alloc, gf.snapshot);
+            // fork: stamp last-activity. A grid_frame is the only frame that
+            // represents a REAL screen change (the host suppresses redundant idle
+            // frames; cursor blink is local), so Surface.idleMillis measures the
+            // gap since this. Lock-free store; ms granularity is plenty for idle.
+            self.last_activity_ms.store(std.time.milliTimestamp(), .release);
             // Wake the GUI renderer so it draws this frame promptly (else it
             // only redraws on a slow fallback -> input lag). notify() is a quick
             // cross-thread signal; doing it under the render mutex is a tiny
@@ -1301,6 +1346,20 @@ pub fn handleFrame(
             self.at_prompt.store(ap.at_prompt, .release);
         },
 
+        .process_info => {
+            // fork (minor 3): the host's resolved foreground process name +
+            // command. Replace the cache wholesale. We hold the guard mutex here
+            // (handleFrame took it), the SAME lock the Surface read accessors take
+            // via the renderer mutex under .client, so a poll sees a consistent
+            // {name, command}. Not visible render state, so no renderer wakeup.
+            var pi = try protocol.ProcessInfo.decode(alloc, payload);
+            defer pi.deinit(alloc);
+            self.fg_process_name.clearRetainingCapacity();
+            try self.fg_process_name.appendSlice(self.gpa, pi.name);
+            self.fg_command.clearRetainingCapacity();
+            try self.fg_command.appendSlice(self.gpa, pi.command);
+        },
+
         // Everything else is either a request-direction frame (the GUI sends
         // these, never receives them) or a liveness frame we don't model yet.
         else => log.debug("client ignoring frame tag={}", .{tag}),
@@ -1329,6 +1388,38 @@ pub fn hasCachedSelection(self: *const Client) bool {
 pub fn copyCachedSelectionText(self: *const Client, alloc: Allocator) !?[:0]const u8 {
     if (!self.selection_present) return null;
     return try alloc.dupeZ(u8, self.selection_text.items);
+}
+
+/// fork: the host's resolved foreground process name (e.g. "claude"), or "" if
+/// none has been pushed yet (old host / pre-first-frame). Caller MUST hold the
+/// guard returned by `renderMutex()` (the Surface read site takes the renderer
+/// mutex, which IS that lock under .client) — same discipline as the selection
+/// accessors. Borrowed slice valid only while the lock is held.
+pub fn foregroundProcessName(self: *const Client) []const u8 {
+    return self.fg_process_name.items;
+}
+
+/// fork: the host's resolved foreground command line (e.g. "claude --resume"),
+/// or "" if none yet. Same lock discipline as `foregroundProcessName`.
+pub fn foregroundCommand(self: *const Client) []const u8 {
+    return self.fg_command.items;
+}
+
+/// fork: ms since the last applied grid_frame (a real screen change), or null if
+/// no frame has been applied yet. Lock-free (reads the `last_activity_ms`
+/// atomic). Drives `Surface.idleMillis`.
+pub fn idleMillis(self: *const Client) ?i64 {
+    const last = self.last_activity_ms.load(.acquire);
+    // 0 is overloaded: "no frame applied yet" AND the (epoch-only, 1970)
+    // milliTimestamp()==0 sentinel. The latter is purely theoretical — a frame
+    // would have to apply at the Unix epoch — so treating 0 as "unknown" is safe.
+    if (last == 0) return null;
+    // Wall-clock (milliTimestamp) is not monotonic: a backward NTP step makes
+    // `now - last` negative. Clamp to 0 (report "just active") rather than let a
+    // negative i64 reach the Swift idleSeconds getter, which maps ms<0 -> nil and
+    // would otherwise surface a clock blip as "idle unknown".
+    const delta = std.time.milliTimestamp() - last;
+    return if (delta < 0) 0 else delta;
 }
 
 /// Rehydrate a `terminal.Style` from a host-side `StylePod` projection — the
@@ -2086,4 +2177,133 @@ test "client: at_prompt frame updates cached cursorIsAtPrompt (Phase D)" {
         try client.handleFrame(alloc, .at_prompt, payload);
         try testing.expectEqual(v, client.cursorIsAtPrompt());
     }
+}
+
+// fork: decoding a process_info frame caches the host-resolved foreground name +
+// command so the Surface getters (driven by MCP list_surfaces) read them with no
+// round-trip; a second frame REPLACES (not appends) the cache; empty strings clear.
+test "client: process_info frame caches foreground name + command" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // The accessors borrow under renderMutex() (handleFrame writes under it); the
+    // sanctioned call pattern holds the guard across the read, so mirror that here
+    // even though the test is single-threaded. A tiny helper takes the lock,
+    // compares the borrowed slices, and drops it.
+    const Read = struct {
+        fn check(c: *Client, want_name: []const u8, want_cmd: []const u8) !void {
+            const m = c.renderMutex();
+            m.lock();
+            defer m.unlock();
+            try testing.expectEqualStrings(want_name, c.foregroundProcessName());
+            try testing.expectEqualStrings(want_cmd, c.foregroundCommand());
+        }
+    };
+
+    // Initially empty (no frame pushed yet).
+    try Read.check(&client, "", "");
+
+    {
+        const pi: protocol.ProcessInfo = .{
+            .session_id = 1,
+            .name = "claude",
+            .command = "claude --resume",
+        };
+        const payload = try pi.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .process_info, payload);
+    }
+    try Read.check(&client, "claude", "claude --resume");
+
+    // A second frame replaces (not appends) the cache.
+    {
+        const pi: protocol.ProcessInfo = .{
+            .session_id = 1,
+            .name = "nvim",
+            .command = "nvim x",
+        };
+        const payload = try pi.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .process_info, payload);
+    }
+    try Read.check(&client, "nvim", "nvim x");
+
+    // Empty strings clear the cache.
+    {
+        const pi: protocol.ProcessInfo = .{ .session_id = 1 };
+        const payload = try pi.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .process_info, payload);
+    }
+    try Read.check(&client, "", "");
+}
+
+// fork: idleMillis is null until a grid_frame is applied, and ONLY a grid_frame
+// stamps activity — an at_prompt frame (or any non-grid frame) must NOT reset it.
+test "client: idleMillis stamped by grid_frame only" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // No frame applied yet => unknown.
+    try testing.expectEqual(@as(?i64, null), client.idleMillis());
+
+    // A non-grid frame must NOT stamp activity (idle stays unknown).
+    {
+        const ap: protocol.AtPrompt = .{ .session_id = 1, .at_prompt = true };
+        const payload = try ap.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .at_prompt, payload);
+    }
+    try testing.expectEqual(@as(?i64, null), client.idleMillis());
+
+    // A REAL grid_frame MUST stamp activity. Build a tiny 1x1 terminal, project
+    // it into a Snapshot, wrap it in a GridFrame, encode, and feed the wire bytes
+    // through handleFrame so the `.grid_frame` arm's `last_activity_ms.store` is
+    // exercised in-unit (a future refactor that drops the store from that arm now
+    // fails here, not only in the host integration test). idle transitions
+    // null -> non-null.
+    {
+        var term = try terminal.Terminal.init(alloc, .{ .cols = 1, .rows = 1 });
+        defer term.deinit(alloc);
+        try term.printString("x");
+
+        var rs: render.RenderState = .empty;
+        defer rs.deinit(alloc);
+        try rs.update(alloc, &term);
+
+        var snap = try Snapshot.fromRenderState(alloc, &rs);
+        defer snap.deinit(alloc);
+
+        const gf: protocol.GridFrame = .{ .session_id = 1, .snapshot = snap };
+        const payload = try gf.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .grid_frame, payload);
+    }
+    const idle = client.idleMillis();
+    try testing.expect(idle != null);
+    try testing.expect(idle.? >= 0);
+}
+
+// fork: a backward wall-clock step (NTP slew) makes `now - last` negative;
+// idleMillis must clamp it to 0, not surface a negative i64 (which the Swift
+// idleSeconds getter would map to nil / "unknown").
+test "client: idleMillis clamps a backward clock step to 0" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var client = try Client.init(alloc, .{});
+    defer client.deinit();
+
+    // Stamp the activity time in the FUTURE relative to milliTimestamp(), so the
+    // delta `now - last` is negative — the backward-clock-step shape.
+    client.last_activity_ms.store(std.time.milliTimestamp() + 10_000, .release);
+    const idle = client.idleMillis();
+    try testing.expect(idle != null);
+    try testing.expectEqual(@as(i64, 0), idle.?);
 }
