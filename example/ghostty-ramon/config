@@ -68,6 +68,18 @@ keybind = ctrl+a>ctrl+shift+l=new_tab_command:~/git/ExampleOS/scripts/claude-acc
 project-directory = ~/git
 keybind = ctrl+a>f=toggle_project_selector
 
+# Agent Dashboard (fork-only): a floating panel of live mini-previews of every
+# split running a CLI agent (claude/codex) across ALL tabs/windows; bell-ringing
+# (needs-input) ones are highlighted, click a preview to jump to that split
+# (un-zooming if it's hidden under a split-zoom). Hidden tiles persist and
+# auto-unhide on bell. Requires pty-host (previews are mirror surfaces fed by the
+# host render-tee). `agent-dashboard` enables it + opens it on launch; `ctrl+a>d`
+# toggles it. `agent-dashboard-commands` = the foreground process names that mark
+# a split as an agent (default claude,codex).
+agent-dashboard = true
+agent-dashboard-commands = claude,codex
+keybind = ctrl+a>d=toggle_agent_dashboard
+
 # --- tmux pane/split bindings --------------------------------------------
 # %  / "   split right / split down   (shift required to type both symbols)
 # @ is also accepted as a personal alias for %.
