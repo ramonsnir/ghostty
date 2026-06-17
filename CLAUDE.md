@@ -380,6 +380,93 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `mcp-token` with `openssl rand -hex 24`, set that Mac's own Tailscale IP); if `local`
   is absent the fork still launches (web monitor + MCP just disabled / token-less).
 
+## PTY-host runs under a launchd LaunchAgent (deploy + new-machine setup)
+
+The `ghostty-host` process (the fork's emulation-on-host backend — see
+`.claude/docs/ptyhost.md`) is **not** launched by the GUI app or a login script. It
+runs as a **user LaunchAgent** `com.mitchellh.ghostty-ramon.host`
+(`~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist`, `KeepAlive=true` +
+`RunAtLoad=true`). The GUI merely connects to its socket
+(`pty-host = ~/.ghostty-ramon-host.sock` in the fork config). One long-lived host
+serves every GUI restart; a **host** restart still loses all live sessions
+(RAM-only). Locations: binary `~/.local/bin/ghostty-host`, socket
+`~/.ghostty-ramon-host.sock`, combined stdout+stderr log
+`~/Library/Logs/ghostty-ramon-host.log`.
+
+**Canonical plist — replicate verbatim on every laptop for environment consistency.**
+launchd requires ABSOLUTE paths (no `~`/env expansion in `ProgramArguments` or the
+socket path), so **replace `/Users/ramon` with that machine's home** (and keep
+`pty-host` in the config pointing at the same absolute socket path):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.mitchellh.ghostty-ramon.host</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ramon/.local/bin/ghostty-host</string>
+        <string>--listen=/Users/ramon/.ghostty-ramon-host.sock</string>
+    </array>
+    <!-- ReleaseFast host honors GHOSTTY_RESOURCES_DIR first; point it at the installed
+         bundle so the child shell gets TERM=xterm-ghostty + a valid TERMINFO. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GHOSTTY_RESOURCES_DIR</key>
+        <string>/Applications/Ghostty (ramon).app/Contents/Resources/ghostty</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>/Users/ramon/Library/Logs/ghostty-ramon-host.log</string>
+    <key>StandardErrorPath</key><string>/Users/ramon/Library/Logs/ghostty-ramon-host.log</string>
+</dict>
+</plist>
+```
+
+**New-machine setup (one-time):** (1) build the host
+(`zig build -Demit-macos-app=false -Doptimize=ReleaseFast`) and copy
+`zig-out/bin/ghostty-host` → `~/.local/bin/ghostty-host`; (2) write the plist above
+(fix the home path) to `~/Library/LaunchAgents/…`; (3)
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist`
+(RunAtLoad starts it); (4) ensure `pty-host = <that socket>` is in the fork config.
+
+### ⚠️ After redeploying the host binary, RELOAD the agent — NEVER just `kill` it
+launchd pins a code-signing launch requirement (**LWCR**) to the host binary's
+**code identity (cdhash)**. The fork builds `ghostty-host` **ad-hoc / linker-signed**,
+so **every rebuild has a new cdhash**. If you swap `~/.local/bin/ghostty-host` under a
+running job and then merely `kill` it, `KeepAlive` respawns the NEW binary under the
+OLD pinned requirement → launchd rejects it → it **exits 78 (`EX_CONFIG`) before it
+can even write a log line** → hot crash loop (`launchctl print …` shows
+`last exit code = 78`, `needs LWCR update`, and `runs` climbing) → nothing binds the
+socket → **the GUI shows empty screens**. The binary is fine — it runs perfectly
+standalone, even with the exact plist env; only launchd rejects it. (This cost a long
+debug session on 2026-06-17; the symptom "I killed the host and a new window didn't
+relaunch it / empty screens" is THIS.)
+
+**Correct deploy-then-restart of the host** (run from a NON-ramon terminal —
+Terminal.app or the official Ghostty — since it ends every session, including this
+Claude Code one if it lives under the host):
+```sh
+# 1) deploy without disturbing the running host: atomic rename keeps the live
+#    process's inode (a plain `cp` over it risks ETXTBSY / corrupting it).
+cp /path/to/repo/zig-out/bin/ghostty-host ~/.local/bin/ghostty-host.new
+chmod +x ~/.local/bin/ghostty-host.new
+mv -f ~/.local/bin/ghostty-host.new ~/.local/bin/ghostty-host
+# 2) RELOAD (bootout+bootstrap) so launchd re-derives the LWCR from the new binary.
+#    Do NOT `kill` — KeepAlive would crash-loop the new binary under the stale LWCR.
+launchctl bootout   gui/$(id -u)/com.mitchellh.ghostty-ramon.host
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist
+# 3) verify healthy: pid set, runs=1, "(never exited)", and "server listening" in the log.
+launchctl print gui/$(id -u)/com.mitchellh.ghostty-ramon.host | grep -iE 'pid =|last exit|runs ='
+```
+After the host comes back, **open fresh tabs/windows** — surfaces attached to the
+pre-restart sessions are dead (sessions are RAM-only). Note: `pkill`/`pgrep -f
+ghostty-host` do NOT match the host's cmdline on macOS; to find the pid use
+`ps ax -o pid,command | grep '[g]hostty-host --listen'`. A stale socket file is NOT a
+problem — the host unlinks-and-rebinds.
+
 ## Iteration lifecycle (macOS)
 
 **Always work on a git worktree, never directly on the main tree's `ramon-fork`
@@ -413,6 +500,13 @@ this macOS); `nushell` for `build.nu`.
    codesign --force --deep --sign - "$APP"
    ```
    Never touch `/Applications/Ghostty.app`.
+
+   **Host code changed too?** The installed app and `ghostty-host` are SEPARATE
+   deploys. If your change touched anything the host runs (`src/host/`,
+   `src/termio/`, emulation/core that links into the host), the new `ghostty-host`
+   must be deployed **and the LaunchAgent reloaded via bootout+bootstrap (never
+   `kill`)** — see *PTY-host runs under a launchd LaunchAgent* above. That restart
+   ends every live session; schedule it deliberately.
 7. **Commit** to `ramon-fork`.
 
 ## ⚠️ Safety
