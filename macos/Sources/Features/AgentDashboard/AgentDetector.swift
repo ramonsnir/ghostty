@@ -1,170 +1,106 @@
 import Foundation
-import Darwin
 
 /// (ramon fork / Agent Dashboard, Layer 3) The kind of CLI agent detected
-/// running inside a terminal surface's foreground process subtree.
+/// running as a terminal surface's foreground process.
 ///
-/// `rawValue` is the matched executable basename (e.g. `claude`, `codex`) so the
-/// UI can render the badge label directly and arbitrary configured commands
-/// work without a fixed enum.
+/// `command` is the matched executable basename (e.g. `claude`, `codex`) so the
+/// UI can render the badge label directly and arbitrary configured commands work
+/// without a fixed enum.
 struct AgentKind: Equatable, Hashable {
-    /// The matched executable basename (lowercased for display stability is NOT
-    /// applied — we keep the configured spelling).
     let command: String
-
-    init(_ command: String) {
-        self.command = command
-    }
+    init(_ command: String) { self.command = command }
 }
 
-/// A snapshot of the process tree, injectable so the pure matcher is testable
-/// without libproc. Keyed by pid; each entry carries the process's executable
-/// basename and its direct children's pids.
-typealias ProcSnapshot = [pid_t: (name: String, children: [pid_t])]
+/// Interpreters whose argv0 is the *runtime*, not the agent — so for these we
+/// also scan the command's remaining tokens for an agent basename. Catches a
+/// node-wrapped agent (e.g. Codex: foreground process is `node`, command is
+/// `node /…/bin/codex`). Native agents (Claude is a Mach-O binary) match
+/// directly on the foreground process name and never need this.
+private let agentInterpreters: Set<String> = [
+    "node", "deno", "bun", "python", "python3", "ruby",
+]
 
-/// Abstracts the libproc syscalls so `matchAgent` can be unit-tested with
-/// fixtures. The production implementation walks the live process table; tests
-/// inject a fixed `ProcSnapshot`.
-protocol ProcEnumerator {
-    /// Build a snapshot rooted at `rootPID` covering it and its descendants
-    /// (bounded). Implementations should cap depth/visited to stay cheap and
-    /// cycle-safe.
-    func snapshot(rootPID: pid_t) -> ProcSnapshot
-}
+private func basename(_ s: String) -> String { (s as NSString).lastPathComponent }
+private func basename(_ s: Substring) -> String { (String(s) as NSString).lastPathComponent }
 
-/// The depth-bounded, cycle-safe pure matcher. PURE: no syscalls, no globals —
-/// drives entirely off `snapshot`. Returns the first agent command found,
-/// searching the root then descending breadth-first up to `maxDepth`.
+/// The PURE agent matcher. Drives off the HOST-RESOLVED foreground process name +
+/// command line — NOT a local process-tree walk. This is the load-bearing fix for
+/// the pty-host backend: under `.client` the agent runs on `ghostty-host`, not the
+/// GUI, so the surface has no GUI-local pid (`ghostty_surface_foreground_pid` is 0)
+/// and a libproc walk finds nothing. The host instead resolves the foreground
+/// process name + command and pushes them (the same data the MCP `list_surfaces`
+/// poll uses); `SurfaceView.foregroundProcessName` / `.foregroundCommand` surface
+/// them and work under BOTH `.client` (host-resolved) and `.exec` (local).
 ///
-/// - direct hit: `rootPID`'s basename is in `commands`.
-/// - child hit: a descendant (e.g. shell -> node -> claude) matches.
-/// - depth is bounded by `maxDepth` (default 4); a `visited` set defends against
-///   cycles / self-referential trees and caps total work.
-func matchAgent(
-    rootPID: pid_t,
-    snapshot: ProcSnapshot,
-    commands: Set<String>,
-    maxDepth: Int = 4
-) -> AgentKind? {
+/// Match order (first hit wins, basename-compared):
+///   1. foreground process basename ∈ `commands` (e.g. `claude`, or a native
+///      `codex` binary);
+///   2. the command's argv0 basename ∈ `commands`;
+///   3. the foreground process (or argv0) is a known INTERPRETER and a later
+///      command token's basename ∈ `commands` (node-wrapped agents).
+///
+/// Returns nil when both inputs are unavailable (e.g. an old host that hasn't
+/// pushed process info yet) — the surface simply isn't classified as an agent.
+func matchAgent(processName: String?, command: String?, commands: Set<String>) -> AgentKind? {
     guard !commands.isEmpty else { return nil }
 
-    var visited = Set<pid_t>()
-    // Queue of (pid, depth). BFS so a shallower match wins deterministically.
-    var queue: [(pid: pid_t, depth: Int)] = [(rootPID, 0)]
-    var head = 0
+    // 1) foreground process basename.
+    if let n = processName, !n.isEmpty {
+        let b = basename(n)
+        if commands.contains(b) { return AgentKind(b) }
+    }
 
-    while head < queue.count {
-        let (pid, depth) = queue[head]
-        head += 1
+    // Tokenize the command line (whitespace-split — adequate for our exe paths).
+    let tokens = (command ?? "").split(whereSeparator: { $0 == " " || $0 == "\t" })
 
-        if visited.contains(pid) { continue }
-        visited.insert(pid)
-        // Defensive cap on total nodes walked (huge/looping trees).
-        guard visited.count <= 4096 else { break }
+    // 2) argv0 basename.
+    if let first = tokens.first {
+        let b = basename(first)
+        if commands.contains(b) { return AgentKind(b) }
+    }
 
-        guard let entry = snapshot[pid] else { continue }
-
-        // basename test. `entry.name` is already a basename in fixtures; the
-        // libproc impl normalizes to a basename (preferring the exe path basename
-        // when proc_name is truncated at MAXCOMLEN) before storing it here.
-        let base = (entry.name as NSString).lastPathComponent
-        if commands.contains(base) {
-            return AgentKind(base)
-        }
-
-        if depth < maxDepth {
-            for child in entry.children where !visited.contains(child) {
-                queue.append((child, depth + 1))
-            }
+    // 3) interpreter-wrapped: the runtime is foreground/argv0; scan the rest. This
+    //    is gated on a known interpreter so a stray path arg (e.g. `vim notes/codex`)
+    //    does NOT false-match.
+    let procBase = processName.map(basename) ?? ""
+    let argv0Base = tokens.first.map(basename) ?? ""
+    if agentInterpreters.contains(procBase) || agentInterpreters.contains(argv0Base) {
+        for tok in tokens.dropFirst() {
+            let b = basename(tok)
+            if commands.contains(b) { return AgentKind(b) }
         }
     }
 
     return nil
 }
 
-/// Production libproc-backed enumerator. Reads the live process table via
-/// `proc_listchildren` / `proc_name` / `proc_pidpath`. Never called from tests
-/// (those inject `ProcSnapshot` directly through `matchAgent`).
-struct LibprocEnumerator: ProcEnumerator {
-    func snapshot(rootPID: pid_t, maxDepth: Int) -> ProcSnapshot {
-        var result: ProcSnapshot = [:]
-        var visited = Set<pid_t>()
-        var queue: [(pid: pid_t, depth: Int)] = [(rootPID, 0)]
-        var head = 0
-
-        while head < queue.count {
-            let (pid, depth) = queue[head]
-            head += 1
-            if visited.contains(pid) { continue }
-            visited.insert(pid)
-            guard visited.count <= 4096 else { break }
-
-            let name = Self.processBasename(pid)
-            let children: [pid_t] = depth < maxDepth ? Self.children(of: pid) : []
-            result[pid] = (name: name, children: children)
-            for c in children where !visited.contains(c) {
-                queue.append((c, depth + 1))
-            }
-        }
-        return result
-    }
-
-    func snapshot(rootPID: pid_t) -> ProcSnapshot {
-        snapshot(rootPID: rootPID, maxDepth: 4)
-    }
-
-    /// Prefer the exe path basename (full, not truncated) over proc_name (capped
-    /// at MAXCOMLEN). Falls back to proc_name, then "".
-    private static func processBasename(_ pid: pid_t) -> String {
-        var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let pathLen = proc_pidpath(pid, &pathBuf, UInt32(MAXPATHLEN))
-        if pathLen > 0 {
-            let path = String(cString: pathBuf)
-            if !path.isEmpty {
-                return (path as NSString).lastPathComponent
-            }
-        }
-
-        var nameBuf = [CChar](repeating: 0, count: 2 * Int(MAXCOMLEN) + 1)
-        let nameLen = proc_name(pid, &nameBuf, UInt32(nameBuf.count))
-        if nameLen > 0 {
-            return String(cString: nameBuf)
-        }
-        return ""
-    }
-
-    private static func children(of pid: pid_t) -> [pid_t] {
-        // `proc_listchildpids` (like the other `proc_list*` calls) takes a buffer
-        // size in BYTES and returns the number of BYTES written (NOT a pid count);
-        // its sizing call (null buffer) returns the needed byte count. We size the
-        // buffer in pids from that byte count (with a little slack for races where
-        // a child is forked between the two calls), then convert the returned byte
-        // count back to a pid count. Every length is clamped to the buffer capacity
-        // so the slice is memory-safe regardless of how the OS interprets the call.
-        let pidSize = MemoryLayout<pid_t>.size
-        let neededBytes = proc_listchildpids(pid, nil, 0)
-        guard neededBytes > 0 else { return [] }
-        // Convert bytes -> pid capacity, add a few slots of slack, and cap.
-        let cap = min(Int(neededBytes) / pidSize + 8, 4096)
-        guard cap > 0 else { return [] }
-        var buf = [pid_t](repeating: 0, count: cap)
-        let gotBytes = proc_listchildpids(pid, &buf, Int32(cap * pidSize))
-        guard gotBytes > 0 else { return [] }
-        let count = min(Int(gotBytes) / pidSize, cap)
-        return Array(buf[0..<count]).filter { $0 > 0 }
-    }
-}
-
 /// (ramon fork / Agent Dashboard, Layer 3) The off-main detection poller. Polls
-/// every ~2s on a dedicated `.utility` queue, walking each surface's foreground
-/// process subtree behind a `ProcEnumerator`. Reads the surface snapshot on main
-/// (value types only) via an injected provider; publishes `[UUID: AgentKind]`
-/// back on main through `onResults`. Paused while the panel is hidden.
+/// every ~2s on a dedicated `.utility` queue. Reads a per-surface snapshot of the
+/// HOST-RESOLVED foreground process name + command on MAIN (value types only) via
+/// an injected provider; publishes `[UUID: AgentKind]` back on main through
+/// `onResults`. Paused while the panel is hidden.
 final class AgentDetector {
+    /// One surface's value-type detection inputs (host-resolved; pty-host-safe).
+    struct SurfaceProc: Equatable {
+        let uuid: UUID
+        let processName: String?
+        let command: String?
+        init(uuid: UUID, processName: String?, command: String?) {
+            self.uuid = uuid
+            self.processName = processName
+            self.command = command
+        }
+    }
+
+    /// Cache key: re-match only when the resolved name OR command changes.
+    struct ProcKey: Equatable {
+        let processName: String?
+        let command: String?
+    }
+
     /// The configured command set (exe basenames). Read once at construction
     /// (relaunch to change, matching the WebMonitor stance).
     private let commands: Set<String>
-    private let enumerator: ProcEnumerator
     private let queue = DispatchQueue(label: "agent-dashboard.detector", qos: .utility)
     private let interval: TimeInterval
 
@@ -172,28 +108,24 @@ final class AgentDetector {
     var onResults: (([UUID: AgentKind]) -> Void)?
 
     private var timer: DispatchSourceTimer?
-    private var snapshotProvider: (() -> [(uuid: UUID, pid: pid_t)])?
+    private var snapshotProvider: (() -> [SurfaceProc])?
 
-    /// Per-UUID cache keyed by foregroundPID: skip re-walking a stable surface.
-    private var cache: [UUID: (pid: pid_t, kind: AgentKind?)] = [:]
+    /// Per-UUID cache keyed by (processName, command): skip re-matching a stable
+    /// surface; re-match when either changes.
+    private var cache: [UUID: (key: ProcKey, kind: AgentKind?)] = [:]
 
-    init(
-        commands: Set<String>,
-        enumerator: ProcEnumerator = LibprocEnumerator(),
-        interval: TimeInterval = 2.0
-    ) {
+    init(commands: Set<String>, interval: TimeInterval = 2.0) {
         self.commands = commands
-        self.enumerator = enumerator
         self.interval = interval
     }
 
     /// Begin polling. `snapshotProvider` is invoked on MAIN (the tick hops there
-    /// via `DispatchQueue.main.sync`); the walk runs off-main on `queue`.
+    /// via `DispatchQueue.main.sync`); matching runs off-main on `queue`.
     ///
     /// `snapshotProvider`/`timer`/`cache` are ALL confined to `queue` — `resume`
     /// and `pause` hop onto it before touching them, and `tick()` runs on it — so
     /// there is no cross-queue field race (no lock needed).
-    func resume(snapshotProvider: @escaping () -> [(uuid: UUID, pid: pid_t)]) {
+    func resume(snapshotProvider: @escaping () -> [SurfaceProc]) {
         queue.async { [weak self] in
             guard let self else { return }
             self.snapshotProvider = snapshotProvider
@@ -221,8 +153,7 @@ final class AgentDetector {
         let (results, nextCache) = AgentDetector.resolve(
             snapshot: snapshot,
             cache: cache,
-            commands: commands,
-            enumerator: enumerator
+            commands: commands
         )
         cache = nextCache
 
@@ -230,28 +161,25 @@ final class AgentDetector {
     }
 
     /// PURE per-tick resolution, factored out of `tick()` so the cache behavior
-    /// (skip-walk on unchanged pid, re-walk on pid change, drop vanished ids) is
-    /// unit-testable with an injected enumerator + fixed snapshot. Returns the
-    /// published results and the next cache. No syscalls of its own — all process
-    /// walks go through `enumerator`.
+    /// (skip-match on unchanged name/command, re-match on change, drop vanished
+    /// ids) is unit-testable with a fixed snapshot. No syscalls.
     static func resolve(
-        snapshot: [(uuid: UUID, pid: pid_t)],
-        cache: [UUID: (pid: pid_t, kind: AgentKind?)],
-        commands: Set<String>,
-        enumerator: ProcEnumerator
-    ) -> (results: [UUID: AgentKind], cache: [UUID: (pid: pid_t, kind: AgentKind?)]) {
+        snapshot: [SurfaceProc],
+        cache: [UUID: (key: ProcKey, kind: AgentKind?)],
+        commands: Set<String>
+    ) -> (results: [UUID: AgentKind], cache: [UUID: (key: ProcKey, kind: AgentKind?)]) {
         var results: [UUID: AgentKind] = [:]
-        var nextCache: [UUID: (pid: pid_t, kind: AgentKind?)] = [:]
-        for (uuid, pid) in snapshot {
-            if let cached = cache[uuid], cached.pid == pid {
-                nextCache[uuid] = cached
-                if let kind = cached.kind { results[uuid] = kind }
+        var nextCache: [UUID: (key: ProcKey, kind: AgentKind?)] = [:]
+        for s in snapshot {
+            let key = ProcKey(processName: s.processName, command: s.command)
+            if let cached = cache[s.uuid], cached.key == key {
+                nextCache[s.uuid] = cached
+                if let kind = cached.kind { results[s.uuid] = kind }
                 continue
             }
-            let procSnapshot = enumerator.snapshot(rootPID: pid)
-            let kind = matchAgent(rootPID: pid, snapshot: procSnapshot, commands: commands)
-            nextCache[uuid] = (pid, kind)
-            if let kind { results[uuid] = kind }
+            let kind = matchAgent(processName: s.processName, command: s.command, commands: commands)
+            nextCache[s.uuid] = (key, kind)
+            if let kind { results[s.uuid] = kind }
         }
         return (results, nextCache)
     }

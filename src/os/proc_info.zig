@@ -22,12 +22,89 @@ const KERN_PROCARGS2: c_int = 49;
 /// libSystem (already linked for the host/lib — no `linkSystemLibrary` needed).
 extern "c" fn proc_name(pid: c_int, buffer: ?*anyopaque, buffersize: u32) c_int;
 
+/// libproc `proc_listchildpids`: writes the pids of `ppid`'s DIRECT children into
+/// `buffer`, returns the number of BYTES written (sizing call when buffer==null
+/// returns the needed byte count); <= 0 on failure. libSystem (already linked).
+extern "c" fn proc_listchildpids(ppid: c_int, buffer: ?*anyopaque, buffersize: c_int) c_int;
+
 /// Resolved foreground process info. Both slices are owned by the allocator
 /// passed to `resolve` (the caller frees them).
 pub const ProcInfo = struct {
     name: []const u8,
     command: []const u8,
 };
+
+/// Launcher/shell/interpreter process names. The foreground pid (the
+/// process-group LEADER from `tcgetpgrp`) is, for a WRAPPED launch, one of these
+/// — and the program the user is actually interacting with is a descendant:
+/// `bash …/claude-pool` spawns `claude`; `env`->`node`->`codex`. We descend
+/// through launchers to the first NON-launcher process (the agent). basename-
+/// compared and PURE, so it is unit-testable. Conservative: only well-known
+/// runtimes/shells are listed, so we never descend past (or into) a real program.
+pub fn isLauncher(name: []const u8) bool {
+    const launchers = [_][]const u8{
+        "sh",   "bash", "zsh",     "dash", "fish", "ksh", "tcsh",
+        "env",  "login", "node",   "deno", "bun",
+        "python", "python3", "ruby", "npx", "npm",
+    };
+    const base = std.fs.path.basename(name);
+    for (launchers) |l| {
+        if (std.mem.eql(u8, base, l)) return true;
+    }
+    return false;
+}
+
+/// Walk from `pid` DOWN through launcher processes to the first non-launcher
+/// descendant — the program the user is interacting with. Descends only on an
+/// UNAMBIGUOUS child (exactly one child, or a single non-launcher child when a
+/// wrapper also spawned a transient shell); a genuine branch stops cleanly.
+/// STOPS at the first non-launcher and never descends into ITS children, so it
+/// never overshoots into helpers the agent itself spawns. Bounded depth. Returns
+/// `pid` unchanged when it is already a real program (the common direct case).
+/// Darwin-only (libproc); the non-Darwin `resolve` stub never calls it.
+fn descendToProgram(pid: c_int) c_int {
+    var cur = pid;
+    var depth: usize = 0;
+    while (depth < 16) : (depth += 1) {
+        var nbuf: [256]u8 = undefined;
+        const n = proc_name(cur, &nbuf, nbuf.len);
+        if (n <= 0) return cur; // can't name it -> resolve what we have
+        if (!isLauncher(nbuf[0..@intCast(n)])) return cur; // first real program
+
+        const next = singleChildForDescent(cur) orelse return cur;
+        if (next <= 0 or next == cur) return cur; // paranoia: no self/invalid loop
+        cur = next;
+    }
+    return cur;
+}
+
+/// The child pid to descend into, or null to stop. Exactly one child -> it;
+/// multiple children -> the SOLE non-launcher child if there is exactly one (a
+/// wrapper that also spawned a transient shell), else null (an ambiguous branch
+/// we won't guess through). Zero children / failure -> null.
+fn singleChildForDescent(pid: c_int) ?c_int {
+    var buf: [256]c_int = undefined;
+    const bufsize_bytes: c_int = @intCast(buf.len * @sizeOf(c_int));
+    const got = proc_listchildpids(pid, &buf, bufsize_bytes);
+    if (got <= 0) return null;
+    const count = @min(@as(usize, @intCast(got)) / @sizeOf(c_int), buf.len);
+    if (count == 0) return null;
+    const kids = buf[0..count];
+    if (count == 1) return kids[0];
+
+    var pick: ?c_int = null;
+    for (kids) |k| {
+        if (k <= 0) continue;
+        var nbuf: [256]u8 = undefined;
+        const n = proc_name(k, &nbuf, nbuf.len);
+        const launcher = n > 0 and isLauncher(nbuf[0..@intCast(n)]);
+        if (!launcher) {
+            if (pick != null) return null; // >1 non-launcher child: ambiguous
+            pick = k;
+        }
+    }
+    return pick;
+}
 
 /// Resolve `pid` -> `{name, command}`. Both slices are owned by `alloc` (caller
 /// frees). Returns null on ANY failure (missing process, syscall error, corrupt
@@ -46,7 +123,13 @@ pub fn resolve(alloc: Allocator, pid: u64) ?ProcInfo {
     // idiomatic `if (comptime <off-target>) return null;` form, cf. kernel_info.zig).
     if (comptime !builtin.os.tag.isDarwin()) return null;
 
-    const pid_c: c_int = std.math.cast(c_int, pid) orelse return null;
+    const pid_root: c_int = std.math.cast(c_int, pid) orelse return null;
+    // The foreground pid (`tcgetpgrp`) is the process-group LEADER, which for a
+    // wrapped launch is a shell/interpreter (`bash …/claude-pool`, `env node …`);
+    // descend through launchers to the actual program the user runs (e.g.
+    // `claude`, `codex`) so the resolved name/command identify the agent, not the
+    // wrapper. Returns pid_root unchanged for a direct (non-wrapped) program.
+    const pid_c: c_int = descendToProgram(pid_root);
 
     // --- command line via sysctl(KERN_PROCARGS2) ---
     // Do ALL the fallible sysctl work FIRST, before allocating any caller-owned
@@ -214,4 +297,26 @@ test "proc_info parseProcArgs2 buffer shorter than argc returns empty" {
     const cmd = try parseProcArgs2(alloc, &tiny);
     defer alloc.free(cmd);
     try std.testing.expectEqual(@as(usize, 0), cmd.len);
+}
+
+test "proc_info isLauncher recognizes shells/interpreters, not real programs" {
+    // Shells + interpreters/wrappers are launchers (we descend through them).
+    try std.testing.expect(isLauncher("bash"));
+    try std.testing.expect(isLauncher("zsh"));
+    try std.testing.expect(isLauncher("sh"));
+    try std.testing.expect(isLauncher("env"));
+    try std.testing.expect(isLauncher("node"));
+    try std.testing.expect(isLauncher("python3"));
+    // Path-qualified names are basenamed.
+    try std.testing.expect(isLauncher("/bin/bash"));
+    try std.testing.expect(isLauncher("/usr/bin/env"));
+    // The agents themselves are NOT launchers -> descent STOPS at them.
+    try std.testing.expect(!isLauncher("claude"));
+    try std.testing.expect(!isLauncher("codex"));
+    try std.testing.expect(!isLauncher("/Users/x/.local/bin/claude"));
+    // A wrapper SCRIPT named claude-pool is not itself a launcher binary (it is
+    // `bash` that runs it); the basename must not partial-match a launcher.
+    try std.testing.expect(!isLauncher("claude-pool"));
+    try std.testing.expect(!isLauncher("vim"));
+    try std.testing.expect(!isLauncher(""));
 }
