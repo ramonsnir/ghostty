@@ -29,3 +29,6 @@ glad.zip
 
 vgcore.*
 
+# fork: per-task build worktrees live here (see CLAUDE.md "Iteration lifecycle")
+.claude/worktrees/
+

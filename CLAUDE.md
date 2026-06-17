@@ -470,9 +470,13 @@ problem — the host unlinks-and-rebinds.
 ## Iteration lifecycle (macOS)
 
 **Always work on a git worktree, never directly on the main tree's `ramon-fork`
-checkout.** Create a worktree for each task (`git worktree add ../ghostty-<task>
--b <branch> ramon-fork`), do all editing/testing there, and keep the main tree's
-`ramon-fork` checkout clean. **Release builds must ALWAYS come from `ramon-fork`
+checkout.** Create a worktree for each task **inside `.claude/worktrees/`**
+(`git worktree add .claude/worktrees/<task> -b <branch> ramon-fork`) — **NOT in
+the repo's parent dir (`../ghostty-<task>`), which clutters `~/git/`**. The
+`.claude/worktrees/` dir is gitignored, so the nested checkout (and its build
+artifacts) never show up in the main tree's `git status`. Do all editing/testing
+there, keep the main tree's `ramon-fork` checkout clean, and remove the worktree
+when done (`git worktree remove .claude/worktrees/<task>`). **Release builds must ALWAYS come from `ramon-fork`
 on the main tree** — never build a Release (the installed `/Applications/Ghostty
 (ramon).app`) from a worktree branch. So when the work is done: **merge the
 worktree branch into `ramon-fork`, switch the main tree to `ramon-fork`, and
