@@ -894,9 +894,41 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// (ramon fork / Agent Dashboard, Layer 3) If `target` is hidden because
+    /// this tab is split-zoomed to a DIFFERENT split, clear the zoom so the
+    /// split re-mounts and can take focus. Ratio-preserving: rebuilds the tree
+    /// from the SAME `root`, only dropping `zoomed` (exactly the reset
+    /// `ghosttyDidToggleSplitZoom` performs). No-op when the tab isn't zoomed or
+    /// `target` is itself in the zoomed subtree. MUST be on main. Lifted from
+    /// WebMonitor's `revealIfZoomedAway` so the dashboard's click-to-jump lands
+    /// focus on a previously zoomed-away split.
+    func unzoomIfHidden(_ target: Ghostty.SurfaceView) {
+        if let next = Self.unzoomedIfHidden(surfaceTree, target: target) {
+            surfaceTree = next
+        }
+    }
+
+    /// PURE decision behind `unzoomIfHidden`, factored out so the gate test
+    /// exercises the SHIPPED logic (not a clone). Returns the rebuilt tree when
+    /// `target` is hidden under a zoom to a different split (ratio-preserving:
+    /// same `root`, only `zoomed` cleared), or `nil` for a no-op (not zoomed, or
+    /// `target` is in the zoomed subtree).
+    static func unzoomedIfHidden<V>(
+        _ tree: SplitTree<V>,
+        target: V
+    ) -> SplitTree<V>? where V: NSView & Codable & Identifiable {
+        guard tree.zoomed != nil else { return nil }
+        guard !tree.zoomedLeaves().contains(where: { $0.id == target.id }) else { return nil }
+        return .init(root: tree.root, zoomed: nil)
+    }
+
     @objc private func ghosttyDidPresentTerminal(_ notification: Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(target) else { return }
+
+        // (ramon fork) Defensively reveal a zoomed-away target so focus lands.
+        // Idempotent; a no-op when the target isn't hidden under a zoom.
+        unzoomIfHidden(target)
 
         // Bring the window to front and focus the surface.
         window?.makeKeyAndOrderFront(nil)

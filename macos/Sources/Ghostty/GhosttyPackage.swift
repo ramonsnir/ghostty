@@ -409,6 +409,11 @@ extension Ghostty.Notification {
     /// Present terminal. Bring the surface's window to focus without activating the app.
     static let ghosttyPresentTerminal = Notification.Name("com.mitchellh.ghostty.presentTerminal")
 
+    /// (ramon fork / Agent Dashboard, Layer 3) Toggle the app-global floating
+    /// Agent Dashboard panel. App-wide (no object payload); observed by the
+    /// AppDelegate, which owns the dashboard controller.
+    static let ghosttyToggleAgentDashboard = Notification.Name("com.mitchellh.ghostty.toggleAgentDashboard")
+
     /// Toggle fullscreen of current window
     static let ghosttyToggleFullscreen = Notification.Name("com.mitchellh.ghostty.toggleFullscreen")
     static let FullscreenModeKey = ghosttyToggleFullscreen.rawValue

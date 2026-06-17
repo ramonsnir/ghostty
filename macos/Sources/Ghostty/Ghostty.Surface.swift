@@ -107,6 +107,17 @@ extension Ghostty {
             return ttyName.isEmpty ? nil : ttyName
         }
 
+        /// (ramon fork / Agent Dashboard, Layer 3) The PTY-host session id of
+        /// this surface (0 when not backed by a `.client`/host session). The
+        /// Agent Dashboard reads this off the REAL surface and feeds it (as a
+        /// String) into a mirror `SurfaceConfiguration` to build a read-only
+        /// preview. Distinct from `SurfaceConfiguration.sessionID` (a `String?`
+        /// parsed back to u64 in `withCValue`).
+        @MainActor
+        var sessionID: UInt64 {
+            ghostty_surface_session_id(surface)
+        }
+
         /// Send a mouse button event to the terminal.
         ///
         /// This sends a complete mouse button event including the button state (press/release),

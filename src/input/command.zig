@@ -575,6 +575,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Open a project directory in a new tab.",
         }},
 
+        .toggle_agent_dashboard => comptime &.{.{
+            .action = .toggle_agent_dashboard,
+            .title = "Toggle Agent Dashboard",
+            .description = "Show or hide the floating dashboard of running CLI agents.",
+        }},
+
         .goto_last_surface => comptime &.{.{
             .action = .goto_last_surface,
             .title = "Go to Last Split",

@@ -820,6 +820,51 @@ extension Ghostty {
             _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
             return v
         }
+
+        // (ramon fork / Agent Dashboard, Layer 3) Master enable for the
+        // floating Agent Dashboard panel. Default false.
+        var agentDashboard: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-dashboard"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        // (ramon fork / Agent Dashboard, Layer 3) Executable basenames treated
+        // as CLI agents by the detector. The Zig field defaults empty; the
+        // user-facing default `claude,codex` is substituted here when unset.
+        var agentDashboardCommands: [String] {
+            guard let config = self.config else {
+                return Ghostty.Config.agentDashboardCommandsDefault
+            }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "agent-dashboard-commands"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else {
+                return Ghostty.Config.agentDashboardCommandsDefault
+            }
+            let parsed: [String]
+            if v.len > 0 {
+                let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+                parsed = buffer.compactMap { $0.map { String(cString: $0) } }
+            } else {
+                parsed = []
+            }
+            return Ghostty.Config.resolveAgentDashboardCommands(parsed)
+        }
+
+        /// The user-facing default agent command set, substituted when the config
+        /// key is unset/empty (the Zig field defaults EMPTY — default lives here).
+        static let agentDashboardCommandsDefault: [String] = ["claude", "codex"]
+
+        /// PURE default-substitution for `agent-dashboard-commands`, factored out
+        /// so the empty→default bridge (the ONLY logic connecting the config key
+        /// to the detector's command set) is unit-testable WITHOUT a live
+        /// `ghostty_config_t`. `parsed` is whatever the C string-list yielded
+        /// (empty when the key is unset); a non-empty user list passes verbatim.
+        static func resolveAgentDashboardCommands(_ parsed: [String]) -> [String] {
+            parsed.isEmpty ? agentDashboardCommandsDefault : parsed
+        }
     }
 }
 

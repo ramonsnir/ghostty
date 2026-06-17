@@ -2907,6 +2907,22 @@ keybind: Keybinds = .{},
 /// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
 @"project-directory": RepeatableString = .{},
 
+/// (ramon fork) Master enable for the floating Agent Dashboard panel (macOS).
+/// When true the panel is created at launch and shown per remembered
+/// visibility; when false the feature is dormant until the
+/// `toggle_agent_dashboard` action is invoked (which lazily creates it).
+/// Default false. Fork-only — keep it in `~/.config/ghostty-ramon/config` (an
+/// official Ghostty sharing `~/.config/ghostty/config` would error on it).
+@"agent-dashboard": bool = false,
+
+/// (ramon fork) Executable basenames the Agent Dashboard treats as CLI agents
+/// when scanning each surface's foreground process subtree. Repeatable;
+/// defaults to `claude,codex` (substituted by the macOS apprt when empty).
+/// Reuses the `project-directory` RepeatableString plumbing. Fork-only — keep
+/// it in `~/.config/ghostty-ramon/config` (an official Ghostty would error on
+/// it).
+@"agent-dashboard-commands": RepeatableString = .{},
+
 /// (ramon fork / Phase 2b) AF_UNIX socket path of a running `ghostty-host`
 /// (`zig-out/bin/ghostty-host --listen=<sockpath>`). When set, a new surface
 /// connects to that host and runs its terminal emulation ON THE HOST,
@@ -4063,6 +4079,54 @@ test "handle bom in config files" {
         try testing.expectEqual(
             2500,
             cfg.@"abnormal-command-exit-runtime",
+        );
+    }
+}
+
+test "agent-dashboard config" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Defaults
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try testing.expectEqual(false, cfg.@"agent-dashboard");
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"agent-dashboard-commands".list.items.len,
+        );
+    }
+
+    // Explicit values
+    {
+        const data =
+            "agent-dashboard = true\n" ++
+            "agent-dashboard-commands = claude\n" ++
+            "agent-dashboard-commands = codex\n";
+        var reader: std.Io.Reader = .fixed(data);
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.loadReader(
+            alloc,
+            &reader,
+            "/home/ghostty/.config/ghostty/config.ghostty",
+        );
+        try cfg.finalize();
+
+        try testing.expect(cfg._diagnostics.empty());
+        try testing.expectEqual(true, cfg.@"agent-dashboard");
+        try testing.expectEqual(
+            @as(usize, 2),
+            cfg.@"agent-dashboard-commands".list.items.len,
+        );
+        try testing.expectEqualStrings(
+            "claude",
+            cfg.@"agent-dashboard-commands".list.items[0],
+        );
+        try testing.expectEqualStrings(
+            "codex",
+            cfg.@"agent-dashboard-commands".list.items[1],
         );
     }
 }

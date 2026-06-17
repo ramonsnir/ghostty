@@ -6155,6 +6155,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .toggle_agent_dashboard => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_agent_dashboard,
+            {},
+        ),
+
         .goto_last_surface => return try self.rt_app.performAction(
             .{ .surface = self },
             .goto_last_surface,

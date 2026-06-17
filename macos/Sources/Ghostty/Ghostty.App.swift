@@ -88,8 +88,18 @@ extension Ghostty {
                 guard let self else { return }
                 self.focusHistoryUpdateScheduled = false
                 guard NSApp.isActive,
-                      let surface = NSApp.keyWindow?.firstResponder as? SurfaceView
+                      let keyWindow = NSApp.keyWindow,
+                      let surface = keyWindow.firstResponder as? SurfaceView
                 else { return }
+                // (ramon fork / Agent Dashboard, Layer 3) Never record a surface
+                // that lives inside the Agent Dashboard panel. Those are
+                // READ-ONLY *mirror* SurfaceViews belonging to no controller; if
+                // the floating panel became key with a mirror as its first
+                // responder, recording it would poison the two-deep
+                // goto_last_surface history with a surface no goto can ever land
+                // on (ghosttyDidPresentTerminal guards on surfaceTree.contains),
+                // making a later goto_last toggle to the wrong/stale split.
+                guard !(keyWindow is AgentDashboardPanel) else { return }
                 self.recordFocusedSurface(surface)
             }
         }
@@ -634,6 +644,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_PROJECT_SELECTOR:
                 toggleProjectSelector(app, target: target)
 
+            case GHOSTTY_ACTION_TOGGLE_AGENT_DASHBOARD:
+                toggleAgentDashboard(app, target: target)
+
             case GHOSTTY_ACTION_GOTO_LAST_SURFACE:
                 gotoLastSurface(app, target: target)
 
@@ -1174,6 +1187,21 @@ extension Ghostty {
             default:
                 assertionFailure()
             }
+        }
+
+        // (ramon fork / Agent Dashboard, Layer 3) Toggle the app-global
+        // floating dashboard panel. Unlike `toggleProjectSelector` (which
+        // attaches to a focused SURFACE and no-ops on an APP target), the
+        // dashboard is app-wide and carries no target payload, so we ignore the
+        // target tag entirely and ALWAYS post. The AppDelegate owns the
+        // controller and observes this notification.
+        private static func toggleAgentDashboard(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) {
+            NotificationCenter.default.post(
+                name: Notification.ghosttyToggleAgentDashboard,
+                object: nil
+            )
         }
 
         /// (ramon fork) Focus the previously focused surface, across any tab or

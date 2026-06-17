@@ -378,6 +378,9 @@ pub const Action = union(Key) {
     /// (ramon fork) Toggle the project selector palette for the target surface.
     toggle_project_selector,
 
+    /// (ramon fork) Toggle the app-global floating Agent Dashboard panel.
+    toggle_agent_dashboard,
+
     /// (ramon fork) Focus the previously focused surface, across any tab or
     /// window. Two-deep toggle.
     goto_last_surface,
@@ -458,6 +461,7 @@ pub const Action = union(Key) {
         pull_marked_split,
         swap_split,
         toggle_project_selector,
+        toggle_agent_dashboard,
         goto_last_surface,
 
         test "ghostty.h Action.Key" {

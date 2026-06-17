@@ -106,6 +106,11 @@ class AppDelegate: NSObject,
     /// at launch; changing mcp-listen/mcp-token needs a relaunch.
     private var mcpServer: MCPServer?
 
+    /// (ramon fork / Agent Dashboard, Layer 3) The app-global floating dashboard
+    /// controller. Created at launch when `agent-dashboard` is enabled, else
+    /// lazily on the first `toggle_agent_dashboard`.
+    private var agentDashboard: AgentDashboardController?
+
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
 
@@ -259,6 +264,15 @@ class AppDelegate: NSObject,
             self.mcpServer = server
         }
 
+        // (ramon fork / Agent Dashboard) When enabled in config, create the
+        // controller at launch and restore its remembered visibility. When
+        // disabled, leave it nil — the toggle action lazily creates it.
+        if ghostty.config.agentDashboard {
+            let controller = AgentDashboardController(ghostty: ghostty)
+            self.agentDashboard = controller
+            controller.restoreVisibility()
+        }
+
         // Start our update checker.
         updateController.startUpdater()
 
@@ -314,6 +328,11 @@ class AppDelegate: NSObject,
             self,
             selector: #selector(ghosttyNewTab(_:)),
             name: Ghostty.Notification.ghosttyNewTab,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttyToggleAgentDashboard(_:)),
+            name: Ghostty.Notification.ghosttyToggleAgentDashboard,
             object: nil)
 
         // Configure user notifications
@@ -454,12 +473,30 @@ class AppDelegate: NSObject,
         return terminate()
     }
 
+    /// (ramon fork / Agent Dashboard) Toggle the app-global dashboard panel.
+    /// Lazily creates the controller on first invocation when not enabled at
+    /// launch.
+    @objc private func ghosttyToggleAgentDashboard(_ notification: Notification) {
+        // Posted from the apprt action callback, which arrives on the main
+        // thread; the controller is @MainActor-isolated.
+        MainActor.assumeIsolated {
+            if agentDashboard == nil {
+                agentDashboard = AgentDashboardController(ghostty: ghostty)
+            }
+            agentDashboard?.toggle()
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         // (ramon fork) Stop the embedded web monitor if running.
         webMonitor?.stop()
 
         // (ramon fork) Stop the embedded MCP server if running.
         mcpServer?.stop()
+
+        // (ramon fork) Tear down the agent dashboard (persist visibility, stop
+        // the detector).
+        agentDashboard?.teardown()
 
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be

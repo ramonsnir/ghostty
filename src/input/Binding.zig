@@ -916,6 +916,11 @@ pub const Action = union(enum) {
     /// base) that opens the chosen one in a new tab. Payload-less.
     toggle_project_selector,
 
+    /// (ramon fork) Toggle the floating Agent Dashboard panel (macOS): a
+    /// glanceable grid of live previews of the running CLI agents. App-global,
+    /// payload-less.
+    toggle_agent_dashboard,
+
     /// (ramon fork) Focus the previously focused surface, across any tab or
     /// window (tmux `last-pane`, global). Two-deep toggle: pressing again
     /// returns to where you were. Payload-less.
@@ -1572,6 +1577,7 @@ pub const Action = union(enum) {
             .toggle_mouse_reporting,
             .toggle_command_palette,
             .toggle_project_selector,
+            .toggle_agent_dashboard,
             .goto_last_surface,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
@@ -3714,6 +3720,21 @@ test "Binding toggle_project_selector" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("toggle_project_selector", buf.written());
+}
+
+test "Binding toggle_agent_dashboard" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=toggle_agent_dashboard");
+    try testing.expect(binding.action == .toggle_agent_dashboard);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("toggle_agent_dashboard", buf.written());
 }
 
 test "Binding goto_last_surface" {

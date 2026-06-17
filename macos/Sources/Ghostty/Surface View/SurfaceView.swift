@@ -660,6 +660,15 @@ extension Ghostty {
         /// persisted across restarts via SurfaceView's Codable `sessionID` key.
         var sessionID: String?
 
+        /// (ramon fork / Agent Dashboard, Layer 3) When true and the `.client`
+        /// termio backend is in use together with a non-zero `sessionID`, the
+        /// surface becomes a READ-ONLY render mirror of the host session
+        /// (Layer 2's `.mirror` role): it consumes `grid_frame`/`mode_frame`
+        /// and suppresses all session-mutating outbound frames. Zero-init /
+        /// default `false` keeps the normal attach/spawn behavior, so this is
+        /// only ever set by the Agent Dashboard's preview tiles.
+        var mirror: Bool = false
+
         /// Wait after the command
         var waitAfterCommand: Bool = false
 
@@ -731,6 +740,10 @@ extension Ghostty {
             // String for Codable simplicity; parse it back to the u64 the C
             // ABI + host expect (unparseable / nil -> 0 = fresh).
             config.session_id = sessionID.flatMap { UInt64($0) } ?? 0
+
+            // (ramon fork / Agent Dashboard) Read-only render mirror of a host
+            // session. Default false => byte-identical attach/spawn behavior.
+            config.mirror = mirror
 
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in
