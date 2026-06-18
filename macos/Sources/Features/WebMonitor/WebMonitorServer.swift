@@ -1609,7 +1609,10 @@ final class WebMonitorServer {
     </head>
     <body>
     <header>
-      <b>Ghostty</b> Web Monitor
+      <!-- No "Ghostty Web Monitor" branding here: the header is tight on a phone,
+           so the space goes to the session title (#cur), which shrinks+ellipsizes
+           rather than wrapping to a 2nd line. The browser tab <title> still names
+           the page. -->
       <button id="back" style="display:none">&larr; Sessions</button>
       <span id="cur"></span>
       <!-- Push-on-bell toggle. ARM when you step away from the laptop, MUTE when
