@@ -353,13 +353,58 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `src/os/proc_info.zig` (`zig build test -Dtest-filter=host` / `-Dtest-filter=proc_info`),
     plus the `process_info`/`idleMillis` Client tests in `src/termio/Client.zig`.
 
+- **Agent Dashboard** (fork-only, macOS, OFF by default) — a floating,
+  foreground-locked `NSPanel` showing a live, natively-rendered mini-preview of every
+  terminal split running a CLI agent (Claude Code / Codex) across ALL tabs and windows;
+  click a tile to jump to that split (raise window + select tab + un-zoom if hidden),
+  Hide ✕ to declutter, bell-ring auto-unhides. **See `AGENT-DASHBOARD.md` for the
+  user-facing config/usage.** The load-bearing facts for an agent touching this code:
+  - **Action + config (fork-only, default off):** the payload-less keybind action
+    `toggle_agent_dashboard` (also a command-palette entry "Toggle Agent Dashboard");
+    `agent-dashboard` (master enable) + `agent-dashboard-commands` (exe names that count
+    as an agent; comma-split OR repeated, default `claude,codex`) — both reuse
+    `RepeatableString`. Keep all three in `~/.config/ghostty-ramon/config`. Read at
+    launch (relaunch to change).
+  - **Live previews need `pty-host`.** Each tile mounts a read-only **mirror**
+    `SurfaceView` (`mirror = true` + the host session id) and lets the existing
+    `SurfaceWrapper` render it natively (full color, viewport-only — right for a
+    thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
+    Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
+  - **Detection is HOST-GATED on a NEW protocol frame.** Under `.client` the GUI mirror
+    can't read the foreground process, so the host pushes the raw foreground pid via an
+    additive `foreground_pid` frame (**protocol minor bumped 3→4**); the GUI walks that
+    pid's process subtree locally with libproc and path-component-matches the configured
+    commands. **Detection silently finds nothing until `ghostty-host` is on a minor-4
+    build** — a GUI upgrade alone is not enough (this was the multi-bug detection-failure
+    chase: stale xcframework left the app on minor 3, plus `proc_listchildpids` is
+    unreliable on macOS — use `proc_listpids`+`proc_pidinfo` parent links — plus a
+    versioned exe basename isn't the command name, hence path-component match).
+  - **Threading / cost:** the detector is a ~2s off-main `.utility` poll (pure
+    `matchAgent`/`resolve` behind an injectable `ProcEnumerator`); paused while the panel
+    is hidden/occluded, and mirror renderers pause via `ghostty_surface_set_occlusion` —
+    a hidden panel costs ~nothing. The model is `@MainActor`; the detector hops to main
+    only to snapshot value types `(uuid, foregroundPID)` and to publish results. Hide set
+    persists in the per-bundle-id UserDefaults; a ringing agent is never left hidden.
+    GUI-only changes relaunch the GUI; the `foreground_pid` frame is a HOST change (host
+    rebuild + LaunchAgent reload, see below). Wiring: core — `src/config/Config.zig`
+    (`agent-dashboard`/`-commands`), `src/input/{Binding,command}.zig` +
+    `src/apprt/action.zig` (action), the minor-4 frame in
+    `src/host/{protocol,Server,Session}.zig` + `src/termio/Client.zig` +
+    `ghostty_surface_foreground_pid` (`include/ghostty.h`, `src/apprt/embedded.zig`,
+    `src/Surface.zig`); macOS — `macos/Sources/Features/AgentDashboard/*` (Controller +
+    Model + Panel + View + PreviewTile + Detector), `AppDelegate.swift`,
+    `Ghostty.Config.swift`, `Ghostty.Surface.swift` (`foregroundPID`), `project.pbxproj`
+    (iOS exclusion). Tests: `macos/Tests/AgentDashboard/AgentDashboardTests.swift`; Zig
+    `agent-dashboard config` + `Binding toggle_agent_dashboard` + the minor-4/
+    `ForegroundPid` round-trip in `src/host/test.zig` + the `foreground_pid` Client decode.
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
 - **Single-instance guard** in `AppDelegate.applicationWillFinishLaunching`: if another process with the same bundle id is already running from a different bundle URL, that one is activated and this process exits. Stops two copies of the same fork identity from racing each other (e.g. dock-attention bouncing one while you click the other).
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`
@@ -490,6 +535,7 @@ this macOS); `nushell` for `build.nu`.
 1. Edit code (Zig core in `src/`, macOS in `macos/Sources/`).
 2. **Zig tests**: `zig build test -Demit-macos-app=false -Demit-xcframework=false -Dtest-filter=<name>`.
 3. **Rebuild lib** (required after any Zig change before the app build): `zig build -Demit-macos-app=false -Doptimize=ReleaseFast`.
+   - **⚠️ Rebuild the lib WITH the xcframework — never pass `-Demit-xcframework=false` here.** The app links the **xcframework**, not the bare lib, so if you skip emitting it (as you correctly do for the *test* command in step 2) the app silently links the **stale** xcframework and your Zig change is invisible to the GUI, even though `zig build` succeeded and the Zig/host tests pass. The default emits it; just `zig build -Demit-macos-app=false -Doptimize=ReleaseFast`. **Symptom of the trap:** host + Zig tests green, the `ghostty-host` binary behaves correctly, but the GUI acts as if the lib change isn't there — e.g. after bumping the host protocol minor, the app kept advertising the OLD minor, so the host withheld the new frame and a whole feature silently no-op'd (this cost most of the Agent Dashboard detection-debug session). Same class of mistake as the LWCR/host-reload gotcha below: the build "succeeds" but ships a stale artifact. After a protocol/lib change, also `rm -rf macos/build/ReleaseLocal` before the app build so Xcode can't reuse a stale embedded framework.
 4. **Swift tests**: `macos/build.nu --action test` (or `xcodebuild … -only-testing:GhosttyTests/SplitTreeTests test`).
 5. **Build the app**: `macos/build.nu --configuration ReleaseLocal --action build` → `macos/build/ReleaseLocal/Ghostty.app` (optimized, no debug banner). This produces "Ghostty (ramon-local)" with bundle id `com.mitchellh.ghostty-ramon.local` — runs side-by-side with the installed Release identity.
 6. **Install/update the fork** over `/Applications/Ghostty (ramon).app`. Verified to be safe to run while the installed Release fork is still hosting Claude Code's shell — `ditto` and `PlistBuddy` don't disturb the running mmap'd binary, and `codesign` succeeds after stripping Apple's `com.apple.provenance` xattrs. The new binary only takes effect on the next launch, so the user still has to quit + relaunch themselves.
