@@ -126,9 +126,13 @@ struct ConfigTests {
         #expect(config.resizeOverlayPosition == .center)
     }
 
-    @Test func macosIconDefaultsToOfficial() throws {
+    // Fork divergence: the ramon fork defaults `macos-icon` to `.chalkboard`
+    // (see src/config/Config.zig and CLAUDE.md) so each fork identity is
+    // distinct at a glance; macOS swaps it per build at runtime. Upstream
+    // defaults to `.official`.
+    @Test func macosIconDefaultsToChalkboard() throws {
         let config = try TemporaryConfig("")
-        #expect(config.macosIcon == .official)
+        #expect(config.macosIcon == .chalkboard)
     }
 
     @Test func macosIconFrameDefaultsToAluminum() throws {
