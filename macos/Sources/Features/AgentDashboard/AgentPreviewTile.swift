@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// (ramon fork / Agent Dashboard, Layer 3) One row: a full-width card with a
 /// compact header (badge · title · bell dot · hide ✕), a live (or metadata-only)
@@ -163,14 +164,18 @@ struct AgentPreviewTile: View {
 /// the existing SurfaceWrapper render it natively (full color, viewport-only —
 /// exactly right for a thumbnail).
 ///
-/// Scaling (spec §2.2): the mirror renders at the HOST's authoritative grid
-/// (cols×rows); we never drive a resize toward it (it's read-only and the core
-/// suppresses outbound resize). Instead we DISPLAY it scaled — aspect-fit by
-/// WIDTH and anchored to the BOTTOM via `scaleEffect(_:anchor:.bottom)`, so the
-/// agent's LATEST rows stay visible and the top is clipped. The SurfaceWrapper
-/// is given the mirror's own pixel size as its frame so SwiftUI's letterboxing
-/// is a no-op and our scaleEffect is the only transform. Hit-testing is disabled
-/// at the call site so the CARD (not the mirror) receives the click.
+/// Scaling: the mirror renders the HOST's authoritative grid (cols×rows) at a
+/// FIXED cell size — it does NOT scale the font to fit the view, it draws the
+/// cells top-aligned and clips/pads the remainder. So if we framed it at the
+/// (short) container height the surface would clip its OWN BOTTOM rows — exactly
+/// the latest output we want to keep. Instead we frame the SurfaceWrapper at the
+/// grid's NATURAL size (`columns·cell_width_px × rows·cell_height_px`, converted
+/// to points via the backing scale) so EVERY row renders with no internal
+/// clip/pad, THEN DISPLAY it scaled — aspect-fit by WIDTH and anchored to the
+/// BOTTOM via `scaleEffect(_:anchor:.bottom)` — so the agent's LATEST rows stay
+/// pinned to the bottom and the TOP overflow is clipped at the call site.
+/// Hit-testing is disabled at the call site so the CARD (not the mirror)
+/// receives the click.
 struct AgentMirrorPreview: View {
     /// Injected into the SurfaceWrapper's `@EnvironmentObject` — without this the
     /// wrapper traps ("No ObservableObject of type App found") the moment a live
@@ -191,19 +196,30 @@ struct AgentMirrorPreview: View {
 
     var body: some View {
         GeometryReader { geo in
-            // The mirror's authoritative pixel size (host grid). Until the first
-            // frame lands `surfaceSize` is nil; fall back to the container size so
-            // the scale is a no-op (1.0) rather than collapsing the view.
-            let mirrorW = surfaceView.surfaceSize.map { CGFloat($0.width_px) } ?? geo.size.width
-            let mirrorH = surfaceView.surfaceSize.map { CGFloat($0.height_px) } ?? geo.size.height
+            // The grid's NATURAL render size in POINTS. `columns`/`rows` are the
+            // host's authoritative grid and `cell_*_px` are BACKING pixels, so we
+            // divide by the backing scale to get points. Framing the surface at
+            // exactly this size means the framebuffer equals the grid's natural
+            // size: every row renders, with no internal top-align clip (which was
+            // eating the latest rows) and no bottom padding. Until the first frame
+            // lands `surfaceSize` is nil; fall back to the container so the scale
+            // is a no-op (1.0) rather than collapsing the view.
+            let backing = surfaceView.window?.backingScaleFactor
+                ?? NSScreen.main?.backingScaleFactor ?? 2.0
+            let naturalW = surfaceView.surfaceSize.map {
+                CGFloat($0.columns) * CGFloat($0.cell_width_px) / backing
+            } ?? geo.size.width
+            let naturalH = surfaceView.surfaceSize.map {
+                CGFloat($0.rows) * CGFloat($0.cell_height_px) / backing
+            } ?? geo.size.height
             // Aspect-fit by WIDTH: the preview width drives the scale so long
             // lines / TUI layouts read at full width; the bottom anchor keeps the
             // most-recent rows pinned and clips the top.
-            let scale = (mirrorW > 0) ? (geo.size.width / mirrorW) : 1.0
+            let scale = (naturalW > 0) ? (geo.size.width / naturalW) : 1.0
 
             Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: true)
                 .environmentObject(ghostty)
-                .frame(width: mirrorW, height: mirrorH)
+                .frame(width: naturalW, height: naturalH)
                 .scaleEffect(scale, anchor: .bottom)
                 // Pin the scaled view to the bottom of the container so the
                 // top overflow is what gets clipped (.clipped() is applied at
