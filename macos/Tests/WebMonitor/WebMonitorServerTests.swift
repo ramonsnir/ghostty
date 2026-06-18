@@ -1378,6 +1378,149 @@ struct WebMonitorServerTests {
             configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
         #expect(d == .unauthorized)
     }
+
+    // MARK: - surfaces cache freshness
+
+    @Test func surfacesCacheFreshNilNeverFresh() {
+        #expect(WebMonitorServer.surfacesCacheFresh(at: nil, now: Date(), ttl: 1.0) == false)
+    }
+    @Test func surfacesCacheFreshWithinTTL() {
+        let at = Date()
+        #expect(WebMonitorServer.surfacesCacheFresh(at: at, now: at.addingTimeInterval(0.5), ttl: 1.0) == true)
+    }
+    @Test func surfacesCacheStaleAtTTLBoundary() {
+        let at = Date()  // strict `<`: exactly TTL is NOT fresh
+        #expect(WebMonitorServer.surfacesCacheFresh(at: at, now: at.addingTimeInterval(1.0), ttl: 1.0) == false)
+    }
+    @Test func surfacesCacheStalePastTTL() {
+        let at = Date()
+        #expect(WebMonitorServer.surfacesCacheFresh(at: at, now: at.addingTimeInterval(3.0), ttl: 1.0) == false)
+    }
+    @Test func surfacesCacheDefaultTTLIsOneSecond() {
+        let at = Date()  // locks the documented 3s-poll / ~1s-build contract
+        #expect(WebMonitorServer.surfacesCacheFresh(at: at, now: at.addingTimeInterval(0.9)) == true)
+        #expect(WebMonitorServer.surfacesCacheFresh(at: at, now: at.addingTimeInterval(1.1)) == false)
+    }
+    /// Explicitly pin the load-bearing constant itself so a change to the TTL is
+    /// flagged directly (not as a confusing boundary-probe failure in the tests above).
+    @Test func surfacesCacheTTLConstantIsOneSecond() {
+        #expect(WebMonitorServer.surfacesCacheTTL == 1.0)
+    }
+
+    // MARK: - surfaces cache read path (hit / miss)
+
+    /// The exact read-side decision the `.surfacesList` handler makes on `queue`:
+    /// a fresh entry is a HIT (returns the cached bytes, no main hop); nil/stale is
+    /// a MISS (returns nil ⇒ the handler rebuilds on main).
+    @Test func cachedSurfacesDataNilIsMiss() {
+        #expect(WebMonitorServer.cachedSurfacesData(nil, now: Date(), ttl: 1.0) == nil)
+    }
+    @Test func cachedSurfacesDataFreshIsHit() {
+        let at = Date()
+        let payload = Data("[{\"id\":\"x\"}]".utf8)
+        let got = WebMonitorServer.cachedSurfacesData((data: payload, at: at), now: at.addingTimeInterval(0.5), ttl: 1.0)
+        #expect(got == payload)
+    }
+    @Test func cachedSurfacesDataStaleIsMiss() {
+        let at = Date()
+        let payload = Data("[{\"id\":\"x\"}]".utf8)
+        // exactly TTL (strict `<`) and well past TTL both miss
+        #expect(WebMonitorServer.cachedSurfacesData((data: payload, at: at), now: at.addingTimeInterval(1.0), ttl: 1.0) == nil)
+        #expect(WebMonitorServer.cachedSurfacesData((data: payload, at: at), now: at.addingTimeInterval(3.0), ttl: 1.0) == nil)
+    }
+    @Test func cachedSurfacesDataDefaultTTLIsOneSecond() {
+        let at = Date()
+        let payload = Data("[]".utf8)
+        #expect(WebMonitorServer.cachedSurfacesData((data: payload, at: at), now: at.addingTimeInterval(0.9)) == payload)
+        #expect(WebMonitorServer.cachedSurfacesData((data: payload, at: at), now: at.addingTimeInterval(1.1)) == nil)
+    }
+
+    // MARK: - surfaces cache STORE-side round-trip
+    //
+    // The read-side tests above feed hand-built tuples to `cachedSurfacesData`.
+    // These compose the two halves end-to-end: build an entry stamped at `now`
+    // (exactly as the `.surfacesList` handler does — `cachedSurfaces = (data,
+    // at: Date())`), then assert it is a HIT throughout [now, now+TTL) and a
+    // MISS at/after now+TTL. This pins the handler's store-at-now / serve-until-
+    // TTL contract, not just the freshness predicate in isolation.
+
+    @Test func cachedSurfacesStoreRoundTripHitWithinTTL() {
+        let now = Date()
+        let payload = Data("[{\"id\":\"abc\"}]".utf8)
+        let stored = (data: payload, at: now)  // what the handler stores
+        // immediately, mid-window, and just-before-TTL: all HIT, return the bytes
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now, ttl: 1.0) == payload)
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(0.5), ttl: 1.0) == payload)
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(0.99), ttl: 1.0) == payload)
+    }
+
+    @Test func cachedSurfacesStoreRoundTripMissAtAndPastTTL() {
+        let now = Date()
+        let payload = Data("[{\"id\":\"abc\"}]".utf8)
+        let stored = (data: payload, at: now)
+        // exactly TTL (strict `<` ⇒ stale) and past TTL: MISS ⇒ handler rebuilds
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(1.0), ttl: 1.0) == nil)
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(5.0), ttl: 1.0) == nil)
+    }
+
+    @Test func cachedSurfacesStoreRoundTripUsesDefaultTTL() {
+        // The handler stores with the default TTL; pin the same boundary via the
+        // default-argument path (no explicit ttl:), so a TTL change is caught here too.
+        let now = Date()
+        let payload = Data("[]".utf8)
+        let stored = (data: payload, at: now)
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(0.9)) == payload)
+        #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(1.0)) == nil)
+    }
+
+    // MARK: - /stream post-hop decision (streamSetupDecision)
+    //
+    // routeStream's genuinely-new logic is the on-`queue` continuation that runs
+    // AFTER the async main resolve hop: the liveness guard (peer may have hung up
+    // mid-hop ⇒ abort so we don't leak a host client), the 404 (surface gone),
+    // the 501 (no pty-host), and the proceed branch. That branching is the pure
+    // `streamSetupDecision`; these pin every branch + the precedence between them.
+
+    private static let liveResolution = WebMonitorServer.StreamResolution(
+        sessionID: 42, socketPath: "/tmp/host.sock", cols: 80, rows: 24)
+
+    @Test func streamDecisionDeadConnAborts() {
+        // Dead conn (connectionRefs[key] == nil after a mid-hop disconnect) ⇒ abort,
+        // EVEN with a fully-usable resolution — the liveness guard takes precedence
+        // so no host client is opened for a gone peer (the leak the guard prevents).
+        #expect(WebMonitorServer.streamSetupDecision(
+            connectionAlive: false, resolved: Self.liveResolution) == .abort)
+        // and abort regardless of what resolved is
+        #expect(WebMonitorServer.streamSetupDecision(
+            connectionAlive: false, resolved: nil) == .abort)
+    }
+
+    @Test func streamDecisionNilResolveIs404() {
+        // Live conn but the surface is gone / has no live surface ⇒ 404.
+        #expect(WebMonitorServer.streamSetupDecision(
+            connectionAlive: true, resolved: nil) == .notFound)
+    }
+
+    @Test func streamDecisionNoPtyHostIs501() {
+        // Live conn, surface resolved, but no pty-host configured (nil OR empty
+        // socket path) ⇒ 501 so the page degrades to the /screen poll.
+        let nilPath = WebMonitorServer.StreamResolution(
+            sessionID: 1, socketPath: nil, cols: 80, rows: 24)
+        let emptyPath = WebMonitorServer.StreamResolution(
+            sessionID: 1, socketPath: "", cols: 80, rows: 24)
+        #expect(WebMonitorServer.streamSetupDecision(
+            connectionAlive: true, resolved: nilPath) == .notImplemented)
+        #expect(WebMonitorServer.streamSetupDecision(
+            connectionAlive: true, resolved: emptyPath) == .notImplemented)
+    }
+
+    @Test func streamDecisionLiveProceeds() {
+        // Live conn + a usable session ⇒ proceed, threading the resolve params
+        // through to the host-client open.
+        #expect(WebMonitorServer.streamSetupDecision(
+            connectionAlive: true, resolved: Self.liveResolution)
+            == .proceed(socketPath: "/tmp/host.sock", sessionID: 42, cols: 80, rows: 24))
+    }
 }
 
 /// Unit tests for the pure framing/codec helpers of `WebMonitorHostClient`,
