@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// (ramon fork / Agent Dashboard, Layer 3) One tile: a fixed 4:3 card with a
+/// (ramon fork / Agent Dashboard, Layer 3) One row: a full-width card with a
 /// compact header (badge · title · bell dot · hide ✕), a live (or metadata-only)
-/// preview, and a dim footer. READ-ONLY: clicking the card jumps to the real
-/// split (present + unzoom). No inline reply / key forwarding (LOCKED #3).
+/// preview showing the agent's LATEST rows, and a dim footer. READ-ONLY:
+/// clicking the card jumps to the real split (present + unzoom). No inline reply
+/// / key forwarding (LOCKED #3).
 struct AgentPreviewTile: View {
     let entry: AgentEntry
     let ghostty: Ghostty.App
@@ -16,12 +17,19 @@ struct AgentPreviewTile: View {
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
 
+    /// Fixed height of the preview area. Kept deliberately SHORTER than a
+    /// full-width terminal scales to, so the bottom-anchored mirror clips the
+    /// top and the agent's most-recent rows ("latest progress") stay visible
+    /// (request #3).
+    private static let previewHeight: CGFloat = 220
+
     var body: some View {
         VStack(spacing: 0) {
             header
             preview
             footer
         }
+        .frame(maxWidth: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(
@@ -32,7 +40,6 @@ struct AgentPreviewTile: View {
                 )
         )
         .shadow(radius: hovering ? 6 : 0)
-        .aspectRatio(4.0 / 3.0, contentMode: .fit)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { jump() }
@@ -88,7 +95,8 @@ struct AgentPreviewTile: View {
         if previewsEnabled, entry.sessionID != 0, ghostty.app != nil {
             AgentMirrorPreview(ghostty: ghostty, sessionID: entry.sessionID)
                 .allowsHitTesting(false)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
+                .frame(height: Self.previewHeight)
                 .clipped()
                 // Re-create the mirror SurfaceView if the session id changes for a
                 // stable tile id (the @StateObject is otherwise keyed only by the
@@ -101,7 +109,8 @@ struct AgentPreviewTile: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity)
+            .frame(height: Self.previewHeight)
         }
     }
 

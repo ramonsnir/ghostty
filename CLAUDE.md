@@ -353,12 +353,16 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `src/os/proc_info.zig` (`zig build test -Dtest-filter=host` / `-Dtest-filter=proc_info`),
     plus the `process_info`/`idleMillis` Client tests in `src/termio/Client.zig`.
 
-- **Agent Dashboard** (fork-only, macOS, OFF by default) — a floating,
-  foreground-locked `NSPanel` showing a live, natively-rendered mini-preview of every
-  terminal split running a CLI agent (Claude Code / Codex) across ALL tabs and windows;
-  click a tile to jump to that split (raise window + select tab + un-zoom if hidden),
-  Hide ✕ to declutter, bell-ring auto-unhides. **See `AGENT-DASHBOARD.md` for the
-  user-facing config/usage.** The load-bearing facts for an agent touching this code:
+- **Agent Dashboard** (fork-only, macOS, OFF by default) — a persistent sidebar
+  `NSPanel` showing a live, natively-rendered preview of every terminal split running a
+  CLI agent (Claude Code / Codex) across ALL tabs and windows, stacked as **full-width
+  rows** each showing the split's **latest rows** (preview is bottom-anchored, top
+  clipped); click a row to jump to that split (raise window + select tab + un-zoom if
+  hidden), Hide ✕ to declutter, bell-ring auto-unhides. The panel is **normal-level (NOT
+  always-on-top)** with a visible title ("Agent Dashboard") + standard-window AX subrole
+  so an external window manager (Rectangle Pro) can target it. **See `AGENT-DASHBOARD.md`
+  for the user-facing config/usage.** The load-bearing facts for an agent touching this
+  code:
   - **Action + config (fork-only, default off):** the payload-less keybind action
     `toggle_agent_dashboard` (also a command-palette entry "Toggle Agent Dashboard");
     `agent-dashboard` (master enable) + `agent-dashboard-commands` (exe names that count

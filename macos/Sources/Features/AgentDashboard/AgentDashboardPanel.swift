@@ -1,10 +1,13 @@
 import Cocoa
 
-/// (ramon fork / Agent Dashboard, Layer 3) The floating, persistent dashboard
-/// panel. Modeled on `QuickTerminalWindow` but, unlike the quick terminal, it
-/// STAYS visible when another app/window is frontmost ("locked to foreground")
-/// and joins all Spaces — it is a glanceable status surface, not a transient
-/// drop-down.
+/// (ramon fork / Agent Dashboard, Layer 3) The persistent dashboard panel.
+/// Modeled on `QuickTerminalWindow` but, unlike the quick terminal, it is a
+/// glanceable status surface, not a transient drop-down. It behaves like a
+/// normal window — it does NOT float above other windows (so windows can be
+/// raised in front of it) and carries a real, visible title + standard-window
+/// accessibility subrole so external window managers (Rectangle Pro etc.) can
+/// target it by title. It still stays visible when another app is frontmost and
+/// joins all Spaces — a persistent sidebar, just not an always-on-top one.
 final class AgentDashboardPanel: NSPanel {
     // Must accept clicks (the tiles), but must never become the app's "main"
     // window (it's an overlay; becoming main would confuse window cycling and
@@ -15,23 +18,28 @@ final class AgentDashboardPanel: NSPanel {
     init() {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 800),
-            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel, .utilityWindow, .fullSizeContentView],
+            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
 
-        // Floating + persistent overlay configuration.
-        isFloatingPanel = true
+        // Persistent (but NOT always-on-top) sidebar configuration. `level =
+        // .normal` (and `isFloatingPanel = false`) so other windows can be
+        // raised in front of it — request #1: "I can't see windows behind it."
+        isFloatingPanel = false
         hidesOnDeactivate = false          // stay visible when another app is frontmost
-        level = .floating                  // above terminal windows; below modal alerts
+        level = .normal                    // normal stacking; other windows can cover it
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovableByWindowBackground = true
 
-        setAccessibilitySubrole(.floatingWindow)
+        // Standard-window subrole + a visible title so external window managers
+        // (Rectangle Pro) can target this window by title — request #2. A
+        // floating-window subrole is filtered out by most window managers.
+        setAccessibilitySubrole(.standardWindow)
         identifier = .init(rawValue: "com.mitchellh.ghostty.agentDashboard")
 
-        titlebarAppearsTransparent = true
-        titleVisibility = .hidden
+        titlebarAppearsTransparent = false
+        titleVisibility = .visible
         title = "Agent Dashboard"
 
         // Defense-in-depth against goto_last_surface focus-history pollution
