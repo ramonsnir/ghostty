@@ -518,6 +518,23 @@ problem — the host unlinks-and-rebinds.
 
 ## Iteration lifecycle (macOS)
 
+> 🛑 **STOP — READ THIS BEFORE YOUR FIRST `Edit`/`Write`.** Claude keeps
+> violating this rule: it reads the task, jumps straight to editing files on
+> the main tree's `ramon-fork` checkout, and only *then* commits there. **That
+> is wrong every single time, even for a "one-line" / "trivial" change, even
+> when you're "already on `ramon-fork`", even when the user says "just commit
+> it".** Being on `ramon-fork` is NOT permission to edit it — it is the exact
+> state the worktree rule exists to protect. The very fact that you're tempted
+> to skip the worktree "because it's small" is the violation. The installed
+> Release fork builds from this checkout and hosts the live Claude Code
+> session; a dirty/half-edited `ramon-fork` here can break the next rebuild
+> under you. So: **before editing ANY tracked file, your FIRST action is to
+> create a worktree** (command below) and `cd` into it. If you've already made
+> edits on the main tree before realizing this, stop, `git stash`, move to a
+> worktree, and `git stash pop` there. When the work is done, merge the branch
+> back into `ramon-fork` as described at the end of this section. No exceptions,
+> no "this once."
+
 **Always work on a git worktree, never directly on the main tree's `ramon-fork`
 checkout.** Create a worktree for each task **inside `.claude/worktrees/`**
 (`git worktree add .claude/worktrees/<task> -b <branch> ramon-fork`) — **NOT in
