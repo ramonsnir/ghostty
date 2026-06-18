@@ -490,20 +490,13 @@ final class AgentDashboardController: NSWindowController {
         model.rebuild(live: live)
     }
 
-    /// Value-type snapshot for the off-main detector: per-surface HOST-RESOLVED
-    /// foreground process name + command. NOT a pid: under the pty-host `.client`
-    /// backend the agent runs on `ghostty-host`, so the surface has no GUI-local
-    /// pid (`foregroundPID` is 0) and a libproc walk finds nothing — the host
-    /// resolves the foreground name/command, which `foregroundProcessName` /
-    /// `foregroundCommand` surface for both `.client` (host) and `.exec` (local).
-    private func detectorSnapshot() -> [AgentDetector.SurfaceProc] {
-        var out: [AgentDetector.SurfaceProc] = []
+    /// Value-type snapshot for the off-main detector: (uuid, foregroundPID).
+    private func detectorSnapshot() -> [(uuid: UUID, pid: pid_t)] {
+        var out: [(UUID, pid_t)] = []
         for controller in TerminalController.all {
             for view in controller.surfaceTree {
-                out.append(.init(
-                    uuid: view.id,
-                    processName: view.foregroundProcessName,
-                    command: view.foregroundCommand))
+                guard let pid = view.surfaceModel?.foregroundPID, pid > 0 else { continue }
+                out.append((view.id, pid_t(pid)))
             }
         }
         return out

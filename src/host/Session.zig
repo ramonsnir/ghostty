@@ -393,7 +393,7 @@ prev_at_prompt: ?bool = null,
 /// the callback returns), so the callback must serialize/copy before returning,
 /// exactly like `on_at_prompt`. null in the standalone path.
 on_process_info_ctx: ?*anyopaque = null,
-on_process_info: ?*const fn (ctx: *anyopaque, self: *Session, name: []const u8, command: []const u8) void = null,
+on_process_info: ?*const fn (ctx: *anyopaque, self: *Session, pid: u64, name: []const u8, command: []const u8) void = null,
 
 /// The last foreground pid resolved+pushed (renderTick-only state, single-
 /// threaded on the render loop). null until the first tick observes one. Used to
@@ -1625,7 +1625,7 @@ pub fn renderTick(self: *Session) !usize {
                     defer self.alloc.free(info.name);
                     defer self.alloc.free(info.command);
                     self.prev_fg_pid = fg;
-                    cb(self.on_process_info_ctx.?, self, info.name, info.command);
+                    cb(self.on_process_info_ctx.?, self, pid, info.name, info.command);
                 }
                 // resolve failed: leave prev_fg_pid unchanged so the next tick retries.
             } else {

@@ -1,134 +1,173 @@
 import AppKit
+import Darwin
 import Testing
 @testable import Ghostty
 
-// MARK: - matchAgent (host-resolved name/command) pure logic
+// MARK: - matchAgent pure logic
 
 struct AgentDetectorTests {
-    // 1) foreground process basename — the common Claude case (native binary, the
-    //    foreground process IS `claude`).
-    @Test func foregroundNameDirectHit() {
-        #expect(matchAgent(processName: "claude", command: "claude --resume",
-                           commands: ["claude", "codex"]) == AgentKind("claude"))
+    /// Helper: build a ProcSnapshot from (pid, name, children) tuples.
+    private func snap(_ entries: [(pid_t, String, [pid_t])]) -> ProcSnapshot {
+        var out: ProcSnapshot = [:]
+        for (pid, name, children) in entries {
+            out[pid] = (name: name, children: children)
+        }
+        return out
     }
 
-    @Test func foregroundNamePathBasenamed() {
-        // A full exe path is basenamed.
-        #expect(matchAgent(processName: "/Users/x/.local/bin/claude", command: nil,
-                           commands: ["claude"]) == AgentKind("claude"))
+    @Test func directHit() {
+        let s = snap([(100, "claude", [])])
+        #expect(matchAgent(rootPID: 100, snapshot: s, commands: ["claude", "codex"]) == AgentKind("claude"))
     }
 
-    // 2) argv0 basename when the foreground name is unavailable/unhelpful.
-    @Test func argv0Hit() {
-        #expect(matchAgent(processName: nil, command: "/opt/homebrew/bin/codex chat",
-                           commands: ["codex"]) == AgentKind("codex"))
+    @Test func childHitShellNodeClaude() {
+        // shell(100) -> node(200) -> claude(300)
+        let s = snap([
+            (100, "zsh", [200]),
+            (200, "node", [300]),
+            (300, "claude", []),
+        ])
+        #expect(matchAgent(rootPID: 100, snapshot: s, commands: ["claude"]) == AgentKind("claude"))
     }
 
-    // 3) interpreter-wrapped (node Codex): foreground process is `node`, the agent
-    //    is a later command token.
-    @Test func nodeWrappedCodex() {
-        #expect(matchAgent(processName: "node",
-                           command: "node /Users/x/.nvm/versions/node/v24/bin/codex",
-                           commands: ["codex"]) == AgentKind("codex"))
+    @Test func depthCapStopsWalk() {
+        // Chain deeper than maxDepth=2: the claude at depth 3 must NOT be found.
+        let s = snap([
+            (1, "a", [2]),
+            (2, "b", [3]),
+            (3, "c", [4]),
+            (4, "claude", []),
+        ])
+        #expect(matchAgent(rootPID: 1, snapshot: s, commands: ["claude"], maxDepth: 2) == nil)
+        // With enough depth it IS found.
+        #expect(matchAgent(rootPID: 1, snapshot: s, commands: ["claude"], maxDepth: 4) == AgentKind("claude"))
     }
 
-    @Test func interpreterArgv0AlsoTriggersScan() {
-        // argv0 is the interpreter even when processName is missing.
-        #expect(matchAgent(processName: nil,
-                           command: "node /x/bin/codex --flag",
-                           commands: ["codex"]) == AgentKind("codex"))
+    @Test func cycleVisitedCapTerminates() {
+        // Self-referential / cyclic tree must terminate and return nil.
+        let s = snap([
+            (1, "a", [2]),
+            (2, "b", [1, 2]), // points back at 1 and itself
+        ])
+        #expect(matchAgent(rootPID: 1, snapshot: s, commands: ["claude"]) == nil)
     }
 
-    @Test func nonInterpreterDoesNotScanArgs() {
-        // A stray path arg under a NON-interpreter must NOT false-match: editing a
-        // file named `codex` is not running the agent.
-        #expect(matchAgent(processName: "vim", command: "vim notes/codex",
-                           commands: ["codex"]) == nil)
+    @Test func prefersPathBasename() {
+        // The fixture stores a full path; matchAgent basenames it.
+        let s = snap([(100, "/opt/homebrew/bin/codex", [])])
+        #expect(matchAgent(rootPID: 100, snapshot: s, commands: ["codex"]) == AgentKind("codex"))
     }
 
     @Test func noMatchReturnsNil() {
-        #expect(matchAgent(processName: "zsh", command: "-zsh",
-                           commands: ["claude", "codex"]) == nil)
+        let s = snap([
+            (100, "zsh", [200]),
+            (200, "vim", []),
+        ])
+        #expect(matchAgent(rootPID: 100, snapshot: s, commands: ["claude", "codex"]) == nil)
     }
 
     @Test func configurableCommandSet() {
-        // Only watching codex: claude must NOT match; codex must.
-        #expect(matchAgent(processName: "claude", command: "claude",
-                           commands: ["codex"]) == nil)
-        #expect(matchAgent(processName: "codex", command: "codex",
-                           commands: ["codex"]) == AgentKind("codex"))
+        let s = snap([(100, "claude", [])])
+        // Only watching codex: claude should NOT match.
+        #expect(matchAgent(rootPID: 100, snapshot: s, commands: ["codex"]) == nil)
+        let s2 = snap([(100, "codex", [])])
+        #expect(matchAgent(rootPID: 100, snapshot: s2, commands: ["codex"]) == AgentKind("codex"))
     }
 
     @Test func emptyCommandsNeverMatches() {
-        #expect(matchAgent(processName: "claude", command: "claude", commands: []) == nil)
+        let s = snap([(100, "claude", [])])
+        #expect(matchAgent(rootPID: 100, snapshot: s, commands: []) == nil)
     }
 
-    @Test func bothInputsNilOrEmptyIsNil() {
-        // An old host that hasn't pushed process info yet -> not classified (rather
-        // than crashing or false-matching).
-        #expect(matchAgent(processName: nil, command: nil,
-                           commands: ["claude", "codex"]) == nil)
-        #expect(matchAgent(processName: "", command: "",
-                           commands: ["claude", "codex"]) == nil)
+    @Test func bfsShallowerMatchWins() {
+        // claude at depth 1, codex at depth 2 under one root. BFS must return the
+        // SHALLOWER match (claude) deterministically — a DFS would surface codex
+        // and break the documented "shallower wins" contract.
+        let s = snap([
+            (1, "zsh", [2]),
+            (2, "claude", [3]),
+            (3, "codex", []),
+        ])
+        #expect(matchAgent(rootPID: 1, snapshot: s, commands: ["claude", "codex"]) == AgentKind("claude"))
     }
 
-    @Test func foregroundNameWinsOverCommandToken() {
-        // When both could match, the (cheaper, more authoritative) foreground name
-        // is returned.
-        #expect(matchAgent(processName: "claude", command: "node /x/bin/codex",
-                           commands: ["claude", "codex"]) == AgentKind("claude"))
+    @Test func bfsShallowerWinsAcrossBranches() {
+        // Two matches at different depths on separate branches: depth-1 codex must
+        // beat depth-2 claude regardless of dictionary/child ordering.
+        let s = snap([
+            (1, "zsh", [2, 3]),
+            (2, "codex", []),       // depth 1
+            (3, "node", [4]),
+            (4, "claude", []),      // depth 2
+        ])
+        #expect(matchAgent(rootPID: 1, snapshot: s, commands: ["claude", "codex"]) == AgentKind("codex"))
     }
 }
 
 // MARK: - AgentDetector cache / resolve logic
 
+/// Counting fake: records how many times each rootPID was walked, so we can
+/// assert the cache skips a re-walk when the pid is unchanged.
+private final class CountingEnumerator: ProcEnumerator {
+    var byPID: [pid_t: ProcSnapshot]
+    private(set) var walkCount: [pid_t: Int] = [:]
+    init(_ byPID: [pid_t: ProcSnapshot]) { self.byPID = byPID }
+    func snapshot(rootPID: pid_t) -> ProcSnapshot {
+        walkCount[rootPID, default: 0] += 1
+        return byPID[rootPID] ?? [:]
+    }
+}
+
 struct AgentDetectorCacheTests {
-    private func proc(_ uuid: UUID, _ name: String?, _ cmd: String?) -> AgentDetector.SurfaceProc {
-        .init(uuid: uuid, processName: name, command: cmd)
-    }
-
-    @Test func resolveMatchesAndCaches() {
+    @Test func cacheHitSkipsRewalk() {
         let a = UUID()
+        let claudeTree: ProcSnapshot = [100: (name: "claude", children: [])]
+        let en = CountingEnumerator([100: claudeTree])
+
+        // First tick: cold cache -> one walk, claude detected.
         let (r1, c1) = AgentDetector.resolve(
-            snapshot: [proc(a, "claude", "claude --resume")],
-            cache: [:], commands: ["claude"])
+            snapshot: [(a, 100)], cache: [:], commands: ["claude"], enumerator: en)
         #expect(r1[a] == AgentKind("claude"))
-        #expect(c1[a]?.kind == AgentKind("claude"))
+        #expect(en.walkCount[100] == 1)
 
-        // Same name/command -> cache hit (key unchanged), same result.
+        // Second tick: same pid -> cache hit, NO re-walk.
         let (r2, _) = AgentDetector.resolve(
-            snapshot: [proc(a, "claude", "claude --resume")],
-            cache: c1, commands: ["claude"])
+            snapshot: [(a, 100)], cache: c1, commands: ["claude"], enumerator: en)
         #expect(r2[a] == AgentKind("claude"))
+        #expect(en.walkCount[100] == 1) // unchanged
     }
 
-    @Test func reMatchOnNameOrCommandChange() {
+    @Test func cacheMissOnPIDChangeRewalks() {
         let a = UUID()
+        let en = CountingEnumerator([
+            100: [100: (name: "claude", children: [])],
+            200: [200: (name: "vim", children: [])],
+        ])
         let (_, c1) = AgentDetector.resolve(
-            snapshot: [proc(a, "claude", "claude")],
-            cache: [:], commands: ["claude"])
-        #expect(c1[a]?.kind == AgentKind("claude"))
+            snapshot: [(a, 100)], cache: [:], commands: ["claude"], enumerator: en)
+        #expect(en.walkCount[100] == 1)
 
-        // Foreground process changed (claude exited -> back at the shell): re-match,
-        // and now no agent.
-        let (r2, c2) = AgentDetector.resolve(
-            snapshot: [proc(a, "zsh", "-zsh")],
-            cache: c1, commands: ["claude"])
+        // Foreground pid changed (100 -> 200): must re-walk, and now no agent.
+        let (r2, _) = AgentDetector.resolve(
+            snapshot: [(a, 200)], cache: c1, commands: ["claude"], enumerator: en)
+        #expect(en.walkCount[200] == 1)
         #expect(r2[a] == nil)
-        #expect(c2[a]?.kind == nil)
     }
 
     @Test func vanishedIDDroppedFromCache() {
         let a = UUID(), b = UUID()
+        let en = CountingEnumerator([
+            100: [100: (name: "claude", children: [])],
+            200: [200: (name: "codex", children: [])],
+        ])
         let (_, c1) = AgentDetector.resolve(
-            snapshot: [proc(a, "claude", "claude"), proc(b, "codex", "codex")],
-            cache: [:], commands: ["claude", "codex"])
+            snapshot: [(a, 100), (b, 200)], cache: [:],
+            commands: ["claude", "codex"], enumerator: en)
         #expect(c1.count == 2)
 
-        // b's surface vanished: next snapshot omits it -> next cache drops it.
+        // b's surface vanished: next snapshot has only a -> next cache drops b.
         let (r2, c2) = AgentDetector.resolve(
-            snapshot: [proc(a, "claude", "claude")],
-            cache: c1, commands: ["claude", "codex"])
+            snapshot: [(a, 100)], cache: c1, commands: ["claude", "codex"], enumerator: en)
         #expect(c2.keys.contains(a))
         #expect(!c2.keys.contains(b))
         #expect(r2[b] == nil)

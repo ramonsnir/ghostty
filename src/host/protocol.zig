@@ -68,7 +68,15 @@ pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
 // host never knows the frame and never sends it (process info reads null until
 // the host is restarted). OLD GUI + NEW host: the host sees minor<=2 and never
 // emits, so the old GUI never sees an unknown tag.
-pub const PROTOCOL_VERSION_MINOR: u16 = 3;
+// Bumped to 4 for the additive host->GUI `foreground_pid` frame: the host ships
+// the focused session's raw foreground pid so the GUI can walk the process
+// subtree locally and classify the agent (the host can't, lacking the agent set).
+// ADDITIVE only — major unchanged, no existing frame encoding or enum order
+// touched (`foreground_pid` is appended at the END of FrameType). Same compat
+// model as minor 3: the host gates emission on the conn's negotiated minor (>= 4),
+// so an old GUI never sees the new tag and a new GUI tolerates an old host (no
+// frame -> foreground pid reads null/0).
+pub const PROTOCOL_VERSION_MINOR: u16 = 4;
 
 /// Maximum on-wire frame length (the value of the BE length prefix, i.e.
 /// tag + payload). Bounds per-connection buffer growth and the speculative
@@ -211,6 +219,16 @@ pub const FrameType = enum(u8) {
     // Appended at the END so all prior tag integers (incl subscribe_render) stay
     // stable.
     process_info,
+    // --- minor 4: foreground pid (host->GUI) ---
+    // host->GUI: the focused session's RAW foreground pid (the tcgetpgrp leader).
+    // Under `.client` the GUI mirror has no local pid (the PTY lives in the host),
+    // so the host ships the pid here; the GUI walks the process subtree LOCALLY
+    // (pids are system-global on macOS) to classify the agent (e.g. find `claude`
+    // under a `claude-pool` wrapper, ignoring sibling helpers). payload =
+    // session_id (u64) + pid (u64); pid == 0 means "no foreground process".
+    // Emitted ONLY to conns that negotiated minor >= 4. Appended at the END so all
+    // prior tag integers (incl process_info) stay stable.
+    foreground_pid,
 };
 
 /// A decoded but not-yet-typed frame: the tag plus the raw payload bytes
@@ -1109,6 +1127,37 @@ pub const AtPrompt = struct {
     }
 
     pub fn deinit(self: *AtPrompt, _: Allocator) void {
+        self.* = undefined;
+    }
+};
+
+/// host->GUI (minor 4): the focused session's RAW foreground pid (tcgetpgrp
+/// leader). `pid == 0` means no foreground process. The GUI walks the subtree
+/// from this pid (pids are system-global) to classify the agent. Pure ints, no
+/// allocation. Mirrors AtPrompt's shape.
+pub const ForegroundPid = struct {
+    session_id: u64,
+    pid: u64 = 0,
+
+    pub fn encode(self: ForegroundPid, alloc: Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        const w = buf.writer(alloc);
+        try writeInt(w, u64, self.session_id);
+        try writeInt(w, u64, self.pid);
+        return buf.toOwnedSlice(alloc);
+    }
+
+    pub fn decode(_: Allocator, payload: []const u8) !ForegroundPid {
+        var fbs = std.io.fixedBufferStream(payload);
+        const r = fbs.reader();
+        return .{
+            .session_id = try readInt(r, u64),
+            .pid = try readInt(r, u64),
+        };
+    }
+
+    pub fn deinit(self: *ForegroundPid, _: Allocator) void {
         self.* = undefined;
     }
 };

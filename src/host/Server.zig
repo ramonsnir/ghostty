@@ -1389,7 +1389,7 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
         },
 
         // Host->GUI frames; not expected from the GUI. Ignore.
-        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt, .raw_output, .process_info => {
+        .hello_ack, .attached, .grid_frame, .mode_frame, .child_exited, .pong, .search_total, .search_selected, .link_frame, .surface_event, .selection_text, .at_prompt, .raw_output, .process_info, .foreground_pid => {
             log.debug("ignoring host->gui frame from client: {s}", .{@tagName(frame.tag)});
         },
     }
@@ -2008,6 +2008,13 @@ pub fn processInfoAllowed(negotiated_minor: u16) bool {
     return negotiated_minor >= 3;
 }
 
+/// fork (minor 4): does a conn want the `foreground_pid` frame? Same compat model
+/// as processInfoAllowed: emit ONLY to peers that advertised minor >= 4 (an older
+/// GUI has no `foreground_pid` tag and treats an unknown tag as fatal).
+pub fn foregroundPidAllowed(negotiated_minor: u16) bool {
+    return negotiated_minor >= 4;
+}
+
 /// fork (minor 3) foreground-process callback. Runs on the session OWNING thread
 /// from renderTick, off registry_mutex — same blocking-write discipline as
 /// onAtPrompt. Frames the resolved foreground process name + command to every
@@ -2016,7 +2023,7 @@ pub fn processInfoAllowed(negotiated_minor: u16) bool {
 /// tag as fatal, so it must never be sent one). The `name`/`command` slices are
 /// BORROWED (owned by renderTick, freed after this returns) — `writeFramed` ->
 /// `encode` copies them synchronously per subscriber, before this returns.
-fn onProcessInfo(ctx: *anyopaque, session: *Session, name: []const u8, command: []const u8) void {
+fn onProcessInfo(ctx: *anyopaque, session: *Session, pid: u64, name: []const u8, command: []const u8) void {
     _ = session;
     const e: *SessionEntry = @ptrCast(@alignCast(ctx));
 
@@ -2026,12 +2033,22 @@ fn onProcessInfo(ctx: *anyopaque, session: *Session, name: []const u8, command: 
         if (conn.closed.load(.acquire)) continue;
         // Compat gate: skip peers that didn't negotiate minor 3 — they cannot
         // decode this tag (see processInfoAllowed).
-        if (!processInfoAllowed(conn.negotiated_minor)) continue;
-        conn.writeFramed(.process_info, protocol.ProcessInfo{
-            .session_id = e.session_id,
-            .name = name,
-            .command = command,
-        });
+        if (processInfoAllowed(conn.negotiated_minor)) {
+            conn.writeFramed(.process_info, protocol.ProcessInfo{
+                .session_id = e.session_id,
+                .name = name,
+                .command = command,
+            });
+        }
+        // minor 4: also ship the RAW foreground pid so the GUI can walk the
+        // process subtree locally and classify the agent (the host can't — it
+        // lacks the agent set; see ForegroundPid). `pid` is the tcgetpgrp leader.
+        if (foregroundPidAllowed(conn.negotiated_minor)) {
+            conn.writeFramed(.foreground_pid, protocol.ForegroundPid{
+                .session_id = e.session_id,
+                .pid = pid,
+            });
+        }
     }
 }
 
@@ -2239,6 +2256,7 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
     // then seeded by the first post-attach pid change, as before).
     var proc: ?proc_info.ProcInfo = null;
     var proc_resolved = false;
+    var fg_pid: u64 = 0; // raw foreground pid, for the minor-4 foreground_pid seed
     defer if (proc) |p| {
         session.alloc.free(p.name);
         session.alloc.free(p.command);
@@ -2269,6 +2287,7 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
             if (!proc_resolved) {
                 proc_resolved = true;
                 if (session.io.getProcessInfo(.foreground_pid)) |fg| {
+                    fg_pid = fg;
                     proc = proc_info.resolve(session.alloc, fg);
                 }
             }
@@ -2276,6 +2295,16 @@ fn pushFullFrames(self: *Server, e: *SessionEntry) !void {
                 .session_id = e.session_id,
                 .name = p.name,
                 .command = p.command,
+            });
+        }
+        // minor 4 foreground-pid reattach seed: ship the raw fg pid (resolved
+        // lazily in the >=3 block above — foregroundPidAllowed implies
+        // processInfoAllowed, so fg_pid is set before this runs; 0 if none) so a
+        // freshly-attached GUI can walk the subtree immediately. Gated >= 4.
+        if (foregroundPidAllowed(conn.negotiated_minor)) {
+            conn.writeFramed(.foreground_pid, protocol.ForegroundPid{
+                .session_id = e.session_id,
+                .pid = fg_pid,
             });
         }
     }

@@ -284,6 +284,11 @@ selection_present: bool = false,
 // so a guarded ArrayList rather than a lock-free atomic.
 fg_process_name: std.ArrayListUnmanaged(u8) = .empty,
 fg_command: std.ArrayListUnmanaged(u8) = .empty,
+// fork (minor 4): the host's RAW foreground pid (tcgetpgrp leader), pushed via
+// the `foreground_pid` frame, so the GUI can walk the process subtree locally
+// and classify the agent. Lock-free atomic (a single u64; read in
+// getProcessInfo without the guard mutex). 0 == no foreground process.
+fg_pid: std.atomic.Value(u64) = .init(0),
 
 /// fork: wall-clock ms (std.time.milliTimestamp) of the last APPLIED grid_frame
 /// (a real screen change). Stamped ONLY in the `.grid_frame` arm — NOT on
@@ -1065,7 +1070,13 @@ pub fn markMirrorEnded(self: *Client) void {
 /// The client does not own a local process (the host does), so this always
 /// returns `null` ("not available"), an explicitly supported result.
 pub fn getProcessInfo(self: *Client, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
-    _ = self;
+    // Under .client only the foreground pid is mirrored — the host pushes it via
+    // the minor-4 `foreground_pid` frame (no local PTY here). Other ProcessInfo
+    // variants are not carried over the wire, so they remain null.
+    if (info == .foreground_pid) {
+        const v = self.fg_pid.load(.acquire);
+        return if (v == 0) null else v;
+    }
     return null;
 }
 
@@ -1358,6 +1369,15 @@ pub fn handleFrame(
             try self.fg_process_name.appendSlice(self.gpa, pi.name);
             self.fg_command.clearRetainingCapacity();
             try self.fg_command.appendSlice(self.gpa, pi.command);
+        },
+
+        .foreground_pid => {
+            // fork (minor 4): the host's RAW foreground pid for GUI-side subtree
+            // walking. Lock-free atomic store (getProcessInfo reads it without the
+            // guard mutex); 0 == no foreground process.
+            var fp = try protocol.ForegroundPid.decode(alloc, payload);
+            defer fp.deinit(alloc);
+            self.fg_pid.store(fp.pid, .release);
         },
 
         // Everything else is either a request-direction frame (the GUI sends

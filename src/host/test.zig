@@ -1518,20 +1518,60 @@ test "host ProcessInfo decode robustness (truncated/over-claimed -> error, no pa
     }
 }
 
-test "host protocol minor bumped to 3 for process_info" {
-    try testing.expectEqual(@as(u16, 3), protocol.PROTOCOL_VERSION_MINOR);
+test "host protocol minor bumped to 4 for foreground_pid" {
+    try testing.expectEqual(@as(u16, 4), protocol.PROTOCOL_VERSION_MINOR);
     try testing.expectEqual(@as(u16, 1), protocol.PROTOCOL_VERSION_MAJOR);
-    // process_info was appended at the END (after subscribe_render), so its tag
-    // integer is strictly greater — guards against a mid-enum insert silently
+    // process_info was appended after subscribe_render (minor 3); foreground_pid
+    // was appended after process_info (minor 4). Each tag integer is strictly
+    // greater than its predecessor — guards against a mid-enum insert silently
     // renumbering the just-shipped frames.
-    try testing.expect(@intFromEnum(protocol.FrameType.process_info) >
-        @intFromEnum(protocol.FrameType.subscribe_render));
-    // Tighter pin: process_info is the LAST variant and immediately follows
-    // subscribe_render, so the gap is exactly 1.
     try testing.expectEqual(
         @intFromEnum(protocol.FrameType.subscribe_render) + 1,
         @intFromEnum(protocol.FrameType.process_info),
     );
+    // Tighter pin: foreground_pid is now the LAST variant and immediately follows
+    // process_info, so the gap is exactly 1.
+    try testing.expectEqual(
+        @intFromEnum(protocol.FrameType.process_info) + 1,
+        @intFromEnum(protocol.FrameType.foreground_pid),
+    );
+}
+
+test "host ForegroundPid frame round-trip (minor 4)" {
+    const alloc = testing.allocator;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // Normal pid round-trips.
+    {
+        const orig: protocol.ForegroundPid = .{ .session_id = 0xABCDEF, .pid = 46318 };
+        const framed = try protocol.encodeFrame(alloc, .foreground_pid, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.foreground_pid, tag);
+        var dec = try protocol.ForegroundPid.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 0xABCDEF), dec.session_id);
+        try testing.expectEqual(@as(u64, 46318), dec.pid);
+    }
+
+    // pid == 0 ("no foreground process") round-trips.
+    {
+        const orig: protocol.ForegroundPid = .{ .session_id = 1, .pid = 0 };
+        const framed = try protocol.encodeFrame(alloc, .foreground_pid, orig);
+        defer alloc.free(framed);
+        const tag = try feedOneByteAtATime(alloc, framed, &payload);
+        try testing.expectEqual(protocol.FrameType.foreground_pid, tag);
+        var dec = try protocol.ForegroundPid.decode(alloc, payload.items);
+        defer dec.deinit(alloc);
+        try testing.expectEqual(@as(u64, 0), dec.pid);
+    }
+
+    // A payload shorter than session_id + pid (16 bytes) errors, never panics.
+    {
+        const short = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }; // only session_id, no pid
+        try testing.expectError(error.EndOfStream, protocol.ForegroundPid.decode(alloc, &short));
+    }
 }
 
 test "host SubscribeRender decode robustness (truncated -> error, no panic) Layer 1" {
