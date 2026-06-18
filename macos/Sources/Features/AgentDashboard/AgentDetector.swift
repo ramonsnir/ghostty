@@ -64,12 +64,15 @@ func matchAgent(
 
         guard let entry = snapshot[pid] else { continue }
 
-        // basename test. `entry.name` is already a basename in fixtures; the
-        // libproc impl normalizes to a basename (preferring the exe path basename
-        // when proc_name is truncated at MAXCOMLEN) before storing it here.
-        let base = (entry.name as NSString).lastPathComponent
-        if commands.contains(base) {
-            return AgentKind(base)
+        // PATH-COMPONENT test. The libproc impl stores the FULL exe path; we match
+        // if ANY path component equals a configured command. This catches both a
+        // clean basename (`/…/bin/codex` -> "codex") AND a versioned/wrapped
+        // install whose basename is NOT the command — Claude's exe is
+        // `/…/share/claude/versions/2.1.181` (basename "2.1.181"), but "claude" is
+        // a path component. (Fixtures store a bare basename, which is a one-element
+        // path and matches the same way.)
+        for comp in entry.name.split(separator: "/") where commands.contains(String(comp)) {
+            return AgentKind(String(comp))
         }
 
         if depth < maxDepth {
@@ -87,6 +90,13 @@ func matchAgent(
 /// (those inject `ProcSnapshot` directly through `matchAgent`).
 struct LibprocEnumerator: ProcEnumerator {
     func snapshot(rootPID: pid_t, maxDepth: Int) -> ProcSnapshot {
+        // Robust child enumeration: `proc_listchildpids` is unreliable on macOS
+        // (its NULL-sizing call and byte-count contract don't behave), so build a
+        // ppid -> [children] map ONCE from the full pid list via proc_pidinfo
+        // parent links, then BFS from rootPID. `name` is the FULL exe path
+        // (matchAgent does path-component matching), since a versioned install's
+        // basename isn't the command name.
+        let childrenOf = Self.childrenMap()
         var result: ProcSnapshot = [:]
         var visited = Set<pid_t>()
         var queue: [(pid: pid_t, depth: Int)] = [(rootPID, 0)]
@@ -99,9 +109,8 @@ struct LibprocEnumerator: ProcEnumerator {
             visited.insert(pid)
             guard visited.count <= 4096 else { break }
 
-            let name = Self.processBasename(pid)
-            let children: [pid_t] = depth < maxDepth ? Self.children(of: pid) : []
-            result[pid] = (name: name, children: children)
+            let children: [pid_t] = depth < maxDepth ? (childrenOf[pid] ?? []) : []
+            result[pid] = (name: Self.exePath(pid), children: children)
             for c in children where !visited.contains(c) {
                 queue.append((c, depth + 1))
             }
@@ -113,45 +122,46 @@ struct LibprocEnumerator: ProcEnumerator {
         snapshot(rootPID: rootPID, maxDepth: 4)
     }
 
-    /// Prefer the exe path basename (full, not truncated) over proc_name (capped
-    /// at MAXCOMLEN). Falls back to proc_name, then "".
-    private static func processBasename(_ pid: pid_t) -> String {
+    /// The full executable path (proc_pidpath), or proc_name, or "". NOT
+    /// basenamed — matchAgent matches on path components (a versioned install
+    /// like `/…/claude/versions/2.1.181` has the command only as a component).
+    private static func exePath(_ pid: pid_t) -> String {
         var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let pathLen = proc_pidpath(pid, &pathBuf, UInt32(MAXPATHLEN))
-        if pathLen > 0 {
+        if proc_pidpath(pid, &pathBuf, UInt32(MAXPATHLEN)) > 0 {
             let path = String(cString: pathBuf)
-            if !path.isEmpty {
-                return (path as NSString).lastPathComponent
-            }
+            if !path.isEmpty { return path }
         }
-
         var nameBuf = [CChar](repeating: 0, count: 2 * Int(MAXCOMLEN) + 1)
-        let nameLen = proc_name(pid, &nameBuf, UInt32(nameBuf.count))
-        if nameLen > 0 {
+        if proc_name(pid, &nameBuf, UInt32(nameBuf.count)) > 0 {
             return String(cString: nameBuf)
         }
         return ""
     }
 
-    private static func children(of pid: pid_t) -> [pid_t] {
-        // `proc_listchildpids` (like the other `proc_list*` calls) takes a buffer
-        // size in BYTES and returns the number of BYTES written (NOT a pid count);
-        // its sizing call (null buffer) returns the needed byte count. We size the
-        // buffer in pids from that byte count (with a little slack for races where
-        // a child is forked between the two calls), then convert the returned byte
-        // count back to a pid count. Every length is clamped to the buffer capacity
-        // so the slice is memory-safe regardless of how the OS interprets the call.
-        let pidSize = MemoryLayout<pid_t>.size
-        let neededBytes = proc_listchildpids(pid, nil, 0)
-        guard neededBytes > 0 else { return [] }
-        // Convert bytes -> pid capacity, add a few slots of slack, and cap.
-        let cap = min(Int(neededBytes) / pidSize + 8, 4096)
-        guard cap > 0 else { return [] }
-        var buf = [pid_t](repeating: 0, count: cap)
-        let gotBytes = proc_listchildpids(pid, &buf, Int32(cap * pidSize))
-        guard gotBytes > 0 else { return [] }
-        let count = min(Int(gotBytes) / pidSize, cap)
-        return Array(buf[0..<count]).filter { $0 > 0 }
+    /// Build pid -> [direct child pids] from the live process table. Uses
+    /// proc_listpids(PROC_ALL_PIDS) + proc_pidinfo(PROC_PIDTBSDINFO) parent links
+    /// — reliable, unlike proc_listchildpids. ~one proc_pidinfo per process; only
+    /// invoked when a surface's foreground pid CHANGES (the resolve cache skips
+    /// stable surfaces), so it is not a per-tick cost.
+    private static func childrenMap() -> [pid_t: [pid_t]] {
+        let needed = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard needed > 0 else { return [:] }
+        let cap = Int(needed) / MemoryLayout<pid_t>.size + 64
+        var pids = [pid_t](repeating: 0, count: cap)
+        let got = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, Int32(cap * MemoryLayout<pid_t>.size))
+        guard got > 0 else { return [:] }
+        let count = min(Int(got) / MemoryLayout<pid_t>.size, cap)
+        var map: [pid_t: [pid_t]] = [:]
+        let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
+        for i in 0..<count {
+            let p = pids[i]
+            if p <= 0 { continue }
+            var bi = proc_bsdinfo()
+            guard proc_pidinfo(p, PROC_PIDTBSDINFO, 0, &bi, sz) == sz else { continue }
+            let ppid = pid_t(bi.pbi_ppid)
+            map[ppid, default: []].append(p)
+        }
+        return map
     }
 }
 

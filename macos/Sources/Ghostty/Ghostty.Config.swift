@@ -863,7 +863,15 @@ extension Ghostty {
         /// `ghostty_config_t`. `parsed` is whatever the C string-list yielded
         /// (empty when the key is unset); a non-empty user list passes verbatim.
         static func resolveAgentDashboardCommands(_ parsed: [String]) -> [String] {
-            parsed.isEmpty ? agentDashboardCommandsDefault : parsed
+            // Accept BOTH one-entry-per-line AND a single comma-separated value
+            // (`agent-dashboard-commands = claude,codex`): split each entry on
+            // commas, trim whitespace, drop empties — so either config form yields
+            // the same set. Empty -> the default.
+            let split = parsed
+                .flatMap { $0.split(separator: ",") }
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            return split.isEmpty ? agentDashboardCommandsDefault : split
         }
     }
 }
