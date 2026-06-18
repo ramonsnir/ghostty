@@ -1660,7 +1660,9 @@ final class WebMonitorServer {
         <button data-key="backspace" title="Backspace / delete char">&#9003;</button>
         <button data-key="ctrl-u" title="Clear line (Ctrl-U)">Clear</button>
         <button data-key="ctrl-c" class="danger">Ctrl-C</button>
-        <button id="clearbell"
+        <!-- Shown only while this split has an active (unacknowledged) bell;
+             hidden again once the clear is processed (visible confirmation). -->
+        <button id="clearbell" style="display:none"
                 title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
       </div>
       <!-- Arrows + remote-control scroll on ONE row to save vertical space.
@@ -1887,7 +1889,7 @@ final class WebMonitorServer {
               }
               var p = document.createElement("div"); p.className = "p"; p.textContent = row.pwd || "";
               d.appendChild(t); d.appendChild(p);
-              d.onclick = function () { showSurface(row.id, row.title); };
+              d.onclick = function () { showSurface(row.id, row.title, row.bell); };
               frag.appendChild(d);
             });
           });
@@ -2073,10 +2075,37 @@ final class WebMonitorServer {
         backBtn.style.display = "none";
         curEl.textContent = "";
         jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
+        setClearBellVisible(false);
       }
 
-      function showSurface(id, title) {
+      // The Clear-bell button is only meaningful when this split has an active
+      // bell, so it's hidden otherwise; its disappearance after a clear doubles
+      // as confirmation the bell was acknowledged (no trip back to the list).
+      function setClearBellVisible(on) {
+        clearBellBtn.style.display = on ? "inline-block" : "none";
+      }
+
+      // While viewing a split the detail view doesn't poll the session list, so
+      // refresh the Clear-bell button against the live bell state — both to
+      // reveal it if a bell rings mid-view and to drop it once a clear lands.
+      function refreshBellButton() {
+        if (!current) return;
+        var want = current;
+        fetch(url("/api/surfaces"), { headers: headers() })
+          .then(function (r) { return r && r.ok ? r.json() : null; })
+          .then(function (rows) {
+            if (!rows || current !== want) return;  // navigated away meanwhile
+            var hit = null;
+            for (var i = 0; i < rows.length; i++) { if (rows[i].id === want) { hit = rows[i]; break; } }
+            if (hit) setClearBellVisible(!!hit.bell);
+          })
+          .catch(function () {});
+      }
+
+      function showSurface(id, title, bell) {
         current = id;
+        setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
+        refreshBellButton();
         listEl.style.display = "none";
         viewer.style.display = "block";
         backBtn.style.display = "inline-block";
@@ -2115,7 +2144,7 @@ final class WebMonitorServer {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/bell"), { method: "POST", headers: headers() })
           .then(function (r) {
-            if (r && r.ok) { setBanner("Bell cleared.", true); setTimeout(clearBannerIfNotError, 1200); }
+            if (r && r.ok) { setClearBellVisible(false); setBanner("Bell cleared.", true); setTimeout(clearBannerIfNotError, 1200); }
             else if (r && r.status === 404) { sessionClosedTeardown(); }
             else { setBanner("Clear bell failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
           })
@@ -2366,7 +2395,7 @@ final class WebMonitorServer {
       // a fresh loadList().
       function start() {
         if (!listTimer) {
-          listTimer = setInterval(function () { if (!current) loadList(); }, 3000);
+          listTimer = setInterval(function () { if (current) refreshBellButton(); else loadList(); }, 3000);
         }
         loadList();
         loadPushConfig();
