@@ -1541,8 +1541,13 @@ final class WebMonitorServer {
     <style>
       :root { color-scheme: dark; }
       body { margin: 0; background: #11131a; color: #d6dae3; font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; font-size: 14px; }
-      header { padding: 10px 12px; background: #1b1e27; position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      header { padding: 10px 12px; background: #1b1e27; position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
       header b { color: #f0a35e; }
+      /* The session id/title is the only growable header item: let it shrink and
+         ellipsize so the (compact, icon-only) Notify button never wraps to a 2nd
+         line on a narrow phone. */
+      #cur { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #notify { flex: 0 0 auto; padding: 6px 9px; }
       button, input, select { font-family: inherit; font-size: 14px; }
       button { background: #2a2e3b; color: #d6dae3; border: 1px solid #3a3f4f; border-radius: 6px; padding: 8px 10px; touch-action: manipulation; }
       button:active { background: #3a3f4f; }
@@ -1610,8 +1615,8 @@ final class WebMonitorServer {
       <!-- Push-on-bell toggle. ARM when you step away from the laptop, MUTE when
            you are back. Disabled (n/a) unless the origin is a secure context
            (HTTPS via `tailscale serve`) and the browser supports Push. -->
-      <button id="notify" style="margin-left:auto"
-              title="Push a notification to this device when any split rings a bell">&#128276; Notify</button>
+      <button id="notify" style="margin-left:auto" aria-label="Notify on bell"
+              title="Push a notification to this device when any split rings a bell">&#128276;</button>
     </header>
     <div id="banner" role="status" aria-live="polite"></div>
     <div id="notice" class="notice" style="display:none" role="alert" aria-live="assertive"></div>
@@ -2285,9 +2290,13 @@ final class WebMonitorServer {
         return arr;
       }
       function refreshNotifyButton() {
+        // Icon-only (just the bell) so the header never wraps to a 2nd line on a
+        // phone; state is conveyed by the `.armed` amber color + the title, and
+        // the disabled (greyed) bell covers the n/a case.
+        notifyBtn.textContent = "\\uD83D\\uDD14";
         if (!pushSupported()) {
           notifyBtn.disabled = true;
-          notifyBtn.textContent = "\\uD83D\\uDD14 n/a";
+          notifyBtn.classList.remove("armed");
           notifyBtn.title = window.isSecureContext
             ? "Push notifications are not supported by this browser"
             : "Needs HTTPS \\u2014 put `tailscale serve` in front of the monitor";
@@ -2295,7 +2304,6 @@ final class WebMonitorServer {
         }
         notifyBtn.disabled = false;
         notifyBtn.classList.toggle("armed", pushEnabled);
-        notifyBtn.textContent = pushEnabled ? "\\uD83D\\uDD14 On" : "\\uD83D\\uDD14 Off";
         notifyBtn.title = pushEnabled
           ? "Notifications ARMED \\u2014 tap to mute"
           : "Tap to get a push on this device when any split rings a bell";
