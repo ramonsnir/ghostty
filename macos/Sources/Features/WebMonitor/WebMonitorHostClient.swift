@@ -45,6 +45,12 @@ final class WebMonitorHostClient {
     enum FrameTag: UInt8 {
         case hello = 0
         case helloAck = 1
+        // host->client: the session's child process exited. The host routes this
+        // existing frame to RAW subscribers too (Server.onChildExited) so this
+        // client can end a stream that would otherwise hang forever (a dead
+        // session emits no more raw_output and the conn never EOFs). See
+        // streamLoop's child-exit handling.
+        case childExited = 11
         case subscribeRaw = 31
         case rawOutput = 32
     }
@@ -99,6 +105,16 @@ final class WebMonitorHostClient {
         let end = payload.index(i, offsetBy: Int(len))
         let bytes = Data(payload[i..<end])
         return (sid, bytes)
+    }
+
+    /// Decode the session_id (u64 LE, the first field) of a `child_exited`
+    /// payload (u64 LE session_id, u32 LE exit_code, u64 LE runtime_ms — see
+    /// protocol.ChildExited). We only need the session id to confirm the exit is
+    /// for THIS subscription; the exit code / runtime are unused on the stream
+    /// path. Returns nil on a truncated payload.
+    static func decodeChildExitedSessionID(_ payload: Data) -> UInt64? {
+        guard payload.count >= 8 else { return nil }
+        return readU64LE(payload, at: payload.startIndex)
     }
 
     // MARK: - FrameReader (partial-read-tolerant reassembler)
@@ -417,6 +433,20 @@ final class WebMonitorHostClient {
                        decoded.sessionID == sessionID,
                        !decoded.bytes.isEmpty {
                         onBytes(decoded.bytes)
+                    }
+                } else if f.tag == FrameTag.childExited.rawValue {
+                    // The host now notifies RAW subscribers when the session's
+                    // child exits (Server.onChildExited). Treat it as end-of-
+                    // stream for OUR session: returning ends the read loop ->
+                    // cleanupAndClose -> onClose, which cancels the browser
+                    // /stream connection so the page falls back to the live
+                    // snapshot poll instead of hanging on a dead session. Without
+                    // this, the prior bug was a permanent freeze (no more
+                    // raw_output, no EOF). Guard on the session id so an unrelated
+                    // frame can't tear down a still-live stream.
+                    if let sid = WebMonitorHostClient.decodeChildExitedSessionID(f.payload),
+                       sid == sessionID {
+                        return
                     }
                 }
                 // Ignore any other frame types on this subscription.

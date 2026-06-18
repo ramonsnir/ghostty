@@ -1511,6 +1511,31 @@ struct WebMonitorHostClientTests {
         #expect(C.decodeRawOutput(Data([0x00, 0x01])) == nil)
     }
 
+    // MARK: - decodeChildExitedSessionID (u64 LE session_id, first field)
+
+    @Test func decodeChildExitedSessionIDReadsFirstU64LE() {
+        // Payload layout: u64 LE session_id, u32 LE exit_code, u64 LE runtime_ms
+        // (protocol.ChildExited). We only read the session id; the rest is ignored.
+        var p = Data()
+        C.appendU64LE(&p, 0xcafef00d)
+        C.appendU32LE(&p, 0)           // exit_code
+        C.appendU64LE(&p, 1234)        // runtime_ms
+        #expect(C.decodeChildExitedSessionID(p) == 0xcafef00d)
+    }
+
+    @Test func decodeChildExitedSessionIDFromHeaderOnly() {
+        // Even a payload with ONLY the 8-byte session id decodes (we never read
+        // past it), so a minimal/forward-compatible frame still tears down cleanly.
+        var p = Data()
+        C.appendU64LE(&p, 7)
+        #expect(C.decodeChildExitedSessionID(p) == 7)
+    }
+
+    @Test func decodeChildExitedSessionIDTooShortIsNil() {
+        #expect(C.decodeChildExitedSessionID(Data([0x00, 0x01, 0x02])) == nil)
+        #expect(C.decodeChildExitedSessionID(Data()) == nil)
+    }
+
     // MARK: - FrameReader (partial-read reassembly)
 
     @Test func frameReaderYieldsCompleteFrame() throws {

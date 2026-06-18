@@ -1899,6 +1899,25 @@ fn onChildExited(ctx: *anyopaque, session: *Session, exit_code: u32, runtime_ms:
         conn.renderOutEnsure(); // lazy-spawn the drain thread (idempotent)
         conn.renderOutPush(.child_exited, ce);
     }
+    // RAW subscribers (the web monitor's `/stream` source — subscribe_raw /
+    // raw_output) ALSO need the exit. Unlike attach + render subscribers above,
+    // a raw subscriber ONLY ever receives `raw_output`, so when the child dies
+    // it would otherwise get NO further frame and NO socket EOF (this host stays
+    // alive, the conn stays open) — its client's blocking read would hang
+    // forever and the browser xterm view would freeze on stale content with no
+    // fallback. This was the bug behind "monitor froze while AFK, input still
+    // worked": input rides a separate live path, but the raw stream silently
+    // stalled. We REUSE the existing `child_exited` frame (additive — no new
+    // frame type, no minor bump; child_exited predates raw subscriptions so any
+    // raw subscriber's negotiated version groks the tag) so WebMonitorHostClient
+    // can end the stream and the page falls back to the live snapshot poll. The
+    // blocking writeFramed matches the attach-subscriber path (child_exited is
+    // small + one-shot); a raw subscriber never also attaches, so this is its
+    // ONLY exit signal, and a duplicate is harmless (the client ends on the first).
+    for (e.raw_subscribers.items) |conn| {
+        if (conn.closed.load(.acquire)) continue;
+        conn.writeFramed(.child_exited, ce);
+    }
 }
 
 /// Search-status callback (runs on the session's SEARCH thread). Frames a

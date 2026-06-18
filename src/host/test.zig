@@ -2933,6 +2933,95 @@ test "host socket integration: subscribe_raw replay + live raw_output delivery (
     std.Thread.sleep(50 * std.time.ns_per_ms);
 }
 
+test "host socket integration: a RAW subscriber receives child_exited on child exit (anti-freeze)" {
+    // Regression for the web-monitor freeze: when a session's child exits, the
+    // host must deliver child_exited to RAW subscribers too (not just attach +
+    // render). Without it a raw subscriber gets no further raw_output and no EOF,
+    // so its client's blocking read hangs forever and the browser xterm view
+    // freezes on stale content with no fallback. See Server.onChildExited.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hrawx.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    // Attach connection: spawns the session + drives the child to exit.
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.rawx" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // Subscribe to RAW output on a SECOND connection BEFORE the child exits.
+    const rawc = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(rawc);
+    try connectUnix(rawc, sock_path);
+    setRecvTimeout(rawc);
+    var rawrdr: ClientReader = .{};
+    defer rawrdr.deinit(alloc);
+
+    try clientSend(alloc, rawc, .hello, protocol.Hello{ .identity_bundle_id = "test.rawx2" });
+    {
+        const tag = (try pollNext(&rawrdr, alloc, rawc, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, rawc, .subscribe_raw, protocol.SubscribeRaw{ .session_id = session_id });
+
+    // Drive the child to exit by sending `exit` to the shell.
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "exit\n",
+    });
+
+    // The raw subscriber MUST receive a child_exited frame for this session. This
+    // is the signal WebMonitorHostClient uses to end the stream so the page can
+    // fall back to the live poll instead of hanging.
+    {
+        var i: usize = 0;
+        var got_exit = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rawrdr, alloc, rawc, &payload, 4)) orelse continue;
+            if (tag != .child_exited) continue;
+            const ce = try protocol.ChildExited.decode(alloc, payload.items);
+            try testing.expectEqual(session_id, ce.session_id);
+            got_exit = true;
+            break;
+        }
+        try testing.expect(got_exit);
+    }
+}
+
 test "host socket integration: subscribe_render seed + live dual fan-out + read-only (Layer 1)" {
     const alloc = testing.allocator;
 
