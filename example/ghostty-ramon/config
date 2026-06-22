@@ -84,6 +84,17 @@ agent-dashboard-commands = claude,codex
 agent-dashboard-pin = true
 keybind = ctrl+a>d=toggle_agent_dashboard
 
+# Agent Manager (fork-only): a Haiku summarizer that replaces each dashboard
+# tile's raw working/waiting chip with a live one-line semantic status
+# (needs-you-first, then task+phase). A warm TypeScript sidecar
+# (macos/agent-manager, built with `npm ci && npm run build`) drives the MCP
+# server; billed via Claude Code auth (no API key). Requires mcp-listen +
+# mcp-token + node + agent-dashboard; self-disables silently if any is missing.
+# Set `agent-manager-node-path` only if node isn't on the login-shell PATH.
+# Tune wording live via ~/.config/ghostty-ramon/agent-manager/summarizer.md.
+# See AGENT-MANAGER.md.
+agent-manager = true
+
 # --- tmux pane/split bindings --------------------------------------------
 # %  / "   split right / split down   (shift required to type both symbols)
 # @ is also accepted as a personal alias for %.
