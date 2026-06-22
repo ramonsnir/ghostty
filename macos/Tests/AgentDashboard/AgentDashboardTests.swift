@@ -533,7 +533,8 @@ struct AgentDashboardConfigTests {
 struct AgentDashboardSortTests {
     private func entry(_ id: UUID, bell: Bool) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: 0)
+              bell: bell, hidden: false, sessionID: 0,
+              agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false)
     }
 
     @Test func bellFirst() {
@@ -577,6 +578,275 @@ struct AgentDashboardSortTests {
         ]
         let sorted = AgentDashboardModel.sorted(entries, lastSeen: lastSeen).map(\.id)
         #expect(sorted.first == ringOld)
+    }
+}
+
+// MARK: - Hook agent-state model transitions (ramon fork / Agent hooks)
+
+@MainActor
+struct AgentDashboardHookStateTests {
+    private func live(_ ids: [UUID]) -> [AgentDashboardModel.LiveSurface] {
+        ids.map { .init(id: $0, view: nil, title: "t", pwd: "/x", sessionID: 0) }
+    }
+
+    private func agents(_ ids: [UUID]) -> [UUID: AgentKind] {
+        Dictionary(uniqueKeysWithValues: ids.map { ($0, AgentKind("claude")) })
+    }
+
+    private func payload(
+        _ state: AgentState, tool: String? = nil, prompt: String? = nil, message: String? = nil
+    ) -> AgentStatePayload {
+        .init(tty: "ttys004", state: state, prompt: prompt, tool: tool, message: message)
+    }
+
+    @Test func hookBackedInsertedOnFirstEvent() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        #expect(!model.hookBacked.contains(a))
+
+        model.applyAgentState(a, payload(.working))
+        #expect(model.hookBacked.contains(a))
+        #expect(model.agentStates[a] == .working)
+        #expect(model.entries.first(where: { $0.id == a })?.hookBacked == true)
+        #expect(model.entries.first(where: { $0.id == a })?.agentState == .working)
+    }
+
+    @Test func workingToWaitingReturnsTrueAndUnhides() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+
+        // Enter working, then hide the tile.
+        _ = model.applyAgentState(a, payload(.working))
+        model.hide(a)
+        #expect(model.hidden.contains(a))
+
+        // working -> waiting: enters waiting (returns true) AND auto-unhides.
+        let entered = model.applyAgentState(a, payload(.waiting, message: "approve?"))
+        #expect(entered == true)
+        #expect(!model.hidden.contains(a))
+        #expect(!store.load().contains(a))            // persistence updated
+        #expect(model.agentStates[a] == .waiting)
+        #expect(model.entries.map(\.id).contains(a))  // reappears
+    }
+
+    @Test func nilToWaitingEntersWaiting() {
+        // First event is .waiting (prev == nil): still the entering edge.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        let entered = model.applyAgentState(a, payload(.waiting, message: "input?"))
+        #expect(entered == true)
+        #expect(model.agentStates[a] == .waiting)
+    }
+
+    @Test func waitingRepublishDoesNotReEnter() {
+        // A second .waiting with the SAME message is coalesced (no transition):
+        // returns false, so the controller does not re-post attention/push.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        #expect(model.applyAgentState(a, payload(.waiting, message: "input?")) == true)
+        // Identical republish: coalesced, returns false.
+        #expect(model.applyAgentState(a, payload(.waiting, message: "input?")) == false)
+        #expect(model.agentStates[a] == .waiting)
+    }
+
+    @Test func coalescedWaitingRepublishDoesNotReUnhideHiddenTile() {
+        // LOCKED, deliberately counterintuitive (AgentDashboardController.swift
+        // applyAgentState): a COALESCED identical `.waiting` republish does NOT
+        // re-unhide a manually-hidden tile — weaker than applyBells' re-unhide on
+        // every republish, because a Notification fires ONCE (not continuously like
+        // a bell). So the user CAN re-hide a still-waiting tile. This is the only
+        // safeguard against a future "fix" that makes waiting re-unhide on republish.
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+
+        // Enter waiting (the edge auto-unhides if hidden; here it isn't hidden yet).
+        #expect(model.applyAgentState(a, payload(.waiting, message: "input?")) == true)
+        // User hides the still-waiting tile.
+        model.hide(a)
+        #expect(model.hidden.contains(a))
+
+        // Identical `.waiting` republish: coalesced (returns false) AND — the locked
+        // bit — does NOT re-unhide. Distinguishes this from the working->waiting
+        // auto-unhide path tested in workingToWaitingReturnsTrueAndUnhides.
+        #expect(model.applyAgentState(a, payload(.waiting, message: "input?")) == false)
+        #expect(model.hidden.contains(a))            // STAYS hidden (locked)
+        #expect(store.load().contains(a))            // persistence still has it
+    }
+
+    @Test func waitingWithNewMessageStaysWaitingButDoesNotReEnter() {
+        // prev == .waiting, new message differs: NOT coalesced (message changed),
+        // but the entering-waiting edge is prev != .waiting, so it returns false.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        #expect(model.applyAgentState(a, payload(.waiting, message: "first")) == true)
+        #expect(model.applyAgentState(a, payload(.waiting, message: "second")) == false)
+        #expect(model.lastMessage[a] == "second")
+    }
+
+    @Test func coalesceUnchangedWorkingNoRebuild() {
+        // Repeated PreToolUse(working) with no field changes must coalesce. The
+        // GENUINE proof the rebuild was skipped is the early-return value `r == false`
+        // (the early-return at applyAgentState returns BEFORE rebuilding). The id
+        // array-compare below is only a sanity check that nothing was added/removed;
+        // it does NOT prove "no rebuild thrash" (ids would match even if a full
+        // rebuild ran, and AgentEntry isn't Equatable so a value compare isn't
+        // possible) — the `r == false` assertion is the load-bearing one.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working, tool: "Bash"))
+        let before = model.entries
+
+        // Same state + same tool -> coalesced: returns false (early return, no rebuild).
+        let r = model.applyAgentState(a, payload(.working, tool: "Bash"))
+        #expect(r == false)                            // the genuine no-rebuild signal
+        #expect(model.entries.map(\.id) == before.map(\.id))  // sanity: membership unchanged
+        #expect(model.entries.first?.lastTool == "Bash")
+    }
+
+    @Test func newToolUpdatesEntryNotCoalesced() {
+        // working -> working but a DIFFERENT tool: not coalesced; lastTool updates.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working, tool: "Bash"))
+        let r = model.applyAgentState(a, payload(.working, tool: "Read"))
+        #expect(r == false)                       // not entering waiting
+        #expect(model.lastTool[a] == "Read")
+        #expect(model.entries.first?.lastTool == "Read")
+    }
+
+    @Test func nilFieldLeavesPreviousValue() {
+        // tool is only present on PreToolUse; a later .idle (tool nil) must LEAVE
+        // the sticky lastTool/lastPrompt rather than wiping them.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working, tool: "Bash", prompt: "do it"))
+        _ = model.applyAgentState(a, payload(.idle))
+        #expect(model.agentStates[a] == .idle)
+        #expect(model.lastTool[a] == "Bash")
+        #expect(model.lastPrompt[a] == "do it")
+    }
+
+    @Test func waitingToIdleDoesNotEnterWaiting() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.waiting, message: "?"))
+        let r = model.applyAgentState(a, payload(.idle))
+        #expect(r == false)
+        #expect(model.agentStates[a] == .idle)
+    }
+
+    @Test func entryProjectionCarriesHookFields() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working, tool: "Grep", prompt: "find foo"))
+        let e = model.entries.first { $0.id == a }
+        #expect(e?.agentState == .working)
+        #expect(e?.lastTool == "Grep")
+        #expect(e?.lastPrompt == "find foo")
+        #expect(e?.hookBacked == true)
+    }
+
+    @Test func hooklessEntryHasNilState() {
+        // A detected agent that never POSTed a hook has nil agentState + false
+        // hookBacked (the idleSeconds heuristic, if any, is NOT muted).
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        let e = model.entries.first { $0.id == a }
+        #expect(e?.agentState == nil)
+        #expect(e?.hookBacked == false)
+        #expect(e?.lastTool == nil)
+    }
+
+    @Test func dropStalePrunesHookState() {
+        // A closed surface's hook state is dropped on rebuild(live:) exactly like
+        // bells/agents/lastSeen.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([a, b]))
+        model.applyAgents(agents([a, b]))
+        _ = model.applyAgentState(a, payload(.waiting, message: "?"))
+        _ = model.applyAgentState(b, payload(.working, tool: "Bash"))
+        #expect(model.hookBacked.contains(a))
+        #expect(model.hookBacked.contains(b))
+
+        // a's surface vanishes: its hook state must be pruned, b's kept.
+        model.rebuild(live: live([b]))
+        #expect(!model.hookBacked.contains(a))
+        #expect(model.agentStates[a] == nil)
+        #expect(model.lastMessage[a] == nil)
+        #expect(model.hookBacked.contains(b))
+        #expect(model.agentStates[b] == .working)
+        #expect(model.lastTool[b] == "Bash")
+    }
+
+    @Test func waitingSortsFirstViaAttentionKey() {
+        // A .waiting (no bell) tile floats above a plain working tile via the
+        // attention-first sort key (bell OR waiting).
+        let waiting = UUID(), working = UUID()
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        model.rebuild(live: live([waiting, working]))
+        model.applyAgents(agents([waiting, working]))
+        _ = model.applyAgentState(working, payload(.working))
+        _ = model.applyAgentState(waiting, payload(.waiting, message: "?"))
+        #expect(model.entries.first?.id == waiting)
+    }
+}
+
+// MARK: - Attention-first sort key (bell OR waiting)
+
+@MainActor
+struct AgentDashboardWaitingSortTests {
+    private func entry(_ id: UUID, bell: Bool, state: AgentState?) -> AgentEntry {
+        .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
+              bell: bell, hidden: false, sessionID: 0,
+              agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil)
+    }
+
+    @Test func waitingBeatsWorking() {
+        let waiting = UUID(), working = UUID()
+        let sorted = AgentDashboardModel.sorted([
+            entry(working, bell: false, state: .working),
+            entry(waiting, bell: false, state: .waiting),
+        ])
+        #expect(sorted.first?.id == waiting)
+    }
+
+    @Test func bellAndWaitingBothFloatAboveQuiet() {
+        let bellOnly = UUID(), waitingOnly = UUID(), quiet = UUID()
+        let sorted = AgentDashboardModel.sorted([
+            entry(quiet, bell: false, state: .working),
+            entry(bellOnly, bell: true, state: .idle),
+            entry(waitingOnly, bell: false, state: .waiting),
+        ]).map(\.id)
+        // Both attention tiles precede the quiet one; quiet is last.
+        #expect(sorted.last == quiet)
     }
 }
 

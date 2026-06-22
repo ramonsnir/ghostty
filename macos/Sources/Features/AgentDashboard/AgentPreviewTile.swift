@@ -17,6 +17,18 @@ struct AgentPreviewTile: View {
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
 
+    /// (ramon fork / Agent hooks) Whether the tile is demanding attention: a
+    /// bell rang OR the hook reports the agent is `.waiting` for the user. Both
+    /// are independent inputs — either lights the amber border + "needs input"
+    /// pill (mirrors the model's attention-first sort). NOTE the waiting
+    /// auto-unhide is weaker than the bell's: it fires only on the enters-waiting
+    /// edge (a Notification is single-shot), not on every republish, so unlike a
+    /// still-ringing tile a still-waiting tile CAN be re-hidden — see
+    /// `AgentDashboardModel.applyAgentState`.
+    private var needsAttention: Bool {
+        entry.bell || entry.agentState == .waiting
+    }
+
     /// Fixed height of the preview area. Kept deliberately SHORTER than a
     /// full-width terminal scales to, so the bottom-anchored mirror clips the
     /// top and the agent's most-recent rows ("latest progress") stay visible
@@ -35,8 +47,8 @@ struct AgentPreviewTile: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
-                    entry.bell ? Self.bellAmber : (hovering ? Color.accentColor.opacity(0.6) : Color.clear),
-                    lineWidth: entry.bell ? 3 : 1
+                    needsAttention ? Self.bellAmber : (hovering ? Color.accentColor.opacity(0.6) : Color.clear),
+                    lineWidth: needsAttention ? 3 : 1
                 )
         )
         .shadow(radius: hovering ? 6 : 0)
@@ -52,12 +64,16 @@ struct AgentPreviewTile: View {
     private var header: some View {
         HStack(spacing: 6) {
             badge
+            if entry.agentState != nil {
+                stateChip
+            }
             Text(entry.title.isEmpty ? "(untitled)" : entry.title)
                 .font(.caption)
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 4)
-            if entry.bell {
+            if needsAttention {
+                // Attention affordance: a bell rang OR the hook reports waiting.
                 Image(systemName: "bell.badge.fill")
                     .font(.caption2)
                     .foregroundStyle(Self.bellAmber)
@@ -81,6 +97,33 @@ struct AgentPreviewTile: View {
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
             .background(Color.secondary.opacity(0.18))
+            .clipShape(Capsule())
+    }
+
+    /// (ramon fork / Agent hooks) The hook-reported lifecycle state chip:
+    /// `working` (blue), `waiting ⚠` (amber, matching the bell visual), `idle`
+    /// (dim/secondary). Rendered only when `entry.agentState != nil`.
+    @ViewBuilder
+    private var stateChip: some View {
+        switch entry.agentState {
+        case .working:
+            chip("working", fg: .blue, bg: Color.blue.opacity(0.18))
+        case .waiting:
+            chip("waiting ⚠", fg: Self.bellAmber, bg: Self.bellAmber.opacity(0.2))
+        case .idle:
+            chip("idle", fg: .secondary, bg: Color.secondary.opacity(0.15))
+        case .none:
+            EmptyView()
+        }
+    }
+
+    private func chip(_ text: String, fg: Color, bg: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(fg)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(bg)
             .clipShape(Capsule())
     }
 
@@ -116,15 +159,38 @@ struct AgentPreviewTile: View {
 
     // MARK: - Footer
 
+    @ViewBuilder
     private var footer: some View {
+        // (ramon fork / Agent hooks) Optional prompt subtitle (truncated) above
+        // the metadata row, so a `working` agent shows what it was asked. Gated on
+        // `.working` (like the `⛭ tool` footer below) so a finished/idle or
+        // waiting tile stays visually quiet rather than keeping the stale prompt.
+        if entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
+            Text(prompt)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+        }
         HStack(spacing: 6) {
             Text((entry.pwd as NSString).lastPathComponent)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.head)
+            // Surface the last tool name while the agent is working
+            // (ramon fork / Agent hooks).
+            if entry.agentState == .working, let tool = entry.lastTool, !tool.isEmpty {
+                Text("⛭ \(tool)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
             Spacer(minLength: 4)
-            if entry.bell {
+            if needsAttention {
                 pill("needs input", color: Self.bellAmber)
             }
         }
