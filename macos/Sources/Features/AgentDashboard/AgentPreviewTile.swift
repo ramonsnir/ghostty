@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import GhosttyKit
 
 /// (ramon fork / Agent Dashboard, Layer 3) One row: a full-width card with a
 /// compact header (badge · title · bell dot · hide ✕), a live (or metadata-only)
@@ -94,8 +95,11 @@ struct AgentPreviewTile: View {
         // the app object) and falls through to the "Preview unavailable"
         // placeholder, never a blank rectangle.
         if previewsEnabled, entry.sessionID != 0, ghostty.app != nil, let realView = entry.realView {
+            // NOTE: hit-testing is NOT disabled here — the inner ScrollView needs
+            // it to scroll, and the mirror SurfaceView itself is made inert inside
+            // AgentMirrorPreview so it never steals the click. Taps still bubble to
+            // the card's tap-to-jump.
             AgentMirrorPreview(ghostty: ghostty, sessionID: entry.sessionID, realSurface: realView)
-                .allowsHitTesting(false)
                 .frame(maxWidth: .infinity)
                 .frame(height: Self.previewHeight)
                 .clipped()
@@ -228,6 +232,11 @@ struct AgentMirrorPreview: View {
             ScrollView(.horizontal, showsIndicators: true) {
                 Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: true)
                     .environmentObject(ghostty)
+                    // Make ONLY the mirror NSView inert (so it never grabs the
+                    // click / first responder); the enclosing frames + ScrollView
+                    // stay hit-testable so scrolling works and taps bubble to the
+                    // card's tap-to-jump.
+                    .allowsHitTesting(false)
                     .frame(width: g.naturalW, height: g.naturalH)
                     .scaleEffect(g.scale, anchor: .bottomLeading)
                     // Bound the scaled content to its on-screen size so the
@@ -235,6 +244,16 @@ struct AgentMirrorPreview: View {
                     // layout) and clips the top overflow to the preview height.
                     .frame(width: g.scaledW, height: geo.size.height, alignment: .bottomLeading)
                     .clipped()
+                    // Mark the mirror UNFOCUSED so its cursor renders as a static
+                    // hollow box instead of blinking (blink only happens on a
+                    // focused surface — see renderer/cursor.zig). Safe to repeat
+                    // (focusCallback no-ops when unchanged); live frames still
+                    // render change-driven, so the preview keeps updating.
+                    .onAppear {
+                        if let surface = surfaceView.surface {
+                            ghostty_surface_set_focus(surface, false)
+                        }
+                    }
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
