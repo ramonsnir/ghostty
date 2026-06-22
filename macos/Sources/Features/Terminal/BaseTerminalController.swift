@@ -930,6 +930,21 @@ class BaseTerminalController: NSWindowController,
         // Idempotent; a no-op when the target isn't hidden under a zoom.
         unzoomIfHidden(target)
 
+        // (ramon fork) Activate the app if it isn't already frontmost, mirroring
+        // `focusSurface`. The Agent Dashboard's tap-to-jump posts this
+        // notification from a `.nonactivatingPanel` that stays visible over other
+        // apps, so a click while Ghostty is NOT the active app makes the panel key
+        // WITHOUT activating Ghostty. Without this, `makeKeyAndOrderFront` below
+        // raises the target window but the app stays inactive — the window is
+        // "frontmost but not key", so the split highlights yet never truly gains
+        // keyboard focus (no cursor blink, dropped keystrokes). Guarded on
+        // `!isActive` so the in-app callers (command palette, goto_last_surface,
+        // project palette) — which always fire from an already-active Ghostty —
+        // are unaffected.
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
         // Bring the window to front and focus the surface.
         window?.makeKeyAndOrderFront(nil)
 
