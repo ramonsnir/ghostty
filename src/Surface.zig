@@ -1527,9 +1527,10 @@ fn selectionScrollTick(self: *Surface) !void {
     // against the local mirror (which is empty/blank, so autoscroll PAST the
     // viewport edge is degraded in B1 — the host owns scrollback; in-viewport
     // drag works). Route the resolved selection to the host instead of the
-    // empty local terminal. .exec is byte-for-byte unchanged.
+    // empty local terminal. .exec is byte-for-byte unchanged (setSelection now
+    // also fires the upstream selection_changed notification).
     switch (self.io.backend) {
-        .exec => try self.io.terminal.screens.active.select(selection),
+        .exec => try self.setSelection(selection),
         // B1: only ship a cell drag (count==1) to the host; word/line
         // (count>=2) boundary-snaps against the empty local mirror and would
         // ship wrong coords. Matches the gating on the press/cursor-pos seams;
@@ -2800,22 +2801,45 @@ fn copyCachedSelectionToClipboards(
     };
 }
 
-/// Set the selection contents.
+/// Set the active selection and notify the apprt on a genuine state
+/// transition. All selection mutations route through here rather than
+/// `screen.select` directly so the notification fires consistently. To
+/// also copy per `copy_on_select`, use `setSelectionAndCopy`.
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    // Compute the transition before `select` below, which untracks (frees)
+    // the previous selection's tracked pins; reading them after would be a
+    // use-after-free.
     const prev_ = self.io.terminal.screens.active.selection;
+    const changed = changed: {
+        const prev = prev_ orelse break :changed sel_ != null;
+        const sel = sel_ orelse break :changed true;
+        break :changed !sel.eql(prev);
+    };
+
     try self.io.terminal.screens.active.select(sel_);
+
+    if (changed) {
+        _ = self.rt_app.performAction(
+            .{ .surface = self },
+            .selection_changed,
+            {},
+        ) catch |err| {
+            log.warn("apprt failed selection_changed notification err={}", .{err});
+        };
+    }
+}
+
+/// Set a selection and, per `copy_on_select`, copy it to the clipboard.
+/// For committing selection gestures (mouse release, select-all binding).
+///
+/// This must be called with the renderer mutex held.
+fn setSelectionAndCopy(self: *Surface, sel: terminal.Selection) !void {
+    try self.setSelection(sel);
 
     // If copy on select is false then exit early.
     if (self.config.copy_on_select == .false) return;
-
-    // Set our selection clipboard. If the selection is cleared we do not
-    // clear the clipboard. If the selection is set, we only set the clipboard
-    // again if it changed, since setting the clipboard can be an expensive
-    // operation.
-    const sel = sel_ orelse return;
-    if (prev_) |prev| if (sel.eql(prev)) return;
 
     switch (self.config.copy_on_select) {
         .false => unreachable, // handled above with an early exit
@@ -4375,7 +4399,7 @@ pub fn mouseButtonCallback(
                 .exec => {
                     const prev_ = self.io.terminal.screens.active.selection;
                     if (prev_) |prev| {
-                        try self.setSelection(terminal.Selection.init(
+                        try self.setSelectionAndCopy(terminal.Selection.init(
                             prev.start(),
                             prev.end(),
                             prev.rectangle,
@@ -4548,9 +4572,10 @@ pub fn mouseButtonCallback(
             else => unreachable,
         }
 
-        // We set the selection directly rather than use `setSelection` because
-        // we want to avoid copying the selection to the selection clipboard.
-        // For left mouse clicks we only set the clipboard on release.
+        // We set the selection (not `setSelectionAndCopy`) to avoid copying the
+        // selection to the selection clipboard. For left mouse clicks we only
+        // copy on release. `setSelection` still fires the upstream
+        // selection_changed notification.
         //
         // Slice B1: under .client route the press commit/clear to the host. A
         // single-click .cell press yields a null `press_selection` (the common
@@ -4562,12 +4587,12 @@ pub fn mouseButtonCallback(
         switch (self.io.backend) {
             .exec => {
                 if (press_selection) |selection| {
-                    try self.io.terminal.screens.active.select(selection);
+                    try self.setSelection(selection);
                     try self.queueRender();
                 } else if (self.mouse.selection_gesture.left_click_count == 1 and
                     self.io.terminal.screens.active.selection != null)
                 {
-                    try self.io.terminal.screens.active.select(null);
+                    try self.setSelection(null);
                     try self.queueRender();
                 }
             },
@@ -4678,13 +4703,13 @@ pub fn mouseButtonCallback(
                 // If there is a link at this position, we want to
                 // select the link. Otherwise, select the word.
                 if (try self.linkAtPos(pos)) |link| {
-                    try self.setSelection(link.selection);
+                    try self.setSelectionAndCopy(link.selection);
                 } else {
                     const sel = screen.selectWord(
                         pin,
                         self.config.selection_word_chars,
                     ) orelse break :sel;
-                    try self.setSelection(sel);
+                    try self.setSelectionAndCopy(sel);
                 }
                 try self.queueRender();
 
@@ -4827,20 +4852,24 @@ fn maybePromptClick(self: *Surface) !bool {
         // Guarded at the start of this function
         .none => unreachable,
 
-        .click_events => {
+        .click_events => |v| {
             // For the event, we always send a left-click press event.
             // This matches what Kitty sends.
+            const key: u8, const y: u32 = switch (v) {
+                .absolute => .{ 1, pos_vp.y +| 1 },
+                .relative => .{ 2, pos_vp.y -| prompt_pin.y +| 1 },
+            };
             var data: termio.Message.WriteReq.Small.Array = undefined;
             const resp = try std.fmt.bufPrint(
                 &data,
                 "\x1B[<0;{d};{d}M",
-                .{ pos_vp.x + 1, pos_vp.y + 1 },
+                .{ pos_vp.x + 1, y },
             );
 
             // Not that noisy since this only happens on prompt clicks.
             log.debug(
-                "sending click_events=1 event=ESC{s}",
-                .{resp[1..]},
+                "sending click_events={} event=ESC{s}",
+                .{ key, resp[1..] },
             );
 
             // Ask our IO thread to write the data
@@ -5099,8 +5128,10 @@ pub fn mousePressureCallback(
         // Slice B1 deferral: deep-press is WORD selection (deepPress derefs cell
         // content for word boundaries), which is meaningless against the empty
         // local mirror under .client. Deferred to B2; left as the already-broken
-        // local select under .client. Unchanged for .exec.
-        try self.io.terminal.screens.active.select(sel orelse break :select);
+        // local select under .client. For .exec this is the upstream path
+        // (setSelection also fires the selection_changed notification); under
+        // .client it sets the empty mirror's selection as before (deferred).
+        try self.setSelection(sel orelse break :select);
         try self.queueRender();
     }
 }
@@ -5323,7 +5354,7 @@ pub fn cursorPosCallback(
         // .client drag seam cell-granularity only until B2 adds host-side
         // word/line resolution.
         switch (self.io.backend) {
-            .exec => try self.io.terminal.screens.active.select(drag_selection),
+            .exec => try self.setSelection(drag_selection),
             .client => if (self.mouse.selection_gesture.left_click_count == 1) {
                 self.sendSelectionToHost(drag_selection);
             },
@@ -6259,7 +6290,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .exec => {
                     const sel = self.io.terminal.screens.active.selectAll();
                     if (sel) |s| {
-                        try self.setSelection(s);
+                        try self.setSelectionAndCopy(s);
                         try self.queueRender();
                     }
                 },
