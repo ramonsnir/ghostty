@@ -310,6 +310,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (`macos/mcp-shim`, `ghostty-mcp`, a dumb stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`,
     built with `swift build`) so `claude mcp add ghostty -- ghostty-mcp` works. The shim's
     default URL is `http://127.0.0.1:8765/mcp`; `GHOSTTY_MCP_URL`/`GHOSTTY_MCP_TOKEN` override.
+  - **Durable registration (the "works on a new laptop" story).** A committed
+    **`.mcp.json`** at the repo root registers the server project-scoped as
+    `ghostty -- ghostty-mcp` (bare PATH name, **no secret, no clone-specific path**), so any
+    Claude Code session opened in the repo auto-gets the 12 tools after a one-time approval +
+    restart. Two pieces make a secret-less, path-less registration work: (1) the shim is
+    installed on PATH at **`~/.local/bin/ghostty-mcp`** (release build, alongside
+    `ghostty-host`; new-machine: `cd macos/mcp-shim && swift build -c release && cp
+    .build/release/ghostty-mcp ~/.local/bin/`); (2) the shim **falls back to reading
+    `mcp-token` from `~/.config/ghostty-ramon/local`** when `GHOSTTY_MCP_TOKEN` is unset
+    (`tokenFromLocalConfig()` in `main.swift` — same canonical secret store the agent-state
+    hook reads), so the committed JSON needs no token. The OLD doc registered a brittle
+    `.build/debug/ghostty-mcp` absolute path with the token baked into the `claude mcp add`
+    invocation — replaced by this. Dev identities still reachable via
+    `GHOSTTY_MCP_URL=…:8766/:8767`. Wiring: `.mcp.json` (repo root), `macos/mcp-shim/Sources/ghostty-mcp/main.swift`
+    (`tokenFromLocalConfig`); see `MCP-SERVER.md` → "Connecting an agent".
   - **12 tools:** `list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`,
     `scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
     `close_surface`, `perform_action` (the keybind-action grammar string). All address a

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ghostty": {
+      "command": "ghostty-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
