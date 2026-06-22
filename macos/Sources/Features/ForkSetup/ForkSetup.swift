@@ -46,6 +46,10 @@ enum ForkSetup {
     /// (successfully) installed/reloaded for. Drives version-aware reload.
     static let kInstalledHostVersion = "forkSetup.hostLaunchAgentVersion"
 
+    /// UserDefaults key: the CFBundleVersion the `ghostty-mcp` shim was last
+    /// installed to `~/.local/bin` for. Drives version-aware reinstall.
+    static let kInstalledShimVersion = "forkSetup.mcpShimVersion"
+
     /// Top-level plist key marking a LaunchAgent plist as written by this app.
     /// Value is the managing bundle id. launchd ignores unknown keys.
     static let managedKey = "GhosttyAppManaged"
@@ -183,6 +187,36 @@ enum ForkSetup {
         return .install(spec)
     }
 
+    // MARK: - MCP shim install (pure)
+
+    /// Decision for installing the bundled `ghostty-mcp` shim onto PATH
+    /// (`~/.local/bin/ghostty-mcp`). Symmetric with the host plan: gated on a
+    /// bundled shim existing (only CI release builds bundle it), so a dev/local
+    /// build never touches a hand-installed `~/.local/bin/ghostty-mcp`.
+    enum ShimPlan: Equatable {
+        /// No `ghostty-mcp` bundled in the app → dev/local build → do nothing.
+        case skipNoBundledShim
+        /// Installed file is present AND recorded for this exact bundle version.
+        case upToDate
+        /// Missing on PATH, or recorded for a different version → (re)install.
+        case install
+    }
+
+    /// Pure decision for the PATH shim. Reinstalls when the on-disk copy is
+    /// missing (covers a manual delete) OR the recorded version differs from the
+    /// running bundle (covers a Sparkle update shipping a new shim) — otherwise a
+    /// no-op so steady-state launches don't rewrite the file.
+    static func planShimInstall(
+        bundledShimExists: Bool,
+        installedShimExists: Bool,
+        installedVersion: String?,
+        bundleVersion: String
+    ) -> ShimPlan {
+        guard bundledShimExists else { return .skipNoBundledShim }
+        if installedShimExists && installedVersion == bundleVersion { return .upToDate }
+        return .install
+    }
+
     // MARK: - Execution (impure)
 
     /// Run both setup jobs. Call OFF the main thread (it does file IO and shells
@@ -206,6 +240,58 @@ enum ForkSetup {
         }
         seedConfigIfNeeded(home: home, fileManager: fileManager)
         manageHostLaunchAgentIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
+        installShimIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
+    }
+
+    /// Install the bundled `ghostty-mcp` stdio shim onto PATH at
+    /// `~/.local/bin/ghostty-mcp` so an MCP client (`claude mcp add ghostty --
+    /// ghostty-mcp`) can reach the in-GUI MCP server. Idempotent + version-aware.
+    ///
+    /// Safety: gated (via `planShimInstall`) on a shim actually being BUNDLED, which
+    /// only CI release builds do — so on a dev machine (no bundled shim) this never
+    /// runs and a hand-installed `~/.local/bin/ghostty-mcp` is left untouched. The
+    /// caller already early-returns unless a host is bundled, so this is reached
+    /// only on distribution builds anyway; the bundled-shim guard is belt-and-braces.
+    ///
+    /// We byte-copy via `Data.write(.atomic)` (temp + rename in the dest dir) rather
+    /// than `copyItem`, because copyItem would propagate the bundle's quarantine
+    /// xattr to the loose copy; a file we author carries none, so the signed Mach-O
+    /// passes Gatekeeper on exec.
+    private static func installShimIfNeeded(
+        bundle: Bundle, defaults: UserDefaults, home: String, fileManager: FileManager
+    ) {
+        let bundledShim = bundle.bundleURL.appendingPathComponent("Contents/MacOS/ghostty-mcp").path
+        let targetDir = "\(home)/.local/bin"
+        let target = "\(targetDir)/ghostty-mcp"
+        let bundleVersion = (bundle.infoDictionary?["CFBundleVersion"] as? String) ?? "0"
+
+        let plan = planShimInstall(
+            bundledShimExists: fileManager.isExecutableFile(atPath: bundledShim),
+            installedShimExists: fileManager.fileExists(atPath: target),
+            installedVersion: defaults.string(forKey: kInstalledShimVersion),
+            bundleVersion: bundleVersion)
+
+        switch plan {
+        case .skipNoBundledShim:
+            logger.debug("no bundled ghostty-mcp (dev/local build); leaving PATH shim unmanaged")
+        case .upToDate:
+            logger.debug("ghostty-mcp shim already installed for version \(bundleVersion, privacy: .public)")
+        case .install:
+            do {
+                let data = try Data(contentsOf: URL(fileURLWithPath: bundledShim))
+                try fileManager.createDirectory(atPath: targetDir, withIntermediateDirectories: true)
+                let targetURL = URL(fileURLWithPath: target)
+                try data.write(to: targetURL, options: .atomic)
+                try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target)
+                defaults.set(bundleVersion, forKey: kInstalledShimVersion)
+                logger.info("installed ghostty-mcp shim at \(target, privacy: .public) for version \(bundleVersion, privacy: .public)")
+            } catch {
+                // Non-fatal: MCP is an opt-in power feature. Leave the recorded
+                // version stale so the next launch retries; the colleague can also
+                // register the shim from its bundled path by hand.
+                logger.warning("failed to install ghostty-mcp shim: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     private static func seedConfigIfNeeded(home: String, fileManager: FileManager) {
@@ -569,6 +655,11 @@ enum ForkSetup {
     # ~/.config/ghostty-ramon/local:
     #   mcp-listen = 127.0.0.1:8765
     #   mcp-token  = <generate with: openssl rand -hex 24>
+    # The `ghostty-mcp` stdio shim is installed to ~/.local/bin on first launch;
+    # connect a local agent with:
+    #   claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"
+    # (the shim reads the token above from ~/.config/ghostty-ramon/local). See
+    # MCP-SERVER.md.
 
     """
 }

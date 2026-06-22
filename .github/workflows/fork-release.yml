@@ -146,6 +146,19 @@ jobs:
           cp -f zig-out/bin/ghostty-host "$APP/Contents/MacOS/ghostty-host"
           chmod +x "$APP/Contents/MacOS/ghostty-host"
 
+      # Bundle the MCP stdio shim alongside the host so it is signed + notarized as
+      # part of the bundle and carried by Sparkle. The app's ForkSetup copies it
+      # onto PATH (~/.local/bin/ghostty-mcp) on first launch so `claude mcp add
+      # ghostty -- ghostty-mcp` works for a colleague. Pure Swift/Foundation SPM
+      # package (NOT in Ghostty.xcodeproj), so it builds with the system swift.
+      - name: Build + bundle ghostty-mcp shim
+        run: |
+          swift build -c release --package-path macos/mcp-shim
+          APP="macos/build/Release/Ghostty.app"
+          cp -f macos/mcp-shim/.build/release/ghostty-mcp "$APP/Contents/MacOS/ghostty-mcp"
+          chmod +x "$APP/Contents/MacOS/ghostty-mcp"
+          test -x "$APP/Contents/MacOS/ghostty-mcp"
+
       - name: Inject version + updater keys into Info.plist
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
@@ -199,6 +212,9 @@ jobs:
           sign "$APP/Contents/PlugIns/DockTilePlugin.plugin"
           # The bundled host runs under launchd; hardened runtime, no special entitlements.
           sign "$APP/Contents/MacOS/ghostty-host"
+          # The MCP shim is copied onto PATH by ForkSetup and exec'd by Claude Code;
+          # sign it so the loose copy passes Gatekeeper. Hardened runtime, no entitlements.
+          sign "$APP/Contents/MacOS/ghostty-mcp"
           # Finally the app bundle itself, with its entitlements.
           /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
             --entitlements "macos/Ghostty.entitlements" "$APP"
