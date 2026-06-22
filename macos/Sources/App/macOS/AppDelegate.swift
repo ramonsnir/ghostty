@@ -121,8 +121,14 @@ class AppDelegate: NSObject,
 
     /// (ramon fork / Agent Dashboard, Layer 3) The app-global floating dashboard
     /// controller. Created at launch when `agent-dashboard` is enabled, else
-    /// lazily on the first `toggle_agent_dashboard`.
-    private var agentDashboard: AgentDashboardController?
+    /// lazily on the first `toggle_agent_dashboard`. `internal` (not private) so
+    /// the MCP `list_surfaces` enrichment can read its `hookSnapshot()` on main.
+    var agentDashboard: AgentDashboardController?
+
+    /// (ramon fork / Agent Manager) Supervises the TypeScript Agent SDK sidecar.
+    /// Created at launch; SELF-DISABLES (no spawn) unless agent-manager is enabled
+    /// AND mcp-listen + mcp-token are set AND a node binary resolves.
+    private var agentManager: AgentManagerController?
 
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
@@ -314,6 +320,15 @@ class AppDelegate: NSObject,
             self.agentDashboard = controller
             controller.restoreVisibility()
         }
+
+        // (ramon fork / Agent Manager) Spawn + supervise the TS Agent SDK sidecar.
+        // Placed AFTER the MCP block because the sidecar's only transport IS the
+        // MCP server; `start()` self-disables (one info log, no spawn) unless
+        // agent-manager is on AND mcp-listen + mcp-token are set AND node resolves.
+        // It hops off-main internally for the node probe + Process spawn.
+        let agentManager = AgentManagerController(ghostty: ghostty)
+        self.agentManager = agentManager
+        agentManager.start()
 
         // Start our update checker.
         updateController.startUpdater()
@@ -539,6 +554,10 @@ class AppDelegate: NSObject,
         // (ramon fork) Tear down the agent dashboard (persist visibility, stop
         // the detector).
         agentDashboard?.teardown()
+
+        // (ramon fork / Agent Manager) Tear down the sidecar (terminate the node
+        // process; cancel any pending restart).
+        agentManager?.teardown()
 
         // We have no notifications we want to persist after death,
         // so remove them all now. In the future we may want to be

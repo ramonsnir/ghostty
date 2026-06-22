@@ -177,11 +177,21 @@ struct AgentPreviewTile: View {
 
     @ViewBuilder
     private var footer: some View {
-        // (ramon fork / Agent hooks) Optional prompt subtitle (truncated) above
-        // the metadata row, so a `working` agent shows what it was asked. Gated on
-        // `.working` (like the `⛭ tool` footer below) so a finished/idle or
-        // waiting tile stays visually quiet rather than keeping the stale prompt.
-        if entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
+        // (ramon fork / Agent Manager) The manager's one-line annotation summary,
+        // shown above the metadata row when present (any state). It is the semantic
+        // status line; the colored state chip in the header still reflects the
+        // authoritative hook state (design §5.1). Mirrors the prompt subtitle's
+        // modifier set. When absent, the tile falls back to the prompt subtitle
+        // below (and the chip alone), so a manager-less tile is unchanged.
+        if let summary = entry.annotation?.summary, !summary.isEmpty {
+            Text(summary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+        } else if entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
             Text(prompt)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -229,14 +239,25 @@ struct AgentPreviewTile: View {
 
     private func jump() {
         guard let view = entry.realView else { return }
-        for controller in TerminalController.all {
-            for v in controller.surfaceTree where v.id == view.id {
-                controller.unzoomIfHidden(v)
-                NotificationCenter.default.post(
-                    name: Ghostty.Notification.ghosttyPresentTerminal,
-                    object: v
-                )
-                return
+        // Defer to the next runloop so the present runs AFTER AppKit finishes
+        // making the dashboard panel the key window from THIS click. The panel
+        // is `canBecomeKey` (the tiles must take clicks), so a click makes it
+        // key as part of the in-flight mouse event. If we posted synchronously,
+        // `ghosttyDidPresentTerminal`'s `makeKeyAndOrderFront` would run before
+        // that settles and the panel could re-grab key afterward — leaving the
+        // target window frontmost but NOT key, so its surface never truly gains
+        // focus (no cursor blink, dropped keystrokes) until you click away and
+        // back. Running on the next runloop makes the target take key last.
+        DispatchQueue.main.async {
+            for controller in TerminalController.all {
+                for v in controller.surfaceTree where v.id == view.id {
+                    controller.unzoomIfHidden(v)
+                    NotificationCenter.default.post(
+                        name: Ghostty.Notification.ghosttyPresentTerminal,
+                        object: v
+                    )
+                    return
+                }
             }
         }
     }

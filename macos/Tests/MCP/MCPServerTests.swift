@@ -404,7 +404,9 @@ struct MCPServerTests {
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
             focused: true, bell: false, exited: false, atPrompt: true,
-            processName: "claude", command: "claude --resume", idleSeconds: 0.0)
+            processName: "claude", command: "claude --resume", idleSeconds: 0.0,
+            agentState: "working", lastPrompt: "do it", lastTool: "Bash",
+            notes: "Implementing fix")
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -423,6 +425,10 @@ struct MCPServerTests {
         #expect(d["processName"] as? String == "claude")
         #expect(d["command"] as? String == "claude --resume")
         #expect(d["idleSeconds"] as? Double == 0.0)
+        #expect(d["agentState"] as? String == "working")
+        #expect(d["lastPrompt"] as? String == "do it")
+        #expect(d["lastTool"] as? String == "Bash")
+        #expect(d["notes"] as? String == "Implementing fix")
     }
 
     // fork: the three optional fields are OMITTED (not null/empty) when unknown.
@@ -432,11 +438,17 @@ struct MCPServerTests {
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
             focused: true, bell: false, exited: false, atPrompt: true,
-            processName: nil, command: nil, idleSeconds: nil)
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
         #expect(d["idleSeconds"] == nil)
+        // fork / Agent Manager: agent-* fields are omitted (not null) when unknown.
+        #expect(d["agentState"] == nil)
+        #expect(d["lastPrompt"] == nil)
+        #expect(d["lastTool"] == nil)
+        #expect(d["notes"] == nil)
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)

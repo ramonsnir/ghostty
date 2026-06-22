@@ -25,7 +25,7 @@ enum MCPTools {
     static let toolSchemas: [[String: Any]] = [
         [
             "name": "list_surfaces",
-            "description": "List all live terminal surfaces (panes) with identity and layout position. Returns the stable surface id (UUID) used by every other tool. window/tab are POSITIONAL indices (encounter order), NOT stable across calls; only id is durable. NOTE on the per-row 'atPrompt' field: it is a COARSE heuristic derived from the inverse of Ghostty's close-confirmation state, NOT a true shell-prompt (OSC 133) signal, and it is gated by the 'confirm-close-surface' config: with the default ('true') it approximates 'a child is idle at a prompt'; with 'confirm-close-surface = false' atPrompt is ALWAYS true; with 'always' it is ALWAYS false. Treat it as a hint, not ground truth. Three OPTIONAL per-row fields are OMITTED when unknown: 'processName' (the foreground process, e.g. 'claude') and 'command' (its full command line, e.g. 'claude --resume') — these require the pty-host backend AND a host new enough to push them, so they are absent until the host is restarted after a GUI upgrade; and 'idleSeconds' (seconds since the surface's screen last changed) — ~0 while a TUI is repainting/working, growing while it waits for input, and a COARSE heuristic (a TUI that repaints on a timer never goes idle).",
+            "description": "List all live terminal surfaces (panes) with identity and layout position. Returns the stable surface id (UUID) used by every other tool. window/tab are POSITIONAL indices (encounter order), NOT stable across calls; only id is durable. NOTE on the per-row 'atPrompt' field: it is a COARSE heuristic derived from the inverse of Ghostty's close-confirmation state, NOT a true shell-prompt (OSC 133) signal, and it is gated by the 'confirm-close-surface' config: with the default ('true') it approximates 'a child is idle at a prompt'; with 'confirm-close-surface = false' atPrompt is ALWAYS true; with 'always' it is ALWAYS false. Treat it as a hint, not ground truth. Three OPTIONAL per-row fields are OMITTED when unknown: 'processName' (the foreground process, e.g. 'claude') and 'command' (its full command line, e.g. 'claude --resume') — these require the pty-host backend AND a host new enough to push them, so they are absent until the host is restarted after a GUI upgrade; and 'idleSeconds' (seconds since the surface's screen last changed) — ~0 while a TUI is repainting/working, growing while it waits for input, and a COARSE heuristic (a TUI that repaints on a timer never goes idle). Four more OPTIONAL fork fields are OMITTED when unknown, sourced from the Agent Dashboard's Claude Code hook state (absent when the dashboard is disabled or no hook has reported): 'agentState' ('working'/'waiting'/'idle'), 'lastPrompt' (last user prompt), 'lastTool' (last tool used), and 'notes' (the Agent Manager's latest annotation summary).",
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
         [
@@ -167,6 +167,23 @@ enum MCPTools {
                 "additionalProperties": false,
             ],
         ],
+        [
+            "name": "set_surface_annotation",
+            "description": "Write a one-line semantic status (the 'annotation') onto a surface's Agent Dashboard tile — the Agent Manager's DISPLAY channel. The tile shows 'summary' in place of the raw state chip (the chip COLOR still reflects the authoritative hook state). 'summary' is required and non-empty; the optional 'suggestion'/'phase'/'needsUser'/'confidence' carry the manager's suggested response, a coarse phase label, an attention flag, and a 0..1 self-reported confidence for later phases (Phase 0 renders only 'summary'). This does NOT send input to the agent.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "string", "description": "Surface UUID from list_surfaces."],
+                    "summary": ["type": "string", "description": "One-line semantic status to display."],
+                    "suggestion": ["type": "string"],
+                    "phase": ["type": "string"],
+                    "needsUser": ["type": "boolean"],
+                    "confidence": ["type": "number"],
+                ],
+                "required": ["id", "summary"],
+                "additionalProperties": false,
+            ],
+        ],
     ]
 
     // MARK: - dispatch
@@ -281,6 +298,17 @@ enum MCPTools {
             }
             let timeoutMs = MCPEventBus.clampTimeoutMs(((arguments["timeoutMs"] as? NSNumber)?.doubleValue) ?? 30000)
             return .watchPattern(MCPEventBus.PatternSpec(uuid: uuid, regex: regex, timeoutMs: timeoutMs))
+
+        case "set_surface_annotation":
+            guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
+            // Validate the annotation body BEFORE any main hop so a blank summary
+            // is a fast, AppKit-free error (mirrors send_key's pre-hop keySpecs
+            // check above).
+            guard let payload = AgentAnnotationPayload.fromArguments(arguments) else {
+                return .invalidParams("missing or empty summary")
+            }
+            let ok = server.applyAnnotation(uuid: uuid, annotation: payload.annotation)
+            return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
 
         default:
             return .methodNotFound

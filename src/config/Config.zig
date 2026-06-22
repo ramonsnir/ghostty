@@ -2923,6 +2923,27 @@ keybind: Keybinds = .{},
 /// it).
 @"agent-dashboard-commands": RepeatableString = .{},
 
+/// (ramon fork / Agent Manager) Master enable for the Agent Manager — a
+/// warm TypeScript Agent SDK sidecar (driven via the embedded MCP server)
+/// that summarizes/annotates live agent sessions in the Agent Dashboard.
+/// When true AND `mcp-listen`+`mcp-token` are set AND a node binary
+/// resolves, the GUI spawns/supervises the sidecar; otherwise it stays
+/// fully dormant. Default false. Fork-only — keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty sharing
+/// `~/.config/ghostty/config` would error on it).
+@"agent-manager": bool = false,
+
+/// (ramon fork / Agent Manager) Absolute path to the `node` binary used to
+/// run the Agent Manager sidecar. A GUI app does not inherit the shell
+/// `PATH`, so a bare `node` won't resolve; set this to an absolute path
+/// (else the macOS apprt falls back to a login-shell probe). Null/empty
+/// (the default) ⇒ probe. Fork-only — keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
+// NOTE: `[:0]const u8` (NOT `[]const u8`) so the C config getter
+// (ghostty_config_get) can return it as a NUL-terminated string — the
+// macOS apprt reads this via the `agentManagerNodePath` Swift getter.
+@"agent-manager-node-path": ?[:0]const u8 = null,
+
 /// (ramon fork / Phase 2b) AF_UNIX socket path of a running `ghostty-host`
 /// (`zig-out/bin/ghostty-host --listen=<sockpath>`). When set, a new surface
 /// connects to that host and runs its terminal emulation ON THE HOST,
@@ -11308,5 +11329,31 @@ test "mcp: parse and default" {
         try cfg.finalize();
         try testing.expectEqualStrings("127.0.0.1:8765", cfg.@"mcp-listen".?);
         try testing.expectEqualStrings("supersecrettoken1234", cfg.@"mcp-token".?);
+    }
+}
+
+test "agent-manager: parse and default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(false, cfg.@"agent-manager");
+        try testing.expect(cfg.@"agent-manager-node-path" == null);
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-manager=true",
+            "--agent-manager-node-path=/usr/local/bin/node",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"agent-manager");
+        try testing.expectEqualStrings("/usr/local/bin/node", cfg.@"agent-manager-node-path".?);
     }
 }

@@ -25,6 +25,10 @@ struct AgentEntry: Identifiable {
     /// True once this surface has EVER reported a hook event — hook state is
     /// authoritative thereafter and MUTES the `idleSeconds` heuristic.
     let hookBacked: Bool
+    /// (ramon fork / Agent Manager) The latest LLM annotation (summary/suggestion)
+    /// for this surface, or nil if the manager has not annotated it. In-memory ONLY
+    /// in Phase 0 (NO persistence).
+    let annotation: AgentAnnotation?
 }
 
 /// Persistence boundary for the hide set, injected so the round-trip is
@@ -121,6 +125,42 @@ final class InMemoryAgentStateStore: AgentStateStore {
     func save(_ map: [UInt64: PersistedAgentState]) { self.map = map }
 }
 
+/// (ramon fork / Agent Dashboard) Persistence boundary for the user's manual
+/// tile order, injected for testability (mirrors `HideStore`/`AgentStateStore`).
+/// An ORDERED list of stable HOST session ids (`UInt64`) — NOT surface UUIDs,
+/// which are freshly minted each GUI launch (so a UUID-keyed order could never
+/// survive a relaunch — the same lesson `AgentStateStore` encodes).
+protocol OrderStore {
+    func load() -> [UInt64]
+    func save(_ order: [UInt64])
+}
+
+/// Production order store backed by the fork bundle-id `UserDefaults` domain.
+/// Session ids are stringified (a `UInt64` can exceed `Int`, and a plist number
+/// array can't safely hold the full range).
+struct UserDefaultsOrderStore: OrderStore {
+    static let key = "agentDashboardManualOrder"
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func load() -> [UInt64] {
+        (defaults.stringArray(forKey: Self.key) ?? []).compactMap { UInt64($0) }
+    }
+
+    func save(_ order: [UInt64]) {
+        defaults.set(order.map(String.init), forKey: Self.key)
+    }
+}
+
+/// In-memory `OrderStore` for tests.
+final class InMemoryOrderStore: OrderStore {
+    private var order: [UInt64]
+    init(_ order: [UInt64] = []) { self.order = order }
+    func load() -> [UInt64] { order }
+    func save(_ order: [UInt64]) { self.order = order }
+}
+
 /// (ramon fork / Agent Dashboard, Layer 3) The single source of truth for the
 /// dashboard. `@MainActor`: every member touches AppKit / `SurfaceView` /
 /// `ghostty_surface_*` (which must be main-only). Detection runs off-main and
@@ -167,7 +207,27 @@ final class AgentDashboardModel: ObservableObject {
     /// thereafter (mutes the `idleSeconds` heuristic for these ids).
     private(set) var hookBacked: Set<UUID> = []
 
+    // MARK: - Manual order (ramon fork / Agent Dashboard)
+
+    /// The user's manual tile order: an ORDERED list of stable HOST session ids
+    /// (`UInt64`). Drives the manual-rank sort key, which sits ABOVE the UUID
+    /// tie-break (placed tiles sort by this list; unplaced tiles — new agents —
+    /// float to the top by recency). `@Published` so the "Reset order"
+    /// affordance shows/hides reactively. Empty ⇒ no manual order. Persisted via
+    /// `orderStore`. Each drag REWRITES this from the displayed order, so it
+    /// never grows past the number of visible tiles.
+    @Published private(set) var manualOrder: [UInt64] = []
+
+    // MARK: - Annotations (ramon fork / Agent Manager)
+
+    /// The latest LLM annotation per surface, written by the Agent Manager sidecar
+    /// through `set_surface_annotation`. `@Published` so a tile re-renders when the
+    /// summary changes. In-memory ONLY in Phase 0 — NO persistence (unlike the
+    /// hook state above), and pruned on `rebuild(live:)` for vanished surfaces.
+    @Published private(set) var annotations: [UUID: AgentAnnotation] = [:]
+
     private let store: HideStore
+    private let orderStore: OrderStore
 
     // MARK: - Agent-state persistence (ramon fork / Agent hooks)
 
@@ -190,10 +250,16 @@ final class AgentDashboardModel: ObservableObject {
     /// churning UserDefaults on every rebuild.
     static let persistTouchInterval: TimeInterval = 3600
 
-    init(store: HideStore, agentStateStore: AgentStateStore = InMemoryAgentStateStore()) {
+    init(
+        store: HideStore,
+        agentStateStore: AgentStateStore = InMemoryAgentStateStore(),
+        orderStore: OrderStore = InMemoryOrderStore()
+    ) {
         self.store = store
         self.agentStore = agentStateStore
+        self.orderStore = orderStore
         self.hidden = store.load()
+        self.manualOrder = orderStore.load()
         let loaded = agentStateStore.load()
         let pruned = AgentDashboardModel.prune(
             loaded, now: Date(),
@@ -235,6 +301,32 @@ final class AgentDashboardModel: ObservableObject {
     /// chip.
     func hiddenCount(among liveIDs: Set<UUID>) -> Int {
         hidden.intersection(liveIDs).count
+    }
+
+    // MARK: - Manual order (ramon fork / Agent Dashboard)
+
+    /// Apply a user drag-reorder. `sessionIDs` is the new full order of the
+    /// CURRENTLY DISPLAYED tiles (WYSIWYG), captured by the view's `.onMove`.
+    /// Sessionless tiles (id 0 — e.g. no `pty-host`, or pre-attach) can't be
+    /// ordered stably across a relaunch, so they're dropped from the saved
+    /// order (they fall back to recency/UUID). Persists and re-sorts.
+    func setManualOrder(_ sessionIDs: [UInt64]) {
+        manualOrder = sessionIDs.filter { $0 != 0 }
+        orderStore.save(manualOrder)
+        rebuildEntriesFromCurrentState()
+    }
+
+    /// True when the user has a custom order (drives the "Reset order" footer
+    /// affordance).
+    var hasManualOrder: Bool { !manualOrder.isEmpty }
+
+    /// Clear the manual order → back to attention-first / recency / UUID.
+    /// Persists. No-op (and no churn) when already empty.
+    func resetOrder() {
+        guard !manualOrder.isEmpty else { return }
+        manualOrder = []
+        orderStore.save(manualOrder)
+        rebuildEntriesFromCurrentState()
     }
 
     // MARK: - Reactive inputs
@@ -331,6 +423,15 @@ final class AgentDashboardModel: ObservableObject {
         return prev != .waiting && payload.state == .waiting
     }
 
+    /// (ramon fork / Agent Manager) Store an annotation for `id` and rebuild the
+    /// entries so the tile re-renders. Called on main from the controller's
+    /// `.ghosttyAgentAnnotationDidChange` observer. NO persistence + NO coalesce in
+    /// Phase 0: the sidecar already rate-limits its own writes.
+    func applyAnnotation(_ id: UUID, _ annotation: AgentAnnotation) {
+        annotations[id] = annotation
+        rebuildEntriesFromCurrentState()
+    }
+
     // MARK: - Reconciliation
 
     /// Snapshot of one live surface taken on main (value types + weak view).
@@ -364,6 +465,9 @@ final class AgentDashboardModel: ObservableObject {
         lastPrompt = lastPrompt.filter { liveIDs.contains($0.key) }
         lastMessage = lastMessage.filter { liveIDs.contains($0.key) }
         hookBacked = hookBacked.intersection(liveIDs)
+        // (ramon fork / Agent Manager) Drop annotations for vanished surfaces too
+        // (in-memory only, so nothing is persisted — just don't leak).
+        annotations = annotations.filter { liveIDs.contains($0.key) }
         // (ramon fork / hooks) Restore persisted state onto the (freshly-minted)
         // surface UUIDs by their stable host session id, and keep live records
         // fresh. This is what makes statuses survive a GUI restart.
@@ -458,6 +562,33 @@ final class AgentDashboardModel: ObservableObject {
     /// the Show popover are all derived from this, never from `liveIDs`.
     var liveAgentIDs: Set<UUID> { Set(live.map(\.id).filter { agents[$0] != nil }) }
 
+    /// (ramon fork / Agent Manager) Per-surface hook/annotation snapshot for the
+    /// MCP `list_surfaces` enrichment. Value types only, so the MCP layer can read
+    /// it on the existing main hop and never touch the @MainActor model off-main.
+    struct HookSnapshotEntry {
+        let agentState: String?   // AgentState rawValue, or nil
+        let lastPrompt: String?
+        let lastTool: String?
+        let notes: String?        // annotation summary (the only honest "notes" source)
+    }
+
+    /// Snapshot the hook + annotation state for every surface that has any of it.
+    /// Surfaces with no state at all are omitted, so an absent map entry means
+    /// "nothing known" (the MCP shaper then omits those fields — honest absence).
+    func hookSnapshot() -> [UUID: HookSnapshotEntry] {
+        var out: [UUID: HookSnapshotEntry] = [:]
+        let ids = Set(agentStates.keys)
+            .union(lastPrompt.keys).union(lastTool.keys).union(annotations.keys)
+        for id in ids {
+            out[id] = HookSnapshotEntry(
+                agentState: agentStates[id]?.rawValue,
+                lastPrompt: lastPrompt[id],
+                lastTool: lastTool[id],
+                notes: annotations[id]?.summary)
+        }
+        return out
+    }
+
     /// Metadata for one hidden-but-live agent, so the "N hidden" popover can show
     /// `badge · title · Show` (spec §4.3) instead of a raw UUID prefix. Retained
     /// from the `live` snapshot + latest detector results even though the
@@ -499,10 +630,17 @@ final class AgentDashboardModel: ObservableObject {
                     agentState: agentStates[s.id],
                     lastTool: lastTool[s.id],
                     lastPrompt: lastPrompt[s.id],
-                    hookBacked: hookBacked.contains(s.id)
+                    hookBacked: hookBacked.contains(s.id),
+                    annotation: annotations[s.id]
                 )
             }
-        entries = AgentDashboardModel.sorted(built.filter { !$0.hidden }, lastSeen: lastSeen)
+        // session id → its index in the user's manual order (keep-first on the
+        // (impossible-in-practice) duplicate, to stay total).
+        let manualRank = Dictionary(
+            manualOrder.enumerated().map { ($1, $0) },
+            uniquingKeysWith: { first, _ in first })
+        entries = AgentDashboardModel.sorted(
+            built.filter { !$0.hidden }, lastSeen: lastSeen, manualRank: manualRank)
     }
 
     // MARK: - Sort (pure, testable)
@@ -514,13 +652,32 @@ final class AgentDashboardModel: ObservableObject {
         e.bell || e.agentState == .waiting
     }
 
-    /// Deterministic order: attention-first (bell OR waiting), then
-    /// most-recently-seen-as-agent (descending), then stable UUID tie-break
-    /// (variant b — no activity tick).
-    static func sorted(_ entries: [AgentEntry], lastSeen: [UUID: Date] = [:]) -> [AgentEntry] {
-        entries.sorted { a, b in
+    /// Deterministic order, highest precedence first:
+    ///   1. attention-first (bell OR waiting) — demands always float to the top;
+    ///   2. user manual order (`manualRank`, keyed by host session id) — an
+    ///      UNPLACED tile (no rank) sorts ABOVE a placed one, so a newly-appeared
+    ///      agent floats to the top until the user places it; placed tiles sort
+    ///      by ascending rank;
+    ///   3. most-recently-seen-as-agent (descending) — orders the unplaced tiles
+    ///      among themselves (and is a near-constant tie for placed ones);
+    ///   4. stable UUID tie-break.
+    /// A session id of 0 (no host session) is treated as never-placed: it can't
+    /// be ranked stably, so it falls through to recency/UUID.
+    static func sorted(
+        _ entries: [AgentEntry],
+        lastSeen: [UUID: Date] = [:],
+        manualRank: [UInt64: Int] = [:]
+    ) -> [AgentEntry] {
+        func rank(_ e: AgentEntry) -> Int? {
+            e.sessionID == 0 ? nil : manualRank[e.sessionID]
+        }
+        return entries.sorted { a, b in
             let aa = needsAttention(a), ba = needsAttention(b)
             if aa != ba { return aa && !ba }
+            let ra = rank(a), rb = rank(b)
+            // Unplaced (nil) sorts before placed (non-nil): new agents at top.
+            if (ra == nil) != (rb == nil) { return ra == nil }
+            if let ra, let rb, ra != rb { return ra < rb }
             let sa = lastSeen[a.id] ?? .distantPast
             let sb = lastSeen[b.id] ?? .distantPast
             if sa != sb { return sa > sb }
@@ -555,7 +712,8 @@ final class AgentDashboardController: NSWindowController {
         self.ghostty = ghostty
         self.model = AgentDashboardModel(
             store: UserDefaultsHideStore(),
-            agentStateStore: UserDefaultsAgentStateStore())
+            agentStateStore: UserDefaultsAgentStateStore(),
+            orderStore: UserDefaultsOrderStore())
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
         let panel = AgentDashboardPanel()
@@ -588,6 +746,7 @@ final class AgentDashboardController: NSWindowController {
 
         subscribeChurn()
         subscribeAgentState()
+        subscribeAnnotation()
         rebuildControllerObservers()
     }
 
@@ -740,6 +899,31 @@ final class AgentDashboardController: NSWindowController {
                 }
             }
             .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Manager) Observe `.ghosttyAgentAnnotationDidChange`
+    /// posted by the MCP `set_surface_annotation` handler after it resolves the
+    /// tool's id to a surface UUID. Mirrors `subscribeAgentState`: registered
+    /// unconditionally (not gated on `isShown`) and hands the annotation to the
+    /// model, which rebuilds its `@Published` entries.
+    private func subscribeAnnotation() {
+        NotificationCenter.default.publisher(for: .ghosttyAgentAnnotationDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,
+                      let annotation = note.userInfo?[AgentStateUserInfoKey.annotation] as? AgentAnnotation
+                else { return }
+                self.model.applyAnnotation(id, annotation)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Manager) Forward the model's per-surface hook/annotation
+    /// snapshot for the MCP `list_surfaces` enrichment. MUST be called on main
+    /// (the model is `@MainActor`); returns value types only.
+    func hookSnapshot() -> [UUID: AgentDashboardModel.HookSnapshotEntry] {
+        model.hookSnapshot()
     }
 
     /// (ramon fork / Agent hooks) Post `.ghosttyAgentNeedsAttention` for `id`,
