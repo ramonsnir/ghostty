@@ -54,8 +54,12 @@ keybind = ctrl+a>d=toggle_agent_dashboard
   it. Use this instead of an external window manager's "pin": Rectangle Pro and friends
   match windows by **bundle id**, and the dashboard shares the fork's bundle id with the
   terminal windows, so their pin can't target the dashboard alone — it ends up managing
-  the terminals too. Pinning in-process avoids that. Read once at launch — relaunch to
-  change.
+  the terminals too. Pinning in-process avoids that. When pinned, the panel also becomes
+  an **activating window** (it's a non-activating overlay otherwise) so Rectangle's
+  move/snap shortcuts can still reposition it — those act on the frontmost app's focused
+  window, which a non-activating panel never becomes. So you keep it on top *and* can
+  still move it with Rectangle; the only side effect is that clicking the dashboard
+  activates Ghostty. Read once at launch — relaunch to change.
 - **`toggle_agent_dashboard`** — a payload-less keybind action (fork-only). Bind it to
   whatever you like; `ctrl+a>d` is the tmux-flavored default. It's also in the command
   palette as **"Toggle Agent Dashboard"**.

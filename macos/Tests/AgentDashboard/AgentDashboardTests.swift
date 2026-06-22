@@ -1536,9 +1536,11 @@ struct UserNotesPersistenceTests {
 @MainActor
 struct AgentDashboardPanelTests {
     @Test func defaultPanelIsNormalLevel() {
-        // Unpinned (default): normal stacking so other windows can cover it.
+        // Unpinned (default): normal stacking so other windows can cover it, and
+        // a non-activating overlay panel (clicking it doesn't steal activation).
         let panel = AgentDashboardPanel()
         #expect(panel.level == .normal)
+        #expect(panel.styleMask.contains(.nonactivatingPanel))
     }
 
     @Test func pinnedPanelFloatsAboveOtherWindows() {
@@ -1548,5 +1550,15 @@ struct AgentDashboardPanelTests {
         let panel = AgentDashboardPanel(pinned: true)
         #expect(panel.level == .floating)
         #expect(panel.accessibilitySubrole() == .standardWindow)
+    }
+
+    @Test func pinnedPanelIsActivatingSoWindowManagersCanTargetIt() {
+        // Pinned drops `.nonactivatingPanel` so the panel can become the
+        // frontmost app's focused window — which is what Rectangle/Rectangle Pro
+        // keyboard shortcuts act on. It must still never become `main`.
+        let panel = AgentDashboardPanel(pinned: true)
+        #expect(!panel.styleMask.contains(.nonactivatingPanel))
+        #expect(panel.canBecomeKey)
+        #expect(!panel.canBecomeMain)
     }
 }

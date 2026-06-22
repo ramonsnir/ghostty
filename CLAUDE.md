@@ -381,15 +381,26 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   a side") CANNOT distinguish the panel from the terminals — they share one bundle id —
   so its pin manages the terminals too; pinning here sidesteps that. The AX subrole stays
   `.standardWindow` even when pinned (a floating subrole is filtered out by most window
-  managers; only the window *level* changes). **See `AGENT-DASHBOARD.md` for the
-  user-facing config/usage.** The load-bearing facts for an agent touching this code:
+  managers; only the window *level* changes). **Pinning ALSO drops `.nonactivatingPanel`**
+  from the style mask: the default overlay never activates Ghostty so it never becomes the
+  app's focused window, and Rectangle/Rectangle Pro keyboard shortcuts act on "the
+  frontmost app's focused window" — so a non-activating pinned panel is UNMOVABLE by
+  Rectangle (Rectangle itself manages any window with level < 21, so the floating level 3
+  is fine; the blocker was the non-activating panel never being the focused window). As an
+  activating window it can become key/focused on click, so Rectangle can move/snap it while
+  the floating level keeps it on top; it STILL never becomes `main` (`canBecomeMain = false`
+  unchanged), so "new window inherits from main" is unaffected. Trade-off: clicking a
+  pinned dashboard activates Ghostty (fine — clicking a tile jumps into a terminal anyway).
+  **See `AGENT-DASHBOARD.md` for the user-facing config/usage.** The load-bearing facts for
+  an agent touching this code:
   - **Action + config (fork-only, default off):** the payload-less keybind action
     `toggle_agent_dashboard` (also a command-palette entry "Toggle Agent Dashboard");
     `agent-dashboard` (master enable) + `agent-dashboard-commands` (exe names that count
     as an agent; comma-split OR repeated, default `claude,codex`; both reuse
     `RepeatableString`) + **`agent-dashboard-pin`** (bool, default false → floating window
-    level when true; wired `Config.zig` → `Ghostty.Config.agentDashboardPin` →
-    `AgentDashboardPanel(pinned:)` `level = pinned ? .floating : .normal`). Keep all in
+    level + activating window when true; wired `Config.zig` → `Ghostty.Config.agentDashboardPin`
+    → `AgentDashboardPanel(pinned:)`, which sets `level = pinned ? .floating : .normal` AND
+    drops `.nonactivatingPanel` from the style mask when pinned). Keep all in
     `~/.config/ghostty-ramon/config`. Read at launch (relaunch to change).
   - **Live previews need `pty-host`.** Each tile mounts a read-only **mirror**
     `SurfaceView` (`mirror = true` + the host session id) and lets the existing
