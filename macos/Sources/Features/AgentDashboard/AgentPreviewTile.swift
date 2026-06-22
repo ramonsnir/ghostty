@@ -19,17 +19,26 @@ struct AgentPreviewTile: View {
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
 
-    /// (ramon fork / Agent hooks) Whether the tile is demanding attention: a
-    /// bell rang OR the hook reports the agent is `.waiting` for the user. Both
-    /// are independent inputs — either lights the amber border + "needs input"
-    /// pill (mirrors the model's attention-first sort). NOTE the waiting
-    /// auto-unhide is weaker than the bell's: it fires only on the enters-waiting
-    /// edge (a Notification is single-shot), not on every republish, so unlike a
-    /// still-ringing tile a still-waiting tile CAN be re-hidden — see
-    /// `AgentDashboardModel.applyAgentState`.
-    private var needsAttention: Bool {
-        entry.bell || entry.agentState == .waiting
-    }
+    /// (ramon fork / Agent hooks) Attention is split into TWO independent signals
+    /// that intentionally behave like their real-terminal analogs:
+    ///
+    /// - `bellRinging` (the REAL bell) drives the amber FRAME (border) + the header
+    ///   bell ICON. Like any bell it CLEARS WHEN YOU FOCUS the surface (Ghostty
+    ///   resets the surface bell on focus and the dashboard's bell publisher
+    ///   follows). This is the transient "something happened" signal.
+    /// - `waitingForInput` (the HOOK `.waiting` state) drives the "waiting ⚠" chip
+    ///   + the "needs input" pill. It is a STATUS, not a bell: it PERSISTS until the
+    ///   agent reports a new state (it does NOT clear on focus), so you can leave a
+    ///   waiting tile up on purpose; hiding the split is the manual dismiss. (The
+    ///   `.waiting` auto-unhide still fires once on the enters-waiting edge — see
+    ///   `AgentDashboardModel.applyAgentState` — so a re-hidden tile re-surfaces
+    ///   only on a fresh waiting transition.)
+    ///
+    /// Keeping the strong frame/icon tied to the bell (not the hook) is deliberate:
+    /// the bell's clear-on-focus is what makes leaving a `.waiting` status around
+    /// non-annoying.
+    private var bellRinging: Bool { entry.bell }
+    private var waitingForInput: Bool { entry.agentState == .waiting }
 
     /// Fixed height of the preview area. Kept deliberately SHORTER than a
     /// full-width terminal scales to, so the bottom-anchored mirror clips the
@@ -49,8 +58,8 @@ struct AgentPreviewTile: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
-                    needsAttention ? Self.bellAmber : (hovering ? Color.accentColor.opacity(0.6) : Color.clear),
-                    lineWidth: needsAttention ? 3 : 1
+                    bellRinging ? Self.bellAmber : (hovering ? Color.accentColor.opacity(0.6) : Color.clear),
+                    lineWidth: bellRinging ? 3 : 1
                 )
         )
         .shadow(radius: hovering ? 6 : 0)
@@ -74,8 +83,10 @@ struct AgentPreviewTile: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 4)
-            if needsAttention {
-                // Attention affordance: a bell rang OR the hook reports waiting.
+            if bellRinging {
+                // REAL-bell affordance only. Clears on focus (bell-tied); the hook
+                // `.waiting` status uses the "waiting ⚠" chip + "needs input" pill
+                // instead, which persist.
                 Image(systemName: "bell.badge.fill")
                     .font(.caption2)
                     .foregroundStyle(Self.bellAmber)
@@ -195,7 +206,9 @@ struct AgentPreviewTile: View {
                     .truncationMode(.tail)
             }
             Spacer(minLength: 4)
-            if needsAttention {
+            if waitingForInput {
+                // Hook-driven status: persists until the agent reports a new state
+                // (NOT cleared by focus, unlike the bell frame/icon).
                 pill("needs input", color: Self.bellAmber)
             }
         }
