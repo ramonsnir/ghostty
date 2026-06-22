@@ -624,9 +624,20 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   `In Progress` until the 90-min job timeout — one run cost ~$9 of macOS minutes for a
   release that never even published. Notarization is Apple's FREE service; only the CI
   *runner time* costs money, so doing it locally is $0 (notary slowness = wall-clock
-  only). Release assets are free and separate from Git LFS. One-time local setup: a
-  notary keychain profile (`xcrun notarytool store-credentials`); the Developer ID cert
-  + Sparkle key already live in the keychain. Run it from `ramon-fork` on the main tree.
+  only). Release assets are free and separate from Git LFS. Run it from `ramon-fork`
+  on the main tree. **One-time per machine:** Developer ID cert in the login keychain;
+  Sparkle private key in the keychain (`sign_update` uses it automatically — no file);
+  `sign_update`+`generate_keys` on PATH (copied to `~/.local/bin`) and `create-dmg`
+  (`npm i -g create-dmg`); a notary keychain profile —
+  `xcrun notarytool store-credentials ghostty-ramon-notary --key <AuthKey.p8> --key-id <ID> --issuer <UUID>`.
+  **NOTARY GOTCHA (cost me a real chase):** a freshly-enrolled Apple Developer account's
+  FIRST notarizations can sit `status: In Progress` for HOURS (Apple-side provisioning /
+  service backlog) — NOT a bug in our artifact (it'd be `Invalid`, with a `notarytool log`,
+  if the zip were bad). Don't burn CI on it (that's how the ~$9 evaporated). Check
+  `developer.apple.com/system-status` (Developer ID Notary Service) + that no Program
+  License Agreement is pending in the account, then just re-run the local script once
+  the service is healthy; `xcrun notarytool history --keychain-profile ghostty-ramon-notary`
+  shows whether old submissions ever drained.
 - **CI release (`.github/workflows/fork-release.yml`) — MANUAL-ONLY fallback.** Its
   `on:` is `workflow_dispatch` only (NOT `push`) precisely so normal pushes don't burn
   macOS minutes; trigger it by hand only if you can't build locally (and expect
