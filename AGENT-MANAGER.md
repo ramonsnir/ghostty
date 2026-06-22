@@ -9,10 +9,14 @@ working/waiting chip — optimized for *which agent needs you* and *what each is
 - `Reviewing the diff before committing`
 - `Idle — task done`
 
+And — once a session is **waiting on you** — it also proposes a **reply you can send**
+(Phase 2), shown on the tile with **Approve / Edit / Dismiss**, plus a **per-session
+notes** field where you tell it the session's goals.
+
 It is **off by default**, macOS-only, and bills through your existing Claude Code
-auth (no API key). This is **Phase 1** of a larger design (a per-session manager that
-suggests/auto-applies replies, and a cross-session coordinator, are future phases —
-not built yet).
+auth (no API key). **Phases 1 (summarizer) and 2 (suggest-only manager) are built**;
+auto-apply and a cross-session coordinator are future phases. It **never sends on its
+own** — a suggestion only reaches the agent when *you* tap Approve.
 
 ## How it works (one paragraph)
 
@@ -22,8 +26,11 @@ surfaces, picks the ones the dashboard has detected as agents, reads each one's
 viewport, makes a single **Haiku** call to summarize it, and writes the one-liner back
 onto the tile via the MCP `set_surface_annotation` tool. The summary call uses no tools
 and the SDK authenticates the same way the `claude` CLI does — so there is **no API key
-in Ghostty** and usage is billed to your normal plan. The sidecar is read-only: it
-never types into a session.
+in Ghostty** and usage is billed to your normal plan. On a separate, slower pass it
+also runs a **manager** (Opus) for any session that is *waiting* — assembling its goals
+(your notes + recent prompts) + screen and proposing a reply, written to the same tile.
+The sidecar **never types into a session**: the suggestion is rendered on the tile and
+only sent if you tap Approve (which types it in — it does not press Return for you).
 
 ## Requirements
 
@@ -57,18 +64,36 @@ Quit + relaunch the fork. On launch the app checks the gate (enabled + MCP confi
 node resolvable); if any is missing it stays **silently dormant** (one info log, the
 dashboard is unaffected). Otherwise it spawns + supervises the sidecar.
 
-## Tuning the summaries (no rebuild)
+## Suggestions + notes (Phase 2)
 
-The summarizer's wording/priorities are tunable at runtime via an optional override
-file, appended to the built-in prompt and reloaded on change:
+When a session is **waiting** on you, its tile shows a proposed reply with three actions:
+
+- **Approve** — *types* the suggestion into the agent's prompt and **stops there**; you
+  read it and press Return yourself. (It never auto-submits — that's deliberate.)
+- **Edit** — tweak the text first, then Approve types your edited version.
+- **Dismiss** — clear the suggestion (the status summary stays).
+
+Each tile also has a **notes** field: type the session's goal/guidance there (e.g.
+"after the fix, add tests and update the changelog") and the manager weights it in
+future suggestions. Notes persist per session across relaunches.
+
+Suggestions only fire on `waiting` (debounced, ~20s) and use the manager's
+accumulated-session-context memory. The manager has **no tools and cannot act** — it
+only proposes text; the sole send path is your Approve tap.
+
+## Tuning the prompts (no rebuild)
+
+Both passes take an optional override file, appended to the built-in prompt and reloaded
+on change (cannot change the output format or grant any capability — both run with no tools):
 
 ```
-~/.config/ghostty-ramon/agent-manager/summarizer.md
+~/.config/ghostty-ramon/agent-manager/summarizer.md   # the status one-liner
+~/.config/ghostty-ramon/agent-manager/manager.md       # the waiting-reply suggestions
 ```
 
-e.g. "Prefer the file/feature name over the verb. Flag any failing test or error
-prominently." The override **cannot** change the output format or grant the summarizer
-any capability (it runs with no tools).
+e.g. summarizer: "Prefer the file/feature name over the verb; flag failing tests."
+e.g. manager: "Be terse; never propose destructive commands; ask a clarifying question
+if the goal is ambiguous."
 
 ## Verifying / troubleshooting
 
@@ -81,6 +106,9 @@ any capability (it runs with no tools).
   exists); confirm `mcp-listen`/`mcp-token` are set.
 - **Summaries look generic?** That's the no-hooks fallback (viewport-only). Install the
   Claude Code hooks so your prompt + working/waiting state reach the summarizer.
+- **No suggestion on a waiting tile?** Suggestions need the hooks (the `waiting` state
+  comes from them) and only fire after the ~20s manager debounce; a session the hooks
+  never marked `waiting` won't get one. The summary still works without hooks.
 
 ## Cost & privacy
 
@@ -91,7 +119,8 @@ disable the feature (or close the tile) for any session you don't want summarize
 
 ## Status / roadmap
 
-Phase 1 (this) is the read-only summarizer. Future phases (a per-session manager that
-proposes — and, opt-in, auto-applies — replies, and a cross-session coordinator) are
-designed but not built; auto-apply will be gated server-side at the MCP boundary, never
-trusted to the model. Architecture/notes: `.claude/plans/agent-manager-design.md`.
+**Built:** Phase 1 (read-only summarizer) + Phase 2 (suggest-only manager — proposes a
+reply on `waiting`, you Approve/Edit/Dismiss; never sends on its own). **Not built:**
+Phase 3 (opt-in *auto-apply*, gated server-side at the MCP boundary, never trusted to
+the model) and Phase 4 (a cross-session coordinator). Architecture/notes:
+`.claude/plans/agent-manager-design.md`.

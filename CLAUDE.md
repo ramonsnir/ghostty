@@ -490,10 +490,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   summarizer** on top of the Agent Dashboard: each agent tile shows a live, one-line
   semantic status (needs-you-FIRST, then task+phase — e.g. "Waiting: which DB to migrate?",
   "Implementing auth fix — writing tests") instead of just the raw working/waiting chip.
-  **This is Phase 1 of a larger design** (`.claude/plans/agent-manager-design.md`, local):
-  Phase 2 = an Opus manager that suggests replies, Phase 3 = opt-in auto-apply, Phase 4 = a
-  cross-session coordinator — NOT built yet. **See `AGENT-MANAGER.md` for user-facing
-  config/usage.** The load-bearing facts for an agent touching this code:
+  **Phases 1 + 2 are BUILT** (`.claude/plans/agent-manager-design.md`, local): Phase 1 =
+  the summarizer (below); **Phase 2 = an Opus manager that SUGGESTS replies** (suggest-only,
+  see its own bullet below). Phase 3 = opt-in auto-apply, Phase 4 = a cross-session
+  coordinator — NOT built yet. **See `AGENT-MANAGER.md` for user-facing config/usage.** The
+  load-bearing facts for an agent touching this code:
   - **A warm TypeScript Agent SDK sidecar is the brain; the MCP server is its hands.**
     `claude -p` was rejected (cold-boots the CLI per call). Instead a persistent TS program
     (`macos/agent-manager/`, `@anthropic-ai/claude-agent-sdk`, NOT in `Ghostty.xcodeproj`,
@@ -553,6 +554,39 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     **GUI relaunch only** to enable (no host restart); the sidecar must be built
     (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
     the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
+  - **PHASE 2 — manager SUGGEST-ONLY (built).** On a `waiting` tile the manager proposes a
+    reply the user can **Approve / Edit / Dismiss**; Approve TYPES it into the agent's prompt
+    WITHOUT submitting (you press Return). **ZERO autonomous send** — the sidecar/manager has
+    no send tools; the ONLY send path is Swift, gated behind an explicit Approve tap. Pieces:
+    - **Manager pass (`macos/agent-manager/src/manager.ts`, `MANAGER_MODEL=claude-opus-4-8`):**
+      a SECOND sweep pass alongside the summarizer, gated `waiting`-only with its own debounce
+      + unchanged-skip (`shouldSuggest`), fed goals (`userNotes` + recent prompts) + screen,
+      writing a `suggestion` via the merge tool. Like the summarizer it runs `tools:[]` / no
+      `mcpServers` (text-only). **SDK-persistence caveat:** the chosen "persistent per-session
+      conversation" is NOT cleanly supported by `@anthropic-ai/claude-agent-sdk` v0.3.185, so
+      it uses the documented **single-shot-with-accumulated-context** fallback (goals + prior
+      suggestion + screen fed each call) — revisit if the SDK gains clean session resume.
+    - **Annotation channel is now a MERGE:** `set_surface_annotation` takes summary-OR-suggestion
+      and MERGES partial updates into the stored per-surface `AgentAnnotation`, so the summarizer
+      (`summary`) and manager (`suggestion`) update INDEPENDENTLY without clobbering
+      (`AgentAnnotationPayload.fromArguments` is the partial parser; the model merges).
+    - **Per-session `userNotes`** (distinct from `notes`=summary): a persisted-by-`sessionID`
+      store mirroring `AgentStateStore` (rehydrated on rebuild), a tile `TextField`, and a
+      `list_surfaces.userNotes` enrichment fed to the manager as explicit goals (omitted-when-nil
+      — absent until you type a note).
+    - **Safety helper (UNUSED in Phase 2):** `macos/Sources/Features/MCP/MCPSafety.swift` —
+      a pure destructive-reply denylist (`isAffirmativeReply`, dangerous-screen patterns) +
+      tests, staged for the Phase-3 auto-apply gate; no Phase-2 path calls it.
+    - Wiring: sidecar — `manager.ts` (+`prompts.ts` `MANAGER_BASE_PROMPT` + `manager.md`
+      override + `model.ts` `suggest()` + `index.ts` second pass); macOS — `MCPAnnotation.swift`
+      (merge), `AgentStateBridge.swift` (`AgentAnnotation`), `AgentDashboardController.swift`
+      (`userNotes` store + merge + observer), `AgentPreviewTile.swift` (suggestion render +
+      Approve/Edit/Dismiss + notes field), `MCPInput.swift` (the type-without-submit helper
+      Approve calls), `MCPLayout.swift`/`MCPTools.swift` (`userNotes`), `MCPSafety.swift`
+      (+iOS exclusion). Tests: `MCPSafetyTests.swift`, the merge/`userNotes` cases in
+      `MCPAnnotationTests`/`MCPServerTests`/`AgentDashboardTests`, and the sidecar
+      `manager.test.ts` (+ updated `index`/`model`/`prompt` suites). **GUI relaunch + a rebuilt
+      sidecar `dist` to enable; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
