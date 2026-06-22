@@ -84,17 +84,26 @@ case "$state" in
 esac
 
 # --- tty: the surface's controlling terminal ---------------------------------
-# Claude Code runs in the terminal surface, so this script's controlling tty is
-# the surface's tty. `ps -o tty=` is the portable read; fall back to the `tty`
-# builtin if ps yields the no-tty marker "??".
-tty="$(ps -o tty= -p "$$" 2>/dev/null | tr -d ' ')"
-if [ -z "$tty" ] || [ "$tty" = "??" ] || [ "$tty" = "?" ]; then
-  tty="$(tty 2>/dev/null)"
-  case "$tty" in
-    "not a tty"|"") tty="" ;;
+# Claude Code spawns hooks DETACHED from the controlling terminal, so this
+# process's OWN tty is usually the no-tty marker "??" (and the `tty` builtin
+# likewise reports "not a tty"). The surface's tty lives on an ANCESTOR — the
+# `claude` process itself runs on it. So walk up the ppid chain and take the
+# nearest ancestor that has a real tty. Stop at init/no-parent or after a bounded
+# number of hops. The FIRST real tty found is the right one (we never reach
+# ghostty-host's own "??" because we stop as soon as a tty appears).
+tty=""
+_pid="$$"
+_hops=0
+while [ -n "$_pid" ] && [ "$_pid" != "0" ] && [ "$_pid" != "1" ] && [ "$_hops" -lt 12 ]; do
+  _t="$(ps -o tty= -p "$_pid" 2>/dev/null | tr -d ' ')"
+  case "$_t" in
+    ""|"??"|"?") : ;;            # no tty at this level — keep walking up
+    *) tty="$_t"; break ;;
   esac
-fi
-# No tty -> the MCP handler can't correlate; nothing to do.
+  _pid="$(ps -o ppid= -p "$_pid" 2>/dev/null | tr -d ' ')"
+  _hops=$(( _hops + 1 ))
+done
+# No tty anywhere up the chain -> the MCP handler can't correlate; nothing to do.
 [ -n "$tty" ] || exit 0
 
 # --- token: env var, else the per-machine secret file ------------------------

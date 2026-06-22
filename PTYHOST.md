@@ -7,16 +7,14 @@ of the split: **a terminal session (live shell + its children + screen state)
 survives a GUI binary swap or restart** — quit the GUI, rebuild/reinstall, relaunch,
 and each tab reattaches to its still-running host session.
 
-Branch: **`ptyhost/phase-2b`**. Isolated worktree at
-`/Users/ramon/git/ghostty-phase2b`; the shared checkout
-(`/Users/ramon/git/ghostty`, branch `ramon-fork`) hosts other live sessions and must
-never be touched. History: `git log eedccf9b5..HEAD` (base `eedccf9b5` =
-"bell: add fork-only bell-features-focused"); use `git show` / `git blame` for the
-rationale behind any line.
+Status: **merged into `ramon-fork`** (the former `ptyhost/phase-2b` branch and
+its isolated worktree are gone — merged and deleted). For the rationale behind
+any line, `git log` / `git show` / `git blame` the `.client`-backend files
+(`src/host/`, `src/termio/Client.zig`, `src/termio/Termio.zig`).
 
 This doc is the **current-state** description (what works, what doesn't, how it's
-built, what the goal status is). Forward backlog + decisions live in
-`.claude/docs/ptyhost-remediation.md`.
+built, what the goal status is). Forward backlog + decisions live in the
+**local-only** (untracked) `.claude/docs/ptyhost-remediation.md`.
 
 ---
 
