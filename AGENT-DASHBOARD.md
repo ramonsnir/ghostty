@@ -34,6 +34,7 @@ afterward — config is read at launch.
 # Agent Dashboard (fork-only). Default off.
 agent-dashboard          = true
 agent-dashboard-commands = claude,codex        # exe names that count as "an agent"
+agent-dashboard-pin      = true                # float the panel above other windows
 
 # Keybind to toggle the panel (also in the command palette: "Toggle Agent Dashboard").
 keybind = ctrl+a>d=toggle_agent_dashboard
@@ -48,6 +49,13 @@ keybind = ctrl+a>d=toggle_agent_dashboard
   versioned/wrapped install whose basename isn't the command name still matches (e.g.
   Claude's exe `…/share/claude/versions/2.1.181` matches because `claude` is a path
   component). Read once at launch — relaunch to change.
+- **`agent-dashboard-pin`** — `true` floats the panel above other windows (native
+  always-on-top); `false` (default) keeps it at normal level so other windows can cover
+  it. Use this instead of an external window manager's "pin": Rectangle Pro and friends
+  match windows by **bundle id**, and the dashboard shares the fork's bundle id with the
+  terminal windows, so their pin can't target the dashboard alone — it ends up managing
+  the terminals too. Pinning in-process avoids that. Read once at launch — relaunch to
+  change.
 - **`toggle_agent_dashboard`** — a payload-less keybind action (fork-only). Bind it to
   whatever you like; `ctrl+a>d` is the tmux-flavored default. It's also in the command
   palette as **"Toggle Agent Dashboard"**.
@@ -241,9 +249,9 @@ gains a live state chip.
 
 ## Where it lives (code map)
 
-- **Config:** `src/config/Config.zig` (`agent-dashboard`, `agent-dashboard-commands`,
-  both reusing `RepeatableString`); the action in `src/input/Binding.zig`,
-  `src/apprt/action.zig`, `src/input/command.zig`.
+- **Config:** `src/config/Config.zig` (`agent-dashboard`, `agent-dashboard-commands`
+  reusing `RepeatableString`, and `agent-dashboard-pin` bool); the action in
+  `src/input/Binding.zig`, `src/apprt/action.zig`, `src/input/command.zig`.
 - **Foreground-pid plumbing (the minor-4 frame):** `src/host/protocol.zig`
   (`foreground_pid` FrameType + `ForegroundPid` struct, `PROTOCOL_VERSION_MINOR = 4`),
   `src/host/Session.zig` (resolve-on-change + reattach seed), `src/host/Server.zig`
@@ -261,7 +269,9 @@ gains a live state chip.
   `AgentDetector.swift` (off-main libproc poller + pure `matchAgent`/`resolve`).
 - **Wiring:** `macos/Sources/App/macOS/AppDelegate.swift` (create-on-launch + toggle
   notification + teardown); `macos/Sources/Ghostty/Ghostty.Config.swift`
-  (`agentDashboard`, `agentDashboardCommands`, `resolveAgentDashboardCommands`);
+  (`agentDashboard`, `agentDashboardCommands`, `resolveAgentDashboardCommands`,
+  `agentDashboardPin`); the panel level is set in `AgentDashboardPanel(pinned:)`,
+  passed `ghostty.config.agentDashboardPin` by the controller;
   `macos/Ghostty.xcodeproj/project.pbxproj` (iOS-target exclusion of the macOS-only
   files).
 - **Per-tile agent state (Claude Code hooks):** the hook script + settings snippet in
@@ -278,6 +288,7 @@ gains a live state chip.
 - **Tests:** `src/config/Config.zig` (`agent-dashboard config`),
   `src/input/Binding.zig` (`Binding toggle_agent_dashboard`), `src/host/test.zig`
   (minor-4 / `ForegroundPid` round-trip), `src/termio/Client.zig` (`foreground_pid`
-  decode), plus the Swift detector/model/sort tests in
+  decode), plus the Swift detector/model/sort tests + the `AgentDashboardPanelTests`
+  pin/window-level tests in
   `macos/Tests/AgentDashboard/AgentDashboardTests.swift` and the hook/agent-state
   pure-helper tests in `macos/Tests/MCP/MCPAgentStateTests.swift`.

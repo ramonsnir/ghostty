@@ -1207,3 +1207,23 @@ struct AgentStatePersistenceTests {
         #expect(store.load().isEmpty)    // pruned + re-saved at init
     }
 }
+
+// MARK: - Panel pin (window level)
+
+@MainActor
+struct AgentDashboardPanelTests {
+    @Test func defaultPanelIsNormalLevel() {
+        // Unpinned (default): normal stacking so other windows can cover it.
+        let panel = AgentDashboardPanel()
+        #expect(panel.level == .normal)
+    }
+
+    @Test func pinnedPanelFloatsAboveOtherWindows() {
+        // `agent-dashboard-pin = true` → floating level (native always-on-top),
+        // while the AX subrole stays a standard window (the pin is the level,
+        // not the subrole).
+        let panel = AgentDashboardPanel(pinned: true)
+        #expect(panel.level == .floating)
+        #expect(panel.accessibilitySubrole() == .standardWindow)
+    }
+}
