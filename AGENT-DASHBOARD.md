@@ -90,6 +90,125 @@ keybind = ctrl+a>d=toggle_agent_dashboard
 
 ---
 
+## Per-tile agent state (Claude Code hooks — optional)
+
+The dashboard can show **what each Claude Code agent is doing right now** — a small
+state chip per tile — when you wire up the included Claude Code **hooks**. This is
+**optional and additive**: without it, tiles still show the live preview and the
+bell border; with it, every tile gains an authoritative state chip and a waiting
+agent floats to the top, auto-unhides, and (if you've armed Web Push) pings your
+phone.
+
+### What the per-tile state means
+
+A hook-backed tile shows one of three states next to its badge:
+
+- **working** (neutral/blue) — the agent is actively running: you submitted a prompt,
+  it's about to call a tool (`PreToolUse`), or the session just started. When working,
+  the tile may also show the **last tool** it ran (e.g. `Bash`) and a truncated copy
+  of your **last prompt** as a subtitle.
+- **waiting** (amber, same look as the bell) — the agent is **asking you for input or
+  approval** (a Claude Code `Notification`). A waiting tile gets the amber border + a
+  "needs input" pill (exactly like a bell), **sorts to the top**, **auto-unhides** if
+  you'd hidden it, and fires a **Web Push** if you've armed the web monitor's Notify
+  toggle. This is the "an agent needs me" signal. (Web Push needs the HTTPS /
+  `tailscale serve` setup described in WEB-MONITOR.md — a plain-HTTP-over-Tailscale-IP
+  monitor can't push.) The waiting push uses its OWN per-surface ~3s debounce, keyed
+  separately from the bell's, so a bell on the same surface within ~3s never swallows
+  the `⏳` waiting push (each kind only coalesces its own repeats) — the headline
+  "needs input" push always gets through. The waiting auto-unhide is slightly weaker
+  than the bell's: it lands once, on entering waiting, so you *can* re-hide a
+  still-waiting tile (a bell, which re-rings, cannot).
+- **idle** (dim) — the agent finished its turn (`Stop`) or the session ended
+  (`SessionEnd`).
+
+A tile only shows a state chip once that agent has reported at least one hook event;
+agents you haven't wired hooks for (or non-Claude agents like Codex) keep the
+preview-only behavior. Once a tile is **hook-backed**, the hook state is
+authoritative — it overrides any heuristic idle/working guess.
+
+### How it works (one sentence)
+
+Each Claude Code lifecycle event runs a tiny script that POSTs `{tty, state, …}` to
+the fork's in-GUI **MCP server**; the MCP server resolves your terminal's **tty** to
+the matching dashboard tile (using the same host-pushed foreground pid the dashboard
+already tracks) and updates that tile's state. It is **GUI + hooks only** — no host
+restart, no extra background process; the POST just rides the MCP server you may
+already be running.
+
+### Setup
+
+**1. You need the MCP server running.** The hooks POST to the fork's MCP server on
+`127.0.0.1`. Make sure `~/.config/ghostty-ramon/config` (and/or the untracked `local`
+file for the token) has:
+
+```ini
+mcp-listen = 127.0.0.1:8765
+mcp-token  = <your-token>        # recommended; put real secrets in ~/.config/ghostty-ramon/local
+```
+
+(See `MCP-SERVER.md` for the MCP server itself. The hook is inert if the server is
+down — the POST just fails silently under a 2-second timeout.) The `mcp-token` is a
+shell-execution credential and the hook reads it from `~/.config/ghostty-ramon/local`
+(or `$GHOSTTY_MCP_TOKEN`), so `chmod 600 ~/.config/ghostty-ramon/local` to keep it
+out of other local users' reach.
+
+**2. Install the hook script.** Copy it into the fork config dir and make it
+executable:
+
+```sh
+mkdir -p ~/.config/ghostty-ramon/claude-hooks
+cp example/claude-hooks/ghostty-agent-state.sh ~/.config/ghostty-ramon/claude-hooks/
+chmod +x ~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh
+```
+
+**3. Wire the hooks into Claude Code.** Merge the `hooks` block from
+`example/claude-hooks/settings-hooks.json` into your `~/.claude/settings.json`. It
+maps each Claude Code event to the script with the state as an argument:
+
+| Claude Code event | state passed |
+|---|---|
+| `UserPromptSubmit` | `working` |
+| `PreToolUse` | `working` |
+| `SessionStart` | `working` |
+| `Notification` | `waiting` |
+| `Stop` | `idle` |
+| `SessionEnd` | `idle` |
+
+That's it — start (or restart) a Claude Code session in a Ghostty tab and its tile
+gains a live state chip.
+
+### Token & dev-build notes
+
+- The script reads the MCP token from `$GHOSTTY_MCP_TOKEN` if set, else greps
+  `mcp-token` from `~/.config/ghostty-ramon/local` (the per-machine secret file). If
+  neither is present it POSTs without a token (fine when the MCP server runs open).
+- It hits port **8765** (the Release MCP default). For a dev build (ReleaseLocal/Debug,
+  which the MCP per-identity offset shifts to 8766/8767), set `GHOSTTY_MCP_PORT` in the
+  hook's environment.
+- The `PreToolUse` event is the chatty one (it fires on every tool call), so the
+  script debounces it per-terminal with a ~1s stamp file in a private dir (`$TMPDIR`,
+  or `~/.cache/ghostty-ramon` if `$TMPDIR` is unset — never world-writable `/tmp`).
+  The debounce actually keys on the `working` arg, so it covers all three `working`
+  events (`UserPromptSubmit`, `PreToolUse`, `SessionStart`) — the script can't tell
+  them apart. In the common turn order this only swallows the redundant `PreToolUse`;
+  the rare reverse edge (a `SessionStart` <1s before a prompt) can drop a prompt
+  subtitle, which is accepted. The `waiting`/`idle` events (`Notification`/`Stop`/
+  `SessionEnd`) are rare/meaningful and never debounced.
+
+### Limitations (honest)
+
+- **Claude Code only.** The hook events are Claude Code's; Codex and other agents
+  keep the preview-only tile (still detected, still previewed, just no state chip).
+- **No TTL / no liveness ping.** State changes only on a hook event. If a session is
+  killed mid-turn without firing `Stop`, the tile can sit on a stale `working` until
+  the ~2s detector poll notices the process is gone and removes the tile entirely — a
+  cosmetic miss, not a leak.
+- **One tab per tty.** Correlation is by controlling tty, which is unique per terminal
+  split, so this is exact in practice.
+
+---
+
 ## Requirements & limits
 
 - **Live color previews require the fork's `pty-host` backend** (`pty-host = …` in the
@@ -134,8 +253,20 @@ keybind = ctrl+a>d=toggle_agent_dashboard
   (`agentDashboard`, `agentDashboardCommands`, `resolveAgentDashboardCommands`);
   `macos/Ghostty.xcodeproj/project.pbxproj` (iOS-target exclusion of the macOS-only
   files).
+- **Per-tile agent state (Claude Code hooks):** the hook script + settings snippet in
+  `example/claude-hooks/{ghostty-agent-state.sh,settings-hooks.json}`; the shared
+  symbols (`AgentState`, `AgentStatePayload`, the two `Notification.Name`s) in
+  `macos/Sources/Features/AgentDashboard/AgentStateBridge.swift`; the MCP `/agent-state`
+  route + tty→surface resolver in `macos/Sources/Features/MCP/MCPServer.swift` +
+  `MCPAgentState.swift`; the model's `agentStates`/`hookBacked`/`applyAgentState` +
+  observer + `postNeedsAttention` in `AgentDashboardController.swift`; the state chip in
+  `AgentPreviewTile.swift`; and the Web Push on waiting in
+  `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (attention observer →
+  `onAttention`/`enqueuePush`). **GUI + hooks only — no Zig/host change** (it reuses the
+  existing minor-4 foreground-pid).
 - **Tests:** `src/config/Config.zig` (`agent-dashboard config`),
   `src/input/Binding.zig` (`Binding toggle_agent_dashboard`), `src/host/test.zig`
   (minor-4 / `ForegroundPid` round-trip), `src/termio/Client.zig` (`foreground_pid`
   decode), plus the Swift detector/model/sort tests in
-  `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
+  `macos/Tests/AgentDashboard/AgentDashboardTests.swift` and the hook/agent-state
+  pure-helper tests in `macos/Tests/MCP/MCPAgentStateTests.swift`.

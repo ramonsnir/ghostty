@@ -192,11 +192,24 @@ final class WebPushManager {
     // Mutated only on `queue`.
     private var subscriptions: [WebPushSubscription]
     private var enabledFlag: Bool
-    /// Per-surface last-push time so a chatty bell does not spam the phone.
-    private var lastSent: [UUID: Date] = [:]
+    /// (ramon fork / Agent hooks) Which signal a push represents. The per-surface
+    /// debounce is keyed PER KIND so the bell and the agent-`.waiting` push coalesce
+    /// INDEPENDENTLY — a chatty bell within 3s must never silently swallow the
+    /// headline "agent needs input" push (or vice-versa). Each kind still self-
+    /// debounces its own repeats at ~3s/surface.
+    private enum PushKind: Hashable { case bell, attention }
+    /// Per-(surface, kind) last-push time so a chatty signal does not spam the phone.
+    private var lastSent: [PushKey: Date] = [:]
+    private struct PushKey: Hashable { let id: UUID; let kind: PushKind }
     private static let debounceInterval: TimeInterval = 3
 
     private var bellObserver: NSObjectProtocol?
+    /// (ramon fork / Agent hooks) Observes `.ghosttyAgentNeedsAttention` so an
+    /// agent that ENTERS `.waiting` (a Claude Code `Notification` hook event,
+    /// resolved to a surface by the MCP `/agent-state` handler and re-posted by
+    /// `AgentDashboardModel` on the working/idle→waiting edge) pushes to the phone
+    /// exactly like a bell. GUI + hooks only — no Zig/host change.
+    private var attentionObserver: NSObjectProtocol?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -273,14 +286,33 @@ final class WebPushManager {
                 guard let self, let view = note.object as? Ghostty.SurfaceView else { return }
                 self.onBell(id: view.id, title: view.title, pwd: view.pwd)
             }
+            // (ramon fork / Agent hooks) Push on agent-waiting, alongside the bell.
+            // The userInfo is the pinned value-type payload from AgentStateBridge;
+            // it crosses the main hop by value (no SurfaceView reference).
+            self.attentionObserver = NotificationCenter.default.addObserver(
+                forName: .ghosttyAgentNeedsAttention, object: nil, queue: .main
+            ) { [weak self] note in
+                guard let self,
+                      let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID else { return }
+                let title = note.userInfo?[AgentStateUserInfoKey.title] as? String ?? ""
+                let pwd = note.userInfo?[AgentStateUserInfoKey.pwd] as? String
+                let msg = note.userInfo?[AgentStateUserInfoKey.message] as? String ?? ""
+                self.onAttention(id: id, title: title, pwd: pwd, message: msg)
+            }
         }
     }
 
     func stop() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, let obs = self.bellObserver else { return }
-            NotificationCenter.default.removeObserver(obs)
-            self.bellObserver = nil
+            guard let self else { return }
+            if let obs = self.bellObserver {
+                NotificationCenter.default.removeObserver(obs)
+                self.bellObserver = nil
+            }
+            if let obs = self.attentionObserver {
+                NotificationCenter.default.removeObserver(obs)
+                self.attentionObserver = nil
+            }
         }
     }
 
@@ -293,19 +325,53 @@ final class WebPushManager {
     }
 
     /// Called on main from the bell observer. Hops to `queue` to check the enable
-    /// flag + debounce and fan out.
+    /// flag + debounce and fan out. The bell body is the surface's pwd.
     private func onBell(id: UUID, title: String, pwd: String?) {
+        enqueuePush(
+            id: id,
+            kind: .bell,
+            title: "🔔 " + (title.isEmpty ? "Ghostty" : title),
+            body: pwd ?? "")
+    }
+
+    /// (ramon fork / Agent hooks) Called on main from the attention observer when
+    /// an agent enters `.waiting`. Reuses the SAME fan-out as `onBell` (enable
+    /// flag, per-surface debounce, payload shape, send). The only differences: an
+    /// "⏳ " title prefix and a body that prefers the "needs input" `message` over
+    /// the pwd.
+    private func onAttention(id: UUID, title: String, pwd: String?, message: String) {
+        let body = message.isEmpty ? (pwd ?? "") : message
+        enqueuePush(
+            id: id,
+            kind: .attention,
+            title: "⏳ " + (title.isEmpty ? "Ghostty" : title),
+            body: body)
+    }
+
+    /// Shared fan-out for both the bell and the agent-waiting pushes. Hops to
+    /// `queue`, applies the enable flag + per-(surface, kind) debounce, builds the
+    /// payload, and sends to every subscription. The `lastSent` debounce is keyed by
+    /// surface id AND `kind`, so the bell and the agent-`.waiting` push coalesce
+    /// INDEPENDENTLY — an unrelated bell within 3s never drops the headline waiting
+    /// push (each kind still self-debounces its own repeats at ~3s/surface).
+    private func enqueuePush(id: UUID, kind: PushKind, title: String, body: String) {
         queue.async {
             guard self.enabledFlag, !self.subscriptions.isEmpty else { return }
+            let key = PushKey(id: id, kind: kind)
             let now = Date()
-            if let last = self.lastSent[id], now.timeIntervalSince(last) < Self.debounceInterval {
+            if let last = self.lastSent[key], now.timeIntervalSince(last) < Self.debounceInterval {
                 return
             }
-            self.lastSent[id] = now
+            // Opportunistically drop entries that are well past their debounce window so
+            // `lastSent` can't grow unbounded across a long-lived app session (one entry
+            // per (surface, kind) ever seen). A stale entry only exists to suppress a
+            // repeat within `debounceInterval`, so anything older is dead weight.
+            let pruneAge = Self.debounceInterval * 10
+            self.lastSent = self.lastSent.filter { now.timeIntervalSince($0.value) < pruneAge }
+            self.lastSent[key] = now
 
-            let body = pwd ?? ""
             let payload: [String: String] = [
-                "title": "🔔 " + (title.isEmpty ? "Ghostty" : title),
+                "title": title,
                 "body": body,
                 "surface": id.uuidString,
             ]
