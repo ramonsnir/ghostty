@@ -63,6 +63,64 @@ final class InMemoryHideStore: HideStore {
     func save(_ ids: Set<UUID>) { self.ids = ids }
 }
 
+/// (ramon fork / Agent hooks) One persisted agent-state record. Keyed by the
+/// HOST session id (see `AgentStateStore`), so a tile's working/waiting/idle
+/// status survives a GUI RESTART: the hooks only POST on transitions, so without
+/// persistence a relaunched GUI shows a blank chip until the agent next does
+/// something (it stays alive on the host across a GUI relaunch, but is usually
+/// idle/waiting between events). `updated` is `timeIntervalSince1970`, used only
+/// to age-prune dead records.
+struct PersistedAgentState: Codable, Equatable {
+    var state: String          // AgentState rawValue
+    var tool: String?
+    var prompt: String?
+    var message: String?
+    var updated: Double
+}
+
+/// Persistence boundary for per-session agent state, injected for testability
+/// (mirrors `HideStore`). Keyed by the HOST session id (`UInt64`) — the STABLE
+/// reattach key across a GUI restart, UNLIKE the surface UUID, which is freshly
+/// minted each launch (so a UUID-keyed store could never re-associate).
+protocol AgentStateStore {
+    func load() -> [UInt64: PersistedAgentState]
+    func save(_ map: [UInt64: PersistedAgentState])
+}
+
+/// Production store backed by the fork bundle-id `UserDefaults` domain. Encodes
+/// `[String: PersistedAgentState]` (session id → record) as JSON `Data` (the
+/// session id is stringified because plist/JSON keys must be strings).
+struct UserDefaultsAgentStateStore: AgentStateStore {
+    static let key = "agentDashboardAgentStates"
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func load() -> [UInt64: PersistedAgentState] {
+        guard let data = defaults.data(forKey: Self.key),
+              let raw = try? JSONDecoder().decode([String: PersistedAgentState].self, from: data)
+        else { return [:] }
+        var out: [UInt64: PersistedAgentState] = [:]
+        for (k, v) in raw { if let sid = UInt64(k) { out[sid] = v } }
+        return out
+    }
+
+    func save(_ map: [UInt64: PersistedAgentState]) {
+        var raw: [String: PersistedAgentState] = [:]
+        for (k, v) in map { raw[String(k)] = v }
+        guard let data = try? JSONEncoder().encode(raw) else { return }
+        defaults.set(data, forKey: Self.key)
+    }
+}
+
+/// In-memory `AgentStateStore` for tests.
+final class InMemoryAgentStateStore: AgentStateStore {
+    private var map: [UInt64: PersistedAgentState]
+    init(_ map: [UInt64: PersistedAgentState] = [:]) { self.map = map }
+    func load() -> [UInt64: PersistedAgentState] { map }
+    func save(_ map: [UInt64: PersistedAgentState]) { self.map = map }
+}
+
 /// (ramon fork / Agent Dashboard, Layer 3) The single source of truth for the
 /// dashboard. `@MainActor`: every member touches AppKit / `SurfaceView` /
 /// `ghostty_surface_*` (which must be main-only). Detection runs off-main and
@@ -111,9 +169,38 @@ final class AgentDashboardModel: ObservableObject {
 
     private let store: HideStore
 
-    init(store: HideStore) {
+    // MARK: - Agent-state persistence (ramon fork / Agent hooks)
+
+    /// Last-known agent state per HOST session id, persisted across GUI restarts
+    /// via `agentStore`. Loaded (pruned) at init, rehydrated onto fresh surface
+    /// UUIDs in `rebuild(live:)`, and written through on every state change.
+    private var restored: [UInt64: PersistedAgentState]
+    private let agentStore: AgentStateStore
+
+    /// Drop persisted records older than this on load (a dead session lingering
+    /// in UserDefaults). Generous: a live agent's record is refreshed by every
+    /// hook event and the periodic touch below, so only genuinely-gone sessions
+    /// age out.
+    static let persistMaxAge: TimeInterval = 14 * 24 * 3600
+    /// Hard cap on persisted records (keep the newest), a backstop against
+    /// unbounded growth independent of age.
+    static let persistMaxCount = 256
+    /// A live session's record is re-saved (timestamp touched) at most this often
+    /// during `rebuild`, so a long-idle-but-ALIVE agent isn't age-pruned without
+    /// churning UserDefaults on every rebuild.
+    static let persistTouchInterval: TimeInterval = 3600
+
+    init(store: HideStore, agentStateStore: AgentStateStore = InMemoryAgentStateStore()) {
         self.store = store
+        self.agentStore = agentStateStore
         self.hidden = store.load()
+        let loaded = agentStateStore.load()
+        let pruned = AgentDashboardModel.prune(
+            loaded, now: Date(),
+            maxAge: AgentDashboardModel.persistMaxAge,
+            maxCount: AgentDashboardModel.persistMaxCount)
+        self.restored = pruned
+        if pruned.count != loaded.count { agentStateStore.save(pruned) }
     }
 
     // MARK: - Hide set
@@ -225,6 +312,12 @@ final class AgentDashboardModel: ObservableObject {
             store.save(hidden)
         }
 
+        // Persist the new state keyed by the stable host session id so it
+        // survives a GUI restart (ramon fork / hooks). No-op if this surface's
+        // session id isn't known yet (`live` not yet populated for it) — the
+        // next `rebuild(live:)` reconciles it.
+        writeThrough(id: id)
+
         // We rebuild unconditionally here even if the detector has not yet matched
         // this id as an agent (`agents[id] == nil` → it's filtered out, so this is a
         // no-visible-change invalidation until the ~2s poll confirms it). That wasted
@@ -271,7 +364,86 @@ final class AgentDashboardModel: ObservableObject {
         lastPrompt = lastPrompt.filter { liveIDs.contains($0.key) }
         lastMessage = lastMessage.filter { liveIDs.contains($0.key) }
         hookBacked = hookBacked.intersection(liveIDs)
+        // (ramon fork / hooks) Restore persisted state onto the (freshly-minted)
+        // surface UUIDs by their stable host session id, and keep live records
+        // fresh. This is what makes statuses survive a GUI restart.
+        rehydrateAndPersist(live: live)
         rebuildEntriesFromCurrentState()
+    }
+
+    // MARK: - Agent-state persistence helpers (ramon fork / hooks)
+
+    /// Pure: drop records older than `maxAge`, then cap to the `maxCount` newest.
+    static func prune(
+        _ map: [UInt64: PersistedAgentState], now: Date,
+        maxAge: TimeInterval, maxCount: Int
+    ) -> [UInt64: PersistedAgentState] {
+        let nowS = now.timeIntervalSince1970
+        var kept = map.filter { nowS - $0.value.updated <= maxAge }
+        if kept.count > maxCount {
+            let newest = kept.sorted { $0.value.updated > $1.value.updated }.prefix(maxCount)
+            kept = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+        }
+        return kept
+    }
+
+    /// The host session id for a live surface UUID, or nil if unknown (not yet
+    /// in the `live` snapshot, or no host session).
+    private func sessionID(for id: UUID) -> UInt64? {
+        live.first { $0.id == id }?.sessionID
+    }
+
+    /// True iff `a` and `b` carry the same state/tool/prompt/message (IGNORING
+    /// `updated`) — so a steady stream of identical states doesn't churn the store.
+    private func sameContent(_ a: PersistedAgentState?, _ b: PersistedAgentState) -> Bool {
+        guard let a else { return false }
+        return a.state == b.state && a.tool == b.tool && a.prompt == b.prompt && a.message == b.message
+    }
+
+    /// Persist the current state for `id`'s host session, if its session id is
+    /// known and non-zero. Saves only when the persisted CONTENT changes.
+    private func writeThrough(id: UUID) {
+        guard let sid = sessionID(for: id), sid != 0, let state = agentStates[id] else { return }
+        let rec = PersistedAgentState(
+            state: state.rawValue, tool: lastTool[id], prompt: lastPrompt[id],
+            message: lastMessage[id], updated: Date().timeIntervalSince1970)
+        if !sameContent(restored[sid], rec) {
+            restored[sid] = rec
+            agentStore.save(restored)
+        }
+    }
+
+    /// For each live surface keyed by its stable host session id: HYDRATE the
+    /// per-UUID hook state from the persisted record when we have no live state
+    /// for it yet (the GUI-restart restore — silent: no push, no waiting-edge
+    /// re-fire; the next live hook takes over), and otherwise keep the persisted
+    /// record current with live state (plus an occasional timestamp touch so a
+    /// long-idle-but-alive agent isn't age-pruned).
+    private func rehydrateAndPersist(live: [LiveSurface]) {
+        var dirty = false
+        let nowS = Date().timeIntervalSince1970
+        for s in live where s.sessionID != 0 {
+            if agentStates[s.id] == nil {
+                guard let rec = restored[s.sessionID],
+                      let state = AgentState(rawValue: rec.state) else { continue }
+                agentStates[s.id] = state
+                if let t = rec.tool { lastTool[s.id] = t }
+                if let p = rec.prompt { lastPrompt[s.id] = p }
+                if let m = rec.message { lastMessage[s.id] = m }
+                hookBacked.insert(s.id)
+            } else if let state = agentStates[s.id] {
+                let rec = PersistedAgentState(
+                    state: state.rawValue, tool: lastTool[s.id], prompt: lastPrompt[s.id],
+                    message: lastMessage[s.id], updated: nowS)
+                let cur = restored[s.sessionID]
+                let stale = cur.map { nowS - $0.updated > Self.persistTouchInterval } ?? true
+                if !sameContent(cur, rec) || stale {
+                    restored[s.sessionID] = rec
+                    dirty = true
+                }
+            }
+        }
+        if dirty { agentStore.save(restored) }
     }
 
     /// The set of currently-live surface ids — ALL terminal splits, agent or
@@ -381,7 +553,9 @@ final class AgentDashboardController: NSWindowController {
 
     init(ghostty: Ghostty.App) {
         self.ghostty = ghostty
-        self.model = AgentDashboardModel(store: UserDefaultsHideStore())
+        self.model = AgentDashboardModel(
+            store: UserDefaultsHideStore(),
+            agentStateStore: UserDefaultsAgentStateStore())
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
         let panel = AgentDashboardPanel()

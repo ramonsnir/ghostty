@@ -959,3 +959,139 @@ struct UnzoomDecisionTests {
         #expect(result.root == base.root) // ratios/structure unchanged
     }
 }
+
+// MARK: - Agent-state persistence across GUI restart (ramon fork / hooks)
+
+@MainActor
+struct AgentStatePersistenceTests {
+    private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
+        pairs.map { (id, sid) in .init(id: id, view: nil, title: "t", pwd: "/x", sessionID: sid) }
+    }
+    private func agents(_ ids: [UUID]) -> [UUID: AgentKind] {
+        Dictionary(uniqueKeysWithValues: ids.map { ($0, AgentKind("claude")) })
+    }
+    private func rec(_ state: String, updated: Double = Date().timeIntervalSince1970) -> PersistedAgentState {
+        PersistedAgentState(state: state, tool: nil, prompt: nil, message: nil, updated: updated)
+    }
+    private func payload(_ s: AgentState, tool: String? = nil) -> AgentStatePayload {
+        AgentStatePayload(tty: "ttys1", state: s, prompt: nil, tool: tool, message: nil)
+    }
+
+    // MARK: pure prune
+
+    @Test func prunesByAge() {
+        let now = Date()
+        let nowS = now.timeIntervalSince1970
+        let out = AgentDashboardModel.prune(
+            [1: rec("working", updated: nowS), 2: rec("idle", updated: nowS - 100_000)],
+            now: now, maxAge: 3600, maxCount: 256)
+        #expect(out[1] != nil)
+        #expect(out[2] == nil)   // older than maxAge dropped
+    }
+
+    @Test func prunesByCountKeepingNewest() {
+        let nowS = Date().timeIntervalSince1970
+        var map: [UInt64: PersistedAgentState] = [:]
+        for i in 0..<10 { map[UInt64(i)] = rec("idle", updated: nowS - Double(i)) }
+        let out = AgentDashboardModel.prune(map, now: Date(), maxAge: 1_000_000, maxCount: 3)
+        #expect(out.count == 3)
+        #expect(out[0] != nil && out[1] != nil && out[2] != nil) // newest (closest to now)
+        #expect(out[9] == nil)
+    }
+
+    // MARK: store round trip (UInt64 keys survive JSON string-keying)
+
+    @Test func userDefaultsStoreRoundTripsUInt64Keys() {
+        let suite = "ghostty-test-agentstate-roundtrip"
+        let d = UserDefaults(suiteName: suite)!
+        d.removePersistentDomain(forName: suite)
+        defer { d.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsAgentStateStore(defaults: d)
+        let r = PersistedAgentState(state: "waiting", tool: "Bash", prompt: "hi", message: "approve?", updated: 123)
+        store.save([42: r])
+        #expect(store.load()[42] == r)
+    }
+
+    // MARK: hydrate on rebuild
+
+    @Test func hydratesPersistedStateOntoFreshUUIDBySessionID() {
+        let sid: UInt64 = 7
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            agentStateStore: InMemoryAgentStateStore([sid: rec("waiting")]))
+        let id = UUID()                              // a FRESH uuid (post-restart)
+        model.applyAgents(agents([id]))
+        model.rebuild(live: live([(id, sid)]))
+        #expect(model.agentStates[id] == .waiting)   // restored onto the new uuid
+        let entry = model.entries.first { $0.id == id }
+        #expect(entry?.agentState == .waiting)       // and the tile shows it
+        #expect(entry?.hookBacked == true)           // hook-authoritative
+    }
+
+    @Test func hydrateSkipsZeroSession() {
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            agentStateStore: InMemoryAgentStateStore([5: rec("idle")]))
+        let id = UUID()
+        model.applyAgents(agents([id]))
+        model.rebuild(live: live([(id, 0)]))         // sessionID 0 → never hydrated
+        #expect(model.agentStates[id] == nil)
+    }
+
+    @Test func noCrossSessionContamination() {
+        let a = UUID(), b = UUID()
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            agentStateStore: InMemoryAgentStateStore([1: rec("working"), 2: rec("idle")]))
+        model.applyAgents(agents([a, b]))
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        #expect(model.agentStates[a] == .working)
+        #expect(model.agentStates[b] == .idle)
+    }
+
+    // MARK: write-through
+
+    @Test func writeThroughPersistsBySessionID() {
+        let sid: UInt64 = 99
+        let store = InMemoryAgentStateStore()
+        let model = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
+        let id = UUID()
+        model.applyAgents(agents([id]))
+        model.rebuild(live: live([(id, sid)]))       // populate `live` so the sid resolves
+        model.applyAgentState(id, payload(.working, tool: "Bash"))
+        #expect(store.load()[sid]?.state == "working")
+        #expect(store.load()[sid]?.tool == "Bash")
+    }
+
+    @Test func writeThroughSkipsWhenSessionUnknown() {
+        let store = InMemoryAgentStateStore()
+        let model = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
+        // No rebuild → `live` empty → session id unknown → nothing persisted.
+        model.applyAgentState(UUID(), payload(.working))
+        #expect(store.load().isEmpty)
+    }
+
+    // MARK: live hook overrides a restored state
+
+    @Test func liveHookOverridesHydratedState() {
+        let sid: UInt64 = 3
+        let store = InMemoryAgentStateStore([sid: rec("working")])
+        let model = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
+        let id = UUID()
+        model.applyAgents(agents([id]))
+        model.rebuild(live: live([(id, sid)]))
+        #expect(model.agentStates[id] == .working)        // hydrated
+        let entered = model.applyAgentState(id, payload(.waiting))
+        #expect(entered == true)                          // working→waiting edge fires
+        #expect(model.agentStates[id] == .waiting)        // live wins over restored
+        #expect(store.load()[sid]?.state == "waiting")    // and is persisted
+    }
+
+    // MARK: prune-on-load re-saves
+
+    @Test func pruneOnLoadDropsAncientAndResaves() {
+        let store = InMemoryAgentStateStore([1: rec("idle", updated: 0)])  // 1970 → ancient
+        _ = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
+        #expect(store.load().isEmpty)    // pruned + re-saved at init
+    }
+}
