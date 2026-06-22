@@ -220,39 +220,73 @@ struct AgentMirrorPreview: View {
                 backing: backing,
                 container: geo.size)
 
-            Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: true)
-                .environmentObject(ghostty)
-                .frame(width: g.naturalW, height: g.naturalH)
-                .scaleEffect(g.scale, anchor: .bottom)
-                // Pin the scaled view to the bottom of the container so the top
-                // overflow is what gets clipped (.clipped() at the call site).
-                .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
+            // Horizontal scroll for splits wider than `referenceColumns`; narrow
+            // splits show left-aligned with empty space on the right. The mirror
+            // is scaled UNIFORMLY (g.scale) so cell size is identical across all
+            // tiles. `.bottomLeading` anchor keeps column 0 at the scroll origin
+            // and the agent's latest (bottom) rows pinned; the top is clipped.
+            ScrollView(.horizontal, showsIndicators: true) {
+                Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: true)
+                    .environmentObject(ghostty)
+                    .frame(width: g.naturalW, height: g.naturalH)
+                    .scaleEffect(g.scale, anchor: .bottomLeading)
+                    // Bound the scaled content to its on-screen size so the
+                    // ScrollView measures `scaledW` (not the larger unscaled
+                    // layout) and clips the top overflow to the preview height.
+                    .frame(width: g.scaledW, height: geo.size.height, alignment: .bottomLeading)
+                    .clipped()
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
     }
 
+    /// The number of columns that fill the preview's WIDTH. This sets a UNIFORM
+    /// cell size across every tile regardless of the split's own width: a split
+    /// with fewer columns shows with empty space on the right; one with more
+    /// columns overflows and is reached via the horizontal scroll bar. Hardcoded
+    /// for now (config knob is a follow-up).
+    static let referenceColumns: CGFloat = 120
+
     /// PURE geometry for the mirror preview, factored out for unit testing (the
     /// view can't render off a headless display). `cellW`/`cellH` are BACKING
-    /// pixels; `cols`/`rows` are the HOST grid. Returns the SurfaceWrapper frame
-    /// (the full host grid drawn at the mirror's cell size, so every row renders
-    /// with no internal clip/pad — `naturalW`×`naturalH` in points) and the
-    /// width-fit `scale` applied bottom-anchored. Falls back to the container
-    /// size (scale 1) when the grid/cell is not yet known, so the view never
-    /// collapses. Using the FULL grid size here — not the mirror's own
-    /// frame-tracking `surfaceSize` — is what prevents the feedback collapse that
-    /// made the preview go empty / show one row.
+    /// pixels; `cols`/`rows` are the HOST grid (from the REAL surface — NOT the
+    /// mirror's own frame-tracking `surfaceSize`, which would feed back and
+    /// collapse the view).
+    ///
+    /// `naturalW`×`naturalH` is the FULL host grid in points (the SurfaceWrapper
+    /// frame, so every row renders with no internal clip/pad). `scale` is UNIFORM
+    /// — chosen so `referenceColumns` columns span the container width — so text
+    /// size is identical across tiles; `scaledW`×`scaledH` is the on-screen size
+    /// after scaling (the horizontal-scroll content width is `scaledW`). Falls
+    /// back to width-fit (scale so the whole grid fits) when the cell size isn't
+    /// known yet, so the view never collapses.
     struct PreviewGeometry: Equatable {
         let naturalW: CGFloat
         let naturalH: CGFloat
         let scale: CGFloat
+        let scaledW: CGFloat
+        let scaledH: CGFloat
     }
     static func geometry(
         cols: Int, rows: Int, cellW: CGFloat, cellH: CGFloat,
-        backing: CGFloat, container: CGSize
+        backing: CGFloat, container: CGSize, referenceColumns: CGFloat = referenceColumns
     ) -> PreviewGeometry {
         let bk = backing > 0 ? backing : 2.0
         let naturalW = (cols > 0 && cellW > 0) ? CGFloat(cols) * cellW / bk : container.width
         let naturalH = (rows > 0 && cellH > 0) ? CGFloat(rows) * cellH / bk : container.height
-        let scale = naturalW > 0 ? container.width / naturalW : 1.0
-        return PreviewGeometry(naturalW: naturalW, naturalH: naturalH, scale: scale)
+        // UNIFORM scale: referenceColumns columns fill the container width, so
+        // every tile renders at the same cell size. Before the first frame
+        // (cellW == 0) fall back to width-fit so the view still fills the row.
+        let scale: CGFloat
+        if cellW > 0 && referenceColumns > 0 {
+            scale = container.width / (referenceColumns * cellW / bk)
+        } else if naturalW > 0 {
+            scale = container.width / naturalW
+        } else {
+            scale = 1.0
+        }
+        return PreviewGeometry(
+            naturalW: naturalW, naturalH: naturalH, scale: scale,
+            scaledW: naturalW * scale, scaledH: naturalH * scale)
     }
 }

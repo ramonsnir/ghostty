@@ -42,6 +42,31 @@ struct AgentMirrorGeometryTests {
         #expect(abs(g.naturalW - 640) < 0.5)
         #expect(g.scale > 0)
     }
+
+    @Test func uniformScaleAcrossSplitsOfDifferentWidths() {
+        // Two splits with DIFFERENT column counts but the same cell/backing must
+        // get the SAME scale (uniform cell size), with `referenceColumns` (here
+        // 120) filling the width. The narrow split's content is narrower than the
+        // row (pads right); the wide split's overflows (horizontal scroll).
+        let container = CGSize(width: 560, height: 220)
+        let narrow = AgentMirrorPreview.geometry(
+            cols: 80, rows: 24, cellW: 14, cellH: 30, backing: 2,
+            container: container, referenceColumns: 120)
+        let wide = AgentMirrorPreview.geometry(
+            cols: 240, rows: 50, cellW: 14, cellH: 30, backing: 2,
+            container: container, referenceColumns: 120)
+        // Same uniform scale regardless of the split's own width.
+        #expect(abs(narrow.scale - wide.scale) < 0.0001)
+        #expect(abs(narrow.scale - 560.0 / (120.0 * 14.0 / 2.0)) < 0.001)
+        // Narrow content fits within the row; wide content overflows → scroll.
+        #expect(narrow.scaledW < container.width)
+        #expect(wide.scaledW > container.width)
+        // Exactly `referenceColumns` columns spans the width.
+        let refWidth = AgentMirrorPreview.geometry(
+            cols: 120, rows: 24, cellW: 14, cellH: 30, backing: 2,
+            container: container, referenceColumns: 120).scaledW
+        #expect(abs(refWidth - container.width) < 0.5)
+    }
 }
 
 // MARK: - matchAgent pure logic
