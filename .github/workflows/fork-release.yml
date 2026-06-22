@@ -40,7 +40,13 @@ permissions:
 jobs:
   build:
     if: github.repository == 'ramonsnir/ghostty'
-    runs-on: macos-15
+    # Native macOS 26 image. NOT macos-15: there, Xcode 26 runs via a framework
+    # override cryptex whose MediaToolbox is missing a symbol, which crashes
+    # AssetCatalogAgent when it renders the Liquid Glass `images/Ghostty.icon`
+    # ("CompileAssetCatalogVariant failed / tool closed the connection"). On a
+    # native macos-26 image Xcode 26 uses the real OS frameworks, so no crash.
+    # (Upstream sidesteps this with Namespace.so runners, which the fork lacks.)
+    runs-on: macos-26
     timeout-minutes: 90
     env:
       # Whether ALL signing secrets are present. Gates every sign/notarize/release
@@ -87,14 +93,11 @@ jobs:
       # clobbering a hand-managed host plist) BEFORE we ever sign/notarize/publish.
       # Ungated — a planner regression must fail the pipeline even on a smoke build.
       - name: Run ForkSetup unit tests
-        # Best-effort gate: the planner's AUTHORITATIVE test run is local (all 18
-        # ForkSetupTests pass there). On the GitHub runner, building the Debug
-        # test-host app intermittently crashes Xcode's AssetCatalogAgent
-        # ("CompileAssetCatalogVariant failed / tool closed the connection") — a
-        # runner-environment bug, NOT our code (same command is green locally). So
-        # this step does not block the signed release; it surfaces a real planner
-        # regression when the runner cooperates, without wedging shipping on an
-        # Apple/runner flake. -jobs 1 eases concurrent-task pressure on the agent.
+        # Best-effort gate (kept continue-on-error during macos-26 bring-up). The
+        # planner's AUTHORITATIVE run is local (all 18 ForkSetupTests pass). The
+        # macos-15 AssetCatalogAgent crash that motivated this should NOT occur on
+        # the native macos-26 image (see the job's runs-on note); once macos-26 is
+        # confirmed stable, drop continue-on-error to make this a hard gate again.
         continue-on-error: true
         run: |
           cd macos
