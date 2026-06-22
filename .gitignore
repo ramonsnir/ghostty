@@ -29,6 +29,9 @@ glad.zip
 
 vgcore.*
 
-# fork: per-task build worktrees live here (see CLAUDE.md "Iteration lifecycle")
-.claude/worktrees/
+# fork: .claude/ is local-only working state (plans, workflows, per-task build
+# worktrees). Nothing under it is tracked — feature docs live at the repo root
+# (PTYHOST.md, AGENT-DASHBOARD.md, …). Force-add (`git add -f`) if a file ever
+# genuinely needs tracking.
+.claude/
 
