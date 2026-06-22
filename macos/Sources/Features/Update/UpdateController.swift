@@ -123,8 +123,26 @@ class UpdateController {
     /// - Returns: Whether the menu item should be enabled
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(checkForUpdates) {
+            // Fork: builds that still carry the fail-closed PLACEHOLDER Sparkle key
+            // (any non-CI build — dev builds and a locally-installed Release built
+            // via the CLAUDE.md step-6 block, which never injects the real key)
+            // cannot verify the fork appcast signature, so a manual check would just
+            // surface a verification error. Keep the item disabled on those builds.
+            if Self.hasPlaceholderUpdateKey { return false }
             return updater.canCheckForUpdates
         }
         return true
+    }
+
+    /// The fail-closed placeholder `SUPublicEDKey` shipped in the committed
+    /// Info.plist (32 zero bytes). Only the CI release build overwrites it with the
+    /// fork's real key. See `Ghostty-Info.plist` + CLAUDE.md "Distribution".
+    private static let placeholderUpdateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+    /// True when this build still carries the placeholder Sparkle public key, i.e.
+    /// it can never verify a real update and the "Check for Updates" action should
+    /// stay disabled.
+    static var hasPlaceholderUpdateKey: Bool {
+        (Bundle.main.infoDictionary?["SUPublicEDKey"] as? String) == placeholderUpdateKey
     }
 }

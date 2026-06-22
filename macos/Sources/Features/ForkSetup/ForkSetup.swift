@@ -126,6 +126,12 @@ enum ForkSetup {
         case reload(LaunchAgentSpec)
         /// We own the plist and the version matches → nothing to do.
         case upToDate
+        /// We own the plist, never recorded a version (lost/never-written
+        /// UserDefaults key), but a healthy host is ALREADY running — adopt it by
+        /// recording the current version. Crucially this does NOT bootout, so we
+        /// never destroy a running host's (RAM-only) sessions on a mere bookkeeping
+        /// gap. (Rewriting the plist on disk is harmless and keeps it current.)
+        case adoptRunning(LaunchAgentSpec)
     }
 
     /// Pure decision for the host LaunchAgent. See type doc for the safety rules.
@@ -133,12 +139,16 @@ enum ForkSetup {
     ///   - existingPlistManagedBy: the `GhosttyAppManaged` value found in the
     ///     existing plist, or nil if the file is absent OR present-but-unreadable
     ///     OR present-without-our-marker (all of which mean "not ours").
+    /// - Parameter agentRunning: whether the LaunchAgent is currently loaded AND
+    ///   running (a live pid). Only consulted to AVOID a destructive reload when
+    ///   the version bookkeeping was lost but the host is healthy.
     static func plan(
         bundledHostExists: Bool,
         existingPlistFileExists: Bool,
         existingPlistManagedBy: String?,
         installedVersion: String?,
         bundleVersion: String,
+        agentRunning: Bool,
         spec: LaunchAgentSpec
     ) -> Plan {
         guard bundledHostExists else { return .skipNoBundledHost }
@@ -147,7 +157,14 @@ enum ForkSetup {
             guard existingPlistManagedBy == spec.managingBundleID else {
                 return .skipExternallyManaged
             }
-            return installedVersion == bundleVersion ? .upToDate : .reload(spec)
+            if installedVersion == bundleVersion { return .upToDate }
+            // Version differs or is unknown. A genuine version change (recorded
+            // version present-and-different) means a new binary/cdhash → reload is
+            // mandatory. But when we never recorded a version (nil) yet a healthy
+            // host is already running, a reload would bootout+kill its RAM-only
+            // sessions for nothing — adopt the running host instead.
+            if installedVersion == nil && agentRunning { return .adoptRunning(spec) }
+            return .reload(spec)
         }
         return .install(spec)
     }
@@ -197,7 +214,15 @@ enum ForkSetup {
         let bundledHostExists = fileManager.isExecutableFile(atPath: spec.hostBinaryPath)
 
         let plistPath = "\(home)/Library/LaunchAgents/\(spec.label).plist"
+        let target = "gui/\(getuid())/\(spec.label)"
         let (fileExists, managedBy) = readPlistMarker(plistPath: plistPath, fileManager: fileManager)
+
+        // Probe "is the host already running?" only when the plist is ours (the
+        // sole case where it changes the decision). hostRunning returns fast when
+        // the host is up; it only burns its backoff budget when the host is down —
+        // and a down host is one we want to (re)bootstrap anyway.
+        let ours = fileExists && managedBy == spec.managingBundleID
+        let agentRunning = ours ? hostRunning(target: target) : false
 
         let decision = plan(
             bundledHostExists: bundledHostExists,
@@ -205,6 +230,7 @@ enum ForkSetup {
             existingPlistManagedBy: managedBy,
             installedVersion: defaults.string(forKey: kInstalledHostVersion),
             bundleVersion: bundleVersion,
+            agentRunning: agentRunning,
             spec: spec)
 
         switch decision {
@@ -214,6 +240,13 @@ enum ForkSetup {
             logger.info("host LaunchAgent at \(plistPath, privacy: .public) is externally managed; not touching it")
         case .upToDate:
             logger.debug("host LaunchAgent already installed for version \(bundleVersion, privacy: .public)")
+        case .adoptRunning(let spec):
+            // Healthy host already running but no recorded version (lost defaults):
+            // record the version and refresh the plist on disk — NO bootout, so the
+            // running host's sessions survive.
+            try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+            defaults.set(bundleVersion, forKey: kInstalledHostVersion)
+            logger.info("adopted already-running host LaunchAgent \(spec.label, privacy: .public); recorded version \(bundleVersion, privacy: .public) without restart")
         case .install(let spec), .reload(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
                                 defaults: defaults, fileManager: fileManager, reload: decision.isReload)
@@ -271,16 +304,22 @@ enum ForkSetup {
         }
     }
 
-    /// Post a best-effort, user-visible notification. The message is always in the
-    /// log too. AppDelegate already configures + authorizes UserNotifications, so
-    /// this is a no-op if the user declined — same pattern as WebMonitor/MCP.
+    /// Post a best-effort, user-visible ALERT notification. The message is always
+    /// in the log too. We request `.alert` ourselves rather than relying on
+    /// AppDelegate (which requests `.badge` only) — a title/body banner needs
+    /// alert authorization to render, and the host-offline banner is the whole
+    /// point of surfacing the failure. Best-effort: silently no-ops if declined.
     private static func notify(title: String, body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        let req = UNNotificationRequest(
-            identifier: "fork-setup-" + UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .badge]) { granted, _ in
+            guard granted else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            let req = UNNotificationRequest(
+                identifier: "fork-setup-" + UUID().uuidString, content: content, trigger: nil)
+            center.add(req, withCompletionHandler: nil)
+        }
     }
 
     /// Read the ownership marker from an existing plist.
@@ -405,7 +444,9 @@ enum ForkSetup {
 
     # Agent Dashboard (fork-only): a panel of live mini-previews of every split
     # running a CLI agent (claude/codex) across all tabs/windows; click to jump.
-    # Requires pty-host (set below). `ctrl+a>d` toggles it.
+    # `ctrl+a>d` toggles it. NOTE: live previews appear only once the HOSTED
+    # backend is active — i.e. after the one-time relaunch below (pty-host) — so on
+    # the very first run the panel may open empty/metadata-only until you relaunch.
     agent-dashboard = true
     agent-dashboard-commands = claude,codex
     keybind = ctrl+a>d=toggle_agent_dashboard

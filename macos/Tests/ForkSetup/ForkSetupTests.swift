@@ -27,6 +27,7 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "1",
             bundleVersion: "2",
+            agentRunning: false,
             spec: spec())
         #expect(p == .skipNoBundledHost)
     }
@@ -40,6 +41,7 @@ struct ForkSetupTests {
             existingPlistManagedBy: nil,
             installedVersion: nil,
             bundleVersion: "100",
+            agentRunning: false,
             spec: s)
         #expect(p == .install(s))
     }
@@ -53,6 +55,7 @@ struct ForkSetupTests {
             existingPlistManagedBy: nil,
             installedVersion: nil,
             bundleVersion: "100",
+            agentRunning: true,   // even if something is running, not ours -> skip
             spec: spec())
         #expect(p == .skipExternallyManaged)
     }
@@ -66,6 +69,7 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon.debug",
             installedVersion: "100",
             bundleVersion: "100",
+            agentRunning: false,
             spec: spec(bundleID: "com.mitchellh.ghostty-ramon"))
         #expect(p == .skipExternallyManaged)
     }
@@ -77,13 +81,15 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "100",
             bundleVersion: "100",
+            agentRunning: true,
             spec: spec())
         #expect(p == .upToDate)
     }
 
-    @Test func planReloadsOursWhenVersionChanged() {
-        // The LWCR gotcha: a new bundle version means a new host cdhash, so we
-        // must reload (bootout+bootstrap) to re-derive launchd's requirement.
+    @Test func planReloadsOursWhenVersionChangedEvenIfRunning() {
+        // The LWCR gotcha: a new bundle version means a new host cdhash, so we must
+        // reload (bootout+bootstrap) to re-derive launchd's requirement — even
+        // though the OLD host is still running (that's exactly the update case).
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
@@ -91,13 +97,15 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "100",
             bundleVersion: "101",
+            agentRunning: true,
             spec: s)
         #expect(p == .reload(s))
     }
 
-    @Test func planReloadsOursWhenNoRecordedVersion() {
-        // We own the plist (marker matches) but never recorded a version (e.g. a
-        // prior bootstrap failed after writing the plist) -> retry via reload.
+    @Test func planAdoptsRunningHostWhenNoRecordedVersion() {
+        // SAFETY: we own the plist, never recorded a version (lost/cleared
+        // UserDefaults), but a healthy host is ALREADY running. We must NOT bootout
+        // (that would kill its RAM-only sessions) — adopt it instead.
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
@@ -105,6 +113,22 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: nil,
             bundleVersion: "100",
+            agentRunning: true,
+            spec: s)
+        #expect(p == .adoptRunning(s))
+    }
+
+    @Test func planReloadsWhenNoRecordedVersionAndNotRunning() {
+        // No recorded version AND the host isn't running -> safe to (re)bootstrap;
+        // there are no live sessions to lose.
+        let s = spec()
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: nil,
+            bundleVersion: "100",
+            agentRunning: false,
             spec: s)
         #expect(p == .reload(s))
     }

@@ -253,6 +253,10 @@ jobs:
           GHOSTTY_COMMIT: ${{ steps.version.outputs.commit }}
         run: |
           TAG="build-${GHOSTTY_BUILD}"
+          # The tag is a function of HEAD (commit count), so a workflow_dispatch
+          # re-run on the same commit reuses it. Make publish idempotent: drop any
+          # prior release+tag first so the rebuilt artifacts cleanly replace them.
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           # --latest makes `releases/latest/download/{Ghostty.dmg,appcast.xml}`
           # resolve here, which is the stable URL Sparkle's feed points at.
           gh release create "$TAG" \
