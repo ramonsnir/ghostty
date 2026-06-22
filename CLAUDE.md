@@ -847,7 +847,19 @@ this macOS); `nushell` for `build.nu`.
 5. **Build the app**: `macos/build.nu --configuration ReleaseLocal --action build` → `macos/build/ReleaseLocal/Ghostty.app` (optimized, no debug banner). This produces "Ghostty (ramon-local)" with bundle id `com.mitchellh.ghostty-ramon.local` — runs side-by-side with the installed Release identity.
 6. **Install/update the fork** over `/Applications/Ghostty (ramon).app`. Verified to be safe to run while the installed Release fork is still hosting Claude Code's shell — `ditto` and `PlistBuddy` don't disturb the running mmap'd binary, and `codesign` succeeds after stripping Apple's `com.apple.provenance` xattrs. The new binary only takes effect on the next launch, so the user still has to quit + relaunch themselves.
 
-   **Always ask the user to confirm before running this block — it overwrites the running host app.** The block:
+   **You MAY run this block WITHOUT asking — but ONLY when BOTH hold: (a) the
+   ReleaseLocal app being installed was built from `ramon-fork` on the main tree,
+   NOT from a worktree/feature branch (see the worktree rule above — a branch build
+   must first be merged to `ramon-fork` and rebuilt there); AND (b) the change is
+   GUI-only and does NOT touch the host (`src/host/`, `src/termio/`, or any core that
+   links into `ghostty-host`).** When both hold, the deploy is non-disruptive: it
+   overwrites the installed binary but `ditto`/`PlistBuddy`/`codesign` don't disturb
+   the running mmap'd process, it does NOT restart the host, and the new binary only
+   takes effect on the user's next relaunch — so it can't break this session and GUI
+   restarts are free. **ASK FIRST if EITHER condition fails** — a host change forces a
+   LaunchAgent reload that ends every live session (schedule it deliberately — see the
+   "Host code changed too?" note below), and a branch build must not become the
+   installed Release. The block:
    ```sh
    APP="/Applications/Ghostty (ramon).app"
    ditto macos/build/ReleaseLocal/Ghostty.app "$APP"
@@ -906,6 +918,8 @@ To restart the dev fork, target precisely:
 (or `.debug`), or kill the PID whose path is under `macos/build/`. For the
 installed Release, the install block in step 6 of the iteration lifecycle is
 safe to run while the host is live (ditto/plist/codesign don't disturb the
-running binary), but **always ask the user to confirm** before running it, and
-let them quit + relaunch the installed Release themselves to pick up the new
-binary.
+running binary) and **may be run WITHOUT confirmation** when the deploy is
+GUI-only from a `ramon-fork` build (see step 6 for the exact two conditions; a
+host change or a branch build still needs to be raised with the user first).
+Either way, let the user quit + relaunch the installed Release themselves to
+pick up the new binary.
