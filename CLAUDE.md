@@ -353,12 +353,16 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `src/os/proc_info.zig` (`zig build test -Dtest-filter=host` / `-Dtest-filter=proc_info`),
     plus the `process_info`/`idleMillis` Client tests in `src/termio/Client.zig`.
 
-- **Agent Dashboard** (fork-only, macOS, OFF by default) — a floating,
-  foreground-locked `NSPanel` showing a live, natively-rendered mini-preview of every
-  terminal split running a CLI agent (Claude Code / Codex) across ALL tabs and windows;
-  click a tile to jump to that split (raise window + select tab + un-zoom if hidden),
-  Hide ✕ to declutter, bell-ring auto-unhides. **See `AGENT-DASHBOARD.md` for the
-  user-facing config/usage.** The load-bearing facts for an agent touching this code:
+- **Agent Dashboard** (fork-only, macOS, OFF by default) — a persistent sidebar
+  `NSPanel` showing a live, natively-rendered preview of every terminal split running a
+  CLI agent (Claude Code / Codex) across ALL tabs and windows, stacked as **full-width
+  rows** each showing the split's **latest rows** (preview is bottom-anchored, top
+  clipped); click a row to jump to that split (raise window + select tab + un-zoom if
+  hidden), Hide ✕ to declutter, bell-ring auto-unhides. The panel is **normal-level (NOT
+  always-on-top)** with a visible title ("Agent Dashboard") + standard-window AX subrole
+  so an external window manager (Rectangle Pro) can target it. **See `AGENT-DASHBOARD.md`
+  for the user-facing config/usage.** The load-bearing facts for an agent touching this
+  code:
   - **Action + config (fork-only, default off):** the payload-less keybind action
     `toggle_agent_dashboard` (also a command-palette entry "Toggle Agent Dashboard");
     `agent-dashboard` (master enable) + `agent-dashboard-commands` (exe names that count
@@ -404,6 +408,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Single-instance guard** in `AppDelegate.applicationWillFinishLaunching`: if another process with the same bundle id is already running from a different bundle URL, that one is activated and this process exits. Stops two copies of the same fork identity from racing each other (e.g. dock-attention bouncing one while you click the other).
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
+- **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
 - **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
@@ -513,6 +518,23 @@ ghostty-host` do NOT match the host's cmdline on macOS; to find the pid use
 problem — the host unlinks-and-rebinds.
 
 ## Iteration lifecycle (macOS)
+
+> 🛑 **STOP — READ THIS BEFORE YOUR FIRST `Edit`/`Write`.** Claude keeps
+> violating this rule: it reads the task, jumps straight to editing files on
+> the main tree's `ramon-fork` checkout, and only *then* commits there. **That
+> is wrong every single time, even for a "one-line" / "trivial" change, even
+> when you're "already on `ramon-fork`", even when the user says "just commit
+> it".** Being on `ramon-fork` is NOT permission to edit it — it is the exact
+> state the worktree rule exists to protect. The very fact that you're tempted
+> to skip the worktree "because it's small" is the violation. The installed
+> Release fork builds from this checkout and hosts the live Claude Code
+> session; a dirty/half-edited `ramon-fork` here can break the next rebuild
+> under you. So: **before editing ANY tracked file, your FIRST action is to
+> create a worktree** (command below) and `cd` into it. If you've already made
+> edits on the main tree before realizing this, stop, `git stash`, move to a
+> worktree, and `git stash pop` there. When the work is done, merge the branch
+> back into `ramon-fork` as described at the end of this section. No exceptions,
+> no "this once."
 
 **Always work on a git worktree, never directly on the main tree's `ramon-fork`
 checkout.** Create a worktree for each task **inside `.claude/worktrees/`**

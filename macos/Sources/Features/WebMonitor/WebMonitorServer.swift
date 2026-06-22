@@ -45,10 +45,16 @@ final class WebMonitorServer {
     // INVARIANT (correctness-critical): this is a DEDICATED, private, SERIAL
     // background queue. It is NEVER DispatchQueue.main. The listener
     // (listener.start(queue:)), every connection (conn.start(queue:)), and
-    // every receive/send callback run on this queue. Because of that, the
-    // `DispatchQueue.main.sync { ... }` hops used by the API handlers (to touch
-    // AppKit / SurfaceView / ghostty_surface_*) can NEVER deadlock — we are
-    // never already on main when we sync onto main.
+    // every receive/send callback run on this queue, which serializes ALL access
+    // to the server's mutable dicts (connectionRefs/Timers, streamClients,
+    // streamingConns, failedAuth, cachedSurfaces). The API handlers that need
+    // AppKit / SurfaceView / ghostty_surface_* hop to main via `respondFromMain`
+    // (the simple ones) or the routeStream resolve hop — both now ASYNC, not
+    // `main.sync`, so the serial queue is FREED during the (slow, under SwiftUI
+    // load) main hop instead of head-of-line-blocking every other connection
+    // behind it. The response is `send`-ed back ON this queue, so dict access
+    // stays serialized; only value types (HTTPResponse) cross the hop. (The hop
+    // is still deadlock-free either way — we are never already on main.)
     private let queue = DispatchQueue(label: "com.mitchellh.ghostty-ramon.webmonitor")
 
     private let listenSpec: String
@@ -110,6 +116,24 @@ final class WebMonitorServer {
     static let failedAuthThreshold = 5
     private static let failedAuthWindow: TimeInterval = 60   // reset after 60s idle
     private static let failedAuthMaxEntries = 4096
+
+    /// Memoized `/api/surfaces` JSON + the time it was built. Accessed ONLY on
+    /// `queue`. The page polls every ~3s and many phones can poll at once; without
+    /// this each poll would hop to main and rebuild the list (iterating every
+    /// TerminalController + surface) — a main-thread cost that scales with clients.
+    /// A short TTL collapses STEADY-STATE bursts to ~1 build/sec (see thundering-
+    /// herd note in `.surfacesList`). Deliberate tradeoff: the list can lag a
+    /// surface create/close/rename by up to the TTL — fine for a phone list view,
+    /// and the per-surface routes (/screen,/input,/scroll,/stream) re-resolve the
+    /// surface LIVE each call, so a stale id from the cached list 404s on next
+    /// action rather than acting on a wrong/closed surface. No token leak: the
+    /// payload is the same {id,title,pwd} for every authenticated caller, and the
+    /// token gate in decideRoute rejects (.unauthorized) BEFORE .surfacesList is
+    /// reached, so the cache is only ever served to already-authenticated callers.
+    private var cachedSurfaces: (data: Data, at: Date)?
+    /// `internal` (not `private`) so `surfacesCacheFresh`'s default-`ttl` argument
+    /// — evaluated at the call site — resolves for the unit tests that omit `ttl`.
+    static let surfacesCacheTTL: TimeInterval = 1.0
 
     /// Current (non-decayed) failure count for a peer. Mutated only on `queue`.
     private func failedAuthCount(_ peer: String) -> Int {
@@ -265,9 +289,10 @@ final class WebMonitorServer {
         // but `connectionRefs` is otherwise mutated only on the dedicated serial
         // `queue` (handle / stateUpdateHandler). Hop onto that queue so ALL
         // access to the connection bookkeeping stays serialized — but do it
-        // ASYNC, never sync: handlers running on `queue` themselves hop to main
-        // via DispatchQueue.main.sync, so a `queue.sync` from main here would be
-        // a lock-order inversion that can hang termination. NWListener /
+        // ASYNC, never sync: a `queue.sync` from main could still invert against
+        // a handler's main hop and hang termination (the handlers' main hops are
+        // now async, but a queue.sync-from-main lock-order rule is kept as the
+        // safe invariant). NWListener /
         // NWConnection .cancel() are thread-safe, so async teardown is fine.
         queue.async {
             self.listener?.cancel()
@@ -462,8 +487,17 @@ final class WebMonitorServer {
                 self.cancelConnectionTimer(key)
                 self.send(.status(400, "Bad Request"), on: conn)
             case .complete(let req):
-                // Full request received; disarm the read watchdog before we do
-                // the (possibly main-thread) routing + response.
+                // Full request received; disarm the watchdogs before we do the
+                // (possibly main-thread) routing + response. This is LOAD-BEARING
+                // for the de-blocked handlers: `cancelConnectionTimer` cancels
+                // BOTH the idle watchdog AND the absolute-deadline timer, and the
+                // converted handlers hop to main *asynchronously* (respondFromMain
+                // / the .surfacesList + routeStream resolve hops) — which frees the
+                // serial `queue`. If the absolute-deadline timer were still armed
+                // here, the now-free queue could let it fire mid-hop and cancel the
+                // connection out from under an in-flight response. Both timers are
+                // already dead by this point, so that race cannot occur; keep this
+                // cancel BEFORE routeRequest. (send() also re-cancels idempotently.)
                 self.cancelConnectionTimer(key)
                 self.routeRequest(req, on: conn)
             }
@@ -673,8 +707,25 @@ final class WebMonitorServer {
 
         case .surfacesList:
             clearAuthFailures(peer)
-            let json: Data = DispatchQueue.main.sync { self.surfacesJSON() }
-            send(.json(json), on: conn)
+            if let cached = Self.cachedSurfacesData(cachedSurfaces, now: Date()) {
+                // Fresh — serve from cache with NO main-thread hop at all.
+                send(.json(cached), on: conn)
+            } else {
+                // Stale/empty — build on main, then on `queue` store + send. NOTE: a
+                // burst of misses arriving BEFORE the first build stores the cache will
+                // each independently hop to main (the cache only collapses misses AFTER
+                // the first store lands), so the ~1 build/sec bound holds in steady
+                // state, not against a cold-cache thundering herd. Still a large win for
+                // the dominant 3s-poll case, and bounded by the 32-conn cap.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let json = self.surfacesJSON()
+                    self.queue.async {
+                        self.cachedSurfaces = (data: json, at: Date())
+                        self.send(.json(json), on: conn)
+                    }
+                }
+            }
 
         case .methodNotAllowed:
             clearAuthFailures(peer)
@@ -686,7 +737,7 @@ final class WebMonitorServer {
 
         case .screen(let uuid, let scrollback):
             clearAuthFailures(peer)
-            let result: HTTPResponse = DispatchQueue.main.sync {
+            respondFromMain(on: conn) {
                 guard let view = self.surface(forUUID: uuid) else { return .status(404, "Not Found") }
                 // Reuse the cached readers (~500ms TTL; they free their own
                 // text inside the cache closure). Value out only.
@@ -695,7 +746,6 @@ final class WebMonitorServer {
                     : view.cachedVisibleContents.get()
                 return .text(text)
             }
-            send(result, on: conn)
 
         case .stream(let uuid):
             clearAuthFailures(peer)
@@ -722,7 +772,7 @@ final class WebMonitorServer {
                 send(.status(400, "Bad Request"), on: conn)
                 return
             }
-            let result: HTTPResponse = DispatchQueue.main.sync {
+            respondFromMain(on: conn) {
                 guard let (controller, view) = self.controllerAndView(forUUID: uuid),
                       let surface = view.surface else { return .status(404, "Not Found") }
                 // If the target is hidden under a zoom, reveal it first so it gets
@@ -737,7 +787,6 @@ final class WebMonitorServer {
                 }
                 return .json(Data(#"{"ok":true,"sent":\#(specs.count)}"#.utf8))
             }
-            send(result, on: conn)
 
         case .scroll(let uuid):
             clearAuthFailures(peer)
@@ -745,7 +794,7 @@ final class WebMonitorServer {
                 send(.status(400, "Bad Request"), on: conn)
                 return
             }
-            let result: HTTPResponse = DispatchQueue.main.sync {
+            respondFromMain(on: conn) {
                 guard let (controller, view) = self.controllerAndView(forUUID: uuid),
                       let surface = view.surface else { return .status(404, "Not Found") }
                 // A zoomed-away split keeps a stale/zero size and ignores scroll;
@@ -758,18 +807,16 @@ final class WebMonitorServer {
                 ghostty_surface_mouse_scroll(surface, 0, dy, 0)
                 return .json(Data(#"{"ok":true}"#.utf8))
             }
-            send(result, on: conn)
 
         case .clearBell(let uuid):
             clearAuthFailures(peer)
             // Acknowledge a bell from the phone WITHOUT focusing the surface
             // locally — drop the 🔔/border/badge so it can ring again later.
-            let result: HTTPResponse = DispatchQueue.main.sync {
+            respondFromMain(on: conn) {
                 guard let view = self.surface(forUUID: uuid) else { return .status(404, "Not Found") }
                 view.resetBell()
                 return .json(Data(#"{"ok":true}"#.utf8))
             }
-            send(result, on: conn)
 
         case .asset(let name, let ext, let contentType):
             clearAuthFailures(peer)
@@ -888,38 +935,85 @@ final class WebMonitorServer {
     /// or 404 when the surface is gone / has no live session id.
     ///
     /// THREADING: the AppKit / `ghostty_surface_*` access (surface lookup,
-    /// `ghostty_surface_session_id`, the config getter) happens inside a single
-    /// `DispatchQueue.main.sync` that returns ONLY value types (a session id +
+    /// `ghostty_surface_session_id`, the config getter) happens inside a
+    /// `DispatchQueue.main.async` that returns ONLY value types (a session id +
     /// the socket-path String) — never a surface pointer / SurfaceView across
-    /// the hop. Everything after (the host client, the NWConnection writes) runs
-    /// on the connection `queue`. The host client's `onBytes`/`onClose` fire on
+    /// the hop. The hop is ASYNC (not `main.sync`) so the serial `queue` is not
+    /// head-of-line-blocked during resolve; the streaming SETUP after it (which
+    /// touches `queue`-only dicts) runs back on the connection `queue` via a
+    /// `queue.async` continuation. That continuation's branching (liveness guard
+    /// ⇒ abort; nil resolve ⇒ 404; missing pty-host ⇒ 501; otherwise proceed) is
+    /// computed by the PURE, unit-tested `streamSetupDecision`; the liveness guard
+    /// (`connectionRefs[key] != nil`) ensures a peer that disconnected mid-hop
+    /// never leaks a host client. The host client's `onBytes`/`onClose` fire on
     /// ITS own background queue; they only call thread-safe `NWConnection`
     /// methods, so no further hop is needed.
     private func routeStream(uuid: UUID, on conn: NWConnection) {
         let key = ObjectIdentifier(conn)
 
-        // Resolve session id + socket path on main (value types only).
-        struct Resolved { let sessionID: UInt64; let socketPath: String?; let cols: UInt16; let rows: UInt16 }
-        let resolved: Resolved? = DispatchQueue.main.sync {
-            guard let view = self.surface(forUUID: uuid),
-                  let surface = view.surface else { return nil }
-            let sid = ghostty_surface_session_id(surface)
-            let path = (NSApp.delegate as? AppDelegate)?.ghostty.config.ptyHost
-            let size = ghostty_surface_size(surface)  // host grid, so xterm can match
-            return Resolved(sessionID: sid, socketPath: path, cols: size.columns, rows: size.rows)
-        }
+        // De-blocked resolve hop (head-of-line fix): like the simple handlers
+        // (see `respondFromMain`) we hop to main ASYNC so the serial `queue` is
+        // not blocked for the whole resolve — but unlike them the streaming setup
+        // AFTER resolve touches `queue`-only state (the timer/conn dicts,
+        // `streamingConns`, `streamClients`) and so MUST run back on `queue`. So
+        // the continuation hops back via `queue.async`. (Old code did the resolve
+        // under `main.sync`, blocking `queue` throughout.)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Resolve session id + socket path on main (value types only).
+            let resolved: StreamResolution? = {
+                guard let view = self.surface(forUUID: uuid),
+                      let surface = view.surface else { return nil }
+                let sid = ghostty_surface_session_id(surface)
+                let path = (NSApp.delegate as? AppDelegate)?.ghostty.config.ptyHost
+                let size = ghostty_surface_size(surface)  // host grid, so xterm can match
+                return StreamResolution(sessionID: sid, socketPath: path, cols: size.columns, rows: size.rows)
+            }()
 
-        guard let resolved else {
-            send(.status(404, "Not Found"), on: conn)
-            return
+            self.queue.async {
+                // The liveness guard, 404, 501 and proceed branching is computed by
+                // the PURE `streamSetupDecision` (unit-tested), so only the side
+                // effects live here. `connectionAlive` is `connectionRefs[key] !=
+                // nil` — the authoritative on-`queue` liveness bit.
+                //
+                // Liveness guard (unique to routeStream): the peer may have
+                // disconnected (or stop() may have torn down) DURING the main
+                // resolve hop, in which case the .cancelled/.failed state handler
+                // already ran on `queue` and dropped connectionRefs[key] /
+                // streamClients / streamingConns. Without aborting we would
+                // re-insert a streaming entry and start a host client for a dead
+                // conn — a leaked host subscription that connects + subscribes
+                // pointlessly. Under the old `main.sync` this window did not exist
+                // because the queue was blocked throughout the hop. This is unique
+                // to routeStream because ONLY routeStream creates a leakable
+                // resource after the hop; the simple respondFromMain handlers
+                // deliberately omit it (they create no such resource — see
+                // respondFromMain's doc comment).
+                switch Self.streamSetupDecision(
+                    connectionAlive: self.connectionRefs[key] != nil, resolved: resolved) {
+                case .abort:
+                    return
+                case .notFound:
+                    self.send(.status(404, "Not Found"), on: conn)
+                case .notImplemented:
+                    // No pty-host configured -> the raw stream is unavailable. 501 so
+                    // the page falls back to the /screen viewport poll, not a hang.
+                    self.send(.status(501, "Not Implemented"), on: conn)
+                case let .proceed(socketPath, sessionID, cols, rows):
+                    self.startStream(on: conn, key: key, socketPath: socketPath,
+                                     sessionID: sessionID, cols: cols, rows: rows)
+                }
+            }
         }
-        // No pty-host configured -> the raw stream is unavailable. 501 so the
-        // page falls back to the /screen viewport poll instead of hanging.
-        guard let socketPath = resolved.socketPath, !socketPath.isEmpty else {
-            send(.status(501, "Not Implemented"), on: conn)
-            return
-        }
+    }
 
+    /// The side-effecting tail of `routeStream` once `streamSetupDecision`
+    /// returns `.proceed`. Runs on `queue` (touches `streamingConns` /
+    /// `streamClients` / the timer dicts). Split out so routeStream's body is the
+    /// pure-decision switch above.
+    private func startStream(on conn: NWConnection, key: ObjectIdentifier,
+                             socketPath: String, sessionID: UInt64,
+                             cols: UInt16, rows: UInt16) {
         // Enter streaming mode: this connection is long-lived, so exempt it from
         // BOTH watchdogs (they would otherwise cancel it mid-stream), and mark it
         // so teardown stays idempotent. We deliberately do NOT route this through
@@ -930,7 +1024,7 @@ final class WebMonitorServer {
 
         // Write the streaming HTTP head. On failure the connection is already
         // gone; the state handler will clean up.
-        conn.send(content: Self.streamResponseHead(cols: resolved.cols, rows: resolved.rows),
+        conn.send(content: Self.streamResponseHead(cols: cols, rows: rows),
                   completion: .contentProcessed { _ in })
 
         // Open the host client and pipe raw bytes onto the connection. onBytes /
@@ -940,7 +1034,7 @@ final class WebMonitorServer {
         // single-threaded.
         let client = WebMonitorHostClient(
             socketPath: socketPath,
-            sessionID: resolved.sessionID,
+            sessionID: sessionID,
             onBytes: { [weak conn] data in
                 conn?.send(content: data, completion: .contentProcessed { err in
                     // A write error means the peer (phone) hung up; tear the
@@ -1290,6 +1384,71 @@ final class WebMonitorServer {
         return (try? JSONSerialization.data(withJSONObject: arr)) ?? Data("[]".utf8)
     }
 
+    /// Whether a cached-at timestamp is still fresh at `now` for the given TTL.
+    /// PURE + `internal` so the cache-freshness boundary is unit-testable without
+    /// AppKit or wall-clock racing. (`at == nil` ⇒ never fresh; strict `<`.)
+    static func surfacesCacheFresh(at: Date?, now: Date, ttl: TimeInterval = surfacesCacheTTL) -> Bool {
+        guard let at else { return false }
+        return now.timeIntervalSince(at) < ttl
+    }
+
+    /// Pure read-side of the `.surfacesList` cache: returns the cached bytes when the
+    /// entry exists AND is still fresh at `now` (a cache HIT, no main hop needed), or
+    /// `nil` when the cache is empty or stale (a MISS ⇒ the handler must rebuild on
+    /// main). `internal` so the hit/miss decision is unit-testable without AppKit; the
+    /// handler calls this on `queue` and never touches `cachedSurfaces` off `queue`.
+    static func cachedSurfacesData(_ cache: (data: Data, at: Date)?, now: Date, ttl: TimeInterval = surfacesCacheTTL) -> Data? {
+        guard let cache, surfacesCacheFresh(at: cache.at, now: now, ttl: ttl) else { return nil }
+        return cache.data
+    }
+
+    // MARK: - /stream post-hop decision (pure)
+
+    /// The value-type result of resolving a surface for `/stream` on the main
+    /// thread: the host session id + socket path + host grid. Only value types,
+    /// so it crosses the main hop safely (never a surface / SurfaceView). Lifted
+    /// from a local struct to type scope so `streamSetupDecision` (and its unit
+    /// tests) can name it.
+    struct StreamResolution: Equatable {
+        let sessionID: UInt64
+        let socketPath: String?
+        let cols: UInt16
+        let rows: UInt16
+    }
+
+    /// What the post-hop continuation must do once it is back on `queue` after
+    /// the async resolve. Pure + `Equatable` so the genuinely-new branching
+    /// (liveness guard ⇒ abort; nil resolve ⇒ 404; missing pty-host ⇒ 501;
+    /// otherwise proceed to open the host client) is unit-testable WITHOUT
+    /// AppKit / a real NWConnection.
+    enum StreamSetupDecision: Equatable {
+        /// The peer disconnected (or `stop()` tore down) DURING the main resolve
+        /// hop — `connectionRefs[key]` is gone. Do nothing: opening a host client
+        /// now would leak a pointless subscription for a dead conn.
+        case abort
+        /// Surface gone / has no live surface ⇒ 404.
+        case notFound
+        /// No pty-host configured ⇒ 501 so the page falls back to the /screen poll.
+        case notImplemented
+        /// Live conn + a usable session ⇒ open the host client with these params.
+        case proceed(socketPath: String, sessionID: UInt64, cols: UInt16, rows: UInt16)
+    }
+
+    /// PURE decision for routeStream's post-hop continuation. `connectionAlive`
+    /// is `connectionRefs[key] != nil` (the authoritative on-`queue` liveness
+    /// bit); `resolved` is the value-type resolve result from the main hop. This
+    /// mirrors EXACTLY the guard chain the on-`queue` continuation runs, so the
+    /// liveness/404/501/proceed branching is testable in isolation. The handler
+    /// still PERFORMS the side effects (insert streamingConns, start the client)
+    /// — this only computes WHICH branch to take.
+    static func streamSetupDecision(connectionAlive: Bool, resolved: StreamResolution?) -> StreamSetupDecision {
+        guard connectionAlive else { return .abort }
+        guard let resolved else { return .notFound }
+        guard let socketPath = resolved.socketPath, !socketPath.isEmpty else { return .notImplemented }
+        return .proceed(socketPath: socketPath, sessionID: resolved.sessionID,
+                        cols: resolved.cols, rows: resolved.rows)
+    }
+
     // MARK: - Token strength (startup gate)
 
     /// Minimum acceptable token length. The token is the sole shell-execution
@@ -1494,6 +1653,50 @@ final class WebMonitorServer {
         conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
     }
 
+    /// Compute a value-type `HTTPResponse` on the MAIN thread (AppKit / surface
+    /// access), then hop BACK to the connection `queue` to `send` it. This is the
+    /// async analog of the old `let r = DispatchQueue.main.sync { … }; send(r, …)`
+    /// pattern: it does NOT block the serial `queue` during the (potentially
+    /// multi-second, under SwiftUI load) main hop, so other connections — notably
+    /// static assets that need nothing from main — are serviced immediately
+    /// instead of queueing head-to-tail behind it (the head-of-line-blocking fix).
+    ///
+    /// CONTRACT for `work` (load-bearing — a future handler added via this helper
+    /// MUST honor it): `work` runs on MAIN and may touch ONLY AppKit / global
+    /// state (`TerminalController.all`, `SurfaceView`, `ghostty_surface_*`). It
+    /// must NEVER read or mutate server `queue`-only state (`cachedSurfaces`,
+    /// `streamClients`, `streamingConns`, the timer dicts, `failedAuth`) — that
+    /// state is single-threaded on `queue` and `work` is on main. (The cache-build
+    /// path in `.surfacesList` obeys this: it touches `self.cachedSurfaces` only
+    /// AFTER the post-hop `guard let self` re-entry on `queue`, never inside the
+    /// main block.) Only a value type (`HTTPResponse`) crosses the hop — never a
+    /// surface / SurfaceView. `send` still runs on `queue`, so all timer/conn dict
+    /// access inside it stays serialized.
+    ///
+    /// LIFECYCLE — the single genuinely new property vs. the old synchronous chain:
+    /// because `send` now runs from a `queue.async` continuation scheduled AFTER
+    /// the main hop, the connection's `stateUpdateHandler(.cancelled)` or `stop()`'s
+    /// teardown can run on `queue` BETWEEN the dispatch and this continuation. That
+    /// is SAFE here: these simple handlers create NO leakable resource (no
+    /// `WebMonitorHostClient`, no `streamingConns` insert), so a `send` to an
+    /// already-cancelled NWConnection just fails harmlessly and
+    /// `cancelConnectionTimer` inside `send` no-ops on the already-emptied dicts.
+    /// (routeStream is the EXCEPTION — it DOES create a leakable resource and so
+    /// needs an explicit liveness guard; see routeStream's `guard connectionRefs`.
+    /// Do NOT add that guard here, and do NOT remove it there.)
+    ///
+    /// `work` retains `self` for the duration of the main hop (it references e.g.
+    /// `self.surface(forUUID:)`), exactly as the old `main.sync` closures did. The
+    /// `[weak self]` below only governs the post-hop `queue` re-entry: if the
+    /// server was torn down during the hop we drop the `send`.
+    private func respondFromMain(on conn: NWConnection, _ work: @escaping () -> HTTPResponse) {
+        DispatchQueue.main.async { [weak self] in
+            let response = work()
+            guard let self else { return }
+            self.queue.async { self.send(response, on: conn) }
+        }
+    }
+
     // MARK: - Web Push service worker
 
     // The service worker that receives background push messages and shows the
@@ -1660,7 +1863,9 @@ final class WebMonitorServer {
         <button data-key="backspace" title="Backspace / delete char">&#9003;</button>
         <button data-key="ctrl-u" title="Clear line (Ctrl-U)">Clear</button>
         <button data-key="ctrl-c" class="danger">Ctrl-C</button>
-        <button id="clearbell"
+        <!-- Shown only while this split has an active (unacknowledged) bell;
+             hidden again once the clear is processed (visible confirmation). -->
+        <button id="clearbell" style="display:none"
                 title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
       </div>
       <!-- Arrows + remote-control scroll on ONE row to save vertical space.
@@ -1887,7 +2092,7 @@ final class WebMonitorServer {
               }
               var p = document.createElement("div"); p.className = "p"; p.textContent = row.pwd || "";
               d.appendChild(t); d.appendChild(p);
-              d.onclick = function () { showSurface(row.id, row.title); };
+              d.onclick = function () { showSurface(row.id, row.title, row.bell); };
               frag.appendChild(d);
             });
           });
@@ -2073,10 +2278,37 @@ final class WebMonitorServer {
         backBtn.style.display = "none";
         curEl.textContent = "";
         jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
+        setClearBellVisible(false);
       }
 
-      function showSurface(id, title) {
+      // The Clear-bell button is only meaningful when this split has an active
+      // bell, so it's hidden otherwise; its disappearance after a clear doubles
+      // as confirmation the bell was acknowledged (no trip back to the list).
+      function setClearBellVisible(on) {
+        clearBellBtn.style.display = on ? "inline-block" : "none";
+      }
+
+      // While viewing a split the detail view doesn't poll the session list, so
+      // refresh the Clear-bell button against the live bell state — both to
+      // reveal it if a bell rings mid-view and to drop it once a clear lands.
+      function refreshBellButton() {
+        if (!current) return;
+        var want = current;
+        fetch(url("/api/surfaces"), { headers: headers() })
+          .then(function (r) { return r && r.ok ? r.json() : null; })
+          .then(function (rows) {
+            if (!rows || current !== want) return;  // navigated away meanwhile
+            var hit = null;
+            for (var i = 0; i < rows.length; i++) { if (rows[i].id === want) { hit = rows[i]; break; } }
+            if (hit) setClearBellVisible(!!hit.bell);
+          })
+          .catch(function () {});
+      }
+
+      function showSurface(id, title, bell) {
         current = id;
+        setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
+        refreshBellButton();
         listEl.style.display = "none";
         viewer.style.display = "block";
         backBtn.style.display = "inline-block";
@@ -2115,7 +2347,7 @@ final class WebMonitorServer {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/bell"), { method: "POST", headers: headers() })
           .then(function (r) {
-            if (r && r.ok) { setBanner("Bell cleared.", true); setTimeout(clearBannerIfNotError, 1200); }
+            if (r && r.ok) { setClearBellVisible(false); setBanner("Bell cleared.", true); setTimeout(clearBannerIfNotError, 1200); }
             else if (r && r.status === 404) { sessionClosedTeardown(); }
             else { setBanner("Clear bell failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
           })
@@ -2366,7 +2598,7 @@ final class WebMonitorServer {
       // a fresh loadList().
       function start() {
         if (!listTimer) {
-          listTimer = setInterval(function () { if (!current) loadList(); }, 3000);
+          listTimer = setInterval(function () { if (current) refreshBellButton(); else loadList(); }, 3000);
         }
         loadList();
         loadPushConfig();

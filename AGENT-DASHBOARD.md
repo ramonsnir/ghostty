@@ -1,12 +1,18 @@
 # Agent Dashboard — a live wall of every CLI agent
 
 Fork-only feature of **"Ghostty (ramon)"** (bundle id `com.mitchellh.ghostty-ramon`).
-A floating, foreground-locked **NSPanel** that shows a live, natively-rendered
-mini-preview of **every terminal split running a CLI agent** (Claude Code / Codex /
+A persistent sidebar **NSPanel** that shows a live, natively-rendered
+preview of **every terminal split running a CLI agent** (Claude Code / Codex /
 …) across **all tabs and all windows** — built for a wide monitor where you want a
-glanceable status wall of your agents off to one side.
+glanceable status wall of your agents off to one side. Agents are stacked as
+**full-width rows**, each showing the **latest rows** of that split.
 
-Each tile shows the agent's last rows in full ANSI color, highlights the ones that
+The panel is **not** always-on-top — it sits at normal window level, so other
+windows can be raised in front of it. It carries a real, visible **window title
+("Agent Dashboard")** and a standard-window accessibility subrole, so an external
+window manager (Rectangle Pro etc.) can target it by title.
+
+Each row shows the agent's last rows in full ANSI color, highlights the ones that
 **rang the bell** (needs-your-input) with the amber bell border, and **jumps you to
 that split** (raising its window, selecting its tab, un-zooming if it's hidden under
 a split-zoom) on click. A per-tile **Hide ✕** declutters idle sessions; a hidden
@@ -53,14 +59,18 @@ keybind = ctrl+a>d=toggle_agent_dashboard
 
 ## Using it
 
-- **The panel** floats above terminal windows, stays visible when another app is
-  frontmost, and joins all Spaces. Drag it by its background; resize it; its frame and
-  open/closed state are remembered across launches (per fork identity's UserDefaults).
-  The default first-run frame is the right ~40% × full height of your widest screen.
-- **Tiles** are 4:3 cards: a header (`agent badge · title · bell dot · Hide ✕`), the
-  live preview, and a footer (`cwd · "needs input"` pill when ringing). They sort
+- **The panel** sits at normal window level (NOT always-on-top, so other windows can
+  cover it), stays visible when another app is frontmost, and joins all Spaces. It has a
+  visible title bar ("Agent Dashboard") and a standard-window subrole, so a window manager
+  (Rectangle Pro) can target it by title. Drag it by its title bar / background; resize it;
+  its frame and open/closed state are remembered across launches (per fork identity's
+  UserDefaults). The default first-run frame is the right ~40% × full height of your widest
+  screen.
+- **Rows** are full-width cards stacked vertically: a header (`agent badge · title · bell
+  dot · Hide ✕`), the live preview (showing the agent's **latest rows** — bottom-anchored,
+  the top is clipped), and a footer (`cwd · "needs input"` pill when ringing). They sort
   **bell-first**, then most-recently-seen-as-an-agent, then a stable tie-break.
-- **Click a tile** to jump to that real split — it raises the window, selects the tab,
+- **Click a row** to jump to that real split — it raises the window, selects the tab,
   **un-zooms** if the split is hidden under a zoom, and gives the standard locate-pane
   highlight flash. The tiles are **read-only**: no inline reply / key forwarding (jump
   to the split to type).

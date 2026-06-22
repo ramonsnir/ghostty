@@ -240,10 +240,21 @@ final class AgentDetector {
     }
 
     /// PURE per-tick resolution, factored out of `tick()` so the cache behavior
-    /// (skip-walk on unchanged pid, re-walk on pid change, drop vanished ids) is
-    /// unit-testable with an injected enumerator + fixed snapshot. Returns the
-    /// published results and the next cache. No syscalls of its own — all process
-    /// walks go through `enumerator`.
+    /// (skip-walk on a POSITIVE unchanged pid, re-walk otherwise, drop vanished
+    /// ids) is unit-testable with an injected enumerator + fixed snapshot.
+    /// Returns the published results and the next cache. No syscalls of its own —
+    /// all process walks go through `enumerator`.
+    ///
+    /// NEGATIVE (non-agent) results are deliberately NOT cached across ticks. A
+    /// long-lived foreground process can spawn an agent CHILD later WITHOUT its
+    /// pid changing — e.g. the claude-accounts pool keeps `bash …/claude-pool` as
+    /// the stable tty foreground-group leader (`tcgetpgrp`) and starts/replaces
+    /// the `claude` child underneath it. Caching the nil from a walk that ran
+    /// before the child existed would hide that agent FOREVER (the pid never
+    /// changes, so a pid-keyed cache never re-walks). So we only fast-path a
+    /// surface already POSITIVELY identified at the same pid; everything else is
+    /// re-walked each tick. (codex doesn't hit the bug because its `node` leader
+    /// has the codex child from the start — its first walk is already positive.)
     static func resolve(
         snapshot: [(uuid: UUID, pid: pid_t)],
         cache: [UUID: (pid: pid_t, kind: AgentKind?)],
@@ -253,9 +264,11 @@ final class AgentDetector {
         var results: [UUID: AgentKind] = [:]
         var nextCache: [UUID: (pid: pid_t, kind: AgentKind?)] = [:]
         for (uuid, pid) in snapshot {
-            if let cached = cache[uuid], cached.pid == pid {
+            // Fast-path ONLY a stable, already-positive surface. A nil-cached
+            // surface (same pid, no agent yet) falls through and re-walks.
+            if let cached = cache[uuid], cached.pid == pid, let kind = cached.kind {
                 nextCache[uuid] = cached
-                if let kind = cached.kind { results[uuid] = kind }
+                results[uuid] = kind
                 continue
             }
             let procSnapshot = enumerator.snapshot(rootPID: pid)

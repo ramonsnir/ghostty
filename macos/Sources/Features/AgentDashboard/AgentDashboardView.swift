@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// (ramon fork / Agent Dashboard, Layer 3) The dashboard surface: a wrapping
-/// grid of agent preview tiles plus the six non-blank degraded states and the
-/// "N hidden" affordance.
+/// (ramon fork / Agent Dashboard, Layer 3) The dashboard surface: a vertical
+/// stack of full-width agent preview rows plus the six non-blank degraded states
+/// and the "N hidden" affordance.
 struct AgentDashboardView: View {
     @ObservedObject var model: AgentDashboardModel
     let ghostty: Ghostty.App
@@ -12,7 +12,9 @@ struct AgentDashboardView: View {
     /// Whether the "N hidden" popover is expanded.
     @State private var showHiddenPopover = false
 
-    private let columns = [GridItem(.adaptive(minimum: 320, maximum: 480), spacing: 12)]
+    // Full-width rows: one flexible column so each agent gets the entire panel
+    // width (request #4 — the little grid tiles were too small to read).
+    private let columns = [GridItem(.flexible(), spacing: 12)]
 
     var body: some View {
         VStack(spacing: 0) {
