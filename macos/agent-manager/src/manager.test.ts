@@ -7,16 +7,20 @@ import assert from "node:assert/strict";
 
 import type { Surface } from "./mcp.js";
 import {
+  DEFAULT_CONFIDENCE,
   DEFAULT_MANAGER_CONFIG,
   MANAGER_MODEL,
   SUGGESTION_MAX_LEN,
   assembleGoals,
   buildContext,
+  clampConfidence,
   composePrompt,
+  dismissFingerprint,
   fingerprint,
   parseSuggestion,
   serializeContext,
   shouldSuggest,
+  type LastSuggestion,
   type ManagerSnapshot,
 } from "./manager.js";
 import { MANAGER_BASE_PROMPT } from "./prompts.js";
@@ -115,6 +119,125 @@ test("shouldSuggest: a changed screen past debounce re-fires", () => {
   assert.equal(d.reason, "changed");
 });
 
+// --- shouldSuggest: dismiss-suppression (Phase 2.1) --------------------------
+
+test("shouldSuggest: dismissed + suppression NOT armed => arms it, skips", () => {
+  const s = snap({ agentState: "waiting", suggestionDismissed: true }, "blocked screen");
+  // A prior record whose manager fingerprint differs from the current one (so the
+  // coarse 'unchanged' gate does NOT short-circuit), with no arm yet.
+  const last: LastSuggestion = {
+    fingerprint: "stale-mgr-fp",
+    atMs: 0,
+    suggestion: "prev",
+    suppressedFingerprint: null,
+  };
+  const d = shouldSuggest(s, "g", last, CFG.debounceMs + 1, CFG);
+  assert.equal(d.due, false);
+  assert.equal(d.reason, "dismissed-arm");
+  // It arms to the CURRENT summarizer fingerprint (the dismissed screen), so the
+  // subsequent dismissed-unchanged compare lives in the same space.
+  assert.equal(d.suppressedFingerprint, dismissFingerprint(s));
+});
+
+test("shouldSuggest: dismissed arms EVEN when the manager fingerprint is UNCHANGED", () => {
+  // The load-bearing regression case: in the NORMAL waiting flow the screen + goals
+  // are stable across the dismiss sweep, so the manager `unchanged` gate WOULD match
+  // (fp === last.fingerprint). Dismiss-suppression must still arm at dismiss time —
+  // it is evaluated BEFORE the `unchanged` gate for a dismissed surface.
+  const goals = "g";
+  const s = snap({ agentState: "waiting", suggestionDismissed: true }, "the blocking screen");
+  const last: LastSuggestion = {
+    fingerprint: fingerprint(s, goals, CFG), // EXACTLY the current manager fp (stable)
+    atMs: 0,
+    suggestion: "prev",
+    suppressedFingerprint: null,
+  };
+  const d = shouldSuggest(s, goals, last, CFG.debounceMs + 1, CFG);
+  assert.equal(d.due, false);
+  assert.equal(d.reason, "dismissed-arm", "arms despite the unchanged manager fp");
+  assert.equal(d.suppressedFingerprint, dismissFingerprint(s));
+});
+
+test("shouldSuggest: dismissed + ONE summarizer change after arming => suggest (single change)", () => {
+  // After arming at screen A, the FIRST meaningful (summarizer) change re-suggests —
+  // a SINGLE change, not two. Manager fp is held stable to prove the decision is
+  // driven purely by the summarizer-space compare.
+  const goals = "g";
+  const sArmed = snap({ agentState: "waiting", suggestionDismissed: true }, "screen A");
+  const armed = dismissFingerprint(sArmed);
+  const sChanged = snap({ agentState: "waiting", suggestionDismissed: true }, "screen B");
+  const last: LastSuggestion = {
+    fingerprint: fingerprint(sChanged, goals, CFG), // stable manager fp (unchanged gate would match)
+    atMs: 0,
+    suggestion: "prev",
+    suppressedFingerprint: armed,
+  };
+  const d = shouldSuggest(sChanged, goals, last, CFG.debounceMs + 1, CFG);
+  assert.equal(d.due, true);
+  assert.equal(d.reason, "dismissed-changed");
+  assert.equal(d.suppressedFingerprint, null);
+});
+
+test("shouldSuggest: (a) dismissed + UNCHANGED vs the arm => skip", () => {
+  const s = snap({ agentState: "waiting", suggestionDismissed: true }, "blocked screen");
+  const armed = dismissFingerprint(s);
+  const last: LastSuggestion = {
+    fingerprint: "stale-mgr-fp", // differs from current so we reach the suppression block
+    atMs: 0,
+    suggestion: "prev",
+    suppressedFingerprint: armed,
+  };
+  const d = shouldSuggest(s, "g", last, CFG.debounceMs + 1, CFG);
+  assert.equal(d.due, false);
+  assert.equal(d.reason, "dismissed-unchanged");
+});
+
+test("shouldSuggest: (b) dismissed + CHANGED vs the arm => suggest AND clear", () => {
+  const s = snap({ agentState: "waiting", suggestionDismissed: true }, "a NEW screen entirely");
+  const last: LastSuggestion = {
+    fingerprint: "stale-mgr-fp",
+    atMs: 0,
+    suggestion: "prev",
+    suppressedFingerprint: "an-old-arm-from-a-different-screen",
+  };
+  const d = shouldSuggest(s, "g", last, CFG.debounceMs + 1, CFG);
+  assert.equal(d.due, true);
+  assert.equal(d.reason, "dismissed-changed");
+  assert.equal(d.suppressedFingerprint, null); // cleared
+});
+
+test("shouldSuggest: (c) NOT dismissed behaves as before (+ clears stale arm)", () => {
+  // Even if a stale arm lingers, a not-dismissed waiting surface suggests as usual.
+  const s = snap({ agentState: "waiting", suggestionDismissed: false }, "changed screen");
+  const last: LastSuggestion = {
+    fingerprint: "stale-mgr-fp",
+    atMs: 0,
+    suggestion: "prev",
+    suppressedFingerprint: "lingering-arm",
+  };
+  const d = shouldSuggest(s, "g", last, CFG.debounceMs + 1, CFG);
+  assert.equal(d.due, true);
+  assert.equal(d.reason, "changed");
+  assert.equal(d.suppressedFingerprint, null);
+});
+
+test("shouldSuggest: dismissed=undefined (pre-upgrade host) reads as not-dismissed", () => {
+  const s = snap({ agentState: "waiting" }, "scr"); // suggestionDismissed omitted
+  const d = shouldSuggest(s, "g", undefined, 0, CFG);
+  assert.equal(d.due, true);
+  assert.equal(d.reason, "first");
+});
+
+test("dismissFingerprint: uses the summarizer's fields (agentState/prompt/tool/tail)", () => {
+  const base = snap({ agentState: "waiting", lastPrompt: "p", lastTool: "Bash" }, "tail");
+  const changedTool = snap(
+    { agentState: "waiting", lastPrompt: "p", lastTool: "Edit" }, "tail");
+  const changedTail = snap(
+    { agentState: "waiting", lastPrompt: "p", lastTool: "Bash" }, "different tail");
+  assert.notEqual(dismissFingerprint(base), dismissFingerprint(changedTool));
+  assert.notEqual(dismissFingerprint(base), dismissFingerprint(changedTail));
+});
+
 test("fingerprint: changes when goals or screen change", () => {
   const a = fingerprint(snap({ agentState: "waiting" }, "screen-1"), "goal-1", CFG);
   const b = fingerprint(snap({ agentState: "waiting" }, "screen-2"), "goal-1", CFG);
@@ -150,6 +273,7 @@ test("composePrompt: system is the manager base (+ override), user is the contex
   const { system, user } = composePrompt(MANAGER_BASE_PROMPT, null, ctx);
   assert.match(system, /Agent Manager/);
   assert.match(system, /"suggestion"/); // the output contract is in the base
+  assert.match(system, /"confidence"/); // (Phase 2.1) confidence is required
   assert.match(user, /SESSION GOALS/);
   const withOverride = composePrompt(MANAGER_BASE_PROMPT, "Be brief.", ctx);
   assert.match(withOverride.system, /Be brief\./);
@@ -163,10 +287,44 @@ test("parseSuggestion: plain object", () => {
   assert.equal(p?.rationale, "the note says so");
 });
 
-test("parseSuggestion: suggestion-only (no rationale)", () => {
+test("parseSuggestion: suggestion-only (no rationale) defaults confidence", () => {
   const p = parseSuggestion('{"suggestion":"yes, option 2"}');
   assert.equal(p?.suggestion, "yes, option 2");
   assert.equal(p?.rationale, undefined);
+  // confidence is ALWAYS populated; absent => DEFAULT_CONFIDENCE.
+  assert.equal(p?.confidence, DEFAULT_CONFIDENCE);
+});
+
+// --- parseSuggestion: confidence parse + clamp (Phase 2.1) -------------------
+
+test("parseSuggestion: parses a valid confidence", () => {
+  const p = parseSuggestion('{"suggestion":"use postgres","confidence":0.8}');
+  assert.equal(p?.confidence, 0.8);
+});
+
+test("parseSuggestion: clamps confidence above 1 to 1", () => {
+  const p = parseSuggestion('{"suggestion":"go","confidence":1.7}');
+  assert.equal(p?.confidence, 1);
+});
+
+test("parseSuggestion: clamps confidence below 0 to 0", () => {
+  const p = parseSuggestion('{"suggestion":"go","confidence":-0.4}');
+  assert.equal(p?.confidence, 0);
+});
+
+test("parseSuggestion: non-number / NaN confidence => default", () => {
+  assert.equal(parseSuggestion('{"suggestion":"go","confidence":"high"}')?.confidence, DEFAULT_CONFIDENCE);
+  assert.equal(parseSuggestion('{"suggestion":"go","confidence":null}')?.confidence, DEFAULT_CONFIDENCE);
+  // NaN is not representable in JSON; clampConfidence guards it directly.
+  assert.equal(clampConfidence(Number.NaN), DEFAULT_CONFIDENCE);
+  assert.equal(clampConfidence(Number.POSITIVE_INFINITY), DEFAULT_CONFIDENCE);
+});
+
+test("clampConfidence: boundary + valid values", () => {
+  assert.equal(clampConfidence(0), 0);
+  assert.equal(clampConfidence(1), 1);
+  assert.equal(clampConfidence(0.42), 0.42);
+  assert.equal(clampConfidence(undefined), DEFAULT_CONFIDENCE);
 });
 
 test("parseSuggestion: strips code fences", () => {

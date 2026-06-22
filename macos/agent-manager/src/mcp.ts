@@ -57,6 +57,12 @@ export interface Surface {
   /** The user's per-session free-text NOTE/goal typed into the dashboard tile —
    *  the STRONGEST goal signal for the manager. Omitted when unset. */
   userNotes?: string;
+  /** (Phase 2.1) True iff the user DISMISSED the manager's current suggestion. The
+   *  manager suppresses re-suggesting while this is true AND the change fingerprint
+   *  is unchanged. The Swift side emits it as a plain bool (always present), but it
+   *  is typed OPTIONAL here so a pre-upgrade host that omits it still typechecks —
+   *  `undefined` reads as false (see shouldSuggest). */
+  suggestionDismissed?: boolean;
   agentKind?: string;
 }
 
@@ -77,6 +83,10 @@ export interface Annotation {
   suggestion?: string;
   phase?: string;
   needsUser?: boolean;
+  /** (Phase 2.1) The manager's HONEST 0..1 self-rating of how well the suggested
+   *  reply advances the user's goal. Written alongside `suggestion`; the tile dims
+   *  a low-confidence one. */
+  confidence?: number;
 }
 
 /** Minimal shape of a JSON-RPC response we care about. */
@@ -148,6 +158,7 @@ export class McpClient {
     if (ann.suggestion !== undefined) args.suggestion = ann.suggestion;
     if (ann.phase !== undefined) args.phase = ann.phase;
     if (ann.needsUser !== undefined) args.needsUser = ann.needsUser;
+    if (ann.confidence !== undefined) args.confidence = ann.confidence;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.
     await this.call("set_surface_annotation", args);
   }

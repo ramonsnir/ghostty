@@ -402,7 +402,7 @@ test("runSweep: budget caps concurrent summaries to maxConcurrent per sweep", as
 // ---------------------------------------------------------------------------
 
 const okSuggestion: SuggestFn = async () =>
-  '{"suggestion":"use postgres","rationale":"the note says migrate to postgres"}';
+  '{"suggestion":"use postgres","confidence":0.9,"rationale":"the note says migrate to postgres"}';
 
 test("runSweep: a WAITING agent gets BOTH a summary and a merged suggestion", async () => {
   const fake = makeFakeClient({
@@ -425,6 +425,8 @@ test("runSweep: a WAITING agent gets BOTH a summary and a merged suggestion", as
   // The manager write is a PARTIAL merge: ONLY the suggestion (no summary field).
   assert.equal(suggestionWrite!.ann.summary, undefined);
   assert.equal(suggestionWrite!.ann.suggestion, "use postgres");
+  // (Phase 2.1) The merge carries the parsed confidence.
+  assert.equal(suggestionWrite!.ann.confidence, 0.9);
   // The manager was called with the Opus model + the goals in the prompt.
   assert.equal(suggestCalls.length, 1);
   assert.equal(suggestCalls[0].model, MANAGER_MODEL);
@@ -485,6 +487,71 @@ test("runSweep: manager skips an UNCHANGED waiting screen past debounce", async 
   t += deps.managerCfg.debounceMs + 1;   // past debounce, but screen unchanged
   await runSweep(deps);                  // second: unchanged → skipped
   assert.equal(suggestCalls.length, 1, "unchanged screen not re-suggested");
+});
+
+test("runSweep: a DISMISSED waiting agent is suppressed until ONE MEANINGFUL change (natural path)", async () => {
+  // The NATURAL production path: a `waiting` agent's screen AND goals stay STABLE
+  // through the dismiss sweep (the user dismisses without the agent or goals moving).
+  // Dismiss-suppression must still arm at dismiss time even though the manager
+  // `unchanged` gate would match the stable screen+goals — and then a SINGLE viewport
+  // change (not two) must re-suggest. This is the off-by-one regression guard: nothing
+  // here mutates `userNotes` to dodge the `unchanged` gate.
+  const surfaceState = makeSurface({
+    id: "s1",
+    agentState: "waiting",
+    userNotes: "migrate to postgres", // STABLE across every sweep below
+  });
+  let viewport = "the blocking screen"; // STABLE through the dismiss sweep
+  const fake = makeFakeClient({ surfaces: [surfaceState] });
+  fake.client.readSurface = (async (id: string) => {
+    void id;
+    return { text: viewport, cols: 80, rows: 24 };
+  }) as McpClient["readSurface"];
+
+  let t = 1_000_000;
+  const lastSuggestion = new Map<string, LastSuggestion>();
+  const { deps, suggestCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    suggest: okSuggestion,
+    lastSuggestion,
+  });
+  deps.now = () => t;
+
+  await runSweep(deps);
+  assert.equal(suggestCalls.length, 1, "first suggestion fires");
+
+  // The user DISMISSES it; host now reports suggestionDismissed:true. The screen AND
+  // goals are UNCHANGED (the natural case) — the arm must still be set this sweep.
+  surfaceState.suggestionDismissed = true;
+  t += deps.managerCfg.debounceMs + 1;
+  await runSweep(deps); // dismissed-arm: arms suppression, no model call
+  assert.equal(suggestCalls.length, 1, "dismissed-arm: no re-suggest");
+  assert.ok(
+    lastSuggestion.get("s1")?.suppressedFingerprint,
+    "suppression armed at dismiss time despite an unchanged screen",
+  );
+
+  // Another stable sweep (screen + goals unchanged) — still suppressed.
+  t += deps.managerCfg.debounceMs + 1;
+  await runSweep(deps); // dismissed-unchanged: still suppressed
+  assert.equal(suggestCalls.length, 1, "dismissed-unchanged: still suppressed");
+
+  // EXACTLY ONE meaningful viewport change → summarizer fingerprint flips → suppression
+  // clears and it suggests again on that SINGLE change.
+  viewport = "a completely different blocking screen";
+  t += deps.managerCfg.debounceMs + 1;
+  await runSweep(deps);
+  assert.equal(
+    suggestCalls.length,
+    2,
+    "a SINGLE meaningful change re-suggests after dismissal",
+  );
+  assert.equal(
+    lastSuggestion.get("s1")?.suppressedFingerprint ?? null,
+    null,
+    "arm cleared on the fresh suggestion",
+  );
 });
 
 test("runSweep: a closed waiting session's manager memory is pruned", async () => {

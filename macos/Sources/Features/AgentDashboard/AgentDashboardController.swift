@@ -32,6 +32,11 @@ struct AgentEntry: Identifiable {
     /// (ramon fork / Agent Manager Phase 2) The user's per-session note for this
     /// surface, or nil if unset. Persisted by host session id (unlike `annotation`).
     let userNotes: String?
+    /// (ramon fork / Agent Manager Phase 2.1) True iff the user dismissed the current
+    /// suggestion. Surfaced to the sidecar (via `list_surfaces`) so the manager
+    /// suppresses re-suggesting until the change fingerprint shifts. Reset to false
+    /// when a NEW suggestion is applied. In-memory ONLY (no persistence).
+    let suggestionDismissed: Bool
 }
 
 /// Persistence boundary for the hide set, injected so the round-trip is
@@ -284,6 +289,15 @@ final class AgentDashboardModel: ObservableObject {
     /// UUID in `rebuild(live:)`. A blank note REMOVES the entry.
     @Published private(set) var userNotes: [UUID: String] = [:]
 
+    // MARK: - Suggestion dismissal (ramon fork / Agent Manager Phase 2.1)
+
+    /// Surfaces whose CURRENT suggestion the user dismissed. Set by
+    /// `dismissSuggestion`; cleared for an id when `applyAnnotation` carries a NEW
+    /// suggestion. Surfaced to the sidecar via `hookSnapshot` → `list_surfaces` so
+    /// the manager suppresses re-suggesting until the change fingerprint shifts.
+    /// In-memory ONLY (no persistence), pruned on `rebuild(live:)`.
+    @Published private(set) var suggestionDismissed: Set<UUID> = []
+
     private let store: HideStore
     private let orderStore: OrderStore
 
@@ -504,6 +518,11 @@ final class AgentDashboardModel: ObservableObject {
     /// This lets the Haiku summarizer (summary) and the Opus manager (suggestion)
     /// update the same surface independently without clobbering each other's field.
     func applyAnnotation(_ id: UUID, _ annotation: AgentAnnotation) {
+        // (Phase 2.1) A merge carrying a NEW suggestion un-dismisses the surface, so
+        // the tile re-shows it and `list_surfaces.suggestionDismissed` flips back to
+        // false (the sidecar then independently clears its own suppression). A
+        // summary-only update (suggestion == nil) leaves the dismissed flag alone.
+        if annotation.suggestion != nil { suggestionDismissed.remove(id) }
         annotations[id] = annotations[id]?.merging(annotation) ?? annotation
         rebuildEntriesFromCurrentState()
     }
@@ -516,24 +535,29 @@ final class AgentDashboardModel: ObservableObject {
         annotations[id] = AgentAnnotation(
             summary: a.summary, suggestion: nil, phase: a.phase,
             needsUser: a.needsUser, confidence: a.confidence)
+        // (Phase 2.1) Mark dismissed so the sidecar suppresses re-suggesting until the
+        // change fingerprint shifts (surfaced via list_surfaces.suggestionDismissed).
+        suggestionDismissed.insert(id)
         rebuildEntriesFromCurrentState()
     }
 
-    /// (ramon fork / Agent Manager Phase 2) TYPE `text` into the surface via REAL
-    /// key events WITHOUT submitting (no Return) — the ONLY send path, always
-    /// user-initiated (the tile's Approve button). Then clear the suggestion. This
-    /// is SUGGEST-ONLY: the sidecar never sends; a human tap is the authorization.
+    /// (ramon fork / Agent Manager Phase 2.1) TYPE `text` into the surface via REAL
+    /// key events AND SUBMIT it (append one trailing Return) — the ONLY send path,
+    /// always user-initiated (the tile's Approve button). Then clear the suggestion.
+    /// This is STILL SUGGEST-ONLY: the sidecar never sends; a human Approve tap is
+    /// the authorization, and Approve now both types and submits in that one tap (no
+    /// second keystroke). Edit still lets the user tweak the text before that tap.
     ///
-    /// DEFENSE-IN-DEPTH: collapse ALL newlines to spaces FIRST. `keySpecs(forText:)`
-    /// converts every embedded `\n`/`\r` into a REAL Return (which submits), so a
-    /// multi-line suggestion would partially auto-submit even with `submit:false`.
-    /// `MCPInput.singleLine` neutralizes that here (the documented sole send path),
-    /// so even a caller that forgets to sanitize the field cannot submit.
+    /// DEFENSE-IN-DEPTH: collapse ALL INTERIOR newlines to spaces FIRST. A multi-line
+    /// edit would otherwise make `keySpecs(forText:)` emit a REAL Return per embedded
+    /// `\n`/`\r` — i.e. several partial submits. `MCPInput.singleLine` neutralizes the
+    /// interior newlines (the documented sole send path) so exactly ONE Return is sent:
+    /// the intentional trailing submit (`submit:true`), never N partial ones.
     func approveSuggestion(_ id: UUID, _ text: String) {
         assert(Thread.isMainThread)  // MCPInput.sendText touches ghostty_surface_* on main
         let safe = MCPInput.singleLine(text)
         guard !safe.isEmpty else { dismissSuggestion(id); return }
-        _ = MCPInput.sendText(uuid: id, text: safe, submit: false)  // TYPE, do NOT submit
+        _ = MCPInput.sendText(uuid: id, text: safe, submit: true)  // TYPE + SUBMIT (one Return)
         dismissSuggestion(id)
     }
 
@@ -597,6 +621,9 @@ final class AgentDashboardModel: ObservableObject {
         // surfaces from the in-memory map (the persisted store keeps them by
         // session id so they rehydrate next time that session reappears).
         userNotes = userNotes.filter { liveIDs.contains($0.key) }
+        // (ramon fork / Agent Manager Phase 2.1) Drop the dismissed flag for vanished
+        // surfaces (in-memory only).
+        suggestionDismissed = suggestionDismissed.intersection(liveIDs)
         // (ramon fork / hooks) Restore persisted state onto the (freshly-minted)
         // surface UUIDs by their stable host session id, and keep live records
         // fresh. This is what makes statuses survive a GUI restart.
@@ -712,6 +739,10 @@ final class AgentDashboardModel: ObservableObject {
         /// the strongest goal signal the manager feeds back in. Persisted by host
         /// session id (survives a relaunch).
         let userNotes: String?
+        /// (ramon fork / Agent Manager Phase 2.1) True iff the user dismissed the
+        /// current suggestion — the sidecar uses this to suppress re-suggesting until
+        /// the change fingerprint shifts.
+        let suggestionDismissed: Bool
         /// (ramon fork / Agent Manager) The DETECTED agent kind's command basename
         /// (e.g. "claude"/"codex") from the dashboard's authoritative subtree-walk
         /// detector, or nil. This is the signal the summarizer keys off to decide a
@@ -729,7 +760,7 @@ final class AgentDashboardModel: ObservableObject {
         let ids = Set(agentStates.keys)
             .union(lastPrompt.keys).union(lastTool.keys)
             .union(annotations.keys).union(agents.keys)
-            .union(userNotes.keys)
+            .union(userNotes.keys).union(suggestionDismissed)
         for id in ids {
             out[id] = HookSnapshotEntry(
                 agentState: agentStates[id]?.rawValue,
@@ -737,6 +768,7 @@ final class AgentDashboardModel: ObservableObject {
                 lastTool: lastTool[id],
                 notes: annotations[id]?.summary,
                 userNotes: userNotes[id],
+                suggestionDismissed: suggestionDismissed.contains(id),
                 agentKind: agents[id]?.command)
         }
         return out
@@ -785,7 +817,8 @@ final class AgentDashboardModel: ObservableObject {
                     lastPrompt: lastPrompt[s.id],
                     hookBacked: hookBacked.contains(s.id),
                     annotation: annotations[s.id],
-                    userNotes: userNotes[s.id]
+                    userNotes: userNotes[s.id],
+                    suggestionDismissed: suggestionDismissed.contains(s.id)
                 )
             }
         // session id → its index in the user's manual order (keep-first on the
