@@ -271,16 +271,18 @@ jobs:
         run: |
           TAG="build-${GHOSTTY_BUILD}"
           # The tag is a function of HEAD (commit count), so a workflow_dispatch
-          # re-run on the same commit reuses it. Make publish idempotent: drop any
-          # prior release+tag first so the rebuilt artifacts cleanly replace them.
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          # --latest makes `releases/latest/download/{Ghostty.dmg,appcast.xml}`
-          # resolve here, which is the stable URL Sparkle's feed points at.
+          # re-run on the same commit reuses it. Make publish idempotent WITHOUT a
+          # destructive delete window (a delete-then-failed-create would leave
+          # `releases/latest/download/...` 404ing): create the release if it doesn't
+          # exist, then (re)upload assets with --clobber, then ensure it's `latest`.
           gh release create "$TAG" \
             --title "Ghostty (ramon) build ${GHOSTTY_BUILD} (${GHOSTTY_COMMIT})" \
             --notes "Automated fork build from ${GHOSTTY_COMMIT}." \
-            --latest \
-            Ghostty.dmg appcast.xml
+            --latest 2>/dev/null || true
+          # --latest makes `releases/latest/download/{Ghostty.dmg,appcast.xml}`
+          # resolve here, which is the stable URL Sparkle's feed points at.
+          gh release upload "$TAG" Ghostty.dmg appcast.xml --clobber
+          gh release edit "$TAG" --latest
 
       # Zip with --symlinks first: upload-artifact dereferences symlinks, which
       # would flatten Sparkle.framework's Versions/Current and produce a bloated,

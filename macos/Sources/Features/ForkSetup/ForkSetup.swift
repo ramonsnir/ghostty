@@ -219,12 +219,11 @@ enum ForkSetup {
             try contents.write(toFile: configPath, atomically: true, encoding: .utf8)
             // First run: the seeded config enables the pty-host backend, but config
             // was already loaded (in-process backend) before this seed ran, so it
-            // takes effect on the NEXT launch. Tell the user a relaunch unlocks the
-            // hosted features rather than leaving them guessing on first run.
+            // takes effect on the NEXT launch. We log this (and SHARING.md + the
+            // seed comments cover it) rather than firing a notification here, which
+            // would force a permission prompt on the benign success path —
+            // notify() is reserved for the real host-offline failure.
             logger.info("seeded default fork config at \(configPath, privacy: .public); relaunch to activate the pty-host backend")
-            notify(
-                title: "Welcome to Ghostty (ramon)",
-                body: "Set up your config. Quit and reopen once to enable hosted sessions (live previews + session survival).")
         } catch {
             logger.warning("failed to seed fork config: \(error.localizedDescription, privacy: .public)")
         }
@@ -315,9 +314,11 @@ enum ForkSetup {
         // immediate `bootstrap` can fail transiently (rc 5 / EBUSY). Retry with a
         // short backoff; break as soon as a bootstrap returns success.
         if bootout { _ = runLaunchctl(["bootout", target]) }
-        for attempt in 0..<5 {
+        // bootout teardown of many live sessions can take several seconds, so give
+        // bootstrap a generous, escalating retry budget (~6s) before giving up.
+        for attempt in 0..<8 {
             if runLaunchctl(["bootstrap", domain, plistPath]) == 0 { break }
-            if attempt < 4 { Thread.sleep(forTimeInterval: 0.25) }
+            if attempt < 7 { Thread.sleep(forTimeInterval: Double(attempt + 1) * 0.2) }
         }
         // Ensure a loaded-but-stopped job actually runs (revive case). No `-k`, so
         // this never restarts/kills an already-running host.
@@ -539,7 +540,11 @@ enum ForkSetup {
     keybind = ctrl+a>shift+:=toggle_command_palette
     keybind = ctrl+a>r=reload_config
 
-    # --- Bell: quieter when in focus -----------------------------------------
+    # --- Bell -----------------------------------------------------------------
+    # Out of focus (backgrounded window / non-focused split / another Space): full
+    # alerting. (bell-features is an upstream key; seeded here, in the fork-only
+    # path, so it's set without touching the shared ~/.config/ghostty/config.)
+    bell-features = system,attention,title,border
     # In focus: sound only (system beep), no dock attention, no title bell.
     bell-features-focused = system,no-attention,no-title
 
