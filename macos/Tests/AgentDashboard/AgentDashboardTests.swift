@@ -821,6 +821,13 @@ struct AgentDashboardHookStateTests {
         ids.map { .init(id: $0, view: nil, title: "t", pwd: "/x", sessionID: 0) }
     }
 
+    // (id, sessionID) overload — for tests that need a non-zero host session id
+    // (e.g. userNotes write-through persists by session id). Mirrors the same
+    // helper in the other model test structs.
+    private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
+        pairs.map { (id, sid) in .init(id: id, view: nil, title: "t", pwd: "/x", sessionID: sid) }
+    }
+
     private func agents(_ ids: [UUID]) -> [UUID: AgentKind] {
         Dictionary(uniqueKeysWithValues: ids.map { ($0, AgentKind("claude")) })
     }
@@ -1181,14 +1188,20 @@ struct AgentDashboardHookStateTests {
         #expect(model.suggestionDismissed.contains(a) == false)
     }
 
-    @Test func hookSnapshotOmitsSurfaceWithNoState() {
-        // A surface with no hook event and no annotation is absent from the
-        // snapshot — so the MCP shaper omits its agent-* fields (honest absence).
+    @Test func hookSnapshotIncludesDetectedAgentButOmitsUnknownSurface() {
+        // A DETECTED agent with no hook event/annotation still appears in the
+        // snapshot carrying ONLY its agentKind (Phase 2 `agentKind` enrichment:
+        // `hookSnapshot()` unions `agents.keys`, so the MCP shaper can report
+        // agentKind even without hooks). A surface that is neither a detected
+        // agent nor hook-backed is omitted (honest absence).
         let model = AgentDashboardModel(store: InMemoryHideStore())
-        let a = UUID()
-        model.rebuild(live: live([a]))
-        model.applyAgents(agents([a]))
-        #expect(model.hookSnapshot()[a] == nil)
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([a, b]))
+        model.applyAgents(agents([a]))          // a is a detected agent; b is not
+        let snap = model.hookSnapshot()
+        #expect(snap[a]?.agentKind == "claude") // present, agentKind only
+        #expect(snap[a]?.agentState == nil)
+        #expect(snap[b] == nil)                 // not an agent, no hook → omitted
     }
 }
 
