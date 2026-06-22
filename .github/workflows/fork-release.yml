@@ -43,9 +43,12 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      # Whether the signing secrets are present. Gates all sign/notarize/release
-      # steps; when false the job is a build-only smoke test.
-      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.APPLE_NOTARIZATION_KEY != '' && secrets.SPARKLE_PRIVATE_KEY != '' }}
+      # Whether ALL signing secrets are present. Gates every sign/notarize/release
+      # step; when false the job is a build-only smoke test. We require the FULL set
+      # (not a subset) so a half-configured enrollment falls cleanly to the smoke
+      # path instead of passing the gate then failing midway (empty codesign
+      # identity) or shipping a broken updater (empty SUPublicEDKey).
+      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PWD != '' && secrets.MACOS_CERTIFICATE_NAME != '' && secrets.MACOS_CI_KEYCHAIN_PWD != '' && secrets.APPLE_NOTARIZATION_ISSUER != '' && secrets.APPLE_NOTARIZATION_KEY_ID != '' && secrets.APPLE_NOTARIZATION_KEY != '' && secrets.SPARKLE_PRIVATE_KEY != '' && secrets.SPARKLE_PUBLIC_KEY != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,9 +89,13 @@ jobs:
       - name: Run ForkSetup unit tests
         run: |
           cd macos
+          # SYMROOT pins output into macos/build (matching build.nu), so this and
+          # the Build step below share artifacts and the app lands where the
+          # downstream sign/bundle steps expect it.
           xcodebuild test -scheme Ghostty \
             -destination 'platform=macOS' \
             -only-testing:GhosttyTests/ForkSetupTests \
+            SYMROOT="$PWD/build" \
             CODE_SIGNING_ALLOWED=NO \
             COMPILATION_CACHE_CAS_PATH="$RUNNER_TEMP/CompilationCache.noindex" \
             COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
@@ -106,10 +113,15 @@ jobs:
       - name: Build Ghostty.app
         run: |
           cd macos
+          # SYMROOT="$PWD/build" lands the app at macos/build/Release/Ghostty.app —
+          # exactly as build.nu does (build.nu:29). Without it xcodebuild writes to
+          # DerivedData and every downstream path (bundle/sign/dmg) would break.
           xcodebuild -target Ghostty -configuration Release \
+            SYMROOT="$PWD/build" \
             CODE_SIGNING_ALLOWED=NO \
             COMPILATION_CACHE_CAS_PATH="$RUNNER_TEMP/CompilationCache.noindex" \
             COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
+          test -d build/Release/Ghostty.app || { echo "::error::app not at macos/build/Release/Ghostty.app"; exit 1; }
 
       # Bundle the host inside the app so it is signed + notarized as part of the
       # bundle, and so Sparkle (which updates the .app) carries new host builds.
@@ -209,13 +221,16 @@ jobs:
           CERT_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
         run: |
           npm install --global create-dmg
-          # create-dmg exits non-zero in some benign cases (e.g. no code-signing of
-          # the DMG itself), so don't trust its rc — assert the artifact exists.
-          create-dmg --identity="$CERT_NAME" "macos/build/Release/Ghostty.app" ./ || true
+          # Output into a FRESH empty dir so a stale/leftover DMG can never be
+          # mistaken for this run's artifact. create-dmg exits non-zero in some
+          # benign cases (e.g. it doesn't codesign the DMG itself), so we don't
+          # trust its rc — we assert exactly one DMG was produced in the clean dir.
+          rm -rf dmgout && mkdir dmgout
+          create-dmg --identity="$CERT_NAME" "macos/build/Release/Ghostty.app" dmgout || true
           shopt -s nullglob
-          dmgs=( ./Ghostty*.dmg )
-          if [ ${#dmgs[@]} -eq 0 ]; then
-            echo "::error::create-dmg produced no DMG"; exit 1
+          dmgs=( dmgout/Ghostty*.dmg )
+          if [ ${#dmgs[@]} -ne 1 ]; then
+            echo "::error::create-dmg did not produce exactly one DMG (found ${#dmgs[@]})"; exit 1
           fi
           mv "${dmgs[0]}" ./Ghostty.dmg
 

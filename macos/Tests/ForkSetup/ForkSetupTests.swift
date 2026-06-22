@@ -86,6 +86,21 @@ struct ForkSetupTests {
         #expect(p == .upToDate)
     }
 
+    @Test func planRevivesDeadHostWhenVersionMatches() {
+        // Recorded-current but NOT running (booted out / crash-looped / plist
+        // half-removed): revive on relaunch instead of being stranded on .upToDate.
+        let s = spec()
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: "100",
+            bundleVersion: "100",
+            agentRunning: false,
+            spec: s)
+        #expect(p == .reload(s))
+    }
+
     @Test func planReloadsOursWhenVersionChangedEvenIfRunning() {
         // The LWCR gotcha: a new bundle version means a new host cdhash, so we must
         // reload (bootout+bootstrap) to re-derive launchd's requirement — even

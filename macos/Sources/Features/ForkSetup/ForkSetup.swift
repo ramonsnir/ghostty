@@ -157,7 +157,15 @@ enum ForkSetup {
             guard existingPlistManagedBy == spec.managingBundleID else {
                 return .skipExternallyManaged
             }
-            if installedVersion == bundleVersion { return .upToDate }
+            if installedVersion == bundleVersion {
+                // Version matches. Healthy host → nothing to do. But a host that is
+                // recorded-current yet NOT actually running (booted out, crash-looped
+                // past KeepAlive, plist half-removed) must be revived on relaunch, or
+                // the colleague is stranded with empty terminals until the next
+                // version bump. Version matches, so there are no live sessions a
+                // (re)bootstrap loses beyond what's already gone.
+                return agentRunning ? .upToDate : .reload(spec)
+            }
             // Version differs or is unknown. A genuine version change (recorded
             // version present-and-different) means a new binary/cdhash → reload is
             // mandatory. But when we never recorded a version (nil) yet a healthy
@@ -217,10 +225,11 @@ enum ForkSetup {
         let target = "gui/\(getuid())/\(spec.label)"
         let (fileExists, managedBy) = readPlistMarker(plistPath: plistPath, fileManager: fileManager)
 
-        // Probe "is the host already running?" only when the plist is ours (the
-        // sole case where it changes the decision). hostRunning returns fast when
-        // the host is up; it only burns its backoff budget when the host is down —
-        // and a down host is one we want to (re)bootstrap anyway.
+        // Probe "is the host already running?" when the plist is ours — every
+        // ours-path consumes it: it decides revive-vs-upToDate (version matches)
+        // and adopt-vs-reload (version unknown). hostRunning returns fast when the
+        // host is up (one launchctl print, no sleeps); it only spends its backoff
+        // budget when the host is down — which is exactly when we want to act.
         let ours = fileExists && managedBy == spec.managingBundleID
         let agentRunning = ours ? hostRunning(target: target) : false
 
