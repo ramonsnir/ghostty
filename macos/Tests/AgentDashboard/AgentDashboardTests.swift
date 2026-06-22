@@ -3,6 +3,47 @@ import Darwin
 import Testing
 @testable import Ghostty
 
+// MARK: - AgentMirrorPreview geometry (pure)
+
+struct AgentMirrorGeometryTests {
+    @Test func framesFullHostGridAndPinsBottom() {
+        // Realistic host grid (120x40, 14x30 backing px) on a 560x220 full-width
+        // row at 2x backing.
+        let g = AgentMirrorPreview.geometry(
+            cols: 120, rows: 40, cellW: 14, cellH: 30, backing: 2,
+            container: CGSize(width: 560, height: 220))
+        // Natural size is the FULL host grid in points — NOT collapsed (the bug
+        // that made the preview empty / one row produced a tiny naturalH here).
+        #expect(abs(g.naturalW - 840) < 0.5)   // 120*14/2
+        #expect(abs(g.naturalH - 600) < 0.5)   // 40*30/2
+        // Scale fits the width.
+        #expect(abs(g.scale - 560.0 / 840.0) < 0.001)
+        // The scaled content is TALLER than the row, so the top is clipped and
+        // the agent's latest (bottom) rows are what's shown.
+        #expect(g.naturalH * g.scale > 220)
+    }
+
+    @Test func fallsBackToContainerWhenGridUnknown() {
+        // Before the first host frame (grid/cell == 0): no collapse, scale is a
+        // no-op so the view fills the container rather than vanishing.
+        let g = AgentMirrorPreview.geometry(
+            cols: 0, rows: 0, cellW: 0, cellH: 0, backing: 2,
+            container: CGSize(width: 560, height: 220))
+        #expect(g.naturalW == 560)
+        #expect(g.naturalH == 220)
+        #expect(g.scale == 1)
+    }
+
+    @Test func zeroBackingDoesNotDivideByZero() {
+        let g = AgentMirrorPreview.geometry(
+            cols: 80, rows: 24, cellW: 16, cellH: 32, backing: 0,
+            container: CGSize(width: 400, height: 200))
+        // backing 0 is treated as 2; naturalW = 80*16/2 = 640.
+        #expect(abs(g.naturalW - 640) < 0.5)
+        #expect(g.scale > 0)
+    }
+}
+
 // MARK: - matchAgent pure logic
 
 struct AgentDetectorTests {

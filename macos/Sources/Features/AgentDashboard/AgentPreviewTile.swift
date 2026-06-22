@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// (ramon fork / Agent Dashboard, Layer 3) One row: a full-width card with a
 /// compact header (badge · title · bell dot · hide ✕), a live (or metadata-only)
@@ -92,8 +93,8 @@ struct AgentPreviewTile: View {
         // keeps a thumbnail strictly non-crashing (AgentMirrorPreview force-reads
         // the app object) and falls through to the "Preview unavailable"
         // placeholder, never a blank rectangle.
-        if previewsEnabled, entry.sessionID != 0, ghostty.app != nil {
-            AgentMirrorPreview(ghostty: ghostty, sessionID: entry.sessionID)
+        if previewsEnabled, entry.sessionID != 0, ghostty.app != nil, let realView = entry.realView {
+            AgentMirrorPreview(ghostty: ghostty, sessionID: entry.sessionID, realSurface: realView)
                 .allowsHitTesting(false)
                 .frame(maxWidth: .infinity)
                 .frame(height: Self.previewHeight)
@@ -163,14 +164,22 @@ struct AgentPreviewTile: View {
 /// the existing SurfaceWrapper render it natively (full color, viewport-only —
 /// exactly right for a thumbnail).
 ///
-/// Scaling (spec §2.2): the mirror renders at the HOST's authoritative grid
-/// (cols×rows); we never drive a resize toward it (it's read-only and the core
-/// suppresses outbound resize). Instead we DISPLAY it scaled — aspect-fit by
-/// WIDTH and anchored to the BOTTOM via `scaleEffect(_:anchor:.bottom)`, so the
-/// agent's LATEST rows stay visible and the top is clipped. The SurfaceWrapper
-/// is given the mirror's own pixel size as its frame so SwiftUI's letterboxing
-/// is a no-op and our scaleEffect is the only transform. Hit-testing is disabled
-/// at the call site so the CARD (not the mirror) receives the click.
+/// Scaling: the mirror renders the HOST's grid at a FIXED cell size (it does NOT
+/// scale the font to fit the view — it draws cells top-aligned and clips/pads the
+/// rest). So to show the agent's LATEST (bottom) rows we must frame the mirror at
+/// the grid's NATURAL size — every host row renders, nothing clipped — and THEN
+/// scale that down to the preview width, bottom-anchored, clipping the top.
+///
+/// The catch: a `.client` MIRROR surface's own `surfaceSize` reports
+/// `columns`/`rows`/`width_px` that track the VIEW frame we set (its core
+/// `size.screen` follows the frame), so they cannot tell us the host grid — using
+/// them feeds back and collapses the view. We instead read the host grid from the
+/// REAL surface (`realSurface`), whose `size.screen` IS the host framebuffer, so
+/// its `columns`/`rows` are the authoritative host grid. The per-cell pixel size
+/// comes from the mirror itself (font metrics — frame-independent and stable).
+/// `@ObservedObject` on `realSurface` keeps the preview correct across host
+/// resizes. Hit-testing is disabled at the call site so the CARD (not the mirror)
+/// receives the click.
 struct AgentMirrorPreview: View {
     /// Injected into the SurfaceWrapper's `@EnvironmentObject` — without this the
     /// wrapper traps ("No ObservableObject of type App found") the moment a live
@@ -178,11 +187,16 @@ struct AgentMirrorPreview: View {
     let ghostty: Ghostty.App
     let sessionID: UInt64
 
+    /// The REAL terminal surface for this session. Its `surfaceSize` is the
+    /// authoritative HOST grid (unlike the mirror's, which tracks our frame).
+    @ObservedObject var realSurface: Ghostty.SurfaceView
+
     @StateObject private var surfaceView: Ghostty.SurfaceView
 
-    init(ghostty: Ghostty.App, sessionID: UInt64) {
+    init(ghostty: Ghostty.App, sessionID: UInt64, realSurface: Ghostty.SurfaceView) {
         self.ghostty = ghostty
         self.sessionID = sessionID
+        self.realSurface = realSurface
         var cfg = Ghostty.SurfaceConfiguration()
         cfg.mirror = true
         cfg.sessionID = String(sessionID)
@@ -191,24 +205,54 @@ struct AgentMirrorPreview: View {
 
     var body: some View {
         GeometryReader { geo in
-            // The mirror's authoritative pixel size (host grid). Until the first
-            // frame lands `surfaceSize` is nil; fall back to the container size so
-            // the scale is a no-op (1.0) rather than collapsing the view.
-            let mirrorW = surfaceView.surfaceSize.map { CGFloat($0.width_px) } ?? geo.size.width
-            let mirrorH = surfaceView.surfaceSize.map { CGFloat($0.height_px) } ?? geo.size.height
-            // Aspect-fit by WIDTH: the preview width drives the scale so long
-            // lines / TUI layouts read at full width; the bottom anchor keeps the
-            // most-recent rows pinned and clips the top.
-            let scale = (mirrorW > 0) ? (geo.size.width / mirrorW) : 1.0
+            let backing = surfaceView.window?.backingScaleFactor
+                ?? NSScreen.main?.backingScaleFactor ?? 2.0
+            // HOST grid from the real surface (authoritative; the mirror's own
+            // grid tracks our frame and must not be used). Per-cell pixels come
+            // from the mirror (font metrics, stable), falling back to the real
+            // surface's cell.
+            let host = realSurface.surfaceSize
+            let g = AgentMirrorPreview.geometry(
+                cols: Int(host?.columns ?? 0),
+                rows: Int(host?.rows ?? 0),
+                cellW: CGFloat(surfaceView.surfaceSize?.cell_width_px ?? host?.cell_width_px ?? 0),
+                cellH: CGFloat(surfaceView.surfaceSize?.cell_height_px ?? host?.cell_height_px ?? 0),
+                backing: backing,
+                container: geo.size)
 
             Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: true)
                 .environmentObject(ghostty)
-                .frame(width: mirrorW, height: mirrorH)
-                .scaleEffect(scale, anchor: .bottom)
-                // Pin the scaled view to the bottom of the container so the
-                // top overflow is what gets clipped (.clipped() is applied at
-                // the call site).
+                .frame(width: g.naturalW, height: g.naturalH)
+                .scaleEffect(g.scale, anchor: .bottom)
+                // Pin the scaled view to the bottom of the container so the top
+                // overflow is what gets clipped (.clipped() at the call site).
                 .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
         }
+    }
+
+    /// PURE geometry for the mirror preview, factored out for unit testing (the
+    /// view can't render off a headless display). `cellW`/`cellH` are BACKING
+    /// pixels; `cols`/`rows` are the HOST grid. Returns the SurfaceWrapper frame
+    /// (the full host grid drawn at the mirror's cell size, so every row renders
+    /// with no internal clip/pad — `naturalW`×`naturalH` in points) and the
+    /// width-fit `scale` applied bottom-anchored. Falls back to the container
+    /// size (scale 1) when the grid/cell is not yet known, so the view never
+    /// collapses. Using the FULL grid size here — not the mirror's own
+    /// frame-tracking `surfaceSize` — is what prevents the feedback collapse that
+    /// made the preview go empty / show one row.
+    struct PreviewGeometry: Equatable {
+        let naturalW: CGFloat
+        let naturalH: CGFloat
+        let scale: CGFloat
+    }
+    static func geometry(
+        cols: Int, rows: Int, cellW: CGFloat, cellH: CGFloat,
+        backing: CGFloat, container: CGSize
+    ) -> PreviewGeometry {
+        let bk = backing > 0 ? backing : 2.0
+        let naturalW = (cols > 0 && cellW > 0) ? CGFloat(cols) * cellW / bk : container.width
+        let naturalH = (rows > 0 && cellH > 0) ? CGFloat(rows) * cellH / bk : container.height
+        let scale = naturalW > 0 ? container.width / naturalW : 1.0
+        return PreviewGeometry(naturalW: naturalW, naturalH: naturalH, scale: scale)
     }
 }
