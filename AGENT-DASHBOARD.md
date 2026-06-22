@@ -107,18 +107,22 @@ A hook-backed tile shows one of three states next to its badge:
   it's about to call a tool (`PreToolUse`), or the session just started. When working,
   the tile may also show the **last tool** it ran (e.g. `Bash`) and a truncated copy
   of your **last prompt** as a subtitle.
-- **waiting** (amber, same look as the bell) — the agent is **asking you for input or
-  approval** (a Claude Code `Notification`). A waiting tile gets the amber border + a
-  "needs input" pill (exactly like a bell), **sorts to the top**, **auto-unhides** if
-  you'd hidden it, and fires a **Web Push** if you've armed the web monitor's Notify
-  toggle. This is the "an agent needs me" signal. (Web Push needs the HTTPS /
-  `tailscale serve` setup described in WEB-MONITOR.md — a plain-HTTP-over-Tailscale-IP
-  monitor can't push.) The waiting push uses its OWN per-surface ~3s debounce, keyed
-  separately from the bell's, so a bell on the same surface within ~3s never swallows
-  the `⏳` waiting push (each kind only coalesces its own repeats) — the headline
-  "needs input" push always gets through. The waiting auto-unhide is slightly weaker
-  than the bell's: it lands once, on entering waiting, so you *can* re-hide a
-  still-waiting tile (a bell, which re-rings, cannot).
+- **waiting** (amber **"waiting ⚠" chip** + **"needs input" pill**) — the agent is
+  **asking you for input or approval** (a Claude Code `Notification`). This is the "an
+  agent needs me" signal: the tile shows the waiting chip and pill, **sorts to the top**,
+  **auto-unhides** if you'd hidden it, and fires a **Web Push** if you've armed the web
+  monitor's Notify toggle. **Unlike a real bell, waiting does NOT clear when you focus
+  the split** — it is a *status*, not a transient alert, so it persists until the agent
+  reports a new state. You can leave a waiting tile up on purpose; **Hide ✕** is the
+  manual dismiss. (Deliberately, the tile's amber **frame + bell icon** are driven by the
+  **real terminal bell ONLY** — and clear on focus, like any bell — so the two signals
+  stay visually distinct: bell = "something pinged, now cleared by looking"; waiting =
+  "still blocked on you".) (Web Push needs the HTTPS / `tailscale serve` setup described
+  in WEB-MONITOR.md — a plain-HTTP-over-Tailscale-IP monitor can't push.) The waiting
+  push uses its OWN per-surface ~3s debounce, keyed separately from the bell's, so a bell
+  on the same surface within ~3s never swallows the `⏳` waiting push. The waiting
+  auto-unhide lands once, on entering waiting, so you *can* re-hide a still-waiting tile
+  (a bell, which re-rings, cannot).
 - **idle** (dim) — the agent finished its turn (`Stop`) or the session ended
   (`SessionEnd`).
 
@@ -126,6 +130,13 @@ A tile only shows a state chip once that agent has reported at least one hook ev
 agents you haven't wired hooks for (or non-Claude agents like Codex) keep the
 preview-only behavior. Once a tile is **hook-backed**, the hook state is
 authoritative — it overrides any heuristic idle/working guess.
+
+**Statuses survive a GUI restart.** The hooks only POST on *transitions*, so a
+relaunched GUI would otherwise show blank chips until each agent next acts. Instead the
+last-known state is persisted (keyed by the **host session id**, which is stable across
+a GUI relaunch — the surface's identity is not) and restored onto the tile when the GUI
+reattaches. The exception is a **host** restart: it ends every session and resets their
+ids, so a chip may briefly show a stale state until the next hook event corrects it.
 
 ### How it works (one sentence)
 
