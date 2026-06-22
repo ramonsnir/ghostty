@@ -193,6 +193,17 @@ enum ForkSetup {
         fileManager: FileManager = .default
     ) {
         let home = NSHomeDirectory()
+        // Gate ALL distribution setup on "is a ghostty-host bundled in this app?".
+        // Only CI release builds bundle it; dev/ReleaseLocal/Debug builds (and a
+        // locally-built Release) do not. This keeps the config seed and the host
+        // LaunchAgent SYMMETRIC: a developer's machine never has the colleague
+        // config authored under it (which would point pty-host at a socket no dev
+        // build serves), and the three identities never race to write it.
+        let bundledHost = bundle.bundleURL.appendingPathComponent("Contents/MacOS/ghostty-host").path
+        guard fileManager.isExecutableFile(atPath: bundledHost) else {
+            logger.debug("no bundled ghostty-host (dev/local build); skipping fork distribution setup")
+            return
+        }
         seedConfigIfNeeded(home: home, fileManager: fileManager)
         manageHostLaunchAgentIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
     }

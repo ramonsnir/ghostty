@@ -99,6 +99,12 @@ class UpdateController {
     ///
     /// This is typically connected to a menu item action.
     @objc func checkForUpdates() {
+        // Fork: a build carrying the placeholder Sparkle key can't verify the fork
+        // feed, so a check would only surface a signature error. Guard HERE (not
+        // just in validateMenuItem) so EVERY entry point — menu, keybind, and
+        // command palette (which call this directly) — is consistent.
+        guard !Self.hasPlaceholderUpdateKey else { return }
+
         // If we're already idle, then just check for updates immediately.
         if viewModel.state == .idle {
             updater.checkForUpdates()
