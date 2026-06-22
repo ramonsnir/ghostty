@@ -75,9 +75,13 @@ keybind = ctrl+a>f=toggle_project_selector
 # auto-unhide on bell. Requires pty-host (previews are mirror surfaces fed by the
 # host render-tee). `agent-dashboard` enables it + opens it on launch; `ctrl+a>d`
 # toggles it. `agent-dashboard-commands` = the foreground process names that mark
-# a split as an agent (default claude,codex).
+# a split as an agent (default claude,codex). `agent-dashboard-pin` floats the
+# panel above other windows (native always-on-top) — use this instead of an
+# external window manager's pin, which can't tell the panel apart from the
+# terminals (they share one bundle id).
 agent-dashboard = true
 agent-dashboard-commands = claude,codex
+agent-dashboard-pin = true
 keybind = ctrl+a>d=toggle_agent_dashboard
 
 # --- tmux pane/split bindings --------------------------------------------

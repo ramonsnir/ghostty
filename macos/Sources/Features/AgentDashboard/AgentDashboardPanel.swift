@@ -2,12 +2,21 @@ import Cocoa
 
 /// (ramon fork / Agent Dashboard, Layer 3) The persistent dashboard panel.
 /// Modeled on `QuickTerminalWindow` but, unlike the quick terminal, it is a
-/// glanceable status surface, not a transient drop-down. It behaves like a
-/// normal window — it does NOT float above other windows (so windows can be
-/// raised in front of it) and carries a real, visible title + standard-window
-/// accessibility subrole so external window managers (Rectangle Pro etc.) can
-/// target it by title. It still stays visible when another app is frontmost and
-/// joins all Spaces — a persistent sidebar, just not an always-on-top one.
+/// glanceable status surface, not a transient drop-down. By default it behaves
+/// like a normal window — it does NOT float above other windows (so windows can
+/// be raised in front of it) and carries a real, visible title + standard-window
+/// accessibility subrole so external window managers can target it by title. It
+/// still stays visible when another app is frontmost and joins all Spaces — a
+/// persistent sidebar.
+///
+/// When `pinned` is true (the `agent-dashboard-pin` config key) the panel uses a
+/// floating window level so other windows can no longer be raised in front of
+/// it — a NATIVE "always-on-top" pin. This exists because the dashboard and the
+/// terminals share one bundle id, so a bundle-id-keyed external pin (Rectangle
+/// Pro's "pin one app to a side") cannot tell them apart and ends up managing
+/// the terminals too; pinning here, in-process, sidesteps that entirely. The AX
+/// subrole stays `.standardWindow` regardless (a floating subrole is filtered
+/// out by most window managers) — only the window LEVEL changes.
 final class AgentDashboardPanel: NSPanel {
     // Must accept clicks (the tiles), but must never become the app's "main"
     // window (it's an overlay; becoming main would confuse window cycling and
@@ -15,7 +24,7 @@ final class AgentDashboardPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    init() {
+    init(pinned: Bool = false) {
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 800),
             styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
@@ -23,18 +32,20 @@ final class AgentDashboardPanel: NSPanel {
             defer: false
         )
 
-        // Persistent (but NOT always-on-top) sidebar configuration. `level =
-        // .normal` (and `isFloatingPanel = false`) so other windows can be
-        // raised in front of it — request #1: "I can't see windows behind it."
+        // Persistent sidebar configuration. When NOT pinned, `level = .normal`
+        // (and `isFloatingPanel = false`) so other windows can be raised in
+        // front of it. When pinned, `level = .floating` lifts it above normal
+        // windows — the native always-on-top pin (config `agent-dashboard-pin`).
         isFloatingPanel = false
         hidesOnDeactivate = false          // stay visible when another app is frontmost
-        level = .normal                    // normal stacking; other windows can cover it
+        level = pinned ? .floating : .normal
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isMovableByWindowBackground = true
 
         // Standard-window subrole + a visible title so external window managers
-        // (Rectangle Pro) can target this window by title — request #2. A
-        // floating-window subrole is filtered out by most window managers.
+        // can target this window by title. A floating-window subrole is filtered
+        // out by most window managers, so we keep `.standardWindow` even when
+        // pinned (the pin is the window level, not the subrole).
         setAccessibilitySubrole(.standardWindow)
         identifier = .init(rawValue: "com.mitchellh.ghostty.agentDashboard")
 

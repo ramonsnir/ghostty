@@ -6,7 +6,11 @@
 //
 // Config (env):
 //   GHOSTTY_MCP_URL    server URL (default http://127.0.0.1:8765/mcp)
-//   GHOSTTY_MCP_TOKEN  shared secret (optional; sent as X-Ghostty-Token)
+//   GHOSTTY_MCP_TOKEN  shared secret (optional; sent as X-Ghostty-Token).
+//                      When unset, the token is read from the `mcp-token = …`
+//                      line of ~/.config/ghostty-ramon/local — the canonical
+//                      secret store — so a committed `.mcp.json` (which can hold
+//                      no secret) just works on any laptop that has `local`.
 //
 // Built with `swift build` (NOT part of Ghostty.xcodeproj). Foundation only,
 // single-threaded / synchronous.
@@ -17,9 +21,28 @@ import Foundation
 import FoundationNetworking
 #endif
 
+/// Read `mcp-token = <value>` from ~/.config/ghostty-ramon/local (the fork's
+/// untracked per-machine secret store). Returns nil if the file or key is
+/// absent. Tolerates leading whitespace, `#` comments, and `key=value` with or
+/// without spaces — matching how the Ghostty config parser reads the same line.
+func tokenFromLocalConfig() -> String? {
+    let path = ("~/.config/ghostty-ramon/local" as NSString).expandingTildeInPath
+    guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+    for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: true) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("#") { continue }
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+        guard key == "mcp-token" else { continue }
+        let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        return value.isEmpty ? nil : value
+    }
+    return nil
+}
+
 let env = ProcessInfo.processInfo.environment
 let urlString = env["GHOSTTY_MCP_URL"] ?? "http://127.0.0.1:8765/mcp"
-let token = env["GHOSTTY_MCP_TOKEN"]
+let token = env["GHOSTTY_MCP_TOKEN"] ?? tokenFromLocalConfig()
 
 guard let serverURL = URL(string: urlString) else {
     FileHandle.standardError.write(Data("ghostty-mcp: invalid GHOSTTY_MCP_URL: \(urlString)\n".utf8))

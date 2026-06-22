@@ -310,6 +310,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (`macos/mcp-shim`, `ghostty-mcp`, a dumb stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`,
     built with `swift build`) so `claude mcp add ghostty -- ghostty-mcp` works. The shim's
     default URL is `http://127.0.0.1:8765/mcp`; `GHOSTTY_MCP_URL`/`GHOSTTY_MCP_TOKEN` override.
+  - **Durable registration (the "works on a new laptop" story).** A committed
+    **`.mcp.json`** at the repo root registers the server project-scoped as
+    `ghostty -- ghostty-mcp` (bare PATH name, **no secret, no clone-specific path**), so any
+    Claude Code session opened in the repo auto-gets the 12 tools after a one-time approval +
+    restart. Two pieces make a secret-less, path-less registration work: (1) the shim is
+    installed on PATH at **`~/.local/bin/ghostty-mcp`** (release build, alongside
+    `ghostty-host`; new-machine: `cd macos/mcp-shim && swift build -c release && cp
+    .build/release/ghostty-mcp ~/.local/bin/`); (2) the shim **falls back to reading
+    `mcp-token` from `~/.config/ghostty-ramon/local`** when `GHOSTTY_MCP_TOKEN` is unset
+    (`tokenFromLocalConfig()` in `main.swift` — same canonical secret store the agent-state
+    hook reads), so the committed JSON needs no token. The OLD doc registered a brittle
+    `.build/debug/ghostty-mcp` absolute path with the token baked into the `claude mcp add`
+    invocation — replaced by this. Dev identities still reachable via
+    `GHOSTTY_MCP_URL=…:8766/:8767`. Wiring: `.mcp.json` (repo root), `macos/mcp-shim/Sources/ghostty-mcp/main.swift`
+    (`tokenFromLocalConfig`); see `MCP-SERVER.md` → "Connecting an agent".
   - **12 tools:** `list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`,
     `scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
     `close_surface`, `perform_action` (the keybind-action grammar string). All address a
@@ -358,17 +373,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   CLI agent (Claude Code / Codex) across ALL tabs and windows, stacked as **full-width
   rows** each showing the split's **latest rows** (preview is bottom-anchored, top
   clipped); click a row to jump to that split (raise window + select tab + un-zoom if
-  hidden), Hide ✕ to declutter, bell-ring auto-unhides. The panel is **normal-level (NOT
-  always-on-top)** with a visible title ("Agent Dashboard") + standard-window AX subrole
-  so an external window manager (Rectangle Pro) can target it. **See `AGENT-DASHBOARD.md`
-  for the user-facing config/usage.** The load-bearing facts for an agent touching this
-  code:
+  hidden), Hide ✕ to declutter, bell-ring auto-unhides. The panel is **normal-level by
+  default** (other windows can cover it) with a visible title ("Agent Dashboard") +
+  standard-window AX subrole; the fork-only **`agent-dashboard-pin`** key flips it to a
+  **floating window level** (native always-on-top). The pin is in-process precisely
+  because an external window manager keyed on bundle id (Rectangle Pro's "pin one app to
+  a side") CANNOT distinguish the panel from the terminals — they share one bundle id —
+  so its pin manages the terminals too; pinning here sidesteps that. The AX subrole stays
+  `.standardWindow` even when pinned (a floating subrole is filtered out by most window
+  managers; only the window *level* changes). **See `AGENT-DASHBOARD.md` for the
+  user-facing config/usage.** The load-bearing facts for an agent touching this code:
   - **Action + config (fork-only, default off):** the payload-less keybind action
     `toggle_agent_dashboard` (also a command-palette entry "Toggle Agent Dashboard");
     `agent-dashboard` (master enable) + `agent-dashboard-commands` (exe names that count
-    as an agent; comma-split OR repeated, default `claude,codex`) — both reuse
-    `RepeatableString`. Keep all three in `~/.config/ghostty-ramon/config`. Read at
-    launch (relaunch to change).
+    as an agent; comma-split OR repeated, default `claude,codex`; both reuse
+    `RepeatableString`) + **`agent-dashboard-pin`** (bool, default false → floating window
+    level when true; wired `Config.zig` → `Ghostty.Config.agentDashboardPin` →
+    `AgentDashboardPanel(pinned:)` `level = pinned ? .floating : .normal`). Keep all in
+    `~/.config/ghostty-ramon/config`. Read at launch (relaunch to change).
   - **Live previews need `pty-host`.** Each tile mounts a read-only **mirror**
     `SurfaceView` (`mirror = true` + the host session id) and lets the existing
     `SurfaceWrapper` render it natively (full color, viewport-only — right for a
@@ -471,7 +493,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

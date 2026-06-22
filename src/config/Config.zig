@@ -2923,6 +2923,17 @@ keybind: Keybinds = .{},
 /// it).
 @"agent-dashboard-commands": RepeatableString = .{},
 
+/// (ramon fork) Pin the Agent Dashboard panel above other windows
+/// ("always-on-top"). When true the panel uses a floating window level so other
+/// windows can no longer be raised in front of it — a native equivalent of an
+/// external window manager's "pin", but reliable because the dashboard and the
+/// terminals share one bundle id and a bundle-id-keyed pin (e.g. Rectangle Pro)
+/// cannot tell them apart. When false (default) the panel stays at normal level
+/// and other windows can cover it. Read at launch (relaunch to change).
+/// Fork-only — keep it in `~/.config/ghostty-ramon/config` (an official Ghostty
+/// sharing `~/.config/ghostty/config` would error on it).
+@"agent-dashboard-pin": bool = false,
+
 /// (ramon fork / Agent Manager) Master enable for the Agent Manager — a
 /// warm TypeScript Agent SDK sidecar (driven via the embedded MCP server)
 /// that summarizes/annotates live agent sessions in the Agent Dashboard.
@@ -4113,6 +4124,7 @@ test "agent-dashboard config" {
         var cfg = try Config.default(alloc);
         defer cfg.deinit();
         try testing.expectEqual(false, cfg.@"agent-dashboard");
+        try testing.expectEqual(false, cfg.@"agent-dashboard-pin");
         try testing.expectEqual(
             @as(usize, 0),
             cfg.@"agent-dashboard-commands".list.items.len,
@@ -4123,6 +4135,7 @@ test "agent-dashboard config" {
     {
         const data =
             "agent-dashboard = true\n" ++
+            "agent-dashboard-pin = true\n" ++
             "agent-dashboard-commands = claude\n" ++
             "agent-dashboard-commands = codex\n";
         var reader: std.Io.Reader = .fixed(data);
@@ -4137,6 +4150,7 @@ test "agent-dashboard config" {
 
         try testing.expect(cfg._diagnostics.empty());
         try testing.expectEqual(true, cfg.@"agent-dashboard");
+        try testing.expectEqual(true, cfg.@"agent-dashboard-pin");
         try testing.expectEqual(
             @as(usize, 2),
             cfg.@"agent-dashboard-commands".list.items.len,
