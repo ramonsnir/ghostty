@@ -98,6 +98,19 @@ class AppDelegate: NSObject,
     /// The ghostty global state. Only one per process.
     let ghostty: Ghostty.App
 
+    /// (ramon fork) Process-lifetime App Nap opt-out token. Held for the whole
+    /// run so the system never naps/throttles us while we are backgrounded or
+    /// occluded. This is load-bearing for the pty-host `.client` backend: when
+    /// the GUI is relaunched into the background with no active display (e.g. a
+    /// remote restart while the user is away), App Nap can suspend the per-surface
+    /// IO threads before they connect to `ghostty-host`, leaving every restored
+    /// surface permanently blank (the connect is single-shot, no retry — see
+    /// `src/termio/Client.zig` connectAndAttach). `.userInitiatedAllowingIdleSystemSleep`
+    /// opts out of App Nap WITHOUT preventing the Mac from sleeping (it omits the
+    /// idle-system/display-sleep-disable bits), so battery/sleep behavior is
+    /// unchanged — we only refuse to be napped. Released implicitly at process exit.
+    private var appNapAssertion: NSObjectProtocol?
+
     /// (ramon fork) The embedded web monitor HTTP server, if enabled via config.
     /// Reads config at launch; changing web-monitor-listen/token needs a relaunch.
     private var webMonitor: WebMonitorServer?
@@ -233,6 +246,19 @@ class AppDelegate: NSObject,
 
         // Store our start time
         applicationLaunchTime = ProcessInfo.processInfo.systemUptime
+
+        // (ramon fork) Opt out of App Nap for the whole process lifetime. Under
+        // the pty-host `.client` backend, surfaces connect to `ghostty-host` from
+        // per-surface IO threads at creation; if the GUI is relaunched into the
+        // background with no active display (a remote restart while away), App Nap
+        // can throttle/suspend those threads before they connect, leaving every
+        // restored surface blank with no recovery (the connect is single-shot).
+        // Holding this assertion keeps us un-napped. `...AllowingIdleSystemSleep`
+        // deliberately does NOT prevent system/display sleep — the Mac still sleeps
+        // normally; we only decline to be napped. Held for the app's lifetime.
+        appNapAssertion = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "Maintain pty-host sessions and connections while backgrounded")
 
         // Check if secure input was enabled when we last quit.
         if UserDefaults.ghostty.bool(forKey: "SecureInput") != SecureInput.shared.enabled {
