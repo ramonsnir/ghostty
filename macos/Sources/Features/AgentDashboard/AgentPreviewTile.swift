@@ -177,11 +177,21 @@ struct AgentPreviewTile: View {
 
     @ViewBuilder
     private var footer: some View {
-        // (ramon fork / Agent hooks) Optional prompt subtitle (truncated) above
-        // the metadata row, so a `working` agent shows what it was asked. Gated on
-        // `.working` (like the `⛭ tool` footer below) so a finished/idle or
-        // waiting tile stays visually quiet rather than keeping the stale prompt.
-        if entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
+        // (ramon fork / Agent Manager) The manager's one-line annotation summary,
+        // shown above the metadata row when present (any state). It is the semantic
+        // status line; the colored state chip in the header still reflects the
+        // authoritative hook state (design §5.1). Mirrors the prompt subtitle's
+        // modifier set. When absent, the tile falls back to the prompt subtitle
+        // below (and the chip alone), so a manager-less tile is unchanged.
+        if let summary = entry.annotation?.summary, !summary.isEmpty {
+            Text(summary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+        } else if entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
             Text(prompt)
                 .font(.caption2)
                 .foregroundStyle(.secondary)

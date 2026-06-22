@@ -883,6 +883,29 @@ extension Ghostty {
                 .filter { !$0.isEmpty }
             return split.isEmpty ? agentDashboardCommandsDefault : split
         }
+
+        // (ramon fork / Agent Manager) Master enable for the Agent Manager
+        // sidecar. Default false. Gated further at runtime by
+        // agentManagerShouldStart(...) (requires mcp-listen + mcp-token + node).
+        var agentManagerEnabled: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-manager"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
+        // nil/empty when unset (the controller falls back to a login-shell probe).
+        var agentManagerNodePath: String? {
+            guard let config = self.config else { return nil }
+            var v: UnsafePointer<Int8>?
+            let key = "agent-manager-node-path"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+            guard let ptr = v else { return nil }
+            let s = String(cString: ptr)
+            return s.isEmpty ? nil : s
+        }
     }
 }
 

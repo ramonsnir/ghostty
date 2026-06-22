@@ -27,6 +27,15 @@
 # Never let an error here surface to Claude Code.
 set +e
 
+# (ramon fork / Agent Manager) Hook-recursion guard. The Agent Manager sidecar
+# sets GHOSTTY_AGENT_MANAGER=1 in the environment of any `claude` it spawns, so
+# its own (current/future) agent activity does NOT loop back through this hook and
+# re-POST agent-state. Exit immediately when set. (In the Phase-0 skeleton the
+# sidecar only calls list/annotate MCP tools and spawns no `claude`, so this is a
+# no-op today — it's here so the guarantee holds the moment the sidecar gains its
+# own agent-spawning capability.)
+[ -n "$GHOSTTY_AGENT_MANAGER" ] && exit 0
+
 state="$1"
 case "$state" in
   working|waiting|idle) ;;

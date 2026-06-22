@@ -600,7 +600,8 @@ struct AgentDashboardSortTests {
     private func entry(_ id: UUID, bell: Bool) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
-              agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false)
+              agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
+              annotation: nil)
     }
 
     @Test func bellFirst() {
@@ -652,7 +653,8 @@ struct AgentDashboardSortTests {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: session,
               agentState: waiting ? .waiting : nil,
-              lastTool: nil, lastPrompt: nil, hookBacked: false)
+              lastTool: nil, lastPrompt: nil, hookBacked: false,
+              annotation: nil)
     }
 
     @Test func manualRankOrdersPlacedTiles() {
@@ -995,6 +997,74 @@ struct AgentDashboardHookStateTests {
         _ = model.applyAgentState(waiting, payload(.waiting, message: "?"))
         #expect(model.entries.first?.id == waiting)
     }
+
+    // MARK: - Annotations (ramon fork / Agent Manager)
+
+    private func annotation(_ summary: String) -> AgentAnnotation {
+        .init(summary: summary, suggestion: nil, phase: nil, needsUser: false, confidence: nil)
+    }
+
+    @Test func applyAnnotationStoresAndRendersSummary() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+
+        model.applyAnnotation(a, annotation("Running test suite"))
+        #expect(model.annotations[a]?.summary == "Running test suite")
+        #expect(model.entries.first(where: { $0.id == a })?.annotation?.summary == "Running test suite")
+    }
+
+    @Test func applyAnnotationOverwrites() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+
+        model.applyAnnotation(a, annotation("first"))
+        model.applyAnnotation(a, annotation("second"))
+        #expect(model.annotations[a]?.summary == "second")
+    }
+
+    @Test func annotationPrunedForVanishedSurface() {
+        // A closed surface's annotation is dropped on rebuild(live:) like the other
+        // per-id state (in-memory only — nothing persisted, just no leak).
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([a, b]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, annotation("a-note"))
+        model.applyAnnotation(b, annotation("b-note"))
+
+        model.rebuild(live: live([b]))
+        #expect(model.annotations[a] == nil)
+        #expect(model.annotations[b]?.summary == "b-note")
+    }
+
+    @Test func hookSnapshotCarriesStateAndNotes() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working, tool: "Bash", prompt: "do it"))
+        model.applyAnnotation(a, annotation("Implementing fix"))
+
+        let snap = model.hookSnapshot()
+        #expect(snap[a]?.agentState == "working")
+        #expect(snap[a]?.lastTool == "Bash")
+        #expect(snap[a]?.lastPrompt == "do it")
+        #expect(snap[a]?.notes == "Implementing fix")
+    }
+
+    @Test func hookSnapshotOmitsSurfaceWithNoState() {
+        // A surface with no hook event and no annotation is absent from the
+        // snapshot — so the MCP shaper omits its agent-* fields (honest absence).
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        #expect(model.hookSnapshot()[a] == nil)
+    }
 }
 
 // MARK: - Attention-first sort key (bell OR waiting)
@@ -1004,7 +1074,8 @@ struct AgentDashboardWaitingSortTests {
     private func entry(_ id: UUID, bell: Bool, state: AgentState?) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
-              agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil)
+              agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil,
+              annotation: nil)
     }
 
     @Test func waitingBeatsWorking() {

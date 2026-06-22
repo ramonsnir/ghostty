@@ -76,11 +76,40 @@ enum MCPLayout {
         /// repaints/works, growing while it waits for input; nil when unknown /
         /// unsupported backend. Coarse: a TUI that repaints on a timer never idles.
         let idleSeconds: Double?
+        /// fork / Agent Manager: the hook-reported agent lifecycle state
+        /// ("working"/"waiting"/"idle"), or nil if no hook has reported for this
+        /// surface (or the Agent Dashboard is disabled). Sourced from the dashboard
+        /// model, not the SurfaceView.
+        let agentState: String?
+        /// fork / Agent Manager: the last UserPromptSubmit prompt text, or nil.
+        let lastPrompt: String?
+        /// fork / Agent Manager: the last PreToolUse tool name, or nil.
+        let lastTool: String?
+        /// fork / Agent Manager: the manager's latest annotation summary for this
+        /// surface, or nil if it has not annotated it (the only "notes" source in
+        /// Phase 0).
+        let notes: String?
+        /// fork / Agent Manager: the DETECTED agent kind ("claude"/"codex") from the
+        /// dashboard's authoritative subtree-walk detector, or nil. The summarizer
+        /// keys off THIS (not `processName`, which is `bash` under the claude-pool
+        /// wrapper) to decide a surface is an agent worth summarizing.
+        let agentKind: String?
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
     static func surfaceRows() -> [SurfaceRow] {
         var rows: [SurfaceRow] = []
+        // (ramon fork / Agent Manager) Per-surface hook/annotation state from the
+        // dashboard model (value types only). Empty when the dashboard is disabled
+        // ⇒ all four agent-* fields are omitted (honest absence). `hookSnapshot()`
+        // is @MainActor (the controller is); this static func is nonisolated but is
+        // ALWAYS invoked inside `DispatchQueue.main.sync` (see MCPTools.dispatch),
+        // so `assumeIsolated` is sound — it satisfies the compiler without changing
+        // the existing on-main calling contract.
+        let hooks: [UUID: AgentDashboardModel.HookSnapshotEntry] =
+            MainActor.assumeIsolated {
+                (NSApp.delegate as? AppDelegate)?.agentDashboard?.hookSnapshot() ?? [:]
+            }
         var groupIndex: [ObjectIdentifier: Int] = [:]
         func windowIndex(_ c: TerminalController) -> Int {
             let key: ObjectIdentifier
@@ -111,6 +140,7 @@ enum MCPLayout {
                 // misleading. Gate atPrompt on !exited so an exited surface is
                 // never also "at a prompt".
                 let atPrompt = !exited && !view.needsConfirmQuit
+                let hook = hooks[view.id]
                 rows.append(SurfaceRow(
                     id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
                     window: win, tab: tabIdx, tabTitle: tabTitle,
@@ -119,7 +149,12 @@ enum MCPLayout {
                     exited: exited, atPrompt: atPrompt,
                     processName: view.foregroundProcessName,
                     command: view.foregroundCommand,
-                    idleSeconds: view.idleSeconds))
+                    idleSeconds: view.idleSeconds,
+                    agentState: hook?.agentState,
+                    lastPrompt: hook?.lastPrompt,
+                    lastTool: hook?.lastTool,
+                    notes: hook?.notes,
+                    agentKind: hook?.agentKind))
             }
         }
         return rows
@@ -140,6 +175,12 @@ enum MCPLayout {
             if let n = $0.processName { d["processName"] = n }
             if let c = $0.command { d["command"] = c }
             if let idle = $0.idleSeconds { d["idleSeconds"] = idle }
+            // fork / Agent Manager: agent-* fields are omitted when unknown.
+            if let s = $0.agentState { d["agentState"] = s }
+            if let p = $0.lastPrompt { d["lastPrompt"] = p }
+            if let t = $0.lastTool { d["lastTool"] = t }
+            if let notes = $0.notes { d["notes"] = notes }
+            if let kind = $0.agentKind { d["agentKind"] = kind }
             return d
         }
     }

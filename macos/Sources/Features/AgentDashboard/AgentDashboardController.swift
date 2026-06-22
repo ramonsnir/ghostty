@@ -25,6 +25,10 @@ struct AgentEntry: Identifiable {
     /// True once this surface has EVER reported a hook event — hook state is
     /// authoritative thereafter and MUTES the `idleSeconds` heuristic.
     let hookBacked: Bool
+    /// (ramon fork / Agent Manager) The latest LLM annotation (summary/suggestion)
+    /// for this surface, or nil if the manager has not annotated it. In-memory ONLY
+    /// in Phase 0 (NO persistence).
+    let annotation: AgentAnnotation?
 }
 
 /// Persistence boundary for the hide set, injected so the round-trip is
@@ -213,6 +217,14 @@ final class AgentDashboardModel: ObservableObject {
     /// `orderStore`. Each drag REWRITES this from the displayed order, so it
     /// never grows past the number of visible tiles.
     @Published private(set) var manualOrder: [UInt64] = []
+
+    // MARK: - Annotations (ramon fork / Agent Manager)
+
+    /// The latest LLM annotation per surface, written by the Agent Manager sidecar
+    /// through `set_surface_annotation`. `@Published` so a tile re-renders when the
+    /// summary changes. In-memory ONLY in Phase 0 — NO persistence (unlike the
+    /// hook state above), and pruned on `rebuild(live:)` for vanished surfaces.
+    @Published private(set) var annotations: [UUID: AgentAnnotation] = [:]
 
     private let store: HideStore
     private let orderStore: OrderStore
@@ -411,6 +423,15 @@ final class AgentDashboardModel: ObservableObject {
         return prev != .waiting && payload.state == .waiting
     }
 
+    /// (ramon fork / Agent Manager) Store an annotation for `id` and rebuild the
+    /// entries so the tile re-renders. Called on main from the controller's
+    /// `.ghosttyAgentAnnotationDidChange` observer. NO persistence + NO coalesce in
+    /// Phase 0: the sidecar already rate-limits its own writes.
+    func applyAnnotation(_ id: UUID, _ annotation: AgentAnnotation) {
+        annotations[id] = annotation
+        rebuildEntriesFromCurrentState()
+    }
+
     // MARK: - Reconciliation
 
     /// Snapshot of one live surface taken on main (value types + weak view).
@@ -444,6 +465,9 @@ final class AgentDashboardModel: ObservableObject {
         lastPrompt = lastPrompt.filter { liveIDs.contains($0.key) }
         lastMessage = lastMessage.filter { liveIDs.contains($0.key) }
         hookBacked = hookBacked.intersection(liveIDs)
+        // (ramon fork / Agent Manager) Drop annotations for vanished surfaces too
+        // (in-memory only, so nothing is persisted — just don't leak).
+        annotations = annotations.filter { liveIDs.contains($0.key) }
         // (ramon fork / hooks) Restore persisted state onto the (freshly-minted)
         // surface UUIDs by their stable host session id, and keep live records
         // fresh. This is what makes statuses survive a GUI restart.
@@ -538,6 +562,42 @@ final class AgentDashboardModel: ObservableObject {
     /// the Show popover are all derived from this, never from `liveIDs`.
     var liveAgentIDs: Set<UUID> { Set(live.map(\.id).filter { agents[$0] != nil }) }
 
+    /// (ramon fork / Agent Manager) Per-surface hook/annotation snapshot for the
+    /// MCP `list_surfaces` enrichment. Value types only, so the MCP layer can read
+    /// it on the existing main hop and never touch the @MainActor model off-main.
+    struct HookSnapshotEntry {
+        let agentState: String?   // AgentState rawValue, or nil
+        let lastPrompt: String?
+        let lastTool: String?
+        let notes: String?        // annotation summary (the only honest "notes" source)
+        /// (ramon fork / Agent Manager) The DETECTED agent kind's command basename
+        /// (e.g. "claude"/"codex") from the dashboard's authoritative subtree-walk
+        /// detector, or nil. This is the signal the summarizer keys off to decide a
+        /// surface is an agent — the foreground `processName` is NOT reliable (under
+        /// the claude-pool wrapper the foreground is `bash`; the real `claude` is a
+        /// child the detector finds via its process-subtree walk).
+        let agentKind: String?
+    }
+
+    /// Snapshot the hook + annotation state for every surface that has any of it.
+    /// Surfaces with no state at all are omitted, so an absent map entry means
+    /// "nothing known" (the MCP shaper then omits those fields — honest absence).
+    func hookSnapshot() -> [UUID: HookSnapshotEntry] {
+        var out: [UUID: HookSnapshotEntry] = [:]
+        let ids = Set(agentStates.keys)
+            .union(lastPrompt.keys).union(lastTool.keys)
+            .union(annotations.keys).union(agents.keys)
+        for id in ids {
+            out[id] = HookSnapshotEntry(
+                agentState: agentStates[id]?.rawValue,
+                lastPrompt: lastPrompt[id],
+                lastTool: lastTool[id],
+                notes: annotations[id]?.summary,
+                agentKind: agents[id]?.command)
+        }
+        return out
+    }
+
     /// Metadata for one hidden-but-live agent, so the "N hidden" popover can show
     /// `badge · title · Show` (spec §4.3) instead of a raw UUID prefix. Retained
     /// from the `live` snapshot + latest detector results even though the
@@ -579,7 +639,8 @@ final class AgentDashboardModel: ObservableObject {
                     agentState: agentStates[s.id],
                     lastTool: lastTool[s.id],
                     lastPrompt: lastPrompt[s.id],
-                    hookBacked: hookBacked.contains(s.id)
+                    hookBacked: hookBacked.contains(s.id),
+                    annotation: annotations[s.id]
                 )
             }
         // session id → its index in the user's manual order (keep-first on the
@@ -694,6 +755,7 @@ final class AgentDashboardController: NSWindowController {
 
         subscribeChurn()
         subscribeAgentState()
+        subscribeAnnotation()
         rebuildControllerObservers()
     }
 
@@ -846,6 +908,31 @@ final class AgentDashboardController: NSWindowController {
                 }
             }
             .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Manager) Observe `.ghosttyAgentAnnotationDidChange`
+    /// posted by the MCP `set_surface_annotation` handler after it resolves the
+    /// tool's id to a surface UUID. Mirrors `subscribeAgentState`: registered
+    /// unconditionally (not gated on `isShown`) and hands the annotation to the
+    /// model, which rebuilds its `@Published` entries.
+    private func subscribeAnnotation() {
+        NotificationCenter.default.publisher(for: .ghosttyAgentAnnotationDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,
+                      let annotation = note.userInfo?[AgentStateUserInfoKey.annotation] as? AgentAnnotation
+                else { return }
+                self.model.applyAnnotation(id, annotation)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Manager) Forward the model's per-surface hook/annotation
+    /// snapshot for the MCP `list_surfaces` enrichment. MUST be called on main
+    /// (the model is `@MainActor`); returns value types only.
+    func hookSnapshot() -> [UUID: AgentDashboardModel.HookSnapshotEntry] {
+        model.hookSnapshot()
     }
 
     /// (ramon fork / Agent hooks) Post `.ghosttyAgentNeedsAttention` for `id`,

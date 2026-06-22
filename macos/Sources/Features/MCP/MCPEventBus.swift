@@ -83,6 +83,13 @@ final class MCPEventBus {
 
     // MARK: - Events
 
+    // TODO(agent-manager Phase 1): add an `agentState` event kind, fired on a hook
+    // agent-state transition (carrying state / prompt? / tool? / message?), so
+    // `wait_for_event` can block on "agent changed state". DELIBERATELY DEFERRED
+    // from Phase 0 (it was a SECONDARY contract item — the annotation round-trip
+    // does not depend on it). The hook signal already reaches the GUI via the MCP
+    // `/agent-state` route + `.ghosttyAgentStateDidChange`; wiring it into this
+    // waiter registry is the only missing piece.
     enum EventType: String { case bell, exited, prompt }
 
     struct Event {

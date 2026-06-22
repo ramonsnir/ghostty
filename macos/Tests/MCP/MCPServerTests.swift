@@ -334,10 +334,10 @@ struct MCPServerTests {
         let expected: Set<String> = [
             "list_surfaces", "read_surface", "get_layout", "send_text", "send_key",
             "scroll", "wait_for_event", "watch_for_pattern", "focus_surface",
-            "new_tab", "close_surface", "perform_action",
+            "new_tab", "close_surface", "perform_action", "set_surface_annotation",
         ]
         #expect(names == expected)
-        #expect(tools.count == 12)
+        #expect(tools.count == 13)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -404,7 +404,9 @@ struct MCPServerTests {
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
             focused: true, bell: false, exited: false, atPrompt: true,
-            processName: "claude", command: "claude --resume", idleSeconds: 0.0)
+            processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
+            agentState: "working", lastPrompt: "do it", lastTool: "Bash",
+            notes: "Implementing fix", agentKind: "claude")
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -420,9 +422,17 @@ struct MCPServerTests {
         #expect(d["bell"] as? Bool == false)
         #expect(d["exited"] as? Bool == false)
         #expect(d["atPrompt"] as? Bool == true)
-        #expect(d["processName"] as? String == "claude")
-        #expect(d["command"] as? String == "claude --resume")
+        #expect(d["processName"] as? String == "bash")
+        #expect(d["command"] as? String == "bash claude-pool")
         #expect(d["idleSeconds"] as? Double == 0.0)
+        #expect(d["agentState"] as? String == "working")
+        #expect(d["lastPrompt"] as? String == "do it")
+        #expect(d["lastTool"] as? String == "Bash")
+        #expect(d["notes"] as? String == "Implementing fix")
+        // fork / Agent Manager: the detector's agent kind rides through (the
+        // foreground process is the `bash` pool wrapper, NOT "claude" — agentKind
+        // is the reliable signal the summarizer uses).
+        #expect(d["agentKind"] as? String == "claude")
     }
 
     // fork: the three optional fields are OMITTED (not null/empty) when unknown.
@@ -432,11 +442,19 @@ struct MCPServerTests {
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
             focused: true, bell: false, exited: false, atPrompt: true,
-            processName: nil, command: nil, idleSeconds: nil)
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: nil)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
         #expect(d["idleSeconds"] == nil)
+        // fork / Agent Manager: agent-* fields are omitted (not null) when unknown.
+        #expect(d["agentState"] == nil)
+        #expect(d["lastPrompt"] == nil)
+        #expect(d["lastTool"] == nil)
+        #expect(d["notes"] == nil)
+        #expect(d["agentKind"] == nil)
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)
