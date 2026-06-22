@@ -93,6 +93,11 @@ enum MCPLayout {
         /// `notes` (the LLM summary): this is the strongest goal signal — persisted
         /// across a GUI restart. Omitted when nil.
         let userNotes: String?
+        /// fork / Agent Manager Phase 2.1: true iff the user dismissed the current
+        /// suggestion. The sidecar uses this to SUPPRESS re-suggesting until the
+        /// change fingerprint shifts. A PLAIN bool — emitted unconditionally in JSON
+        /// (unlike the omit-when-nil optionals around it).
+        let suggestionDismissed: Bool
         /// fork / Agent Manager: the DETECTED agent kind ("claude"/"codex") from the
         /// dashboard's authoritative subtree-walk detector, or nil. The summarizer
         /// keys off THIS (not `processName`, which is `bash` under the claude-pool
@@ -159,6 +164,7 @@ enum MCPLayout {
                     lastTool: hook?.lastTool,
                     notes: hook?.notes,
                     userNotes: hook?.userNotes,
+                    suggestionDismissed: hook?.suggestionDismissed ?? false,
                     agentKind: hook?.agentKind))
             }
         }
@@ -186,6 +192,9 @@ enum MCPLayout {
             if let t = $0.lastTool { d["lastTool"] = t }
             if let notes = $0.notes { d["notes"] = notes }
             if let un = $0.userNotes { d["userNotes"] = un }
+            // fork / Agent Manager Phase 2.1: a PLAIN bool — emit unconditionally (the
+            // sidecar reads it to suppress re-suggesting a dismissed suggestion).
+            d["suggestionDismissed"] = $0.suggestionDismissed
             if let kind = $0.agentKind { d["agentKind"] = kind }
             return d
         }

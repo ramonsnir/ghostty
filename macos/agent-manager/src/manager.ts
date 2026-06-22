@@ -20,12 +20,15 @@
 import type { Surface } from "./mcp.js";
 import { composeSystemPrompt } from "./prompt.js";
 import {
+  DEFAULT_CONFIG,
   eachJsonObject,
+  fingerprint as summarizerFingerprint,
   fnv1a,
   lastLines,
   stripFences,
   truncateCodePoints,
 } from "./summarizer.js";
+import type { SummarizerConfig, SurfaceSnapshot } from "./summarizer.js";
 
 /** The default manager model. Free-form string (no SDK enum), per the Map. */
 export const MANAGER_MODEL = "claude-opus-4-8";
@@ -61,16 +64,29 @@ export interface ManagerSnapshot {
   viewport: string;
 }
 
-/** The record the loop keeps per session from the last suggestion attempt. */
+/** Default confidence used when the model omits the field or emits an invalid
+ *  value. Mid-scale (NOT dimmed by the tile's default threshold). */
+export const DEFAULT_CONFIDENCE = 0.5;
+
+/** The record the loop keeps per session from the last suggestion attempt.
+ *  `fingerprint` is the manager's own debounce fingerprint (goals + tail); it
+ *  doubles as `lastSuggestFingerprint`. `suppressedFingerprint` (Phase 2.1) is the
+ *  summarizer-style fingerprint at which the user DISMISSED the suggestion — while
+ *  the current summarizer-style fingerprint equals it, the manager skips
+ *  re-suggesting; null = not suppressed. */
 export interface LastSuggestion {
   fingerprint: string;
   atMs: number;
   suggestion: string;
+  suppressedFingerprint?: string | null;
 }
 
 /** The parsed, validated manager output. */
 export interface ParsedSuggestion {
   suggestion: string;
+  /** The manager's HONEST 0..1 self-rating of goal-advancement. ALWAYS populated
+   *  (defaulted to DEFAULT_CONFIDENCE when absent/invalid) + clamped to [0,1]. */
+  confidence: number;
   rationale?: string;
 }
 
@@ -121,16 +137,56 @@ export function fingerprint(
 }
 
 /**
- * The suggest/skip decision. PURE. Rules (each tested):
- *   - agent NOT waiting              -> {due:false, reason:"not-waiting"}
+ * The "meaningful change" fingerprint for DISMISS-SUPPRESSION. PURE. Deliberately
+ * reuses the SUMMARIZER's fingerprint (agentState | lastPrompt | lastTool + viewport
+ * tail) — NOT the manager's own debounce fingerprint (goals + tail) — so "the
+ * situation meaningfully changed" matches the summarizer's notion exactly (per the
+ * Phase-2.1 contract). A `ManagerSnapshot` is structurally a `SurfaceSnapshot`
+ * (`{surface, viewport}`); the tail window comes from the shared SummarizerConfig
+ * (`DEFAULT_CONFIG` by default) so both layers hash the same lines.
+ */
+export function dismissFingerprint(
+  s: ManagerSnapshot,
+  summarizerCfg: SummarizerConfig = DEFAULT_CONFIG,
+): string {
+  return summarizerFingerprint(s as SurfaceSnapshot, summarizerCfg);
+}
+
+/**
+ * The suggest/skip decision. PURE. Rules (each tested), evaluated in order:
  *   - exited                         -> {due:false, reason:"exited"}
+ *   - agent NOT waiting              -> {due:false, reason:"not-waiting"}
  *   - within debounceMs of last call -> {due:false, reason:"debounce"}
- *   - fingerprint unchanged since the last suggestion -> {due:false, reason:"unchanged"}
- *   - otherwise                      -> {due:true,  reason:"first"|"changed"}
+ *   - (Phase 2.1) DISMISS-SUPPRESSION — evaluated for a DISMISSED surface BEFORE the
+ *     manager `unchanged` gate, so the suppression arms AT DISMISS TIME (when the
+ *     screen+goals are stable, which is the NORMAL `waiting` case) rather than being
+ *     short-circuited by `unchanged`. The arm value, the unchanged compare, and the
+ *     changed compare ALL live in the SUMMARIZER fingerprint space
+ *     (`dismissFingerprint` = agentState|lastPrompt|lastTool + viewport tail) — NOT
+ *     the manager debounce fingerprint (`last.fingerprint` = goals + tail), which is
+ *     a DIFFERENT hash space and must NEVER be used to arm (mixing the two would make
+ *     `armed === dfp` never match, re-firing a dismissed suggestion every sweep):
+ *       * dismissed + suppression NOT yet armed -> ARM it: return
+ *         {due:false, reason:"dismissed-arm", suppressedFingerprint:dfp} where
+ *         `dfp = dismissFingerprint(s)` is the CURRENT summarizer fingerprint (the
+ *         dismissed screen). The caller persists it.
+ *       * dismissed + the summarizer-style fingerprint UNCHANGED vs. the armed value
+ *         -> {due:false, reason:"dismissed-unchanged"}.
+ *       * dismissed + the summarizer-style fingerprint CHANGED vs. the arm
+ *         -> {due:true, reason:"dismissed-changed", suppressedFingerprint:null}
+ *         (a SINGLE meaningful change re-suggests + clears suppression).
+ *   - (not dismissed) fingerprint unchanged since the last suggestion
+ *                                    -> {due:false, reason:"unchanged"}
+ *   - otherwise                      -> {due:true, reason:"first"|"changed",
+ *                                        suppressedFingerprint:null}.
  *
  * Manager fires ONLY for a `waiting` agent (NOT working/idle), per the spec — a
  * suggestion is meaningless mid-work. `unchanged` skip avoids re-proposing the
  * SAME reply for the SAME screen (the user may simply not have acted yet).
+ *
+ * `suppressedFingerprint` in the return is the value the caller should PERSIST onto
+ * the session's LastSuggestion: undefined ⇒ leave as-is; a string ⇒ arm to it; null
+ * ⇒ clear. `last.suppressedFingerprint` carries the currently-armed value in.
  */
 export function shouldSuggest(
   s: ManagerSnapshot,
@@ -138,7 +194,8 @@ export function shouldSuggest(
   last: LastSuggestion | undefined,
   nowMs: number,
   cfg: ManagerConfig,
-): { due: boolean; reason: string } {
+  summarizerCfg: SummarizerConfig = DEFAULT_CONFIG,
+): { due: boolean; reason: string; suppressedFingerprint?: string | null } {
   if (s.surface.exited) return { due: false, reason: "exited" };
   if (s.surface.agentState !== "waiting") {
     return { due: false, reason: "not-waiting" };
@@ -146,11 +203,41 @@ export function shouldSuggest(
   if (last && nowMs - last.atMs < cfg.debounceMs) {
     return { due: false, reason: "debounce" };
   }
+
+  // (Phase 2.1) Dismiss-suppression. `undefined` suggestionDismissed reads as false
+  // (a pre-upgrade host omits the field). Evaluated BEFORE the manager `unchanged`
+  // gate: in the normal `waiting` flow the screen + goals are stable, so `unchanged`
+  // would short-circuit and the arm would never be set at dismiss time. The compare
+  // uses the SUMMARIZER's fingerprint (the contract's "meaningful change" = the
+  // summarizer's notion) and is independent of the manager debounce fingerprint.
+  const dismissed = s.surface.suggestionDismissed === true;
+  if (dismissed) {
+    const armed = last?.suppressedFingerprint ?? null;
+    // The suppression fingerprint is the SUMMARIZER's (screen + agentState/prompt/
+    // tool, NO goals); the arm value and BOTH compares MUST live in this same space.
+    const dfp = dismissFingerprint(s, summarizerCfg);
+    if (armed === null) {
+      // Arm suppression at the current summarizer fingerprint (the dismissed screen).
+      return { due: false, reason: "dismissed-arm", suppressedFingerprint: dfp };
+    }
+    if (armed === dfp) {
+      return { due: false, reason: "dismissed-unchanged" };
+    }
+    // A SINGLE meaningful change since the dismissal -> allow + clear suppression.
+    return { due: true, reason: "dismissed-changed", suppressedFingerprint: null };
+  }
+
+  // Not dismissed: behaves as before. Coarse `unchanged` skip avoids re-proposing the
+  // same reply for the same (goals + screen) state; also clears any stale arm.
   const fp = fingerprint(s, goals, cfg);
   if (last !== undefined && last.fingerprint === fp) {
     return { due: false, reason: "unchanged" };
   }
-  return { due: true, reason: last === undefined ? "first" : "changed" };
+  return {
+    due: true,
+    reason: last === undefined ? "first" : "changed",
+    suppressedFingerprint: null,
+  };
 }
 
 /** Build the SuggestionContext fed to the model from a snapshot + goals + prior. */
@@ -206,8 +293,9 @@ export function composePrompt(
  * Tolerant parser for the manager's reply. PURE. Mirrors summarizer.parseSummary:
  * strips fences, walks EVERY balanced top-level JSON object, and returns the FIRST
  * carrying a non-empty string `suggestion`. `suggestion` is trimmed + truncated by
- * CODE POINT; `rationale` kept only when a non-empty string. Returns null when no
- * usable suggestion is found.
+ * CODE POINT; `rationale` kept only when a non-empty string; `confidence` is parsed
+ * + CLAMPED to [0,1], defaulting to DEFAULT_CONFIDENCE when absent/non-number/NaN.
+ * Returns null when no usable suggestion is found.
  */
 export function parseSuggestion(modelText: string): ParsedSuggestion | null {
   if (typeof modelText !== "string") return null;
@@ -230,6 +318,7 @@ export function parseSuggestion(modelText: string): ParsedSuggestion | null {
 
     const result: ParsedSuggestion = {
       suggestion: truncateCodePoints(suggestion, SUGGESTION_MAX_LEN),
+      confidence: clampConfidence(rec.confidence),
     };
     if (typeof rec.rationale === "string") {
       const r = rec.rationale.trim();
@@ -238,4 +327,14 @@ export function parseSuggestion(modelText: string): ParsedSuggestion | null {
     return result;
   }
   return null;
+}
+
+/**
+ * PURE: coerce a model-supplied `confidence` to a number in [0,1], defaulting to
+ * DEFAULT_CONFIDENCE when it is absent, not a finite number, or otherwise invalid.
+ * Out-of-range finite numbers are CLAMPED (e.g. 1.7 -> 1, -0.2 -> 0).
+ */
+export function clampConfidence(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return DEFAULT_CONFIDENCE;
+  return Math.max(0, Math.min(1, raw));
 }

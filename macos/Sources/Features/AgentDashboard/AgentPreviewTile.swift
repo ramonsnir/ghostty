@@ -13,9 +13,10 @@ struct AgentPreviewTile: View {
     /// When false (pty-host off), render a metadata-only tile (no mirror).
     let previewsEnabled: Bool
     let onHide: () -> Void
-    /// (ramon fork / Agent Manager Phase 2) Approve the suggestion: TYPE the given
-    /// (possibly edited) text into the surface WITHOUT submitting. User-initiated
-    /// only — the sole send path. Dismiss the suggestion (clear it, keep summary).
+    /// (ramon fork / Agent Manager Phase 2.1) Approve the suggestion: TYPE the given
+    /// (possibly edited) text into the surface AND SUBMIT it (one trailing Return) in
+    /// one tap. User-initiated only — the sole send path; still SUGGEST-ONLY (a human
+    /// tap is the authorization, nothing autonomous). Dismiss clears it, keeps summary.
     let onApprove: (String) -> Void
     let onDismiss: () -> Void
     /// (ramon fork / Agent Manager Phase 2) Commit the user's per-session note edit.
@@ -60,6 +61,34 @@ struct AgentPreviewTile: View {
     /// top and the agent's most-recent rows ("latest progress") stay visible
     /// (request #3).
     private static let previewHeight: CGFloat = 220
+
+    /// (ramon fork / Agent Manager Phase 2.1) Suggestions with a confidence BELOW
+    /// this threshold are visually de-emphasized (dimmed) — every suggestion is still
+    /// rendered, but a weak "had to say something" reply reads as secondary while a
+    /// strong goal-advancing one is full-strength. A missing confidence is treated as
+    /// mid (0.5) — i.e. NOT dimmed (see `suggestionStyle`).
+    static let CONF_DIM_THRESHOLD: Double = 0.5
+
+    /// PURE style for a suggestion given its (optional) confidence. Factored out for
+    /// unit testing (the view can't render headless). A `nil` confidence defaults to
+    /// mid (0.5) so an un-rated suggestion is shown full-strength; a value strictly
+    /// below `CONF_DIM_THRESHOLD` dims (reduced opacity + secondary label color).
+    struct SuggestionStyle: Equatable {
+        let opacity: Double
+        let dimmed: Bool
+        /// Whole-percent confidence for the inline indicator (e.g. 80 → "80%").
+        let percent: Int
+    }
+    static func suggestionStyle(
+        confidence: Double?, threshold: Double = CONF_DIM_THRESHOLD
+    ) -> SuggestionStyle {
+        let c = max(0.0, min(1.0, confidence ?? 0.5))
+        let dimmed = c < threshold
+        return SuggestionStyle(
+            opacity: dimmed ? 0.55 : 1.0,
+            dimmed: dimmed,
+            percent: Int((c * 100).rounded()))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -277,21 +306,32 @@ struct AgentPreviewTile: View {
 
     /// The manager's proposed reply, shown with Approve / Edit / Dismiss when a
     /// non-empty `suggestion` is present. Approve TYPES `editedSuggestion` into the
-    /// surface WITHOUT submitting (no Return) — the ONLY send path, user-initiated.
-    /// Edit makes the suggestion an editable field (it already IS one — typing in
-    /// it is "edit"); Dismiss clears the suggestion (leaving the summary intact).
-    /// SUGGEST-ONLY: nothing here can submit; only a tap types text.
+    /// surface AND SUBMITS it (one trailing Return) — the ONLY send path, always
+    /// user-initiated. Edit makes the suggestion an editable field (it already IS one
+    /// — typing in it is "edit"); Dismiss clears the suggestion (leaving the summary
+    /// intact). STILL SUGGEST-ONLY: nothing autonomous can submit — the Approve TAP is
+    /// the human authorization; the sidecar/manager never sends. Every suggestion is
+    /// rendered, but a low-confidence one is visually de-emphasized (see
+    /// `suggestionStyle` / `CONF_DIM_THRESHOLD`).
     @ViewBuilder
     private var suggestionRow: some View {
         if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty {
+            let style = Self.suggestionStyle(confidence: entry.annotation?.confidence)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
                     Image(systemName: "lightbulb")
                         .font(.caption2)
-                        .foregroundStyle(Self.bellAmber)
+                        .foregroundStyle(style.dimmed ? Color.secondary : Self.bellAmber)
                     Text("Suggested reply")
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
+                    // Inline confidence indicator: the manager's HONEST self-rating
+                    // of how well this reply advances the user's goal. A weak one is
+                    // dimmed (see `suggestionStyle`) and reads as secondary.
+                    Text("\(style.percent)%")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .help("Manager confidence this reply advances your goal")
                 }
                 // Editable so the user can tweak before Approve (the "Edit" of
                 // Approve/Edit/Dismiss). Multi-line, capped height.
@@ -312,10 +352,13 @@ struct AgentPreviewTile: View {
                     .buttonStyle(.borderless)
                     .help("Discard this suggestion (keeps the status line)")
                     Button {
-                        // TYPE the (possibly edited) suggestion — never submit. Collapse
-                        // newlines to spaces FIRST so a multi-line edit can't sneak a
-                        // Return (which submits) through keySpecs(forText:). approveSuggestion
-                        // re-applies the same guard (defense-in-depth, sole send path).
+                        // TYPE the (possibly edited) suggestion AND submit it in one
+                        // tap. Collapse INTERIOR newlines to spaces FIRST so a
+                        // multi-line edit produces exactly ONE trailing Return (the
+                        // intended submit) — not N partial submits through
+                        // keySpecs(forText:). approveSuggestion re-applies the same
+                        // guard then appends the single submit Return (sole send path,
+                        // user-initiated by this tap).
                         let text = MCPInput.singleLine(editedSuggestion)
                         guard !text.isEmpty else { return }
                         onApprove(text)
@@ -324,9 +367,10 @@ struct AgentPreviewTile: View {
                     }
                     .buttonStyle(.borderless)
                     .disabled(MCPInput.singleLine(editedSuggestion).isEmpty)
-                    .help("Type this reply into the agent (does NOT submit — press Return yourself)")
+                    .help("Type this reply into the agent and submit it (sends a Return)")
                 }
             }
+            .opacity(style.opacity)
             .padding(.horizontal, 8)
             .padding(.bottom, 6)
         }

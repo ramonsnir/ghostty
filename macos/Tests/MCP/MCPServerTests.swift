@@ -142,8 +142,12 @@ struct MCPServerTests {
     }
 
     @Test func singleLineSuggestionEmitsNoReturn() {
-        // The load-bearing safety guarantee: a multi-line suggestion, once run through
-        // singleLine, produces NO Return KeySpec (keycode 36) — so Approve only TYPES.
+        // The load-bearing safety guard: singleLine STRIPS INTERIOR newlines, so a
+        // multi-line suggestion run through it produces NO Return KeySpec (keycode 36)
+        // from keySpecs(forText:). (Phase 2.1: Approve now submits, but via exactly ONE
+        // trailing Return appended by sendText(submit:true) — NOT one per interior
+        // newline. This test guards that interior-newline collapse, which turns N
+        // partial submits into the single intended one.)
         let multiline = "Yes, proceed.\nUse the staging DB.\nrm -rf is fine here\n"
         let sanitized = MCPInput.singleLine(multiline)
         let specs = MCPInput.keySpecs(forText: sanitized)
@@ -429,7 +433,8 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
-            notes: "Implementing fix", userNotes: "migrate to postgres", agentKind: "claude")
+            notes: "Implementing fix", userNotes: "migrate to postgres",
+            suggestionDismissed: true, agentKind: "claude")
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -453,6 +458,8 @@ struct MCPServerTests {
         #expect(d["lastTool"] as? String == "Bash")
         #expect(d["notes"] as? String == "Implementing fix")
         #expect(d["userNotes"] as? String == "migrate to postgres")
+        // fork / Agent Manager Phase 2.1: a plain bool, emitted unconditionally.
+        #expect(d["suggestionDismissed"] as? Bool == true)
         // fork / Agent Manager: the detector's agent kind rides through (the
         // foreground process is the `bash` pool wrapper, NOT "claude" — agentKind
         // is the reliable signal the summarizer uses).
@@ -468,7 +475,7 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
-            userNotes: nil, agentKind: nil)
+            userNotes: nil, suggestionDismissed: false, agentKind: nil)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
@@ -483,6 +490,9 @@ struct MCPServerTests {
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)
+        // fork / Agent Manager Phase 2.1: suggestionDismissed is a plain bool, so it
+        // is ALWAYS present (false here), unlike the omit-when-nil optionals above.
+        #expect(d["suggestionDismissed"] as? Bool == false)
     }
 
     // MARK: - dispatch (AppKit-free paths only)

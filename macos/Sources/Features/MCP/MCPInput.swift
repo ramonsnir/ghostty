@@ -118,12 +118,14 @@ enum MCPInput {
 
     /// PURE: collapse ALL newlines (interior + leading/trailing) in `text` into
     /// single spaces and trim, producing a strictly single-line string. This is the
-    /// SUGGEST-ONLY safety guarantee for the Phase-2 Approve path: `keySpecs(forText:)`
+    /// load-bearing safety guard for the Phase-2.1 Approve path: `keySpecs(forText:)`
     /// turns every embedded `\n`/`\r` into a REAL Return key event (native keycode 36),
-    /// which would SUBMIT — partially sending text the user did not intend. Running a
-    /// suggestion through this first guarantees `keySpecs(forText:)` emits NO Return,
-    /// so Approve only TYPES, never submits. `submit:false` only suppresses the APPENDED
-    /// trailing Return; it does nothing about interior newlines — this is the real guard.
+    /// which SUBMITS. Approve now intentionally submits in one tap — but it must send
+    /// exactly ONE trailing Return, not one per interior newline. Running a multi-line
+    /// suggestion through this first STRIPS the INTERIOR newlines so `keySpecs(forText:)`
+    /// emits no Return at all; the single intended submit is then the `submit:true`
+    /// APPENDED Return in `sendText`. So this guard turns N partial submits into the
+    /// one intended submit — it does NOT (any longer) suppress the submit itself.
     static func singleLine(_ text: String) -> String {
         return text
             .replacingOccurrences(of: "\r\n", with: " ")

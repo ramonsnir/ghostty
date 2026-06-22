@@ -554,9 +554,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     **GUI relaunch only** to enable (no host restart); the sidecar must be built
     (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
     the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
-  - **PHASE 2 — manager SUGGEST-ONLY (built).** On a `waiting` tile the manager proposes a
-    reply the user can **Approve / Edit / Dismiss**; Approve TYPES it into the agent's prompt
-    WITHOUT submitting (you press Return). **ZERO autonomous send** — the sidecar/manager has
+  - **PHASE 2 — manager SUGGEST-ONLY (built; refined by Phase 2.1 below).** On a `waiting` tile
+    the manager proposes a reply the user can **Approve / Edit / Dismiss**; as of Phase 2.1
+    Approve TYPES the (possibly edited) reply into the agent AND submits it in one user-initiated
+    tap (was: type-without-submit). **ZERO autonomous send** — the sidecar/manager has
     no send tools; the ONLY send path is Swift, gated behind an explicit Approve tap. Pieces:
     - **Manager pass (`macos/agent-manager/src/manager.ts`, `MANAGER_MODEL=claude-opus-4-8`):**
       a SECOND sweep pass alongside the summarizer, gated `waiting`-only with its own debounce
@@ -587,6 +588,38 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `MCPAnnotationTests`/`MCPServerTests`/`AgentDashboardTests`, and the sidecar
       `manager.test.ts` (+ updated `index`/`model`/`prompt` suites). **GUI relaunch + a rebuilt
       sidecar `dist` to enable; no host/Zig change.**
+  - **PHASE 2.1 — polish (built; still SUGGEST-ONLY, no autonomous send).** Three changes:
+    - **Approve = TYPE + SUBMIT (one tap).** Approve now types the (possibly edited) reply AND
+      sends a real Return so it submits in a single user-initiated tap — no second keystroke.
+      Still a human tap, not autonomy: `AgentDashboardController.approveSuggestion` calls
+      `MCPInput.sendText(submit: true)` (was `false`), reusing the real-key path (Return =
+      `KeySpec(keycode: 36)`). `MCPInput.singleLine` STILL collapses INTERIOR newlines so a
+      multi-line edit produces exactly ONE trailing Return, not N partial submits — only the
+      final trailing Return flipped from suppressed to appended.
+    - **Dismiss suppresses re-suggestion until a meaningful change.** "Meaningful" = the
+      summarizer's `fingerprint` (agentState|lastPrompt|lastTool + viewport tail) changes.
+      Swift: `AgentDashboardModel` tracks per-surface `suggestionDismissed` (set on Dismiss,
+      cleared when a merge carries a NEW `suggestion`), plumbed `suggestionDismissed: Bool`
+      identically to `userNotes` → `HookSnapshotEntry` → `MCPLayout.SurfaceRow` →
+      `list_surfaces` JSON (emitted UNCONDITIONALLY, a plain bool) → TS `Surface.suggestionDismissed?`.
+      Sidecar: per-session `suppressedFingerprint` on the loop deps (like the summarizer's
+      `lastBySession`); the PURE `shouldSuggest` skips while
+      `suppressedFingerprint != null && currentFp == suppressedFingerprint`, and a changed
+      fingerprint clears the suppression + re-suggests. Both stores reset independently on a
+      fresh suggestion (Swift dashboard flag + TS loop memory) so UI and loop agree.
+    - **Suggestion confidence + dim-the-weak.** Manager output JSON gains `confidence` (0..1 =
+      the manager's honest self-rating of goal-advancement; `MANAGER_BASE_PROMPT` defines the
+      ~0.8–1.0 / ~0.0–0.4 / mid scale). TS `parseSuggestion` parses + clamps to [0,1],
+      defaulting ~0.5 when absent/invalid; written via `set_surface_annotation { suggestion,
+      confidence }` (Swift `AgentAnnotation.confidence` already shipped in Phase 0). The tile
+      renders EVERY suggestion but visually de-emphasizes ones below
+      `AgentPreviewTile.CONF_DIM_THRESHOLD` (0.5) via the pure, tested
+      `suggestionStyle(confidence:)` (reduced opacity + secondary color) and shows a small inline
+      `%` indicator. Tests: sidecar `manager.test.ts` (`shouldSuggest` dismissed cases +
+      `parseSuggestion` confidence clamp), `mcp.test.ts` (`setAnnotation` confidence forwarding),
+      `index.test.ts` (suppression end-to-end + confidence carry); Swift `AgentDashboardTests`
+      (`suggestionStyle` + dismissed-flag lifecycle), `MCPServerTests` (`suggestionDismissed`
+      JSON). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

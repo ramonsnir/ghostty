@@ -30,7 +30,8 @@ in Ghostty** and usage is billed to your normal plan. On a separate, slower pass
 also runs a **manager** (Opus) for any session that is *waiting* — assembling its goals
 (your notes + recent prompts) + screen and proposing a reply, written to the same tile.
 The sidecar **never types into a session**: the suggestion is rendered on the tile and
-only sent if you tap Approve (which types it in — it does not press Return for you).
+only sent if you tap Approve — a single tap that **types it in *and* submits it** (your
+deliberate authorization; nothing autonomous ever sends).
 
 ## Requirements
 
@@ -68,10 +69,19 @@ dashboard is unaffected). Otherwise it spawns + supervises the sidecar.
 
 When a session is **waiting** on you, its tile shows a proposed reply with three actions:
 
-- **Approve** — *types* the suggestion into the agent's prompt and **stops there**; you
-  read it and press Return yourself. (It never auto-submits — that's deliberate.)
-- **Edit** — tweak the text first, then Approve types your edited version.
-- **Dismiss** — clear the suggestion (the status summary stays).
+- **Approve** — **types the suggestion into the agent's prompt *and* submits it** in one
+  tap (it sends a Return for you). Still suggest-only: the tap is *your* authorization,
+  not the sidecar acting on its own. Edit first if you want to tweak it.
+- **Edit** — tweak the text in place, then Approve types + submits your edited version.
+- **Dismiss** — clear the suggestion (the status summary stays). After a dismissal the
+  manager **stops re-proposing for that session until the situation meaningfully
+  changes** (a new prompt/tool/state or a real screen change), so a reply you rejected
+  doesn't keep coming back unchanged.
+
+Each suggestion shows an inline **confidence %** — the manager's honest self-rating of
+how well the reply advances your stated goal. A low-confidence suggestion (below ~50%) is
+**dimmed** rather than hidden: every suggestion is still shown, but a weak "had to say
+something" reply reads as secondary while a strong, goal-advancing one is full-strength.
 
 Each tile also has a **notes** field: type the session's goal/guidance there (e.g.
 "after the fix, add tests and update the changelog") and the manager weights it in

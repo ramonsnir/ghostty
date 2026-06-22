@@ -213,13 +213,15 @@ async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
   const goals = assembleGoals(surface.userNotes, [surface.lastPrompt]);
 
   // Advance the per-session debounce clock on a SPENT attempt (failed/unparseable),
-  // preserving the prior fingerprint + suggestion so a genuine change still re-fires
-  // once debounce passes — same backoff discipline as summarizeOne.recordAttempt.
+  // preserving the prior fingerprint + suggestion (and the armed suppression) so a
+  // genuine change still re-fires once debounce passes — same backoff discipline as
+  // summarizeOne.recordAttempt.
   const recordAttempt = (): void => {
     deps.lastSuggestionBySession.set(surface.id, {
       fingerprint: prev?.fingerprint ?? "",
       atMs: deps.now(),
       suggestion: prev?.suggestion ?? "",
+      suppressedFingerprint: prev?.suppressedFingerprint ?? null,
     });
   };
 
@@ -228,7 +230,27 @@ async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
     const snapshot: ManagerSnapshot = { surface, viewport: screen.text };
 
     const decision = shouldSuggest(snapshot, goals, prev, deps.now(), deps.managerCfg);
-    if (!decision.due) return; // not-waiting / debounce / unchanged → skip (no clock advance)
+    // (Phase 2.1) Persist a suppression ARM (or CLEAR) the decision asks for, even
+    // when not due — so the dismissed-but-unchanged state is remembered without a
+    // model call and without advancing the debounce clock. `undefined` ⇒ leave as-is.
+    if (!decision.due) {
+      if (decision.suppressedFingerprint !== undefined && prev !== undefined) {
+        deps.lastSuggestionBySession.set(surface.id, {
+          ...prev,
+          suppressedFingerprint: decision.suppressedFingerprint,
+        });
+      } else if (decision.suppressedFingerprint !== undefined) {
+        // No prior record yet (e.g. dismissed before any suggestion); seed one
+        // carrying only the arm so the suppression persists across sweeps.
+        deps.lastSuggestionBySession.set(surface.id, {
+          fingerprint: "",
+          atMs: 0,
+          suggestion: "",
+          suppressedFingerprint: decision.suppressedFingerprint,
+        });
+      }
+      return; // not-waiting / debounce / unchanged / dismissed → skip (no model call)
+    }
 
     const ctx = buildManagerContext(snapshot, goals, prev?.suggestion, deps.managerCfg);
     const { system, user } = composeManagerPrompt(
@@ -245,15 +267,22 @@ async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
       return;
     }
 
-    // MERGE channel: write ONLY the suggestion; the summarizer's summary is kept.
-    await deps.client.setAnnotation(surface.id, { suggestion: parsed.suggestion });
+    // MERGE channel: write the suggestion + its confidence; the summarizer's summary
+    // is kept (the Swift side merges partial annotations).
+    await deps.client.setAnnotation(surface.id, {
+      suggestion: parsed.suggestion,
+      confidence: parsed.confidence,
+    });
 
     deps.lastSuggestionBySession.set(surface.id, {
       fingerprint: managerFingerprint(snapshot, goals, deps.managerCfg),
       atMs: deps.now(),
       suggestion: parsed.suggestion,
+      // A fresh suggestion CLEARS suppression (mirrors the Swift applyAnnotation
+      // un-dismiss). Both stores reset independently, per the contract.
+      suppressedFingerprint: null,
     });
-    log(`surface ${surface.id}: suggestion "${parsed.suggestion}"`);
+    log(`surface ${surface.id}: suggestion "${parsed.suggestion}" (conf ${parsed.confidence.toFixed(2)})`);
   } catch (err) {
     recordAttempt();
     const what = err instanceof McpError ? "mcp" : "model";

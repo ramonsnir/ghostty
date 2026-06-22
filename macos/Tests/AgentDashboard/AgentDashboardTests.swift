@@ -69,6 +69,50 @@ struct AgentMirrorGeometryTests {
     }
 }
 
+// MARK: - AgentPreviewTile.suggestionStyle (pure; confidence dimming)
+
+struct SuggestionStyleTests {
+    @Test func strongConfidenceIsFullStrength() {
+        let s = AgentPreviewTile.suggestionStyle(confidence: 0.9)
+        #expect(s.dimmed == false)
+        #expect(s.opacity == 1.0)
+        #expect(s.percent == 90)
+    }
+
+    @Test func weakConfidenceIsDimmed() {
+        let s = AgentPreviewTile.suggestionStyle(confidence: 0.2)
+        #expect(s.dimmed == true)
+        #expect(s.opacity < 1.0)
+        #expect(s.percent == 20)
+    }
+
+    @Test func nilConfidenceDefaultsToMidNotDimmed() {
+        // A missing confidence reads as 0.5 (the threshold), so NOT dimmed.
+        let s = AgentPreviewTile.suggestionStyle(confidence: nil)
+        #expect(s.dimmed == false)
+        #expect(s.percent == 50)
+    }
+
+    @Test func atThresholdIsNotDimmed() {
+        // Strictly-below dims; exactly at the threshold is full-strength.
+        let s = AgentPreviewTile.suggestionStyle(confidence: AgentPreviewTile.CONF_DIM_THRESHOLD)
+        #expect(s.dimmed == false)
+    }
+
+    @Test func justBelowThresholdIsDimmed() {
+        let s = AgentPreviewTile.suggestionStyle(
+            confidence: AgentPreviewTile.CONF_DIM_THRESHOLD - 0.01)
+        #expect(s.dimmed == true)
+    }
+
+    @Test func outOfRangeConfidenceIsClamped() {
+        #expect(AgentPreviewTile.suggestionStyle(confidence: 1.8).percent == 100)
+        #expect(AgentPreviewTile.suggestionStyle(confidence: -0.4).percent == 0)
+        #expect(AgentPreviewTile.suggestionStyle(confidence: -0.4).dimmed == true)
+        #expect(AgentPreviewTile.suggestionStyle(confidence: 1.8).dimmed == false)
+    }
+}
+
 // MARK: - matchAgent pure logic
 
 struct AgentDetectorTests {
@@ -609,7 +653,7 @@ struct AgentDashboardSortTests {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
               agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
-              annotation: nil, userNotes: nil)
+              annotation: nil, userNotes: nil, suggestionDismissed: false)
     }
 
     @Test func bellFirst() {
@@ -662,7 +706,7 @@ struct AgentDashboardSortTests {
               bell: bell, hidden: false, sessionID: session,
               agentState: waiting ? .waiting : nil,
               lastTool: nil, lastPrompt: nil, hookBacked: false,
-              annotation: nil, userNotes: nil)
+              annotation: nil, userNotes: nil, suggestionDismissed: false)
     }
 
     @Test func manualRankOrdersPlacedTiles() {
@@ -1093,6 +1137,48 @@ struct AgentDashboardHookStateTests {
         #expect(snap[a]?.lastPrompt == "do it")
         #expect(snap[a]?.notes == "Implementing fix")
         #expect(snap[a]?.userNotes == "migrate to postgres")
+        // Phase 2.1: no dismissal yet → false in the snapshot.
+        #expect(snap[a]?.suggestionDismissed == false)
+    }
+
+    @Test func suggestionDismissedFlagLifecycle() {
+        // Dismiss SETS the flag; applying a NEW suggestion CLEARS it. A summary-only
+        // update (no suggestion) leaves it set. Surfaced on the entry + the snapshot.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        // A suggestion arrives, then the user dismisses it.
+        model.applyAnnotation(a, AgentAnnotation(
+            summary: "Waiting", suggestion: "Approve", phase: nil,
+            needsUser: nil, confidence: 0.9))
+        model.dismissSuggestion(a)
+        #expect(model.suggestionDismissed.contains(a) == true)
+        #expect(model.entries.first { $0.id == a }?.suggestionDismissed == true)
+        #expect(model.hookSnapshot()[a]?.suggestionDismissed == true)
+        // A summary-only update does NOT clear the dismissed flag.
+        model.applyAnnotation(a, annotation("Still waiting"))
+        #expect(model.suggestionDismissed.contains(a) == true)
+        // A NEW suggestion clears it (the tile re-shows; list_surfaces flips to false).
+        model.applyAnnotation(a, AgentAnnotation(
+            summary: nil, suggestion: "Try this instead", phase: nil,
+            needsUser: nil, confidence: 0.8))
+        #expect(model.suggestionDismissed.contains(a) == false)
+        #expect(model.entries.first { $0.id == a }?.suggestionDismissed == false)
+        #expect(model.hookSnapshot()[a]?.suggestionDismissed == false)
+    }
+
+    @Test func suggestionDismissedPrunedForVanishedSurface() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([a, b]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, AgentAnnotation(
+            summary: nil, suggestion: "s", phase: nil, needsUser: nil, confidence: nil))
+        model.dismissSuggestion(a)
+        #expect(model.suggestionDismissed.contains(a) == true)
+        model.rebuild(live: live([b]))
+        #expect(model.suggestionDismissed.contains(a) == false)
     }
 
     @Test func hookSnapshotOmitsSurfaceWithNoState() {
@@ -1114,7 +1200,7 @@ struct AgentDashboardWaitingSortTests {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
               agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil,
-              annotation: nil, userNotes: nil)
+              annotation: nil, userNotes: nil, suggestionDismissed: false)
     }
 
     @Test func waitingBeatsWorking() {
