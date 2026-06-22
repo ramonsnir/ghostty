@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh working" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh working" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh waiting" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh idle" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh working" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh idle" } ] }
+    ]
+  }
+}

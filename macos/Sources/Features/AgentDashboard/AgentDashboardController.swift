@@ -15,6 +15,16 @@ struct AgentEntry: Identifiable {
     let bell: Bool
     let hidden: Bool
     let sessionID: UInt64
+    /// (ramon fork / Agent hooks) The hook-reported agent lifecycle state, or
+    /// nil for a hookless tile (one that has never POSTed a hook event).
+    let agentState: AgentState?
+    /// Last PreToolUse tool name (sticky until the next PreToolUse).
+    let lastTool: String?
+    /// Last UserPromptSubmit prompt text (truncated by the parser).
+    let lastPrompt: String?
+    /// True once this surface has EVER reported a hook event — hook state is
+    /// authoritative thereafter and MUTES the `idleSeconds` heuristic.
+    let hookBacked: Bool
 }
 
 /// Persistence boundary for the hide set, injected so the round-trip is
@@ -78,6 +88,26 @@ final class AgentDashboardModel: ObservableObject {
     /// heuristic), used as the secondary sort key (variant b — no per-frame
     /// activity tick).
     private(set) var lastSeen: [UUID: Date] = [:]
+
+    // MARK: - Hook state (ramon fork / Agent hooks)
+
+    /// The latest hook-reported lifecycle state per surface. `@Published` so a
+    /// tile re-renders when the agent moves working→waiting→idle. Drives the
+    /// state chip + the waiting-first sort.
+    @Published private(set) var agentStates: [UUID: AgentState] = [:]
+
+    /// Last PreToolUse tool name per surface (sticky until the next PreToolUse).
+    private(set) var lastTool: [UUID: String] = [:]
+
+    /// Last UserPromptSubmit prompt text per surface.
+    private(set) var lastPrompt: [UUID: String] = [:]
+
+    /// Last Notification message per surface (the "needs input" reason).
+    private(set) var lastMessage: [UUID: String] = [:]
+
+    /// Surfaces that have EVER reported a hook event. Hook-authoritative
+    /// thereafter (mutes the `idleSeconds` heuristic for these ids).
+    private(set) var hookBacked: Set<UUID> = []
 
     private let store: HideStore
 
@@ -151,6 +181,63 @@ final class AgentDashboardModel: ObservableObject {
         rebuildEntriesFromCurrentState()
     }
 
+    /// (ramon fork / Agent hooks) Apply one hook event (called on main from the
+    /// controller's `.ghosttyAgentStateDidChange` observer). Returns true iff
+    /// this transition ENTERS `.waiting` (working/idle/nil → waiting), so the
+    /// controller can post `.ghosttyAgentNeedsAttention` exactly on that edge.
+    ///
+    /// App-side coalescing (LOCKED, the PreToolUse second debounce): if the
+    /// resolved state AND tool/prompt/message are all unchanged, we RETURN
+    /// without mutating the `@Published` state so the chatty PreToolUse stream
+    /// doesn't thrash the rebuild.
+    @discardableResult
+    func applyAgentState(_ id: UUID, _ payload: AgentStatePayload) -> Bool {
+        hookBacked.insert(id)
+
+        let prev = agentStates[id]
+
+        // Coalesce: unchanged state + unchanged (present) fields → no rebuild.
+        // A nil field in the payload leaves the previous value, so an unchanged
+        // state with all-nil incoming fields is a pure republish to swallow.
+        let toolUnchanged = payload.tool == nil || payload.tool == lastTool[id]
+        let promptUnchanged = payload.prompt == nil || payload.prompt == lastPrompt[id]
+        let messageUnchanged = payload.message == nil || payload.message == lastMessage[id]
+        if payload.state == prev, toolUnchanged, promptUnchanged, messageUnchanged {
+            return false
+        }
+
+        agentStates[id] = payload.state
+        // A nil field LEAVES the previous value (`tool` is only present on
+        // PreToolUse, `prompt` on UserPromptSubmit, `message` on Notification).
+        if let tool = payload.tool { lastTool[id] = tool }
+        if let prompt = payload.prompt { lastPrompt[id] = prompt }
+        if let message = payload.message { lastMessage[id] = message }
+
+        // Auto-unhide on .waiting: a waiting agent — one asking the user for
+        // input — must never stay hidden. NOTE this is weaker than applyBells'
+        // re-unhide-on-every-ringing-republish: it lands only on the (non-
+        // coalesced) enters-waiting edge, because a Notification fires ONCE (not
+        // continuously like a bell). So after the coalesce early-return above, an
+        // identical `.waiting` republish does NOT re-unhide — a user CAN hide a
+        // still-waiting tile, by design (single-shot hook + LOCKED coalesce rule).
+        if payload.state == .waiting, hidden.contains(id) {
+            hidden.remove(id)
+            store.save(hidden)
+        }
+
+        // We rebuild unconditionally here even if the detector has not yet matched
+        // this id as an agent (`agents[id] == nil` → it's filtered out, so this is a
+        // no-visible-change invalidation until the ~2s poll confirms it). That wasted
+        // rebuild is deliberate and the safer choice: the hook state is retained, and
+        // skipping the rebuild risks dropping the one that must fire the instant the
+        // detector adds the id. Claude Code is the foreground process, so the gap is
+        // a couple seconds at most.
+        rebuildEntriesFromCurrentState()
+
+        // The "enters .waiting" edge is `prev != .waiting`.
+        return prev != .waiting && payload.state == .waiting
+    }
+
     // MARK: - Reconciliation
 
     /// Snapshot of one live surface taken on main (value types + weak view).
@@ -177,6 +264,13 @@ final class AgentDashboardModel: ObservableObject {
         bells = bells.filter { liveIDs.contains($0.key) }
         agents = agents.filter { liveIDs.contains($0.key) }
         lastSeen = lastSeen.filter { liveIDs.contains($0.key) }
+        // Prune hook state for vanished surfaces exactly like the other per-id
+        // state (a closed surface's hook state is dropped — ramon fork / hooks).
+        agentStates = agentStates.filter { liveIDs.contains($0.key) }
+        lastTool = lastTool.filter { liveIDs.contains($0.key) }
+        lastPrompt = lastPrompt.filter { liveIDs.contains($0.key) }
+        lastMessage = lastMessage.filter { liveIDs.contains($0.key) }
+        hookBacked = hookBacked.intersection(liveIDs)
         rebuildEntriesFromCurrentState()
     }
 
@@ -229,7 +323,11 @@ final class AgentDashboardModel: ObservableObject {
                     agent: agents[s.id],
                     bell: bells[s.id] ?? false,
                     hidden: hidden.contains(s.id),
-                    sessionID: s.sessionID
+                    sessionID: s.sessionID,
+                    agentState: agentStates[s.id],
+                    lastTool: lastTool[s.id],
+                    lastPrompt: lastPrompt[s.id],
+                    hookBacked: hookBacked.contains(s.id)
                 )
             }
         entries = AgentDashboardModel.sorted(built.filter { !$0.hidden }, lastSeen: lastSeen)
@@ -237,11 +335,20 @@ final class AgentDashboardModel: ObservableObject {
 
     // MARK: - Sort (pure, testable)
 
-    /// Deterministic order: bell-first, then most-recently-seen-as-agent
-    /// (descending), then stable UUID tie-break (variant b — no activity tick).
+    /// Whether a tile is demanding attention: a bell rang OR the hook reports
+    /// the agent is `.waiting` for the user (ramon fork / Agent hooks). Both
+    /// inputs are independent — either floats the tile to the top.
+    private static func needsAttention(_ e: AgentEntry) -> Bool {
+        e.bell || e.agentState == .waiting
+    }
+
+    /// Deterministic order: attention-first (bell OR waiting), then
+    /// most-recently-seen-as-agent (descending), then stable UUID tie-break
+    /// (variant b — no activity tick).
     static func sorted(_ entries: [AgentEntry], lastSeen: [UUID: Date] = [:]) -> [AgentEntry] {
         entries.sorted { a, b in
-            if a.bell != b.bell { return a.bell && !b.bell }
+            let aa = needsAttention(a), ba = needsAttention(b)
+            if aa != ba { return aa && !ba }
             let sa = lastSeen[a.id] ?? .distantPast
             let sb = lastSeen[b.id] ?? .distantPast
             if sa != sb { return sa > sb }
@@ -306,6 +413,7 @@ final class AgentDashboardController: NSWindowController {
         }
 
         subscribeChurn()
+        subscribeAgentState()
         rebuildControllerObservers()
     }
 
@@ -433,6 +541,55 @@ final class AgentDashboardController: NSWindowController {
                 }
                 .store(in: &cancellables)
         }
+    }
+
+    /// (ramon fork / Agent hooks) Observe `.ghosttyAgentStateDidChange` posted
+    /// by the MCP `/agent-state` handler after it resolves the hook tty to a
+    /// surface UUID. Registered UNCONDITIONALLY (like the bell observers, NOT
+    /// gated on `isShown`): a `.waiting` event must auto-unhide + push even while
+    /// the panel is hidden. The model already rebuilds its `@Published` entries,
+    /// so there is nothing extra to do when shown.
+    private func subscribeAgentState() {
+        NotificationCenter.default.publisher(for: .ghosttyAgentStateDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,
+                      let payload = note.userInfo?[AgentStateUserInfoKey.payload] as? AgentStatePayload
+                else { return }
+                let enteredWaiting = self.model.applyAgentState(id, payload)
+                if enteredWaiting {
+                    // Re-post the attention notification with title/pwd resolved
+                    // on main (mirrors the bell auto-unhide path); WebPush
+                    // observes this to fire a push.
+                    self.postNeedsAttention(id: id, message: payload.message ?? "")
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent hooks) Post `.ghosttyAgentNeedsAttention` for `id`,
+    /// looking up the live title/pwd from `TerminalController.all` on main (this
+    /// touches AppKit, so it lives on the controller, not the model). Observed by
+    /// `WebPushManager` to fire a Web Push.
+    private func postNeedsAttention(id: UUID, message: String) {
+        var title = ""
+        var pwd = ""
+        outer: for controller in TerminalController.all {
+            for view in controller.surfaceTree where view.id == id {
+                title = view.title
+                pwd = view.pwd ?? ""
+                break outer
+            }
+        }
+        NotificationCenter.default.post(
+            name: .ghosttyAgentNeedsAttention, object: nil,
+            userInfo: [
+                AgentStateUserInfoKey.surfaceID: id,
+                AgentStateUserInfoKey.title: title,
+                AgentStateUserInfoKey.pwd: pwd,
+                AgentStateUserInfoKey.message: message,
+            ])
     }
 
     /// Rebuild per-controller bell subscriptions + tree sinks for the current

@@ -128,6 +128,14 @@ what's being asked → `send_key`/`send_text` to respond → repeat; plus `perfo
 - **No TLS** — keep the bind local (or tailnet-only). The token is the credential.
 - **The token gates every `/mcp` request** (`X-Ghostty-Token`, constant-time compare). It
   is a **shell-execution credential** — treat it like an SSH key.
+- **Second route — `POST /agent-state`.** The same listener also serves a token-gated
+  `POST /agent-state`, the ingest endpoint for the Claude Code per-tile-state hooks (see
+  AGENT-DASHBOARD.md → "Per-tile agent state (Claude Code hooks)"). It rides the **exact
+  same** Host-header guard, token gate (same `X-Ghostty-Token`, constant-time compare), and
+  backoff as `/mcp`, so anyone holding the MCP token — or any caller, when the server runs
+  open — can also POST agent-state events. It does NOT spawn shells; it only updates a
+  dashboard tile's displayed state. Still, it is a real second authenticated surface on the
+  same token, so treat the token accordingly.
 - **Defense in depth** (copied from the web monitor, independent of the token): a
   Host-header allowlist (DNS-rebinding guard), a per-peer failed-token backoff (when a
   token is set), and per-connection bounds (idle watchdog + absolute deadline +

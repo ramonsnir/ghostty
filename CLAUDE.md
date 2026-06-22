@@ -401,6 +401,51 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (iOS exclusion). Tests: `macos/Tests/AgentDashboard/AgentDashboardTests.swift`; Zig
     `agent-dashboard config` + `Binding toggle_agent_dashboard` + the minor-4/
     `ForegroundPid` round-trip in `src/host/test.zig` + the `foreground_pid` Client decode.
+  - **Per-tile agent state via Claude Code hooks (fork-only, GUI + hooks ONLY, ZERO
+    Zig/host change).** Each tile can show an authoritative `working`/`waiting`/`idle`
+    chip (+ `lastTool`/`lastPrompt`) driven by Claude Code's lifecycle hooks, NOT a
+    heuristic. A tiny shell hook (`example/claude-hooks/ghostty-agent-state.sh`, wired by
+    `example/claude-hooks/settings-hooks.json` into `~/.claude/settings.json`) fires on
+    `UserPromptSubmit`/`PreToolUse`/`SessionStart` (→ `working`), `Notification` (→
+    `waiting`), `Stop`/`SessionEnd` (→ `idle`) and **POSTs `{tty,state,prompt?,tool?,
+    message?}` to the EXISTING in-GUI MCP server** at `POST /agent-state` (`X-Ghostty-Token`,
+    `127.0.0.1:8765`; `GHOSTTY_MCP_PORT` overrides for the 8766/8767 dev offsets). The hook
+    is fire-and-forget (backgrounded `curl --max-time 2`, never blocks/fails the agent),
+    debounces only the chatty `PreToolUse`/`working` with a ~1s per-tty stamp file, and
+    reads the token from `$GHOSTTY_MCP_TOKEN` or `~/.config/ghostty-ramon/local`. **tty
+    correlation is the load-bearing trick:** the hook reports its own controlling tty
+    (`ps -o tty=`, the surface's tty since Claude Code runs in it); the MCP handler
+    (`MCPServer.handleAgentState`) resolves it to a surface UUID by reading each surface's
+    **host-pushed minor-4 `foregroundPID`** (the SAME pid the dashboard detector already
+    consumes — no new frame) and mapping that pid → controlling tty via libproc
+    `proc_pidinfo(PROC_PIDTBSDINFO).pbi_e_tdev` → `devname()`, normalizing both sides
+    (`/dev/ttysNNN`/`ttysNNN`/`sNNN` → `ttysNNN`). A no-match returns 200 (the hook is
+    fire-and-forget; a momentary miss isn't an error). The handler posts
+    `.ghosttyAgentStateDidChange`; `AgentDashboardModel.applyAgentState` is
+    **hook-authoritative + alongside** (any surface that ever POSTed joins `hookBacked` and
+    thereafter MUTES the `idleSeconds` heuristic), app-side **coalesces** an unchanged state
+    (the second `PreToolUse` debounce), auto-unhides + sorts-first on `.waiting` (mirrors
+    the bell auto-unhide), and on the working/idle→`.waiting` EDGE posts
+    `.ghosttyAgentNeedsAttention`, which `WebPushManager` observes to fire a Web Push (an
+    `⏳ ` push, reusing the bell fan-out via the shared `enqueuePush`; the per-surface
+    ~3s debounce is keyed per-kind so a bell never swallows the waiting push). **No TTL** — the ~2s detector poll
+    removes dead agents; a missed `Stop` is an accepted cosmetic stale-`working`.
+    Claude-Code-only (Codex tiles stay preview-only). Pinned shared symbols
+    (`AgentState`/`AgentStatePayload`/the two `Notification.Name`s/`AgentStateUserInfoKey`)
+    live in `macos/Sources/Features/AgentDashboard/AgentStateBridge.swift`. Wiring: hooks —
+    `example/claude-hooks/*`; MCP — `macos/Sources/Features/MCP/MCPAgentState.swift` (pure
+    parser + tty normalize/match + the injectable `TTYResolver` proc seam) +
+    `MCPServer.swift` (`/agent-state` route + `handleAgentState`); dashboard —
+    `AgentStateBridge.swift` + `AgentDashboardController.swift` (model state + observer +
+    `postNeedsAttention` + drop-stale) + `AgentPreviewTile.swift` (state chip + waiting
+    border/pill + tool/prompt); push — `macos/Sources/Features/WebMonitor/WebMonitorPush.swift`
+    (attention observer → `onAttention`/`enqueuePush`); `project.pbxproj` (iOS exclusion of
+    the 2 new source files). Tests: `macos/Tests/MCP/MCPAgentStateTests.swift` (parse /
+    normalizeTTY / ttyMatches / resolveSurface w/ injected resolver / decideRoute
+    `/agent-state`) + the `applyAgentState` model tests in
+    `macos/Tests/AgentDashboard/AgentDashboardTests.swift`. **GUI relaunch only** to pick it
+    up (no host restart); the user copies the hook to `~/.config/ghostty-ramon/claude-hooks/`
+    + merges the settings block — see `AGENT-DASHBOARD.md`.
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

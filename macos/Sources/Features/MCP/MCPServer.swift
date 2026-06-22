@@ -394,8 +394,9 @@ final class MCPServer {
         case forbiddenHost      // 403 — Host-header / DNS-rebinding guard
         case throttled          // 429 — per-peer backoff (token mode only)
         case unauthorized       // 401 — token mismatch; bumps failure count
-        case mcp                // POST /mcp — the only functional route
-        case methodNotAllowed   // 405 — /mcp with a non-POST method
+        case mcp                // POST /mcp — the JSON-RPC route
+        case agentState         // POST /agent-state — Claude Code hook ingest
+        case methodNotAllowed   // 405 — /mcp or /agent-state with a non-POST method
         case notFound           // 404 — any other path
     }
 
@@ -429,6 +430,9 @@ final class MCPServer {
 
         if path == "/mcp" {
             return method == "POST" ? .mcp : .methodNotAllowed
+        }
+        if path == "/agent-state" {
+            return method == "POST" ? .agentState : .methodNotAllowed
         }
         return .notFound
     }
@@ -475,7 +479,51 @@ final class MCPServer {
         case .mcp:
             clearAuthFailures(peer)
             handleRPC(req.body, on: conn)
+
+        case .agentState:
+            clearAuthFailures(peer)
+            handleAgentState(req.body, on: conn)
         }
+    }
+
+    // MARK: - Agent-state hook ingest (POST /agent-state)
+
+    /// Handle a Claude Code hook POST. NOT pure (touches the socket via `send` and
+    /// hops to main for the surface walk), so it stays out of `MCPAgentState.swift`.
+    /// Parses the body, resolves the hook's tty -> a live surface UUID on MAIN
+    /// (reading `SurfaceView.foregroundPID`, the same host-pushed minor-4 pid the
+    /// Agent Dashboard consumes), and posts `.ghosttyAgentStateDidChange` so the
+    /// dashboard model can update the per-tile agent state.
+    private func handleAgentState(_ body: Data, on conn: NWConnection) {
+        guard let payload = MCPAgentState.parse(body) else {
+            send(.status(400, "Bad Request"), on: conn); return
+        }
+        // Resolve tty -> UUID on MAIN (reads SurfaceView.foregroundPID, main-only),
+        // returning ONLY value types across the hop (the WebMonitor/MCP rule). The
+        // (uuid, pid) snapshot shape matches the Agent Dashboard's detectorSnapshot.
+        let surfaces: [(uuid: UUID, pid: pid_t)] = DispatchQueue.main.sync {
+            var out: [(uuid: UUID, pid: pid_t)] = []
+            for c in TerminalController.all {
+                for view in c.surfaceTree {
+                    if let pid = view.surfaceModel?.foregroundPID, pid > 0 {
+                        out.append((view.id, pid_t(pid)))
+                    }
+                }
+            }
+            return out
+        }
+        guard let uuid = MCPAgentState.resolveSurface(forTTY: payload.tty, surfaces: surfaces) else {
+            // 200, not 404: the hook is fire-and-forget and a momentary no-match
+            // (surface just closed, pid not yet pushed) is not an error.
+            send(.empty(200, "OK"), on: conn); return
+        }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .ghosttyAgentStateDidChange, object: nil,
+                userInfo: [AgentStateUserInfoKey.surfaceID: uuid,
+                           AgentStateUserInfoKey.payload: payload])
+        }
+        send(.empty(202, "Accepted"), on: conn)
     }
 
     // MARK: - Token strength (startup gate)
