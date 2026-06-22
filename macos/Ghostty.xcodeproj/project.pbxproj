@@ -179,6 +179,7 @@
 				"Features/MCP/MCPInput.swift",
 				"Features/MCP/MCPLayout.swift",
 				"Features/MCP/MCPEventBus.swift",
+				"Features/MCP/MCPSafety.swift",
 				Features/QuickTerminal/QuickTerminal.xib,
 				Features/QuickTerminal/QuickTerminalController.swift,
 				Features/QuickTerminal/QuickTerminalPosition.swift,

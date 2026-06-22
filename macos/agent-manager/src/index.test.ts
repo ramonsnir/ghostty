@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSweep, type LoopDeps, type SummarizeFn } from "./index.js";
+import { runSweep, type LoopDeps, type SummarizeFn, type SuggestFn } from "./index.js";
 import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
@@ -17,6 +17,11 @@ import {
   type LastSummary,
   type SurfaceSnapshot,
 } from "./summarizer.js";
+import {
+  DEFAULT_MANAGER_CONFIG,
+  MANAGER_MODEL,
+  type LastSuggestion,
+} from "./manager.js";
 import { makeOverrideLoader, type OverrideFs } from "./prompt.js";
 
 // An OverrideFs that always reports "no override file" (returns null).
@@ -87,16 +92,29 @@ interface DepsSpec {
   now?: number;
   last?: Map<string, LastSummary>;
   budgetMax?: number;
+  /** Phase 2: optional manager call seam + its per-session memory. Defaults to a
+   *  stub that throws (so a stray manager fire is loud), and an empty map. The
+   *  summarizer tests use `agentState:"working"` surfaces, so the manager pass —
+   *  which only fires on `waiting` — never reaches the stub there. */
+  suggest?: SuggestFn;
+  lastSuggestion?: Map<string, LastSuggestion>;
 }
 
 function makeDeps(spec: DepsSpec): {
   deps: LoopDeps;
   summarizeCalls: Array<{ system: string; user: string }>;
+  suggestCalls: Array<{ system: string; user: string; model: string }>;
 } {
   const summarizeCalls: Array<{ system: string; user: string }> = [];
   const summarize: SummarizeFn = async (req) => {
     summarizeCalls.push(req);
     return spec.summarize(req);
+  };
+  const suggestCalls: Array<{ system: string; user: string; model: string }> = [];
+  const suggest: SuggestFn = async (req) => {
+    suggestCalls.push(req);
+    if (!spec.suggest) throw new Error("unexpected manager call (no suggest stub)");
+    return spec.suggest(req);
   };
   const cfg = { ...DEFAULT_CONFIG, maxConcurrent: spec.budgetMax ?? DEFAULT_CONFIG.maxConcurrent };
   const deps: LoopDeps = {
@@ -107,8 +125,13 @@ function makeDeps(spec: DepsSpec): {
     now: () => spec.now ?? 1_000_000,
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
+    managerOverrides: makeOverrideLoader("/home/test", noOverrideFs),
+    managerCfg: { ...DEFAULT_MANAGER_CONFIG },
+    managerModel: MANAGER_MODEL,
+    suggest,
+    lastSuggestionBySession: spec.lastSuggestion ?? new Map<string, LastSuggestion>(),
   };
-  return { deps, summarizeCalls };
+  return { deps, summarizeCalls, suggestCalls };
 }
 
 const okSummary: SummarizeFn = async () => '{"summary":"Doing the thing","phase":"build"}';
@@ -372,4 +395,109 @@ test("runSweep: budget caps concurrent summaries to maxConcurrent per sweep", as
   // Only 2 of the 4 surfaces are summarized in this single sweep (batch cap).
   assert.equal(fake.setCalls.length, 2);
   assert.equal(deps.budget.active, 0, "all slots released after the sweep");
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 manager pass (ramon fork / Agent Manager)
+// ---------------------------------------------------------------------------
+
+const okSuggestion: SuggestFn = async () =>
+  '{"suggestion":"use postgres","rationale":"the note says migrate to postgres"}';
+
+test("runSweep: a WAITING agent gets BOTH a summary and a merged suggestion", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "waiting", userNotes: "migrate to postgres" })],
+    screens: { s1: "Which database should I migrate to? (postgres/mysql)" },
+  });
+  const { deps, suggestCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    suggest: okSuggestion,
+  });
+
+  await runSweep(deps);
+
+  // Two annotation writes: the summary (summarizer) and the suggestion (manager).
+  const summaryWrite = fake.setCalls.find((c) => c.ann.summary !== undefined);
+  const suggestionWrite = fake.setCalls.find((c) => c.ann.suggestion !== undefined);
+  assert.ok(summaryWrite, "summarizer wrote a summary");
+  assert.ok(suggestionWrite, "manager wrote a suggestion");
+  // The manager write is a PARTIAL merge: ONLY the suggestion (no summary field).
+  assert.equal(suggestionWrite!.ann.summary, undefined);
+  assert.equal(suggestionWrite!.ann.suggestion, "use postgres");
+  // The manager was called with the Opus model + the goals in the prompt.
+  assert.equal(suggestCalls.length, 1);
+  assert.equal(suggestCalls[0].model, MANAGER_MODEL);
+  assert.match(suggestCalls[0].user, /migrate to postgres/);
+  // And its memory was recorded.
+  assert.equal(deps.lastSuggestionBySession.get("s1")?.suggestion, "use postgres");
+});
+
+test("runSweep: a WORKING agent never triggers the manager pass", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "doing work" },
+  });
+  // No suggest stub: a stray manager fire would throw "unexpected manager call".
+  const { deps, suggestCalls } = makeDeps({ fake, summarize: okSummary });
+  await runSweep(deps);
+  assert.equal(suggestCalls.length, 0, "manager skipped a non-waiting agent");
+  // Only the summary was written.
+  assert.ok(fake.setCalls.every((c) => c.ann.suggestion === undefined));
+});
+
+test("runSweep: manager debounces a waiting agent (no second suggestion within debounceMs)", async () => {
+  const last = new Map<string, LastSuggestion>([
+    ["s1", { fingerprint: "x", atMs: 999_000, suggestion: "earlier" }],
+  ]);
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "waiting" })],
+    screens: { s1: "still waiting" },
+  });
+  // now=1_000_000, last at 999_000 → 1s < 20s debounce → skipped (no read, no call).
+  const { deps, suggestCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    now: 1_000_000,
+    lastSuggestion: last,
+  });
+  await runSweep(deps);
+  assert.equal(suggestCalls.length, 0, "manager debounced");
+});
+
+test("runSweep: manager skips an UNCHANGED waiting screen past debounce", async () => {
+  // Seed last with the fingerprint the NEXT call would compute, so it is unchanged.
+  // We compute it by running once, then a second run with no screen change.
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "waiting", userNotes: "goal" })],
+    screens: { s1: "same screen" },
+  });
+  let t = 1_000_000;
+  const { deps, suggestCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    suggest: okSuggestion,
+    lastSuggestion: new Map(),
+  });
+  deps.now = () => t;
+  await runSweep(deps);                  // first: fires
+  assert.equal(suggestCalls.length, 1);
+  t += deps.managerCfg.debounceMs + 1;   // past debounce, but screen unchanged
+  await runSweep(deps);                  // second: unchanged → skipped
+  assert.equal(suggestCalls.length, 1, "unchanged screen not re-suggested");
+});
+
+test("runSweep: a closed waiting session's manager memory is pruned", async () => {
+  const last = new Map<string, LastSuggestion>([
+    ["gone", { fingerprint: "f", atMs: 1, suggestion: "old" }],
+    ["s1", { fingerprint: "g", atMs: 1, suggestion: "keep" }],
+  ]);
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "idle" })],
+    screens: { s1: "x" },
+  });
+  const { deps } = makeDeps({ fake, summarize: okSummary, lastSuggestion: last });
+  await runSweep(deps);
+  assert.equal(deps.lastSuggestionBySession.has("gone"), false, "dead manager record pruned");
+  assert.equal(deps.lastSuggestionBySession.has("s1"), true, "live manager record kept");
 });

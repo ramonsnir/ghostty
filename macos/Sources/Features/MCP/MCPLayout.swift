@@ -86,9 +86,13 @@ enum MCPLayout {
         /// fork / Agent Manager: the last PreToolUse tool name, or nil.
         let lastTool: String?
         /// fork / Agent Manager: the manager's latest annotation summary for this
-        /// surface, or nil if it has not annotated it (the only "notes" source in
-        /// Phase 0).
+        /// surface, or nil if it has not annotated it (the LLM status round-trip).
         let notes: String?
+        /// fork / Agent Manager Phase 2: the user's per-session NOTE (free-text
+        /// goal/guidance typed into the tile), or nil if unset. Distinct from
+        /// `notes` (the LLM summary): this is the strongest goal signal — persisted
+        /// across a GUI restart. Omitted when nil.
+        let userNotes: String?
         /// fork / Agent Manager: the DETECTED agent kind ("claude"/"codex") from the
         /// dashboard's authoritative subtree-walk detector, or nil. The summarizer
         /// keys off THIS (not `processName`, which is `bash` under the claude-pool
@@ -154,6 +158,7 @@ enum MCPLayout {
                     lastPrompt: hook?.lastPrompt,
                     lastTool: hook?.lastTool,
                     notes: hook?.notes,
+                    userNotes: hook?.userNotes,
                     agentKind: hook?.agentKind))
             }
         }
@@ -180,6 +185,7 @@ enum MCPLayout {
             if let p = $0.lastPrompt { d["lastPrompt"] = p }
             if let t = $0.lastTool { d["lastTool"] = t }
             if let notes = $0.notes { d["notes"] = notes }
+            if let un = $0.userNotes { d["userNotes"] = un }
             if let kind = $0.agentKind { d["agentKind"] = kind }
             return d
         }

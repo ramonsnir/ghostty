@@ -54,6 +54,9 @@ export interface Surface {
   lastPrompt?: string;
   lastTool?: string;
   notes?: string;
+  /** The user's per-session free-text NOTE/goal typed into the dashboard tile —
+   *  the STRONGEST goal signal for the manager. Omitted when unset. */
+  userNotes?: string;
   agentKind?: string;
 }
 
@@ -64,10 +67,14 @@ export interface SurfaceScreen {
   rows: number;
 }
 
-/** The annotation write payload. Phase 1 writes ONLY summary (+ optional
- *  phase/needsUser); suggestion/confidence are manager Phase 2+. */
+/** The annotation write payload. The summarizer writes `summary` (+ optional
+ *  phase/needsUser); the manager (Phase 2) writes `suggestion`. Every field is
+ *  OPTIONAL — set_surface_annotation is a PARTIAL MERGE on the Swift side, so a
+ *  writer sends ONLY the field(s) it owns and the others keep their prior value.
+ *  AT LEAST ONE field must be present. */
 export interface Annotation {
-  summary: string;
+  summary?: string;
+  suggestion?: string;
   phase?: string;
   needsUser?: boolean;
 }
@@ -132,9 +139,13 @@ export class McpClient {
     };
   }
 
-  /** set_surface_annotation(id, ann). Writes ONLY summary/phase/needsUser. */
+  /** set_surface_annotation(id, ann). A PARTIAL MERGE: only the provided fields
+   *  are sent (the Swift side overlays them onto the prior annotation), so the
+   *  summarizer and the manager can write their own fields independently. */
   async setAnnotation(id: string, ann: Annotation): Promise<void> {
-    const args: Record<string, unknown> = { id, summary: ann.summary };
+    const args: Record<string, unknown> = { id };
+    if (ann.summary !== undefined) args.summary = ann.summary;
+    if (ann.suggestion !== undefined) args.suggestion = ann.suggestion;
     if (ann.phase !== undefined) args.phase = ann.phase;
     if (ann.needsUser !== undefined) args.needsUser = ann.needsUser;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.

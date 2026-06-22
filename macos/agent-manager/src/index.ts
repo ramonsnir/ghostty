@@ -29,9 +29,16 @@
 import { pathToFileURL } from "node:url";
 
 import { McpClient, McpError, type Surface } from "./mcp.js";
-import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
-import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
-import { summarize as defaultSummarize } from "./model.js";
+import { SUMMARIZER_BASE_PROMPT, MANAGER_BASE_PROMPT } from "./prompts.js";
+import {
+  makeOverrideLoader,
+  makeManagerOverrideLoader,
+  type OverrideLoader,
+} from "./prompt.js";
+import {
+  summarize as defaultSummarize,
+  suggest as defaultSuggest,
+} from "./model.js";
 import {
   DEFAULT_CONFIG,
   ConcurrencyBudget,
@@ -45,6 +52,19 @@ import {
   type SummarizerConfig,
   type SurfaceSnapshot,
 } from "./summarizer.js";
+import {
+  DEFAULT_MANAGER_CONFIG,
+  MANAGER_MODEL,
+  assembleGoals,
+  buildContext as buildManagerContext,
+  composePrompt as composeManagerPrompt,
+  fingerprint as managerFingerprint,
+  parseSuggestion,
+  shouldSuggest,
+  type LastSuggestion,
+  type ManagerConfig,
+  type ManagerSnapshot,
+} from "./manager.js";
 
 /** Poll interval between list_surfaces sweeps. */
 const POLL_INTERVAL_MS = 5000;
@@ -58,6 +78,11 @@ export type SummarizeFn = (
   req: { system: string; user: string },
 ) => Promise<string>;
 
+/** The single-shot manager call seam (defaults to model.ts `suggest`). */
+export type SuggestFn = (
+  req: { system: string; user: string; model: string },
+) => Promise<string>;
+
 export interface LoopDeps {
   client: McpClient;
   overrides: OverrideLoader;
@@ -69,6 +94,18 @@ export interface LoopDeps {
   /** Per-session memory of the last successful summary, keyed by surface id.
    *  Held on deps (NOT module scope) so a test can seed/inspect it. */
   lastBySession: Map<string, LastSummary>;
+
+  // --- Phase 2 manager pass (ramon fork / Agent Manager) ---
+  /** Manager override loader (manager.md), mtime-cached. */
+  managerOverrides: OverrideLoader;
+  /** Manager gate config (waiting-only + its own debounce). */
+  managerCfg: ManagerConfig;
+  /** The manager model id (default MANAGER_MODEL). */
+  managerModel: string;
+  /** The manager call. Injectable; defaults to model.ts `suggest`. */
+  suggest: SuggestFn;
+  /** Per-session memory of the last suggestion attempt, keyed by surface id. */
+  lastSuggestionBySession: Map<string, LastSuggestion>;
 }
 
 /**
@@ -163,10 +200,79 @@ async function summarizeOne(
 }
 
 /**
- * One sweep: list surfaces, gate each, and fire summaries for due agent surfaces
- * up to the concurrency budget. Awaits all fired calls so the budget is settled
- * before the next sweep. Catches list_surfaces failure (logs + returns) so a
- * transient MCP outage just skips a sweep. Exported for testing the gating.
+ * (ramon fork / Agent Manager Phase 2) Suggest a reply for ONE WAITING surface
+ * end-to-end: assemble goals, read the viewport, run the full waiting/debounce/
+ * unchanged gate, and (if due) compose, call the Opus manager, parse, and write
+ * the `suggestion` annotation via the MERGE channel (summary untouched). SUGGEST-
+ * ONLY: this NEVER sends input — it writes an annotation the user approves in the
+ * tile. Catches its OWN errors. Assumes a budget slot was acquired by the caller
+ * and releases it (finally). Mirrors `summarizeOne` exactly.
+ */
+async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
+  const prev = deps.lastSuggestionBySession.get(surface.id);
+  const goals = assembleGoals(surface.userNotes, [surface.lastPrompt]);
+
+  // Advance the per-session debounce clock on a SPENT attempt (failed/unparseable),
+  // preserving the prior fingerprint + suggestion so a genuine change still re-fires
+  // once debounce passes — same backoff discipline as summarizeOne.recordAttempt.
+  const recordAttempt = (): void => {
+    deps.lastSuggestionBySession.set(surface.id, {
+      fingerprint: prev?.fingerprint ?? "",
+      atMs: deps.now(),
+      suggestion: prev?.suggestion ?? "",
+    });
+  };
+
+  try {
+    const screen = await deps.client.readSurface(surface.id);
+    const snapshot: ManagerSnapshot = { surface, viewport: screen.text };
+
+    const decision = shouldSuggest(snapshot, goals, prev, deps.now(), deps.managerCfg);
+    if (!decision.due) return; // not-waiting / debounce / unchanged → skip (no clock advance)
+
+    const ctx = buildManagerContext(snapshot, goals, prev?.suggestion, deps.managerCfg);
+    const { system, user } = composeManagerPrompt(
+      MANAGER_BASE_PROMPT,
+      deps.managerOverrides.load(),
+      ctx,
+    );
+
+    const raw = await deps.suggest({ system, user, model: deps.managerModel });
+    const parsed = parseSuggestion(raw);
+    if (!parsed) {
+      recordAttempt();
+      errlog(`surface ${surface.id}: manager reply not parseable; skipping`);
+      return;
+    }
+
+    // MERGE channel: write ONLY the suggestion; the summarizer's summary is kept.
+    await deps.client.setAnnotation(surface.id, { suggestion: parsed.suggestion });
+
+    deps.lastSuggestionBySession.set(surface.id, {
+      fingerprint: managerFingerprint(snapshot, goals, deps.managerCfg),
+      atMs: deps.now(),
+      suggestion: parsed.suggestion,
+    });
+    log(`surface ${surface.id}: suggestion "${parsed.suggestion}"`);
+  } catch (err) {
+    recordAttempt();
+    const what = err instanceof McpError ? "mcp" : "model";
+    errlog(
+      `surface ${surface.id}: manager ${what} error: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  } finally {
+    deps.budget.release();
+  }
+}
+
+/**
+ * One sweep: list surfaces, then run TWO passes sharing the loop's MCP client +
+ * concurrency budget — (1) the SUMMARIZER (every due agent surface) and (2) the
+ * MANAGER (every due WAITING agent surface). Awaits all fired calls so the budget
+ * is settled before the next sweep. Catches list_surfaces failure (logs + returns)
+ * so a transient MCP outage just skips a sweep. Exported for testing the gating.
  */
 export async function runSweep(deps: LoopDeps): Promise<void> {
   let surfaces: Surface[];
@@ -179,13 +285,19 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     return;
   }
 
-  // Drop session records for surfaces that no longer exist (closed/exited).
+  // Drop session records for surfaces that no longer exist (closed/exited) — both
+  // the summarizer's and the manager's per-session memory.
   const liveIds = new Set(surfaces.map((s) => s.id));
   for (const id of [...deps.lastBySession.keys()]) {
     if (!liveIds.has(id)) deps.lastBySession.delete(id);
   }
+  for (const id of [...deps.lastSuggestionBySession.keys()]) {
+    if (!liveIds.has(id)) deps.lastSuggestionBySession.delete(id);
+  }
 
   const fired: Array<Promise<void>> = [];
+
+  // Pass 1: SUMMARIZER (unchanged behavior).
   for (const surface of surfaces) {
     // Cheap pre-gate from row fields only (no read_surface yet): skip non-agent
     // + debounced surfaces. The viewport-aware fingerprint/idle decision happens
@@ -205,6 +317,19 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     fired.push(summarizeOne(surface, deps));
   }
 
+  // Pass 2: MANAGER (ramon fork / Phase 2). Only WAITING agents are candidates;
+  // the cheap pre-check skips non-waiting/non-agent/debounced surfaces WITHOUT a
+  // read, so a non-waiting fleet never spends a manager slot. Shares the same
+  // budget — when the summarizer exhausted it, the manager simply waits a sweep.
+  for (const surface of surfaces) {
+    if (surface.exited) continue;
+    if (surface.agentState !== "waiting") continue;
+    const last = deps.lastSuggestionBySession.get(surface.id);
+    if (last && deps.now() - last.atMs < deps.managerCfg.debounceMs) continue;
+    if (!deps.budget.tryAcquire()) break; // budget exhausted this sweep
+    fired.push(manageOne(surface, deps));
+  }
+
   await Promise.all(fired);
 }
 
@@ -213,6 +338,7 @@ async function main(): Promise<void> {
   const token = process.env.GHOSTTY_MCP_TOKEN;
 
   const cfg: SummarizerConfig = { ...DEFAULT_CONFIG };
+  const managerCfg: ManagerConfig = { ...DEFAULT_MANAGER_CONFIG };
   const deps: LoopDeps = {
     client: new McpClient({ url, token }),
     overrides: makeOverrideLoader(),
@@ -221,9 +347,14 @@ async function main(): Promise<void> {
     now: () => Date.now(),
     summarize: defaultSummarize,
     lastBySession: new Map<string, LastSummary>(),
+    managerOverrides: makeManagerOverrideLoader(),
+    managerCfg,
+    managerModel: MANAGER_MODEL,
+    suggest: defaultSuggest,
+    lastSuggestionBySession: new Map<string, LastSuggestion>(),
   };
 
-  log(`summarizer started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
+  log(`summarizer + manager started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
 
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;

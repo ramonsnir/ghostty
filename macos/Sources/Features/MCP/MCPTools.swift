@@ -25,7 +25,7 @@ enum MCPTools {
     static let toolSchemas: [[String: Any]] = [
         [
             "name": "list_surfaces",
-            "description": "List all live terminal surfaces (panes) with identity and layout position. Returns the stable surface id (UUID) used by every other tool. window/tab are POSITIONAL indices (encounter order), NOT stable across calls; only id is durable. NOTE on the per-row 'atPrompt' field: it is a COARSE heuristic derived from the inverse of Ghostty's close-confirmation state, NOT a true shell-prompt (OSC 133) signal, and it is gated by the 'confirm-close-surface' config: with the default ('true') it approximates 'a child is idle at a prompt'; with 'confirm-close-surface = false' atPrompt is ALWAYS true; with 'always' it is ALWAYS false. Treat it as a hint, not ground truth. Three OPTIONAL per-row fields are OMITTED when unknown: 'processName' (the foreground process, e.g. 'claude') and 'command' (its full command line, e.g. 'claude --resume') — these require the pty-host backend AND a host new enough to push them, so they are absent until the host is restarted after a GUI upgrade; and 'idleSeconds' (seconds since the surface's screen last changed) — ~0 while a TUI is repainting/working, growing while it waits for input, and a COARSE heuristic (a TUI that repaints on a timer never goes idle). Five more OPTIONAL fork fields are OMITTED when unknown, sourced from the Agent Dashboard (absent when the dashboard is disabled): 'agentState' ('working'/'waiting'/'idle'), 'lastPrompt' (last user prompt), 'lastTool' (last tool used), and 'notes' (the Agent Manager's latest annotation summary) come from Claude Code hooks; 'agentKind' ('claude'/'codex') is the dashboard's authoritative subtree-walk DETECTION of the agent running in the surface — reliable even when the foreground process is a wrapper (e.g. the claude-pool 'bash'), unlike 'processName'.",
+            "description": "List all live terminal surfaces (panes) with identity and layout position. Returns the stable surface id (UUID) used by every other tool. window/tab are POSITIONAL indices (encounter order), NOT stable across calls; only id is durable. NOTE on the per-row 'atPrompt' field: it is a COARSE heuristic derived from the inverse of Ghostty's close-confirmation state, NOT a true shell-prompt (OSC 133) signal, and it is gated by the 'confirm-close-surface' config: with the default ('true') it approximates 'a child is idle at a prompt'; with 'confirm-close-surface = false' atPrompt is ALWAYS true; with 'always' it is ALWAYS false. Treat it as a hint, not ground truth. Three OPTIONAL per-row fields are OMITTED when unknown: 'processName' (the foreground process, e.g. 'claude') and 'command' (its full command line, e.g. 'claude --resume') — these require the pty-host backend AND a host new enough to push them, so they are absent until the host is restarted after a GUI upgrade; and 'idleSeconds' (seconds since the surface's screen last changed) — ~0 while a TUI is repainting/working, growing while it waits for input, and a COARSE heuristic (a TUI that repaints on a timer never goes idle). Six more OPTIONAL fork fields are OMITTED when unknown, sourced from the Agent Dashboard (absent when the dashboard is disabled): 'agentState' ('working'/'waiting'/'idle'), 'lastPrompt' (last user prompt), 'lastTool' (last tool used), and 'notes' (the Agent Manager's latest annotation summary) come from Claude Code hooks; 'userNotes' is the user's per-session free-text note/goal typed into the Agent Dashboard tile (the strongest goal signal, persisted across restarts), omitted when unset; 'agentKind' ('claude'/'codex') is the dashboard's authoritative subtree-walk DETECTION of the agent running in the surface — reliable even when the foreground process is a wrapper (e.g. the claude-pool 'bash'), unlike 'processName'.",
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
         [
@@ -169,18 +169,18 @@ enum MCPTools {
         ],
         [
             "name": "set_surface_annotation",
-            "description": "Write a one-line semantic status (the 'annotation') onto a surface's Agent Dashboard tile — the Agent Manager's DISPLAY channel. The tile shows 'summary' in place of the raw state chip (the chip COLOR still reflects the authoritative hook state). 'summary' is required and non-empty; the optional 'suggestion'/'phase'/'needsUser'/'confidence' carry the manager's suggested response, a coarse phase label, an attention flag, and a 0..1 self-reported confidence for later phases (Phase 0 renders only 'summary'). This does NOT send input to the agent.",
+            "description": "Write/update an annotation onto a surface's Agent Dashboard tile — the Agent Manager's DISPLAY channel. This is a PARTIAL update that MERGES into the surface's existing annotation: fields you OMIT keep their prior value, so the status summarizer can write 'summary' and the manager can write 'suggestion' INDEPENDENTLY without clobbering each other. Provide the 'id' and AT LEAST ONE of: 'summary' (one-line semantic status shown in place of the raw state chip), 'suggestion' (a proposed reply for a waiting agent, shown with Approve/Edit/Dismiss in the tile — Approve TYPES it without submitting; the model never sends input on its own), 'phase' (a coarse phase label), 'needsUser' (attention flag), 'confidence' (0..1). This NEVER sends input to the agent.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "id": ["type": "string", "description": "Surface UUID from list_surfaces."],
                     "summary": ["type": "string", "description": "One-line semantic status to display."],
-                    "suggestion": ["type": "string"],
+                    "suggestion": ["type": "string", "description": "A proposed reply for a waiting agent (shown with Approve/Edit/Dismiss; typed, never auto-sent)."],
                     "phase": ["type": "string"],
                     "needsUser": ["type": "boolean"],
                     "confidence": ["type": "number"],
                 ],
-                "required": ["id", "summary"],
+                "required": ["id"],
                 "additionalProperties": false,
             ],
         ],
@@ -301,11 +301,12 @@ enum MCPTools {
 
         case "set_surface_annotation":
             guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
-            // Validate the annotation body BEFORE any main hop so a blank summary
-            // is a fast, AppKit-free error (mirrors send_key's pre-hop keySpecs
-            // check above).
+            // Validate the annotation body BEFORE any main hop so an empty body is
+            // a fast, AppKit-free error (mirrors send_key's pre-hop keySpecs check
+            // above). At least one updatable field (summary/suggestion/phase/
+            // needsUser/confidence) must be present.
             guard let payload = AgentAnnotationPayload.fromArguments(arguments) else {
-                return .invalidParams("missing or empty summary")
+                return .invalidParams("empty annotation: provide at least one of summary/suggestion/phase/needsUser/confidence")
             }
             let ok = server.applyAnnotation(uuid: uuid, annotation: payload.annotation)
             return ok ? .ok(["ok": true]) : .toolError("unknown surface id")

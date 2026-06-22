@@ -13,17 +13,23 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { statSync, readFileSync } from "node:fs";
 
+/** The override directory under the home dir, shared by all agent-manager layers. */
+export const OVERRIDE_DIR = [".config", "ghostty-ramon", "agent-manager"];
+
 /** The fixed sub-path under the home directory for the summarizer override. */
-export const SUMMARIZER_OVERRIDE_RELPATH = [
-  ".config",
-  "ghostty-ramon",
-  "agent-manager",
-  "summarizer.md",
-];
+export const SUMMARIZER_OVERRIDE_RELPATH = [...OVERRIDE_DIR, "summarizer.md"];
+
+/** (Phase 2) The fixed sub-path for the manager (reply-suggester) override. */
+export const MANAGER_OVERRIDE_RELPATH = [...OVERRIDE_DIR, "manager.md"];
 
 /** Resolve the absolute path to the summarizer override for a given home dir. */
 export function summarizerOverridePath(home: string): string {
   return join(home, ...SUMMARIZER_OVERRIDE_RELPATH);
+}
+
+/** Resolve the absolute path to the manager override for a given home dir. */
+export function managerOverridePath(home: string): string {
+  return join(home, ...MANAGER_OVERRIDE_RELPATH);
 }
 
 /** Injectable filesystem seam (for tests). */
@@ -65,11 +71,12 @@ export interface OverrideLoader {
   load(): string | null;
 }
 
-export function makeOverrideLoader(
-  home: string = homedir(),
+/** Core mtime-cached loader for an EXPLICIT absolute path. Shared by the
+ *  summarizer + manager loaders. PURE over its injected fs seam. */
+export function makeOverrideLoaderForPath(
+  path: string,
   fs: OverrideFs = realOverrideFs,
 ): OverrideLoader {
-  const path = summarizerOverridePath(home);
   let cachedMtime: number | null = null;
   let cachedText: string | null = null;
   let primed = false;
@@ -94,6 +101,22 @@ export function makeOverrideLoader(
       return cachedText;
     },
   };
+}
+
+/** The summarizer override loader (summarizer.md). */
+export function makeOverrideLoader(
+  home: string = homedir(),
+  fs: OverrideFs = realOverrideFs,
+): OverrideLoader {
+  return makeOverrideLoaderForPath(summarizerOverridePath(home), fs);
+}
+
+/** (Phase 2) The manager override loader (manager.md). */
+export function makeManagerOverrideLoader(
+  home: string = homedir(),
+  fs: OverrideFs = realOverrideFs,
+): OverrideLoader {
+  return makeOverrideLoaderForPath(managerOverridePath(home), fs);
 }
 
 /**

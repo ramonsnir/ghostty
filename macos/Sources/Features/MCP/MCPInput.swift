@@ -116,6 +116,22 @@ enum MCPInput {
         return specs
     }
 
+    /// PURE: collapse ALL newlines (interior + leading/trailing) in `text` into
+    /// single spaces and trim, producing a strictly single-line string. This is the
+    /// SUGGEST-ONLY safety guarantee for the Phase-2 Approve path: `keySpecs(forText:)`
+    /// turns every embedded `\n`/`\r` into a REAL Return key event (native keycode 36),
+    /// which would SUBMIT — partially sending text the user did not intend. Running a
+    /// suggestion through this first guarantees `keySpecs(forText:)` emits NO Return,
+    /// so Approve only TYPES, never submits. `submit:false` only suppresses the APPENDED
+    /// trailing Return; it does nothing about interior newlines — this is the real guard.
+    static func singleLine(_ text: String) -> String {
+        return text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
     // MARK: - Scroll delta (pure, testable)
 
     /// PURE: clamp a wheel-tick delta to a sane range. nil on a zero delta (a
