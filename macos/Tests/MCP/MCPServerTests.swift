@@ -334,10 +334,10 @@ struct MCPServerTests {
         let expected: Set<String> = [
             "list_surfaces", "read_surface", "get_layout", "send_text", "send_key",
             "scroll", "wait_for_event", "watch_for_pattern", "focus_surface",
-            "new_tab", "close_surface", "perform_action",
+            "new_tab", "close_surface", "perform_action", "set_surface_annotation",
         ]
         #expect(names == expected)
-        #expect(tools.count == 12)
+        #expect(tools.count == 13)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
