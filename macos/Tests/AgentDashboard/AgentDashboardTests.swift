@@ -11,12 +11,12 @@ struct AgentMirrorGeometryTests {
         // row at 2x backing.
         let g = AgentMirrorPreview.geometry(
             cols: 120, rows: 40, cellW: 14, cellH: 30, backing: 2,
-            container: CGSize(width: 560, height: 220))
+            container: CGSize(width: 560, height: 220), referenceColumns: 120)
         // Natural size is the FULL host grid in points — NOT collapsed (the bug
         // that made the preview empty / one row produced a tiny naturalH here).
         #expect(abs(g.naturalW - 840) < 0.5)   // 120*14/2
         #expect(abs(g.naturalH - 600) < 0.5)   // 40*30/2
-        // Scale fits the width.
+        // With referenceColumns == cols, the full width is filled (scale fits).
         #expect(abs(g.scale - 560.0 / 840.0) < 0.001)
         // The scaled content is TALLER than the row, so the top is clipped and
         // the agent's latest (bottom) rows are what's shown.

@@ -264,7 +264,7 @@ struct AgentMirrorPreview: View {
     /// with fewer columns shows with empty space on the right; one with more
     /// columns overflows and is reached via the horizontal scroll bar. Hardcoded
     /// for now (config knob is a follow-up).
-    static let referenceColumns: CGFloat = 120
+    static let referenceColumns: CGFloat = 125
 
     /// PURE geometry for the mirror preview, factored out for unit testing (the
     /// view can't render off a headless display). `cellW`/`cellH` are BACKING
