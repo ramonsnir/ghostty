@@ -25,8 +25,11 @@
 name: Fork Release
 
 on:
-  push:
-    branches: [main]
+  # MANUAL-ONLY by default. macOS CI minutes are billed at ~10x and a stuck Apple
+  # notary can burn a whole 90-min job, so we do NOT auto-run on push. The PRIMARY,
+  # FREE release path is the local build script `dist/macos/release-local.sh` on a
+  # Mac (build + sign + notarize + DMG + appcast + gh release — $0). This workflow
+  # remains as an opt-in fallback you can trigger by hand from the Actions tab.
   workflow_dispatch: {}
 
 # Avoid overlapping releases racing on the same tag/latest pointer.

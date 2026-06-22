@@ -515,7 +515,22 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   off-main call), `project.pbxproj` (iOS exclusion). Tests:
   `macos/Tests/ForkSetup/ForkSetupTests.swift`.
 
-- **CI release (`.github/workflows/fork-release.yml`).** Fork-only (`if:
+- **PRIMARY release path = LOCAL + FREE (`dist/macos/release-local.sh`).** Builds +
+  signs + notarizes + DMGs + appcasts + `gh release`-publishes on your Mac. **Why not
+  CI:** GitHub macOS runners bill at ~10x, the actool/Liquid-Glass-icon crash forces the
+  scarce native `macos-26` image (long queues), and a backlogged Apple notary can sit
+  `In Progress` until the 90-min job timeout — one run cost ~$9 of macOS minutes for a
+  release that never even published. Notarization is Apple's FREE service; only the CI
+  *runner time* costs money, so doing it locally is $0 (notary slowness = wall-clock
+  only). Release assets are free and separate from Git LFS. One-time local setup: a
+  notary keychain profile (`xcrun notarytool store-credentials`); the Developer ID cert
+  + Sparkle key already live in the keychain. Run it from `ramon-fork` on the main tree.
+- **CI release (`.github/workflows/fork-release.yml`) — MANUAL-ONLY fallback.** Its
+  `on:` is `workflow_dispatch` only (NOT `push`) precisely so normal pushes don't burn
+  macOS minutes; trigger it by hand only if you can't build locally (and expect
+  `macos-26` queue + notary cost). It builds on `macos-26` (the `macos-15` image crashes
+  AssetCatalogAgent on the Liquid Glass `.icon` via a MediaToolbox override cryptex).
+  Fork-only (`if:
   github.repository == 'ramonsnir/ghostty'`); the inherited upstream workflows are
   already inert on the fork (owner/tag/repo guards), so no neutering. Builds the
   xcframework + `ghostty-host` (`nix develop -c zig build … -Demit-macos-app=false`),
