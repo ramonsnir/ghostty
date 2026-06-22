@@ -55,22 +55,52 @@ mcp-token  = <48-hex secret>                # `openssl rand -hex 24`
 
 ## Connecting an agent
 
-The stdio shim's built-in default URL is already `http://127.0.0.1:8765/mcp`, so with the
-recommended config you only pass the token:
+A Claude Code session opened anywhere in this repo gets the `ghostty` MCP server
+**automatically** — the committed **`.mcp.json`** at the repo root registers it (Claude
+Code prompts once to approve a project-scoped server, then remembers). No per-machine
+`claude mcp add`, no secret in the registration. Two things make that work:
 
-```sh
-# build the shim once (in the repo)
-cd macos/mcp-shim && swift build        # -> .build/debug/ghostty-mcp
+1. **The shim is on `PATH`** as `ghostty-mcp` (installed to `~/.local/bin/ghostty-mcp` —
+   see *New-machine setup* below). `.mcp.json` invokes the bare name, not a clone-specific
+   path.
+2. **The token needs no env var.** When `GHOSTTY_MCP_TOKEN` is unset the shim reads the
+   `mcp-token` line straight from `~/.config/ghostty-ramon/local` (the fork's canonical
+   secret store), so the committed `.mcp.json` carries no secret yet still authenticates.
 
-# register it with Claude Code
-GHOSTTY_MCP_TOKEN=<your token> \
-  claude mcp add ghostty -- /ABS/PATH/macos/mcp-shim/.build/debug/ghostty-mcp
+After a fresh clone + setup, just **restart Claude Code** in the repo and the tools load.
+
+```jsonc
+// .mcp.json (committed at the repo root) — no secret, no absolute path
+{ "mcpServers": { "ghostty": { "command": "ghostty-mcp", "args": [], "env": {} } } }
 ```
 
-- `GHOSTTY_MCP_URL` overrides the endpoint (default `http://127.0.0.1:8765/mcp`).
-- `GHOSTTY_MCP_TOKEN` is sent as `X-Ghostty-Token`.
+**Manual / one-off registration** (e.g. outside the repo, or to target a dev build):
 
-A remote MCP client can also hit `POST /mcp` directly with the header, no shim.
+```sh
+claude mcp add ghostty -- ghostty-mcp
+```
+
+- `GHOSTTY_MCP_URL` overrides the endpoint (default `http://127.0.0.1:8765/mcp`). Point it
+  at a dev identity with `GHOSTTY_MCP_URL=http://127.0.0.1:8766/mcp` (ReleaseLocal) or
+  `:8767` (Debug).
+- `GHOSTTY_MCP_TOKEN` overrides the token (sent as `X-Ghostty-Token`); if unset it falls
+  back to `mcp-token` in `~/.config/ghostty-ramon/local`.
+
+A remote MCP client can also hit `POST /mcp` directly with the `X-Ghostty-Token` header,
+no shim.
+
+### New-machine setup (install the shim once)
+
+The shim is a tiny standalone SPM package. Build a release binary and drop it on `PATH`
+(alongside `ghostty-host`):
+
+```sh
+cd macos/mcp-shim && swift build -c release
+cp .build/release/ghostty-mcp ~/.local/bin/ghostty-mcp     # ~/.local/bin must be on PATH
+```
+
+That + an `mcp-token` in `~/.config/ghostty-ramon/local` is all the per-machine state the
+committed `.mcp.json` needs. (The shim changes rarely — rebuild only if `main.swift` does.)
 
 ---
 
@@ -219,6 +249,7 @@ initial command, `send_key`, and `wait_for_event` parking/timeout). Merged on `r
 | Surface enumeration + layout + un-zoom | `macos/Sources/Features/MCP/MCPLayout.swift` |
 | Watch event bus (`wait_for_event`/pattern) | `macos/Sources/Features/MCP/MCPEventBus.swift` |
 | stdio↔HTTP shim (separate SPM package) | `macos/mcp-shim/Sources/ghostty-mcp/main.swift` |
+| Auto-registration (project-scoped) | `.mcp.json` (repo root) |
 | Unit tests | `macos/Tests/MCP/MCPServerTests.swift` |
 | Config keys (`[:0]`-terminated, C-gettable) | `src/config/Config.zig` (`mcp-listen` / `mcp-token`) |
 | macOS config getters | `macos/Sources/Ghostty/Ghostty.Config.swift` (`mcpListen` / `mcpToken`) |
