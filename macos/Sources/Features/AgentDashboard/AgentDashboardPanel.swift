@@ -17,6 +17,18 @@ import Cocoa
 /// the terminals too; pinning here, in-process, sidesteps that entirely. The AX
 /// subrole stays `.standardWindow` regardless (a floating subrole is filtered
 /// out by most window managers) — only the window LEVEL changes.
+///
+/// Pinning ALSO drops `.nonactivatingPanel` from the style mask. The default
+/// overlay is a non-activating panel (clicking it never activates Ghostty, so it
+/// never becomes the app's focused window) — which means an external window
+/// manager whose keyboard shortcuts act on "the frontmost app's focused window"
+/// (Rectangle/Rectangle Pro) can never target it, so a pinned overlay would be
+/// unmovable. As an activating window it can become key/focused on click, so
+/// Rectangle's move/snap shortcuts resolve to it while the floating level keeps
+/// it on top. It STILL never becomes `main` (`canBecomeMain = false`), so the
+/// "new window inherits from main" logic is unaffected. The trade is that
+/// clicking a pinned dashboard activates Ghostty — acceptable, since clicking a
+/// tile jumps you into a terminal anyway.
 final class AgentDashboardPanel: NSPanel {
     // Must accept clicks (the tiles), but must never become the app's "main"
     // window (it's an overlay; becoming main would confuse window cycling and
@@ -25,9 +37,15 @@ final class AgentDashboardPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 
     init(pinned: Bool = false) {
+        // Unpinned: a non-activating overlay panel (byte-identical to the
+        // original). Pinned: an ACTIVATING window (no `.nonactivatingPanel`) so
+        // it can become the frontmost app's focused window that an external
+        // window manager's shortcuts target — see the type doc comment.
+        var style: NSWindow.StyleMask = [.titled, .closable, .resizable]
+        if !pinned { style.insert(.nonactivatingPanel) }
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 800),
-            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+            styleMask: style,
             backing: .buffered,
             defer: false
         )
