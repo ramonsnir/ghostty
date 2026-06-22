@@ -413,8 +413,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     is fire-and-forget (backgrounded `curl --max-time 2`, never blocks/fails the agent),
     debounces only the chatty `PreToolUse`/`working` with a ~1s per-tty stamp file, and
     reads the token from `$GHOSTTY_MCP_TOKEN` or `~/.config/ghostty-ramon/local`. **tty
-    correlation is the load-bearing trick:** the hook reports its own controlling tty
-    (`ps -o tty=`, the surface's tty since Claude Code runs in it); the MCP handler
+    correlation is the load-bearing trick:** the hook reports the surface's controlling
+    tty — but Claude Code spawns hooks (like Bash tool calls) **DETACHED from the
+    controlling terminal**, so the hook's OWN tty is `??`/none. The script therefore
+    **walks up its ppid chain** (`ps -o tty= -p <pid>`, then `ps -o ppid=`) and takes the
+    nearest ancestor with a real tty — the `claude` process itself runs on the surface's
+    tty (e.g. `ttys030`). (The original "read your own `ps -o tty=`" assumption was WRONG
+    and made the hook silently `exit 0` with a blank tty — see the 2026-06-22 debug note.)
+    The MCP handler
     (`MCPServer.handleAgentState`) resolves it to a surface UUID by reading each surface's
     **host-pushed minor-4 `foregroundPID`** (the SAME pid the dashboard detector already
     consumes — no new frame) and mapping that pid → controlling tty via libproc
