@@ -126,6 +126,12 @@ enum ForkSetup {
         case reload(LaunchAgentSpec)
         /// We own the plist and the version matches → nothing to do.
         case upToDate
+        /// We own the plist, the version matches, but the host is not running
+        /// (booted out / crash-looped past KeepAlive / plist half-removed). Revive
+        /// it NON-DESTRUCTIVELY (bootstrap if needed + kickstart) — the cdhash is
+        /// unchanged so there is NO bootout, and a transient running-probe
+        /// false-negative therefore can't kill a live host's RAM-only sessions.
+        case revive(LaunchAgentSpec)
         /// We own the plist, never recorded a version (lost/never-written
         /// UserDefaults key), but a healthy host is ALREADY running — adopt it by
         /// recording the current version. Crucially this does NOT bootout, so we
@@ -158,13 +164,13 @@ enum ForkSetup {
                 return .skipExternallyManaged
             }
             if installedVersion == bundleVersion {
-                // Version matches. Healthy host → nothing to do. But a host that is
-                // recorded-current yet NOT actually running (booted out, crash-looped
-                // past KeepAlive, plist half-removed) must be revived on relaunch, or
-                // the colleague is stranded with empty terminals until the next
-                // version bump. Version matches, so there are no live sessions a
-                // (re)bootstrap loses beyond what's already gone.
-                return agentRunning ? .upToDate : .reload(spec)
+                // Version matches. Healthy host → nothing to do. A host that is
+                // recorded-current yet NOT running (booted out, crash-looped past
+                // KeepAlive, plist half-removed) is revived NON-DESTRUCTIVELY: the
+                // cdhash is unchanged, so we never bootout (which would also be the
+                // only way a transient running-probe false-negative could kill a
+                // live host's sessions) — we just bootstrap-if-needed + kickstart.
+                return agentRunning ? .upToDate : .revive(spec)
             }
             // Version differs or is unknown. A genuine version change (recorded
             // version present-and-different) means a new binary/cdhash → reload is
@@ -256,15 +262,28 @@ enum ForkSetup {
             try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
             defaults.set(bundleVersion, forKey: kInstalledHostVersion)
             logger.info("adopted already-running host LaunchAgent \(spec.label, privacy: .public); recorded version \(bundleVersion, privacy: .public) without restart")
-        case .install(let spec), .reload(let spec):
+        case .install(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                defaults: defaults, fileManager: fileManager, reload: decision.isReload)
+                                defaults: defaults, fileManager: fileManager, bootout: false, verb: "installed")
+        case .reload(let spec):
+            installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
+                                defaults: defaults, fileManager: fileManager, bootout: true, verb: "reloaded")
+        case .revive(let spec):
+            installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
+                                defaults: defaults, fileManager: fileManager, bootout: false, verb: "revived")
         }
     }
 
+    /// Write the plist and (re)bring-up the agent.
+    /// - Parameter bootout: when true (a genuine version change → new cdhash) the
+    ///   old job is booted out first so launchd re-derives the LWCR. When false
+    ///   (fresh install / revive of a same-version host) we NEVER bootout — so a
+    ///   transient running-probe false-negative can't kill a live host. `kickstart`
+    ///   then guarantees a loaded-but-stopped job starts (it never restarts a
+    ///   running one, lacking `-k`).
     private static func installAndBootstrap(
         spec: LaunchAgentSpec, plistPath: String, bundleVersion: String,
-        defaults: UserDefaults, fileManager: FileManager, reload: Bool
+        defaults: UserDefaults, fileManager: FileManager, bootout: Bool, verb: String
     ) {
         let dir = (plistPath as NSString).deletingLastPathComponent
         do {
@@ -279,16 +298,19 @@ enum ForkSetup {
         let domain = "gui/\(uid)"
         let target = "\(domain)/\(spec.label)"
 
-        // Boot out the old job so launchd re-derives the LWCR for the new binary's
-        // cdhash (the CLAUDE.md gotcha; mandatory on the reload path after a Sparkle
-        // update). `bootout` is ASYNCHRONOUS — the job may still be tearing down —
-        // so an immediate `bootstrap` can fail transiently (rc 5 / EBUSY). Retry
-        // with a short backoff; break as soon as a bootstrap returns success.
-        _ = runLaunchctl(["bootout", target])
+        // Boot out the old job ONLY on a genuine version change, so launchd
+        // re-derives the LWCR for the new binary's cdhash (the CLAUDE.md gotcha).
+        // `bootout` is ASYNCHRONOUS — the job may still be tearing down — so an
+        // immediate `bootstrap` can fail transiently (rc 5 / EBUSY). Retry with a
+        // short backoff; break as soon as a bootstrap returns success.
+        if bootout { _ = runLaunchctl(["bootout", target]) }
         for attempt in 0..<5 {
             if runLaunchctl(["bootstrap", domain, plistPath]) == 0 { break }
             if attempt < 4 { Thread.sleep(forTimeInterval: 0.25) }
         }
+        // Ensure a loaded-but-stopped job actually runs (revive case). No `-k`, so
+        // this never restarts/kills an already-running host.
+        _ = runLaunchctl(["kickstart", target])
 
         // Authoritative check after teardown has settled: is the agent actually
         // RUNNING (a live pid), not merely loaded? A bootstrap can report a benign
@@ -300,7 +322,7 @@ enum ForkSetup {
         let loaded = hostRunning(target: target)
         if loaded {
             defaults.set(bundleVersion, forKey: kInstalledHostVersion)
-            logger.info("\(reload ? "reloaded" : "installed", privacy: .public) host LaunchAgent \(spec.label, privacy: .public) for version \(bundleVersion, privacy: .public)")
+            logger.info("\(verb, privacy: .public) host LaunchAgent \(spec.label, privacy: .public) for version \(bundleVersion, privacy: .public)")
         } else {
             // The old job was booted out and the new one would not load: the host
             // is OFFLINE (terminals will be empty) until the next relaunch. Leave
@@ -535,9 +557,3 @@ enum ForkSetup {
     """
 }
 
-private extension ForkSetup.Plan {
-    var isReload: Bool {
-        if case .reload = self { return true }
-        return false
-    }
-}

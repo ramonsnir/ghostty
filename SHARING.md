@@ -35,6 +35,11 @@ The app does a one-time, idempotent setup:
   supervises the bundled `ghostty-host` daemon. This is what powers session
   survival across app restarts, live agent-dashboard previews, and the
   color/scrollback web monitor.
+- **Opens the Agent Dashboard panel** (a sidebar of live previews of any
+  Claude/Codex splits) — it's enabled by default. On the very first launch it may
+  appear empty until you relaunch (previews need the hosted backend, below).
+  Toggle it any time with `ctrl+a>d`, or set `agent-dashboard = false` in
+  `~/.config/ghostty-ramon/config` to keep it off.
 
 > **Relaunch once after the first run.** The hosted (`pty-host`) backend is enabled
 > by the seeded config, which only takes effect on the *next* launch. So the very

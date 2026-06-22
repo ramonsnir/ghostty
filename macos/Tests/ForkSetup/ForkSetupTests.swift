@@ -88,7 +88,8 @@ struct ForkSetupTests {
 
     @Test func planRevivesDeadHostWhenVersionMatches() {
         // Recorded-current but NOT running (booted out / crash-looped / plist
-        // half-removed): revive on relaunch instead of being stranded on .upToDate.
+        // half-removed): NON-destructively revive on relaunch (no bootout, since the
+        // cdhash is unchanged) instead of being stranded on .upToDate.
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
@@ -98,7 +99,7 @@ struct ForkSetupTests {
             bundleVersion: "100",
             agentRunning: false,
             spec: s)
-        #expect(p == .reload(s))
+        #expect(p == .revive(s))
     }
 
     @Test func planReloadsOursWhenVersionChangedEvenIfRunning() {

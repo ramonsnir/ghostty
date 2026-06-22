@@ -89,9 +89,11 @@ jobs:
       - name: Run ForkSetup unit tests
         run: |
           cd macos
-          # SYMROOT pins output into macos/build (matching build.nu), so this and
-          # the Build step below share artifacts and the app lands where the
-          # downstream sign/bundle steps expect it.
+          # Independent safety guard for the ForkSetup planner. NOTE: the Ghostty
+          # scheme's TestAction is Debug, so this builds build/Debug — it does NOT
+          # produce the Release app. SYMROOT here only keeps test output inside
+          # macos/build. The shippable Release artifact is built solely by the
+          # explicit `-configuration Release` step below (don't remove that).
           xcodebuild test -scheme Ghostty \
             -destination 'platform=macOS' \
             -only-testing:GhosttyTests/ForkSetupTests \
