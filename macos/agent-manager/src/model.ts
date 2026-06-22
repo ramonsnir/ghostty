@@ -67,3 +67,30 @@ export async function summarize(
   }
   throw new Error("summarize: query produced no result message");
 }
+
+// (ramon fork / Agent Manager Phase 2) The manager's single-shot call. IDENTICAL
+// shape to `summarize` (no mcpServers, tools:[], maxTurns:1, read `.result` off the
+// success result) — the manager is just as non-agentic and SUGGEST-ONLY: it emits
+// text and structurally CANNOT send (no tools to call). The only difference is the
+// default model (Opus). Reuses the SAME injectable `QueryFn` seam.
+
+export interface SuggestRequest {
+  system: string;
+  user: string;
+  /** Optional model override; the caller passes the manager model. */
+  model: string;
+}
+
+/**
+ * Run a single-shot suggestion call and return the raw assistant text. THROWS on
+ * an error-subtype result or a spawn-time failure. `queryFn` defaults to the real
+ * SDK `query` but is injectable so the manager loop can be tested without spawning.
+ */
+export async function suggest(
+  req: SuggestRequest,
+  queryFn: QueryFn = query,
+): Promise<string> {
+  // Delegate to summarize: same options, the model passed through. (summarize's
+  // model param defaults only when undefined, so an explicit model wins.)
+  return summarize({ system: req.system, user: req.user, model: req.model }, queryFn);
+}

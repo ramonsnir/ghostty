@@ -14,28 +14,42 @@ import AppKit
 
 /// PURE, unit-tested validation of the `set_surface_annotation` tool arguments.
 /// The `id` argument is validated separately by `MCPTools.uuidArg`; this validates
-/// the annotation BODY (a non-empty `summary` is required; the rest are optional)
-/// and builds the shared `AgentAnnotation` value type. Returns nil only when
-/// `summary` is missing or blank.
+/// the annotation BODY and builds a PARTIAL `AgentAnnotation` carrying ONLY the
+/// provided fields (so the model can MERGE it onto the prior stored annotation
+/// without clobbering — see `AgentDashboardModel.applyAnnotation`).
+///
+/// (ramon fork / Agent Manager Phase 2) `summary` is no longer hard-required:
+/// AT LEAST ONE updatable field (summary, suggestion, phase, needsUser, or
+/// confidence) must be present, else the call is rejected (a fully-empty body is
+/// still invalid). Both the summarizer (summary-only) and the manager
+/// (suggestion-only) write through this same parser.
 struct AgentAnnotationPayload {
     let annotation: AgentAnnotation
 
     static func fromArguments(_ arguments: [String: Any]) -> AgentAnnotationPayload? {
-        guard let summaryRaw = arguments["summary"] as? String else { return nil }
-        let summary = summaryRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !summary.isEmpty else { return nil }
-
-        let suggestion = (arguments["suggestion"] as? String).flatMap { s -> String? in
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : t
+        // Each string field: present-and-non-blank ⇒ trimmed value, else nil. A
+        // non-string (e.g. a number) is treated as absent (nil), never coerced.
+        func trimmedString(_ key: String) -> String? {
+            (arguments[key] as? String).flatMap { s -> String? in
+                let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : t
+            }
         }
-        let phase = (arguments["phase"] as? String).flatMap { s -> String? in
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : t
-        }
-        let needsUser = (arguments["needsUser"] as? Bool) ?? false
+        let summary = trimmedString("summary")
+        let suggestion = trimmedString("suggestion")
+        let phase = trimmedString("phase")
+        // needsUser is OPTIONAL: present-as-bool ⇒ that bool; absent or non-bool ⇒
+        // nil (so a partial update omitting it leaves the prior value on merge).
+        let needsUser = arguments["needsUser"] as? Bool
         // confidence is a JSON number → NSNumber; missing/non-number ⇒ nil.
         let confidence = (arguments["confidence"] as? NSNumber)?.doubleValue
+
+        // At least one updatable field must be present; otherwise the update is a
+        // no-op and we reject it (mirrors the old "blank summary" rejection but for
+        // an entirely empty body).
+        guard summary != nil || suggestion != nil || phase != nil
+            || needsUser != nil || confidence != nil
+        else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
             summary: summary, suggestion: suggestion, phase: phase,

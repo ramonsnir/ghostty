@@ -13,8 +13,23 @@ struct AgentPreviewTile: View {
     /// When false (pty-host off), render a metadata-only tile (no mirror).
     let previewsEnabled: Bool
     let onHide: () -> Void
+    /// (ramon fork / Agent Manager Phase 2) Approve the suggestion: TYPE the given
+    /// (possibly edited) text into the surface WITHOUT submitting. User-initiated
+    /// only — the sole send path. Dismiss the suggestion (clear it, keep summary).
+    let onApprove: (String) -> Void
+    let onDismiss: () -> Void
+    /// (ramon fork / Agent Manager Phase 2) Commit the user's per-session note edit.
+    let onSetNote: (String) -> Void
 
     @State private var hovering = false
+
+    /// (ramon fork / Agent Manager Phase 2) Editable copy of the suggestion, seeded
+    /// from `entry.annotation?.suggestion` and reset whenever that changes (via
+    /// `.onChange`). Approve types whatever is in here; Edit just lets the user
+    /// alter it first.
+    @State private var editedSuggestion: String = ""
+    /// The user's per-session note, edited locally and committed on submit/blur.
+    @State private var noteText: String = ""
 
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
@@ -51,6 +66,8 @@ struct AgentPreviewTile: View {
             header
             preview
             footer
+            suggestionRow
+            noteRow
         }
         .frame(maxWidth: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -65,9 +82,24 @@ struct AgentPreviewTile: View {
         .shadow(radius: hovering ? 6 : 0)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .onTapGesture { jump() }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Jump to \(entry.agent?.command ?? "agent") — \(entry.title)")
+        // NOTE: no card-wide tap-to-jump — the suggestion buttons + the editable
+        // fields must take their own clicks/keystrokes. Jump is on the preview +
+        // header instead (see `preview`/`header`).
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(entry.agent?.command ?? "agent") — \(entry.title)")
+        .onAppear {
+            editedSuggestion = entry.annotation?.suggestion ?? ""
+            noteText = entry.userNotes ?? ""
+        }
+        // Reseed the editable copies if the underlying values change out from under
+        // the user (a fresh suggestion from the manager, or a rehydrated note).
+        // Single-param onChange closure for the macOS 13 deployment target.
+        .onChange(of: entry.annotation?.suggestion) { new in
+            editedSuggestion = new ?? ""
+        }
+        .onChange(of: entry.userNotes) { new in
+            noteText = new ?? ""
+        }
     }
 
     // MARK: - Header
@@ -102,6 +134,8 @@ struct AgentPreviewTile: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 22)
+        .contentShape(Rectangle())
+        .onTapGesture { jump() }
     }
 
     private var badge: some View {
@@ -161,6 +195,8 @@ struct AgentPreviewTile: View {
                 // stable tile id (the @StateObject is otherwise keyed only by the
                 // ForEach UUID, so it would keep the old session).
                 .id(entry.sessionID)
+                .contentShape(Rectangle())
+                .onTapGesture { jump() }
         } else {
             ZStack {
                 Color.black.opacity(0.04)
@@ -170,6 +206,8 @@ struct AgentPreviewTile: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: Self.previewHeight)
+            .contentShape(Rectangle())
+            .onTapGesture { jump() }
         }
     }
 
@@ -233,6 +271,92 @@ struct AgentPreviewTile: View {
             .padding(.vertical, 1)
             .background(color.opacity(0.2))
             .clipShape(Capsule())
+    }
+
+    // MARK: - Suggestion (ramon fork / Agent Manager Phase 2)
+
+    /// The manager's proposed reply, shown with Approve / Edit / Dismiss when a
+    /// non-empty `suggestion` is present. Approve TYPES `editedSuggestion` into the
+    /// surface WITHOUT submitting (no Return) — the ONLY send path, user-initiated.
+    /// Edit makes the suggestion an editable field (it already IS one — typing in
+    /// it is "edit"); Dismiss clears the suggestion (leaving the summary intact).
+    /// SUGGEST-ONLY: nothing here can submit; only a tap types text.
+    @ViewBuilder
+    private var suggestionRow: some View {
+        if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 4) {
+                    Image(systemName: "lightbulb")
+                        .font(.caption2)
+                        .foregroundStyle(Self.bellAmber)
+                    Text("Suggested reply")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                // Editable so the user can tweak before Approve (the "Edit" of
+                // Approve/Edit/Dismiss). Multi-line, capped height.
+                TextEditor(text: $editedSuggestion)
+                    .font(.caption2)
+                    .frame(minHeight: 24, maxHeight: 56)
+                    .scrollContentBackground(.hidden)
+                    .padding(4)
+                    .background(Color.black.opacity(0.05))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                HStack(spacing: 6) {
+                    Spacer(minLength: 0)
+                    Button {
+                        onDismiss()
+                    } label: {
+                        Text("Dismiss").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Discard this suggestion (keeps the status line)")
+                    Button {
+                        // TYPE the (possibly edited) suggestion — never submit. Collapse
+                        // newlines to spaces FIRST so a multi-line edit can't sneak a
+                        // Return (which submits) through keySpecs(forText:). approveSuggestion
+                        // re-applies the same guard (defense-in-depth, sole send path).
+                        let text = MCPInput.singleLine(editedSuggestion)
+                        guard !text.isEmpty else { return }
+                        onApprove(text)
+                    } label: {
+                        Text("Approve").font(.caption2.weight(.semibold))
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(MCPInput.singleLine(editedSuggestion).isEmpty)
+                    .help("Type this reply into the agent (does NOT submit — press Return yourself)")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 6)
+        }
+    }
+
+    // MARK: - User note (ramon fork / Agent Manager Phase 2)
+
+    /// A compact per-session note field. Edits commit on submit (Return) / blur via
+    /// `onSetNote`; the model write-throughs to the persisted store. Always shown
+    /// (so the user can ADD a note), kept visually quiet.
+    @ViewBuilder
+    private var noteRow: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "note.text")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField("Note / goal for the manager…", text: $noteText)
+                .font(.caption2)
+                .textFieldStyle(.plain)
+                .onSubmit { onSetNote(noteText) }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 8)
+        // Commit when the pointer leaves the tile too (not just on Return), so an
+        // edit isn't lost if the user moves away without pressing Return.
+        .onChange(of: hovering) { isHovering in
+            if !isHovering, noteText != (entry.userNotes ?? "") {
+                onSetNote(noteText)
+            }
+        }
     }
 
     // MARK: - Jump
