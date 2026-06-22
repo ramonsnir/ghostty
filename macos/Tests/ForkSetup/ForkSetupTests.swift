@@ -272,4 +272,45 @@ struct ForkSetupTests {
         #expect(seed.contains("agent-dashboard = true"))
         #expect(seed.contains("auto-update = check"))
     }
+
+    // MARK: - planShimInstall(): PATH shim install gate
+
+    @Test func shimSkipsWhenNoBundledShim() {
+        // Dev/local builds (incl. Ramon's locally-built Release) bundle no shim ->
+        // must never overwrite a hand-installed ~/.local/bin/ghostty-mcp.
+        #expect(ForkSetup.planShimInstall(
+            bundledShimExists: false, installedShimExists: true,
+            installedVersion: "1", bundleVersion: "2") == .skipNoBundledShim)
+        // Even with nothing installed, no bundled shim still means do nothing.
+        #expect(ForkSetup.planShimInstall(
+            bundledShimExists: false, installedShimExists: false,
+            installedVersion: nil, bundleVersion: "2") == .skipNoBundledShim)
+    }
+
+    @Test func shimInstallsOnCleanMachine() {
+        // Bundled shim, nothing on PATH yet -> install.
+        #expect(ForkSetup.planShimInstall(
+            bundledShimExists: true, installedShimExists: false,
+            installedVersion: nil, bundleVersion: "5") == .install)
+    }
+
+    @Test func shimUpToDateWhenPresentAndVersionMatches() {
+        #expect(ForkSetup.planShimInstall(
+            bundledShimExists: true, installedShimExists: true,
+            installedVersion: "5", bundleVersion: "5") == .upToDate)
+    }
+
+    @Test func shimReinstallsOnVersionChange() {
+        // A Sparkle update bumps CFBundleVersion -> ship the new shim.
+        #expect(ForkSetup.planShimInstall(
+            bundledShimExists: true, installedShimExists: true,
+            installedVersion: "5", bundleVersion: "6") == .install)
+    }
+
+    @Test func shimReinstallsWhenFileMissingDespiteRecordedVersion() {
+        // Recorded version matches but the colleague deleted the file -> reinstall.
+        #expect(ForkSetup.planShimInstall(
+            bundledShimExists: true, installedShimExists: false,
+            installedVersion: "5", bundleVersion: "5") == .install)
+    }
 }
