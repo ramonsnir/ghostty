@@ -89,6 +89,11 @@ enum MCPLayout {
         /// surface, or nil if it has not annotated it (the only "notes" source in
         /// Phase 0).
         let notes: String?
+        /// fork / Agent Manager: the DETECTED agent kind ("claude"/"codex") from the
+        /// dashboard's authoritative subtree-walk detector, or nil. The summarizer
+        /// keys off THIS (not `processName`, which is `bash` under the claude-pool
+        /// wrapper) to decide a surface is an agent worth summarizing.
+        let agentKind: String?
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
@@ -148,7 +153,8 @@ enum MCPLayout {
                     agentState: hook?.agentState,
                     lastPrompt: hook?.lastPrompt,
                     lastTool: hook?.lastTool,
-                    notes: hook?.notes))
+                    notes: hook?.notes,
+                    agentKind: hook?.agentKind))
             }
         }
         return rows
@@ -174,6 +180,7 @@ enum MCPLayout {
             if let p = $0.lastPrompt { d["lastPrompt"] = p }
             if let t = $0.lastTool { d["lastTool"] = t }
             if let notes = $0.notes { d["notes"] = notes }
+            if let kind = $0.agentKind { d["agentKind"] = kind }
             return d
         }
     }

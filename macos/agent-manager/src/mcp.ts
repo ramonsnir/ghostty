@@ -29,9 +29,11 @@ export class McpError extends Error {
   }
 }
 
-/** A list_surfaces row. The 6 optional fields are OMITTED (=== undefined) when
+/** A list_surfaces row. The optional fields are OMITTED (=== undefined) when
  *  unknown — never null/"". `notes` is the summarizer's own last summary
- *  round-tripping back. */
+ *  round-tripping back. `agentKind` ("claude"/"codex") is the dashboard's
+ *  authoritative subtree-walk DETECTION — the reliable "this is an agent" signal
+ *  (the foreground `processName` is the pool wrapper `bash`, not the agent). */
 export interface Surface {
   id: string;
   title: string;
@@ -52,6 +54,7 @@ export interface Surface {
   lastPrompt?: string;
   lastTool?: string;
   notes?: string;
+  agentKind?: string;
 }
 
 /** read_surface return: the viewport screen text + its grid dimensions. */

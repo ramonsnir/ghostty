@@ -69,6 +69,30 @@ test("isAgentSurface: unknown processName, no state => false", () => {
   assert.equal(isAgentSurface(makeSurface({ processName: "zsh" }), cfg), false);
 });
 
+test("isAgentSurface: agentKind present (detector) => true", () => {
+  assert.equal(isAgentSurface(makeSurface({ agentKind: "claude" }), cfg), true);
+});
+
+test("isAgentSurface: pool wrapper (processName=bash) but agentKind set => true", () => {
+  // The real-world case: claude runs under the claude-pool `bash` wrapper, so the
+  // foreground processName is "bash" and never matches the agent list — only the
+  // dashboard's subtree-walk detection (agentKind) recognizes it.
+  assert.equal(
+    isAgentSurface(
+      makeSurface({ processName: "bash", command: "bash claude-pool", agentKind: "claude" }),
+      cfg,
+    ),
+    true,
+  );
+});
+
+test("isAgentSurface: pool wrapper (bash) with NO agentKind/state => false", () => {
+  assert.equal(
+    isAgentSurface(makeSurface({ processName: "bash", command: "bash claude-pool" }), cfg),
+    false,
+  );
+});
+
 test("isAgentSurface: bare row (no optionals) => false", () => {
   assert.equal(isAgentSurface(makeSurface(), cfg), false);
 });
@@ -337,7 +361,7 @@ test("composePrompt: includes base and serialized context; no override", () => {
   );
   const { system, user } = composePrompt("BASE_PROMPT", null, ctx);
   assert.equal(system, "BASE_PROMPT"); // no override appended
-  assert.match(user, /Hook state: working/);
+  assert.match(user, /Agent state: working/);
   assert.match(user, /Last tool: Edit/);
   assert.match(user, /Your previous summary: prev summary/);
   assert.match(user, /hello\nworld/);
@@ -354,7 +378,7 @@ test("composePrompt: appends override under a delimiter", () => {
 test("serializeContext: omits unknown optional fields", () => {
   const ctx = buildContext(snap({ agentState: "working" }), undefined, cfg);
   const text = serializeContext(ctx);
-  assert.doesNotMatch(text, /Last user prompt/);
+  assert.doesNotMatch(text, /User request/);
   assert.doesNotMatch(text, /Last tool/);
   assert.doesNotMatch(text, /Idle seconds/);
   assert.doesNotMatch(text, /previous summary/);
@@ -363,6 +387,28 @@ test("serializeContext: omits unknown optional fields", () => {
 test("serializeContext: empty viewport shows placeholder", () => {
   const ctx = buildContext(snap({ agentState: "working" }, ""), undefined, cfg);
   assert.match(serializeContext(ctx), /\(no output\)/);
+});
+
+test("serializeContext: leads with the actionable signals (state + request)", () => {
+  const ctx = buildContext(
+    snap({ agentState: "waiting", lastPrompt: "add the migration" }, "out"),
+    undefined,
+    cfg,
+  );
+  const text = serializeContext(ctx);
+  assert.match(text, /User request: add the migration/);
+  // Agent state and the request precede the raw terminal output.
+  assert.ok(text.indexOf("Agent state:") < text.indexOf("Recent terminal output"));
+  assert.ok(text.indexOf("User request:") < text.indexOf("Recent terminal output"));
+});
+
+test("buildContext: prompt window uses promptTailLines (wider than the fingerprint)", () => {
+  // 30 lines: the tight fingerprint window (20) would drop the earliest, but the
+  // wider prompt window (40) keeps all 30 so the model sees more task context.
+  const vp = Array.from({ length: 30 }, (_, i) => `line${i}`).join("\n");
+  const ctx = buildContext(snap({ agentState: "working" }, vp), undefined, cfg);
+  assert.match(ctx.viewportTail, /line0\b/); // earliest line retained
+  assert.match(ctx.viewportTail, /line29\b/); // latest line retained
 });
 
 // ---------------------------------------------------------------------------

@@ -570,6 +570,13 @@ final class AgentDashboardModel: ObservableObject {
         let lastPrompt: String?
         let lastTool: String?
         let notes: String?        // annotation summary (the only honest "notes" source)
+        /// (ramon fork / Agent Manager) The DETECTED agent kind's command basename
+        /// (e.g. "claude"/"codex") from the dashboard's authoritative subtree-walk
+        /// detector, or nil. This is the signal the summarizer keys off to decide a
+        /// surface is an agent — the foreground `processName` is NOT reliable (under
+        /// the claude-pool wrapper the foreground is `bash`; the real `claude` is a
+        /// child the detector finds via its process-subtree walk).
+        let agentKind: String?
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -578,13 +585,15 @@ final class AgentDashboardModel: ObservableObject {
     func hookSnapshot() -> [UUID: HookSnapshotEntry] {
         var out: [UUID: HookSnapshotEntry] = [:]
         let ids = Set(agentStates.keys)
-            .union(lastPrompt.keys).union(lastTool.keys).union(annotations.keys)
+            .union(lastPrompt.keys).union(lastTool.keys)
+            .union(annotations.keys).union(agents.keys)
         for id in ids {
             out[id] = HookSnapshotEntry(
                 agentState: agentStates[id]?.rawValue,
                 lastPrompt: lastPrompt[id],
                 lastTool: lastTool[id],
-                notes: annotations[id]?.summary)
+                notes: annotations[id]?.summary,
+                agentKind: agents[id]?.command)
         }
         return out
     }
