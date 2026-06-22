@@ -65,10 +65,44 @@ jobs:
           if nix develop -c nu .github/scripts/ghostty-tip $GHOSTTY_COMMIT_LONG; then
             echo "Tip release already exists for commit $GHOSTTY_COMMIT_LONG"
             echo "should_skip=true" >> $GITHUB_OUTPUT
-          else
-            echo "No tip release found for commit $GHOSTTY_COMMIT_LONG"
-            echo "should_skip=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
+          echo "No tip release found for commit $GHOSTTY_COMMIT_LONG"
+
+          # Skip the release when nothing release-relevant changed since
+          # the last tip (e.g. only VOUCHED.td or other .github metadata
+          # changed). Files under .github don't affect the built artifacts,
+          # with the exception of the release workflows and scripts, which
+          # affect how the artifacts are built and should therefore be
+          # exercised by a fresh build.
+          #
+          # This list is intentionally independent from the skip filter in
+          # test.yml: that one gates CI jobs and must stay narrow so that
+          # .github changes are still linted.
+          #
+          # Manual dispatches always build.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_run" ] &&
+            git rev-parse -q --verify refs/tags/tip >/dev/null; then
+            relevant=false
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/release-*.yml | .github/scripts/*)
+                  relevant=true
+                  ;;
+                .github/*) ;;
+                *)
+                  relevant=true
+                  ;;
+              esac
+            done < <(git diff --name-only tip..HEAD)
+            if [ "$relevant" = "false" ]; then
+              echo "Only non-release files changed since the last tip, skipping"
+              echo "should_skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          echo "should_skip=false" >> $GITHUB_OUTPUT
 
   tag:
     runs-on: namespace-profile-ghostty-sm
