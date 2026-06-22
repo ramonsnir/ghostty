@@ -229,14 +229,25 @@ struct AgentPreviewTile: View {
 
     private func jump() {
         guard let view = entry.realView else { return }
-        for controller in TerminalController.all {
-            for v in controller.surfaceTree where v.id == view.id {
-                controller.unzoomIfHidden(v)
-                NotificationCenter.default.post(
-                    name: Ghostty.Notification.ghosttyPresentTerminal,
-                    object: v
-                )
-                return
+        // Defer to the next runloop so the present runs AFTER AppKit finishes
+        // making the dashboard panel the key window from THIS click. The panel
+        // is `canBecomeKey` (the tiles must take clicks), so a click makes it
+        // key as part of the in-flight mouse event. If we posted synchronously,
+        // `ghosttyDidPresentTerminal`'s `makeKeyAndOrderFront` would run before
+        // that settles and the panel could re-grab key afterward — leaving the
+        // target window frontmost but NOT key, so its surface never truly gains
+        // focus (no cursor blink, dropped keystrokes) until you click away and
+        // back. Running on the next runloop makes the target take key last.
+        DispatchQueue.main.async {
+            for controller in TerminalController.all {
+                for v in controller.surfaceTree where v.id == view.id {
+                    controller.unzoomIfHidden(v)
+                    NotificationCenter.default.post(
+                        name: Ghostty.Notification.ghosttyPresentTerminal,
+                        object: v
+                    )
+                    return
+                }
             }
         }
     }
