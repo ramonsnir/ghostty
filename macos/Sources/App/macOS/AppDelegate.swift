@@ -268,6 +268,14 @@ class AppDelegate: NSObject,
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
 
+        // (ramon fork) First-launch setup for distribution builds: seed a
+        // default ~/.config/ghostty-ramon/config if absent, and install/reload
+        // the LaunchAgent for the bundled ghostty-host (CI release builds only).
+        // Idempotent and safe on every launch; a no-op on dev/local builds (no
+        // bundled host) and when a host LaunchAgent is externally managed. Runs
+        // off-main because it does file IO + shells out to launchctl.
+        DispatchQueue.global(qos: .utility).async { ForkSetup.perform() }
+
         // (ramon fork) Start the embedded web monitor if configured. It reads
         // config only here (changing listen/token requires a relaunch); the
         // server refuses to start if the token is empty.

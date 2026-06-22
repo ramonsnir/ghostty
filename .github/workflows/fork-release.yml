@@ -1,0 +1,279 @@
+# Fork release: build + (sign + notarize + DMG + Sparkle appcast) + publish a
+# GitHub Release on every push to `main` of the ramon fork.
+#
+# This is FORK-ONLY. It is guarded to `ramonsnir/ghostty` so it never runs on
+# the upstream `ghostty-org/ghostty` (origin). The inherited upstream workflows
+# (release-tip / release-tag / test) are already inert on the fork — they are
+# guarded by `github.repository_owner == 'ghostty-org'`, version-tag triggers, or
+# `github.repository == 'ghostty-org/ghostty'` — so no neutering is needed.
+#
+# SIGNING IS OPTIONAL UNTIL ENROLLED: when the signing secrets are absent the
+# workflow still builds the app (proving the pipeline + compile) and uploads the
+# unsigned .app as a workflow artifact, but it does NOT create a release. Once the
+# secrets below are set it signs, notarizes, builds a DMG, generates a signed
+# appcast, and publishes the release.
+#
+# Required repo secrets for a real release (mirrors upstream naming, FORK-owned):
+#   MACOS_CERTIFICATE        base64 of the Developer ID Application .p12
+#   MACOS_CERTIFICATE_PWD    password for that .p12
+#   MACOS_CERTIFICATE_NAME   identity name, e.g. "Developer ID Application: NAME (TEAMID)"
+#   MACOS_CI_KEYCHAIN_PWD    any throwaway password for the temp CI keychain
+#   APPLE_NOTARIZATION_ISSUER / _KEY_ID / _KEY   App Store Connect API key (.p8 + ids)
+#   SPARKLE_PRIVATE_KEY      Sparkle EdDSA private key (from `generate_keys -x`)
+#   SPARKLE_PUBLIC_KEY       Sparkle EdDSA public key (SUPublicEDKey value)
+
+name: Fork Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Avoid overlapping releases racing on the same tag/latest pointer.
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # create releases + upload assets
+
+jobs:
+  build:
+    if: github.repository == 'ramonsnir/ghostty'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      # Whether the signing secrets are present. Gates all sign/notarize/release
+      # steps; when false the job is a build-only smoke test.
+      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.APPLE_NOTARIZATION_KEY != '' && secrets.SPARKLE_PRIVATE_KEY != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history for `git rev-list --count`
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Build the GhosttyKit xcframework AND the ghostty-host binary in one go.
+      # `-Demit-macos-app=false` skips the (Linux-style) app bundle but still emits
+      # the xcframework (default on macOS) and installs ghostty-host to zig-out/bin.
+      - name: Compute version
+        id: version
+        run: |
+          echo "build=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build GhosttyKit + ghostty-host
+        run: |
+          nix develop -c zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dversion-string=0.0.0-fork-${{ steps.version.outputs.build }}
+          test -f zig-out/bin/ghostty-host
+
+      # Exercise the safety-critical ForkSetup planner (the sole guard against
+      # clobbering a hand-managed host plist) BEFORE we ever sign/notarize/publish.
+      # Ungated — a planner regression must fail the pipeline even on a smoke build.
+      - name: Run ForkSetup unit tests
+        run: |
+          cd macos
+          xcodebuild test -scheme Ghostty \
+            -destination 'platform=macOS' \
+            -only-testing:GhosttyTests/ForkSetupTests \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILATION_CACHE_CAS_PATH="$RUNNER_TEMP/CompilationCache.noindex" \
+            COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
+
+      - name: Setup Sparkle tools
+        env:
+          SPARKLE_VERSION: 2.9.0
+        run: |
+          mkdir -p .action/sparkle
+          cd .action/sparkle
+          curl -L "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-for-Swift-Package-Manager.zip" > sparkle.zip
+          unzip -q sparkle.zip
+          echo "$(pwd)/bin" >> "$GITHUB_PATH"
+
+      - name: Build Ghostty.app
+        run: |
+          cd macos
+          xcodebuild -target Ghostty -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILATION_CACHE_CAS_PATH="$RUNNER_TEMP/CompilationCache.noindex" \
+            COMPILATION_CACHE_KEEP_CAS_DIRECTORY=YES
+
+      # Bundle the host inside the app so it is signed + notarized as part of the
+      # bundle, and so Sparkle (which updates the .app) carries new host builds.
+      # The app's ForkSetup installs/reloads a LaunchAgent pointing at this path.
+      - name: Bundle ghostty-host
+        run: |
+          APP="macos/build/Release/Ghostty.app"
+          cp -f zig-out/bin/ghostty-host "$APP/Contents/MacOS/ghostty-host"
+          chmod +x "$APP/Contents/MacOS/ghostty-host"
+
+      - name: Inject version + updater keys into Info.plist
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+        run: |
+          PLIST="macos/build/Release/Ghostty.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :GhosttyCommit ${{ steps.version.outputs.commit }}" "$PLIST" || \
+            /usr/libexec/PlistBuddy -c "Add :GhosttyCommit string ${{ steps.version.outputs.commit }}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ steps.version.outputs.build }}" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.commit }}" "$PLIST"
+          if [ "$HAS_SIGNING" = "true" ]; then
+            # Pin the fork's real Sparkle public key (the committed plist carries a
+            # fail-closed placeholder). Then remove the hard-off override: dev builds
+            # ship SUEnableAutomaticChecks=false; deleting it hands control to the
+            # `auto-update` config key (the seeded fork config sets `auto-update =
+            # check`) / Sparkle's first-launch update-consent prompt — it does NOT by
+            # itself force background checks.
+            /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_KEY" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Delete :SUEnableAutomaticChecks" "$PLIST" || true
+          fi
+
+      # ---- Everything below requires signing secrets ----
+
+      - name: Import signing certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_CI_KEYCHAIN_PWD: ${{ secrets.MACOS_CI_KEYCHAIN_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$MACOS_CI_KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$MACOS_CI_KEYCHAIN_PWD" build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CI_KEYCHAIN_PWD" build.keychain
+          rm -f certificate.p12
+
+      - name: Codesign app bundle
+        if: env.HAS_SIGNING == 'true'
+        env:
+          CERT_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+        run: |
+          APP="macos/build/Release/Ghostty.app"
+          sign() { /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime "$@"; }
+          # Inside-out: sign nested code before the outer bundle.
+          sign "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc"
+          sign "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc"
+          sign "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate"
+          sign "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app"
+          sign "$APP/Contents/Frameworks/Sparkle.framework"
+          sign "$APP/Contents/PlugIns/DockTilePlugin.plugin"
+          # The bundled host runs under launchd; hardened runtime, no special entitlements.
+          sign "$APP/Contents/MacOS/ghostty-host"
+          # Finally the app bundle itself, with its entitlements.
+          /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
+            --entitlements "macos/Ghostty.entitlements" "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+
+      # Notarize + STAPLE THE APP FIRST, so the .app a colleague drags out of the
+      # DMG carries its own stapled ticket and launches OFFLINE without a Gatekeeper
+      # round-trip. The DMG is then built from the already-stapled app.
+      - name: Notarize + staple app
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+        run: |
+          APP="macos/build/Release/Ghostty.app"
+          echo "$APPLE_NOTARIZATION_KEY" > notarization_key.p8
+          # Store the profile once; reused to notarize the DMG below.
+          xcrun notarytool store-credentials "notarytool-profile" \
+            --key notarization_key.p8 \
+            --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+            --issuer "$APPLE_NOTARIZATION_ISSUER"
+          rm -f notarization_key.p8
+          # notarytool needs an archive; ditto preserves the bundle's symlinks.
+          ditto -c -k --keepParent "$APP" notarize-app.zip
+          xcrun notarytool submit notarize-app.zip --keychain-profile "notarytool-profile" --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f notarize-app.zip
+
+      - name: Create DMG
+        if: env.HAS_SIGNING == 'true'
+        env:
+          CERT_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+        run: |
+          npm install --global create-dmg
+          # create-dmg exits non-zero in some benign cases (e.g. no code-signing of
+          # the DMG itself), so don't trust its rc — assert the artifact exists.
+          create-dmg --identity="$CERT_NAME" "macos/build/Release/Ghostty.app" ./ || true
+          shopt -s nullglob
+          dmgs=( ./Ghostty*.dmg )
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "::error::create-dmg produced no DMG"; exit 1
+          fi
+          mv "${dmgs[0]}" ./Ghostty.dmg
+
+      - name: Notarize + staple DMG
+        if: env.HAS_SIGNING == 'true'
+        run: |
+          xcrun notarytool submit "Ghostty.dmg" --keychain-profile "notarytool-profile" --wait
+          xcrun stapler staple "Ghostty.dmg"
+          xcrun stapler validate "Ghostty.dmg"
+
+      - name: Generate Sparkle appcast
+        if: env.HAS_SIGNING == 'true'
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          GHOSTTY_BUILD: ${{ steps.version.outputs.build }}
+          GHOSTTY_COMMIT: ${{ steps.version.outputs.commit }}
+        run: |
+          echo "$SPARKLE_PRIVATE_KEY" > signing.key
+          sign_update -f signing.key Ghostty.dmg > sign_update.txt
+          rm -f signing.key
+          export GHOSTTY_DMG_URL="https://github.com/${{ github.repository }}/releases/download/build-${GHOSTTY_BUILD}/Ghostty.dmg"
+          export GHOSTTY_PUBDATE="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
+          # Track what actually shipped rather than a hardcoded floor: read the
+          # bundle's LSMinimumSystemVersion (fall back to 13.0 if absent).
+          PLIST="macos/build/Release/Ghostty.app/Contents/Info.plist"
+          export GHOSTTY_MIN_MACOS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST" 2>/dev/null || echo 13.0)"
+          python3 ./dist/macos/fork_appcast.py
+          test -f appcast.xml
+
+      - name: Publish GitHub Release
+        if: env.HAS_SIGNING == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHOSTTY_BUILD: ${{ steps.version.outputs.build }}
+          GHOSTTY_COMMIT: ${{ steps.version.outputs.commit }}
+        run: |
+          TAG="build-${GHOSTTY_BUILD}"
+          # --latest makes `releases/latest/download/{Ghostty.dmg,appcast.xml}`
+          # resolve here, which is the stable URL Sparkle's feed points at.
+          gh release create "$TAG" \
+            --title "Ghostty (ramon) build ${GHOSTTY_BUILD} (${GHOSTTY_COMMIT})" \
+            --notes "Automated fork build from ${GHOSTTY_COMMIT}." \
+            --latest \
+            Ghostty.dmg appcast.xml
+
+      # Zip with --symlinks first: upload-artifact dereferences symlinks, which
+      # would flatten Sparkle.framework's Versions/Current and produce a bloated,
+      # non-runnable bundle. A zip preserves the bundle structure.
+      - name: Package unsigned app (no signing secrets)
+        if: env.HAS_SIGNING != 'true'
+        run: |
+          cd macos/build/Release
+          zip -9 -r --symlinks "$RUNNER_TEMP/ghostty-ramon-unsigned.zip" Ghostty.app
+
+      - name: Upload unsigned app (no signing secrets)
+        if: env.HAS_SIGNING != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostty-ramon-unsigned-${{ steps.version.outputs.commit }}
+          path: ${{ runner.temp }}/ghostty-ramon-unsigned.zip
+          retention-days: 7

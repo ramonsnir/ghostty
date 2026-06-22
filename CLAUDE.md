@@ -407,7 +407,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
 - **Single-instance guard** in `AppDelegate.applicationWillFinishLaunching`: if another process with the same bundle id is already running from a different bundle URL, that one is activated and this process exits. Stops two copies of the same fork identity from racing each other (e.g. dock-attention bouncing one while you click the other).
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
-- **Auto-update hard-disabled** in code: Sparkle never starts, `checkForUpdates` is a no-op, menu item disabled — independent of config. (`macos/Sources/Features/Update/UpdateController.swift`)
+- **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key + injects the fork's `SUPublicEDKey`. The committed `SUPublicEDKey` is a fail-closed PLACEHOLDER (32 zero bytes, NOT upstream's key) — replaced by CI, and to be replaced in-source once the fork's Sparkle keypair is generated at enrollment (`generate_keys`: public → `SUPublicEDKey` + `SPARKLE_PUBLIC_KEY` secret, private → `SPARKLE_PRIVATE_KEY` secret). See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
 - **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
@@ -429,6 +429,61 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   the tracked config. On a new machine, create `local` by hand (generate a fresh
   `mcp-token` with `openssl rand -hex 24`, set that Mac's own Tailscale IP); if `local`
   is absent the fork still launches (web monitor + MCP just disabled / token-less).
+
+## Distribution / sharing the fork (colleague builds, CI release, auto-update)
+
+The fork can be shared with colleagues as a signed/notarized DMG, auto-released by
+CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
+`SHARING.md`.** The load-bearing facts for an agent touching this code:
+
+- **Sparkle is RE-ENABLED but pinned to the fork's OWN feed.** `UpdateController`'s
+  three methods (startUpdater/checkForUpdates/validateMenuItem) are restored to the
+  real upstream implementation; `UpdateDelegate.feedURLString` points BOTH channels
+  at `https://github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`
+  (never ghostty.org — so the fork is never replaced by an official build). The
+  committed `Ghostty-Info.plist` still ships `SUEnableAutomaticChecks=false`, so dev
+  builds never auto-check; the CI release build DELETES that key (enables checks) and
+  injects the fork's `SUPublicEDKey`. Wiring: `macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`.
+
+- **First-launch setup (`ForkSetup`, GUI-only, distribution builds).** On launch the
+  app (off-main, in `AppDelegate.applicationDidFinishLaunching`) runs
+  `ForkSetup.perform()`, which is idempotent and does two jobs: (1) seed a sanitized
+  `~/.config/ghostty-ramon/config` if absent (embedded `seedTemplate`, `__HOME__`
+  substituted, personal launchers commented out, open `mcp-listen`/`web-monitor-listen`
+  disabled — opt-in via `local`); (2) install/version-reload a launchd LaunchAgent for
+  a `ghostty-host` BUNDLED at `Contents/MacOS/ghostty-host`. **Two safety gates make it
+  impossible to clobber a hand-managed host** (Ramon's own dev setup uses the SAME label
+  `com.mitchellh.ghostty-ramon.host`): it only acts when a host is actually bundled
+  (local/dev builds skip — they don't bundle it), and it writes an ownership marker
+  (`GhosttyAppManaged` = bundle id) into any plist it creates, refusing to touch a
+  pre-existing plist that lacks the marker. The version-aware reload (bootout+bootstrap,
+  never kill) re-derives launchd's LWCR after a Sparkle update gives the bundled host a
+  new cdhash — encoding the LWCR gotcha (below) into the app. Pure planner `plan(...)`,
+  `makeSpec`, `configSeedContents`, `readPlistMarker` are unit-tested. Wiring:
+  `macos/Sources/Features/ForkSetup/ForkSetup.swift`, `AppDelegate.swift` (the
+  off-main call), `project.pbxproj` (iOS exclusion). Tests:
+  `macos/Tests/ForkSetup/ForkSetupTests.swift`.
+
+- **CI release (`.github/workflows/fork-release.yml`).** Fork-only (`if:
+  github.repository == 'ramonsnir/ghostty'`); the inherited upstream workflows are
+  already inert on the fork (owner/tag/repo guards), so no neutering. Builds the
+  xcframework + `ghostty-host` (`nix develop -c zig build … -Demit-macos-app=false`),
+  builds the app (`xcodebuild -configuration Release` → already the fork's Release id +
+  display name), bundles + signs the host inside the app, injects
+  `CFBundleVersion=git rev-list --count HEAD` (monotonic — Sparkle compares this),
+  signs/notarizes/staples, builds the DMG (`create-dmg`), generates a SINGLE-item signed
+  appcast (`dist/macos/fork_appcast.py`, enclosure → the release's DMG URL), and
+  publishes a `build-<N>` GitHub Release marked `--latest` (so the
+  `releases/latest/download/{Ghostty.dmg,appcast.xml}` URLs resolve). **Signing is
+  gated on secrets** (`HAS_SIGNING`): without them the job is a build-only smoke test
+  that uploads the unsigned `.app` as an artifact and creates NO release. Secrets
+  (fork-owned): `MACOS_CERTIFICATE`/`_PWD`/`_NAME`, `MACOS_CI_KEYCHAIN_PWD`,
+  `APPLE_NOTARIZATION_ISSUER`/`_KEY_ID`/`_KEY`, `SPARKLE_PRIVATE_KEY`/`SPARKLE_PUBLIC_KEY`.
+
+- **The host is bundled IN the app for colleagues** (vs. Ramon's `~/.local/bin`
+  hand-deploy), so Sparkle — which only updates the `.app` — carries new host builds,
+  and notarization covers the host automatically. A colleague's update flow restarts
+  the host (ends live sessions, RAM-only) exactly like Ramon's manual reload.
 
 ## PTY-host runs under a launchd LaunchAgent (deploy + new-machine setup)
 

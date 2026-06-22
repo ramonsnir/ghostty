@@ -167,6 +167,7 @@
 				"Features/Custom App Icon/DockTilePlugin.swift",
 				"Features/Custom App Icon/Extensions/Notification+AppIcon.swift",
 				"Features/Custom App Icon/Extensions/UserDefaults+AppIcon.swift",
+				Features/ForkSetup/ForkSetup.swift,
 				"Features/Global Keybinds/GlobalEventTap.swift",
 				"Features/MCP/MCPServer.swift",
 				"Features/MCP/MCPRPC.swift",

@@ -7,12 +7,19 @@ extension UpdateDriver: SPUUpdaterDelegate {
             return nil
         }
 
-        // Sparkle supports a native concept of "channels" but it requires that
-        // you share a single appcast file. We don't want to do that so we
-        // do this instead.
+        // Fork: the feed is pinned to THIS fork's own GitHub Releases, never
+        // ghostty.org, so the fork is never replaced by an official Ghostty
+        // build. The fork ships a single continuous release stream (one DMG +
+        // appcast per push to `main`, published by .github/workflows/fork-release.yml),
+        // so both Sparkle "channels" resolve to the same fork appcast. The
+        // `releases/latest/download/<asset>` URL always serves the asset from
+        // the most recent release (each release is published `--latest`). The
+        // appcast is a SINGLE newest-item feed (dist/macos/fork_appcast.py emits
+        // one item, NOT a cumulative history) — that is all Sparkle needs, since
+        // update detection compares the monotonic CFBundleVersion/sparkle:version.
         switch appDelegate.ghostty.config.autoUpdateChannel {
-        case .tip: return "https://tip.files.ghostty.org/appcast.xml"
-        case .stable: return "https://release.files.ghostty.org/appcast.xml"
+        case .tip, .stable:
+            return "https://github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml"
         }
     }
 

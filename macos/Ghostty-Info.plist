@@ -107,7 +107,11 @@
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
 	<key>SUPublicEDKey</key>
-	<string>wsNcGf5hirwtdXMVnYoxRIX/SqZQLMOsYlD3q3imeok=</string>
+	<!-- Fork: NOT the upstream Ghostty key. Fail-closed PLACEHOLDER (32 zero bytes)
+	     so dev builds parse it yet reject every update signature; the CI release build
+	     overwrites it with the fork's real SPARKLE_PUBLIC_KEY. Replace with the fork's
+	     public key once generated at enrollment (see SHARING.md / CLAUDE.md). -->
+	<string>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</string>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
