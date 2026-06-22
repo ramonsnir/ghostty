@@ -154,6 +154,32 @@ struct AgentDetectorCacheTests {
         #expect(r2[a] == nil)
     }
 
+    @Test func negativeResultRewalksWhenAgentAppearsUnderStablePID() {
+        // Regression: the claude-accounts pool keeps a stable foreground pid (a
+        // `bash …/claude-pool` leader) and spawns the `claude` child LATER. A
+        // nil result must NOT be cached, or the agent stays invisible forever
+        // (the pid never changes, so a pid-keyed cache would never re-walk).
+        let a = UUID()
+        let en = CountingEnumerator([
+            // Tick 1: leader present, NO agent child yet.
+            100: [100: (name: "bash", children: [])],
+        ])
+        let (r1, c1) = AgentDetector.resolve(
+            snapshot: [(a, 100)], cache: [:], commands: ["claude"], enumerator: en)
+        #expect(r1[a] == nil)
+        #expect(en.walkCount[100] == 1)
+
+        // The pool starts claude under the SAME leader pid.
+        en.byPID[100] = [
+            100: (name: "bash", children: [200]),
+            200: (name: "/Users/ramon/.local/share/claude/versions/2.1.181", children: []),
+        ]
+        let (r2, _) = AgentDetector.resolve(
+            snapshot: [(a, 100)], cache: c1, commands: ["claude"], enumerator: en)
+        #expect(r2[a] == AgentKind("claude")) // now detected
+        #expect(en.walkCount[100] == 2)       // re-walked despite the stable pid
+    }
+
     @Test func vanishedIDDroppedFromCache() {
         let a = UUID(), b = UUID()
         let en = CountingEnumerator([
