@@ -486,6 +486,74 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     up (no host restart); the user copies the hook to `~/.config/ghostty-ramon/claude-hooks/`
     + merges the settings block — see `AGENT-DASHBOARD.md`.
 
+- **Agent Manager** (fork-only, macOS, OFF by default) — layers a **Haiku status
+  summarizer** on top of the Agent Dashboard: each agent tile shows a live, one-line
+  semantic status (needs-you-FIRST, then task+phase — e.g. "Waiting: which DB to migrate?",
+  "Implementing auth fix — writing tests") instead of just the raw working/waiting chip.
+  **This is Phase 1 of a larger design** (`.claude/plans/agent-manager-design.md`, local):
+  Phase 2 = an Opus manager that suggests replies, Phase 3 = opt-in auto-apply, Phase 4 = a
+  cross-session coordinator — NOT built yet. **See `AGENT-MANAGER.md` for user-facing
+  config/usage.** The load-bearing facts for an agent touching this code:
+  - **A warm TypeScript Agent SDK sidecar is the brain; the MCP server is its hands.**
+    `claude -p` was rejected (cold-boots the CLI per call). Instead a persistent TS program
+    (`macos/agent-manager/`, `@anthropic-ai/claude-agent-sdk`, NOT in `Ghostty.xcodeproj`,
+    built with `npm ci && npm run build`) keeps warm and drives Ghostty's existing **MCP
+    server** as a tool provider. **Billing rides Claude Code's own auth** (subscription/pool
+    creds the SDK reads on disk) — **NO Anthropic API key in Ghostty** (verified: a bare
+    `query()` with no `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` succeeds via the pool).
+  - **Deterministic loop, single-shot LLM (NOT agentic).** `src/index.ts` polls
+    `list_surfaces` every 5s, applies PURE gates (`src/summarizer.ts`:
+    `isAgentSurface`/`shouldSummarize`/`fingerprint`/debounce/skip-idle/`ConcurrencyBudget`),
+    `read_surface`s the viewport, composes a prompt (baked base `src/prompts.ts` + the
+    `~/.config/ghostty-ramon/agent-manager/summarizer.md` override, mtime-cached), makes ONE
+    Haiku call (`src/model.ts`: `tools:[]`, `maxTurns:1`, NO `mcpServers` — the summary call
+    touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
+    dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
+    Node's built-in `node --test`.
+  - **Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha).** Under
+    the `claude-pool` wrapper the surface's foreground process is `bash` (and even bare,
+    `claude` reports its versioned-binary basename e.g. `2.1.185`), so a
+    `processName ∈ {claude,codex}` check NEVER matches a real agent. The Agent Dashboard
+    already detects agents via a foreground-pid **subtree walk**; Phase 0 exposes that result
+    as `list_surfaces.agentKind` (`AgentDashboardModel.agents` → `HookSnapshotEntry.agentKind`
+    → `MCPLayout.SurfaceRow.agentKind` → JSON → `Surface.agentKind`), and `isAgentSurface`
+    keys off it (then `agentState`, then `processName`). This also keeps the summarizer's
+    notion of "agent" identical to the dashboard's tiles.
+  - **Rich summaries need the Claude hooks.** The strongest inputs — the user's `lastPrompt`
+    and `agentState` (working/waiting) — arrive via the same Agent-Dashboard `/agent-state`
+    hooks (so they only populate on the build the hooks POST to, i.e. the **installed
+    Release** on the default MCP port, NOT a dev `+1/+2` port). Without them the summarizer
+    falls back to the viewport tail alone and reads thin ("Idle — repo ready"); with them it
+    reads rich. Prompt is tunable live via the override file (no rebuild).
+  - **SELF-DISABLE (hard requirement, unit-tested).** `AgentManagerController.start()` runs
+    the §8 gate `agentManagerShouldStart(enabled, mcpListen, mcpToken, nodePath)` off-main:
+    unless `agent-manager` is on AND `mcp-listen`+`mcp-token` are set AND `node` resolves
+    (config `agent-manager-node-path`, else a login-shell `command -v node` probe — GUI apps
+    don't inherit `PATH`), it stays fully dormant with EXACTLY ONE info log; the dashboard is
+    unaffected. The sidecar is spawned/supervised via `Process` (lazy, bounded restart
+    backoff — both pure + tested), torn down on quit, run with `GHOSTTY_AGENT_MANAGER=1` so
+    its own model activity can't recurse through the agent-state hook.
+  - **Phase 0/1 = read-only; ZERO autonomous send, ZERO host/Zig protocol change.** The only
+    Zig change is two additive default-off config keys. Safety stays at the MCP boundary
+    (later auto-apply will be a separate server-gated tool, not trusted to the sidecar).
+    Wiring: core — `src/config/Config.zig` (`agent-manager`/`agent-manager-node-path` + parse
+    test); macOS — `macos/Sources/Features/AgentManager/AgentManagerController.swift`,
+    `macos/Sources/Features/MCP/MCPAnnotation.swift` (`set_surface_annotation` tool + pure
+    `AgentAnnotationPayload.fromArguments` + main-hop handler posting
+    `.ghosttyAgentAnnotationDidChange`), `MCPLayout.swift`/`MCPTools.swift` (`agentKind` +
+    `list_surfaces` enrichment), `AgentDashboardController.swift`
+    (`HookSnapshotEntry.agentKind` + `annotations` store + observer) +
+    `AgentPreviewTile.swift` (renders the summary), `Ghostty.Config.swift`
+    (`agentManagerEnabled`/`agentManagerNodePath`), `AppDelegate.swift` (off-main start),
+    `project.pbxproj` (iOS exclusion); sidecar — `macos/agent-manager/*`. Tests:
+    `macos/Tests/AgentManager/AgentManagerControllerTests.swift` (self-disable truth table +
+    backoff + URL), `macos/Tests/MCP/MCPAnnotationTests.swift`, the `agentKind`
+    `surfacesJSONData` cases in `macos/Tests/MCP/MCPServerTests.swift`, the `agent-manager`
+    Zig config test, and the sidecar's `node --test` suite (`npm test` in `macos/agent-manager`).
+    **GUI relaunch only** to enable (no host restart); the sidecar must be built
+    (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
+    the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
@@ -493,7 +561,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`
