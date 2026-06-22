@@ -96,8 +96,15 @@ enum MCPLayout {
         var rows: [SurfaceRow] = []
         // (ramon fork / Agent Manager) Per-surface hook/annotation state from the
         // dashboard model (value types only). Empty when the dashboard is disabled
-        // ⇒ all four agent-* fields are omitted (honest absence) — main-only read.
-        let hooks = (NSApp.delegate as? AppDelegate)?.agentDashboard?.hookSnapshot() ?? [:]
+        // ⇒ all four agent-* fields are omitted (honest absence). `hookSnapshot()`
+        // is @MainActor (the controller is); this static func is nonisolated but is
+        // ALWAYS invoked inside `DispatchQueue.main.sync` (see MCPTools.dispatch),
+        // so `assumeIsolated` is sound — it satisfies the compiler without changing
+        // the existing on-main calling contract.
+        let hooks: [UUID: AgentDashboardModel.HookSnapshotEntry] =
+            MainActor.assumeIsolated {
+                (NSApp.delegate as? AppDelegate)?.agentDashboard?.hookSnapshot() ?? [:]
+            }
         var groupIndex: [ObjectIdentifier: Int] = [:]
         func windowIndex(_ c: TerminalController) -> Int {
             let key: ObjectIdentifier
