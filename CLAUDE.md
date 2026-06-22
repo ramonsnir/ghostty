@@ -436,6 +436,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `⏳ ` push, reusing the bell fan-out via the shared `enqueuePush`; the per-surface
     ~3s debounce is keyed per-kind so a bell never swallows the waiting push). **No TTL** — the ~2s detector poll
     removes dead agents; a missed `Stop` is an accepted cosmetic stale-`working`.
+    **Persisted across GUI restart** (hooks only POST on transitions, so a relaunched
+    GUI would otherwise show blank chips until the agent next acts): the model
+    write-throughs each state to an `AgentStateStore` (UserDefaults) keyed by the
+    **stable host session id** — NOT the surface UUID, which is freshly minted each
+    launch — and `rebuild(live:)` rehydrates it onto the new UUID by session id
+    (silent restore — no push / no waiting-edge re-fire; the next live hook takes
+    over). Records age-prune (14d / 256-cap, timestamp touched for live sessions).
+    Caveat: a HOST restart resets the session-id counter, so a stale record could
+    briefly hydrate a reused id with wrong state until the next hook self-corrects
+    (host restarts are rare + lose all sessions anyway). `prune` /
+    `AgentStateStore` / `UserDefaultsAgentStateStore` are unit-tested.
     Claude-Code-only (Codex tiles stay preview-only). Pinned shared symbols
     (`AgentState`/`AgentStatePayload`/the two `Notification.Name`s/`AgentStateUserInfoKey`)
     live in `macos/Sources/Features/AgentDashboard/AgentStateBridge.swift`. Wiring: hooks —
