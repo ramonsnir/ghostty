@@ -81,6 +81,20 @@ mcp-token  = <openssl rand -hex 24>
 
 If `local` is absent the app still launches fine; those two features just stay off.
 
+### Connecting an agent to the MCP server
+
+The app installs the `ghostty-mcp` stdio shim to `~/.local/bin/ghostty-mcp` on first
+launch (and refreshes it on each update). Once `mcp-listen` + `mcp-token` are set in
+`local`, point your local Claude Code at it:
+
+```sh
+claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"
+```
+
+No token in that command — the shim reads `mcp-token` from `~/.config/ghostty-ramon/local`.
+Restart Claude Code afterward. (If `~/.local/bin` is on your `PATH`, `claude mcp add
+ghostty -- ghostty-mcp` works too.) See **MCP-SERVER.md** for the tool list.
+
 ## Uninstall
 
 ```sh

@@ -531,11 +531,12 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
 
 - **First-launch setup (`ForkSetup`, GUI-only, distribution builds).** On launch the
   app (off-main, in `AppDelegate.applicationDidFinishLaunching`) runs
-  `ForkSetup.perform()`, which is idempotent and does two jobs: (1) seed a sanitized
+  `ForkSetup.perform()`, which is idempotent and does three jobs: (1) seed a sanitized
   `~/.config/ghostty-ramon/config` if absent (embedded `seedTemplate`, `__HOME__`
   substituted, personal launchers commented out, open `mcp-listen`/`web-monitor-listen`
   disabled — opt-in via `local`); (2) install/version-reload a launchd LaunchAgent for
-  a `ghostty-host` BUNDLED at `Contents/MacOS/ghostty-host`. **Two safety gates make it
+  a `ghostty-host` BUNDLED at `Contents/MacOS/ghostty-host`; (3) install the bundled
+  `ghostty-mcp` shim onto PATH (see the MCP-shim bullet below). **Two safety gates make it
   impossible to clobber a hand-managed host** (Ramon's own dev setup uses the SAME label
   `com.mitchellh.ghostty-ramon.host`): it only acts when a host is actually bundled
   (local/dev builds skip — they don't bundle it), and it writes an ownership marker
@@ -553,7 +554,7 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   already inert on the fork (owner/tag/repo guards), so no neutering. Builds the
   xcframework + `ghostty-host` (`nix develop -c zig build … -Demit-macos-app=false`),
   builds the app (`xcodebuild -configuration Release` → already the fork's Release id +
-  display name), bundles + signs the host inside the app, injects
+  display name), bundles + signs the host AND the `ghostty-mcp` shim inside the app, injects
   `CFBundleVersion=git rev-list --count HEAD` (monotonic — Sparkle compares this),
   signs/notarizes/staples, builds the DMG (`create-dmg`), generates a SINGLE-item signed
   appcast (`dist/macos/fork_appcast.py`, enclosure → the release's DMG URL), and
@@ -568,6 +569,23 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   hand-deploy), so Sparkle — which only updates the `.app` — carries new host builds,
   and notarization covers the host automatically. A colleague's update flow restarts
   the host (ends live sessions, RAM-only) exactly like Ramon's manual reload.
+
+- **The `ghostty-mcp` shim is bundled + installed-to-PATH for colleagues too** — same
+  pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. CI
+  `swift build -c release`s the shim and copies+signs it into `Contents/MacOS/ghostty-mcp`
+  (alongside the host, inside the notarized bundle, carried by Sparkle). On first launch
+  `ForkSetup.installShimIfNeeded` copies it onto PATH at `~/.local/bin/ghostty-mcp`
+  (version-aware via `kInstalledShimVersion`; reinstalls on a Sparkle bump or a manual
+  delete). **Safety is symmetric with the host:** `planShimInstall` only acts when a shim
+  is actually BUNDLED, and the whole of `perform()` early-returns unless a host is bundled
+  — so a dev/local build never overwrites Ramon's hand-installed `~/.local/bin/ghostty-mcp`.
+  The copy is a byte-level `Data.write(.atomic)` (NOT `copyItem`) so the bundle's quarantine
+  xattr doesn't propagate to the loose copy. A colleague then registers with
+  `claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"` (token auto-read from `local`);
+  the committed `.mcp.json` (bare `ghostty-mcp`) serves repo-clone developers, not DMG users.
+  Wiring: `.github/workflows/fork-release.yml` (build+bundle+sign steps),
+  `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`ShimPlan`/`planShimInstall`/
+  `installShimIfNeeded`); tests in `macos/Tests/ForkSetup/ForkSetupTests.swift` (`shim*`).
 
 ## PTY-host runs under a launchd LaunchAgent (deploy + new-machine setup)
 
