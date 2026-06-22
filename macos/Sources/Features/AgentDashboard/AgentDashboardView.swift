@@ -12,10 +12,6 @@ struct AgentDashboardView: View {
     /// Whether the "N hidden" popover is expanded.
     @State private var showHiddenPopover = false
 
-    // Full-width rows: one flexible column so each agent gets the entire panel
-    // width (request #4 — the little grid tiles were too small to read).
-    private let columns = [GridItem(.flexible(), spacing: 12)]
-
     var body: some View {
         VStack(spacing: 0) {
             content
@@ -49,42 +45,78 @@ struct AgentDashboardView: View {
                 )
             }
         } else {
-            ScrollView {
+            // Full-width rows in a List so `.onMove` gives drag-to-reorder for
+            // free (the dashboard is already a single column). The list chrome is
+            // stripped (plain style, hidden separators/background, clear rows) so
+            // the tiles keep their card look. Reordering does NOT remount the
+            // mirror previews — `ForEach` identity stays `entry.id` and the
+            // mirror's `.id(sessionID)` is untouched.
+            List {
                 if !ptyHostEnabled {
                     banner("Live previews require pty-host. Showing metadata-only tiles.")
+                        .listRowInsets(EdgeInsets(top: 12, leading: 12, bottom: 0, trailing: 12))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                        .moveDisabled(true)
                 }
-                LazyVGrid(columns: columns, spacing: 12) {
-                    ForEach(model.entries) { entry in
-                        AgentPreviewTile(
-                            entry: entry,
-                            ghostty: ghostty,
-                            previewsEnabled: ptyHostEnabled,
-                            onHide: { model.hide(entry.id) }
-                        )
-                    }
+                ForEach(model.entries) { entry in
+                    AgentPreviewTile(
+                        entry: entry,
+                        ghostty: ghostty,
+                        previewsEnabled: ptyHostEnabled,
+                        onHide: { model.hide(entry.id) }
+                    )
+                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
                 }
-                .padding(12)
-                .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
+                .onMove { source, destination in
+                    // Capture the displayed session-id order (WYSIWYG), apply the
+                    // move, and hand the new full order to the model to persist.
+                    var ids = model.entries.map(\.sessionID)
+                    ids.move(fromOffsets: source, toOffset: destination)
+                    model.setManualOrder(ids)
+                }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
         }
     }
 
     @ViewBuilder
     private var footer: some View {
         let hiddenLive = model.hiddenCount(among: model.liveAgentIDs)
-        if hiddenLive > 0 {
+        // Only offer "Reset order" when there's actually a list to reorder (not
+        // floating over a degraded "No terminals / agents" state).
+        let showReset = model.hasManualOrder && !model.entries.isEmpty
+        if hiddenLive > 0 || showReset {
             HStack {
-                Button {
-                    showHiddenPopover.toggle()
-                } label: {
-                    Label("\(hiddenLive) hidden", systemImage: "eye.slash")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .popover(isPresented: $showHiddenPopover) {
-                    hiddenPopover
+                if hiddenLive > 0 {
+                    Button {
+                        showHiddenPopover.toggle()
+                    } label: {
+                        Label("\(hiddenLive) hidden", systemImage: "eye.slash")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $showHiddenPopover) {
+                        hiddenPopover
+                    }
                 }
                 Spacer()
+                if showReset {
+                    // Escape hatch from a manual drag order back to the automatic
+                    // attention-first / recent-activity sort.
+                    Button {
+                        model.resetOrder()
+                    } label: {
+                        Label("Reset order", systemImage: "arrow.up.arrow.down")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Clear your manual order and sort by recent activity")
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)

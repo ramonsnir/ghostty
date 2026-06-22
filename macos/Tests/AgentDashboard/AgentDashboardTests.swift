@@ -645,6 +645,118 @@ struct AgentDashboardSortTests {
         let sorted = AgentDashboardModel.sorted(entries, lastSeen: lastSeen).map(\.id)
         #expect(sorted.first == ringOld)
     }
+
+    // MARK: - Manual order (ramon fork / Agent Dashboard)
+
+    private func entry(_ id: UUID, session: UInt64, bell: Bool = false, waiting: Bool = false) -> AgentEntry {
+        .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
+              bell: bell, hidden: false, sessionID: session,
+              agentState: waiting ? .waiting : nil,
+              lastTool: nil, lastPrompt: nil, hookBacked: false)
+    }
+
+    @Test func manualRankOrdersPlacedTiles() {
+        // All placed (sessions present in manualRank), no attention, equal
+        // recency: order follows the manual rank, NOT UUID.
+        let a = UUID(), b = UUID(), c = UUID()
+        let entries = [entry(a, session: 10), entry(b, session: 20), entry(c, session: 30)]
+        let rank: [UInt64: Int] = [30: 0, 10: 1, 20: 2]
+        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.sessionID)
+        #expect(sorted == [30, 10, 20])
+    }
+
+    @Test func unplacedTileFloatsAbovePlaced() {
+        // A tile with no manual rank (a freshly-appeared agent) sorts ABOVE the
+        // placed ones — the "new agents at top" choice.
+        let a = UUID(), b = UUID(), fresh = UUID()
+        let entries = [entry(a, session: 1), entry(b, session: 2), entry(fresh, session: 99)]
+        let rank: [UInt64: Int] = [1: 0, 2: 1]   // 99 is unplaced
+        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.sessionID)
+        #expect(sorted == [99, 1, 2])
+    }
+
+    @Test func attentionOutranksManualOrder() {
+        // A waiting tile placed LAST in the manual order still floats to the top.
+        let a = UUID(), b = UUID(), wait = UUID()
+        let entries = [
+            entry(a, session: 1),
+            entry(b, session: 2),
+            entry(wait, session: 3, waiting: true),
+        ]
+        let rank: [UInt64: Int] = [1: 0, 2: 1, 3: 2]
+        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank)
+        #expect(sorted.first?.id == wait)
+    }
+
+    @Test func sessionZeroIsNeverPlaced() {
+        // A sessionless tile (id 0) is treated as unplaced even if a rank for 0
+        // somehow exists — it can't be ordered stably, so it floats up (unplaced)
+        // and never sorts by the bogus rank.
+        let zero = UUID(), placed = UUID()
+        let entries = [entry(placed, session: 5), entry(zero, session: 0)]
+        let rank: [UInt64: Int] = [0: 9, 5: 0]
+        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.sessionID)
+        #expect(sorted == [0, 5])
+    }
+}
+
+// MARK: - Manual order: model round-trip (ramon fork / Agent Dashboard)
+
+@MainActor
+struct AgentDashboardManualOrderModelTests {
+    private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
+        pairs.map { .init(id: $0.0, view: nil, title: "t", pwd: "/x", sessionID: $0.1) }
+    }
+    private func agents(_ ids: [UUID]) -> [UUID: AgentKind] {
+        Dictionary(uniqueKeysWithValues: ids.map { ($0, AgentKind("claude")) })
+    }
+
+    @Test func setManualOrderPersistsAndReorders() {
+        let store = InMemoryOrderStore()
+        let model = AgentDashboardModel(store: InMemoryHideStore(), orderStore: store)
+        let a = UUID(), b = UUID(), c = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2), (c, 3)]))
+        model.applyAgents(agents([a, b, c]))
+        model.setManualOrder([3, 1, 2])
+        #expect(model.manualOrder == [3, 1, 2])
+        #expect(store.load() == [3, 1, 2])           // persisted
+        #expect(model.entries.map(\.sessionID) == [3, 1, 2])
+        #expect(model.hasManualOrder)
+    }
+
+    @Test func sessionlessTilesDroppedFromOrder() {
+        let store = InMemoryOrderStore()
+        let model = AgentDashboardModel(store: InMemoryHideStore(), orderStore: store)
+        model.setManualOrder([0, 5, 0, 7])
+        #expect(model.manualOrder == [5, 7])
+        #expect(store.load() == [5, 7])
+    }
+
+    @Test func resetOrderClearsAndPersists() {
+        let store = InMemoryOrderStore([9, 8, 7])
+        let model = AgentDashboardModel(store: InMemoryHideStore(), orderStore: store)
+        #expect(model.manualOrder == [9, 8, 7])      // loaded from the store at init
+        #expect(model.hasManualOrder)
+        model.resetOrder()
+        #expect(model.manualOrder.isEmpty)
+        #expect(store.load().isEmpty)
+        #expect(!model.hasManualOrder)
+    }
+
+    @Test func newAgentFloatsAbovePlacedAfterRebuild() {
+        let store = InMemoryOrderStore()
+        let model = AgentDashboardModel(store: InMemoryHideStore(), orderStore: store)
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))
+        model.setManualOrder([1, 2])
+        #expect(model.entries.map(\.sessionID) == [1, 2])
+        // A new agent (session 3) appears: it's unplaced, so it floats to the top.
+        let c = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2), (c, 3)]))
+        model.applyAgents(agents([a, b, c]))
+        #expect(model.entries.map(\.sessionID) == [3, 1, 2])
+    }
 }
 
 // MARK: - Hook agent-state model transitions (ramon fork / Agent hooks)
