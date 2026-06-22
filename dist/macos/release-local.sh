@@ -43,6 +43,13 @@ xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 \
   || { echo "ERROR: notary profile '$NOTARY_PROFILE' missing. Create it once:"; \
        echo "  xcrun notarytool store-credentials \"$NOTARY_PROFILE\" --key <AuthKey.p8> --key-id <KEYID> --issuer <ISSUER>"; exit 1; }
 
+# All transient artifacts (notarize zip, DMG, appcast, sign_update) live in a temp
+# dir and are auto-removed on exit, so a run — even one that fails mid-notarization —
+# NEVER dirties the repo working tree. (The canonical DMG/appcast live on the
+# GitHub Release; the build outputs in macos/build + zig-out are gitignored.)
+WORKDIR="$(mktemp -d)"
+trap 'rm -rf "$WORKDIR"' EXIT
+
 GHOSTTY_BUILD="$(git rev-list --count HEAD)"
 GHOSTTY_COMMIT="$(git rev-parse --short HEAD)"
 TAG="build-${GHOSTTY_BUILD}"
@@ -90,41 +97,40 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 
 # ---- 6. notarize + staple the app (so the app inside the DMG is offline-ok) -
 echo ">> [6/8] notarize + staple app (Apple's free service; may be slow)"
-ditto -c -k --keepParent "$APP" notarize-app.zip
-xcrun notarytool submit notarize-app.zip --keychain-profile "$NOTARY_PROFILE" --wait --timeout 60m
+ditto -c -k --keepParent "$APP" "$WORKDIR/notarize-app.zip"
+xcrun notarytool submit "$WORKDIR/notarize-app.zip" --keychain-profile "$NOTARY_PROFILE" --wait --timeout 60m
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
-rm -f notarize-app.zip
 
 # ---- 7. DMG from the stapled app, then notarize + staple the DMG -----------
 echo ">> [7/8] create + notarize DMG"
-rm -rf dmgout && mkdir dmgout
-create-dmg --identity="$IDENTITY" "$APP" dmgout || true
+DMG="$WORKDIR/Ghostty.dmg"
+create-dmg --identity="$IDENTITY" "$APP" "$WORKDIR" || true
 shopt -s nullglob
-dmgs=( dmgout/Ghostty*.dmg )
+dmgs=( "$WORKDIR"/Ghostty*.dmg )
 [ ${#dmgs[@]} -eq 1 ] || { echo "ERROR: create-dmg did not produce exactly one DMG (${#dmgs[@]})"; exit 1; }
-mv "${dmgs[0]}" Ghostty.dmg
-rm -rf dmgout
-xcrun notarytool submit Ghostty.dmg --keychain-profile "$NOTARY_PROFILE" --wait --timeout 60m
-xcrun stapler staple Ghostty.dmg
-xcrun stapler validate Ghostty.dmg
+mv "${dmgs[0]}" "$DMG"
+xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait --timeout 60m
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
 
 # ---- 8. signed appcast + publish -------------------------------------------
 echo ">> [8/8] appcast + GitHub Release"
-sign_update Ghostty.dmg > sign_update.txt   # uses the keychain-stored Sparkle key
+sign_update "$DMG" > "$WORKDIR/sign_update.txt"   # uses the keychain-stored Sparkle key
 export GHOSTTY_BUILD GHOSTTY_COMMIT
 export GHOSTTY_DMG_URL="https://github.com/$REPO/releases/download/$TAG/Ghostty.dmg"
 export GHOSTTY_PUBDATE="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
 export GHOSTTY_MIN_MACOS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST" 2>/dev/null || echo 13.0)"
+export SIGN_UPDATE_FILE="$WORKDIR/sign_update.txt"
+export APPCAST_OUT="$WORKDIR/appcast.xml"
 python3 dist/macos/fork_appcast.py
-test -f appcast.xml
+test -f "$WORKDIR/appcast.xml"
 
 # Idempotent publish (no destructive delete window).
 gh release create "$TAG" --repo "$REPO" \
   --title "Ghostty (ramon) build $GHOSTTY_BUILD ($GHOSTTY_COMMIT)" \
   --notes "Local fork build from $GHOSTTY_COMMIT." --latest 2>/dev/null || true
-gh release upload "$TAG" Ghostty.dmg appcast.xml --repo "$REPO" --clobber
+gh release upload "$TAG" "$DMG" "$WORKDIR/appcast.xml" --repo "$REPO" --clobber
 gh release edit   "$TAG" --repo "$REPO" --latest
 
-rm -f sign_update.txt
 echo ">> DONE: https://github.com/$REPO/releases/tag/$TAG"
