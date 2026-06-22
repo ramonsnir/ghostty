@@ -868,7 +868,13 @@ this macOS); `nushell` for `build.nu`.
    xattr -cr "$APP"                          # codesign rejects provenance xattrs
    codesign --force --deep --sign - "$APP"
    ```
-   Never touch `/Applications/Ghostty.app`.
+   Note this is NOT a straight copy: ReleaseLocal is its OWN identity ("Ghostty
+   (ramon-local)", bundle id `…ghostty-ramon.local`, MCP/web-monitor ports `+1`,
+   `paper` icon). The two `PlistBuddy` lines **re-stamp it INTO the Release identity**
+   by overwriting `CFBundleIdentifier` → `com.mitchellh.ghostty-ramon` + the display
+   name; everything else identity-derived (the MCP/web-monitor port offset and the
+   runtime icon swap) keys off the bundle id at launch, so that one re-stamp converts
+   the whole identity to Release (`+0`, `chalkboard`). Never touch `/Applications/Ghostty.app`.
 
    **Host code changed too?** The installed app and `ghostty-host` are SEPARATE
    deploys. If your change touched anything the host runs (`src/host/`,
