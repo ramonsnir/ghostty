@@ -831,6 +831,16 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Agent Dashboard) Pin the panel above other windows
+        // (floating window level). Default false. Read at launch.
+        var agentDashboardPin: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-dashboard-pin"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Dashboard, Layer 3) Executable basenames treated
         // as CLI agents by the detector. The Zig field defaults empty; the
         // user-facing default `claude,codex` is substituted here when unset.

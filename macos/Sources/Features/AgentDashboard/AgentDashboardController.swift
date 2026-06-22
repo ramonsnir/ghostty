@@ -558,7 +558,7 @@ final class AgentDashboardController: NSWindowController {
             agentStateStore: UserDefaultsAgentStateStore())
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
-        let panel = AgentDashboardPanel()
+        let panel = AgentDashboardPanel(pinned: ghostty.config.agentDashboardPin)
         super.init(window: panel)
 
         let host = NSHostingView(rootView: AgentDashboardView(
