@@ -299,6 +299,14 @@ struct AgentPreviewTile: View {
             AgentMirrorPreview(ghostty: ghostty, sessionID: entry.sessionID, realSurface: realView)
                 .frame(maxWidth: .infinity)
                 .frame(height: Self.previewHeight)
+                // Fill the whole preview rectangle with the THEME terminal
+                // background so a split narrower than `referenceColumns` (which
+                // renders left-aligned with empty space on the right — see
+                // AgentMirrorPreview) blends seamlessly into the mirror instead of
+                // showing the tile's control-background. Read from config (the
+                // `background` color), never hard-coded; the mirror surface paints
+                // the same color under its cells, so the seam is invisible.
+                .background(ghostty.config.backgroundColor)
                 .clipped()
                 // Re-create the mirror SurfaceView if the session id changes for a
                 // stable tile id (the @StateObject is otherwise keyed only by the
