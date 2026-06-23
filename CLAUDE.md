@@ -646,6 +646,23 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     a success result). Regression test: `index.test.ts` "manager is NOT starved when the
     summarizer budget is exhausted". Deploy is a sidecar rebuild + restart only (the GUI's
     `AgentManagerController` respawns it from the repo `dist` — no app relaunch).
+  - **QUALITY — directive-or-ABSTAIN (stop the filler).** The manager used to pad with
+    pleasantries ("OK, thanks", "yes, I'll do that") because `MANAGER_BASE_PROMPT` told it to
+    "propose a safe, conservative reply" even when the goals didn't determine one. Now the
+    prompt says: PROPOSE a reply ONLY if it (a) answers a blocked question, (b) makes a needed
+    decision, or (c) gives concrete next direction — AND is GROUNDED in the goals/screen;
+    OTHERWISE **ABSTAIN** by returning an EMPTY suggestion (`{"suggestion":"","confidence":0}`),
+    which `parseSuggestion` maps to null → the loop writes NOTHING (silent; the tile shows just
+    the summary). Acknowledgments are explicitly banned. **Code backstop:**
+    `ManagerConfig.suppressBelow` (default 0.35) — `manageOne` treats a parsed suggestion rated
+    below the floor as an abstain (write nothing, debounce), so padding the model rates low is
+    suppressed even if it doesn't emit the empty form; the tile's `CONF_DIM_THRESHOLD` (0.5)
+    then dims the 0.35-0.5 band that IS shown. Net: substantive/directive suggestions or
+    silence — no filler. Tunable live via the `manager.md` override. Tests: `index.test.ts`
+    (low-confidence SUPPRESSED + empty-suggestion ABSTAIN write nothing). Verified live (a
+    busy fleet now yields directive suggestions + silent abstentions, no "OK thanks"). NOTE:
+    `error_max_turns` still occurs intermittently even at `maxTurns:3` (summarizer path) — it
+    is caught + skipped, harmless, and a separate lower-priority SDK quirk.
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

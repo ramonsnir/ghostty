@@ -265,8 +265,18 @@ async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
     const raw = await deps.suggest({ system, user, model: deps.managerModel });
     const parsed = parseSuggestion(raw);
     if (!parsed) {
+      // ABSTAIN: empty/unparseable reply (the prompt's empty-suggestion abstain lands
+      // here) — write NOTHING, just throttle the retry.
       recordAttempt();
-      errlog(`surface ${surface.id}: manager reply not parseable; skipping`);
+      return;
+    }
+    if (parsed.confidence < deps.managerCfg.suppressBelow) {
+      // The model padded with a low-value reply but rated it low (per the prompt) —
+      // SUPPRESS it (treat as abstain): show nothing rather than filler. Throttle.
+      recordAttempt();
+      log(
+        `surface ${surface.id}: suggestion suppressed (conf ${parsed.confidence.toFixed(2)} < ${deps.managerCfg.suppressBelow})`,
+      );
       return;
     }
 

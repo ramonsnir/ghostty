@@ -54,6 +54,13 @@ export interface ManagerConfig {
    *  the bug where, with ≥summarizer-cap due summaries every sweep, the manager
    *  pass got zero slots and never proposed. Default 4. */
   maxConcurrent: number;
+  /** SUPPRESS floor: a parsed suggestion whose confidence is BELOW this is treated
+   *  as an abstain — NOT written, so the tile shows nothing (the prompt already asks
+   *  the model to abstain via an empty suggestion when it would only pad; this is the
+   *  code backstop for when it pads anyway with a low self-rating). Default 0.35;
+   *  the tile's own dim threshold (0.5) then de-emphasizes the 0.35-0.5 band that IS
+   *  shown. Set to 0 to disable suppression (show everything the model returns). */
+  suppressBelow: number;
 }
 
 export const DEFAULT_MANAGER_CONFIG: ManagerConfig = {
@@ -61,6 +68,7 @@ export const DEFAULT_MANAGER_CONFIG: ManagerConfig = {
   promptTailLines: 60,
   fingerprintTailLines: 30,
   maxConcurrent: 4,
+  suppressBelow: 0.35,
 };
 
 /** A point-in-time view of one surface, enriched with its viewport text. */
