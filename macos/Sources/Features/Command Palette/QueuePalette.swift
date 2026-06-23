@@ -45,7 +45,16 @@ struct QueuePaletteView: View {
 
     var body: some View {
         ZStack {
-            if isPresented {
+            // The param FORM is shown whenever a prompt is pending — INDEPENDENT of
+            // `isPresented`. This is load-bearing: `CommandPaletteView` sets the bound
+            // `isPresented = false` BEFORE running the selected option's action (see
+            // CommandPalette.swift), so by the time the option sets `prompt.active` the
+            // picker has already dismissed. Gating the form on `isPresented` would mean it
+            // never appears (and the onChange would clear `prompt.active`). The QueuePalette
+            // view is always mounted (TerminalView gates it via this same `isPresented`
+            // binding but keeps the view in the hierarchy), so its `@StateObject` survives
+            // the flip and the form can render after the picker closes.
+            if isPresented || prompt.active != nil {
                 GeometryReader { geometry in
                     VStack {
                         Spacer().frame(height: geometry.size.height * 0.05)
@@ -57,14 +66,10 @@ struct QueuePaletteView: View {
                             QueueParamFormView(
                                 prompt: active,
                                 backgroundColor: ghosttyConfig.backgroundColor,
-                                onCancel: {
-                                    prompt.active = nil
-                                    isPresented = false
-                                },
+                                onCancel: { closeForm() },
                                 onStart: { values in
                                     Self.postStart(template: active.template, params: values)
-                                    prompt.active = nil
-                                    isPresented = false
+                                    closeForm()
                                 }
                             )
                             .frame(maxWidth: 560)
@@ -85,14 +90,32 @@ struct QueuePaletteView: View {
             }
         }
         .onChange(of: isPresented) { newValue in
-            // When the palette disappears, send focus back to the surface view we
-            // were overlaid on top of, and clear any pending param prompt.
-            if !newValue {
+            if newValue {
+                // Fresh open of the picker — clear any stale pending prompt.
                 prompt.active = nil
+            } else {
+                // The picker closed. Return focus to the surface ONLY if no param form is
+                // (about to be) shown. Defer to the next runloop tick: when an option fires,
+                // CommandPaletteView sets isPresented=false and THEN runs the action that
+                // sets prompt.active synchronously — so by the time this async block runs,
+                // prompt.active reflects whether a form is pending.
                 DispatchQueue.main.async {
-                    surfaceView.window?.makeFirstResponder(surfaceView)
+                    if prompt.active == nil {
+                        surfaceView.window?.makeFirstResponder(surfaceView)
+                    }
                 }
             }
+        }
+    }
+
+    /// Dismiss the param form: clear the pending prompt, ensure the palette binding is
+    /// closed, and return focus to the surface (the picker already set isPresented=false,
+    /// so its onChange won't fire again — return focus here explicitly).
+    private func closeForm() {
+        prompt.active = nil
+        isPresented = false
+        DispatchQueue.main.async {
+            surfaceView.window?.makeFirstResponder(surfaceView)
         }
     }
 
