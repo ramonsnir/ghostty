@@ -91,13 +91,13 @@ test("ConcurrencyBudget caps acquisitions and releases", () => {
 
 test("selectCandidates: within-tick dedup — same key twice in one list dispatched once", () => {
   const items = [item("K-1"), item("K-1"), item("K-2")];
-  const out = selectCandidates(items, new Map(), new Map(), 0, 10, 10);
+  const out = selectCandidates(items, new Map(), new Map(), new Set(), 0, 10, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-1", "K-2"]);
 });
 
 test("selectCandidates: a key already in the active set is skipped (cross-restart dedup)", () => {
   const active = activeSetFromKept([asgn({ key: "K-1" })]);
-  const out = selectCandidates([item("K-1"), item("K-2")], active, new Map(), 0, 10, 10);
+  const out = selectCandidates([item("K-1"), item("K-2")], active, new Map(), new Set(), 0, 10, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-2"]);
 });
 
@@ -106,30 +106,51 @@ test("selectCandidates: a key in cooldown (future until) is skipped; expired is 
     ["K-1", 5000], // future at now=1000
     ["K-2", 500], // expired at now=1000
   ]);
-  const out = selectCandidates([item("K-1"), item("K-2")], new Map(), cooldown, 1000, 10, 10);
+  const out = selectCandidates([item("K-1"), item("K-2")], new Map(), cooldown, new Set(), 1000, 10, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-2"]);
+});
+
+test("selectCandidates: a key in the dispatched LATCH is skipped (§7.1) — even with no cooldown and slots free", () => {
+  const dispatched = new Set<string>(["K-1"]);
+  const out = selectCandidates([item("K-1"), item("K-2")], new Map(), new Map(), dispatched, 1000, 10, 10);
+  assert.deepEqual(out.map((i) => i.key), ["K-2"], "K-1 suppressed by the latch; K-2 eligible");
+});
+
+test("selectCandidates: a latched key is eligible again ONCE removed from the latch (re-arm)", () => {
+  const dispatched = new Set<string>(["K-1"]);
+  // Before re-arm: suppressed.
+  assert.deepEqual(
+    selectCandidates([item("K-1")], new Map(), new Map(), dispatched, 1000, 10, 10).map((i) => i.key),
+    [],
+  );
+  // After re-arm (the dispatch sweep clears it when a successful list omits the key):
+  dispatched.delete("K-1");
+  assert.deepEqual(
+    selectCandidates([item("K-1")], new Map(), new Map(), dispatched, 1000, 10, 10).map((i) => i.key),
+    ["K-1"],
+  );
 });
 
 test("selectCandidates: respects the remainingSlots cap (concurrency/grid)", () => {
   const items = [item("K-1"), item("K-2"), item("K-3")];
-  const out = selectCandidates(items, new Map(), new Map(), 0, 2, 10);
+  const out = selectCandidates(items, new Map(), new Map(), new Set(), 0, 2, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-1", "K-2"]);
 });
 
 test("selectCandidates: respects the maxItemsRemaining (lifetime) clamp", () => {
   const items = [item("K-1"), item("K-2"), item("K-3")];
-  const out = selectCandidates(items, new Map(), new Map(), 0, 10, 1);
+  const out = selectCandidates(items, new Map(), new Map(), new Set(), 0, 10, 1);
   assert.deepEqual(out.map((i) => i.key), ["K-1"]);
 });
 
 test("selectCandidates: a non-positive cap yields nothing", () => {
-  assert.deepEqual(selectCandidates([item("K-1")], new Map(), new Map(), 0, 0, 10), []);
-  assert.deepEqual(selectCandidates([item("K-1")], new Map(), new Map(), 0, 10, 0), []);
-  assert.deepEqual(selectCandidates([item("K-1")], new Map(), new Map(), 0, -3, 10), []);
+  assert.deepEqual(selectCandidates([item("K-1")], new Map(), new Map(), new Set(), 0, 0, 10), []);
+  assert.deepEqual(selectCandidates([item("K-1")], new Map(), new Map(), new Set(), 0, 10, 0), []);
+  assert.deepEqual(selectCandidates([item("K-1")], new Map(), new Map(), new Set(), 0, -3, 10), []);
 });
 
 test("selectCandidates: keyless items are never dispatched", () => {
-  const out = selectCandidates([{ key: "" }, item("K-2")], new Map(), new Map(), 0, 10, 10);
+  const out = selectCandidates([{ key: "" }, item("K-2")], new Map(), new Map(), new Set(), 0, 10, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-2"]);
 });
 
@@ -150,7 +171,7 @@ test("cross-restart dedup: reconcile re-adopts a live key, then selectCandidates
   assert.ok(active.has("K-LIVE")); // re-adopted, not lost
 
   // The fresh list still includes K-LIVE — it must NOT be re-dispatched.
-  const out = selectCandidates([item("K-LIVE"), item("K-NEW")], active, new Map(), 1000, 10, 10);
+  const out = selectCandidates([item("K-LIVE"), item("K-NEW")], active, new Map(), new Set(), 1000, 10, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-NEW"]); // zero double-dispatch
 });
 
@@ -445,12 +466,12 @@ test("cooldown: a finished key blocks immediate re-dispatch then becomes eligibl
   cooldown.set("K-DONE", cooldownUntil(now, 2000)); // until = 3000
 
   // Immediately after finishing: blocked.
-  let out = selectCandidates([item("K-DONE")], new Map(), cooldown, now + 1, 10, 10);
+  let out = selectCandidates([item("K-DONE")], new Map(), cooldown, new Set(), now + 1, 10, 10);
   assert.deepEqual(out, []);
   assert.ok(!cooldownExpired(cooldown, "K-DONE", now + 1));
 
   // After the window: eligible again (re-picks a reopened item).
-  out = selectCandidates([item("K-DONE")], new Map(), cooldown, 3001, 10, 10);
+  out = selectCandidates([item("K-DONE")], new Map(), cooldown, new Set(), 3001, 10, 10);
   assert.deepEqual(out.map((i) => i.key), ["K-DONE"]);
   assert.ok(cooldownExpired(cooldown, "K-DONE", 3001));
 });

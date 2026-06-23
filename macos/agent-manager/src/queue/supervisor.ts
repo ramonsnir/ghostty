@@ -57,6 +57,12 @@ export class ConcurrencyBudget {
  *   - its key is in `cooldown` with an `until` strictly in the future (`nowMs <
  *     until`) — a just-finished key is held so a stale `list` can't immediately
  *     re-dispatch it (§6 COOLDOWN); an expired cooldown entry no longer blocks;
+ *   - its key is in the `dispatched` LATCH (§7.1) — it was already dispatched and has
+ *     NOT yet left the actionable `list` since. The latch is cleared by the caller only
+ *     when a SUCCESSFUL `list` no longer reports the key (it left the actionable set);
+ *     until then a re-dispatch is BLOCKED ENTIRELY (not merely time-cooled), so a kill
+ *     BEFORE the agent claims its item — the item still in the list — is never re-grabbed.
+ *     Re-arm requires the item to leave the list and return (a real status round-trip);
  *   - a DUPLICATE key already chosen earlier in THIS selection round (a flaky
  *     provider can emit the same key twice in one list — we dispatch it once).
  *
@@ -78,6 +84,7 @@ export function selectCandidates(
   items: WorkItem[],
   active: Map<string, Assignment>,
   cooldown: Map<string, number>,
+  dispatched: ReadonlySet<string>,
   nowMs: number,
   remainingSlots: number,
   maxItemsRemaining: number,
@@ -93,6 +100,7 @@ export function selectCandidates(
     const key = item.key;
     if (typeof key !== "string" || key.length === 0) continue; // never dispatch keyless
     if (active.has(key)) continue; // already running/tracked (within-tick + cross-restart)
+    if (dispatched.has(key)) continue; // §7.1 latch: dispatched + not yet left the list
     if (chosenKeys.has(key)) continue; // duplicate key in this same list
     const until = cooldown.get(key);
     if (until !== undefined && nowMs < until) continue; // cooling down

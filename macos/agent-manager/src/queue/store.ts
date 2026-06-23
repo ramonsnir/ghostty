@@ -47,6 +47,14 @@ export interface StoreFile {
   version: 1;
   records: Assignment[];
   lifetimeDispatched: number;
+  /** The DISPATCHED-LATCH key set (§7.1): every work-item key the run has dispatched and
+   *  not yet re-armed. A key here is SUPPRESSED from re-dispatch until a SUCCESSFUL `list`
+   *  no longer reports it (it left the actionable set — claimed/blocked/labeled/moved off
+   *  the queried state) and it later reappears. Persisted so the suppression survives a
+   *  sidecar/GUI restart — a kill BEFORE the agent claims its item (the item still in the
+   *  list) must NOT be re-grabbed on the next sweep just because its key is still actionable.
+   *  Additive (absent in a pre-upgrade file → an empty latch, the prior behavior). */
+  dispatched: string[];
 }
 
 /** The current store schema version. */
@@ -88,12 +96,21 @@ export function parseStore(text: string | null): Assignment[] {
 export function serializeStore(
   records: Assignment[],
   lifetimeDispatched = 0,
+  dispatched: string[] = [],
 ): string {
   const lifetime =
     Number.isFinite(lifetimeDispatched) && lifetimeDispatched > 0
       ? Math.floor(lifetimeDispatched)
       : 0;
-  const file: StoreFile = { version: STORE_VERSION, records, lifetimeDispatched: lifetime };
+  // Sanitize the latch: non-empty strings only, deduped, stable order — defends the file
+  // against a hand-edit and keeps the serialization deterministic for tests.
+  const latch = [...new Set(dispatched.filter((k) => typeof k === "string" && k.length > 0))];
+  const file: StoreFile = {
+    version: STORE_VERSION,
+    records,
+    lifetimeDispatched: lifetime,
+    dispatched: latch,
+  };
   return JSON.stringify(file, null, 2);
 }
 
@@ -130,6 +147,42 @@ export function loadLifetimeDispatched(io: StoreIO): number {
     return 0;
   }
   return parseLifetimeDispatched(text);
+}
+
+/**
+ * Parse the persisted DISPATCHED-LATCH key set (§7.1). PURE + TOLERANT. A null/empty
+ * input (first run), unparseable JSON, a wrong-shaped object, or a missing / non-array
+ * `dispatched` all yield `[]` (an empty latch — the safe pre-upgrade default, which simply
+ * means "nothing suppressed yet"). Non-string / empty entries are dropped; the result is
+ * deduped. Read alongside `parseStore` on the first reconcile to rehydrate the latch across
+ * a restart so a kill-before-claim item stays suppressed.
+ */
+export function parseDispatched(text: string | null): string[] {
+  if (text === null || text.trim().length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return [];
+  }
+  const arr = (parsed as { dispatched?: unknown }).dispatched;
+  if (!Array.isArray(arr)) return [];
+  return [...new Set(arr.filter((k): k is string => typeof k === "string" && k.length > 0))];
+}
+
+/** Read + parse the persisted dispatched-latch set via the seam. Returns `[]` on any
+ *  read/parse failure; never throws into the loop. */
+export function loadDispatched(io: StoreIO): string[] {
+  let text: string | null;
+  try {
+    text = io.read();
+  } catch {
+    return [];
+  }
+  return parseDispatched(text);
 }
 
 /** Coerce arbitrary parsed JSON into a valid Assignment, or null when it lacks the
@@ -201,9 +254,10 @@ export function persistStore(
   io: StoreIO,
   records: Assignment[],
   lifetimeDispatched = 0,
+  dispatched: string[] = [],
 ): boolean {
   try {
-    io.write(serializeStore(records, lifetimeDispatched));
+    io.write(serializeStore(records, lifetimeDispatched, dispatched));
     return true;
   } catch {
     return false;

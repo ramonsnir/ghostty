@@ -787,6 +787,30 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     prune is grace-gated against a one-sweep `list_surfaces` lag. (These three — the lag grace,
     orphan grid-slot reclamation, and the `sessionID:0` self-disable — were the adversarial-
     review blockers; all fixed + regression-tested.)
+  - **DISPATCH LATCH (§7.1) — block re-dispatch ENTIRELY until the item leaves the list and
+    returns.** The ~2-min `cooldown` is NOT enough on its own: the dispatch→claim gap is
+    HUMAN-GATED (the agent waits for the user's go-ahead before `/todo claim`, which is what
+    moves the item off the queried state), so a split KILLED in that window leaves the item
+    STILL in the `list` — and the cooldown would expire and re-grab it (and a restart drops the
+    cooldown map → re-grab immediately). So every dispatched key joins a PERSISTED `dispatched`
+    latch (`QueueRun.dispatched`, in the per-run store file); `selectCandidates` suppresses any
+    latched key OUTRIGHT (not time-cooled). The latch is RE-ARMED (cleared) only when a
+    SUCCESSFUL `list` no longer reports the key (it left the actionable set — claimed / blocked /
+    labeled / moved off the queried state); a FAILED list never re-arms (no false re-enable on a
+    transient provider error). So re-dispatch requires a real **status round-trip** (leave the
+    list, return) — the user's explicit "block it off unless it literally changes status and back
+    to Todo." BEHAVIOR CHANGE this subsumes: a crashed (EXITED) agent whose item stays listed is
+    no longer auto-retried after cooldown — it needs the round-trip too (a crashed agent is not
+    blindly re-run on the same item). Latched at dispatch intent (rolled back only if the spawn
+    itself fails), persisted on every store write, rehydrated on the first reconcile (so the
+    suppression survives a sidecar/GUI restart), and cleared on `abort` (a deliberate re-start is
+    fresh). Wiring: `store.ts` (`StoreFile.dispatched` + `serializeStore`/`parseDispatched`/
+    `loadDispatched` + `persistStore` 4th arg), `supervisor.ts` (`selectCandidates` `dispatched`
+    param), `runner.ts` (`QueueRun.dispatched` + latch add/rollback in `dispatchOne` + re-arm in
+    `dispatchCandidates` + rehydrate on first reconcile). Tests: `store.test.ts`
+    (serialize/parse/persist round-trips + tolerance), `supervisor.test.ts` (`selectCandidates`
+    latch skip + re-arm), `runner.test.ts` (kill-before-claim NOT re-dispatched w/o a round-trip,
+    crashed-EXITED cooled-then-latched, latch persists across restart).
   - **ON-DEMAND lifecycle via a GUI→sidecar COMMAND CHANNEL** (§8a) — the sidecar is the MCP
     CLIENT so the GUI can't push; commands are DRAINED. `MCPServer` holds a thread-safe FIFO
     (enqueued on its serial queue via a `.ghosttyQueueCommand` observer the palette/dashboard

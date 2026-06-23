@@ -56,6 +56,7 @@ import {
   activeSetFromKept,
   finalizeRecord,
   loadLifetimeDispatched,
+  loadDispatched,
   loadStore,
   makePendingRecord,
   persistStore,
@@ -103,6 +104,18 @@ export interface QueueRun {
   active: Map<string, Assignment>;
   /** Per-key cooldown `until` timestamps (§6). */
   cooldown: Map<string, number>;
+  /** (§7.1) The DISPATCHED LATCH: every work-item key dispatched and not yet re-armed.
+   *  `selectCandidates` SUPPRESSES any key in here — a re-dispatch is BLOCKED ENTIRELY
+   *  (not merely time-cooled like `cooldown`) until a SUCCESSFUL `list` no longer reports
+   *  the key (it left the actionable set), at which point the dispatch sweep clears it; if
+   *  the key later REAPPEARS in the list it is eligible again. This closes the
+   *  kill-before-claim hole: the dispatch→claim gap is human-gated (the agent waits for
+   *  the user's go-ahead before it claims, which is what moves the item off the queried
+   *  state), so a split killed in that window leaves the item STILL actionable — the
+   *  ~2-min cooldown would expire and re-grab it. The latch instead requires a real status
+   *  round-trip (leave the list, return) to re-arm. Persisted + rehydrated on the first
+   *  reconcile so the suppression survives a sidecar/GUI restart. */
+  dispatched: Set<string>;
   /** Per-key idle-debounce anchor (ms the agentState last BECAME idle, §10). */
   idleAnchor: Map<string, number | undefined>;
   /** Per-key close-sequence progress (§10). Once an assignment enters CLOSING the loop
@@ -172,6 +185,7 @@ export function makeQueueRun(
     storeIO,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
+    dispatched: new Set<string>(),
     idleAnchor: new Map<string, number | undefined>(),
     closeAwait: new Map<string, { exitKeysSent: boolean; sinceMs: number }>(),
     lifetimeDispatched: 0,
@@ -387,8 +401,12 @@ async function abortRun(run: QueueRun, surfaces: Surface[], deps: QueueDeps): Pr
   run.active.clear();
   run.idleAnchor.clear();
   run.closeAwait.clear();
+  // Abort is a full teardown — also drop the §7.1 dispatch latch so a DELIBERATE re-start
+  // of this template begins fresh (an aborted item still in the list is re-dispatchable
+  // again), matching the records being cleared here.
+  run.dispatched.clear();
   // Clear the durable assignment store so a restart won't re-adopt the closed panes.
-  persistStore(run.storeIO, [], run.lifetimeDispatched);
+  persistStore(run.storeIO, [], run.lifetimeDispatched, []);
 }
 
 /** Whether an assignment OCCUPIES a concurrency + grid slot. PURE. An EXITED
@@ -459,6 +477,10 @@ async function runOne(
   if (!run.reconciledOnce) {
     const persisted = loadLifetimeDispatched(run.storeIO);
     if (persisted > run.lifetimeDispatched) run.lifetimeDispatched = persisted;
+    // Rehydrate the dispatched LATCH (§7.1) too: a kill-before-claim item is still in the
+    // actionable `list`, so without restoring the latch the first post-restart dispatch
+    // sweep would re-grab it. Union into whatever the fresh run already holds (empty here).
+    for (const k of loadDispatched(run.storeIO)) run.dispatched.add(k);
   }
 
   // Rebuild the in-memory active set from the kept records BEFORE any dispatch.
@@ -495,7 +517,7 @@ async function runOne(
       );
     }
   }
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
   run.reconciledOnce = true;
 
   // --- 2) ADVANCE active assignment states ----------------------------------------
@@ -668,7 +690,7 @@ async function advanceStates(
       }
     }
   }
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
+  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +781,7 @@ async function runCloseSequences(
     }
     // else: still within the await window and not yet exited → keep polling next sweep.
   }
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
+  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
 }
 
 /** Move a closed assignment to FINISHED and start its key's COOLDOWN, freeing the
@@ -802,6 +824,26 @@ async function dispatchCandidates(
     const res = await fetchListResult(t.provider.list, deps.exec, { cwd: t.workdir });
     items = res.items;
     run.sawEmptyListThisSweep = res.ok && res.items.length === 0;
+    // RE-ARM the §7.1 dispatch latch: a previously-dispatched key that a SUCCESSFUL list no
+    // longer reports has LEFT the actionable set (claimed/blocked/labeled/moved off the
+    // queried state) — clear it so it is eligible again IF it later reappears. Only a
+    // SUCCESSFUL list re-arms (`res.ok`); a failed/skipped list must NEVER clear the latch,
+    // else a transient provider error would re-enable a killed-before-claim item. A
+    // successful EMPTY list re-arms ALL latched keys (every one has left the set) — done
+    // here, BEFORE the `items.length === 0` early-return below.
+    if (res.ok && run.dispatched.size > 0) {
+      const present = new Set(items.map((i) => i.key));
+      let rearmed = false;
+      for (const key of [...run.dispatched]) {
+        if (!present.has(key)) {
+          run.dispatched.delete(key);
+          rearmed = true;
+        }
+      }
+      if (rearmed) {
+        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+      }
+    }
   } catch (err) {
     errlog(`run "${t.name}": list provider failed: ${msg(err)}`);
     return 0;
@@ -812,6 +854,7 @@ async function dispatchCandidates(
     items,
     run.active,
     run.cooldown,
+    run.dispatched,
     nowMs,
     slots,
     maxItemsRemaining,
@@ -886,7 +929,13 @@ async function dispatchOne(
   // §7 lifetime cap — and it is persisted as a top-level field, surviving a restart.
   run.active.set(item.key, pending);
   run.lifetimeDispatched += 1;
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
+  // LATCH the key (§7.1): once dispatched it is SUPPRESSED from re-dispatch until a
+  // successful `list` no longer reports it (it left the actionable set) and it later
+  // returns — so a kill BEFORE the agent claims (the item still in the list) is never
+  // re-grabbed. Stamped at the intent (alongside the lifetime counter) + persisted, so it
+  // holds across a crash/restart; rolled back below only if the spawn itself fails.
+  run.dispatched.add(item.key);
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
 
   // (d) Spawn the split, DELIVERING item context to the agent (§13, the #1 requirement).
   // Item fields ride as GHOSTTY_ITEM_* env, NEVER spliced as bare shell text. They are
@@ -927,7 +976,10 @@ async function dispatchOne(
     // actually launched, so the failed attempt must not consume the §7 lifetime budget.
     run.active.delete(item.key);
     if (run.lifetimeDispatched > 0) run.lifetimeDispatched -= 1;
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
+    // Roll back the §7.1 latch too: nothing actually launched, so the key must stay
+    // eligible to retry on the next list (mirrors the lifetime-counter rollback).
+    run.dispatched.delete(item.key);
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
     errlog(`run "${t.name}": spawn ${item.key} failed: ${msg(err)}`);
     return false;
   }
@@ -957,7 +1009,7 @@ async function dispatchOne(
   // a pending session id reconcile will backfill (see above).
   const finalized = finalizeRecord(pending, spawned.sessionId, spawned.id, deps.now());
   run.active.set(item.key, finalized);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
 
   // (f) Stamp the {queueKey} annotation so the dashboard groups it + reconcile can
   // adopt it after a crash (§8.5/§9). Best-effort.

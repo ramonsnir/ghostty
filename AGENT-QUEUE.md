@@ -147,6 +147,17 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 - **No duplicate agents per item key** — across the dispatch race (before an item leaves the
   filter), across overlapping polls, and across sidecar/GUI restarts. Works **without** a
   `claim` step.
+- **An item dispatched once is not re-grabbed until it leaves the list and comes back.** Once
+  the queue launches an agent for an item, that item's key is *latched* — the queue will not
+  dispatch it again until a successful `list` stops reporting it (it left the actionable set:
+  claimed, blocked, labeled, or moved off the queried state) **and then it reappears**. This is
+  the important guard for the common workflow where the agent **waits for your go-ahead before
+  it claims** the item: if you kill that split before it claims, the item is still in the list,
+  and the latch keeps the queue from immediately re-opening it. To deliberately re-queue a
+  killed item, move it out of the queried state and back (e.g. a Linear status round-trip). The
+  latch is **persisted**, so a sidecar/GUI restart won't re-grab a killed-before-claim item.
+  Consequence: a **crashed** agent whose item stays in the list is **not** auto-retried either —
+  re-queue it with the same round-trip (the queue won't blindly re-run a crash on the same item).
 - **Concurrency** is never exceeded (per-queue `concurrency`, the `cols×rows` grid, and the
   global `agent-queue-max-total`).
 - **Restart-proof** — a started queue, its tiles, and its in-flight items survive a sidecar

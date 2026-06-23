@@ -777,13 +777,19 @@ test("runQueueSweep: an agent that EXITS early rings the bell (signal_attention)
 //      same still-failing item before the cooldown hold elapses.
 // ---------------------------------------------------------------------------
 
-test("runQueueSweep: closing an EXITED split puts its key into COOLDOWN (not immediately eligible)", async () => {
+test("runQueueSweep: a crashed (EXITED) split's key is COOLED then LATCHED — NOT re-dispatched until it leaves the list and returns (§7.1)", async () => {
   let surfaces: Surface[] = [];
-  const fake = makeQueueFake({
-    surfaces: [],
+  // Mutable spec so the `list` provider's output can change mid-test (the item leaving /
+  // returning to the actionable set is what re-arms the §7.1 dispatch latch).
+  const spec = {
+    surfaces: [] as Surface[],
     listJson: '[{"id":"K-1","title":"task"}]',
-    spawns: [{ id: "spawned-1", sessionId: 900 }],
-  });
+    spawns: [
+      { id: "spawned-1", sessionId: 900 },
+      { id: "spawned-2", sessionId: 901 },
+    ],
+  };
+  const fake = makeQueueFake(spec);
   (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
     async () => surfaces;
 
@@ -794,6 +800,7 @@ test("runQueueSweep: closing an EXITED split puts its key into COOLDOWN (not imm
   await runQueueSweep(deps); // arm
   now += 5000;
   await runQueueSweep(deps); // dispatch K-1
+  assert.ok(run.dispatched.has("K-1"), "K-1 latched at dispatch");
 
   // The spawned surface appears but EXITS early (leave-and-bell).
   surfaces = [
@@ -805,19 +812,128 @@ test("runQueueSweep: closing an EXITED split puts its key into COOLDOWN (not imm
   assert.equal(run.cooldown.has("K-1"), false, "not cooled while the split is still open");
 
   // A human closes the dead split → its session vanishes → reconcile prunes the EXITED
-  // record. Per §6 the freed key enters COOLDOWN, so the very next list does NOT
-  // re-dispatch it even though K-1 is still in the list.
+  // record. Per §6 the freed key enters COOLDOWN; per §7.1 it ALSO stays in the dispatch
+  // latch (K-1 is still in the list — it never left the actionable set).
   surfaces = [];
   now += 5000;
   await runQueueSweep(deps);
   assert.equal(run.active.has("K-1"), false, "EXITED record pruned after the human closed it");
   assert.ok(run.cooldown.has("K-1"), "freed key entered COOLDOWN");
-  assert.equal(fake.calls.spawn.length, 1, "K-1 NOT re-dispatched while cooling (still just the one spawn)");
+  assert.ok(run.dispatched.has("K-1"), "still latched (K-1 never left the list)");
+  assert.equal(fake.calls.spawn.length, 1, "K-1 NOT re-dispatched while cooling/latched");
 
-  // After the cooldown elapses the key is eligible again (a reopened item is re-picked).
+  // Cooldown elapses, but K-1 is STILL in the list → the §7.1 latch keeps it suppressed.
+  // (This is the behavior change: cooldown alone no longer re-dispatches an item that
+  // never left the list — a crashed agent is not blindly auto-retried.)
   now += 130_000; // > DEFAULT_COOLDOWN_MS (120s)
   await runQueueSweep(deps);
-  assert.equal(fake.calls.spawn.length, 2, "K-1 re-dispatched once its cooldown expired");
+  assert.equal(fake.calls.spawn.length, 1, "still NOT re-dispatched — the latch outlives the cooldown while K-1 stays listed");
+  assert.ok(run.dispatched.has("K-1"), "latch still held");
+
+  // K-1 LEAVES the actionable list (e.g. moved off the queried state) for a sweep → the
+  // latch RE-ARMS (clears). quitWhenEmpty is false in tmpl() so the empty list won't quit.
+  spec.listJson = "[]";
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(run.dispatched.has("K-1"), false, "latch re-armed once K-1 left the list");
+  assert.equal(fake.calls.spawn.length, 1, "nothing dispatched on the empty list");
+
+  // K-1 RETURNS to the list (a real status round-trip) → now eligible → re-dispatched.
+  spec.listJson = '[{"id":"K-1","title":"task"}]';
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 2, "re-dispatched only after K-1 left the list and returned");
+});
+
+test("runQueueSweep: a split KILLED BEFORE the agent claims (item still listed, NO cooldown) is NOT re-dispatched until a list round-trip (§7.1 — the kill-before-claim hole)", async () => {
+  let surfaces: Surface[] = [];
+  const spec = {
+    surfaces: [] as Surface[],
+    listJson: '[{"id":"K-1","title":"task"}]',
+    spawns: [
+      { id: "spawned-1", sessionId: 700 },
+      { id: "spawned-2", sessionId: 701 },
+    ],
+  };
+  const fake = makeQueueFake(spec);
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+
+  const run = makeQueueRun(tmpl(), memStore());
+  let now = 6_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1
+  assert.equal(fake.calls.spawn.length, 1);
+  assert.ok(run.dispatched.has("K-1"), "latched at dispatch");
+
+  // The agent is up and WORKING but has NOT claimed (the human-gated dispatch→claim gap),
+  // so the item is STILL in the list. The user kills the split before confirming. A killed
+  // WORKING (non-EXITED) record is session-gone-pruned with NO cooldown — so ONLY the
+  // §7.1 latch can suppress re-dispatch here (this is precisely the hole the latch closes).
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 700, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps); // observe it live + working
+
+  surfaces = []; // user killed it
+  now += 200_000; // well past any cooldown/grace window — proves it's the latch, not a timer
+  await runQueueSweep(deps);
+  assert.equal(run.active.has("K-1"), false, "killed record pruned (empty active set)");
+  assert.equal(run.cooldown.has("K-1"), false, "no cooldown for a killed working agent — only the latch holds it");
+  assert.ok(run.dispatched.has("K-1"), "still latched (K-1 never left the list)");
+  assert.equal(fake.calls.spawn.length, 1, "NOT re-dispatched despite an empty active set AND no cooldown");
+
+  // K-1 leaves the list, then returns (the only re-arm path) → re-dispatched.
+  spec.listJson = "[]";
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(run.dispatched.has("K-1"), false, "latch re-armed when K-1 left the list");
+  spec.listJson = '[{"id":"K-1","title":"task"}]';
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 2, "re-dispatched only after the list round-trip");
+});
+
+test("runQueueSweep: the dispatched latch PERSISTS across a sidecar restart (a killed-before-claim item isn't re-grabbed after restart)", async () => {
+  const store = memStore(); // ONE store, shared across the simulated restart
+  const spec = {
+    surfaces: [] as Surface[],
+    listJson: '[{"id":"K-1","title":"task"}]',
+    spawns: [
+      { id: "spawned-1", sessionId: 800 },
+      { id: "spawned-2", sessionId: 801 },
+    ],
+  };
+  const fake = makeQueueFake(spec);
+  let surfaces: Surface[] = [];
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+
+  // --- run #1: dispatch K-1, then the user kills it before claim ---
+  const run1 = makeQueueRun(tmpl(), store);
+  let now = 7_000_000;
+  let deps = makeQueueDeps(fake, [run1], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1
+  assert.equal(fake.calls.spawn.length, 1);
+  assert.ok(run1.dispatched.has("K-1"), "latched (and persisted) at dispatch");
+  surfaces = []; // user kills the split
+
+  // --- SIDECAR RESTART: a brand-new run over the SAME persisted store ---
+  const run2 = makeQueueRun(tmpl(), store);
+  deps = makeQueueDeps(fake, [run2], () => now);
+  now += 200_000; // past grace so the killed record is pruned, isolating the latch
+  await runQueueSweep(deps); // first post-restart sweep reconciles + rehydrates the latch (dispatch suppressed)
+  assert.ok(run2.dispatched.has("K-1"), "latch rehydrated from the store on restart");
+  assert.equal(run2.active.has("K-1"), false, "killed record pruned — only the rehydrated latch remains");
+  now += 5000;
+  await runQueueSweep(deps); // now dispatch-armed; K-1 still listed → latch suppresses
+  assert.equal(fake.calls.spawn.length, 1, "NOT re-dispatched after restart (the latch persisted)");
 });
 
 // ---------------------------------------------------------------------------
