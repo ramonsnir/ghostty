@@ -362,9 +362,12 @@ struct MCPServerTests {
             "list_surfaces", "read_surface", "get_layout", "send_text", "send_key",
             "scroll", "wait_for_event", "watch_for_pattern", "focus_surface",
             "new_tab", "close_surface", "perform_action", "set_surface_annotation",
+            // Agent Queue (§8): the supervisor's "hands".
+            "spawn_split_command", "force_close_surface", "signal_attention",
+            "take_queue_commands",
         ]
         #expect(names == expected)
-        #expect(tools.count == 13)
+        #expect(tools.count == 17)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -434,7 +437,7 @@ struct MCPServerTests {
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
             notes: "Implementing fix", userNotes: "migrate to postgres",
-            suggestionDismissed: true, agentKind: "claude")
+            suggestionDismissed: true, agentKind: "claude", sessionID: 4242)
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -464,6 +467,8 @@ struct MCPServerTests {
         // foreground process is the `bash` pool wrapper, NOT "claude" — agentKind
         // is the reliable signal the summarizer uses).
         #expect(d["agentKind"] as? String == "claude")
+        // fork / Agent Queue (§8.4): sessionID is a PLAIN integer, always present.
+        #expect((d["sessionID"] as? NSNumber)?.uint64Value == 4242)
     }
 
     // fork: the three optional fields are OMITTED (not null/empty) when unknown.
@@ -475,7 +480,7 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
-            userNotes: nil, suggestionDismissed: false, agentKind: nil)
+            userNotes: nil, suggestionDismissed: false, agentKind: nil, sessionID: 0)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
@@ -493,6 +498,9 @@ struct MCPServerTests {
         // fork / Agent Manager Phase 2.1: suggestionDismissed is a plain bool, so it
         // is ALWAYS present (false here), unlike the omit-when-nil optionals above.
         #expect(d["suggestionDismissed"] as? Bool == false)
+        // fork / Agent Queue (§8.4): sessionID is a plain integer, ALWAYS present —
+        // 0 here (no host session). The supervisor self-disables on a 0.
+        #expect((d["sessionID"] as? NSNumber)?.uint64Value == 0)
     }
 
     // MARK: - dispatch (AppKit-free paths only)
@@ -877,5 +885,119 @@ struct MCPServerTests {
         #expect(MCPTools.uuidArg(["id": "not-a-uuid"]) == nil)
         #expect(MCPTools.uuidArg([:]) == nil)
         #expect(MCPTools.uuidArg(["id": 123]) == nil)  // non-string
+    }
+
+    // MARK: - Agent Queue: newDirection (split direction mapping)
+
+    @Test func newDirectionMapping() {
+        #expect(MCPLayout.newDirection("right") == .right)
+        #expect(MCPLayout.newDirection("left") == .left)
+        #expect(MCPLayout.newDirection("down") == .down)
+        #expect(MCPLayout.newDirection("up") == .up)
+        #expect(MCPLayout.newDirection("diagonal") == nil)
+        #expect(MCPLayout.newDirection(nil) == nil)
+        #expect(MCPLayout.newDirection("") == nil)
+    }
+
+    // MARK: - Agent Queue: QueueCommand value type + jsonObject
+
+    @Test func queueCommandJSONObjectStartCarriesTemplate() {
+        let cmd = QueueCommand(action: .start, template: "backlog")
+        let d = cmd.jsonObject
+        #expect(d["action"] as? String == "start")
+        #expect(d["template"] as? String == "backlog")
+        // run is nil ⇒ omitted.
+        #expect(d["run"] == nil)
+    }
+
+    @Test func queueCommandJSONObjectFlagCarriesRun() {
+        for (action, expected) in [(QueueCommand.Action.pause, "pause"),
+                                   (.resume, "resume"), (.stop, "stop"), (.abort, "abort")] {
+            let d = QueueCommand(action: action, run: "my-team backlog").jsonObject
+            #expect(d["action"] as? String == expected)
+            #expect(d["run"] as? String == "my-team backlog")
+            #expect(d["template"] == nil)
+        }
+    }
+
+    @Test func queueCommandJSONObjectOmitsEmptyStrings() {
+        // Empty strings are omitted (mirrors the sidecar's tolerant coerce, which
+        // only keeps non-empty strings).
+        let d = QueueCommand(action: .start, template: "", run: "").jsonObject
+        #expect(d["action"] as? String == "start")
+        #expect(d["template"] == nil)
+        #expect(d["run"] == nil)
+    }
+
+    // MARK: - Agent Queue: take_queue_commands envelope shaping
+
+    @Test func queueCommandsJSONDataEnvelope() {
+        let cmds = [
+            QueueCommand(action: .start, template: "backlog"),
+            QueueCommand(action: .pause, run: "backlog name"),
+        ]
+        let env = MCPServer.queueCommandsJSONData(cmds)
+        let arr = env["commands"] as! [[String: Any]]
+        #expect(arr.count == 2)
+        #expect(arr[0]["action"] as? String == "start")
+        #expect(arr[0]["template"] as? String == "backlog")
+        #expect(arr[1]["action"] as? String == "pause")
+        #expect(arr[1]["run"] as? String == "backlog name")
+        // The whole envelope round-trips through JSONSerialization (the wire path).
+        let data = try! JSONSerialization.data(withJSONObject: env)
+        let back = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+        #expect((back["commands"] as! [[String: Any]]).count == 2)
+    }
+
+    @Test func queueCommandsJSONDataEmpty() {
+        let env = MCPServer.queueCommandsJSONData([])
+        #expect((env["commands"] as! [[String: Any]]).isEmpty)
+    }
+
+    // MARK: - Agent Queue: tool schemas registered
+
+    @Test func agentQueueToolsRegistered() {
+        let names = Set(MCPTools.toolSchemas.compactMap { $0["name"] as? String })
+        #expect(names.contains("spawn_split_command"))
+        #expect(names.contains("force_close_surface"))
+        #expect(names.contains("signal_attention"))
+        #expect(names.contains("take_queue_commands"))
+    }
+
+    // MARK: - Agent Queue: dispatch validation (AppKit-free paths)
+
+    @Test func dispatchSpawnSplitMissingCommand() {
+        // command is required; missing ⇒ invalidParams, no main hop.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let outcome = MCPTools.dispatch(name: "spawn_split_command", arguments: [:], server: server)
+        guard case .invalidParams = outcome else {
+            Issue.record("expected invalidParams for missing command")
+            return
+        }
+    }
+
+    @Test func dispatchSpawnSplitNonFirstTabRequiresTarget() {
+        // Not firstTab + no targetUUID ⇒ invalidParams (validated before the main hop).
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let outcome = MCPTools.dispatch(
+            name: "spawn_split_command",
+            arguments: ["command": "claude", "direction": "right"],
+            server: server)
+        guard case .invalidParams = outcome else {
+            Issue.record("expected invalidParams for missing targetUUID")
+            return
+        }
+    }
+
+    @Test func dispatchSpawnSplitNonFirstTabRequiresDirection() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let outcome = MCPTools.dispatch(
+            name: "spawn_split_command",
+            arguments: ["command": "claude", "targetUUID": UUID().uuidString, "direction": "sideways"],
+            server: server)
+        guard case .invalidParams = outcome else {
+            Issue.record("expected invalidParams for invalid direction")
+            return
+        }
     }
 }

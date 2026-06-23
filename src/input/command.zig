@@ -581,6 +581,13 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show or hide the floating dashboard of running CLI agents.",
         }},
 
+        .start_agent_queue => comptime &.{.{
+            // Bare (picker) form; the palette opens the queue-template picker.
+            .action = .{ .start_agent_queue = .{} },
+            .title = "Start Agent Queue…",
+            .description = "Start a fleet of CLI agents from a queue template.",
+        }},
+
         .goto_last_surface => comptime &.{.{
             .action = .goto_last_surface,
             .title = "Go to Last Split",

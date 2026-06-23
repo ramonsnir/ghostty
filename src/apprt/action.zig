@@ -385,6 +385,12 @@ pub const Action = union(Key) {
     /// (ramon fork) Toggle the app-global floating Agent Dashboard panel.
     toggle_agent_dashboard,
 
+    /// (ramon fork / Agent Queue Supervisor) Start an Agent Queue run. An empty
+    /// template opens the queue-template picker for the target surface; a
+    /// non-empty template basename starts that run directly (the apprt enqueues
+    /// the start intent for the sidecar supervisor).
+    start_agent_queue: StartAgentQueue,
+
     /// (ramon fork) Focus the previously focused surface, across any tab or
     /// window. Two-deep toggle.
     goto_last_surface,
@@ -467,6 +473,7 @@ pub const Action = union(Key) {
         swap_split,
         toggle_project_selector,
         toggle_agent_dashboard,
+        start_agent_queue,
         goto_last_surface,
 
         test "ghostty.h Action.Key" {
@@ -835,6 +842,34 @@ pub const SetTitle = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.title });
+    }
+};
+
+/// (ramon fork / Agent Queue Supervisor) The payload for `start_agent_queue`.
+/// `template` is the queue-template basename to start, or the EMPTY string to
+/// open the picker (the apprt always carries a non-null, possibly-empty string
+/// so the C representation is a plain `[*:0]const u8`).
+pub const StartAgentQueue = struct {
+    template: [:0]const u8,
+
+    // Sync with: ghostty_action_start_agent_queue_s
+    pub const C = extern struct {
+        template: [*:0]const u8,
+    };
+
+    pub fn cval(self: StartAgentQueue) C {
+        return .{
+            .template = self.template.ptr,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.template });
     }
 };
 

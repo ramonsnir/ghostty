@@ -6264,6 +6264,21 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .start_agent_queue => |v| {
+            // Render the (optional) template basename as a sentinel C string;
+            // an absent template becomes the empty string "" (the picker form).
+            const template: [:0]const u8 = if (v.template) |t|
+                try self.alloc.dupeZ(u8, t)
+            else
+                "";
+            defer if (v.template != null) self.alloc.free(template);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .start_agent_queue,
+                .{ .template = template },
+            );
+        },
+
         .goto_last_surface => return try self.rt_app.performAction(
             .{ .surface = self },
             .goto_last_surface,

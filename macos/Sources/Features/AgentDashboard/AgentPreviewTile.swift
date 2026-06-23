@@ -152,6 +152,9 @@ struct AgentPreviewTile: View {
     private var header: some View {
         HStack(spacing: 6) {
             badge
+            if let marker = originMarker {
+                marker
+            }
             if entry.agentState != nil {
                 stateChip
             }
@@ -190,6 +193,58 @@ struct AgentPreviewTile: View {
             .padding(.vertical, 1)
             .background(Color.secondary.opacity(0.18))
             .clipShape(Capsule())
+    }
+
+    /// (ramon fork / Agent Queue, §11) The per-tile ORIGIN marker: a small badge
+    /// naming the owning queue, plus the work-item KEY when present. Rendered ONLY
+    /// for QUEUE tiles (those carrying a `queueName` annotation) — a non-queue tile
+    /// (the `(other)` origin) shows no extra marker, keeping legacy tiles uncluttered.
+    /// All text is rendered via `Text` (SwiftUI escapes it — `textContent`-safe; the
+    /// queue name/key are untrusted template/annotation data).
+    private var originMarker: AnyView? {
+        guard let name = entry.annotation?.queueName, !name.isEmpty else { return nil }
+        let key = entry.annotation?.queueKey
+        let label = (key?.isEmpty == false) ? "\(name) · \(key!)" : name
+        return AnyView(
+            Text(label)
+                .font(.caption2.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .foregroundStyle(Color.accentColor)
+                .background(Color.accentColor.opacity(0.16))
+                .clipShape(Capsule())
+                .help("Queue: \(name)" + (key.map { " · \($0)" } ?? ""))
+        )
+    }
+
+    /// (ramon fork / Agent Queue, §11) The clickable work-item URL link, shown in
+    /// the footer for a queue tile that carries a `queueUrl`. Uses `Link` (SwiftUI
+    /// escapes the visible text — `textContent`-safe). Only http(s) URLs are made
+    /// clickable; any other/garbage value is shown as plain text (never opened).
+    @ViewBuilder
+    private var queueURLLink: some View {
+        if let urlString = entry.annotation?.queueUrl, !urlString.isEmpty {
+            if let url = URL(string: urlString),
+               let scheme = url.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
+                Link(destination: url) {
+                    Label(urlString, systemImage: "link")
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+            } else {
+                Text(urlString)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
     }
 
     /// (ramon fork / Agent hooks) The hook-reported lifecycle state chip:
@@ -307,6 +362,12 @@ struct AgentPreviewTile: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 16)
+        // (ramon fork / Agent Queue, §11) The clickable work-item URL for a queue
+        // tile, shown below the metadata row. Absent (zero height) for non-queue
+        // tiles or a queue tile with no url.
+        queueURLLink
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
     }
 
     private func pill(_ text: String, color: Color) -> some View {

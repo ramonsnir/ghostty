@@ -19,10 +19,11 @@ import AppKit
 /// without clobbering — see `AgentDashboardModel.applyAnnotation`).
 ///
 /// (ramon fork / Agent Manager Phase 2) `summary` is no longer hard-required:
-/// AT LEAST ONE updatable field (summary, suggestion, phase, needsUser, or
-/// confidence) must be present, else the call is rejected (a fully-empty body is
-/// still invalid). Both the summarizer (summary-only) and the manager
-/// (suggestion-only) write through this same parser.
+/// AT LEAST ONE updatable field (summary, suggestion, phase, needsUser,
+/// confidence, queueKey, queueName, or queueUrl) must be present, else the call is
+/// rejected (a fully-empty body is still invalid). The summarizer (summary-only),
+/// the manager (suggestion-only), and the Agent Queue supervisor
+/// (queueKey/queueName/queueUrl at dispatch) all write through this same parser.
 struct AgentAnnotationPayload {
     let annotation: AgentAnnotation
 
@@ -43,17 +44,24 @@ struct AgentAnnotationPayload {
         let needsUser = arguments["needsUser"] as? Bool
         // confidence is a JSON number → NSNumber; missing/non-number ⇒ nil.
         let confidence = (arguments["confidence"] as? NSNumber)?.doubleValue
+        // (ramon fork / Agent Queue, §8.5) the queue tag fields — same partial-merge
+        // string semantics as summary/suggestion (present-and-non-blank ⇒ trimmed).
+        let queueKey = trimmedString("queueKey")
+        let queueName = trimmedString("queueName")
+        let queueUrl = trimmedString("queueUrl")
 
         // At least one updatable field must be present; otherwise the update is a
         // no-op and we reject it (mirrors the old "blank summary" rejection but for
         // an entirely empty body).
         guard summary != nil || suggestion != nil || phase != nil
             || needsUser != nil || confidence != nil
+            || queueKey != nil || queueName != nil || queueUrl != nil
         else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
             summary: summary, suggestion: suggestion, phase: phase,
-            needsUser: needsUser, confidence: confidence))
+            needsUser: needsUser, confidence: confidence,
+            queueKey: queueKey, queueName: queueName, queueUrl: queueUrl))
     }
 }
 

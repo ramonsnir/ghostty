@@ -36,6 +36,9 @@ protocol TerminalViewModel: ObservableObject {
     /// (ramon fork) The project selector palette state.
     var projectSelectorIsShowing: Bool { get set }
 
+    /// (ramon fork / Agent Queue Supervisor) The queue-template picker state.
+    var queueSelectorIsShowing: Bool { get set }
+
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
 
@@ -144,6 +147,13 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         isPresented: $viewModel.projectSelectorIsShowing,
                         ghosttyConfig: ghostty.config,
                         projectDirectories: ghostty.config.projectDirectories
+                    )
+
+                    QueuePaletteView(
+                        surfaceView: surfaceView,
+                        isPresented: $viewModel.queueSelectorIsShowing,
+                        ghosttyConfig: ghostty.config,
+                        templatesDir: ghostty.config.agentQueueTemplatesDir
                     )
                 }
 

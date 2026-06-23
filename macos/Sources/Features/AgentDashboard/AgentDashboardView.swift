@@ -45,61 +45,156 @@ struct AgentDashboardView: View {
                 )
             }
         } else {
-            // Full-width-ish rows in a List so `.onMove` gives drag-to-reorder
-            // for free (the dashboard is already a single column). The list chrome
-            // is stripped (plain style, hidden separators/background, clear rows)
-            // so the tiles keep their card look. Row insets are zeroed on the
-            // LEADING and TRAILING edges (only a small top/bottom inset remains to
-            // separate stacked cards), which trims the original 12pt gutter — BUT a
-            // small residual horizontal inset (~5–10pt) REMAINS: SwiftUI `List` is
-            // backed by `NSTableView`, whose built-in cell inset is not reachable
-            // via `listRowInsets` or `.contentMargins` (verified empirically). True
-            // edge-to-edge would require dropping `List` for a ScrollView+LazyVStack,
-            // which loses `.onMove` — a deliberate trade (keep reorder, accept the
-            // macOS List inset floor). Reordering does NOT remount the mirror
-            // previews — `ForEach` identity stays `entry.id` and the mirror's
-            // `.id(sessionID)` is untouched.
-            List {
-                if !ptyHostEnabled {
-                    banner("Live previews require pty-host. Showing metadata-only tiles.")
-                        .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 0, trailing: 0))
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                        .moveDisabled(true)
+            VStack(spacing: 0) {
+                // (ramon fork / Agent Queue, §11) Filter bar: one include/exclude
+                // toggle per known origin. Only shown when there's more than one
+                // origin to choose between (a single-origin fleet needs no filter).
+                if model.knownOrigins.count > 1 {
+                    originFilterBar
                 }
-                ForEach(model.entries) { entry in
-                    AgentPreviewTile(
-                        entry: entry,
-                        ghostty: ghostty,
-                        previewsEnabled: ptyHostEnabled,
-                        onHide: { model.hide(entry.id) },
-                        onApprove: { text in model.approveSuggestion(entry.id, text) },
-                        onDismiss: { model.dismissSuggestion(entry.id) },
-                        onSetNote: { text in model.setUserNotes(entry.id, text) }
-                    )
-                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                sectionedList
+            }
+        }
+    }
+
+    // MARK: - Sectioned tile list (ramon fork / Agent Queue, §11)
+
+    /// Full-width-ish rows in a List so `.onMove` gives drag-to-reorder for free.
+    /// The list chrome is stripped (plain style, hidden separators/background,
+    /// clear rows) so the tiles keep their card look. Tiles are grouped into
+    /// origin SECTIONS, each with a header (origin name · count · queue controls).
+    /// `.onMove` operates over the GLOBAL displayed order (across sections), so the
+    /// captured session-id order spans every section — the model resorts and
+    /// re-groups, so a drag still re-buckets cleanly. Reordering does NOT remount
+    /// the mirror previews — the tile identity stays `entry.id` and the mirror's
+    /// `.id(sessionID)` is untouched. The residual ~5–10pt horizontal `NSTableView`
+    /// cell inset remains (see the original full-width note) — a deliberate trade to
+    /// keep `.onMove`.
+    @ViewBuilder
+    private var sectionedList: some View {
+        List {
+            if !ptyHostEnabled {
+                banner("Live previews require pty-host. Showing metadata-only tiles.")
+                    .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 0, trailing: 0))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
-                }
-                .onMove { source, destination in
-                    // Capture the displayed session-id order (WYSIWYG), apply the
-                    // move, and hand the new full order to the model to persist.
-                    var ids = model.entries.map(\.sessionID)
-                    ids.move(fromOffsets: source, toOffset: destination)
-                    model.setManualOrder(ids)
+                    .moveDisabled(true)
+            }
+            ForEach(model.sections) { section in
+                Section {
+                    ForEach(section.entries) { entry in
+                        AgentPreviewTile(
+                            entry: entry,
+                            ghostty: ghostty,
+                            previewsEnabled: ptyHostEnabled,
+                            onHide: { model.hide(entry.id) },
+                            onApprove: { text in model.approveSuggestion(entry.id, text) },
+                            onDismiss: { model.dismissSuggestion(entry.id) },
+                            onSetNote: { text in model.setUserNotes(entry.id, text) }
+                        )
+                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                    }
+                    .onMove { source, destination in
+                        // Reorder ACROSS all sections: capture the global displayed
+                        // session-id order, apply the in-section move at the right
+                        // offset, then hand the full order to the model.
+                        moveWithinSection(section, source: source, destination: destination)
+                    }
+                } header: {
+                    // A lone `(other)` section (the legacy, no-queue case) shows no
+                    // header — keep the classic flat look until a queue origin
+                    // exists. Once there are 2+ origins, every section is labeled.
+                    if !(model.sections.count == 1 && section.isOther) {
+                        OriginSectionHeader(
+                            section: section,
+                            onPause: { model.sendRunCommand(.pause, run: section.id) },
+                            onResume: { model.sendRunCommand(.resume, run: section.id) },
+                            onStop: { model.sendRunCommand(.stop, run: section.id) },
+                            onAbort: { model.sendRunCommand(.abort, run: section.id) }
+                        )
+                        .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
+                        .listRowBackground(Color.clear)
+                    }
                 }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            // Zero the List's horizontal scroll-content margin (macOS 14+, behind
-            // an availability shim). NOTE: this trims the scroll-content margin but
-            // does NOT fully remove the row gutter — the residual ~5–10pt is the
-            // `NSTableView` cell inset (see the block comment above), which this API
-            // does not reach. Kept because it's harmless and removes what margin it
-            // can; it is NOT sufficient for true edge-to-edge on its own.
-            .zeroHorizontalScrollMargin()
-            .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .zeroHorizontalScrollMargin()
+        .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
+    }
+
+    /// Translate an in-section `.onMove` into a global session-id reorder. The
+    /// section's tiles are a contiguous slice of the global displayed order; we
+    /// rebuild the full order with the slice moved, then persist. Sessionless tiles
+    /// (id 0) are filtered by the model on save.
+    private func moveWithinSection(
+        _ section: AgentDashboardModel.OriginSection,
+        source: IndexSet, destination: Int
+    ) {
+        // Global displayed order across all sections (WYSIWYG).
+        let global = model.sections.flatMap { $0.entries }.map(\.sessionID)
+        // The section's own slice (in displayed order).
+        var sectionIDs = section.entries.map(\.sessionID)
+        sectionIDs.move(fromOffsets: source, toOffset: destination)
+        // Splice the reordered slice back into the global order at the section's
+        // first position, preserving the relative order of the other sections.
+        let sectionSet = Set(section.entries.map(\.sessionID))
+        var result: [UInt64] = []
+        var spliced = false
+        for sid in global {
+            if sectionSet.contains(sid) {
+                if !spliced { result.append(contentsOf: sectionIDs); spliced = true }
+            } else {
+                result.append(sid)
+            }
+        }
+        if !spliced { result.append(contentsOf: sectionIDs) }
+        model.setManualOrder(result)
+    }
+
+    /// The per-origin include/exclude filter bar (§11). A wrapping row of toggle
+    /// chips, one per known origin, plus a "Show all" when anything is excluded.
+    @ViewBuilder
+    private var originFilterBar: some View {
+        let origins = model.knownOrigins.sorted { a, b in
+            if a == AgentDashboardModel.otherOrigin { return false }
+            if b == AgentDashboardModel.otherOrigin { return true }
+            return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+        }
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(origins, id: \.self) { origin in
+                    let included = !model.excludedOrigins.contains(origin)
+                    Button {
+                        model.toggleOrigin(origin)
+                    } label: {
+                        Text(origin)
+                            .font(.caption2.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(included ? Color.accentColor.opacity(0.22) : Color.secondary.opacity(0.12))
+                            .foregroundStyle(included ? Color.accentColor : Color.secondary)
+                            .clipShape(Capsule())
+                            .opacity(included ? 1.0 : 0.6)
+                    }
+                    .buttonStyle(.plain)
+                    .help(included ? "Hide \(origin) from the view" : "Show \(origin)")
+                }
+                if !model.excludedOrigins.isEmpty {
+                    Button { model.showAllOrigins() } label: {
+                        Text("Show all").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+        }
+        .background(.ultraThinMaterial)
     }
 
     @ViewBuilder
@@ -191,6 +286,54 @@ struct AgentDashboardView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(8)
             .background(.yellow.opacity(0.12))
+    }
+}
+
+/// (ramon fork / Agent Queue, §11) One origin section header: the origin name +
+/// live tile count, and — for a queue origin (not `(other)`) — Pause/Stop/Abort
+/// control buttons that post `.ghosttyQueueCommand` (run-control intents the
+/// sidecar reconciles). The origin name is rendered via `Text` (SwiftUI escapes
+/// it — `textContent`-safe; it is untrusted queue-template / annotation data).
+private struct OriginSectionHeader: View {
+    let section: AgentDashboardModel.OriginSection
+    let onPause: () -> Void
+    let onResume: () -> Void
+    let onStop: () -> Void
+    let onAbort: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(section.id)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text("\(section.count)")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.18))
+                .clipShape(Capsule())
+            Spacer(minLength: 4)
+            if !section.isOther {
+                // Cheap run-control intents (§8/§11). Pause and Resume are both
+                // offered (the model holds no run state, so we can't know which is
+                // active — the sidecar treats the inactive one as a no-op).
+                queueButton("pause", help: "Pause: stop dispatching new agents", action: onPause)
+                queueButton("play", help: "Resume dispatching", action: onResume)
+                queueButton("stop", help: "Stop: drain, no new agents", action: onStop)
+                queueButton("xmark.octagon", help: "Abort: force-close all agents in this run", action: onAbort)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage).font(.caption2)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
     }
 }
 

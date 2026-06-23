@@ -51,6 +51,9 @@ class BaseTerminalController: NSWindowController,
     /// (ramon fork) This can be set to show/hide the project selector palette.
     @Published var projectSelectorIsShowing: Bool = false
 
+    /// (ramon fork / Agent Queue Supervisor) Show/hide the queue-template picker.
+    @Published var queueSelectorIsShowing: Bool = false
+
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 
@@ -187,6 +190,11 @@ class BaseTerminalController: NSWindowController,
             self,
             selector: #selector(ghosttyProjectSelectorDidToggle(_:)),
             name: .ghosttyProjectSelectorDidToggle,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyQueueSelectorDidToggle(_:)),
+            name: .ghosttyQueueSelectorDidToggle,
             object: nil)
         center.addObserver(
             self,
@@ -695,6 +703,12 @@ class BaseTerminalController: NSWindowController,
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(surfaceView) else { return }
         toggleProjectSelector(nil)
+    }
+
+    @objc private func ghosttyQueueSelectorDidToggle(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(surfaceView) else { return }
+        toggleQueueSelector(nil)
     }
 
     @objc private func ghosttyMaximizeDidToggle(_ notification: Notification) {
@@ -1790,6 +1804,15 @@ class BaseTerminalController: NSWindowController,
         projectSelectorIsShowing.toggle()
         if projectSelectorIsShowing {
             // Mirror toggleCommandPalette: resign the surface's first responder
+            // so the palette receives keyboard input rather than the surface.
+            _ = focusedSurface?.resignFirstResponder()
+        }
+    }
+
+    @IBAction func toggleQueueSelector(_ sender: Any?) {
+        queueSelectorIsShowing.toggle()
+        if queueSelectorIsShowing {
+            // Mirror toggleProjectSelector: resign the surface's first responder
             // so the palette receives keyboard input rather than the surface.
             _ = focusedSurface?.resignFirstResponder()
         }

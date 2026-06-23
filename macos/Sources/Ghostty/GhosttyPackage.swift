@@ -371,6 +371,9 @@ extension Notification.Name {
     /// (ramon fork) Toggle the project selector palette
     static let ghosttyProjectSelectorDidToggle = Notification.Name("com.mitchellh.ghostty.projectSelectorDidToggle")
 
+    /// (ramon fork / Agent Queue Supervisor) Toggle the queue-template picker palette
+    static let ghosttyQueueSelectorDidToggle = Notification.Name("com.mitchellh.ghostty.queueSelectorDidToggle")
+
     /// Toggle maximize of current window
     static let ghosttyMaximizeDidToggle = Notification.Name("com.mitchellh.ghostty.maximizeDidToggle")
 

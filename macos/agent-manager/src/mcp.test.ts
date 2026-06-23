@@ -6,7 +6,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { extractToolText, parseToolJson, McpError, McpClient } from "./mcp.js";
+import {
+  extractToolText,
+  parseToolJson,
+  coerceQueueCommands,
+  McpError,
+  McpClient,
+} from "./mcp.js";
 
 test("extractToolText: success returns the inner text string", () => {
   const env = {
@@ -121,4 +127,221 @@ test("setAnnotation: omits confidence when undefined", async () => {
   const args = await captureSetAnnotationArgs("s1", { suggestion: "go" });
   assert.equal(args.suggestion, "go");
   assert.equal("confidence" in args, false);
+});
+
+// --- Agent Queue wrappers: envelope / encode --------------------------------
+// The queue wrappers exist server-side only in a later Swift phase; here we mock
+// the transport (stub global fetch) and assert the JSON-RPC method + arguments
+// encoding and the success-payload decoding.
+
+/** Capture the JSON-RPC body of ONE awaited client call, returning the parsed
+ *  {method, name, arguments}. The stub fetch returns `responseText` as the tool's
+ *  double-encoded success payload. */
+async function captureCall(
+  responseText: string,
+  run: (c: McpClient) => Promise<unknown>,
+): Promise<{ method: string; name: string; args: Record<string, unknown>; result: unknown }> {
+  const originalFetch = globalThis.fetch;
+  let method = "";
+  let name = "";
+  let args: Record<string, unknown> = {};
+  globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+    const parsed = JSON.parse(init?.body ?? "{}") as {
+      method?: string;
+      params?: { name?: string; arguments?: Record<string, unknown> };
+    };
+    method = parsed.method ?? "";
+    name = parsed.params?.name ?? "";
+    args = parsed.params?.arguments ?? {};
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { content: [{ type: "text", text: responseText }], isError: false },
+      }),
+    } as unknown as Response;
+  }) as typeof fetch;
+  let result: unknown;
+  try {
+    const client = new McpClient({ url: "http://127.0.0.1:0/mcp" });
+    result = await run(client);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return { method, name, args, result };
+}
+
+test("setAnnotation: forwards queueKey/queueName/queueUrl (partial merge)", async () => {
+  const args = await captureSetAnnotationArgs("s1", {
+    queueKey: "PROJ-42",
+    queueName: "backlog",
+    queueUrl: "https://example/PROJ-42",
+  });
+  assert.equal(args.id, "s1");
+  assert.equal(args.queueKey, "PROJ-42");
+  assert.equal(args.queueName, "backlog");
+  assert.equal(args.queueUrl, "https://example/PROJ-42");
+});
+
+test("setAnnotation: omits the queue fields when undefined", async () => {
+  const args = await captureSetAnnotationArgs("s1", { summary: "x" });
+  assert.equal("queueKey" in args, false);
+  assert.equal("queueName" in args, false);
+  assert.equal("queueUrl" in args, false);
+});
+
+test("spawnSplitCommand: encodes the tool + forwards only present fields", async () => {
+  const { method, name, args, result } = await captureCall(
+    '{"id":"new-uuid","sessionId":17}',
+    (c) =>
+      c.spawnSplitCommand({
+        targetUUID: "t1",
+        direction: "down",
+        command: "claude work",
+        cwd: "/repo",
+      }),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "spawn_split_command");
+  assert.equal(args.targetUUID, "t1");
+  assert.equal(args.direction, "down");
+  assert.equal(args.command, "claude work");
+  assert.equal(args.cwd, "/repo");
+  assert.equal("firstTab" in args, false);
+  assert.deepEqual(result, { id: "new-uuid", sessionId: 17 });
+});
+
+test("spawnSplitCommand: forwards the item env (GHOSTTY_ITEM_*) and omits an empty env", async () => {
+  const withEnv = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({
+      command: "claude work",
+      firstTab: true,
+      env: { GHOSTTY_ITEM_KEY: "K-1", GHOSTTY_ITEM_TITLE: 'a"b $x' },
+    }),
+  );
+  assert.deepEqual(withEnv.args.env, {
+    GHOSTTY_ITEM_KEY: "K-1",
+    GHOSTTY_ITEM_TITLE: 'a"b $x',
+  });
+
+  // An empty env map is omitted from the wire payload entirely.
+  const emptyEnv = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({ command: "claude", firstTab: true, env: {} }),
+  );
+  assert.equal("env" in emptyEnv.args, false, "empty env omitted from the payload");
+
+  // No env arg → no env key.
+  const noEnv = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({ command: "claude", firstTab: true }),
+  );
+  assert.equal("env" in noEnv.args, false, "absent env omitted from the payload");
+});
+
+test("sendKey: encodes the send_key tool with id + key", async () => {
+  const { method, name, args } = await captureCall('{"ok":true}', (c) =>
+    c.sendKey("s9", "ctrl_d"),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "send_key");
+  assert.equal(args.id, "s9");
+  assert.equal(args.key, "ctrl_d");
+});
+
+test("spawnSplitCommand: firstTab open omits target/direction", async () => {
+  const { args, result } = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({ command: "claude", firstTab: true }),
+  );
+  assert.equal(args.firstTab, true);
+  assert.equal(args.command, "claude");
+  assert.equal("targetUUID" in args, false);
+  assert.equal("direction" in args, false);
+  assert.deepEqual(result, { id: "u", sessionId: 1 });
+});
+
+test("spawnSplitCommand: defaults sessionId to 0 when absent", async () => {
+  const { result } = await captureCall('{"id":"u"}', (c) =>
+    c.spawnSplitCommand({ command: "claude", firstTab: true }),
+  );
+  assert.deepEqual(result, { id: "u", sessionId: 0 });
+});
+
+test("spawnSplitCommand: throws McpError on a payload with no id", async () => {
+  await assert.rejects(
+    () => captureCall('{"sessionId":3}', (c) => c.spawnSplitCommand({ command: "x", firstTab: true })),
+    McpError,
+  );
+});
+
+test("forceCloseSurface: encodes the tool + id", async () => {
+  const { method, name, args } = await captureCall('{"ok":true}', (c) =>
+    c.forceCloseSurface("s9"),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "force_close_surface");
+  assert.equal(args.id, "s9");
+});
+
+test("signalAttention: encodes the tool, id, and optional reason", async () => {
+  const withReason = await captureCall('{"ok":true}', (c) =>
+    c.signalAttention("s9", "agent exited early"),
+  );
+  assert.equal(withReason.name, "signal_attention");
+  assert.equal(withReason.args.id, "s9");
+  assert.equal(withReason.args.reason, "agent exited early");
+
+  const noReason = await captureCall('{"ok":true}', (c) => c.signalAttention("s9"));
+  assert.equal(noReason.args.id, "s9");
+  assert.equal("reason" in noReason.args, false);
+});
+
+// --- take_queue_commands envelope (§8a) -------------------------------------
+// The GUI→sidecar command drain. The tool name + the {commands:[...]} envelope
+// decode, plus the tolerant coercion (malformed → []), are the load-bearing logic.
+
+test("takeQueueCommands: calls the take_queue_commands tool and decodes the envelope", async () => {
+  const { method, name, args, result } = await captureCall(
+    '{"commands":[{"action":"start","template":"backlog"},{"action":"pause","run":"backlog"}]}',
+    (c) => c.takeQueueCommands(),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "take_queue_commands");
+  assert.deepEqual(args, {}, "no arguments");
+  assert.deepEqual(result, [
+    { action: "start", template: "backlog" },
+    { action: "pause", run: "backlog" },
+  ]);
+});
+
+test("takeQueueCommands: an empty envelope yields []", async () => {
+  const { result } = await captureCall('{"commands":[]}', (c) => c.takeQueueCommands());
+  assert.deepEqual(result, []);
+});
+
+test("coerceQueueCommands: tolerant of malformed shapes → []", () => {
+  assert.deepEqual(coerceQueueCommands(null), []);
+  assert.deepEqual(coerceQueueCommands("nope"), []);
+  assert.deepEqual(coerceQueueCommands([]), [], "a bare array (no envelope) → []");
+  assert.deepEqual(coerceQueueCommands({}), [], "no commands field → []");
+  assert.deepEqual(coerceQueueCommands({ commands: "x" }), [], "non-array commands → []");
+});
+
+test("coerceQueueCommands: drops non-object entries and unrecognized actions, keeps valid fields", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "start", template: "t1" },
+      { action: "bogus", run: "x" }, // unrecognized action dropped
+      "not-an-object", // dropped
+      { action: "stop" }, // valid action, no run (kept; the reducer no-ops it)
+      { action: "resume", run: "r", extra: "ignored" }, // extra fields stripped
+      { action: "pause", template: 9 }, // non-string template stripped, action kept
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "start", template: "t1" },
+    { action: "stop" },
+    { action: "resume", run: "r" },
+    { action: "pause" },
+  ]);
 });

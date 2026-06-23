@@ -711,6 +711,13 @@ typedef struct {
   const char* title;
 } ghostty_action_set_title_s;
 
+// apprt.action.StartAgentQueue.C (ramon fork / Agent Queue Supervisor)
+typedef struct {
+  // The queue-template basename to start, or the empty string "" to open the
+  // picker. Never NULL.
+  const char* template;
+} ghostty_action_start_agent_queue_s;
+
 // apprt.action.PromptTitle
 typedef enum {
   GHOSTTY_PROMPT_TITLE_SURFACE,
@@ -1002,6 +1009,7 @@ typedef enum {
   GHOSTTY_ACTION_SWAP_SPLIT,
   GHOSTTY_ACTION_TOGGLE_PROJECT_SELECTOR,
   GHOSTTY_ACTION_TOGGLE_AGENT_DASHBOARD,
+  GHOSTTY_ACTION_START_AGENT_QUEUE,
   GHOSTTY_ACTION_GOTO_LAST_SURFACE,
 } ghostty_action_tag_e;
 
@@ -1027,6 +1035,7 @@ typedef union {
   ghostty_action_desktop_notification_s desktop_notification;
   ghostty_action_set_title_s set_title;
   ghostty_action_set_title_s set_tab_title;
+  ghostty_action_start_agent_queue_s start_agent_queue;
   ghostty_action_prompt_title_e prompt_title;
   ghostty_action_pwd_s pwd;
   ghostty_action_mouse_shape_e mouse_shape;

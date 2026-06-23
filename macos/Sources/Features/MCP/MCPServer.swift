@@ -106,6 +106,20 @@ final class MCPServer {
     /// Whether the listener entered .failed (surfaced once to the user).
     private(set) var didFailToBind = false
 
+    /// (ramon fork / Agent Queue, §8a) The GUI→sidecar command FIFO. Local control
+    /// intents (palette / dashboard buttons / keybind) are posted as
+    /// `.ghosttyQueueCommand`; the observer hops the enqueue onto THIS serial queue
+    /// and appends here, and `take_queue_commands` drains+clears it (also on `queue`).
+    /// So every access is on `queue` — race-free WITHOUT a lock. In-memory only: an
+    /// undrained command lost on a GUI crash just means re-trigger (the STARTED-run
+    /// STATE is persisted sidecar-side, so a running queue survives regardless).
+    /// Mutated ONLY on `queue`.
+    var queueCommandFIFO: [QueueCommand] = []
+
+    /// Observer token for `.ghosttyQueueCommand`. Set in `start()`, removed in
+    /// `stop()`. Touched only on main (NotificationCenter add/remove).
+    var queueCommandObserver: NSObjectProtocol?
+
     init(listen: String, token: String) {
         self.listenSpec = listen
         self.token = token
@@ -177,6 +191,9 @@ final class MCPServer {
             // on main, before accepting connections, so a waiter that registers
             // immediately has a live source feeding it.
             bus.start(server: self)
+            // (Agent Queue, §8a) Observe local control-command posts and enqueue
+            // them onto the FIFO (race-free, on `queue`).
+            startQueueCommandObserver()
             l.start(queue: queue)
         } catch {
             logger.error("mcp: failed to create listener: \(String(describing: error), privacy: .public)")
@@ -189,6 +206,7 @@ final class MCPServer {
         // themselves hop to main via DispatchQueue.main.sync, so a sync teardown
         // from main would be a lock-order inversion.
         bus.stop()
+        stopQueueCommandObserver()
         queue.async {
             self.listener?.cancel()
             self.listener = nil

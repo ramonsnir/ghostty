@@ -179,10 +179,65 @@ enum MCPTools {
                     "phase": ["type": "string"],
                     "needsUser": ["type": "boolean"],
                     "confidence": ["type": "number"],
+                    // (Agent Queue, §8.5) origin-tagging fields the supervisor writes
+                    // through this same merge tool, so a strict MCP-client validator
+                    // honoring additionalProperties:false doesn't reject the call.
+                    "queueKey": ["type": "string", "description": "Agent Queue: the work-item key this surface is bound to."],
+                    "queueName": ["type": "string", "description": "Agent Queue: the run/origin name (dashboard grouping)."],
+                    "queueUrl": ["type": "string", "description": "Agent Queue: the work-item URL (clickable in the tile)."],
                 ],
                 "required": ["id"],
                 "additionalProperties": false,
             ],
+        ],
+        [
+            // (ramon fork / Agent Queue, §8.1)
+            "name": "spawn_split_command",
+            "description": "Agent Queue: spawn one agent split running a command, returning the NEW surface's stable identity {id (UUID), sessionId (the pty-host session id; 0 when there is no host session)}. With firstTab:true, opens the run's first TAB (from app defaults in cwd); otherwise SPLITS the targetUUID surface in the given direction. The command is run as the new surface's first input in an interactive shell (it does NOT replace the shell); interior newlines are collapsed so exactly one trailing submit is sent. SAFETY/GENERICITY: item context MUST be passed via the 'env' map (e.g. GHOSTTY_ITEM_KEY/TITLE/URL) — which is set on the new split's environment so the launched shell inherits it — and NEVER string-spliced into 'command' (that would be shell injection). 'command' is the template launch line passed VERBATIM. 'cwd' is NOT tilde-expanded (use an absolute path).",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "targetUUID": ["type": "string", "description": "Surface UUID to split (required unless firstTab)."],
+                    "direction": ["type": "string", "enum": ["right", "down", "left", "up"], "description": "Split direction (required unless firstTab)."],
+                    "command": ["type": "string", "description": "The launch command, run VERBATIM as the new surface's first input."],
+                    "cwd": ["type": "string", "description": "Working directory (no '~' expansion)."],
+                    "firstTab": ["type": "boolean", "default": false, "description": "Open the run's first tab instead of splitting a target."],
+                    "env": ["type": "object", "description": "Item-context env vars (GHOSTTY_ITEM_*) set on the launched shell. NEVER splice these into 'command'.", "additionalProperties": ["type": "string"]],
+                ],
+                "required": ["command"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / Agent Queue, §8.2/§10)
+            "name": "force_close_surface",
+            "description": "Agent Queue: close a surface WITHOUT the close-confirmation prompt. Unlike close_surface (which honors confirm-close and pops a modal for a live child), this bypasses confirmation. Intended to be called only AFTER the surface's child has exited (the supervisor first sends the template exit keys), so a done-but-still-rendering agent split actually closes instead of stalling on a modal.",
+            "inputSchema": [
+                "type": "object",
+                "properties": ["id": ["type": "string"]],
+                "required": ["id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / Agent Queue, §8.3/§6)
+            "name": "signal_attention",
+            "description": "Agent Queue: ring the bell / raise attention for a surface, reusing Ghostty's normal bell pipeline so the dashboard bell aggregate, the web monitor, and a push notification all fire. Used by onAgentExit=leave-and-bell so a crashed/exited agent surfaces itself for human review. The optional 'reason' is a human-readable note (logged). Generic + reusable.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "string"],
+                    "reason": ["type": "string"],
+                ],
+                "required": ["id"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / Agent Queue, §8a)
+            "name": "take_queue_commands",
+            "description": "Agent Queue: DRAIN and return the GUI's in-memory FIFO of local control commands (start/stop/abort/pause/resume) enqueued by the command palette / dashboard buttons / a keybind. Returns {commands:[{action, template?, run?}, …]} and CLEARS the FIFO. The sidecar's supervisor pass calls this each sweep to learn which queues to start/pause/stop/abort. Empty when nothing is pending.",
+            "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
     ]
 
@@ -310,6 +365,61 @@ enum MCPTools {
             }
             let ok = server.applyAnnotation(uuid: uuid, annotation: payload.annotation)
             return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
+
+        case "spawn_split_command":
+            // command is required. targetUUID/direction are required UNLESS firstTab.
+            guard let command = arguments["command"] as? String, !command.isEmpty else {
+                return .invalidParams("missing command")
+            }
+            let firstTab = (arguments["firstTab"] as? Bool) ?? false
+            let cwd = arguments["cwd"] as? String
+            let direction = arguments["direction"] as? String
+            // The item-context env: only string→string entries are kept (§13). A
+            // non-string value is dropped rather than coerced.
+            var env: [String: String] = [:]
+            if let raw = arguments["env"] as? [String: Any] {
+                for (k, v) in raw { if let s = v as? String { env[k] = s } }
+            }
+            // Validate the split target/direction up front (AppKit-free) so a bad
+            // call fails fast rather than after a main hop.
+            var targetUUID: UUID? = nil
+            if !firstTab {
+                guard let s = arguments["targetUUID"] as? String, let u = UUID(uuidString: s) else {
+                    return .invalidParams("missing or invalid targetUUID (required unless firstTab)")
+                }
+                guard MCPLayout.newDirection(direction) != nil else {
+                    return .invalidParams("missing or invalid direction (required unless firstTab)")
+                }
+                targetUUID = u
+            }
+            let result: (id: String, sessionID: UInt64)? = DispatchQueue.main.sync {
+                MCPLayout.newSplitCommand(
+                    targetUUID: targetUUID, direction: direction, command: command,
+                    cwd: cwd, firstTab: firstTab, env: env)
+            }
+            guard let result else { return .toolError("failed to spawn split") }
+            // Casing note: this returns "sessionId" (lowercase); list_surfaces emits
+            // "sessionID" (capital, MCPLayout.swift). Each matches its TS reader in mcp.ts.
+            return .ok(["id": result.id, "sessionId": NSNumber(value: result.sessionID)])
+
+        case "force_close_surface":
+            guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
+            let ok = DispatchQueue.main.sync { MCPLayout.forceClose(uuid: uuid) }
+            return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
+
+        case "signal_attention":
+            guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
+            let reason = arguments["reason"] as? String
+            let ok = server.signalAttention(uuid: uuid, reason: reason)
+            return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
+
+        case "take_queue_commands":
+            // dispatch() ALREADY runs on the server serial `queue` (handleRPC is a
+            // route handler on `queue`), which is the SAME queue the FIFO is mutated
+            // on (enqueue hops there) — so draining directly here is race-free WITHOUT
+            // a nested `queue.sync` (which would DEADLOCK on this serial queue).
+            let drained = server.drainQueueCommands()
+            return .ok(MCPServer.queueCommandsJSONData(drained))
 
         default:
             return .methodNotFound

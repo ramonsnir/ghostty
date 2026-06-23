@@ -2955,6 +2955,38 @@ keybind: Keybinds = .{},
 // macOS apprt reads this via the `agentManagerNodePath` Swift getter.
 @"agent-manager-node-path": ?[:0]const u8 = null,
 
+/// (ramon fork / Agent Queue Supervisor) Master enable for the Agent Queue
+/// Supervisor — the deterministic supervisor "pass 3" the Agent Manager
+/// sidecar runs (no LLM in the control path) that starts, tracks, and tears
+/// down a fleet of CLI agents working through a queue of tasks (one tab of
+/// auto-gridded splits, hard concurrency cap, completion-based cleanup). When
+/// true AND `agent-manager` + the MCP server are configured AND at least one
+/// valid queue TEMPLATE loads, the supervisor runs; otherwise it stays fully
+/// dormant (one info log) and the dashboard/summarizer/suggester are
+/// unaffected. Default false. Fork-only — keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty sharing
+/// `~/.config/ghostty/config` would error on it).
+@"agent-queue": bool = false,
+
+/// (ramon fork / Agent Queue Supervisor) Directory holding the queue TEMPLATE
+/// JSON files (team policy: provider commands, agent launch command,
+/// concurrency, grid, intervals, completion rule). Null (the default) ⇒ the
+/// sidecar's built-in default
+/// `~/.config/ghostty-ramon/agent-manager/queues`. `~` is expanded
+/// macOS-side. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+// NOTE: `[:0]const u8` (NOT `[]const u8`) so the C config getter
+// (ghostty_config_get) can return it as a NUL-terminated string — the
+// macOS apprt reads this via the `agentQueueTemplatesDir` Swift getter
+// (mirrors `agent-manager-node-path`).
+@"agent-queue-templates-dir": ?[:0]const u8 = null,
+
+/// (ramon fork / Agent Queue Supervisor) Global concurrency cap across ALL
+/// queue runs — the hard ceiling on how many queue agents the supervisor may
+/// have live at once, fleet-wide (each run additionally has its own
+/// `concurrency` + grid cap in its template). Default 8. Fork-only — keep it
+/// in `~/.config/ghostty-ramon/config`.
+@"agent-queue-max-total": u32 = 8,
+
 /// (ramon fork / Phase 2b) AF_UNIX socket path of a running `ghostty-host`
 /// (`zig-out/bin/ghostty-host --listen=<sockpath>`). When set, a new surface
 /// connects to that host and runs its terminal emulation ON THE HOST,
@@ -11369,5 +11401,37 @@ test "agent-manager: parse and default" {
         try cfg.finalize();
         try testing.expectEqual(true, cfg.@"agent-manager");
         try testing.expectEqualStrings("/usr/local/bin/node", cfg.@"agent-manager-node-path".?);
+    }
+}
+
+test "agent-queue: parse and default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(false, cfg.@"agent-queue");
+        try testing.expect(cfg.@"agent-queue-templates-dir" == null);
+        try testing.expectEqual(@as(u32, 8), cfg.@"agent-queue-max-total");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue=true",
+            "--agent-queue-templates-dir=/Users/ramon/.config/ghostty-ramon/agent-manager/queues",
+            "--agent-queue-max-total=4",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"agent-queue");
+        try testing.expectEqualStrings(
+            "/Users/ramon/.config/ghostty-ramon/agent-manager/queues",
+            cfg.@"agent-queue-templates-dir".?,
+        );
+        try testing.expectEqual(@as(u32, 4), cfg.@"agent-queue-max-total");
     }
 }

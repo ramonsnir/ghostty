@@ -1599,3 +1599,144 @@ struct AgentDashboardPanelTests {
         #expect(!panel.canBecomeMain)
     }
 }
+
+// MARK: - Origin grouping + filter (ramon fork / Agent Queue, §11)
+
+@MainActor
+struct AgentDashboardOriginTests {
+    /// A tile carrying an optional queue annotation (origin = queueName, else
+    /// `(other)`), with a given session for stable identity.
+    private func entry(
+        _ id: UUID, session: UInt64,
+        queueName: String? = nil, queueKey: String? = nil, queueUrl: String? = nil,
+        bell: Bool = false, waiting: Bool = false
+    ) -> AgentEntry {
+        let ann: AgentAnnotation? = (queueName != nil || queueKey != nil || queueUrl != nil)
+            ? AgentAnnotation(queueKey: queueKey, queueName: queueName, queueUrl: queueUrl)
+            : nil
+        return .init(id: id, realView: nil, title: "t", pwd: "/x", agent: AgentKind("claude"),
+                     bell: bell, hidden: false, sessionID: session,
+                     agentState: waiting ? .waiting : nil,
+                     lastTool: nil, lastPrompt: nil, hookBacked: false,
+                     annotation: ann, userNotes: nil, suggestionDismissed: false)
+    }
+
+    // MARK: pure origin/grouping/filter
+
+    @Test func originIsQueueNameElseOther() {
+        let q = entry(UUID(), session: 1, queueName: "backlog")
+        let n = entry(UUID(), session: 2)
+        let blank = entry(UUID(), session: 3, queueName: "")  // empty name → (other)
+        #expect(AgentDashboardModel.origin(of: q) == "backlog")
+        #expect(AgentDashboardModel.origin(of: n) == AgentDashboardModel.otherOrigin)
+        #expect(AgentDashboardModel.origin(of: blank) == AgentDashboardModel.otherOrigin)
+    }
+
+    @Test func knownOriginsCollectsDistinct() {
+        let es = [
+            entry(UUID(), session: 1, queueName: "alpha"),
+            entry(UUID(), session: 2, queueName: "beta"),
+            entry(UUID(), session: 3),                          // (other)
+            entry(UUID(), session: 4, queueName: "alpha"),      // dup
+        ]
+        #expect(AgentDashboardModel.knownOrigins(in: es)
+            == ["alpha", "beta", AgentDashboardModel.otherOrigin])
+    }
+
+    @Test func groupByOriginPutsOtherLastAndSortsQueues() {
+        let es = [
+            entry(UUID(), session: 1),                          // (other)
+            entry(UUID(), session: 2, queueName: "Zeta"),
+            entry(UUID(), session: 3, queueName: "alpha"),
+        ]
+        let sections = AgentDashboardModel.groupByOrigin(es)
+        #expect(sections.map(\.id) == ["alpha", "Zeta", AgentDashboardModel.otherOrigin])
+        #expect(sections.last?.isOther == true)
+        #expect(sections.first?.count == 1)
+    }
+
+    @Test func groupByOriginPreservesInputOrderWithinSection() {
+        // Input order (the global sort) is preserved inside each section.
+        let a = entry(UUID(), session: 10, queueName: "q")
+        let b = entry(UUID(), session: 20, queueName: "q")
+        let sections = AgentDashboardModel.groupByOrigin([a, b])
+        #expect(sections.count == 1)
+        #expect(sections[0].entries.map(\.sessionID) == [10, 20])
+    }
+
+    @Test func applyOriginFilterDropsExcluded() {
+        let es = [
+            entry(UUID(), session: 1, queueName: "alpha"),
+            entry(UUID(), session: 2, queueName: "beta"),
+            entry(UUID(), session: 3),                          // (other)
+        ]
+        let kept = AgentDashboardModel.applyOriginFilter(es, excluded: ["beta"])
+        #expect(kept.map(\.sessionID) == [1, 3])
+        // Empty exclusion is identity.
+        #expect(AgentDashboardModel.applyOriginFilter(es, excluded: []).count == 3)
+    }
+
+    // MARK: model instance: filter state, persistence, sections
+
+    private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
+        pairs.map { .init(id: $0.0, view: nil, title: "t", pwd: "/x", sessionID: $0.1) }
+    }
+    private func agents(_ ids: [UUID]) -> [UUID: AgentKind] {
+        Dictionary(uniqueKeysWithValues: ids.map { ($0, AgentKind("claude")) })
+    }
+
+    @Test func toggleOriginPersistsAndFiltersSections() {
+        let filterStore = InMemoryOriginFilterStore()
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(), originFilterStore: filterStore)
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, AgentAnnotation(queueName: "alpha"))
+        model.applyAnnotation(b, AgentAnnotation(queueName: "beta"))
+
+        // Both origins visible.
+        #expect(model.knownOrigins == ["alpha", "beta"])
+        #expect(model.sections.map(\.id) == ["alpha", "beta"])
+
+        // Exclude beta → only alpha's tiles remain; persisted.
+        model.toggleOrigin("beta")
+        #expect(model.excludedOrigins == ["beta"])
+        #expect(filterStore.load() == ["beta"])
+        #expect(model.sections.map(\.id) == ["alpha"])
+        // The filter bar still offers beta (knownOrigins is the unfiltered set).
+        #expect(model.knownOrigins == ["alpha", "beta"])
+
+        // Re-include via showAllOrigins → both back; persisted clear.
+        model.showAllOrigins()
+        #expect(model.excludedOrigins.isEmpty)
+        #expect(filterStore.load().isEmpty)
+        #expect(model.sections.map(\.id) == ["alpha", "beta"])
+    }
+
+    @Test func excludedFilterLoadsFromStoreAtInit() {
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            originFilterStore: InMemoryOriginFilterStore(["muted"]))
+        #expect(model.excludedOrigins == ["muted"])
+    }
+
+    @Test func filterIsViewOnly_excludedStillInEntries() {
+        // The origin filter is a VIEW filter: `entries` (the attention/auto-unhide
+        // universe) keeps the excluded tile; only `sections` (the displayed,
+        // grouped, filtered view) drops it — so an excluded-but-ringing agent is
+        // never muted.
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            originFilterStore: InMemoryOriginFilterStore(["beta"]))
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, AgentAnnotation(queueName: "alpha"))
+        model.applyAnnotation(b, AgentAnnotation(queueName: "beta"))
+        // entries keeps BOTH (the model's attention universe is unfiltered).
+        #expect(Set(model.entries.map(\.sessionID)) == [1, 2])
+        // sections drops the excluded beta tile.
+        #expect(model.sections.flatMap { $0.entries }.map(\.sessionID) == [1])
+    }
+}

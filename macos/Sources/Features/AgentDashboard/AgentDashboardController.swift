@@ -169,6 +169,42 @@ final class InMemoryOrderStore: OrderStore {
     func save(_ order: [UInt64]) { self.order = order }
 }
 
+/// (ramon fork / Agent Queue, §11) Persistence boundary for the dashboard's
+/// origin FILTER — the set of origins (queue names, or `(other)`) the user has
+/// EXCLUDED from the view. A VIEW filter only: an excluded origin's agents are
+/// hidden from the tile list but still ring/auto-unhide (attention is never
+/// muted). Injected for testability, mirroring `OrderStore`. Keyed by origin
+/// STRING (stable across relaunch — the queue name, unlike the surface UUID).
+protocol OriginFilterStore {
+    func load() -> Set<String>
+    func save(_ excluded: Set<String>)
+}
+
+/// Production origin-filter store backed by the fork bundle-id `UserDefaults`
+/// domain. Stores the excluded origins as a string array.
+struct UserDefaultsOriginFilterStore: OriginFilterStore {
+    static let key = "agentDashboardExcludedOrigins"
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func load() -> Set<String> {
+        Set(defaults.stringArray(forKey: Self.key) ?? [])
+    }
+
+    func save(_ excluded: Set<String>) {
+        defaults.set(Array(excluded), forKey: Self.key)
+    }
+}
+
+/// In-memory `OriginFilterStore` for tests.
+final class InMemoryOriginFilterStore: OriginFilterStore {
+    private var excluded: Set<String>
+    init(_ excluded: Set<String> = []) { self.excluded = excluded }
+    func load() -> Set<String> { excluded }
+    func save(_ excluded: Set<String>) { self.excluded = excluded }
+}
+
 /// (ramon fork / Agent Manager Phase 2) Persistence boundary for the user's
 /// per-session NOTES — free-text goals/guidance the user types into a tile field
 /// for the Agent Manager (distinct from `notes`, which is the LLM summary
@@ -298,8 +334,20 @@ final class AgentDashboardModel: ObservableObject {
     /// In-memory ONLY (no persistence), pruned on `rebuild(live:)`.
     @Published private(set) var suggestionDismissed: Set<UUID> = []
 
+    // MARK: - Origin filter (ramon fork / Agent Queue, §11)
+
+    /// Origins (queue names, or `(other)`) the user has EXCLUDED from the view.
+    /// `@Published` so the filter bar + tile list re-render on toggle. A VIEW
+    /// filter only — `entries` excludes these origins' tiles, but attention paths
+    /// (`applyBells` / `applyAgentState` auto-unhide) operate on the full state, so
+    /// an excluded-but-ringing/waiting agent STILL rings/pushes/auto-unhides.
+    /// Persisted via `originFilterStore`, keyed by origin string (stable across
+    /// relaunch, unlike a surface UUID).
+    @Published private(set) var excludedOrigins: Set<String> = []
+
     private let store: HideStore
     private let orderStore: OrderStore
+    private let originFilterStore: OriginFilterStore
 
     // MARK: - Agent-state persistence (ramon fork / Agent hooks)
 
@@ -335,14 +383,17 @@ final class AgentDashboardModel: ObservableObject {
         store: HideStore,
         agentStateStore: AgentStateStore = InMemoryAgentStateStore(),
         orderStore: OrderStore = InMemoryOrderStore(),
-        userNotesStore: UserNotesStore = InMemoryUserNotesStore()
+        userNotesStore: UserNotesStore = InMemoryUserNotesStore(),
+        originFilterStore: OriginFilterStore = InMemoryOriginFilterStore()
     ) {
         self.store = store
         self.agentStore = agentStateStore
         self.orderStore = orderStore
         self.userNotesStore = userNotesStore
+        self.originFilterStore = originFilterStore
         self.hidden = store.load()
         self.manualOrder = orderStore.load()
+        self.excludedOrigins = originFilterStore.load()
         self.restoredNotes = userNotesStore.load()
         let loaded = agentStateStore.load()
         let pruned = AgentDashboardModel.prune(
@@ -534,7 +585,9 @@ final class AgentDashboardModel: ObservableObject {
         guard let a = annotations[id] else { return }
         annotations[id] = AgentAnnotation(
             summary: a.summary, suggestion: nil, phase: a.phase,
-            needsUser: a.needsUser, confidence: a.confidence)
+            needsUser: a.needsUser, confidence: a.confidence,
+            // (Agent Queue, §8.5) preserve the queue tag through a suggestion dismiss.
+            queueKey: a.queueKey, queueName: a.queueName, queueUrl: a.queueUrl)
         // (Phase 2.1) Mark dismissed so the sidecar suppresses re-suggesting until the
         // change fingerprint shifts (surfaced via list_surfaces.suggestionDismissed).
         suggestionDismissed.insert(id)
@@ -871,6 +924,129 @@ final class AgentDashboardModel: ObservableObject {
             return a.id.uuidString < b.id.uuidString
         }
     }
+
+    // MARK: - Origin grouping + filter (ramon fork / Agent Queue, §11)
+
+    /// The label used for non-queue agents (legacy / today's behavior). A queue
+    /// tile's origin is its `queueName` annotation; everything else is here.
+    static let otherOrigin = "(other)"
+
+    /// PURE: the origin of one tile — its queue name (from the annotation, §8.5),
+    /// or `(other)` for a non-queue agent. A blank queue name is treated as
+    /// `(other)` (a defensive guard against an empty annotation string).
+    static func origin(of entry: AgentEntry) -> String {
+        if let q = entry.annotation?.queueName, !q.isEmpty { return q }
+        return otherOrigin
+    }
+
+    /// PURE: the set of origins present in a tile list. Used to drive the filter
+    /// bar (one toggle per known origin). Unit-tested.
+    static func knownOrigins(in entries: [AgentEntry]) -> Set<String> {
+        Set(entries.map { origin(of: $0) })
+    }
+
+    /// PURE: drop tiles whose origin is in `excluded`. The VIEW filter (§11) — it
+    /// never touches the model's attention paths, so an excluded agent still
+    /// rings/auto-unhides. Unit-tested.
+    static func applyOriginFilter(
+        _ entries: [AgentEntry], excluded: Set<String>
+    ) -> [AgentEntry] {
+        guard !excluded.isEmpty else { return entries }
+        return entries.filter { !excluded.contains(origin(of: $0)) }
+    }
+
+    /// One rendered origin section: a header label + its tiles (already sorted).
+    /// `id` is the origin string (stable). The `(other)` section sorts LAST; queue
+    /// origins sort case-insensitively before it.
+    struct OriginSection: Identifiable, Equatable {
+        let id: String          // == origin
+        let entries: [AgentEntry]
+        var count: Int { entries.count }
+        /// True for the catch-all `(other)` section (no queue controls on it).
+        var isOther: Bool { id == AgentDashboardModel.otherOrigin }
+
+        static func == (lhs: OriginSection, rhs: OriginSection) -> Bool {
+            lhs.id == rhs.id && lhs.entries.map(\.id) == rhs.entries.map(\.id)
+        }
+    }
+
+    /// PURE: group an already-sorted, already-filtered tile list into ordered
+    /// origin sections — queue origins first (case-insensitive by name), the
+    /// `(other)` catch-all LAST. Within a section the input order is preserved
+    /// (the caller passes the global `sorted(...)` order, so attention-first /
+    /// manual / recency carries into each section). Unit-tested.
+    static func groupByOrigin(_ entries: [AgentEntry]) -> [OriginSection] {
+        var order: [String] = []           // first-seen origin order (for tie-stable grouping)
+        var buckets: [String: [AgentEntry]] = [:]
+        for e in entries {
+            let o = origin(of: e)
+            if buckets[o] == nil { order.append(o) }
+            buckets[o, default: []].append(e)
+        }
+        // Queue origins sorted case-insensitively, `(other)` always last.
+        let origins = order.sorted { a, b in
+            if a == otherOrigin { return false }
+            if b == otherOrigin { return true }
+            return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+        }
+        return origins.map { OriginSection(id: $0, entries: buckets[$0] ?? []) }
+    }
+
+    // MARK: - Origin filter (instance API)
+
+    /// All origins currently present among the (unfiltered) displayed tiles —
+    /// drives the filter bar's toggle list. Derived from `entries` (which is the
+    /// sorted, non-hidden, but NOT origin-filtered set — see the note below) so the
+    /// bar always offers a toggle for every visible origin, including excluded ones
+    /// (so the user can re-include them).
+    var knownOrigins: Set<String> { AgentDashboardModel.knownOrigins(in: entries) }
+
+    /// The displayed, origin-filtered tiles grouped into ordered sections. The
+    /// `entries` list is the global-sorted, non-hidden set (NOT origin-filtered);
+    /// the origin filter is applied HERE so the model's attention logic and the
+    /// filter-bar toggle list both see the full origin set.
+    var sections: [OriginSection] {
+        let filtered = AgentDashboardModel.applyOriginFilter(entries, excluded: excludedOrigins)
+        return AgentDashboardModel.groupByOrigin(filtered)
+    }
+
+    /// Toggle an origin's inclusion in the view. Excluded ⇄ included. Persists.
+    /// Does NOT touch the hide set or attention paths — a re-included origin's
+    /// tiles reappear immediately; an excluded origin's agents keep ringing.
+    func toggleOrigin(_ origin: String) {
+        if excludedOrigins.contains(origin) {
+            excludedOrigins.remove(origin)
+        } else {
+            excludedOrigins.insert(origin)
+        }
+        originFilterStore.save(excludedOrigins)
+    }
+
+    /// Re-include every origin (clear the filter). Persists. No-op when empty.
+    func showAllOrigins() {
+        guard !excludedOrigins.isEmpty else { return }
+        excludedOrigins.removeAll()
+        originFilterStore.save(excludedOrigins)
+    }
+
+    // MARK: - Queue run control (ramon fork / Agent Queue, §8a/§11)
+
+    /// Post a `pause`/`resume`/`stop`/`abort` control intent for a queue RUN
+    /// (origin = run name) onto the MCP server's FIFO via `.ghosttyQueueCommand` —
+    /// the SAME enqueue path the palette + the keybind action use. The sidecar
+    /// supervisor drains + applies it on its next sweep (§8a). No-op for the
+    /// `(other)` catch-all (it is not a queue run). The model never holds run
+    /// state — this is a one-way control intent (single owner = the sidecar).
+    func sendRunCommand(_ action: QueueCommand.Action, run: String) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: action, run: run),
+            ])
+    }
 }
 
 /// (ramon fork / Agent Dashboard, Layer 3) Owns the panel, the SwiftUI host
@@ -901,7 +1077,8 @@ final class AgentDashboardController: NSWindowController {
             store: UserDefaultsHideStore(),
             agentStateStore: UserDefaultsAgentStateStore(),
             orderStore: UserDefaultsOrderStore(),
-            userNotesStore: UserDefaultsUserNotesStore())
+            userNotesStore: UserDefaultsUserNotesStore(),
+            originFilterStore: UserDefaultsOriginFilterStore())
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
         let panel = AgentDashboardPanel(pinned: ghostty.config.agentDashboardPin)

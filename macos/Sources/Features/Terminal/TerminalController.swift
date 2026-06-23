@@ -773,6 +773,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
+        // The node IS the tab/window root. The IBAction-style closeTab/closeWindow
+        // below re-check `needsConfirmQuit` and pop a modal for any live child,
+        // which would IGNORE a `withConfirmation: false` request and STALL an
+        // unattended teardown (e.g. the Agent Queue force-close path, §8.2/§10:
+        // the supervisor closes a done+idle agent that is the tab's ONLY pane, so
+        // the surface is the root). When confirmation is explicitly suppressed,
+        // route to the confirm-FREE immediate close paths instead.
+        if !withConfirmation {
+            if window?.tabGroup?.windows.count ?? 0 > 1 {
+                closeTabImmediately()
+            } else {
+                closeWindowImmediately()
+            }
+            return
+        }
+
         // More than 1 window means we have tabs and we're closing a tab
         if window?.tabGroup?.windows.count ?? 0 > 1 {
             closeTab(nil)

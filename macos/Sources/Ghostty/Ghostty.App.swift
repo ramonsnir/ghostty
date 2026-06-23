@@ -647,6 +647,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_AGENT_DASHBOARD:
                 toggleAgentDashboard(app, target: target)
 
+            case GHOSTTY_ACTION_START_AGENT_QUEUE:
+                startAgentQueue(app, target: target, v: action.action.start_agent_queue)
+
             case GHOSTTY_ACTION_GOTO_LAST_SURFACE:
                 gotoLastSurface(app, target: target)
 
@@ -1205,6 +1208,60 @@ extension Ghostty {
                 name: Notification.ghosttyToggleAgentDashboard,
                 object: nil
             )
+        }
+
+        // (ramon fork / Agent Queue Supervisor) Start an Agent Queue run. With an
+        // EMPTY template, this opens the queue-template picker palette for the
+        // target surface (mirrors `toggleProjectSelector`: surface-attached, no-op
+        // on an APP target). With a NON-EMPTY template, it SKIPS the picker and
+        // enqueues a `{action:"start", template:…}` command onto the MCP server's
+        // FIFO via `.ghosttyQueueCommand` — the SAME enqueue path the palette uses
+        // — so the sidecar supervisor starts the run on its next sweep.
+        private static func startAgentQueue(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_start_agent_queue_s) {
+            // Always non-null from Surface.zig (empty string "" = picker), but
+            // read defensively like the other string-bearing actions.
+            let template = v.template.map { String(cString: $0) } ?? ""
+
+            // Non-empty template: enqueue the start intent directly (no palette).
+            // App-wide, like the dashboard control buttons — no surface needed.
+            if !template.isEmpty {
+                // DEBUG AID: the FIFO + this observer only exist when the MCP server is
+                // running (mcp-listen set). With MCP off the post is silently dropped —
+                // log so a dropped enqueue is diagnosable (consistent with the feature's
+                // hard-dep self-disable model; no user-facing error).
+                Ghostty.logger.info("start agent queue: enqueuing start for template \"\(template)\" (no-op if MCP server is not running)")
+                NotificationCenter.default.post(
+                    name: .ghosttyQueueCommand,
+                    object: nil,
+                    userInfo: [
+                        QueueCommandUserInfoKey.command:
+                            QueueCommand(action: .start, template: template),
+                    ]
+                )
+                return
+            }
+
+            // Empty template: open the picker palette, attached to the focused
+            // surface (same shape as the project selector).
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("start agent queue (picker) needs a surface target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                NotificationCenter.default.post(
+                    name: .ghosttyQueueSelectorDidToggle,
+                    object: surfaceView
+                )
+
+            default:
+                assertionFailure()
+            }
         }
 
         /// (ramon fork) Focus the previously focused surface, across any tab or

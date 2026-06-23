@@ -906,6 +906,42 @@ extension Ghostty {
             let s = String(cString: ptr)
             return s.isEmpty ? nil : s
         }
+
+        // (ramon fork / Agent Queue Supervisor) Master enable for the deterministic
+        // queue supervisor "pass 3" the Agent Manager sidecar runs. Default false.
+        // Gated further at runtime (requires agent-manager + MCP + a valid template).
+        var agentQueueEnabled: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-queue"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        // (ramon fork / Agent Queue Supervisor) Directory holding the queue TEMPLATE
+        // JSON files; nil/empty when unset (the sidecar uses its built-in default
+        // ~/.config/ghostty-ramon/agent-manager/queues).
+        var agentQueueTemplatesDir: String? {
+            guard let config = self.config else { return nil }
+            var v: UnsafePointer<Int8>?
+            let key = "agent-queue-templates-dir"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+            guard let ptr = v else { return nil }
+            let s = String(cString: ptr)
+            return s.isEmpty ? nil : s
+        }
+
+        // (ramon fork / Agent Queue Supervisor) Global concurrency cap across ALL queue
+        // runs (the hard fleet-wide ceiling). Default 8.
+        var agentQueueMaxTotal: UInt32 {
+            let defaultValue: UInt32 = 8
+            guard let config = self.config else { return defaultValue }
+            var v: UInt32?
+            let key = "agent-queue-max-total"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
+            guard let v else { return defaultValue }
+            return v
+        }
     }
 }
 

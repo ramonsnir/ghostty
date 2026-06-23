@@ -103,6 +103,12 @@ enum MCPLayout {
         /// keys off THIS (not `processName`, which is `bash` under the claude-pool
         /// wrapper) to decide a surface is an agent worth summarizing.
         let agentKind: String?
+        /// fork / Agent Queue (§8.4): the STABLE pty-host session id
+        /// (`ghostty_surface_session_id`), the supervisor's persistence/re-adoption
+        /// key (§9). 0 when there is no host session (the `.exec` backend / no
+        /// pty-host) — the supervisor self-disables on a 0 here. A PLAIN integer —
+        /// emitted UNCONDITIONALLY in JSON (the sidecar reads it every sweep).
+        let sessionID: UInt64
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
@@ -150,6 +156,11 @@ enum MCPLayout {
                 // never also "at a prompt".
                 let atPrompt = !exited && !view.needsConfirmQuit
                 let hook = hooks[view.id]
+                // (Agent Queue, §8.4) Read the stable host session id via the C API
+                // directly (matching the surrounding direct-C style, e.g.
+                // ghostty_surface_size in readText). 0 when there's no live surface /
+                // no host session — the supervisor self-disables on 0.
+                let sessionID: UInt64 = view.surface.map { ghostty_surface_session_id($0) } ?? 0
                 rows.append(SurfaceRow(
                     id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
                     window: win, tab: tabIdx, tabTitle: tabTitle,
@@ -165,7 +176,8 @@ enum MCPLayout {
                     notes: hook?.notes,
                     userNotes: hook?.userNotes,
                     suggestionDismissed: hook?.suggestionDismissed ?? false,
-                    agentKind: hook?.agentKind))
+                    agentKind: hook?.agentKind,
+                    sessionID: sessionID))
             }
         }
         return rows
@@ -196,6 +208,16 @@ enum MCPLayout {
             // sidecar reads it to suppress re-suggesting a dismissed suggestion).
             d["suggestionDismissed"] = $0.suggestionDismissed
             if let kind = $0.agentKind { d["agentKind"] = kind }
+            // (Agent Queue, §8.4) a PLAIN integer — emit UNCONDITIONALLY (the
+            // supervisor keys persistence on it and self-disables when it is 0).
+            // JSON numbers are doubles; UInt64 fits exactly within 2^53 session-id
+            // range, but pass it as an NSNumber so JSONSerialization emits an integer.
+            // NOTE on casing: list_surfaces emits "sessionID" (capital), while
+            // spawn_split_command returns "sessionId" (lowercase, MCPTools.swift). Each
+            // side is internally consistent with its TS reader (mcp.ts reads "sessionID"
+            // off list rows and "sessionId" off the spawn result); keep them in sync if
+            // either key is renamed.
+            d["sessionID"] = NSNumber(value: $0.sessionID)
             return d
         }
     }
@@ -365,6 +387,111 @@ enum MCPLayout {
         let created = TerminalController.newTab(
             appDelegate.ghostty, from: parent, withBaseConfig: config)
         return created != nil
+    }
+
+    // MARK: - Agent Queue: spawn_split_command / force_close
+
+    /// (Agent Queue, §8.1) Spawn the run's NEXT agent: either open the run's first
+    /// TAB (`firstTab == true`) or SPLIT `targetUUID` in `direction`, in both cases
+    /// running `command` (the template launch line, VERBATIM — item context arrives
+    /// via `env`, never spliced — §13), and return the NEW leaf's stable identity
+    /// `(id, sessionID)` as VALUE types. MUST be called on main.
+    ///
+    /// `command` is fed as the new surface's INITIAL INPUT (an interactive shell
+    /// runs it; it does NOT replace the shell — mirrors `newTab`/`new_tab_command`),
+    /// with interior newlines collapsed via `MCPInput.singleLine` so exactly ONE
+    /// trailing submit is sent. `env` (GHOSTTY_ITEM_*) is set on the new surface's
+    /// `environmentVariables` so the launched shell inherits the item context. `cwd`
+    /// is NOT tilde-expanded (use an absolute path).
+    ///
+    /// The split tree is populated SYNCHRONOUSLY by `newSplit`/`newTab`
+    /// (BaseTerminalController), so the new leaf's UUID + `ghostty_surface_session_id`
+    /// are read back IMMEDIATELY, never returning the SurfaceView across the hop.
+    /// Returns nil when nothing could be created (e.g. an unresolved/un-seated
+    /// target for a split, or tab creation failed).
+    static func newSplitCommand(
+        targetUUID: UUID?,
+        direction: String?,
+        command: String,
+        cwd: String?,
+        firstTab: Bool,
+        env: [String: String]
+    ) -> (id: String, sessionID: UInt64)? {
+        // Render the command as a single line of initial input with one trailing
+        // newline = one submit. `singleLine` collapses INTERIOR newlines (so a
+        // multi-line template line never fires N partial submits); we then append
+        // exactly one trailing newline so the shell runs it.
+        let oneLine = MCPInput.singleLine(command)
+        // Fail the spawn on an empty OR all-whitespace command (`singleLine` collapses
+        // interior newlines but can leave whitespace), rather than submitting a
+        // near-empty line. A real template always carries a substantive command.
+        guard !oneLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let initialInput = oneLine + "\n"
+
+        if firstTab {
+            // Open the run's tab. Build a BARE config (no inherited context — the
+            // queue tab starts from app defaults in the chosen cwd, like the project
+            // selector), carrying cwd / initialInput / the item env.
+            var config = Ghostty.SurfaceConfiguration()
+            if let cwd { config.workingDirectory = cwd }
+            config.initialInput = initialInput
+            config.environmentVariables = env
+            guard let appDelegate = NSApp.delegate as? AppDelegate else { return nil }
+            // Anchor on the frontmost terminal window if there is one (the tab joins
+            // it); a nil parent opens a new window. Mirrors `newTab`'s no-source path.
+            let parent = TerminalController.all.first?.window
+            guard let created = TerminalController.newTab(
+                appDelegate.ghostty, from: parent, withBaseConfig: config) else { return nil }
+            // The new tab's surface tree is populated synchronously: the run's first
+            // leaf is the only/first leaf.
+            guard let view = created.surfaceTree.first else { return nil }
+            return identity(of: view)
+        }
+
+        // Split path: resolve the target + the NewDirection, split it.
+        guard let targetUUID,
+              let (controller, target) = controllerAndView(forUUID: targetUUID),
+              let newDir = newDirection(direction) else { return nil }
+        revealIfZoomedAway(controller, target)
+        var config = Ghostty.SurfaceConfiguration()
+        if let cwd { config.workingDirectory = cwd }
+        config.initialInput = initialInput
+        config.environmentVariables = env
+        guard let newView = controller.newSplit(
+            at: target, direction: newDir, baseConfig: config) else { return nil }
+        return identity(of: newView)
+    }
+
+    /// PURE: read a freshly-created leaf's stable identity. `sessionID` via the C
+    /// API (0 with no live surface / no host session). Internal helper for
+    /// `newSplitCommand` — keeps the value-types-only-across-the-hop rule honest.
+    private static func identity(of view: Ghostty.SurfaceView) -> (id: String, sessionID: UInt64) {
+        let sid: UInt64 = view.surface.map { ghostty_surface_session_id($0) } ?? 0
+        return (view.id.uuidString, sid)
+    }
+
+    /// PURE: map the tool's direction string to a SplitTree NewDirection. Unknown /
+    /// nil ⇒ nil (the caller fails the spawn). Internal for testability.
+    static func newDirection(_ s: String?) -> SplitTree<Ghostty.SurfaceView>.NewDirection? {
+        switch s {
+        case "right": return .right
+        case "left": return .left
+        case "down": return .down
+        case "up": return .up
+        default: return nil
+        }
+    }
+
+    /// (Agent Queue, §8.2/§10) Close a surface WITHOUT the confirm-close prompt. The
+    /// supervisor calls this only AFTER the agent's child has exited (it first sends
+    /// the template `exit` keys), so `close_surface`/`request_close`'s
+    /// confirm-on-live-child modal would otherwise STALL teardown. Routes through the
+    /// controller's `closeSurface(_:withConfirmation:false)`, the confirm-bypass path
+    /// (`removeSurfaceNode`). MUST be called on main. Returns false on an unresolved id.
+    static func forceClose(uuid: UUID) -> Bool {
+        guard let (controller, view) = controllerAndView(forUUID: uuid) else { return false }
+        controller.closeSurface(view, withConfirmation: false)
+        return true
     }
 
     /// Run a keybind-action grammar string against a surface. v1 = focus-then-act

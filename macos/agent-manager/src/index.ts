@@ -65,12 +65,39 @@ import {
   type ManagerConfig,
   type ManagerSnapshot,
 } from "./manager.js";
+import {
+  runQueueSweep,
+  DEFAULT_PENDING_GRACE_MS,
+  type QueueDeps,
+} from "./queue/runner.js";
+import type { RunRegistry } from "./queue/commands.js";
+import { ConcurrencyBudget as QueueConcurrencyBudget } from "./queue/supervisor.js";
+import {
+  persistActiveRuns as persistActiveRunsToIO,
+  type ActiveRunRecord,
+} from "./queue/store.js";
+import {
+  defaultStateDir,
+  defaultTemplatesDir,
+  rehydrateActiveRuns,
+  makeActiveRunsStoreIO,
+  makeFileRunFactory,
+  realExec,
+} from "./queue/wiring.js";
 
 /** Poll interval between list_surfaces sweeps. */
 const POLL_INTERVAL_MS = 5000;
 
 const log = (msg: string): void => console.log(`agent-manager: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: ${msg}`);
+
+/** Parse a positive integer from an env string, falling back to `def` on
+ *  absent/blank/invalid/non-positive input. PURE. */
+function parsePositiveInt(v: string | undefined, def: number): number {
+  if (v === undefined) return def;
+  const n = Number.parseInt(v.trim(), 10);
+  return Number.isInteger(n) && n > 0 ? n : def;
+}
 
 /** The single-shot model call seam (defaults to the real SDK-backed summarize).
  *  Injectable so the loop can be exercised without spawning the CLI. */
@@ -109,6 +136,13 @@ export interface LoopDeps {
   /** The manager's OWN concurrency budget, separate from `budget` (the summarizer's),
    *  so a busy summarizer can never starve the manager pass of slots. */
   managerBudget: ConcurrencyBudget;
+
+  // --- Pass 3: the Agent Queue Supervisor (ramon fork / Agent Queue) ---
+  /** The supervisor pass's seams. OPTIONAL: when omitted (or carrying no runs), pass 3
+   *  is a NO-OP and the summarizer + manager behavior is byte-identical to before — so
+   *  a build with no queue configured behaves exactly as the Phase-1/2 sidecar did. Its
+   *  OWN ConcurrencyBudget lives inside `QueueDeps` (the starvation lesson). */
+  queue?: QueueDeps;
 }
 
 /**
@@ -375,6 +409,21 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
   }
 
   await Promise.all(fired);
+
+  // Pass 3: the AGENT QUEUE SUPERVISOR (ramon fork / Agent Queue). Deterministic, NO
+  // LLM in the control path — it reconciles + dispatches + tracks + closes a fleet of
+  // queue agents via the additive MCP tools. A NO-OP when no queue is configured
+  // (`deps.queue` absent or carrying no runs), so the passes above stay unchanged for
+  // a non-queue build. It owns its OWN ConcurrencyBudget inside QueueDeps. Runs AFTER
+  // the summarizer/manager settle (the loop is non-overlapping), and catches its own
+  // errors so a bad provider/run never stops the loop.
+  if (deps.queue !== undefined) {
+    try {
+      await runQueueSweep(deps.queue);
+    } catch (err) {
+      errlog(`queue sweep error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 async function main(): Promise<void> {
@@ -383,8 +432,9 @@ async function main(): Promise<void> {
 
   const cfg: SummarizerConfig = { ...DEFAULT_CONFIG };
   const managerCfg: ManagerConfig = { ...DEFAULT_MANAGER_CONFIG };
+  const client = new McpClient({ url, token });
   const deps: LoopDeps = {
-    client: new McpClient({ url, token }),
+    client,
     overrides: makeOverrideLoader(),
     cfg,
     budget: new ConcurrencyBudget(cfg.maxConcurrent),
@@ -398,6 +448,50 @@ async function main(): Promise<void> {
     lastSuggestionBySession: new Map<string, LastSuggestion>(),
     managerBudget: new ConcurrencyBudget(managerCfg.maxConcurrent),
   };
+
+  // Pass 3: the AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on AND
+  // at least one valid template loads from the templates dir. The Swift controller sets
+  // GHOSTTY_AGENT_QUEUE=1 (master enable) + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
+  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys; absent ⇒ pass 3 stays a
+  // no-op and the summarizer + manager behavior is byte-identical.
+  if (process.env.GHOSTTY_AGENT_QUEUE === "1") {
+    const templatesDir = process.env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR ?? defaultTemplatesDir();
+    const stateDir = defaultStateDir();
+    const maxTotal = parsePositiveInt(process.env.GHOSTTY_AGENT_QUEUE_MAX_TOTAL, 8);
+
+    // ON-DEMAND run lifecycle (§8a): runs are NOT auto-started from every template.
+    // Build a DYNAMIC registry, REHYDRATE any previously-started runs from the persisted
+    // active-runs set (so a started queue + its in-flight items survive a sidecar restart
+    // with no re-dispatch — §9), and DRAIN GUI→sidecar `start/pause/stop/abort` commands
+    // each sweep. A template merely existing on disk does NOT auto-run — only a
+    // persisted/started run, or one a `start` command arms.
+    const registry: RunRegistry = new Map();
+    for (const run of rehydrateActiveRuns(templatesDir, stateDir)) {
+      registry.set(run.template.name, run);
+    }
+    const activeRunsIO = makeActiveRunsStoreIO(stateDir);
+
+    deps.queue = {
+      client,
+      exec: realExec,
+      // The supervisor's OWN budget (NOT the summarizer's / manager's) — the starvation
+      // lesson. Cap it at the global fleet total so a sweep can't try to dispatch more
+      // than the fleet allows in one batch.
+      budget: new QueueConcurrencyBudget(maxTotal),
+      now: () => Date.now(),
+      registry,
+      factory: makeFileRunFactory(templatesDir, stateDir),
+      takeCommands: () => client.takeQueueCommands(),
+      persistActiveRuns: (records: ActiveRunRecord[]) =>
+        persistActiveRunsToIO(activeRunsIO, records),
+      maxTotal,
+      pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    };
+    log(
+      `queue: supervisor armed (on-demand); ${registry.size} run(s) rehydrated; ` +
+        `templatesDir=${templatesDir}; maxTotal=${maxTotal}`,
+    );
+  }
 
   log(`summarizer + manager started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
 

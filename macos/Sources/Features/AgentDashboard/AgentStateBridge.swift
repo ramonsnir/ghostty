@@ -42,19 +42,54 @@ struct AgentAnnotation: Equatable, Sendable {
     /// the single tile render site.
     let needsUser: Bool?
     let confidence: Double?  // 0..1 self-reported confidence, or nil if unstated
+    /// (ramon fork / Agent Queue, §8.5) The work-item dedup KEY tagging this surface
+    /// as a queue tile. Written at dispatch (and re-stamped on reconcile when a GUI
+    /// restart dropped the in-memory annotation map). Partial-merge, like the rest.
+    let queueKey: String?
+    /// (ramon fork / Agent Queue, §8.5) The owning run's NAME = the dashboard ORIGIN
+    /// (§11). The dashboard derives the per-tile origin marker + grouping from this.
+    let queueName: String?
+    /// (ramon fork / Agent Queue, §8.5) The work-item URL for the dashboard's
+    /// clickable origin badge.
+    let queueUrl: String?
+
+    init(
+        summary: String? = nil,
+        suggestion: String? = nil,
+        phase: String? = nil,
+        needsUser: Bool? = nil,
+        confidence: Double? = nil,
+        queueKey: String? = nil,
+        queueName: String? = nil,
+        queueUrl: String? = nil
+    ) {
+        self.summary = summary
+        self.suggestion = suggestion
+        self.phase = phase
+        self.needsUser = needsUser
+        self.confidence = confidence
+        self.queueKey = queueKey
+        self.queueName = queueName
+        self.queueUrl = queueUrl
+    }
 
     /// Overlay `other`'s PROVIDED (non-nil) fields onto `self`, keeping `self`'s
     /// value for every field `other` leaves nil. PURE + unit-tested. This is the
     /// merge that lets the summarizer and the manager update the same annotation
     /// independently: a summary-only update preserves a prior suggestion (and vice
-    /// versa), and an update that omits `needsUser` preserves the prior flag.
+    /// versa), and an update that omits `needsUser` preserves the prior flag. The
+    /// Agent-Queue fields (queueKey/queueName/queueUrl) merge identically — a queue
+    /// tag set at dispatch survives a later summary-only or suggestion-only update.
     func merging(_ other: AgentAnnotation) -> AgentAnnotation {
         AgentAnnotation(
             summary: other.summary ?? summary,
             suggestion: other.suggestion ?? suggestion,
             phase: other.phase ?? phase,
             needsUser: other.needsUser ?? needsUser,
-            confidence: other.confidence ?? confidence)
+            confidence: other.confidence ?? confidence,
+            queueKey: other.queueKey ?? queueKey,
+            queueName: other.queueName ?? queueName,
+            queueUrl: other.queueUrl ?? queueUrl)
     }
 }
 

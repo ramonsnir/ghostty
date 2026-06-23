@@ -921,6 +921,16 @@ pub const Action = union(enum) {
     /// payload-less.
     toggle_agent_dashboard,
 
+    /// (ramon fork / Agent Queue Supervisor) Start an Agent Queue run. With NO
+    /// value (bare `start_agent_queue`) this opens a fuzzy palette of the
+    /// available queue templates; selecting one starts that run. With a value
+    /// (`start_agent_queue:my-template`) it SKIPS the palette and starts that
+    /// template directly. The template is a basename (the `*.json` filename in
+    /// the templates dir, minus the extension). The actual run is started by the
+    /// sidecar supervisor on its next sweep — this action only enqueues the
+    /// start intent (macOS) / opens the picker.
+    start_agent_queue: StartAgentQueue,
+
     /// (ramon fork) Focus the previously focused surface, across any tab or
     /// window (tmux `last-pane`, global). Two-deep toggle: pressing again
     /// returns to where you were. Payload-less.
@@ -1213,6 +1223,35 @@ pub const Action = union(enum) {
             return .{
                 .working_directory = if (self.working_directory) |wd|
                     try alloc.dupe(u8, wd)
+                else
+                    null,
+            };
+        }
+    };
+
+    /// (ramon fork / Agent Queue Supervisor) The optional template basename for
+    /// `start_agent_queue`. A null/empty template means "open the picker"; a
+    /// non-empty one starts that template directly.
+    pub const StartAgentQueue = struct {
+        /// The template basename to start, or null to open the picker.
+        template: ?[]const u8 = null,
+
+        pub const default: StartAgentQueue = .{};
+
+        pub fn parse(input: []const u8) !StartAgentQueue {
+            // An empty value is equivalent to bare `start_agent_queue` (picker).
+            if (input.len == 0) return .{};
+            return .{ .template = input };
+        }
+
+        pub fn format(self: StartAgentQueue, writer: *std.Io.Writer) !void {
+            if (self.template) |t| try writer.writeAll(t);
+        }
+
+        pub fn clone(self: StartAgentQueue, alloc: Allocator) !StartAgentQueue {
+            return .{
+                .template = if (self.template) |t|
+                    try alloc.dupe(u8, t)
                 else
                     null,
             };
@@ -1578,6 +1617,7 @@ pub const Action = union(enum) {
             .toggle_command_palette,
             .toggle_project_selector,
             .toggle_agent_dashboard,
+            .start_agent_queue,
             .goto_last_surface,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
@@ -3735,6 +3775,53 @@ test "Binding toggle_agent_dashboard" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("toggle_agent_dashboard", buf.written());
+}
+
+test "Binding start_agent_queue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Bare name → no template (the picker form).
+    {
+        const binding = try parseSingle("a=start_agent_queue");
+        try testing.expect(binding.action == .start_agent_queue);
+        try testing.expectEqual(
+            @as(?[]const u8, null),
+            binding.action.start_agent_queue.template,
+        );
+
+        // Round-trips with no ":" suffix (equals the type's `default`).
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        defer buf.deinit();
+        try binding.action.format(&buf.writer);
+        try testing.expectEqualStrings("start_agent_queue", buf.written());
+    }
+
+    // With a template basename → skip the picker.
+    {
+        const binding = try parseSingle("a=start_agent_queue:my-backlog");
+        try testing.expect(binding.action == .start_agent_queue);
+        try testing.expectEqualStrings(
+            "my-backlog",
+            binding.action.start_agent_queue.template.?,
+        );
+
+        // Round-trips through format back to the same string.
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        defer buf.deinit();
+        try binding.action.format(&buf.writer);
+        try testing.expectEqualStrings("start_agent_queue:my-backlog", buf.written());
+    }
+
+    // Empty value after the colon is treated as bare (the picker).
+    {
+        const binding = try parseSingle("a=start_agent_queue:");
+        try testing.expect(binding.action == .start_agent_queue);
+        try testing.expectEqual(
+            @as(?[]const u8, null),
+            binding.action.start_agent_queue.template,
+        );
+    }
 }
 
 test "Binding goto_last_surface" {

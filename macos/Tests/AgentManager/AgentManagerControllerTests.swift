@@ -160,4 +160,69 @@ struct AgentManagerControllerTests {
         #expect(AgentManagerController.mcpURL(listen: "garbage", offset: 2)
             == "http://127.0.0.1:8767/mcp")
     }
+
+    // MARK: - applyAgentQueueEnv (the §8a/§15 GUI→sidecar queue arming)
+
+    /// Disabled ⇒ env is unchanged AND any inherited queue keys are stripped, so a
+    /// disabled supervisor can never arm the sidecar's pass 3.
+    @Test func agentQueueEnvDisabledStripsKeys() {
+        let base = [
+            "PATH": "/usr/bin",
+            "GHOSTTY_AGENT_QUEUE": "1",                 // stray inherited value
+            "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/x",
+            "GHOSTTY_AGENT_QUEUE_MAX_TOTAL": "99",
+        ]
+        let out = AgentManagerController.applyAgentQueueEnv(
+            into: base, enabled: false, templatesDir: "/should/not/appear", maxTotal: 8)
+        #expect(out["PATH"] == "/usr/bin")
+        #expect(out["GHOSTTY_AGENT_QUEUE"] == nil)
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
+        #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == nil)
+    }
+
+    /// Enabled ⇒ arms the master enable + the fleet cap; an ABSOLUTE templates dir is
+    /// plumbed unchanged (so the palette + sidecar loader can't desync).
+    @Test func agentQueueEnvEnabledSetsAllThree() {
+        let out = AgentManagerController.applyAgentQueueEnv(
+            into: ["PATH": "/usr/bin"],
+            enabled: true,
+            templatesDir: "/Users/me/.config/ghostty-ramon/agent-manager/queues",
+            maxTotal: 12)
+        #expect(out["GHOSTTY_AGENT_QUEUE"] == "1")
+        #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == "12")
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"]
+            == "/Users/me/.config/ghostty-ramon/agent-manager/queues")
+        #expect(out["PATH"] == "/usr/bin")  // untouched
+    }
+
+    /// Enabled with a `~`-prefixed templates dir ⇒ the dir is TILDE-EXPANDED to an
+    /// absolute path (matching the palette's `discoverTemplates`, which does the same),
+    /// so the palette LISTS and the sidecar READS the identical dir. (Regression for the
+    /// templates-dir tilde desync: the sidecar does no `~` expansion of its own.)
+    @Test func agentQueueEnvEnabledExpandsTilde() {
+        let out = AgentManagerController.applyAgentQueueEnv(
+            into: [:],
+            enabled: true,
+            templatesDir: "~/git/queues",
+            maxTotal: 8)
+        let expected = ("~/git/queues" as NSString).expandingTildeInPath
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == expected)
+        // It must actually have expanded (no leading `~` survives).
+        #expect(!(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"]?.hasPrefix("~") ?? true))
+    }
+
+    /// Enabled with NO templates dir (nil OR empty) ⇒ the master enable + cap are set
+    /// but the dir key is ABSENT so the sidecar uses its built-in default (which
+    /// matches the palette's default discovery dir).
+    @Test func agentQueueEnvEnabledWithoutDirOmitsDirKey() {
+        for dir in [nil, ""] as [String?] {
+            let out = AgentManagerController.applyAgentQueueEnv(
+                into: ["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/stale"],
+                enabled: true, templatesDir: dir, maxTotal: 8)
+            #expect(out["GHOSTTY_AGENT_QUEUE"] == "1")
+            #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == "8")
+            // A stale inherited dir must NOT survive — the sidecar default wins.
+            #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
+        }
+    }
 }

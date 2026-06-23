@@ -18,6 +18,8 @@
 // ALL failure modes THROW an `McpError` the loop catches: the sidecar must never
 // crash on a transient MCP failure — the caller logs + continues.
 
+import type { QueueCommand } from "./queue/commands.js";
+
 /** Thrown for any MCP transport / protocol / tool failure. The loop catches it. */
 export class McpError extends Error {
   /** JSON-RPC error code when this is a protocol-level error, else undefined. */
@@ -64,6 +66,11 @@ export interface Surface {
    *  `undefined` reads as false (see shouldSuggest). */
   suggestionDismissed?: boolean;
   agentKind?: string;
+  /** (Agent Queue) The STABLE host session id (`ghostty_surface_session_id`) — the
+   *  supervisor's persistence/re-adoption key (§9). OMITTED (=== undefined) when
+   *  absent so a pre-upgrade host that doesn't yet emit it still typechecks. Under
+   *  the `.exec` backend / no pty-host it is 0, which the supervisor self-disables on. */
+  sessionID?: number;
 }
 
 /** read_surface return: the viewport screen text + its grid dimensions. */
@@ -87,6 +94,16 @@ export interface Annotation {
    *  reply advances the user's goal. Written alongside `suggestion`; the tile dims
    *  a low-confidence one. */
   confidence?: number;
+  /** (Agent Queue, §8.5) The work-item dedup KEY tagging this surface as a queue tile.
+   *  Written at dispatch (and re-stamped on reconcile when a GUI restart dropped the
+   *  in-memory annotation map — the durable store is truth, §9). The dashboard derives
+   *  the per-tile origin marker + grouping from `queueName`; reconcile reads `queueKey`
+   *  as the orphan-adoption hint. Partial-merge, like summary/suggestion. */
+  queueKey?: string;
+  /** (Agent Queue, §8.5) The owning run's name = the dashboard ORIGIN (§11). */
+  queueName?: string;
+  /** (Agent Queue, §8.5) The work-item url for the dashboard's clickable badge. */
+  queueUrl?: string;
 }
 
 /** Minimal shape of a JSON-RPC response we care about. */
@@ -159,8 +176,105 @@ export class McpClient {
     if (ann.phase !== undefined) args.phase = ann.phase;
     if (ann.needsUser !== undefined) args.needsUser = ann.needsUser;
     if (ann.confidence !== undefined) args.confidence = ann.confidence;
+    if (ann.queueKey !== undefined) args.queueKey = ann.queueKey;
+    if (ann.queueName !== undefined) args.queueName = ann.queueName;
+    if (ann.queueUrl !== undefined) args.queueUrl = ann.queueUrl;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.
     await this.call("set_surface_annotation", args);
+  }
+
+  /**
+   * (Agent Queue, §8.1) spawn_split_command — split a TARGET surface in a given
+   * direction (or open the run's first tab when `firstTab`) running `command`, and
+   * return the new leaf's stable identity `{id (UUID), sessionId}`. The macOS-layer
+   * tool feeds the rendered command as input (interior newlines collapsed to one
+   * trailing submit).
+   *
+   * GENERICITY / §13 (the #1 requirement): item fields reach the agent's launch
+   * command as ENV VARS, NEVER spliced into the shell line. Those vars travel in the
+   * `env` map (GHOSTTY_ITEM_*); the Swift `spawn_split_command` handler sets them on the
+   * new split's `SurfaceConfiguration.environmentVariables` so the launched shell
+   * inherits them, and the template's `command` references them as `$GHOSTTY_ITEM_*`.
+   * `command` itself is the template's launch line passed through VERBATIM — the caller
+   * MUST NOT string-substitute item fields into it (that would be injection). SAFETY: the
+   * dedup/spawn gating is the caller's. Throws McpError on any failure (the loop catches +
+   * skips the dispatch).
+   */
+  async spawnSplitCommand(args: {
+    targetUUID?: string;
+    direction?: "right" | "down" | "left" | "up";
+    command: string;
+    cwd?: string;
+    firstTab?: boolean;
+    /** The item-context env (GHOSTTY_ITEM_*) for the launched agent (§13). Forwarded
+     *  to the tool as `env`; the Swift handler sets it on the new split's
+     *  environmentVariables. Omitted from the wire payload when empty/undefined. */
+    env?: Record<string, string>;
+  }): Promise<{ id: string; sessionId: number }> {
+    const toolArgs: Record<string, unknown> = { command: args.command };
+    if (args.targetUUID !== undefined) toolArgs.targetUUID = args.targetUUID;
+    if (args.direction !== undefined) toolArgs.direction = args.direction;
+    if (args.cwd !== undefined) toolArgs.cwd = args.cwd;
+    if (args.firstTab !== undefined) toolArgs.firstTab = args.firstTab;
+    if (args.env !== undefined && Object.keys(args.env).length > 0) {
+      toolArgs.env = args.env;
+    }
+    const payload = await this.call("spawn_split_command", toolArgs);
+    const obj = parseToolJson(payload) as { id?: unknown; sessionId?: unknown };
+    if (typeof obj.id !== "string" || obj.id.length === 0) {
+      throw new McpError("spawn_split_command: malformed payload (no id)");
+    }
+    const sessionId = typeof obj.sessionId === "number" ? obj.sessionId : 0;
+    return { id: obj.id, sessionId };
+  }
+
+  /**
+   * (Agent Queue, §10) send_key — send a SINGLE real key event to a surface via the
+   * existing MCP `send_key` tool (the supervisor's only key send; it never sends
+   * free-form input). Used by the close sequence to deliver the template `agent.exit`
+   * keys (default Ctrl-D) so the agent's child exits before the confirm-bypass close.
+   * `key` is a template `exit.keys` entry passed verbatim. Throws McpError on failure.
+   */
+  async sendKey(id: string, key: string): Promise<void> {
+    await this.call("send_key", { id, key });
+  }
+
+  /**
+   * (Agent Queue, §8.2) force_close_surface — close WITHOUT the confirm-close prompt
+   * (§10). The supervisor calls this only AFTER the agent's child has exited, so the
+   * confirm-bypass close doesn't pop a modal. Throws McpError on any failure.
+   */
+  async forceCloseSurface(id: string): Promise<void> {
+    await this.call("force_close_surface", { id });
+  }
+
+  /**
+   * (Agent Queue, §8.3) signal_attention — ring the bell / raise attention for a
+   * surface (fans out to the dashboard aggregate, web monitor, and push, reusing the
+   * `.ghosttyBellDidRing` pipeline). Used by `onAgentExit=leave-and-bell` (§6) so a
+   * crashed agent surfaces itself for human review. Generic + reusable. `reason` is an
+   * optional human-readable note. Throws McpError on any failure.
+   */
+  async signalAttention(id: string, reason?: string): Promise<void> {
+    const args: Record<string, unknown> = { id };
+    if (reason !== undefined) args.reason = reason;
+    await this.call("signal_attention", args);
+  }
+
+  /**
+   * (Agent Queue, §8a) take_queue_commands — DRAIN + clear the GUI's in-memory FIFO of
+   * GUI→sidecar control commands. Returns the drained commands (a `{commands:[...]}`
+   * envelope on the wire). TOLERANT: a malformed payload, a non-array `commands`, or any
+   * non-object entry yields `[]` (the worst case is a missed control intent the user can
+   * re-trigger — the STARTED-run STATE itself is persisted sidecar-side, so a running
+   * queue survives regardless). Per-entry, only a recognized `action` with the right shape
+   * is kept; unrecognized entries are dropped. Throws McpError ONLY on a transport/protocol
+   * failure (the loop catches it and simply skips the drain this sweep).
+   */
+  async takeQueueCommands(): Promise<QueueCommand[]> {
+    const payload = await this.call("take_queue_commands", {});
+    const obj = parseToolJson(payload);
+    return coerceQueueCommands(obj);
   }
 
   /**
@@ -254,4 +368,38 @@ export function parseToolJson(text: string): unknown {
   } catch {
     throw new McpError("tool result was not valid JSON");
   }
+}
+
+/** The recognized control-command actions (§8a). */
+const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
+  "start",
+  "stop",
+  "abort",
+  "pause",
+  "resume",
+]);
+
+/**
+ * Coerce an arbitrary parsed `take_queue_commands` payload into a clean `QueueCommand[]`.
+ * PURE + TOLERANT — exported for unit testing. Accepts the `{commands:[...]}` envelope
+ * (the wire shape). Anything else — a non-object, a missing/non-array `commands`, a
+ * non-object entry, or an entry with an unrecognized `action` — yields `[]` / drops that
+ * entry. Only `action`, `template`, and `run` are carried (and only when string-typed).
+ */
+export function coerceQueueCommands(obj: unknown): QueueCommand[] {
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return [];
+  const cmds = (obj as { commands?: unknown }).commands;
+  if (!Array.isArray(cmds)) return [];
+  const out: QueueCommand[] = [];
+  for (const raw of cmds) {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const r = raw as Record<string, unknown>;
+    const action = r.action;
+    if (typeof action !== "string" || !QUEUE_ACTIONS.has(action)) continue;
+    const cmd: QueueCommand = { action: action as QueueCommand["action"] };
+    if (typeof r.template === "string" && r.template.length > 0) cmd.template = r.template;
+    if (typeof r.run === "string" && r.run.length > 0) cmd.run = r.run;
+    out.push(cmd);
+  }
+  return out;
 }

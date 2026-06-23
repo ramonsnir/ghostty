@@ -168,6 +168,51 @@ struct MCPAnnotationTests {
         #expect(base.merging(explicitFalse).needsUser == false)
     }
 
+    // MARK: - Agent Queue: queue annotation fields (parse + merge)
+
+    @Test func parseQueueFieldsAlone() {
+        // The supervisor tags a tile at dispatch with queueKey/queueName/queueUrl
+        // and NO summary/suggestion — that must be a VALID partial annotation.
+        let p = AgentAnnotationPayload.fromArguments([
+            "id": UUID().uuidString,
+            "queueKey": "ENG-123",
+            "queueName": "my-team backlog",
+            "queueUrl": "https://example.test/ENG-123",
+        ])
+        #expect(p != nil)
+        #expect(p?.annotation.queueKey == "ENG-123")
+        #expect(p?.annotation.queueName == "my-team backlog")
+        #expect(p?.annotation.queueUrl == "https://example.test/ENG-123")
+        // Untouched fields stay nil (partial update).
+        #expect(p?.annotation.summary == nil)
+        #expect(p?.annotation.suggestion == nil)
+    }
+
+    @Test func parseQueueFieldsTrimAndBlankReject() {
+        // Blank queue strings are treated as absent (same trim semantics as summary).
+        let blank = AgentAnnotationPayload.fromArguments([
+            "id": UUID().uuidString, "queueKey": "   ",
+        ])
+        #expect(blank == nil)  // no other field ⇒ empty body ⇒ reject
+        let trimmed = AgentAnnotationPayload.fromArguments([
+            "id": UUID().uuidString, "queueName": "  backlog  ",
+        ])
+        #expect(trimmed?.annotation.queueName == "backlog")
+    }
+
+    @Test func mergeQueueFieldsSurviveSummaryOnlyUpdate() {
+        // A queue tag set at dispatch must survive a later summary-only or
+        // suggestion-only update (the summarizer/manager never touch queue fields).
+        let tagged = AgentAnnotation(
+            queueKey: "ENG-9", queueName: "backlog", queueUrl: "https://x.test/9")
+        let summaryUpdate = AgentAnnotation(summary: "Implementing fix")
+        let merged = tagged.merging(summaryUpdate)
+        #expect(merged.summary == "Implementing fix")
+        #expect(merged.queueKey == "ENG-9")        // preserved
+        #expect(merged.queueName == "backlog")     // preserved
+        #expect(merged.queueUrl == "https://x.test/9")  // preserved
+    }
+
     // MARK: - dispatch (AppKit-free validation paths)
 
     @Test func dispatchMissingIdInvalidParams() {
