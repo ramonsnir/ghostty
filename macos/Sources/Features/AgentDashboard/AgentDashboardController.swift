@@ -37,6 +37,12 @@ struct AgentEntry: Identifiable {
     /// suppresses re-suggesting until the change fingerprint shifts. Reset to false
     /// when a NEW suggestion is applied. In-memory ONLY (no persistence).
     let suggestionDismissed: Bool
+    /// (ramon fork / Agent hooks) Number of background shells Claude Code reports
+    /// still running for this surface (read from its footer; 0 when none / not a
+    /// `.waiting` tile). A `.waiting` tile with `> 0` is waiting on its OWN work,
+    /// not the user, so it is DEMOTED out of the attention sort + push and shows a
+    /// neutral chip. Recomputed each rebuild for waiting tiles; in-memory ONLY.
+    let backgroundShells: Int
 }
 
 /// Persistence boundary for the hide set, injected so the round-trip is
@@ -349,6 +355,27 @@ final class AgentDashboardModel: ObservableObject {
     private let orderStore: OrderStore
     private let originFilterStore: OriginFilterStore
 
+    /// (ramon fork / Agent hooks) How many background shells a `.waiting` surface
+    /// has running, used to DEMOTE it (see `AgentEntry.backgroundShells`). Injected
+    /// so the demotion logic is unit-testable without a real surface; the default
+    /// reads the surface's viewport (Claude Code's footer) on main. Returns 0 when
+    /// the surface/view is gone or no indicator is present.
+    lazy var backgroundShellReader: (UUID) -> Int = { [weak self] id in
+        self?.readBackgroundShellsFromViewport(id) ?? 0
+    }
+
+    /// Default `backgroundShellReader`: read the live surface's viewport mirror
+    /// (row-accurate under pty-host, same source as the footer-skip) and scan its
+    /// footer for the shell-count indicator. Main-only (the model is `@MainActor`);
+    /// the read is the 500ms-cached `cachedVisibleContents`, so it is cheap.
+    private func readBackgroundShellsFromViewport(_ id: UUID) -> Int {
+        guard let view = live.first(where: { $0.id == id })?.view else { return 0 }
+        let text = view.cachedVisibleContents.get()
+        var lines = text.components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        return AgentMirrorPreview.backgroundShellCount(rows: lines)
+    }
+
     // MARK: - Agent-state persistence (ramon fork / Agent hooks)
 
     /// Last-known agent state per HOST session id, persisted across GUI restarts
@@ -504,8 +531,16 @@ final class AgentDashboardModel: ObservableObject {
     /// resolved state AND tool/prompt/message are all unchanged, we RETURN
     /// without mutating the `@Published` state so the chatty PreToolUse stream
     /// doesn't thrash the rebuild.
+    ///
+    /// (ramon fork / Agent hooks) BACKGROUND-WORK DEMOTION: a transition into
+    /// `.waiting` only counts as an attention edge (and only auto-unhides) when the
+    /// agent has NO background shell still running — otherwise it is waiting on its
+    /// OWN work, not the user, so it must not nag. `backgroundShells` is read from
+    /// the surface's footer (injectable for tests; nil → read the live viewport).
     @discardableResult
-    func applyAgentState(_ id: UUID, _ payload: AgentStatePayload) -> Bool {
+    func applyAgentState(
+        _ id: UUID, _ payload: AgentStatePayload, backgroundShells bgOverride: Int? = nil
+    ) -> Bool {
         hookBacked.insert(id)
 
         let prev = agentStates[id]
@@ -527,6 +562,15 @@ final class AgentDashboardModel: ObservableObject {
         if let prompt = payload.prompt { lastPrompt[id] = prompt }
         if let message = payload.message { lastMessage[id] = message }
 
+        // Background-work demotion gate: only a TRUE waiting (no background shell
+        // churning) is an attention edge / auto-unhide. Read once here for the
+        // unhide check + the return; rebuildEntriesFromCurrentState reads the same
+        // (cached) source for the chip/sort.
+        let backgroundShells = payload.state == .waiting
+            ? (bgOverride ?? backgroundShellReader(id))
+            : 0
+        let genuinelyWaiting = payload.state == .waiting && backgroundShells == 0
+
         // Auto-unhide on .waiting: a waiting agent — one asking the user for
         // input — must never stay hidden. NOTE this is weaker than applyBells'
         // re-unhide-on-every-ringing-republish: it lands only on the (non-
@@ -534,7 +578,8 @@ final class AgentDashboardModel: ObservableObject {
         // continuously like a bell). So after the coalesce early-return above, an
         // identical `.waiting` republish does NOT re-unhide — a user CAN hide a
         // still-waiting tile, by design (single-shot hook + LOCKED coalesce rule).
-        if payload.state == .waiting, hidden.contains(id) {
+        // A background-busy waiting tile is NOT auto-unhidden (it isn't nagging).
+        if genuinelyWaiting, hidden.contains(id) {
             hidden.remove(id)
             store.save(hidden)
         }
@@ -554,8 +599,9 @@ final class AgentDashboardModel: ObservableObject {
         // a couple seconds at most.
         rebuildEntriesFromCurrentState()
 
-        // The "enters .waiting" edge is `prev != .waiting`.
-        return prev != .waiting && payload.state == .waiting
+        // The "enters .waiting" edge is `prev != .waiting` — but a background-busy
+        // waiting tile is demoted (no push/attention), so it never reports the edge.
+        return prev != .waiting && genuinelyWaiting
     }
 
     /// (ramon fork / Agent Manager) MERGE an annotation update for `id` into the
@@ -871,7 +917,12 @@ final class AgentDashboardModel: ObservableObject {
                     hookBacked: hookBacked.contains(s.id),
                     annotation: annotations[s.id],
                     userNotes: userNotes[s.id],
-                    suggestionDismissed: suggestionDismissed.contains(s.id)
+                    suggestionDismissed: suggestionDismissed.contains(s.id),
+                    // Only waiting tiles can be demoted, so only they pay the
+                    // (cached) viewport read; everything else is 0.
+                    backgroundShells: agentStates[s.id] == .waiting
+                        ? backgroundShellReader(s.id)
+                        : 0
                 )
             }
         // session id → its index in the user's manual order (keep-first on the
@@ -888,8 +939,12 @@ final class AgentDashboardModel: ObservableObject {
     /// Whether a tile is demanding attention: a bell rang OR the hook reports
     /// the agent is `.waiting` for the user (ramon fork / Agent hooks). Both
     /// inputs are independent — either floats the tile to the top.
+    ///
+    /// (ramon fork / Agent hooks) A `.waiting` tile with a live background shell
+    /// is DEMOTED — it is waiting on its own work, not the user, so it does NOT
+    /// float to the top. A bell still floats it (a bell is a real event).
     private static func needsAttention(_ e: AgentEntry) -> Bool {
-        e.bell || e.agentState == .waiting
+        e.bell || (e.agentState == .waiting && e.backgroundShells == 0)
     }
 
     /// Deterministic order, highest precedence first:
