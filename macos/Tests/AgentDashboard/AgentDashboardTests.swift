@@ -135,6 +135,24 @@ struct SuggestionStyleTests {
         // A legacy / un-rated annotation (nil) is treated as mid (0.5) → shown, never hidden.
         #expect(AgentPreviewTile.shouldShowSuggestion(confidence: nil) == true)
     }
+
+    @Test func neverShownWhileWorking() {
+        // A suggestion is NEVER surfaced while the agent is actively working —
+        // regardless of how high its confidence is (the annotation persists across the
+        // waiting→working edge; the view gate keeps a working tile clean).
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: .working) == false)
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 1.0, agentState: .working) == false)
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: nil, agentState: .working) == false)
+    }
+
+    @Test func shownWhenNotWorking() {
+        // Waiting / idle / unknown states still gate on the confidence floor alone.
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: .waiting) == true)
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: .idle) == true)
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: nil) == true)
+        // …and the floor still applies in those states.
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.1, agentState: .waiting) == false)
+    }
 }
 
 // MARK: - matchAgent pure logic
