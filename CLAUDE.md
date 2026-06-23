@@ -428,6 +428,33 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `SurfaceWrapper` render it natively (full color, viewport-only — right for a
     thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
     Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
+    - **Smart bottom-anchor (skip empty trailing rows; fork-only, always on, no
+      config).** A bottom-anchored thumbnail of a partially-filled screen (a fresh
+      agent chat, a TUI that hasn't reached the bottom) would waste the preview on
+      empty trailing rows. So the preview now shifts the bottom-anchored mirror DOWN by
+      the height of the trailing blank rows, dropping them below the clip so the LAST
+      row with content sits at the bottom. It does NOT collapse interior repeated/blank
+      lines (the native Metal mirror renders the host grid as-is — there's no seam to
+      inject a "… N more …" marker into; that would need a separate self-rendered text
+      preview, which loses color/TUI fidelity — deliberately not done). The trailing-
+      blank count is grid-accurate (NOT text-derived: `read_text` uses `unwrap=true` +
+      always trims trailing blanks, so it can't give a row-accurate count): a new
+      read-only core getter `RenderState.trailingBlankRows()` scans the host render
+      mirror's viewport rows bottom-up via `Cell.hasTextAny` (a row of spaces counts as
+      content → safe undershoot, never clips a visible char), exported as
+      `ghostty_surface_trailing_blank_rows` and read on the REAL surface (authoritative
+      host grid, like the geometry). 0 when there's no mirror (`.exec`) ⇒ plain bottom-
+      anchor. The offset is a pure, tested `AgentMirrorPreview.bottomAnchorOffset(...)`
+      (clamped to `rows-1` so an all-blank screen keeps one row visible), refreshed on a
+      light 0.7s timer per tile (live frames render off the Metal path, not via
+      `@Published`, so a poll — not an observer — drives it). HOST links the new core
+      getter but does NOT call it (no behavior change ⇒ **no host restart needed**; GUI
+      relaunch only). Wiring: `src/terminal/render.zig` (`trailingBlankRows`),
+      `src/apprt/embedded.zig` + `include/ghostty.h` (export), `Surface
+      View/SurfaceView_AppKit.swift` (`trailingBlankRows()` accessor),
+      `AgentDashboard/AgentPreviewTile.swift` (`bottomAnchorOffset` + `.offset` + timer).
+      Tests: `render.zig` (`trailingBlankRows*`, run via `-Dtest-filter=trailingBlankRows`),
+      `macos/Tests/AgentDashboard/AgentDashboardTests.swift` (`BottomAnchorOffsetTests`).
   - **Detection is HOST-GATED on a NEW protocol frame.** Under `.client` the GUI mirror
     can't read the foreground process, so the host pushes the raw foreground pid via an
     additive `foreground_pid` frame (**protocol minor bumped 3→4**); the GUI walks that

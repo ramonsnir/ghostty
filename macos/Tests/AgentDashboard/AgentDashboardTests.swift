@@ -69,6 +69,52 @@ struct AgentMirrorGeometryTests {
     }
 }
 
+// MARK: - AgentMirrorPreview.bottomAnchorOffset (pure; skip empty trailing rows)
+
+struct BottomAnchorOffsetTests {
+    @Test func zeroWhenNoTrailingBlanks() {
+        // A full screen (no trailing blanks) is unchanged — plain bottom-anchor.
+        let off = AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 0, rows: 40, cellH: 30, backing: 2, scale: 0.5)
+        #expect(off == 0)
+    }
+
+    @Test func shiftsDownByBlankRegionHeight() {
+        // 10 blank trailing rows of a 40-row grid: shift down by 10 scaled rows.
+        // Per-row scaled height = (cellH / backing) * scale = (30/2)*0.5 = 7.5.
+        let off = AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 10, rows: 40, cellH: 30, backing: 2, scale: 0.5)
+        #expect(abs(off - 75) < 0.0001)   // 10 * 7.5
+    }
+
+    @Test func clampsToKeepOneRowAnchored() {
+        // An all-blank screen clamps to rows-1 so a single row stays in view
+        // rather than the whole (empty) grid scrolling out.
+        let bk: CGFloat = 2, cellH: CGFloat = 30, scale: CGFloat = 0.5
+        let scaledRowH = (cellH / bk) * scale
+        let off = AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 24, rows: 24, cellH: cellH, backing: bk, scale: scale)
+        #expect(abs(off - CGFloat(23) * scaledRowH) < 0.0001)
+    }
+
+    @Test func zeroForDegenerateInputs() {
+        // No cell size / no scale / single-row grid → no offset (never NaN/inf).
+        #expect(AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 5, rows: 40, cellH: 0, backing: 2, scale: 0.5) == 0)
+        #expect(AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 5, rows: 40, cellH: 30, backing: 2, scale: 0) == 0)
+        #expect(AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 1, rows: 1, cellH: 30, backing: 2, scale: 0.5) == 0)
+    }
+
+    @Test func zeroBackingTreatedAsTwo() {
+        // backing 0 is treated as 2 (matches `geometry`), so no divide-by-zero.
+        let off = AgentMirrorPreview.bottomAnchorOffset(
+            trailingBlankRows: 4, rows: 40, cellH: 30, backing: 0, scale: 0.5)
+        #expect(abs(off - 4 * (30.0 / 2.0) * 0.5) < 0.0001)
+    }
+}
+
 // MARK: - AgentPreviewTile.suggestionStyle (pure; confidence dimming)
 
 struct SuggestionStyleTests {
