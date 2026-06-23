@@ -41,7 +41,10 @@ export async function summarize(
     options: {
       // No mcpServers — the summary call needs no Ghostty tools.
       tools: [], // disables ALL built-in tools (Bash/Read/Edit/…)
-      maxTurns: 1, // one model turn, no tool loop
+      maxTurns: 3, // headroom: maxTurns:1 frequently returns subtype=error_max_turns
+      // (the SDK doesn't always settle a clean result in 1 turn even with tools:[]).
+      // With tools:[] there is no tool loop, so the model still produces ONE text answer;
+      // the higher ceiling just lets the query reach a success result instead of erroring.
       model: req.model ?? SUMMARIZER_MODEL,
       systemPrompt: req.system,
       // NOTE: options.env is intentionally OMITTED so the spawned claude inherits

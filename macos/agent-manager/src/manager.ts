@@ -49,12 +49,18 @@ export interface ManagerConfig {
   /** How many trailing viewport lines feed the CHANGE-DETECTION fingerprint.
    *  Default 30. */
   fingerprintTailLines: number;
+  /** Max concurrent in-flight manager calls. The manager has its OWN budget
+   *  (NOT shared with the summarizer) so a busy summarizer can never starve it —
+   *  the bug where, with ≥summarizer-cap due summaries every sweep, the manager
+   *  pass got zero slots and never proposed. Default 4. */
+  maxConcurrent: number;
 }
 
 export const DEFAULT_MANAGER_CONFIG: ManagerConfig = {
   debounceMs: 20000,
   promptTailLines: 60,
   fingerprintTailLines: 30,
+  maxConcurrent: 4,
 };
 
 /** A point-in-time view of one surface, enriched with its viewport text. */

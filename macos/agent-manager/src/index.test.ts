@@ -92,6 +92,7 @@ interface DepsSpec {
   now?: number;
   last?: Map<string, LastSummary>;
   budgetMax?: number;
+  managerBudgetMax?: number;
   /** Phase 2: optional manager call seam + its per-session memory. Defaults to a
    *  stub that throws (so a stray manager fire is loud), and an empty map. The
    *  summarizer tests use `agentState:"working"` surfaces, so the manager pass —
@@ -130,6 +131,9 @@ function makeDeps(spec: DepsSpec): {
     managerModel: MANAGER_MODEL,
     suggest,
     lastSuggestionBySession: spec.lastSuggestion ?? new Map<string, LastSuggestion>(),
+    managerBudget: new ConcurrencyBudget(
+      spec.managerBudgetMax ?? DEFAULT_MANAGER_CONFIG.maxConcurrent,
+    ),
   };
   return { deps, summarizeCalls, suggestCalls };
 }
@@ -433,6 +437,38 @@ test("runSweep: a WAITING agent gets BOTH a summary and a merged suggestion", as
   assert.match(suggestCalls[0].user, /migrate to postgres/);
   // And its memory was recorded.
   assert.equal(deps.lastSuggestionBySession.get("s1")?.suggestion, "use postgres");
+});
+
+test("runSweep: the manager is NOT starved when the summarizer budget is exhausted", async () => {
+  // Regression: the manager used to SHARE the summarizer's budget and run second,
+  // so with >= summarizer-cap due summaries every sweep it got zero slots and never
+  // proposed. With its OWN budget it still fires for the waiting surface.
+  const fake = makeFakeClient({
+    surfaces: [
+      makeSurface({ id: "a1", agentState: "working" }),
+      makeSurface({ id: "a2", agentState: "working" }),
+      makeSurface({ id: "w1", agentState: "waiting", userNotes: "ship it" }),
+    ],
+    screens: { a1: "x", a2: "y", w1: "Proceed? (y/n)" },
+  });
+  // Summarizer cap = 2 → a1+a2 exhaust it this sweep; w1 gets no SUMMARIZER slot.
+  const { deps, suggestCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    suggest: okSuggestion,
+    budgetMax: 2,
+  });
+
+  await runSweep(deps);
+
+  // The manager still proposed for the waiting surface (own budget, not starved).
+  assert.equal(suggestCalls.length, 1, "manager fired despite summarizer budget exhaustion");
+  assert.ok(
+    fake.setCalls.find((c) => c.id === "w1" && c.ann.suggestion === "use postgres"),
+    "the waiting surface got its suggestion",
+  );
+  assert.equal(deps.budget.active, 0, "summarizer budget released");
+  assert.equal(deps.managerBudget.active, 0, "manager budget released");
 });
 
 test("runSweep: a WORKING agent never triggers the manager pass", async () => {

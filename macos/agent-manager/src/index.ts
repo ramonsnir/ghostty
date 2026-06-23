@@ -106,6 +106,9 @@ export interface LoopDeps {
   suggest: SuggestFn;
   /** Per-session memory of the last suggestion attempt, keyed by surface id. */
   lastSuggestionBySession: Map<string, LastSuggestion>;
+  /** The manager's OWN concurrency budget, separate from `budget` (the summarizer's),
+   *  so a busy summarizer can never starve the manager pass of slots. */
+  managerBudget: ConcurrencyBudget;
 }
 
 /**
@@ -292,7 +295,7 @@ async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
       }`,
     );
   } finally {
-    deps.budget.release();
+    deps.managerBudget.release();
   }
 }
 
@@ -355,7 +358,9 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     if (surface.agentState !== "waiting") continue;
     const last = deps.lastSuggestionBySession.get(surface.id);
     if (last && deps.now() - last.atMs < deps.managerCfg.debounceMs) continue;
-    if (!deps.budget.tryAcquire()) break; // budget exhausted this sweep
+    // The manager's OWN budget — NOT the summarizer's — so a busy summarizer
+    // (≥cap due summaries this sweep) can never starve the manager pass.
+    if (!deps.managerBudget.tryAcquire()) break; // manager budget exhausted this sweep
     fired.push(manageOne(surface, deps));
   }
 
@@ -381,6 +386,7 @@ async function main(): Promise<void> {
     managerModel: MANAGER_MODEL,
     suggest: defaultSuggest,
     lastSuggestionBySession: new Map<string, LastSuggestion>(),
+    managerBudget: new ConcurrencyBudget(managerCfg.maxConcurrent),
   };
 
   log(`summarizer + manager started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);

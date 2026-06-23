@@ -112,7 +112,7 @@ test("summarize: passes the safety flags + system/user prompt through to query",
   assert.equal(params.prompt, "USR");
   assert.equal(params.options.systemPrompt, "SYS");
   assert.deepEqual(params.options.tools, []); // disables ALL built-ins
-  assert.equal(params.options.maxTurns, 1); // true single shot
+  assert.equal(params.options.maxTurns, 3); // headroom over the error_max_turns failure
   assert.equal(params.options.model, SUMMARIZER_MODEL);
   // No mcpServers (read-only summarizer) and no env (inherit CLI OAuth + HOME/PATH).
   assert.equal(params.options.mcpServers, undefined);
@@ -150,7 +150,7 @@ test("suggest: passes the Opus model + the SAME safety flags (no tools, no mcp, 
   assert.equal(params.options.systemPrompt, "SYS");
   assert.equal(params.options.model, "claude-opus-4-8");
   assert.deepEqual(params.options.tools, []);   // manager has NO tools — cannot send
-  assert.equal(params.options.maxTurns, 1);
+  assert.equal(params.options.maxTurns, 3);
   assert.equal(params.options.mcpServers, undefined);
   assert.equal(params.options.env, undefined);
 });
