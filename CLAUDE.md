@@ -459,7 +459,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
         within `maxStatusLines` (3) short lines of the last content; (2) its matching top
         rule is within `maxBoxRows` (6) — a SMALL box, so the tall `/workflows` panel is
         rejected; (3) the box interior is empty-ish (only `❯`/`>`/box-border/whitespace —
-        a typed command or a permission question makes it non-empty → shown). Handles both
+        a typed command or a permission question makes it non-empty → shown). **GOTCHA
+        (the "nothing changed for two builds" bug, fixed):** Claude Code pads the prompt
+        line with a **NO-BREAK SPACE U+00A0**, not a normal space — `❯\u{00A0}…` — and the
+        rule rows are real U+2500 (confirmed by hexdumping the live `cachedVisibleContents`).
+        `isEmptyInteriorRow`/`isBlankRow` therefore test the **Unicode whitespace property**
+        (covers U+00A0), NOT just U+0020/U+0009; the old codepoint-only check read the NBSP
+        as content, so the interior never looked empty and `chromeTrailingSkip` returned 0
+        for EVERY footer. The per-tile refresh also runs off a `.task` poll tied to view
+        identity (not a `Timer.publish`, which restarts on every re-render). Handles both
         Claude Code footer shapes (full-width `───`/`❯`/`───` rules and rounded `╭─╮`/`│ │`/
         `╰─╯` boxes). When a footer IS found it also drops the ENTIRE blank gap above it
         (not just one separator) — a near-empty session has content at the TOP, a big blank
@@ -467,8 +475,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
         real content row at the bottom instead of a blank row mid-gap.
       - The offset is a pure, tested `AgentMirrorPreview.bottomAnchorOffset(skipRows:…)`
         (clamped to `rows-1` so an all-blank screen keeps one row visible), refreshed by
-        `refreshSkipRows()` on a light 1.0s per-tile timer (live frames render off the
-        Metal path, not via `@Published`, so a poll — not an observer — drives it).
+        `refreshSkipRows()` on a light ~0.8s per-tile `.task` poll (live frames render off
+        the Metal path, not via `@Published`, so a poll — not an observer — drives it).
         Limitation: a placeholder prompt (`❯ Try "…"`) reads as non-empty interior → the
         box is shown (conservative); most active agents show a bare `❯`. **GUI-only, no
         Zig/host change, GUI relaunch to pick up.** Wiring: `AgentDashboard/AgentPreviewTile.swift`

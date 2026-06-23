@@ -138,6 +138,24 @@ struct ChromeTrailingSkipTests {
         #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 5)
     }
 
+    @Test func prologueInteriorPadIsNoBreakSpace() {
+        // REGRESSION: the real prompt line is "❯\u{00A0}" — the pad after ❯ is a
+        // NO-BREAK SPACE (U+00A0), not a normal space. An interior check that only
+        // treats U+0020/U+0009 as whitespace reads it as content and never skips
+        // the footer (the "nothing changed" bug). With Unicode-whitespace handling
+        // the footer is skipped exactly as with a normal space.
+        let rows = [
+            "  last content line",
+            Self.rule,
+            "❯\u{00A0}",                     // ❯ + NO-BREAK SPACE (as Claude Code emits)
+            Self.rule,
+            "  ⏵⏵ auto mode on",
+        ]
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 4)
+        #expect(AgentMirrorPreview.isEmptyInteriorRow("❯\u{00A0}"))
+        #expect(AgentMirrorPreview.isBlankRow("\u{00A0}\u{00A0}"))
+    }
+
     @Test func skipsFooterWithTrailingBlankRows() {
         // Same footer but with trailing blank rows after the mode line: blanks +
         // footer are all skipped.
