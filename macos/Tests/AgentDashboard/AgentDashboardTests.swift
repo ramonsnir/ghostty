@@ -197,6 +197,34 @@ struct ChromeTrailingSkipTests {
         #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
     }
 
+    @Test func skipsBlankGapAboveFooterOnSparseScreen() {
+        // Real near-empty Claude Code session: a small banner + exchange at the
+        // TOP, a big blank gap, then the input-box footer pinned at the bottom
+        // (the bottom border carries the claude-pool status, still a rule). The
+        // footer AND the whole gap are skipped so "✻ Baked for 4s" lands at the
+        // bottom — not a blank row mid-gap.
+        var rows = [
+            "",
+            " ▐▛███▜▌   Claude Code v2.1.186",
+            "▝▜█████▛▘  Opus 4.8 (1M context)",
+            "  ▘▘ ▝▝    ~/git/ghostty",
+            "",
+            "❯ 2 + 2",
+            "",
+            "⏺ 4",
+            "",
+            "✻ Baked for 4s",
+        ]
+        for _ in 0..<28 { rows.append("") }                       // big blank gap
+        rows.append(Self.rule)                                     // input box top
+        rows.append("❯ ")                                          // empty prompt
+        rows.append("▶ [claude-pool] pool: active=three " + Self.rule)  // bottom rule + status
+        rows.append("  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents")
+        // Everything from row 10 (first gap blank) down is dropped; "✻ Baked
+        // for 4s" (index 9) is the new bottom.
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == rows.count - 10)
+    }
+
     @Test func ruleRowDetectionIgnoresAsciiDashes() {
         // ASCII '-' (markdown table separators etc.) is NOT a box rule, so a row
         // of ASCII dashes is treated as content, not an input-box border.
