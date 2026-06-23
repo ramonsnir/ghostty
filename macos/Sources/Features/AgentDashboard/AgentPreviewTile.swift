@@ -739,76 +739,69 @@ struct AgentMirrorPreview: View {
 
     // MARK: - Footer detection (skip information-less chrome)
 
-    /// Caps for the footer heuristic. These keep detection CONSERVATIVE — biased
-    /// toward showing content — so a tall content box (e.g. the `/workflows`
-    /// viewer) or a permission/choice prompt is never mistaken for the chrome
-    /// input box and hidden.
-    private static let maxStatusLines = 3   // mode/help lines below the input box
-    private static let maxBoxRows = 6       // the input box is small; a tall box is content
+    /// Caps for the footer heuristic. CONSERVATIVE — biased toward showing
+    /// content.
+    private static let maxStatusLines = 3   // mode/help lines below a box's bottom border
     private static let ruleMinDashes = 12   // a horizontal rule is a long ── run
 
     /// PURE: how many trailing viewport rows to drop from a bottom-anchored
-    /// thumbnail = trailing blank rows PLUS, when present, an information-less
-    /// footer (the agent's input box and the mode/status lines below it). `rows`
-    /// is the row-accurate viewport, top-first (under pty-host the GUI mirror is
+    /// thumbnail so the LAST row of real content lands at the bottom. `rows` is
+    /// the row-accurate viewport, top-first (under pty-host the GUI mirror is
     /// exactly one text line per grid row — no soft-wrap, blanks preserved).
     ///
-    /// The footer is only skipped when ALL hold (else just trailing blanks), so
-    /// real content is never hidden:
-    ///   1. a horizontal-rule row (the input box border) sits within
-    ///      `maxStatusLines` short lines of the last content row,
-    ///   2. its matching top rule is within `maxBoxRows` (a SMALL box — not a
-    ///      tall content box like the `/workflows` panel),
-    ///   3. the box interior is empty-ish (just the `❯`/`>`/border + whitespace —
-    ///      not a typed command or a permission question).
+    /// Drops trailing information-less chrome: blank rows, an agent input box or
+    /// a content box's empty bottom (the `/workflows` viewer's empty cells +
+    /// bottom border), and the mode/status/help line(s) beneath it — stopping at
+    /// the first row with REAL content so nothing meaningful is hidden.
+    ///
+    /// Conservative gating (else only trailing blanks are skipped):
+    ///   1. at most `maxStatusLines` status/help lines (plain text, NO box-drawing
+    ///      — e.g. "⏵⏵ auto mode on…", "↑↓ select · x stop workflow…") sit above…
+    ///   2. …a horizontal-rule row (a box's bottom border), and then
+    ///   3. we peel the box's structural rows upward — borders (incl. one carrying
+    ///      embedded status text, e.g. the claude-pool line), empty interior cells
+    ///      (`│   │`), the empty `❯` prompt, and blank gap — stopping at the first
+    ///      row with real content (a filled box-interior row, a question, output).
     static func chromeTrailingSkip(rows: [String]) -> Int {
         let n = rows.count
         if n == 0 { return 0 }
 
-        // 1. Trailing blank rows.
+        // Trailing blank rows (the fallback skip when there's no chrome footer).
         var i = n - 1
         while i >= 0 && isBlankRow(rows[i]) { i -= 1 }
         if i < 0 { return n }                  // all blank
         let blanks = n - 1 - i
         let lastContent = i
 
-        // 2. Walk up at most `maxStatusLines` non-rule status lines to the input
-        //    box's bottom rule.
-        var b = -1
+        // 1. Peel up to `maxStatusLines` status/help lines (plain text, no
+        //    box-drawing — distinguishes an outside-the-box status line from a
+        //    filled box-interior row, which has `│` borders).
         var k = lastContent
         var status = 0
-        while k >= 0 && status <= maxStatusLines {
-            if isRuleRow(rows[k]) { b = k; break }
-            status += 1
+        while k >= 0 && isStatusLine(rows[k]) && status < maxStatusLines {
             k -= 1
-        }
-        if b < 0 { return blanks }             // no input box near the bottom
-
-        // 3. Find the matching top rule within `maxBoxRows` (a small box).
-        var t = -1
-        var j = b - 1
-        var depth = 0
-        while j >= 0 && depth < maxBoxRows {
-            if isRuleRow(rows[j]) { t = j; break }
-            depth += 1
-            j -= 1
-        }
-        if t < 0 { return blanks }             // box too tall → content, not chrome
-
-        // 4. Interior must be empty-ish (the chrome input box, not a question).
-        if t + 1 < b {
-            for r in (t + 1)..<b where !isEmptyInteriorRow(rows[r]) { return blanks }
+            status += 1
         }
 
-        // 5. Footer = rows [top ... n-1]. Also drop the ENTIRE blank gap above
-        //    it — once the footer is gone those blanks are effectively trailing,
-        //    so the last row of real content lands at the bottom. (A near-empty
-        //    Claude Code session puts content at the top, a big blank gap, then
-        //    the footer pinned at the bottom; absorbing only one separator left
-        //    the anchor on a blank row → a near-empty preview.)
-        var top = t
-        while top - 1 >= 0 && isBlankRow(rows[top - 1]) { top -= 1 }
-        return n - top
+        // 2. The chrome MUST bottom out in a horizontal rule (a box's bottom
+        //    border). If not, this isn't a box footer → skip only trailing blanks.
+        guard k >= 0, isRuleRow(rows[k]) else { return blanks }
+
+        // 3. Peel structural rows upward — rules (incl. text-embedded borders) and
+        //    empty-ish interior/blank rows — stopping at the first real-content row.
+        while k >= 0 && (isRuleRow(rows[k]) || isEmptyInteriorRow(rows[k])) { k -= 1 }
+        return n - 1 - k
+    }
+
+    /// A status/help line: real text with NO box-drawing characters (e.g.
+    /// "⏵⏵ auto mode on (shift+tab to cycle)", "↑↓ select · x stop workflow…").
+    /// The no-box-drawing test is what separates it from a filled box-interior
+    /// row (which carries `│` borders), so a box's content rows are never peeled
+    /// as "status".
+    static func isStatusLine(_ s: String) -> Bool {
+        if isEmptyInteriorRow(s) { return false }   // blank / border / empty interior
+        for u in s.unicodeScalars where (0x2500...0x257F).contains(u.value) { return false }
+        return true
     }
 
     /// A blank row: empty or whitespace-only. Uses the Unicode whitespace

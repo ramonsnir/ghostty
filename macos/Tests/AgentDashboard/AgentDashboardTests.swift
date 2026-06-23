@@ -168,21 +168,45 @@ struct ChromeTrailingSkipTests {
         #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 6)
     }
 
-    @Test func keepsTallContentBox() {
-        // The /workflows viewer is a TALL rounded box that IS content, with a help
-        // line below it. The top border is far above the bottom border (> maxBoxRows)
-        // so it is NOT mistaken for the input box — nothing is skipped.
+    @Test func tallContentBoxKeepsFilledRowsTrimsChrome() {
+        // A fully-filled tall box (every interior row has text) keeps ALL its
+        // content rows; only the help line + bottom border below them are trimmed.
         var rows = ["  ✻ Waiting for 1 dynamic workflow to finish", ""]
         rows.append(" ╭ Phases " + String(repeating: "─", count: 40) + "╮")  // tall box top
         for _ in 0..<12 { rows.append(" │  some live workflow row" + String(repeating: " ", count: 10) + "│") }
         rows.append(" ╰" + String(repeating: "─", count: 48) + "╯")          // tall box bottom
         rows.append(" ↑↓ select · x stop workflow · p pause · esc back · s save")
-        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
+        // Skip = help line + bottom border (2); the 12 filled rows are kept.
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 2)
     }
 
-    @Test func keepsPermissionPromptBox() {
-        // A small box whose interior has a real question/options must NOT be
-        // skipped (the user needs to see it).
+    @Test func workflowViewerSkipsEmptyBoxTail() {
+        // The real /workflows viewer: filled phase rows at the TOP, then many
+        // EMPTY interior cells, the bottom border, and the help line. The empty
+        // tail + border + help are skipped so the FILLED rows fill the preview;
+        // the last filled row ("│ 3 Implement … │") is the new bottom.
+        var rows = [
+            "  …prior conversation…",
+            "✻ Waiting for 1 dynamic workflow to finish",
+            String(repeating: "─", count: 100),               // separator rule
+            " swe-dev",
+            " Software development … 6/7 agents · 22m17s",
+            "",
+            " ╭ Phases ──────────────┬ Design · 5 agents " + String(repeating: "─", count: 30) + "╮",
+            " │   ✔ Preflight    2/2 │  ✔ design ✍️   …  │",     // filled
+            " │ ❯ 2 Design       4/5 │  ✔ design 🔎   …  │",     // filled
+            " │   3 Implement+Test   │                  │",     // filled (left col has text)
+        ]
+        for _ in 0..<10 { rows.append(" │                      │                  │") }  // empty interior
+        rows.append(" ╰──────────────────────┴" + String(repeating: "─", count: 18) + "╯")  // bottom border
+        rows.append(" ↑↓ select · x stop workflow · p pause · esc back · s save")           // help
+        // Skip = help(1) + bottom border(1) + 10 empty interior = 12.
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 12)
+    }
+
+    @Test func permissionPromptBoxKeepsQuestionTrimsBorder() {
+        // A small box whose interior has a real question/options keeps the
+        // question + options; only the bottom border below them is trimmed.
         let rows = [
             "  Edit file src/main.zig?",
             Self.rule,
@@ -190,7 +214,8 @@ struct ChromeTrailingSkipTests {
             "  2. No, and tell Claude what to do differently",
             Self.rule,
         ]
-        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
+        // Skip = just the bottom border (1); the Yes/No options are kept.
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 1)
     }
 
     @Test func onlyTrailingBlanksWhenNoFooter() {

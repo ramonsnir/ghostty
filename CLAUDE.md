@@ -450,16 +450,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
         a row count (it uses `unwrap=true` + trims trailing blanks) — but the **mirror**
         path (the only one the dashboard hits) does neither, which is what makes this work.
       - **Footer detection is CONSERVATIVE — never hides content** (the load-bearing
-        design constraint, found by reading real screens): a `working` agent showing the
-        `/workflows` viewer is a TALL box that IS content with a help line under it, and a
-        permission prompt is a SMALL box with a real question — neither may be skipped.
-        `AgentMirrorPreview.chromeTrailingSkip(rows:)` (pure, tested) only skips the footer
-        when ALL hold, else just trailing blanks: (1) a horizontal-rule row (`─`×≥12, the
-        input-box border — ASCII `-` does NOT count, so markdown rules are safe) sits
-        within `maxStatusLines` (3) short lines of the last content; (2) its matching top
-        rule is within `maxBoxRows` (6) — a SMALL box, so the tall `/workflows` panel is
-        rejected; (3) the box interior is empty-ish (only `❯`/`>`/box-border/whitespace —
-        a typed command or a permission question makes it non-empty → shown). **GOTCHA
+        design constraint, found by reading real screens). `AgentMirrorPreview.chromeTrailingSkip(rows:)`
+        (pure, tested) peels trailing chrome and stops at the first row with REAL content,
+        so nothing meaningful is hidden. It peels, from the bottom: (1) up to
+        `maxStatusLines` (3) status/help lines — plain text with NO box-drawing (e.g.
+        `⏵⏵ auto mode on…`, `↑↓ select · x stop workflow…`); the no-box-drawing test is what
+        distinguishes an outside-the-box status line from a filled box-interior row (which
+        carries `│`); then (2) it REQUIRES a horizontal-rule row (`─`×≥12 — a box's bottom
+        border; ASCII `-` does NOT count, so markdown rules are safe) or it bails to
+        blanks-only; then (3) it peels the box's structural rows upward — borders (incl. a
+        border carrying embedded status text, e.g. the claude-pool line), empty interior
+        cells (`│   │`), the empty `❯` prompt, and blank gap — stopping at the first
+        real-content row. This handles BOTH the input box AND content boxes: the
+        `/workflows` viewer's filled phase rows are real content (kept), while its empty
+        interior tail + bottom border + help line are dropped; a permission prompt keeps its
+        question/options and only loses the bottom border. (The earlier version special-cased
+        a SMALL empty-interior input box and rejected tall boxes via a `maxBoxRows` cap — that
+        preserved the whole `/workflows` box including its wasted empty bottom; the unified
+        peel replaced it.) **GOTCHA
         (the "nothing changed for two builds" bug, fixed):** Claude Code pads the prompt
         line with a **NO-BREAK SPACE U+00A0**, not a normal space — `❯\u{00A0}…` — and the
         rule rows are real U+2500 (confirmed by hexdumping the live `cachedVisibleContents`).
