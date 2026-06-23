@@ -89,8 +89,10 @@ struct AgentDashboardView: View {
             .scrollContentBackground(.hidden)
             // Plain `List` still reserves a ~5–10pt horizontal scroll-content
             // margin that `listRowInsets` can't reach; zero it so the tiles are
-            // truly edge-to-edge (the user's "full-width rows" ask).
-            .contentMargins(.horizontal, 0, for: .scrollContent)
+            // truly edge-to-edge (the user's "full-width rows" ask). The API is
+            // macOS 14+, so it's behind an availability shim (older deploy
+            // targets keep the small gutter — graceful degradation).
+            .zeroHorizontalScrollMargin()
             .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
         }
     }
@@ -184,5 +186,19 @@ struct AgentDashboardView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(8)
             .background(.yellow.opacity(0.12))
+    }
+}
+
+private extension View {
+    /// Zero the horizontal scroll-content margin of a `List`/scroll view so its
+    /// rows reach the container edges. `contentMargins(_:_:for:)` is macOS 14+,
+    /// so on older systems this is a no-op (the small default gutter remains).
+    @ViewBuilder
+    func zeroHorizontalScrollMargin() -> some View {
+        if #available(macOS 14.0, *) {
+            self.contentMargins(.horizontal, 0, for: .scrollContent)
+        } else {
+            self
+        }
     }
 }
