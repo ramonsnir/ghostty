@@ -1100,66 +1100,81 @@ test("runQueueSweep: a configured claim command fires after dispatch and is non-
 });
 
 // ---------------------------------------------------------------------------
-// (12) §2 HARD DEP: a spawn returning sessionID 0 (no pty-host) self-DISABLES the run
-//      and creates NO cross-restart re-dispatch loop. Without a stable session id a
-//      surface can be neither persisted nor re-adopted, so the supervisor must refuse to
-//      track it (rather than persist a sessionID-0 record that prunes → re-dispatches a
-//      duplicate every restart cycle). This is the sidecar backstop for the §2 self-
-//      disable the mcp.ts contract documents.
+// (12) §2 sessionID-0 TOLERANCE + BACKFILL: a freshly-spawned SPLIT returns sessionID 0
+//      because the host attaches asynchronously. The supervisor must NOT treat that as
+//      "no pty-host" and self-disable — it tracks the surface by UUID and BACKFILLS the
+//      real sessionID once the host attaches (visible next sweep). It self-disables ONLY
+//      if the surface stays live-but-session-0 PAST the grace window (genuine no pty-host).
 // ---------------------------------------------------------------------------
 
-test("runQueueSweep: a sessionID-0 spawn (no pty-host) self-disables the run with no re-dispatch loop", async () => {
-  // The shared store a simulated restart re-reads.
-  const store = memStore();
-  const fake = makeQueueFake({
+test("runQueueSweep: a sessionID-0 spawn is TOLERATED + BACKFILLED once the host attaches (no false self-disable)", async () => {
+  const spec: { surfaces: Surface[]; listJson: string; spawns: { id: string; sessionId: number }[] } = {
     surfaces: [],
     listJson: '[{"id":"K-1"}]',
-    // The spawn returns sessionID 0 — the no-pty-host signal.
-    spawns: [{ id: "spawned-1", sessionId: 0 }],
-  });
-  const run = makeQueueRun(tmpl(), store);
+    spawns: [{ id: "spawned-1", sessionId: 0 }], // async-attach: session not ready at spawn
+  };
+  const fake = makeQueueFake(spec);
+  const run = makeQueueRun(tmpl(), memStore());
   let now = 12_000_000;
   const deps = makeQueueDeps(fake, [run], () => now);
 
   await runQueueSweep(deps); // arm
   now += 5000;
-  await runQueueSweep(deps); // attempt dispatch — spawn returns sessionID 0
+  await runQueueSweep(deps); // dispatch K-1; spawn returns sessionId 0 — TOLERATED
 
-  // The spawn was attempted exactly once; the run is now self-disabled and tracks NOTHING.
-  assert.equal(fake.calls.spawn.length, 1, "one spawn attempted");
-  assert.equal(run.disabled, true, "run self-disabled on the sessionID-0 spawn");
-  assert.equal(run.active.has("K-1"), false, "the untrackable sessionID-0 surface is NOT tracked");
-  assert.equal(run.lifetimeDispatched, 0, "the lifetime counter rolled back (nothing trackable launched)");
+  assert.equal(fake.calls.spawn.length, 1, "one spawn");
+  assert.equal(run.disabled, false, "NOT disabled on a transient sessionID 0");
+  assert.equal(run.active.has("K-1"), true, "the surface is tracked (pending session) by UUID");
+  assert.equal(run.active.get("K-1")!.sessionID, 0, "session pending (0) for now");
 
-  // The persisted store carries NO sessionID-0 record (so a restart can't re-dispatch it).
-  assert.equal(loadStore(store).length, 0, "no sessionID-0 record persisted");
+  // The host attaches: list_surfaces now shows the spawned surface with a REAL session
+  // (carrying the queueKey annotation the dispatch stamped).
+  spec.surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 555, queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps); // reconcile UUID-matches the pending record + BACKFILLS the session
 
-  // Further sweeps on THIS run dispatch nothing (disabled), even though K-1 stays listed.
-  for (let i = 0; i < 3; i++) {
-    now += 5000;
-    await runQueueSweep(deps);
-  }
-  assert.equal(fake.calls.spawn.length, 1, "disabled run dispatches nothing further (no loop)");
+  assert.equal(run.active.has("K-1"), true, "still tracked");
+  assert.equal(run.active.get("K-1")!.sessionID, 555, "sessionID BACKFILLED from list_surfaces");
+  assert.equal(run.disabled, false, "still not disabled");
+  assert.equal(fake.calls.spawn.length, 1, "no re-dispatch (the key was never freed)");
+});
 
-  // SIMULATE a sidecar restart with the SAME store: the fresh run reconciles from the
-  // (empty) store and must NOT re-dispatch the same key into a loop. Its first spawn
-  // would again return sessionID 0 → it self-disables again, never looping duplicates.
-  const fake2 = makeQueueFake({
+test("runQueueSweep: a surface that NEVER attaches a session (genuine no pty-host) self-disables AFTER grace", async () => {
+  const spec: { surfaces: Surface[]; listJson: string; spawns: { id: string; sessionId: number }[] } = {
     surfaces: [],
     listJson: '[{"id":"K-1"}]',
-    spawns: [{ id: "spawned-2", sessionId: 0 }],
-  });
-  const run2 = makeQueueRun(tmpl(), store); // SAME store
-  const deps2 = makeQueueDeps(fake2, [run2], () => now);
-  await runQueueSweep(deps2); // arm
+    spawns: [{ id: "spawned-1", sessionId: 0 }],
+  };
+  const fake = makeQueueFake(spec);
+  const run = makeQueueRun(tmpl(), memStore());
+  let now = 20_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
   now += 5000;
-  await runQueueSweep(deps2); // one spawn attempt, then disabled
+  await runQueueSweep(deps); // dispatch; spawn sessionId 0 — tolerated
+  assert.equal(run.disabled, false, "not disabled yet (transient tolerance)");
+
+  // The surface is LIVE but its session STAYS 0 (no pty-host — .exec backend).
+  spec.surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 0, queueKey: "K-1", queueName: "backlog" }),
+  ];
   now += 5000;
-  await runQueueSweep(deps2);
+  await runQueueSweep(deps);
+  assert.equal(run.disabled, false, "within grace: still tolerated");
+
+  // Past the grace window: a live-but-session-0 surface ⇒ no-pty-host ⇒ self-disable.
+  now += DEFAULT_PENDING_GRACE_MS + 1000;
+  await runQueueSweep(deps);
+  assert.equal(run.disabled, true, "past grace with a live session-0 surface → self-disabled (deferred §2 backstop)");
+
+  // Disabled ⇒ no further dispatch (no tight loop).
+  const spawnsAfter = fake.calls.spawn.length;
   now += 5000;
-  await runQueueSweep(deps2);
-  assert.equal(fake2.calls.spawn.length, 1, "restart attempts ONE spawn then self-disables — no duplicate loop");
-  assert.equal(run2.disabled, true, "restarted run also self-disabled");
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, spawnsAfter, "disabled run dispatches nothing further");
 });
 
 // ===========================================================================

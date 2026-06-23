@@ -307,7 +307,16 @@ export type ReconcileAction =
    *  one-sweep `list_surfaces` lag (an immediate prune would free the key with no
    *  cooldown → a duplicate re-dispatch, §7); a long-lived RUNNING record's `sinceMs`
    *  is old, so a genuinely vanished session is past grace and pruned at once. */
-  | { kind: "prune"; assignment: Assignment; reason: "session-gone" | "pending-expired" }
+  | {
+      kind: "prune";
+      assignment: Assignment;
+      // session-gone: finalized record, session not in list_surfaces (past grace).
+      // pending-expired: a sessionID-0 record whose surface never appeared (past grace).
+      // no-pty-host: a sessionID-0 record whose surface IS live but its sessionID stayed
+      //   0 past grace — the host never attached, i.e. genuinely no pty-host (§2). The
+      //   caller self-disables the run on this reason (a transient 0 backfills instead).
+      reason: "session-gone" | "pending-expired" | "no-pty-host";
+    }
   /** A live surface carrying a queueKey annotation with NO matching record → adopt
    *  it as an assignment (NEVER re-dispatch). Crash-recovery for a spawn that lost
    *  its finalize. */
@@ -363,16 +372,26 @@ export function reconcile(
   // Index live surfaces by sessionID (only finalized, non-zero sessions can match a
   // record). A sessionID of 0 is "unknown" and never a match key.
   const liveBySession = new Map<number, LiveSurface>();
+  // Also index by UUID: a freshly-dispatched record can carry sessionID 0 (the host
+  // attaches asynchronously, so the split's id isn't ready at spawn time — see
+  // dispatchOne). Such a record is matched by its stable surfaceUUID until its session
+  // attaches, at which point we BACKFILL the real sessionID. (UUID is stable WITHIN a GUI
+  // session; across a GUI restart the UUID is re-minted, but by then the surface's
+  // session has attached and orphan-adoption by the queueKey annotation recovers it.)
+  const liveByUUID = new Map<string, LiveSurface>();
   for (const s of liveSurfaces) {
     if (s.sessionID !== 0) liveBySession.set(s.sessionID, s);
+    liveByUUID.set(s.surfaceUUID, s);
   }
 
   const actions: ReconcileAction[] = [];
   const kept: Assignment[] = [];
 
   // Track which live surfaces were claimed by a record so the leftovers can be
-  // considered for orphan adoption. Claim by sessionID (the match key).
+  // considered for orphan adoption. Claim by sessionID (the match key) AND by UUID (for
+  // sessionID-0 records matched by UUID, so they aren't also orphan-adopted).
   const claimedSessions = new Set<number>();
+  const claimedUUIDs = new Set<string>();
 
   for (const rec of records) {
     const live = rec.sessionID !== 0 ? liveBySession.get(rec.sessionID) : undefined;
@@ -420,7 +439,40 @@ export function reconcile(
       }
       continue;
     }
-    // Still pending (never finalized). Keep within the grace window; prune after.
+    // sessionID 0: either a never-finalized pending record (no UUID yet) OR a finalized
+    // record whose split's host session hasn't attached yet (has a UUID, session 0).
+    // Try to match the live surface by UUID and BACKFILL the session once it attaches.
+    const liveByUuid = rec.surfaceUUID !== undefined ? liveByUUID.get(rec.surfaceUUID) : undefined;
+    if (liveByUuid !== undefined) {
+      claimedUUIDs.add(liveByUuid.surfaceUUID);
+      if (liveByUuid.sessionID !== 0) {
+        // The host has now attached → BACKFILL the real sessionID (and refresh the UUID).
+        claimedSessions.add(liveByUuid.sessionID);
+        const refreshed: Assignment = {
+          ...rec,
+          sessionID: liveByUuid.sessionID,
+          surfaceUUID: liveByUuid.surfaceUUID,
+        };
+        const needsAnnotationRestamp = liveByUuid.queueKey !== rec.key;
+        actions.push({ kind: "active", assignment: refreshed, needsAnnotationRestamp });
+        kept.push(refreshed);
+      } else if (nowMs - rec.sinceMs > graceMs) {
+        // The surface is LIVE but its sessionID has stayed 0 past the grace window → the
+        // host never attached, i.e. genuinely NO pty-host (§2 hard dep). Prune it with the
+        // `no-pty-host` reason so the caller self-disables the run (vs a transient 0, which
+        // backfills above). This is the DEFERRED §2 backstop — no false self-disable on a
+        // split that simply hasn't attached yet.
+        actions.push({ kind: "prune", assignment: rec, reason: "no-pty-host" });
+      } else {
+        // Live surface, session not yet attached, within grace → KEEP (pending session).
+        // It occupies its slot; the agent is running; backfill is expected next sweep.
+        kept.push(rec);
+      }
+      continue;
+    }
+
+    // No live surface for this record's UUID (or no UUID yet). Keep within the grace
+    // window (the spawn → first list_surfaces lag); prune after.
     if (nowMs - rec.sinceMs > graceMs) {
       actions.push({ kind: "prune", assignment: rec, reason: "pending-expired" });
     } else {
@@ -450,6 +502,7 @@ export function reconcile(
   const adoptedSessions = new Set<number>();
   for (const s of liveSurfaces) {
     if (s.sessionID === 0) continue; // can't be persistence-keyed → not adoptable
+    if (claimedUUIDs.has(s.surfaceUUID)) continue; // a sessionID-0 record matched it by UUID
     if (claimedSessions.has(s.sessionID)) continue;
     if (adoptedSessions.has(s.sessionID)) continue;
     const queueKey = s.queueKey;

@@ -481,6 +481,17 @@ async function runOne(
       run.cooldown.set(action.assignment.key, cooldownUntil(nowMs));
       run.idleAnchor.delete(action.assignment.key);
       run.closeAwait.delete(action.assignment.key);
+    } else if (action.kind === "prune" && action.reason === "no-pty-host") {
+      // §2 DEFERRED BACKSTOP: a dispatched surface stayed sessionID 0 past the grace
+      // window (it's live but the host never attached) → genuinely no pty-host. Disable
+      // the run so it dispatches nothing further (the feature is a documented no-op
+      // without pty-host), and cool the key so it isn't immediately re-dispatched.
+      run.disabled = true;
+      run.cooldown.set(action.assignment.key, cooldownUntil(nowMs));
+      errlog(
+        `run "${t.name}": ${action.assignment.key} surface never attached a host session ` +
+          `(no pty-host, §2) — supervisor self-DISABLED for this run`,
+      );
     }
   }
   persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
@@ -920,29 +931,21 @@ async function dispatchOne(
   // │  silently WIDEN that crash window into a real duplicate-dispatch gap.
   // └─ If you must await between spawn and finalize, re-derive the §9 recovery story first.
 
-  // §2 HARD-DEP BACKSTOP: a spawn that returns sessionID 0 means there is NO pty-host
-  // (`ghostty_surface_session_id` returns 0 under `.exec`), so the surface has no stable
-  // persistence key. Finalizing + persisting a sessionID-0 record would create the exact
-  // cross-restart duplicate loop §2 calls out: on the next process the record can't match
-  // any live surface (reconcile keys by sessionID != 0), is pruned, and its key
-  // re-dispatches a duplicate agent. So we REFUSE to track it: drop the pending record,
-  // roll back the lifetime counter (nothing trackable launched), DISABLE the run (it
-  // dispatches nothing further), and log ONCE. The just-spawned surface is left running
-  // (closing it would be a destructive action the supervisor never takes autonomously),
-  // but it is not tracked — the feature is a documented no-op without pty-host (§2).
-  if (spawned.sessionId === 0) {
-    run.active.delete(item.key);
-    if (run.lifetimeDispatched > 0) run.lifetimeDispatched -= 1;
-    run.disabled = true;
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
-    errlog(
-      `run "${t.name}": spawn ${item.key} returned sessionID 0 (no pty-host) — ` +
-        `supervisor self-DISABLED for this run (§2 hard dep); not tracking the surface`,
-    );
-    return false;
-  }
+  // sessionID-0 TOLERANCE (the async-attach reality): a freshly-created SPLIT surface
+  // usually returns sessionID 0 from `ghostty_surface_session_id` because the host
+  // attaches ASYNCHRONOUSLY (on a per-surface IO thread) — the id is assigned a beat
+  // after the split is created, and is visible in the very next `list_surfaces`. (The
+  // new-TAB path is slow enough that its id is already attached by the time it returns,
+  // which is why the first item gets a real session and later splits often don't.) So we
+  // do NOT treat a 0 here as "no pty-host" and self-disable. We FINALIZE the record with
+  // the stable UUID (sessionID 0 for now) and stamp the queueKey annotation; reconcile
+  // then UUID-matches the live surface next sweep and BACKFILLS the real sessionID once
+  // the host has attached (§9). Genuine no-pty-host (the id NEVER attaches) is detected
+  // in reconcile — a session-0 record whose surface stays live-but-session-0 PAST the
+  // grace window — which self-disables the run then (deferred, not on a transient 0).
 
-  // (e) FINALIZE the record with the stable sessionID + UUID; persist.
+  // (e) FINALIZE the record with the (maybe-0) sessionID + UUID; persist. A 0 here is
+  // a pending session id reconcile will backfill (see above).
   const finalized = finalizeRecord(pending, spawned.sessionId, spawned.id, deps.now());
   run.active.set(item.key, finalized);
   persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
