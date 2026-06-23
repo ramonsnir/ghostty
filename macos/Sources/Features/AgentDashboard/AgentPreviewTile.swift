@@ -568,7 +568,6 @@ struct AgentMirrorPreview: View {
     /// text, polled on a light timer (live frames render off the Metal path, not
     /// SwiftUI, so an observer wouldn't fire).
     @State private var skipRows: Int = 0
-    private let skipPoll = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     init(ghostty: Ghostty.App, sessionID: UInt64, realSurface: Ghostty.SurfaceView) {
         self.ghostty = ghostty
@@ -641,7 +640,15 @@ struct AgentMirrorPreview: View {
                         }
                         refreshSkipRows()
                     }
-                    .onReceive(skipPoll) { _ in refreshSkipRows() }
+                    // Poll tied to view IDENTITY (survives re-renders), unlike a
+                    // per-instance Timer.publish which restarts its countdown on
+                    // every re-render.
+                    .task {
+                        while !Task.isCancelled {
+                            refreshSkipRows()
+                            try? await Task.sleep(nanoseconds: 800_000_000)
+                        }
+                    }
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
@@ -804,10 +811,11 @@ struct AgentMirrorPreview: View {
         return n - top
     }
 
-    /// A blank row: empty or whitespace-only (the mirror already trims a row's
-    /// trailing cells, so a truly empty grid row arrives as "").
+    /// A blank row: empty or whitespace-only. Uses the Unicode whitespace
+    /// property so NO-BREAK SPACE (U+00A0) and friends count — Claude Code pads
+    /// with U+00A0, not U+0020.
     static func isBlankRow(_ s: String) -> Bool {
-        s.allSatisfy { $0 == " " || $0 == "\t" } || s.isEmpty
+        s.unicodeScalars.allSatisfy { $0.properties.isWhitespace }
     }
 
     /// A horizontal-rule row: a long run of box-drawing horizontal line chars
@@ -825,7 +833,11 @@ struct AgentMirrorPreview: View {
     /// text or a permission question makes it non-empty → the box is shown.
     static func isEmptyInteriorRow(_ s: String) -> Bool {
         for u in s.unicodeScalars {
-            if u.value == 0x20 || u.value == 0x09 { continue }          // space/tab
+            // Unicode whitespace covers space/tab AND U+00A0 NO-BREAK SPACE,
+            // which Claude Code uses to pad the prompt line (`❯\u{00A0}…`). The
+            // old 0x20/0x09-only check read that NBSP as content and never
+            // skipped the footer — the bug behind "nothing changed".
+            if u.properties.isWhitespace { continue }
             if u.value == 0x276F || u.value == 0x3E { continue }        // ❯  >
             if (0x2500...0x257F).contains(u.value) { continue }         // box drawing
             return false
