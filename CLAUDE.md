@@ -664,6 +664,89 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `error_max_turns` still occurs intermittently even at `maxTurns:3` (summarizer path) — it
     is caught + skipped, harmless, and a separate lower-priority SDK quirk.
 
+- **Agent Queue Supervisor** (fork-only, macOS, OFF by default) — turns the Agent
+  Dashboard/Manager into an active **supervisor + driver**: start a **queue** from a
+  user-authored JSON **template** and the manager opens a tab of splits, launches one CLI
+  agent per work item, never doubles up on an item key, caps concurrency, tracks each to
+  completion, and force-closes its split when the item is done + the agent idle —
+  re-polling for new/unblocked items. **See `AGENT-QUEUE.md` for user-facing config/usage**
+  and the local design + review ledger `scratchpad/agent-queue-design.md` (paths in the
+  iteration worktree). The load-bearing facts for an agent touching this code:
+  - **GENERIC by design — the #1 requirement.** Ghostty/sidecar link NO tracker (Linear/
+    GitHub/Jira) code. The queue source is a **command-based provider** the template
+    defines: `list` (prints actionable items as JSON; expected to already exclude
+    blocked/claimed/done — NO dependency graph in v1), `status {key}` (prints
+    `{"state":…}`; terminal iff in `doneStates`), optional `claim`. Item fields reach the
+    PROVIDER as argv elements (`{key}`) and the AGENT as **`GHOSTTY_ITEM_*` env vars** —
+    NEVER string-spliced into a shell line (the one injection seam, closed). Completion is
+    **status-only** (idleness alone never completes — no false positives).
+  - **Engine = a deterministic THIRD pass in the existing TS sidecar** (`macos/agent-manager/`,
+    `src/queue/{types,provider,grid,templates,store,supervisor,runner,wiring,commands}.ts`) —
+    NO LLM in the control path (summarizer/manager passes are orthogonal, still run on the
+    tiles). It has its OWN `ConcurrencyBudget` (the manager-starvation lesson). Pure core
+    (selectCandidates/nextState/grid/reconcile/applyCommand) is `node --test`-tested.
+  - **HARD DEPS, self-disables silently otherwise (§2):** pty-host (detection `agentKind` +
+    STABLE session ids for persistence — `sessionID==0` without it) AND the Claude
+    agent-state hooks (the close-gate keys off hook-driven `agentState==idle` held
+    `closeStableSeconds`; `idleSeconds` is deliberately NOT a fallback — a repainting TUI
+    never idles by it). Hooks post to the INSTALLED RELEASE port, so real queues run there,
+    not a dev `+1/+2` build. **Codex can dispatch/preview but CANNOT auto-close in v1** (no
+    hooks) — documented limitation.
+  - **No-duplicates guarantee, robust WITHOUT `claim`** (§7/§9): synchronous pre-`await`
+    active-set insert (within-tick), durable sidecar store keyed by `sessionID` +
+    reconcile-each-sweep (cross-tick/restart), cooldown (re-dispatch of a just-finished key).
+    `claim` is a latency optimization only. **Resilience is first-class:** a started queue +
+    its in-flight items survive a sidecar OR GUI restart with NO re-dispatch and NO orphaning
+    — the **first sweep is dispatch-suppressed until reconcile runs**, crash-safe dispatch
+    ordering (pending record → spawn → annotate → finalize), orphan adoption, finalized-record
+    prune is grace-gated against a one-sweep `list_surfaces` lag. (These three — the lag grace,
+    orphan grid-slot reclamation, and the `sessionID:0` self-disable — were the adversarial-
+    review blockers; all fixed + regression-tested.)
+  - **ON-DEMAND lifecycle via a GUI→sidecar COMMAND CHANNEL** (§8a) — the sidecar is the MCP
+    CLIENT so the GUI can't push; commands are DRAINED. `MCPServer` holds a thread-safe FIFO
+    (enqueued on its serial queue via a `.ghosttyQueueCommand` observer the palette/dashboard
+    post to; `QueueCommandBridge.swift`/`MCPQueueCommands.swift`), drained by the new MCP tool
+    **`take_queue_commands`**. The sidecar applies start/pause/stop(drain)/abort/resume
+    (`commands.ts applyCommand`), persists the active-run SET (`active-runs.json`) + rehydrates
+    it on restart. **A template merely on disk does NOT auto-run** (replaced Phase-1
+    `loadRuns(all)`) — only a started/persisted run.
+  - **GRID layout** (§12): all of a run's splits in ONE tab, auto-arranged up to `cols×rows`
+    filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
+    splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are
+    left + refilled lowest-slot-first (no re-flow). `concurrency` clamps to `cols×rows`.
+  - **Close path (§10) — the subtle one:** `close_surface`/`request_close` HONORS
+    `confirm-close-surface` and would pop a modal for a live agent. So the supervisor sends the
+    template `agent.exit` keys (→ child exits) then calls **`force_close_surface`**, which
+    routes a LAST/ONLY-pane (tree-root) close to the confirm-FREE
+    `closeTabImmediately()`/`closeWindowImmediately()` (NOT `closeTab`/`closeWindow`, which
+    re-check `needsConfirmQuit`) — `TerminalController.closeSurface` override. `onAgentExit:
+    leave-and-bell` keeps a crashed split for review + rings the bell everywhere via
+    **`signal_attention`** (posts `.ghosttyBellDidRing` with the SurfaceView as `object`, so
+    the dashboard aggregate + web monitor + push all fire), and FREES the slot (no deadlock).
+  - **New MCP tools (Swift, the engine's "hands"):** `spawn_split_command` (opens the run's
+    first tab or splits a target surface running a command, returns `{id, sessionId}` —
+    `MCPLayout.newSplitCommand` reads the new leaf's UUID + `ghostty_surface_session_id` back
+    as VALUE types on the main hop), `force_close_surface`, `signal_attention`,
+    `take_queue_commands`, plus `sessionID` added to `list_surfaces` rows and queue annotation
+    fields (`queueKey`/`queueName`/`queueUrl`, partial-merge like summary/suggestion). No host/
+    Zig protocol change — only 3 additive default-off config keys (`agent-queue`,
+    `agent-queue-templates-dir`, `agent-queue-max-total`) + the `start_agent_queue` action.
+  - **Dashboard** (§11): tiles **grouped by origin** (queue name, or `(other)` for non-queue
+    agents), per-tile origin **marker**, a top **filter bar** (include/exclude origins,
+    persisted; VIEW-only — an excluded ringing/waiting agent still alerts), per-queue
+    Pause/Stop/Abort header buttons (post `.ghosttyQueueCommand`). Start via the
+    `start_agent_queue` action (+ `:template-name`) → `QueuePalette` (mirrors `ProjectPalette`)
+    → posts a `start` command. Wiring: sidecar `src/queue/*`; Swift
+    `macos/Sources/Features/MCP/{MCPLayout,MCPTools,MCPServer,MCPAnnotation,MCPQueueCommands,
+    QueueCommandBridge}.swift`, `AgentDashboard/{AgentDashboardController,View,PreviewTile,
+    AgentStateBridge}.swift`, `Command Palette/QueuePalette.swift`, `Terminal/
+    {TerminalController,BaseTerminalController,TerminalView}.swift`, `Ghostty/{Ghostty.App,
+    Ghostty.Config}.swift`; core `src/config/Config.zig` + `src/input/{Binding,command}.zig` +
+    `src/apprt/action.zig` + `src/Surface.zig`. Tests: sidecar `node --test` (337+), Swift
+    `MCPServerTests`/`MCPAnnotationTests`/`AgentDashboardTests`/`QueuePaletteTests`, Zig
+    `agent-queue` config + `start_agent_queue` binding. **GUI relaunch + rebuilt sidecar
+    `dist` to enable; no host restart.**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
@@ -671,7 +754,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`
