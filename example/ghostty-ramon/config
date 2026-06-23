@@ -95,6 +95,13 @@ keybind = ctrl+a>d=toggle_agent_dashboard
 # See AGENT-MANAGER.md.
 agent-manager = true
 
+# Agent Queue Supervisor (fork-only): start a queue from a template and the manager
+# dispatches one agent per work item, caps concurrency, tracks to completion, and
+# closes splits when done. Templates live in agent-manager/queues/. Self-disables
+# unless pty-host + agent-manager + the Claude hooks are present. Start via the
+# command palette ("Start Agent Queue…") or bind start_agent_queue. See AGENT-QUEUE.md.
+agent-queue = true
+
 # --- tmux pane/split bindings --------------------------------------------
 # %  / "   split right / split down   (shift required to type both symbols)
 # @ is also accepted as a personal alias for %.
