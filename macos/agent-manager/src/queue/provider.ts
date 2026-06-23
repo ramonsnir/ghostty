@@ -276,9 +276,24 @@ export async function fetchList(
   exec: Exec,
   opts: ExecOptions = {},
 ): Promise<WorkItem[]> {
+  return (await fetchListResult(spec, exec, opts)).items;
+}
+
+/**
+ * Like `fetchList` but distinguishes a SUCCESSFUL empty list from a FAILED/skip one:
+ * `ok` is true only when the provider exited cleanly and its output parsed. The
+ * quit-when-empty logic (§8a) needs this — a flaky/non-zero `list` returns
+ * `{ok:false, items:[]}` (treated as "skip", never "the queue is empty") so a transient
+ * provider failure can never tear a run down. PURE-ish (only the injected exec).
+ */
+export async function fetchListResult(
+  spec: ProviderListSpec,
+  exec: Exec,
+  opts: ExecOptions = {},
+): Promise<{ ok: boolean; items: WorkItem[] }> {
   const run = await runProvider(spec.command, exec, opts);
-  if (!run.ok) return [];
-  return parseListOutput(run.result.stdout, spec);
+  if (!run.ok) return { ok: false, items: [] };
+  return { ok: true, items: parseListOutput(run.result.stdout, spec) };
 }
 
 // ---------------------------------------------------------------------------

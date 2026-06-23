@@ -39,6 +39,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
     closeStableSeconds: 5,
+    quitWhenEmpty: false,
     ...over,
   };
 }
@@ -383,6 +384,42 @@ test("closeSequencePlan: template exit keys are honored in order", () => {
   assert.deepEqual(steps, [
     { kind: "sendKey", key: "ctrl_c" },
     { kind: "sendKey", key: "ctrl_d" },
+    { kind: "awaitExited" },
+    { kind: "forceClose" },
+  ]);
+});
+
+test("closeSequencePlan: a typed exit command (text) types it + presses Enter", () => {
+  // Claude Code exits via "/quit" (it swallows Ctrl-D), so the prelude is sendText + Enter.
+  const steps = closeSequencePlan(asgn(), tmpl({ agent: { command: "claude", exit: { text: "/quit" } } }));
+  assert.deepEqual(steps, [
+    { kind: "sendText", text: "/quit" },
+    { kind: "sendKey", key: "enter" },
+    { kind: "awaitExited" },
+    { kind: "forceClose" },
+  ]);
+});
+
+test("closeSequencePlan: text exit with submit:false types WITHOUT Enter", () => {
+  const steps = closeSequencePlan(asgn(), tmpl({ agent: { command: "x", exit: { text: "/quit", submit: false } } }));
+  assert.deepEqual(steps, [
+    { kind: "sendText", text: "/quit" },
+    { kind: "awaitExited" },
+    { kind: "forceClose" },
+  ]);
+});
+
+test("closeSequencePlan: text-only exit does NOT append the default Ctrl-D", () => {
+  const steps = closeSequencePlan(asgn(), tmpl({ agent: { command: "x", exit: { text: "/quit" } } }));
+  assert.equal(steps.some((s) => s.kind === "sendKey" && s.key === DEFAULT_EXIT_KEYS[0]), false);
+});
+
+test("closeSequencePlan: text + keys runs the text prelude THEN the keys", () => {
+  const steps = closeSequencePlan(asgn(), tmpl({ agent: { command: "x", exit: { text: "/q", keys: ["ctrl-d"] } } }));
+  assert.deepEqual(steps, [
+    { kind: "sendText", text: "/q" },
+    { kind: "sendKey", key: "enter" },
+    { kind: "sendKey", key: "ctrl-d" },
     { kind: "awaitExited" },
     { kind: "forceClose" },
   ]);

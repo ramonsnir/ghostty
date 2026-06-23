@@ -33,7 +33,7 @@ import {
 } from "./commands.js";
 import {
   buildItemEnv,
-  fetchList,
+  fetchListResult,
   probeStatus,
   renderArgv,
   runProvider,
@@ -148,6 +148,11 @@ export interface QueueRun {
    *  ALL its live assignments THIS sweep, then is removed from the registry. NOT persisted as
    *  a flag (abort terminates the run; the active-runs store simply drops it). */
   aborting: boolean;
+  /** (§8a quit-when-empty) TRANSIENT per-sweep flag: set true when THIS sweep's dispatch
+   *  fetched a SUCCESSFUL EMPTY `list` (not a failed/skip one). The sweep loop quits the
+   *  run when this is true AND `active.size === 0`. Reset to false at the top of every
+   *  per-run sweep; never persisted. */
+  sawEmptyListThisSweep: boolean;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -175,6 +180,7 @@ export function makeQueueRun(
     paused: opts.paused ?? false,
     draining: opts.draining ?? false,
     aborting: false,
+    sawEmptyListThisSweep: false,
   };
 }
 
@@ -305,6 +311,19 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         deps.registry.delete(name);
         registryChanged = true;
         log(`run "${name}" DRAINED — no slot-occupying assignments, run removed`);
+      } else if (
+        // QUIT-WHEN-EMPTY (§8a): the template opted in AND this sweep saw a SUCCESSFUL
+        // empty `list` AND nothing is tracked (no in-flight agents, no review-held
+        // EXITED splits) → there is genuinely nothing left to do, so quit even before
+        // maxItems. A momentary empty list while agents run (active > 0) does NOT quit —
+        // the run keeps polling for new/unblocked items until BOTH queue and fleet drain.
+        run.template.quitWhenEmpty &&
+        run.sawEmptyListThisSweep &&
+        run.active.size === 0
+      ) {
+        deps.registry.delete(name);
+        registryChanged = true;
+        log(`run "${name}" QUIT — queue empty and no active agents (quitWhenEmpty)`);
       }
     } catch (err) {
       errlog(`run "${name}": ${msg(err)}`);
@@ -351,11 +370,11 @@ async function abortRun(run: QueueRun, surfaces: Surface[], deps: QueueDeps): Pr
     // close — same handshake as the normal close (§10), but done in one shot for an abort.
     const steps = closeSequencePlan(a, run.template);
     for (const step of steps) {
-      if (step.kind !== "sendKey") continue;
       try {
-        await sendKey(deps, uuid, step.key);
+        if (step.kind === "sendText") await sendText(deps, uuid, step.text);
+        else if (step.kind === "sendKey") await sendKey(deps, uuid, step.key);
       } catch (err) {
-        errlog(`abort ${a.key} (sendKey): ${msg(err)}`);
+        errlog(`abort ${a.key} (${step.kind}): ${msg(err)}`);
       }
     }
     try {
@@ -421,6 +440,9 @@ async function runOne(
 ): Promise<number> {
   const nowMs = deps.now();
   const t = run.template;
+  // Reset the per-sweep quit-when-empty observation; dispatchCandidates sets it true
+  // only if it fetches a SUCCESSFUL EMPTY list this sweep.
+  run.sawEmptyListThisSweep = false;
 
   // --- 1) RECONCILE (always first; §9) --------------------------------------------
   // Project the live surfaces carrying THIS run's annotation into LiveSurface views.
@@ -687,11 +709,13 @@ async function runCloseSequences(
     if (progress === undefined || !progress.exitKeysSent) {
       const steps = closeSequencePlan(a, run.template);
       for (const step of steps) {
-        if (step.kind !== "sendKey") continue;
         try {
-          await sendKey(deps, uuid, step.key); // template exit.keys entry, verbatim
+          // The exit prelude: a typed command (sendText, e.g. "/quit") and/or control
+          // keys (sendKey, e.g. "ctrl-d"/"enter"), per the template's agent.exit (§10).
+          if (step.kind === "sendText") await sendText(deps, uuid, step.text);
+          else if (step.kind === "sendKey") await sendKey(deps, uuid, step.key);
         } catch (err) {
-          errlog(`close ${a.key} (sendKey): ${msg(err)}`);
+          errlog(`close ${a.key} (${step.kind}): ${msg(err)}`);
         }
       }
       progress = { exitKeysSent: true, sinceMs: deps.now() };
@@ -758,10 +782,14 @@ async function dispatchCandidates(
   const maxItemsRemaining = Math.max(0, t.maxItems - run.lifetimeDispatched);
   if (slots <= 0 || maxItemsRemaining <= 0) return 0;
 
-  // Fetch the provider list (skip the tick on any failure — never throws).
+  // Fetch the provider list (skip the tick on any failure — never throws). Use the
+  // ok-distinguishing variant so quit-when-empty can tell a SUCCESSFUL empty list from a
+  // failed/skip one (§8a): only a clean, parsed, empty list arms the quit.
   let items: WorkItem[];
   try {
-    items = await fetchList(t.provider.list, deps.exec, { cwd: t.workdir });
+    const res = await fetchListResult(t.provider.list, deps.exec, { cwd: t.workdir });
+    items = res.items;
+    run.sawEmptyListThisSweep = res.ok && res.items.length === 0;
   } catch (err) {
     errlog(`run "${t.name}": list provider failed: ${msg(err)}`);
     return 0;
@@ -976,6 +1004,14 @@ async function signal(deps: QueueDeps, uuid: string, reason: string): Promise<vo
  *  (closeOne) and the close still proceeds to force-close (§10). */
 async function sendKey(deps: QueueDeps, uuid: string, key: string): Promise<void> {
   await deps.client.sendKey(uuid, key);
+}
+
+/** Type a literal exit COMMAND via the MCP `send_text` tool (for agents that exit via a
+ *  typed command, e.g. Claude Code's `/quit`). Types only — a subsequent `sendKey("enter")`
+ *  from the close plan submits it. Best-effort like `sendKey`; a failure is logged by the
+ *  caller and the close still proceeds to force-close (§10). */
+async function sendText(deps: QueueDeps, uuid: string, text: string): Promise<void> {
+  await deps.client.sendText(uuid, text);
 }
 
 function msg(err: unknown): string {

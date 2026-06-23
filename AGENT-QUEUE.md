@@ -79,11 +79,19 @@ shell the engine just runs.
     // Item fields arrive as ENV VARS — never spliced into the shell (injection-safe):
     //   GHOSTTY_ITEM_KEY  GHOSTTY_ITEM_TITLE  GHOSTTY_ITEM_URL  GHOSTTY_ITEM_META_*
     "command": "claude \"Work on $GHOSTTY_ITEM_KEY: $GHOSTTY_ITEM_TITLE ($GHOSTTY_ITEM_URL)\"",
-    "exit": { "keys": ["ctrl_d"] }           // make the agent's child exit before close (default Ctrl-D)
+    // How to make the agent EXIT before the split is closed (so the close doesn't hit
+    // the confirm dialog, §10). Choose ONE form:
+    //   "exit": { "keys": ["ctrl-d"] }      // control key(s) — DEFAULT is ["ctrl-d"]
+    //   "exit": { "text": "/quit" }         // a TYPED command (e.g. Claude Code's /quit,
+    //                                       // which swallows Ctrl-D); typed + Enter
+    //   "exit": { "text": "/quit", "submit": false }  // type without pressing Enter
+    "exit": { "keys": ["ctrl-d"] }
   },
   "concurrency": 3,                          // max simultaneous agents (clamped to the grid)
   "maxItems": 200,                           // hard ceiling on total lifetime dispatches
   "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // auto-layout; fill columns before rows
+  "quitWhenEmpty": false,                    // true => the run quits when the queue drains
+                                             //   AND no agents are left (even before maxItems)
   "intervals": { "listMs": 45000, "statusMs": 20000 },
   "provider": {
     // LIST: print the actionable items as a JSON array. Expected to ALREADY exclude

@@ -38,6 +38,7 @@ export const TEMPLATE_DEFAULTS = {
   onAgentExit: "leave-and-bell" as OnAgentExit,
   closeOnComplete: true,
   closeStableSeconds: 5,
+  quitWhenEmpty: false,
 };
 
 /** The outcome of validation: a typed template, or a list of human-readable errors. */
@@ -89,6 +90,10 @@ export function validateTemplate(obj: unknown): ValidateResult {
     rec.closeOnComplete,
     TEMPLATE_DEFAULTS.closeOnComplete,
   );
+  const quitWhenEmpty = boolOrDefault(
+    rec.quitWhenEmpty,
+    TEMPLATE_DEFAULTS.quitWhenEmpty,
+  );
 
   if (
     errors.length > 0 ||
@@ -115,6 +120,7 @@ export function validateTemplate(obj: unknown): ValidateResult {
     onAgentExit,
     closeOnComplete,
     closeStableSeconds,
+    quitWhenEmpty,
   };
   return { ok: true, template, errors: [] };
 }
@@ -238,14 +244,39 @@ function validateAgent(v: unknown, errors: string[]): AgentSpec | undefined {
   if (rec.exit !== undefined) {
     const exit = rec.exit;
     if (exit === null || typeof exit !== "object" || Array.isArray(exit)) {
-      errors.push("agent.exit must be an object with a `keys` array");
+      errors.push("agent.exit must be an object with `text` and/or a `keys` array");
     } else {
-      const keys = (exit as Record<string, unknown>).keys;
-      if (!isStringArray(keys) || keys.length === 0) {
-        errors.push("agent.exit.keys must be a non-empty array of strings");
-      } else {
-        agent.exit = { keys };
+      const e = exit as Record<string, unknown>;
+      const spec: { text?: string; submit?: boolean; keys?: string[] } = {};
+      let any = false;
+      if (e.text !== undefined) {
+        if (typeof e.text !== "string" || e.text.length === 0) {
+          errors.push("agent.exit.text must be a non-empty string");
+        } else {
+          spec.text = e.text;
+          any = true;
+        }
       }
+      if (e.submit !== undefined) {
+        if (typeof e.submit !== "boolean") {
+          errors.push("agent.exit.submit must be a boolean");
+        } else {
+          spec.submit = e.submit;
+        }
+      }
+      if (e.keys !== undefined) {
+        if (!isStringArray(e.keys) || e.keys.length === 0) {
+          errors.push("agent.exit.keys must be a non-empty array of strings");
+        } else {
+          spec.keys = e.keys;
+          any = true;
+        }
+      }
+      // Require at least one of text/keys (a bare {} or {submit} is meaningless).
+      if (!any && e.text === undefined && e.keys === undefined) {
+        errors.push("agent.exit must set `text` and/or `keys`");
+      }
+      if (any) agent.exit = spec;
     }
   }
   return agent;

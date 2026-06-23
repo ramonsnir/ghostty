@@ -80,6 +80,9 @@ enum MCPInput {
                                        unshiftedCodepoint: UInt32(UnicodeScalar("c").value))]
         case "ctrl-u": return [KeySpec(keycode: 32, mods: GHOSTTY_MODS_CTRL,
                                        unshiftedCodepoint: UInt32(UnicodeScalar("u").value))]
+        // ctrl-d = shell EOF; the Agent Queue's default exit key (§10). keycode 2 = 'd'.
+        case "ctrl-d": return [KeySpec(keycode: 2, mods: GHOSTTY_MODS_CTRL,
+                                       unshiftedCodepoint: UInt32(UnicodeScalar("d").value))]
         case "up": return [KeySpec(keycode: 126)]
         case "down": return [KeySpec(keycode: 125)]
         case "left": return [KeySpec(keycode: 123)]

@@ -83,6 +83,9 @@ struct MCPServerTests {
             keycode: 8, mods: GHOSTTY_MODS_CTRL, unshiftedCodepoint: UInt32(UnicodeScalar("c").value))])
         #expect(MCPInput.keySpecs(forKey: "ctrl-u") == [MCPInput.KeySpec(
             keycode: 32, mods: GHOSTTY_MODS_CTRL, unshiftedCodepoint: UInt32(UnicodeScalar("u").value))])
+        // ctrl-d: the Agent Queue's default exit key (§10) — must resolve (keycode 2 = 'd').
+        #expect(MCPInput.keySpecs(forKey: "ctrl-d") == [MCPInput.KeySpec(
+            keycode: 2, mods: GHOSTTY_MODS_CTRL, unshiftedCodepoint: UInt32(UnicodeScalar("d").value))])
     }
 
     @Test func keySpecsForKeyYNSpace() {

@@ -714,9 +714,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
     splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are
     left + refilled lowest-slot-first (no re-flow). `concurrency` clamps to `cols×rows`.
+  - **Exit forms + quit-when-empty (template knobs):** `agent.exit` supports a TYPED exit
+    command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
+    `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only
+    recognizes hyphenated names (`ctrl-d`/`ctrl-c`/`enter`/…) — the engine's old `"ctrl_d"`
+    default silently no-op'd (saved only by the force-close timeout) until `ctrl-d` was added to
+    `MCPInput.keySpecs(forKey:)` (keycode 2 + ctrl). Claude Code swallows Ctrl-D, so use
+    `{text:"/quit"}`. `quitWhenEmpty:true` removes the run when a sweep sees a SUCCESSFUL empty
+    `list` AND `active.size===0` (even before `maxItems`); a FAILED list (`fetchListResult` ok:false)
+    is never "empty" (no false quit), and an empty list while agents still run does NOT quit (keeps
+    polling for new/unblocked items). The close sequence is sendText/sendKey-prelude → `awaitExited`
+    (bounded; force-closes anyway on timeout, so a `/quit` that leaves the launching shell alive
+    still tears down) → forceClose.
   - **Close path (§10) — the subtle one:** `close_surface`/`request_close` HONORS
     `confirm-close-surface` and would pop a modal for a live agent. So the supervisor sends the
-    template `agent.exit` keys (→ child exits) then calls **`force_close_surface`**, which
+    template `agent.exit` prelude (→ child exits) then calls **`force_close_surface`**, which
     routes a LAST/ONLY-pane (tree-root) close to the confirm-FREE
     `closeTabImmediately()`/`closeWindowImmediately()` (NOT `closeTab`/`closeWindow`, which
     re-check `needsConfirmQuit`) — `TerminalController.closeSurface` override. `onAgentExit:

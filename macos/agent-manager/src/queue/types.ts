@@ -64,12 +64,20 @@ export interface ProviderSpec {
 }
 
 /** The agent launch spec (§5). `command` is the shell command the split runs (item
- *  fields reach it as GHOSTTY_ITEM_* ENV VARS, never spliced — §13). `exit.keys`
- *  (optional) are the keys to make the agent's child EXIT before close so the close
- *  doesn't hit the confirm dialog (§10); default Ctrl-D. */
+ *  fields reach it as GHOSTTY_ITEM_* ENV VARS, never spliced — §13). `exit` (optional)
+ *  describes how to make the agent EXIT before close so the close doesn't hit the
+ *  confirm dialog (§10):
+ *    - `text`   : a TYPED exit command (e.g. Claude Code's "/quit", which swallows
+ *                 Ctrl-D) — typed via send_text, then submitted with Enter unless
+ *                 `submit:false`.
+ *    - `submit` : whether to press Enter after `text` (default true).
+ *    - `keys`   : control keys to send (e.g. ["ctrl-d"]); names must be ones the MCP
+ *                 send_key tool recognizes ("ctrl-d","enter","esc",…).
+ *  When `exit` is absent the default is a single Ctrl-D ("ctrl-d"). `text` and `keys`
+ *  may be combined (text prelude, then keys). */
 export interface AgentSpec {
   command: string;
-  exit?: { keys: string[] };
+  exit?: { text?: string; submit?: boolean; keys?: string[] };
 }
 
 /** What to do when an agent EXITS early, before provider completion (§6). v1 locks
@@ -97,6 +105,14 @@ export interface QueueTemplate {
   closeOnComplete: boolean;
   /** agentState==idle, unchanged this long, before the close sequence fires (§10). */
   closeStableSeconds: number;
+  /** When true, the RUN quits (removes itself from the registry) as soon as a sweep
+   *  observes a SUCCESSFUL EMPTY `list` AND it has no active assignments — i.e. there
+   *  is nothing left to do, even before `maxItems` is reached. A flaky/failed `list`
+   *  (which is treated as "skip", not "empty") never triggers it, and a momentary
+   *  empty list while agents are still running does NOT quit (active > 0) — the run
+   *  keeps polling for new/unblocked items until BOTH the queue and the fleet are
+   *  empty. Default false (poll forever). */
+  quitWhenEmpty: boolean;
 }
 
 // ---------------------------------------------------------------------------

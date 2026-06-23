@@ -240,6 +240,16 @@ export class McpClient {
   }
 
   /**
+   * (Agent Queue, §10) send_text — TYPE a literal string into a surface (does NOT
+   * submit). Used by the close sequence for agents whose exit is a typed command
+   * (Claude Code's `/quit`); a `sendKey("enter")` follows to submit. Throws McpError on
+   * any failure.
+   */
+  async sendText(id: string, text: string): Promise<void> {
+    await this.call("send_text", { id, text });
+  }
+
+  /**
    * (Agent Queue, §8.2) force_close_surface — close WITHOUT the confirm-close prompt
    * (§10). The supervisor calls this only AFTER the agent's child has exited, so the
    * confirm-bypass close doesn't pop a modal. Throws McpError on any failure.

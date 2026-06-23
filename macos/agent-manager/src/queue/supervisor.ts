@@ -291,9 +291,15 @@ export function foldIdleAnchor(
 /** One step of the close sequence (§10). The loop executes them in order, awaiting
  *  the `awaitExited` step (bounded) before the `forceClose`. */
 export type CloseStep =
+  /** TYPE a literal string into the agent to make it exit — for agents whose exit is a
+   *  typed COMMAND, not a control key (e.g. Claude Code's `/quit`, which swallows
+   *  Ctrl-D). Routed through the MCP send_text tool (types only, does not submit), so a
+   *  submitting `sendKey "enter"` normally follows. */
+  | { kind: "sendText"; text: string }
   /** Send a key to make the agent's CHILD exit (default Ctrl-D), so the subsequent
    *  close does not hit the confirm-close dialog. `key` is a template `exit.keys`
-   *  entry (e.g. "ctrl_d"), passed through to the MCP send_key tool verbatim. */
+   *  entry (e.g. "ctrl-d", "enter"), passed through to the MCP send_key tool verbatim
+   *  (must be a name the tool recognizes — see MCPInput.keySpecs(forKey:)). */
   | { kind: "sendKey"; key: string }
   /** Poll `list_surfaces` until the surface's `exited === true` (bounded; on timeout
    *  the loop proceeds to forceClose anyway — §10). */
@@ -302,30 +308,40 @@ export type CloseStep =
   | { kind: "forceClose" };
 
 /** The default exit keys when a template's `agent.exit` is absent (§5/§10): Ctrl-D
- *  at the shell prompt. */
-export const DEFAULT_EXIT_KEYS = ["ctrl_d"];
+ *  at the shell prompt. NOTE the HYPHEN form — it must match a key name the MCP
+ *  send_key tool recognizes (MCPInput.keySpecs(forKey:) uses "ctrl-d"/"ctrl-c"/…). */
+export const DEFAULT_EXIT_KEYS = ["ctrl-d"];
 
 /**
  * Plan the close sequence for a DONE_PENDING+stably-idle assignment (§10). PURE +
- * deterministic. Emits: one `sendKey` per template `agent.exit.keys` (default
- * `["ctrl_d"]` when absent/empty) → one `awaitExited` → one `forceClose`. The loop
- * executes them in order: type the exit key(s), wait (bounded) for the child to
- * exit, then confirm-bypass close. After a successful close the loop frees the key +
- * grid slot and starts the key's COOLDOWN.
- *
- * `assignment` is accepted for symmetry / future per-assignment exit overrides and
- * to keep the planner's signature honest about what it closes; the plan today is
- * derived purely from the template's exit keys.
+ * deterministic. The exit prelude is derived from the template's `agent.exit`:
+ *   - `{ text }`  → `sendText(text)` then (unless `submit:false`) `sendKey "enter"` —
+ *     for agents that exit via a TYPED command (Claude Code's `/quit`).
+ *   - `{ keys }`  → one `sendKey` per key (verbatim).
+ *   - both        → the text prelude THEN the keys.
+ *   - absent      → the default `["ctrl-d"]` shell-EOF.
+ * Then one `awaitExited` (bounded) → one `forceClose`. The loop executes in order:
+ * make the child exit, wait (bounded) for `exited`, then confirm-bypass close; on a
+ * successful close it frees the key + grid slot and starts the key's COOLDOWN. (On the
+ * `awaitExited` timeout the loop force-closes anyway — so an agent like Claude Code
+ * whose `/quit` leaves the launching shell alive still tears down.)
  */
 export function closeSequencePlan(
   _assignment: Assignment,
   template: QueueTemplate,
 ): CloseStep[] {
-  const keys =
-    template.agent.exit && template.agent.exit.keys.length > 0
-      ? template.agent.exit.keys
-      : DEFAULT_EXIT_KEYS;
+  const ex = template.agent.exit;
   const steps: CloseStep[] = [];
+  if (ex?.text !== undefined && ex.text.length > 0) {
+    steps.push({ kind: "sendText", text: ex.text });
+    if (ex.submit !== false) steps.push({ kind: "sendKey", key: "enter" });
+  }
+  const keys =
+    ex?.keys && ex.keys.length > 0
+      ? ex.keys
+      : ex?.text
+        ? [] // a text-only exit: no implicit Ctrl-D
+        : DEFAULT_EXIT_KEYS;
   for (const key of keys) steps.push({ kind: "sendKey", key });
   steps.push({ kind: "awaitExited" });
   steps.push({ kind: "forceClose" });

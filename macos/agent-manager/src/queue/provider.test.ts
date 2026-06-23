@@ -12,6 +12,7 @@ import {
   buildItemEnv,
   clampEnvValue,
   fetchList,
+  fetchListResult,
   parseListOutput,
   parseStatusOutput,
   probeStatus,
@@ -360,4 +361,30 @@ test("fetchList: a flaky list (non-zero exit) => [] (skip the tick)", async () =
   const spec: ProviderListSpec = { command: ["list"], keyField: "k" };
   const { exec } = fakeExec({ code: 1, stdout: "", stderr: "boom" });
   assert.deepEqual(await fetchList(spec, exec), []);
+});
+
+// fetchListResult — distinguishes a SUCCESSFUL empty list from a FAILED/skip one (the
+// quit-when-empty signal, §8a). A failed list must NEVER read as "empty".
+test("fetchListResult: a clean empty list => {ok:true, items:[]} (arms quit-when-empty)", async () => {
+  const spec: ProviderListSpec = { command: ["list"], keyField: "k" };
+  const { exec } = fakeExec({ code: 0, stdout: "[]", stderr: "" });
+  assert.deepEqual(await fetchListResult(spec, exec), { ok: true, items: [] });
+});
+
+test("fetchListResult: a non-zero exit => {ok:false, items:[]} (NOT empty — never quits)", async () => {
+  const spec: ProviderListSpec = { command: ["list"], keyField: "k" };
+  const { exec } = fakeExec({ code: 1, stdout: "", stderr: "boom" });
+  assert.deepEqual(await fetchListResult(spec, exec), { ok: false, items: [] });
+});
+
+test("fetchListResult: a spawn error => {ok:false, items:[]}", async () => {
+  const spec: ProviderListSpec = { command: ["list"], keyField: "k" };
+  const { exec } = fakeExec(new Error("spawn ENOENT"));
+  assert.deepEqual(await fetchListResult(spec, exec), { ok: false, items: [] });
+});
+
+test("fetchListResult: success parses items with ok:true", async () => {
+  const spec: ProviderListSpec = { command: ["list"], keyField: "identifier" };
+  const { exec } = fakeExec({ code: 0, stdout: JSON.stringify([{ identifier: "A-1" }]), stderr: "" });
+  assert.deepEqual(await fetchListResult(spec, exec), { ok: true, items: [{ key: "A-1" }] });
 });
