@@ -111,6 +111,30 @@ struct SuggestionStyleTests {
         #expect(AgentPreviewTile.suggestionStyle(confidence: -0.4).dimmed == true)
         #expect(AgentPreviewTile.suggestionStyle(confidence: 1.8).dimmed == false)
     }
+
+    // MARK: - shouldShowSuggestion (pure; SUPPRESS floor)
+
+    @Test func suppressesBelowFloor() {
+        // The reported bug: a 25% suggestion must NOT render (it's below the 0.35 floor).
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.25) == false)
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.0) == false)
+        #expect(
+            AgentPreviewTile.shouldShowSuggestion(
+                confidence: AgentPreviewTile.CONF_SUPPRESS_THRESHOLD - 0.01) == false)
+    }
+
+    @Test func showsAtOrAboveFloor() {
+        #expect(
+            AgentPreviewTile.shouldShowSuggestion(
+                confidence: AgentPreviewTile.CONF_SUPPRESS_THRESHOLD) == true)
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.4) == true) // dimmed but shown
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9) == true)
+    }
+
+    @Test func nilConfidenceIsShown() {
+        // A legacy / un-rated annotation (nil) is treated as mid (0.5) → shown, never hidden.
+        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: nil) == true)
+    }
 }
 
 // MARK: - matchAgent pure logic

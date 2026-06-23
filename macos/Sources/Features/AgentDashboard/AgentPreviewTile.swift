@@ -69,6 +69,22 @@ struct AgentPreviewTile: View {
     /// mid (0.5) — i.e. NOT dimmed (see `suggestionStyle`).
     static let CONF_DIM_THRESHOLD: Double = 0.5
 
+    /// (ramon fork / Agent Manager) SUPPRESS floor — a suggestion whose confidence is
+    /// strictly BELOW this is NOT rendered at all (the tile shows only the summary), so
+    /// a low-value reply is hidden rather than dimmed. Belt-and-suspenders with the
+    /// sidecar's own `suppressBelow` gate (default 0.35, same value) — the sidecar
+    /// declines to WRITE sub-floor suggestions, and this also hides any already-stored
+    /// one (e.g. a stale annotation written before the sidecar gate, or one left over
+    /// from a moment the context scored higher). A `nil` confidence is treated as mid
+    /// (0.5) → shown (an un-rated/legacy annotation is never hidden).
+    static let CONF_SUPPRESS_THRESHOLD: Double = 0.35
+
+    /// Whether a suggestion with this (optional) confidence should be SHOWN at all.
+    /// PURE + unit-tested. `nil` ⇒ shown (treated as mid 0.5).
+    static func shouldShowSuggestion(confidence: Double?) -> Bool {
+        (confidence ?? 0.5) >= CONF_SUPPRESS_THRESHOLD
+    }
+
     /// PURE style for a suggestion given its (optional) confidence. Factored out for
     /// unit testing (the view can't render headless). A `nil` confidence defaults to
     /// mid (0.5) so an un-rated suggestion is shown full-strength; a value strictly
@@ -315,7 +331,8 @@ struct AgentPreviewTile: View {
     /// `suggestionStyle` / `CONF_DIM_THRESHOLD`).
     @ViewBuilder
     private var suggestionRow: some View {
-        if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty {
+        if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty,
+           Self.shouldShowSuggestion(confidence: entry.annotation?.confidence) {
             let style = Self.suggestionStyle(confidence: entry.annotation?.confidence)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
