@@ -561,6 +561,15 @@ struct AgentMirrorPreview: View {
 
     @StateObject private var surfaceView: Ghostty.SurfaceView
 
+    /// Number of trailing blank rows in the host viewport, polled from the real
+    /// surface so the bottom-anchored thumbnail can rise to the last row with
+    /// content (a fresh agent chat / a TUI that hasn't reached the bottom would
+    /// otherwise waste the preview on empty rows). Live frames render off the
+    /// Metal path, not SwiftUI, so this is refreshed on a light timer rather
+    /// than from `@Published` changes.
+    @State private var trailingBlankRows: Int = 0
+    private let blankPoll = Timer.publish(every: 0.7, on: .main, in: .common).autoconnect()
+
     init(ghostty: Ghostty.App, sessionID: UInt64, realSurface: Ghostty.SurfaceView) {
         self.ghostty = ghostty
         self.sessionID = sessionID
@@ -580,13 +589,21 @@ struct AgentMirrorPreview: View {
             // from the mirror (font metrics, stable), falling back to the real
             // surface's cell.
             let host = realSurface.surfaceSize
+            let rows = Int(host?.rows ?? 0)
+            let cellH = CGFloat(surfaceView.surfaceSize?.cell_height_px ?? host?.cell_height_px ?? 0)
             let g = AgentMirrorPreview.geometry(
                 cols: Int(host?.columns ?? 0),
-                rows: Int(host?.rows ?? 0),
+                rows: rows,
                 cellW: CGFloat(surfaceView.surfaceSize?.cell_width_px ?? host?.cell_width_px ?? 0),
-                cellH: CGFloat(surfaceView.surfaceSize?.cell_height_px ?? host?.cell_height_px ?? 0),
+                cellH: cellH,
                 backing: backing,
                 container: geo.size)
+            // Skip empty trailing rows: shift the bottom-anchored mirror down so
+            // the last row with content lands at the bottom of the preview (the
+            // blank rows fall below the clip). 0 for a full screen → unchanged.
+            let anchorOffset = AgentMirrorPreview.bottomAnchorOffset(
+                trailingBlankRows: trailingBlankRows, rows: rows,
+                cellH: cellH, backing: backing, scale: g.scale)
 
             // Horizontal scroll for splits wider than `referenceColumns`; narrow
             // splits show left-aligned with empty space on the right. The mirror
@@ -603,6 +620,10 @@ struct AgentMirrorPreview: View {
                     .allowsHitTesting(false)
                     .frame(width: g.naturalW, height: g.naturalH)
                     .scaleEffect(g.scale, anchor: .bottomLeading)
+                    // Shift down by the trailing-blank-rows height so the last
+                    // row with content sits at the bottom (the blanks fall below
+                    // the clip). Render-only — does not affect layout/measurement.
+                    .offset(y: anchorOffset)
                     // Bound the scaled content to its on-screen size so the
                     // ScrollView measures `scaledW` (not the larger unscaled
                     // layout) and clips the top overflow to the preview height.
@@ -617,6 +638,11 @@ struct AgentMirrorPreview: View {
                         if let surface = surfaceView.surface {
                             ghostty_surface_set_focus(surface, false)
                         }
+                        trailingBlankRows = realSurface.trailingBlankRows()
+                    }
+                    .onReceive(blankPoll) { _ in
+                        let n = realSurface.trailingBlankRows()
+                        if n != trailingBlankRows { trailingBlankRows = n }
                     }
             }
             .frame(width: geo.size.width, height: geo.size.height)
@@ -671,5 +697,25 @@ struct AgentMirrorPreview: View {
         return PreviewGeometry(
             naturalW: naturalW, naturalH: naturalH, scale: scale,
             scaledW: naturalW * scale, scaledH: naturalH * scale)
+    }
+
+    /// PURE: the vertical offset (points, DOWNWARD) to shift the bottom-anchored
+    /// scaled mirror so the LAST row with content sits at the bottom of the
+    /// preview, dropping `trailingBlankRows` empty rows below the clip. Factored
+    /// out for unit testing.
+    ///
+    /// Returns 0 when there are no trailing blanks (a full screen) → identical
+    /// to a plain bottom-anchor. Clamped to `rows - 1` so at least one row stays
+    /// anchored, i.e. an all-blank screen shows a single blank row instead of
+    /// scrolling the (empty) grid fully out of view. The per-row scaled height
+    /// matches `geometry`'s: `(cellH / backing) * scale`.
+    static func bottomAnchorOffset(
+        trailingBlankRows: Int, rows: Int, cellH: CGFloat, backing: CGFloat, scale: CGFloat
+    ) -> CGFloat {
+        guard trailingBlankRows > 0, rows > 1, cellH > 0, scale > 0 else { return 0 }
+        let bk = backing > 0 ? backing : 2.0
+        let clamped = min(trailingBlankRows, rows - 1)
+        let scaledRowH = (cellH / bk) * scale
+        return CGFloat(clamped) * scaledRowH
     }
 }

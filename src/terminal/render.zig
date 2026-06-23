@@ -993,6 +993,32 @@ pub const RenderState = struct {
         }
     }
 
+    /// Returns the number of trailing blank rows in the viewport mirror: rows
+    /// at the bottom (highest y) whose cells contain no text, capped at the
+    /// total row count. A row is "blank" by the same `Cell.hasTextAny` rule
+    /// used elsewhere in the terminal (a cell whose codepoint is 0; styling- /
+    /// background-color-only cells do NOT count as text), which is the safe
+    /// direction here: a row of spaces is treated as content, so we never skip
+    /// past a row that has visible characters.
+    ///
+    /// Used by the macOS Agent Dashboard preview (ramon fork): the thumbnail is
+    /// bottom-anchored, so a partially-filled screen (a fresh agent chat, a TUI
+    /// that hasn't reached the bottom) would otherwise waste the preview on
+    /// empty trailing rows. The caller shifts the anchor up by this many rows so
+    /// the last row with content sits at the bottom of the preview.
+    pub fn trailingBlankRows(self: *const RenderState) size.CellCountInt {
+        const row_slice = self.row_data.slice();
+        const row_cells = row_slice.items(.cells);
+        var count: size.CellCountInt = 0;
+        var i: usize = row_cells.len;
+        while (i > 0) : (i -= 1) {
+            const raws = row_cells[i - 1].slice().items(.raw);
+            if (page.Cell.hasTextAny(raws)) break;
+            count += 1;
+        }
+        return count;
+    }
+
     /// A set of coordinates representing cells.
     pub const CellSet = std.AutoArrayHashMapUnmanaged(point.Coordinate, void);
 
@@ -1647,6 +1673,68 @@ test "dumpText trims trailing blanks and never emits NUL" {
 
     // Trailing blanks trimmed; blank row collapses to just a newline; no NUL.
     try testing.expectEqualStrings("AB\n\n", result);
+}
+
+test "trailingBlankRows counts empty rows at the bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 5,
+        .rows = 4,
+    });
+    defer t.deinit(alloc);
+
+    // Content only on the first row; rows 1..3 are blank.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("AB");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // 3 trailing blank rows (the cursor row has content).
+    try testing.expectEqual(@as(size.CellCountInt, 3), state.trailingBlankRows());
+}
+
+test "trailingBlankRows is 0 when the bottom row has content" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 4,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    // Fill down to the last row so there are no trailing blanks.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("A\r\nB\r\nC");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.trailingBlankRows());
+}
+
+test "trailingBlankRows counts all rows when the screen is empty" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 4,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(@as(size.CellCountInt, 3), state.trailingBlankRows());
 }
 
 test "dumpText preserves interior spaces" {
