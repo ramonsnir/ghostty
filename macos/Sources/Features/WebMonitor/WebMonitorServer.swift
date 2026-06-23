@@ -2084,10 +2084,12 @@ final class WebMonitorServer {
       var listLoaded = false;
       // Enable/disable the agent filters depending on whether the Agent Dashboard
       // is running. When it isn't, the checkboxes are disabled (their persisted
-      // checked state is kept, just not applied) and a note explains why.
+      // checked state is kept, just not applied) and a note explains why. "Hide
+      // hidden" only layers on top of "Agents only" (hiding is an agent concept),
+      // so it's also disabled — and not applied — whenever "Agents only" is off.
       function applyFilterAvailability(dashboard) {
         fAgents.disabled = !dashboard;
-        fVisible.disabled = !dashboard;
+        fVisible.disabled = !dashboard || !fAgents.checked;
         if (dashboard) {
           filterBar.classList.remove("disabled");
           filterNote.textContent = "";
@@ -2115,8 +2117,10 @@ final class WebMonitorServer {
           applyFilterAvailability(dashboard);
           // Filters only apply when the dashboard is running (its agent/hidden
           // signal would be meaningless otherwise — never silently hide rows).
+          // "Hide hidden" only applies on top of "Agents only": with agents-only
+          // off, hidden splits are SHOWN (the checkbox is disabled too).
           var agentsOnly = dashboard && fAgents.checked;
-          var hideHidden = dashboard && fVisible.checked;
+          var hideHidden = agentsOnly && fVisible.checked;
           var rows = allRows.filter(function (row) {
             if (agentsOnly && !row.isAgent) return false;
             if (hideHidden && row.hidden) return false;

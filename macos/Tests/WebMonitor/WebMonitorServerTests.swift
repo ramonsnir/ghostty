@@ -1013,6 +1013,11 @@ struct WebMonitorServerTests {
         #expect(page.contains("ghostty_filter_visible"))
         #expect(page.contains("row.isAgent"))
         #expect(page.contains("row.hidden"))
+        // "Hide hidden" only layers on "Agents only": it's disabled when agents-only
+        // is off, and the hide filter is gated behind agentsOnly (so hidden splits
+        // are shown when agents-only is off).
+        #expect(page.contains("fVisible.disabled = !dashboard || !fAgents.checked"))
+        #expect(page.contains("var hideHidden = agentsOnly && fVisible.checked"))
     }
 
     @Test func htmlPageControlsAreCompact() {
