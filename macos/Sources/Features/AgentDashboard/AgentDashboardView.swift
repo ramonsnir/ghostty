@@ -87,6 +87,10 @@ struct AgentDashboardView: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            // Plain `List` still reserves a ~5–10pt horizontal scroll-content
+            // margin that `listRowInsets` can't reach; zero it so the tiles are
+            // truly edge-to-edge (the user's "full-width rows" ask).
+            .contentMargins(.horizontal, 0, for: .scrollContent)
             .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
         }
     }
