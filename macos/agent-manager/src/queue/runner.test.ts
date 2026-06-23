@@ -26,7 +26,7 @@ import {
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
 import { loadStore, type StoreIO } from "./store.js";
-import type { Exec, ExecResult } from "./provider.js";
+import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -326,7 +326,13 @@ test("runQueueSweep: first sweep is dispatch-suppressed; second sweep dispatches
   await runQueueSweep(deps);
   assert.equal(fake.calls.spawn.length, 1, "second sweep dispatches");
   assert.equal(fake.calls.spawn[0].firstTab, true, "first item opens the run tab");
-  assert.equal(fake.calls.spawn[0].command, "claude work");
+  // The command is the item-env PREFIX (delivered via the command since the host spawn
+  // protocol drops env_vars under .client) + the verbatim template launch line.
+  assert.equal(
+    fake.calls.spawn[0].command,
+    shellEnvPrefix({ key: "K-1", title: "do a thing", url: "http://x/K-1" }) + "claude work",
+  );
+  assert.ok((fake.calls.spawn[0].command as string).endsWith("claude work"), "template appended verbatim");
   // §13 / acceptance #3: item context reaches the agent as GHOSTTY_ITEM_* ENV VARS
   // carried on the spawn call — NOT spliced into the command string.
   const env = fake.calls.spawn[0].env as Record<string, string> | undefined;
@@ -879,12 +885,15 @@ test("runQueueSweep: a too-small queue budget bounds the dispatch batch within a
 });
 
 // ---------------------------------------------------------------------------
-// (7) §13 INJECTION: a hostile item title is delivered VERBATIM as env DATA on the
-//     spawn — the command string is byte-identical to the template (no splice).
+// (7) §13 INJECTION: a hostile item title rides the command ONLY inside a single-quoted
+//     env-assignment prefix (so it can't break out), with the template appended VERBATIM;
+//     it ALSO rides the env field. A `'`-containing title is the breakout attempt.
 // ---------------------------------------------------------------------------
 
-test("runQueueSweep: a hostile item title is NEVER spliced into the command — rides only in env", async () => {
-  const hostileTitle = '"; rm -rf ~; echo "';
+test("runQueueSweep: a hostile item title is single-quote-escaped in the command prefix (no injection) + appended template is verbatim", async () => {
+  // A single-quote breakout attempt — the worst case for the single-quoted prefix.
+  const hostileTitle = "'; rm -rf ~; echo '";
+  const item = { key: "K-1", title: hostileTitle, url: "http://x/K-1" };
   const fake = makeQueueFake({
     surfaces: [],
     listJson: JSON.stringify([{ id: "K-1", title: hostileTitle, url: "http://x/K-1" }]),
@@ -899,22 +908,19 @@ test("runQueueSweep: a hostile item title is NEVER spliced into the command — 
   await runQueueSweep(deps); // dispatch
 
   assert.equal(fake.calls.spawn.length, 1);
-  // (a) The command is BYTE-IDENTICAL to the template's launch line — no substitution.
-  assert.equal(
-    fake.calls.spawn[0].command,
-    "claude work",
-    "command is the verbatim template string (no field splice)",
-  );
-  // (b) The hostile title rides ONLY in env, verbatim — inert as an env VALUE.
+  const command = fake.calls.spawn[0].command as string;
+  // (a) The command is EXACTLY the safe prefix + the verbatim template (no naive splice).
+  assert.equal(command, shellEnvPrefix(item) + "claude work");
+  // (b) The template launch line is appended UNALTERED.
+  assert.ok(command.endsWith("claude work"), "template appended verbatim");
+  // (c) The hostile bytes appear ONLY inside a single-quoted literal — the breakout `'`
+  //     is escaped as '\'' so the shell can't terminate the quote and run `rm`.
+  assert.ok(command.includes("GHOSTTY_ITEM_TITLE='"), "title is inside a single-quoted assignment");
+  assert.ok(command.includes("'\\''"), "the embedded single quote is escaped");
+  // (d) The title still rides the env field too (for the .exec backend), verbatim.
   const env = fake.calls.spawn[0].env as Record<string, string>;
   assert.equal(env.GHOSTTY_ITEM_TITLE, hostileTitle, "title delivered verbatim as env data");
   assert.equal(env.GHOSTTY_ITEM_KEY, "K-1");
-  // The command string contains NONE of the hostile bytes.
-  assert.equal(
-    (fake.calls.spawn[0].command as string).includes("rm -rf"),
-    false,
-    "no item bytes leaked into the command string",
-  );
 });
 
 // ---------------------------------------------------------------------------

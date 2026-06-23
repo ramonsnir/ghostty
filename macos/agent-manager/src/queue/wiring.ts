@@ -182,7 +182,16 @@ export function loadTemplateByName(
 ): LoadResult {
   const path = join(templatesDir, `${basename}.json`);
   const loader = makeTemplateLoader(path, realTemplateFs);
-  return loader.load();
+  const res = loader.load();
+  // Expand a leading `~` in the template's workdir to an ABSOLUTE path HERE (once, at
+  // load), so every downstream use is absolute: the provider commands' cwd (realExec)
+  // AND the spawned agent split's cwd (passed to spawn_split_command). The macOS
+  // SurfaceConfiguration.workingDirectory does NOT expand `~` (it only normalizes
+  // separators), so an unexpanded `~/foo` is dropped and the split inherits the parent's
+  // cwd — the agent then runs in the WRONG directory. The validator stays pure (no
+  // homedir lookup); this impure seam owns the expansion.
+  if (res.ok) res.template.workdir = expandHome(res.template.workdir);
+  return res;
 }
 
 /**

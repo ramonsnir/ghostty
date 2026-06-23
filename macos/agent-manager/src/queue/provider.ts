@@ -94,6 +94,31 @@ export function clampEnvValue(value: string): string {
   return value.length > MAX_ENV_VALUE_LEN ? value.slice(0, MAX_ENV_VALUE_LEN) : value;
 }
 
+/** Wrap a string as a POSIX single-quoted shell literal, safe for ANY content (the only
+ *  escape needed inside single quotes is `'` itself → `'\''`). PURE. So a hostile value
+ *  with spaces/`$`/backticks/`;`/quotes can never break out of the assignment. */
+export function shellSingleQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+/** Build a shell ENV-ASSIGNMENT PREFIX for the agent launch command from the item's
+ *  GHOSTTY_ITEM_* map, e.g. `GHOSTTY_ITEM_KEY='EX-1' GHOSTTY_ITEM_TITLE='do x' ` (one
+ *  trailing space). PURE.
+ *
+ *  WHY a command prefix and not the spawn `env` field: under the fork's pty-host
+ *  (`.client`) backend the host's spawn protocol forwards `working_directory` +
+ *  `initial_input` but NOT env vars, so a `SurfaceConfiguration.environmentVariables`
+ *  set on the spawn is silently DROPPED — the agent would launch with no item context.
+ *  The command (initial_input) IS forwarded, so the item context rides the command as
+ *  inline env assignments, single-quoted so a hostile title can't inject. The assignments
+ *  apply to the launched command (`KEY='v' … <command>`), so `exec launcher.sh` (or any
+ *  command) sees them in its environment. Empty (no item fields) ⇒ "" (no prefix). */
+export function shellEnvPrefix(item: WorkItem): string {
+  const env = buildItemEnv(item);
+  const parts = Object.entries(env).map(([k, v]) => `${k}=${shellSingleQuote(v)}`);
+  return parts.length > 0 ? parts.join(" ") + " " : "";
+}
+
 /** Sanitize an arbitrary meta key into a valid env-var name suffix. PURE. */
 export function sanitizeEnvSuffix(key: string): string {
   let s = key.toUpperCase().replace(/[^A-Z0-9_]/g, "_");

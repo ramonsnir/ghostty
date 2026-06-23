@@ -33,6 +33,7 @@ import {
 } from "./commands.js";
 import {
   buildItemEnv,
+  shellEnvPrefix,
   fetchListResult,
   probeStatus,
   renderArgv,
@@ -887,21 +888,29 @@ async function dispatchOne(
   run.lifetimeDispatched += 1;
   persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched);
 
-  // (d) Spawn the split, DELIVERING item context as ENV VARS (§13, the #1 requirement).
-  // `command` is the template's launch line passed through VERBATIM — item fields are
-  // NEVER spliced into it (that would be shell injection); they ride ONLY in `itemEnv`
-  // (GHOSTTY_ITEM_*) which the Swift handler sets on the new split's
-  // environmentVariables, so a hostile title is inert env DATA the launched shell sees
-  // as `$GHOSTTY_ITEM_TITLE`, not shell text. A non-firstTab split targets the live UUID
-  // occupying the planner's target slot; we omit `targetUUID` entirely (undefined, not
-  // "") when there is no live target so the tool's first-tab fallback applies cleanly.
+  // (d) Spawn the split, DELIVERING item context to the agent (§13, the #1 requirement).
+  // Item fields ride as GHOSTTY_ITEM_* env, NEVER spliced as bare shell text. They are
+  // delivered TWO ways for the two backends:
+  //   - `env` (itemEnv): the SurfaceConfiguration.environmentVariables — honored under
+  //     the `.exec` backend.
+  //   - a single-quoted ENV-ASSIGNMENT PREFIX on `command` (`KEY='v' … <command>`): under
+  //     the fork's pty-host (`.client`) backend the host spawn protocol forwards
+  //     `working_directory`+`initial_input` but NOT env vars, so the `env` field is
+  //     dropped there — the prefix rides the command (which IS forwarded) instead. The
+  //     single-quoting (shellEnvPrefix) keeps a hostile title inert (no injection); the
+  //     template `command` itself is still appended VERBATIM. Belt-and-suspenders: both
+  //     set the same vars, so it works on either backend.
+  // A non-firstTab split targets the live UUID occupying the planner's target slot; we
+  // omit `targetUUID` entirely (undefined, not "") when there is no live target so the
+  // tool's first-tab fallback applies cleanly.
   const itemEnv = buildItemEnv(item);
+  const commandWithItemEnv = shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
   try {
     const targetUUID =
       sp.firstTab === true ? undefined : occupiedUUID(run, sp.targetSlotIndex);
     spawned = await deps.client.spawnSplitCommand({
-      command: t.agent.command,
+      command: commandWithItemEnv,
       cwd: t.workdir,
       env: itemEnv,
       ...(sp.firstTab === true
