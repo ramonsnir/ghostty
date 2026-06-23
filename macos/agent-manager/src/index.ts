@@ -85,8 +85,12 @@ import {
   realExec,
 } from "./queue/wiring.js";
 
-/** Poll interval between list_surfaces sweeps. */
+/** Poll interval between list_surfaces sweeps (summarizer/manager). */
 const POLL_INTERVAL_MS = 5000;
+
+/** Poll interval for the INDEPENDENT Agent Queue supervisor loop (decoupled from the
+ *  slow LLM passes — see `runQueueSweepSafe` / `queueTick`). */
+const QUEUE_POLL_INTERVAL_MS = 5000;
 
 const log = (msg: string): void => console.log(`agent-manager: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: ${msg}`);
@@ -409,20 +413,23 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
   }
 
   await Promise.all(fired);
+  // NOTE: the AGENT QUEUE SUPERVISOR (pass 3) is NOT run here. It is a deterministic,
+  // latency-sensitive loop that must NOT be gated behind the (slow, LLM-bound)
+  // summarizer/manager passes above — with many agents, `Promise.all(fired)` can take
+  // tens of seconds, which would starve the queue's dispatch/track/close cadence. So
+  // the queue runs on its OWN independent timer (`runQueueLoop` in main), decoupled
+  // from this sweep entirely. See `runQueueSweep`.
+}
 
-  // Pass 3: the AGENT QUEUE SUPERVISOR (ramon fork / Agent Queue). Deterministic, NO
-  // LLM in the control path — it reconciles + dispatches + tracks + closes a fleet of
-  // queue agents via the additive MCP tools. A NO-OP when no queue is configured
-  // (`deps.queue` absent or carrying no runs), so the passes above stay unchanged for
-  // a non-queue build. It owns its OWN ConcurrencyBudget inside QueueDeps. Runs AFTER
-  // the summarizer/manager settle (the loop is non-overlapping), and catches its own
-  // errors so a bad provider/run never stops the loop.
-  if (deps.queue !== undefined) {
-    try {
-      await runQueueSweep(deps.queue);
-    } catch (err) {
-      errlog(`queue sweep error: ${err instanceof Error ? err.message : String(err)}`);
-    }
+/** One queue-supervisor sweep, error-isolated (a bad provider/run never stops the loop).
+ *  Driven by its OWN timer in `main` so the deterministic queue is never blocked by the
+ *  slow summarizer/manager passes in `runSweep`. A NO-OP when no queue is configured. */
+export async function runQueueSweepSafe(deps: LoopDeps): Promise<void> {
+  if (deps.queue === undefined) return;
+  try {
+    await runQueueSweep(deps.queue);
+  } catch (err) {
+    errlog(`queue sweep error: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -497,10 +504,12 @@ async function main(): Promise<void> {
 
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
+  let queueTimer: NodeJS.Timeout | undefined;
   const shutdown = (sig: string): void => {
     if (stopped) return;
     stopped = true;
     if (timer) clearTimeout(timer);
+    if (queueTimer) clearTimeout(queueTimer);
     log(`received ${sig}; shutting down`);
     process.exit(0);
   };
@@ -521,7 +530,21 @@ async function main(): Promise<void> {
     }
     if (!stopped) timer = setTimeout(() => void tick(), POLL_INTERVAL_MS);
   };
+
+  // INDEPENDENT queue loop (ramon fork / Agent Queue): the deterministic supervisor
+  // runs on its OWN self-paced timer, NOT inside `tick`/`runSweep`. This decouples the
+  // latency-sensitive queue (dispatch/track/close) from the slow LLM summarizer/manager
+  // passes — with many agents a single `runSweep` can take tens of seconds, which would
+  // otherwise starve the queue. Only armed when a queue is configured. Same
+  // non-overlapping self-pace as `tick`.
+  const queueTick = async (): Promise<void> => {
+    if (stopped) return;
+    await runQueueSweepSafe(deps); // self-isolating; no-op when no queue configured
+    if (!stopped) queueTimer = setTimeout(() => void queueTick(), QUEUE_POLL_INTERVAL_MS);
+  };
+
   await tick();
+  if (deps.queue !== undefined) void queueTick();
 }
 
 // Only start the poll loop when this module is the program ENTRY POINT (i.e.

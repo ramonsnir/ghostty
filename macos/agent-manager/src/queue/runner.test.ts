@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSweep, type LoopDeps } from "../index.js";
+import { runSweep, runQueueSweepSafe, type LoopDeps } from "../index.js";
 import type { McpClient, Surface, SurfaceScreen, Annotation } from "../mcp.js";
 import { DEFAULT_CONFIG, ConcurrencyBudget } from "../summarizer.js";
 import { DEFAULT_MANAGER_CONFIG, MANAGER_MODEL } from "../manager.js";
@@ -254,14 +254,39 @@ function makeLoopDeps(client: McpClient): LoopDeps {
   };
 }
 
-test("runSweep: pass 3 is a NO-OP when no queue is configured", async () => {
+test("runSweep: NEVER touches the queue (the queue runs on its own decoupled loop)", async () => {
+  // The queue supervisor is no longer pass 3 of runSweep — it runs on an INDEPENDENT
+  // timer (runQueueSweepSafe) so the slow LLM passes can never block/starve it. So
+  // runSweep must touch ZERO queue tools, even when a queue is configured.
   const fake = makeQueueFake({ surfaces: [surface({ id: "s1", processName: "zsh" })] });
   const deps = makeLoopDeps(fake.client);
+  deps.queue = makeQueueDeps(fake, [makeQueueRun(tmpl(), memStore())], () => 1_000);
   await runSweep(deps); // must not throw, must not touch any queue tool
-  assert.equal(fake.calls.spawn.length, 0);
+  assert.equal(fake.calls.spawn.length, 0, "runSweep does not dispatch");
   assert.equal(fake.calls.forceClose.length, 0);
   assert.equal(fake.calls.signal.length, 0);
-  assert.equal(fake.calls.list, 0, "no provider list run");
+  assert.equal(fake.calls.list, 0, "runSweep does not run the provider list");
+});
+
+test("runQueueSweepSafe: a no-op (no throw) when no queue is configured", async () => {
+  const fake = makeQueueFake({ surfaces: [] });
+  let listed = 0;
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => { listed += 1; return []; };
+  const deps = makeLoopDeps(fake.client); // deps.queue intentionally undefined
+  await runQueueSweepSafe(deps);
+  assert.equal(listed, 0, "no queue → not even a list_surfaces call");
+  assert.equal(fake.calls.spawn.length, 0);
+});
+
+test("runQueueSweepSafe: isolates a thrown error (the loop never dies)", async () => {
+  const fake = makeQueueFake({ surfaces: [] });
+  const deps = makeLoopDeps(fake.client);
+  deps.queue = makeQueueDeps(fake, [makeQueueRun(tmpl(), memStore())], () => 1_000);
+  // Make the queue's list_surfaces throw — runQueueSweepSafe must swallow it.
+  (deps.queue.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => { throw new Error("boom"); };
+  await runQueueSweepSafe(deps); // must NOT throw
 });
 
 test("runQueueSweep: empty runs list is a no-op (does not even list surfaces)", async () => {
@@ -369,13 +394,18 @@ test("runSweep: the supervisor is NOT starved when summarizer + manager budgets 
   assert.notEqual(deps.queue!.budget, deps.budget, "queue budget != summarizer budget");
   assert.notEqual(deps.queue!.budget, deps.managerBudget, "queue budget != manager budget");
 
-  // First sweep arms the queue (dispatch-suppressed); second sweep dispatches.
-  await runSweep(deps);
+  // The queue runs on its OWN independent timer (`runQueueSweepSafe`), DECOUPLED from
+  // the slow LLM summarizer/manager passes (`runSweep`) — so it can never be blocked or
+  // starved by them, even when their budgets are exhausted or their model calls are slow.
+  // Drive the LLM passes once (consuming their budgets), then the queue's own loop twice
+  // (arm + dispatch).
+  await runSweep(deps); // summarizer + manager (no queue inside runSweep anymore)
+  await runQueueSweepSafe(deps); // queue's own loop: first call arms (dispatch-suppressed)
   assert.equal(fake.calls.spawn.length, 0, "queue suppressed on its first sweep");
   now += 5000;
-  await runSweep(deps);
+  await runQueueSweepSafe(deps); // queue dispatches, independent of the LLM passes
 
-  assert.equal(fake.calls.spawn.length, 1, "queue dispatched despite exhausted pass-1/2 budgets");
+  assert.equal(fake.calls.spawn.length, 1, "queue dispatched independently of the LLM passes");
   assert.equal(deps.queue!.budget.active, 0, "queue budget released");
   // Passes 1+2 genuinely ran against the busy fleet (so the queue dispatched ALONGSIDE
   // real summarizer/manager work, not because the fleet was idle).
