@@ -295,6 +295,32 @@ test("parseSuggestion: suggestion-only (no rationale) defaults confidence", () =
   assert.equal(p?.confidence, DEFAULT_CONFIDENCE);
 });
 
+// --- parseSuggestion: ABSTAIN primitive -------------------------------------
+// An empty / blank / missing / non-string suggestion is the manager's ABSTAIN signal:
+// parseSuggestion returns null, and the loop (manageOne) then writes NOTHING — the tile
+// shows only the summary. This is the PURE behavior the loop-level abstain test builds on.
+
+test("parseSuggestion: empty-string suggestion => null (ABSTAIN)", () => {
+  assert.equal(parseSuggestion('{"suggestion":"","confidence":0}'), null);
+});
+
+test("parseSuggestion: whitespace-only suggestion => null (ABSTAIN)", () => {
+  assert.equal(parseSuggestion('{"suggestion":"   \\n\\t ","confidence":0}'), null);
+});
+
+test("parseSuggestion: missing suggestion field => null (ABSTAIN)", () => {
+  assert.equal(parseSuggestion('{"confidence":0.9}'), null);
+});
+
+test("parseSuggestion: non-string suggestion => null (ABSTAIN)", () => {
+  assert.equal(parseSuggestion('{"suggestion":42,"confidence":0.9}'), null);
+});
+
+test("parseSuggestion: garbage / non-JSON => null (ABSTAIN)", () => {
+  assert.equal(parseSuggestion("sure, I'll do that"), null);
+  assert.equal(parseSuggestion(""), null);
+});
+
 // --- parseSuggestion: confidence parse + clamp (Phase 2.1) -------------------
 
 test("parseSuggestion: parses a valid confidence", () => {
