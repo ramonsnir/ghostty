@@ -45,16 +45,20 @@ struct AgentDashboardView: View {
                 )
             }
         } else {
-            // Full-width rows in a List so `.onMove` gives drag-to-reorder for
-            // free (the dashboard is already a single column). The list chrome is
-            // stripped (plain style, hidden separators/background, clear rows) so
-            // the tiles keep their card look. Row insets are zeroed on the LEADING
-            // and TRAILING edges so tiles span EDGE-TO-EDGE (no side gutter) — only
-            // a small top/bottom inset remains to separate stacked cards. (Plain
-            // `List` otherwise reserves a horizontal gutter; explicit zero insets
-            // override it.) Reordering does NOT remount the mirror previews —
-            // `ForEach` identity stays `entry.id` and the mirror's `.id(sessionID)`
-            // is untouched.
+            // Full-width-ish rows in a List so `.onMove` gives drag-to-reorder
+            // for free (the dashboard is already a single column). The list chrome
+            // is stripped (plain style, hidden separators/background, clear rows)
+            // so the tiles keep their card look. Row insets are zeroed on the
+            // LEADING and TRAILING edges (only a small top/bottom inset remains to
+            // separate stacked cards), which trims the original 12pt gutter — BUT a
+            // small residual horizontal inset (~5–10pt) REMAINS: SwiftUI `List` is
+            // backed by `NSTableView`, whose built-in cell inset is not reachable
+            // via `listRowInsets` or `.contentMargins` (verified empirically). True
+            // edge-to-edge would require dropping `List` for a ScrollView+LazyVStack,
+            // which loses `.onMove` — a deliberate trade (keep reorder, accept the
+            // macOS List inset floor). Reordering does NOT remount the mirror
+            // previews — `ForEach` identity stays `entry.id` and the mirror's
+            // `.id(sessionID)` is untouched.
             List {
                 if !ptyHostEnabled {
                     banner("Live previews require pty-host. Showing metadata-only tiles.")
@@ -87,11 +91,12 @@ struct AgentDashboardView: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            // Plain `List` still reserves a ~5–10pt horizontal scroll-content
-            // margin that `listRowInsets` can't reach; zero it so the tiles are
-            // truly edge-to-edge (the user's "full-width rows" ask). The API is
-            // macOS 14+, so it's behind an availability shim (older deploy
-            // targets keep the small gutter — graceful degradation).
+            // Zero the List's horizontal scroll-content margin (macOS 14+, behind
+            // an availability shim). NOTE: this trims the scroll-content margin but
+            // does NOT fully remove the row gutter — the residual ~5–10pt is the
+            // `NSTableView` cell inset (see the block comment above), which this API
+            // does not reach. Kept because it's harmless and removes what margin it
+            // can; it is NOT sufficient for true edge-to-edge on its own.
             .zeroHorizontalScrollMargin()
             .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
         }
@@ -190,9 +195,11 @@ struct AgentDashboardView: View {
 }
 
 private extension View {
-    /// Zero the horizontal scroll-content margin of a `List`/scroll view so its
-    /// rows reach the container edges. `contentMargins(_:_:for:)` is macOS 14+,
-    /// so on older systems this is a no-op (the small default gutter remains).
+    /// Zero the horizontal scroll-content margin of a `List`/scroll view.
+    /// `contentMargins(_:_:for:)` is macOS 14+, so on older systems this is a
+    /// no-op. NOTE for `List` specifically: this trims the scroll-content margin
+    /// but NOT the underlying `NSTableView` cell inset, so a small residual
+    /// horizontal gutter remains either way (see AgentDashboardView's row block).
     @ViewBuilder
     func zeroHorizontalScrollMargin() -> some View {
         if #available(macOS 14.0, *) {
