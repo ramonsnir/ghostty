@@ -409,6 +409,14 @@ export function coerceQueueCommands(obj: unknown): QueueCommand[] {
     const cmd: QueueCommand = { action: action as QueueCommand["action"] };
     if (typeof r.template === "string" && r.template.length > 0) cmd.template = r.template;
     if (typeof r.run === "string" && r.run.length > 0) cmd.run = r.run;
+    // (§8b) start-time params: an object of string→string (drop non-string values).
+    if (r.params !== null && typeof r.params === "object" && !Array.isArray(r.params)) {
+      const params: Record<string, string> = {};
+      for (const [k, v] of Object.entries(r.params as Record<string, unknown>)) {
+        if (typeof k === "string" && k.length > 0 && typeof v === "string") params[k] = v;
+      }
+      if (Object.keys(params).length > 0) cmd.params = params;
+    }
     out.push(cmd);
   }
   return out;

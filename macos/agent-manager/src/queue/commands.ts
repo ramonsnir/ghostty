@@ -30,13 +30,20 @@ export interface QueueCommand {
   template?: string;
   /** The active run name to pause/resume/stop/abort. */
   run?: string;
+  /** (§8b) START-TIME parameter answers (param name → value) collected by the GUI prompt,
+   *  passed through to the factory (start only). Absent when the template declares no params. */
+  params?: Record<string, string>;
 }
 
-/** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME, or return
- *  null when the template is absent/invalid (logged by the factory; `applyCommand` treats
- *  null as a failed start). Production wires this to the template loader + a file StoreIO
- *  (wiring.ts); tests inject a fake. Keeping it a seam keeps `applyCommand` PURE. */
-export type RunFactory = (templateBasename: string) => QueueRun | null;
+/** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME (+ the
+ *  start-time param answers, §8b), or return null when the template is absent/invalid OR a
+ *  REQUIRED param is missing (logged by the factory; `applyCommand` treats null as a failed
+ *  start). Production wires this to the template loader + a file StoreIO (wiring.ts); tests
+ *  inject a fake. Keeping it a seam keeps `applyCommand` PURE. */
+export type RunFactory = (
+  templateBasename: string,
+  params?: Record<string, string>,
+) => QueueRun | null;
 
 /** The active-run registry: live runs keyed by run NAME (= `template.name`). */
 export type RunRegistry = Map<string, QueueRun>;
@@ -79,9 +86,9 @@ export function applyCommand(
           return { kind: "noop", runName: run.template.name };
         }
       }
-      const run = factory(basename);
+      const run = factory(basename, cmd.params);
       if (run === null) {
-        // The factory logged the validation/load error; a failed start is a no-op.
+        // The factory logged the validation/load/required-param error; a failed start is a no-op.
         return { kind: "noop" };
       }
       // The run NAME (origin) keys the registry. GUARD a name collision: if a DIFFERENT

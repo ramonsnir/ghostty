@@ -40,6 +40,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     closeOnComplete: true,
     closeStableSeconds: 5,
     quitWhenEmpty: false,
+    params: [],
     ...over,
   };
 }

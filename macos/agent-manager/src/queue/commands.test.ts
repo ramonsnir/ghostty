@@ -32,6 +32,7 @@ function tmpl(name: string): QueueTemplate {
     closeOnComplete: true,
     closeStableSeconds: 5,
     quitWhenEmpty: false,
+    params: [],
   };
 }
 
@@ -58,6 +59,23 @@ test("applyCommand start: creates a run keyed by its template name", () => {
   assert.ok(reg.has("backlog"), "registry keyed by run name (template.name)");
   assert.equal(reg.get("backlog")!.templateName, "backlog-file", "carries the basename for reload");
   assert.deepEqual(calls, ["backlog-file"], "factory invoked once for the start");
+});
+
+test("applyCommand start: the start-time params (§8b) are passed through to the factory", () => {
+  const reg: RunRegistry = new Map();
+  let seen: Record<string, string> | undefined = { sentinel: "unset" };
+  const factory: RunFactory = (basename, params) => {
+    seen = params;
+    return makeQueueRun(tmpl("backlog"), memStore(), { templateName: basename, params });
+  };
+  const res = applyCommand(
+    reg,
+    { action: "start", template: "backlog-file", params: { project: "Acme", milestones: "Q3" } },
+    factory,
+  );
+  assert.equal(res.kind, "started");
+  assert.deepEqual(seen, { project: "Acme", milestones: "Q3" }, "params forwarded to the factory");
+  assert.deepEqual(reg.get("backlog")!.params, { project: "Acme", milestones: "Q3" }, "stored on the run");
 });
 
 test("applyCommand start: re-start of the same template basename is an idempotent NO-OP", () => {

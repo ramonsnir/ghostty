@@ -345,3 +345,18 @@ test("coerceQueueCommands: drops non-object entries and unrecognized actions, ke
     { action: "pause" },
   ]);
 });
+
+test("coerceQueueCommands: parses start-time params (§8b) — string values only, non-strings dropped", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "start", template: "t1", params: { project: "Acme", milestones: "Q3", n: 5 } },
+      { action: "start", template: "t2", params: {} }, // empty params object → omitted
+      { action: "start", template: "t3", params: "nope" }, // non-object params → omitted
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "start", template: "t1", params: { project: "Acme", milestones: "Q3" } },
+    { action: "start", template: "t2" },
+    { action: "start", template: "t3" },
+  ]);
+});

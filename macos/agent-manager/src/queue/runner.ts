@@ -65,6 +65,7 @@ import {
   type LiveSurface,
   type StoreIO,
 } from "./store.js";
+import { resolveParamsEnv } from "./templates.js";
 import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
 
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
@@ -100,6 +101,12 @@ export interface QueueRun {
   templateName: string;
   /** The store seam for THIS run's durable records (one file per run). */
   storeIO: StoreIO;
+  /** (§8b) The resolved START-TIME parameter answers (param name → value) the run was
+   *  started with. Injected into the PROVIDER command env each sweep via
+   *  `resolveParamsEnv(template, params)` so the `list`/`status`/`claim` commands are
+   *  scoped to the user's chosen project/milestone/etc. Empty when the template declares no
+   *  params. Persisted in the active-runs record so a restart re-applies the same scope. */
+  params: Record<string, string>;
   /** The active assignments, keyed by work-item KEY (the dedup identity, §7). */
   active: Map<string, Assignment>;
   /** Per-key cooldown `until` timestamps (§6). */
@@ -177,12 +184,18 @@ export interface QueueRun {
 export function makeQueueRun(
   template: QueueTemplate,
   storeIO: StoreIO,
-  opts: { templateName?: string; paused?: boolean; draining?: boolean } = {},
+  opts: {
+    templateName?: string;
+    paused?: boolean;
+    draining?: boolean;
+    params?: Record<string, string>;
+  } = {},
 ): QueueRun {
   return {
     template,
     templateName: opts.templateName ?? template.name,
     storeIO,
+    params: opts.params ?? {},
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
@@ -245,12 +258,16 @@ export interface QueueDeps {
 export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
   const out: ActiveRunRecord[] = [];
   for (const run of registry.values()) {
-    out.push({
+    const rec: ActiveRunRecord = {
       template: run.templateName,
       name: run.template.name,
       paused: run.paused,
       draining: run.draining,
-    });
+    };
+    // Persist the start-time params (§8b) so a restart re-applies the same scope. Omit
+    // when empty (no declared params / no answers) to keep the file tidy + back-compat.
+    if (Object.keys(run.params).length > 0) rec.params = { ...run.params };
+    out.push(rec);
   }
   return out;
 }
@@ -650,6 +667,7 @@ async function advanceStates(
     if (surfaceLive && (a.state === "SPAWNED" || a.state === "RUNNING")) {
       const probe = await probeStatus(run.template.provider.status, a.key, deps.exec, {
         cwd: run.template.workdir,
+        env: resolveParamsEnv(run.template, run.params),
       });
       statusTerminal = probe.terminal;
     }
@@ -821,7 +839,10 @@ async function dispatchCandidates(
   // failed/skip one (§8a): only a clean, parsed, empty list arms the quit.
   let items: WorkItem[];
   try {
-    const res = await fetchListResult(t.provider.list, deps.exec, { cwd: t.workdir });
+    const res = await fetchListResult(t.provider.list, deps.exec, {
+      cwd: t.workdir,
+      env: resolveParamsEnv(t, run.params),
+    });
     items = res.items;
     run.sawEmptyListThisSweep = res.ok && res.items.length === 0;
     // RE-ARM the §7.1 dispatch latch: a previously-dispatched key that a SUCCESSFUL list no
@@ -1026,7 +1047,10 @@ async function dispatchOne(
   // (g) Optional fire-and-forget claim (a LATENCY optimization, never correctness §7).
   if (t.provider.claim !== undefined) {
     const argv = renderArgv(t.provider.claim.command, item.key);
-    void runProvider(argv, deps.exec, { cwd: t.workdir }).catch(() => {
+    void runProvider(argv, deps.exec, {
+      cwd: t.workdir,
+      env: resolveParamsEnv(t, run.params),
+    }).catch(() => {
       /* claim failure is non-fatal + already logged inside runProvider's result */
     });
   }

@@ -23,6 +23,7 @@ import type {
   ProviderListSpec,
   ProviderSpec,
   ProviderStatusSpec,
+  QueueParam,
   QueueTemplate,
 } from "./types.js";
 
@@ -94,6 +95,7 @@ export function validateTemplate(obj: unknown): ValidateResult {
     rec.quitWhenEmpty,
     TEMPLATE_DEFAULTS.quitWhenEmpty,
   );
+  const params = validateParams(rec.params, errors);
 
   if (
     errors.length > 0 ||
@@ -121,6 +123,7 @@ export function validateTemplate(obj: unknown): ValidateResult {
     closeOnComplete,
     closeStableSeconds,
     quitWhenEmpty,
+    params,
   };
   return { ok: true, template, errors: [] };
 }
@@ -407,6 +410,110 @@ function validateOnAgentExit(v: unknown, errors: string[]): OnAgentExit {
   if (v === "leave-and-bell") return v;
   errors.push('onAgentExit must be "leave-and-bell"');
   return TEMPLATE_DEFAULTS.onAgentExit;
+}
+
+/**
+ * (§8b) Resolve the template's declared params + the user's answers into the ENV map handed
+ * to the provider commands. PURE. For each declared param, the value is `values[name]` when
+ * present, else the param's `default`, else "" — and it is exported under `param.env`. An
+ * empty value is still set (the provider sees an empty var) UNLESS it's the empty-string
+ * default-of-absent, in which case it is omitted so the provider's own env-file fallback can
+ * apply. Undeclared keys in `values` are ignored (only declared params flow through).
+ */
+export function resolveParamsEnv(
+  template: QueueTemplate,
+  values: Record<string, string> = {},
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const p of template.params) {
+    const v = values[p.name] ?? p.default ?? "";
+    if (v.length > 0) out[p.env] = v;
+  }
+  return out;
+}
+
+/**
+ * (§8b) The names of REQUIRED params left empty (no provided value AND no default). PURE.
+ * A non-empty result means the start must be REJECTED (the factory logs + returns null).
+ */
+export function missingRequiredParams(
+  template: QueueTemplate,
+  values: Record<string, string> = {},
+): string[] {
+  const missing: string[] = [];
+  for (const p of template.params) {
+    if (p.required !== true) continue;
+    const v = values[p.name] ?? p.default ?? "";
+    if (v.length === 0) missing.push(p.name);
+  }
+  return missing;
+}
+
+/** A valid POSIX env-var name: a letter/underscore then letters/digits/underscores. */
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Validate the optional START-TIME `params` (§8b). PURE. Absent ⇒ `[]` (no prompt — the
+ * prior behavior). Each entry needs a non-empty `name` and an `env` that is a valid env-var
+ * name (the value is exported under it to the provider); `label`/`default` are optional
+ * strings; `required` an optional bool. A malformed entry pushes an error (so the start
+ * fails loudly rather than silently dropping a param). Duplicate `name`s or `env`s are
+ * rejected (an ambiguous prompt / clobbered env).
+ */
+function validateParams(v: unknown, errors: string[]): QueueParam[] {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) {
+    errors.push("params must be an array of {name,env,label?,default?,required?}");
+    return [];
+  }
+  const out: QueueParam[] = [];
+  const names = new Set<string>();
+  const envs = new Set<string>();
+  for (const raw of v) {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      errors.push("each param must be an object {name,env,…}");
+      continue;
+    }
+    const r = raw as Record<string, unknown>;
+    const name = r.name;
+    const env = r.env;
+    if (typeof name !== "string" || name.length === 0) {
+      errors.push("param.name must be a non-empty string");
+      continue;
+    }
+    if (typeof env !== "string" || !ENV_NAME_RE.test(env)) {
+      errors.push(`param "${name}": env must be a valid env-var name (got ${JSON.stringify(env)})`);
+      continue;
+    }
+    if (names.has(name)) {
+      errors.push(`duplicate param name "${name}"`);
+      continue;
+    }
+    if (envs.has(env)) {
+      errors.push(`duplicate param env "${env}"`);
+      continue;
+    }
+    if (r.label !== undefined && typeof r.label !== "string") {
+      errors.push(`param "${name}": label must be a string`);
+      continue;
+    }
+    if (r.default !== undefined && typeof r.default !== "string") {
+      errors.push(`param "${name}": default must be a string`);
+      continue;
+    }
+    if (r.required !== undefined && typeof r.required !== "boolean") {
+      errors.push(`param "${name}": required must be a boolean`);
+      continue;
+    }
+    names.add(name);
+    envs.add(env);
+    const p: QueueParam = { name, env };
+    if (typeof r.label === "string") p.label = r.label;
+    if (typeof r.default === "string") p.default = r.default;
+    if (r.required === true) p.required = true;
+    out.push(p);
+  }
+  return out;
 }
 
 /** A command must be a non-empty array of non-empty strings (argv). PURE. */

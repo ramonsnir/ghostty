@@ -819,6 +819,30 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (`commands.ts applyCommand`), persists the active-run SET (`active-runs.json`) + rehydrates
     it on restart. **A template merely on disk does NOT auto-run** (replaced Phase-1
     `loadRuns(all)`) — only a started/persisted run.
+  - **START-TIME PARAMS (§8b) — prompt for project/milestone/etc. at start, don't hard-code.**
+    A template can declare `params: [{name, env, label?, default?, required?}]`; on start the
+    QueuePalette PROMPTS for each (a form, pre-filled with `default`), and each answer is
+    injected into the PROVIDER command env under `param.env` (the `list`/`status`/`claim`
+    calls read it) — so ONE generic template is re-pointed at a different scope per run with no
+    file edits. STAYS GENERIC: the TEMPLATE names the env var; Ghostty never hard-codes
+    "Linear". A param scopes "what to work on" and is delivered ONLY to the provider, NOT the
+    agent (the agent gets per-item `GHOSTTY_ITEM_*`). Resolution is `answer ?? default ?? omit`
+    (`resolveParamsEnv`, pure); a REQUIRED param with no answer+no default REJECTS the start
+    (`missingRequiredParams`, enforced in the factory + the GUI Start button is disabled).
+    Params persist in the active-runs record (`params` map) so a restart re-applies the same
+    scope. A template with no params starts directly (prior behavior). Wiring: sidecar —
+    `types.ts` (`QueueParam` + `QueueTemplate.params`), `templates.ts` (`validateParams` +
+    `resolveParamsEnv`/`missingRequiredParams`), `runner.ts` (`QueueRun.params` + provider-call
+    env + `activeRunRecords`), `commands.ts` (`QueueCommand.params` + `RunFactory(basename,
+    params?)`), `store.ts` (`ActiveRunRecord.params` parse/serialize), `mcp.ts`
+    (`coerceQueueCommands` params), `wiring.ts` (factory enforces required + passes params,
+    rehydrate re-applies); Swift — `QueueCommandBridge.swift` (`QueueCommand.params` + wire),
+    `Command Palette/QueuePalette.swift` (`templateParams` JSON parse + `QueueParamFormView`
+    prompt + two-step flow). Tests: sidecar `templates.test.ts`/`commands.test.ts`/
+    `store.test.ts`/`mcp.test.ts`/`runner.test.ts` (validate/resolve/required, command carry,
+    persist round-trip, coerce, provider-env injection); Swift `QueuePaletteTests`
+    (`templateParams*`, `canStart*`, `startCommand*Params`). **GUI relaunch (for the prompt) +
+    a rebuilt sidecar `dist`; no host/Zig change.**
   - **GRID layout** (§12): all of a run's splits in ONE tab, auto-arranged up to `cols×rows`
     filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
     splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are

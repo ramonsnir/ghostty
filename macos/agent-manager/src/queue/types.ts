@@ -86,6 +86,29 @@ export interface AgentSpec {
  *  additive. */
 export type OnAgentExit = "leave-and-bell";
 
+/**
+ * (§8b) A START-TIME PARAMETER the template declares (e.g. a Linear project or
+ * milestone). The GUI prompts for each when the queue is started; the resolved value is
+ * injected into the PROVIDER's environment under `env` (the `list`/`status`/`claim`
+ * commands read it), so the SAME generic template can be pointed at a different scope per
+ * run without editing files. Keeps the design generic: the TEMPLATE names the env var;
+ * Ghostty never hard-codes "Linear". A param scopes "what to work on" and is delivered ONLY
+ * to the provider commands, NOT to the agent (the agent gets per-item `GHOSTTY_ITEM_*`).
+ */
+export interface QueueParam {
+  /** Identifier the GUI/command keys the user's answer by (e.g. "project"). */
+  name: string;
+  /** The env var the resolved value is exported as to the provider commands (e.g.
+   *  "LINEAR_PROJECT"). */
+  env: string;
+  /** Human prompt label (defaults to `name` when absent). */
+  label?: string;
+  /** Pre-filled value in the prompt (the common case is "accept the default"). */
+  default?: string;
+  /** When true the start is REJECTED if the resolved value is empty. Default false. */
+  required?: boolean;
+}
+
 /** A fully-parsed, validated queue template (§5). The runtime engine consumes this;
  *  it is produced by `validateTemplate` from raw JSON. */
 export interface QueueTemplate {
@@ -94,6 +117,9 @@ export interface QueueTemplate {
   /** The split cwd; `~` is expanded macOS-side (the sidecar passes it through). */
   workdir: string;
   agent: AgentSpec;
+  /** (§8b) START-TIME parameters the GUI prompts for; each resolved value is injected
+   *  into the provider command env. Empty array when absent (no prompt — prior behavior). */
+  params: QueueParam[];
   /** Max simultaneous agents, clamped to the grid cap (cols*rows) by the validator. */
   concurrency: number;
   /** Hard ceiling on total LIFETIME dispatches for this run (§7). */

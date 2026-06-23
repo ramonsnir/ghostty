@@ -28,6 +28,7 @@ import { makeQueueRun, type QueueRun } from "./runner.js";
 import {
   QUEUES_DIR,
   makeTemplateLoader,
+  missingRequiredParams,
   realTemplateFs,
   type LoadResult,
 } from "./templates.js";
@@ -205,7 +206,7 @@ export function makeFileRunFactory(
   templatesDir: string,
   stateDir: string,
 ): RunFactory {
-  return (basename: string): QueueRun | null => {
+  return (basename: string, params?: Record<string, string>): QueueRun | null => {
     const res = loadTemplateByName(templatesDir, basename);
     if (!res.ok) {
       console.error(
@@ -213,8 +214,17 @@ export function makeFileRunFactory(
       );
       return null;
     }
+    // (§8b) REJECT the start if a REQUIRED param was left empty (no answer + no default) —
+    // a required scope (e.g. the Linear project) must be present before any dispatch.
+    const missing = missingRequiredParams(res.template, params ?? {});
+    if (missing.length > 0) {
+      console.error(
+        `agent-manager: queue: cannot start template "${basename}": missing required param(s): ${missing.join(", ")}`,
+      );
+      return null;
+    }
     const storeIO = makeFileStoreIO(join(stateDir, `${basename}.state.json`));
-    return makeQueueRun(res.template, storeIO, { templateName: basename });
+    return makeQueueRun(res.template, storeIO, { templateName: basename, params: params ?? {} });
   };
 }
 
@@ -245,6 +255,7 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
         templateName: rec.template,
         paused: rec.paused,
         draining: rec.draining,
+        params: rec.params ?? {},
       }),
     );
   }

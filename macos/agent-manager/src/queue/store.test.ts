@@ -393,6 +393,26 @@ test("serializeActiveRuns / parseActiveRuns: round-trips the started-run set", (
   assert.deepEqual(parseActiveRuns(text), runs);
 });
 
+test("serializeActiveRuns / parseActiveRuns: round-trips start-time params (§8b)", () => {
+  const runs: ActiveRunRecord[] = [
+    { template: "example", name: "ExampleOS", paused: false, draining: false, params: { project: "Acme", milestones: "Q3" } },
+  ];
+  assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
+});
+
+test("parseActiveRuns: tolerates a malformed params field (non-object / non-string values dropped)", () => {
+  // non-object params → record kept WITHOUT params
+  assert.deepEqual(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","params":"nope"}]}'),
+    [{ template: "t", name: "t", paused: false, draining: false }],
+  );
+  // mixed value types → only string values survive
+  assert.deepEqual(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","params":{"a":"x","b":7}}]}'),
+    [{ template: "t", name: "t", paused: false, draining: false, params: { a: "x" } }],
+  );
+});
+
 test("parseActiveRuns: tolerant of malformed input → []", () => {
   assert.deepEqual(parseActiveRuns(null), []);
   assert.deepEqual(parseActiveRuns(""), []);

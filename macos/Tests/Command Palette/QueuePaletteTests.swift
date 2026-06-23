@@ -71,4 +71,66 @@ struct QueuePaletteTests {
         defer { try? FileManager.default.removeItem(at: base) }
         #expect(QueuePaletteView.discoverTemplates(dir: base.path).isEmpty)
     }
+
+    // MARK: - templateParams (§8b)
+
+    private func write(_ url: URL, _ json: String) throws {
+        try json.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// A template's `params` array is parsed: `name` required, `label` defaults to
+    /// `name`, `default`/`required` carried; the GUI-irrelevant `env` is ignored.
+    @Test func templateParamsParsesDeclaredParams() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("example.json"), """
+        { "name": "ExampleOS", "params": [
+            { "name": "project", "env": "LINEAR_PROJECT", "label": "Project", "default": "Acme Foods", "required": true },
+            { "name": "milestones", "env": "LINEAR_MILESTONES" }
+        ] }
+        """)
+        let params = QueuePaletteView.templateParams(dir: base.path, basename: "example")
+        #expect(params == [
+            QueueParamSpec(name: "project", label: "Project", defaultValue: "Acme Foods", required: true),
+            QueueParamSpec(name: "milestones", label: "milestones", defaultValue: "", required: false),
+        ])
+    }
+
+    /// A template with no `params` (or a missing file) yields an empty list — the
+    /// "start directly, no prompt" path.
+    @Test func templateParamsEmptyWhenAbsentOrMissing() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("plain.json"), #"{ "name": "Plain" }"#)
+        #expect(QueuePaletteView.templateParams(dir: base.path, basename: "plain").isEmpty)
+        #expect(QueuePaletteView.templateParams(dir: base.path, basename: "nope").isEmpty)
+    }
+
+    // MARK: - QueueParamFormView.canStart (§8b)
+
+    @Test func canStartRequiresNonBlankRequiredFields() {
+        let params = [
+            QueueParamSpec(name: "project", label: "Project", defaultValue: "", required: true),
+            QueueParamSpec(name: "ms", label: "Milestones", defaultValue: "", required: false),
+        ]
+        #expect(!QueueParamFormView.canStart(params: params, values: [:]))
+        #expect(!QueueParamFormView.canStart(params: params, values: ["project": "   "]))  // blank
+        #expect(QueueParamFormView.canStart(params: params, values: ["project": "Acme"]))
+        #expect(QueueParamFormView.canStart(params: params, values: ["project": "Acme", "ms": ""]))
+    }
+
+    // MARK: - QueueCommand wire shape carries params (§8b)
+
+    @Test func startCommandEmitsParamsWhenPresent() {
+        let cmd = QueueCommand(action: .start, template: "example", params: ["project": "Acme"])
+        let json = cmd.jsonObject
+        #expect(json["action"] as? String == "start")
+        #expect(json["template"] as? String == "example")
+        #expect((json["params"] as? [String: String]) == ["project": "Acme"])
+    }
+
+    @Test func startCommandOmitsEmptyOrNilParams() {
+        #expect(QueueCommand(action: .start, template: "t", params: nil).jsonObject["params"] == nil)
+        #expect(QueueCommand(action: .start, template: "t", params: [:]).jsonObject["params"] == nil)
+    }
 }

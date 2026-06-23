@@ -115,6 +115,36 @@ shell the engine just runs.
 }
 ```
 
+### Start-time parameters (ask me when starting)
+
+Instead of hard-coding the scope (e.g. a Linear project/milestone) in the provider command
+or an env file, a template can declare **`params`** — and the queue **prompts you for them
+when you start it**. Each answer is exported as an environment variable to your provider
+commands, so one generic template can be pointed at a different project/milestone/etc. each
+run with no file edits:
+
+```jsonc
+{
+  "name": "ExampleOS",
+  // … workdir / agent / provider as above …
+  "params": [
+    { "name": "project",    "env": "LINEAR_PROJECT",    "label": "Linear project",       "default": "Acme Foods", "required": true },
+    { "name": "milestones", "env": "LINEAR_MILESTONES", "label": "Milestone(s), comma-sep", "default": "Visual Prototype" }
+  ]
+}
+```
+
+- On **Start**, a small form appears with one field per param, pre-filled with its `default`
+  — usually you just press Enter. Each value is set as `param.env` in the environment your
+  `list`/`status`/`claim` commands run with (so your script reads `$LINEAR_PROJECT`, etc.).
+- `required: true` blocks the start until that field is non-empty (the Start button stays
+  disabled; the engine also rejects it).
+- The chosen values are remembered for the run and **re-applied across a restart**.
+- A template with **no `params`** starts immediately, exactly as before.
+- Stays generic: the *template* names the env var — Ghostty has no knowledge of Linear (or
+  any tracker). Keep secrets (e.g. a `LINEAR_API_KEY`) in your provider's own env file; use
+  `params` only for the per-run scope you want to be asked about.
+
 Provider contract (the genericity boundary):
 - **`list`** → stdout is a JSON array; `keyField`/`titleField`/`urlField` map fields onto each
   item. A non-zero exit or unparseable output **skips that poll** (never dispatches garbage).

@@ -615,6 +615,9 @@ export interface ActiveRunRecord {
   name: string;
   paused: boolean;
   draining: boolean;
+  /** (§8b) The start-time parameter answers (name → value) this run was started with, so a
+   *  restart re-applies the same provider scope. Omitted when the template declares none. */
+  params?: Record<string, string>;
 }
 
 /** The on-disk active-runs file shape. Versioned for additive migration. */
@@ -659,12 +662,21 @@ export function parseActiveRuns(text: string | null): ActiveRunRecord[] {
     const r = raw as Record<string, unknown>;
     const template = r.template;
     if (typeof template !== "string" || template.length === 0) continue;
-    out.push({
+    const rec: ActiveRunRecord = {
       template,
       name: typeof r.name === "string" ? r.name : template,
       paused: r.paused === true,
       draining: r.draining === true,
-    });
+    };
+    // (§8b) tolerate + carry the start-time params object (string→string only).
+    if (r.params !== null && typeof r.params === "object" && !Array.isArray(r.params)) {
+      const params: Record<string, string> = {};
+      for (const [k, val] of Object.entries(r.params as Record<string, unknown>)) {
+        if (typeof k === "string" && k.length > 0 && typeof val === "string") params[k] = val;
+      }
+      if (Object.keys(params).length > 0) rec.params = params;
+    }
+    out.push(rec);
   }
   return out;
 }

@@ -52,6 +52,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     closeOnComplete: true,
     closeStableSeconds: 5,
     quitWhenEmpty: false,
+    params: [],
     ...over,
   };
 }
@@ -959,6 +960,41 @@ test("runQueueSweep: agent-queue-max-total caps total dispatches across runs", a
   await runQueueSweep(deps); // dispatch — capped at maxTotal across the two runs
 
   assert.equal(fakeA.calls.spawn.length, 2, "global maxTotal(2) capped the fleet across runs");
+});
+
+// ---------------------------------------------------------------------------
+// (6b) §8b START-TIME PARAMS: a run's params are injected into the provider command env.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: start-time params (§8b) are injected into the provider list env (answer > default)", async () => {
+  const t = tmpl();
+  t.params = [
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "ms", env: "LINEAR_MILESTONES", default: "VP" }, // no answer → default flows
+  ];
+  let listEnv: Record<string, string> | undefined;
+  // Custom exec captures the env handed to the `list` provider call.
+  const exec: Exec = async (argv, opts) => {
+    if (argv[0] === "list") {
+      listEnv = opts.env;
+      return { code: 0, stdout: "[]", stderr: "" };
+    }
+    return { code: 0, stdout: '{"state":"x"}', stderr: "" };
+  };
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const run = makeQueueRun(t, memStore(), { params: { project: "Acme" } });
+  let now = 8_500_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { exec });
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch sweep fetches the list WITH the params env
+
+  assert.deepEqual(
+    listEnv,
+    { LINEAR_PROJECT: "Acme", LINEAR_MILESTONES: "VP" },
+    "the user's answer overrides; an unanswered param falls back to its default",
+  );
 });
 
 // ---------------------------------------------------------------------------

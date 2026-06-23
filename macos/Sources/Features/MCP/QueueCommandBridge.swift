@@ -33,21 +33,33 @@ struct QueueCommand: Equatable, Sendable {
     let template: String?
     /// The active run name to pause/resume/stop/abort.
     let run: String?
+    /// (§8b) START-TIME parameter answers (param name → value) collected by the
+    /// queue palette's prompt, passed through to the sidecar factory (start only).
+    /// nil/empty when the template declares no params.
+    let params: [String: String]?
 
-    init(action: Action, template: String? = nil, run: String? = nil) {
+    init(
+        action: Action,
+        template: String? = nil,
+        run: String? = nil,
+        params: [String: String]? = nil
+    ) {
         self.action = action
         self.template = template
         self.run = run
+        self.params = params
     }
 
     /// PURE: the wire dict drained by `take_queue_commands`. `action` is always
     /// present; `template`/`run` are emitted only when non-nil (mirrors the
     /// sidecar's tolerant `coerceQueueCommands`, which only keeps non-empty
-    /// strings). Unit-tested.
+    /// strings); `params` is emitted only when non-nil AND non-empty (the sidecar
+    /// drops empty/non-string entries regardless). Unit-tested.
     var jsonObject: [String: Any] {
         var d: [String: Any] = ["action": action.rawValue]
         if let template, !template.isEmpty { d["template"] = template }
         if let run, !run.isEmpty { d["run"] = run }
+        if let params, !params.isEmpty { d["params"] = params }
         return d
     }
 }

@@ -7,9 +7,12 @@ import assert from "node:assert/strict";
 import {
   TEMPLATE_DEFAULTS,
   makeTemplateLoader,
+  missingRequiredParams,
+  resolveParamsEnv,
   validateTemplate,
   type TemplateFs,
 } from "./templates.js";
+import type { QueueTemplate } from "./types.js";
 
 /** A minimal VALID template object (the smallest input that validates). */
 function goodTemplateObj(): Record<string, unknown> {
@@ -28,6 +31,78 @@ function goodTemplateObj(): Record<string, unknown> {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// §8b start-time params: validateTemplate(params) + resolveParamsEnv + missingRequiredParams.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: params default to [] when absent", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.template.params, []);
+});
+
+test("validateTemplate: a valid params array is parsed (label/default/required kept)", () => {
+  const obj = goodTemplateObj();
+  obj.params = [
+    { name: "project", env: "LINEAR_PROJECT", label: "Project", default: "Acme Foods", required: true },
+    { name: "milestones", env: "LINEAR_MILESTONES" },
+  ];
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.template.params, [
+    { name: "project", env: "LINEAR_PROJECT", label: "Project", default: "Acme Foods", required: true },
+    { name: "milestones", env: "LINEAR_MILESTONES" },
+  ]);
+});
+
+test("validateTemplate: rejects a bad env name, duplicate name, duplicate env, non-string label", () => {
+  for (const params of [
+    [{ name: "p", env: "1BAD" }], // env not a valid var name
+    [{ name: "p", env: "A" }, { name: "p", env: "B" }], // dup name
+    [{ name: "a", env: "X" }, { name: "b", env: "X" }], // dup env
+    [{ name: "p", env: "X", label: 5 }], // non-string label
+    [{ name: "", env: "X" }], // empty name
+    [{ name: "p" }], // missing env
+  ]) {
+    const obj = goodTemplateObj();
+    obj.params = params;
+    const r = validateTemplate(obj);
+    assert.equal(r.ok, false, JSON.stringify(params));
+  }
+});
+
+test("resolveParamsEnv: value > default > omit-empty; undeclared keys ignored", () => {
+  const t = {
+    params: [
+      { name: "project", env: "LINEAR_PROJECT", default: "Default Co" },
+      { name: "milestones", env: "LINEAR_MILESTONES" }, // no default
+      { name: "team", env: "LINEAR_TEAM", default: "" }, // empty default → omitted
+    ],
+  } as unknown as QueueTemplate;
+  // No answers → only the param WITH a non-empty default is set.
+  assert.deepEqual(resolveParamsEnv(t, {}), { LINEAR_PROJECT: "Default Co" });
+  // Answers override the default; an undeclared key ("bogus") is ignored.
+  assert.deepEqual(
+    resolveParamsEnv(t, { project: "Acme", milestones: "Q3", bogus: "x" }),
+    { LINEAR_PROJECT: "Acme", LINEAR_MILESTONES: "Q3" },
+  );
+});
+
+test("missingRequiredParams: only required-and-empty (no answer + no default) are missing", () => {
+  const t = {
+    params: [
+      { name: "project", env: "LINEAR_PROJECT", required: true }, // no default
+      { name: "milestones", env: "LINEAR_MILESTONES", required: true, default: "VP" }, // has default
+      { name: "extra", env: "X" }, // not required
+    ],
+  } as unknown as QueueTemplate;
+  assert.deepEqual(missingRequiredParams(t, {}), ["project"]);
+  assert.deepEqual(missingRequiredParams(t, { project: "Acme" }), []);
+  assert.deepEqual(missingRequiredParams(t, { project: "" }), ["project"]);
+});
 
 // ---------------------------------------------------------------------------
 // validateTemplate — good.
