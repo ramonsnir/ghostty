@@ -428,33 +428,51 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `SurfaceWrapper` render it natively (full color, viewport-only — right for a
     thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
     Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
-    - **Smart bottom-anchor (skip empty trailing rows; fork-only, always on, no
-      config).** A bottom-anchored thumbnail of a partially-filled screen (a fresh
-      agent chat, a TUI that hasn't reached the bottom) would waste the preview on
-      empty trailing rows. So the preview now shifts the bottom-anchored mirror DOWN by
-      the height of the trailing blank rows, dropping them below the clip so the LAST
-      row with content sits at the bottom. It does NOT collapse interior repeated/blank
-      lines (the native Metal mirror renders the host grid as-is — there's no seam to
-      inject a "… N more …" marker into; that would need a separate self-rendered text
-      preview, which loses color/TUI fidelity — deliberately not done). The trailing-
-      blank count is grid-accurate (NOT text-derived: `read_text` uses `unwrap=true` +
-      always trims trailing blanks, so it can't give a row-accurate count): a new
-      read-only core getter `RenderState.trailingBlankRows()` scans the host render
-      mirror's viewport rows bottom-up via `Cell.hasTextAny` (a row of spaces counts as
-      content → safe undershoot, never clips a visible char), exported as
-      `ghostty_surface_trailing_blank_rows` and read on the REAL surface (authoritative
-      host grid, like the geometry). 0 when there's no mirror (`.exec`) ⇒ plain bottom-
-      anchor. The offset is a pure, tested `AgentMirrorPreview.bottomAnchorOffset(...)`
-      (clamped to `rows-1` so an all-blank screen keeps one row visible), refreshed on a
-      light 0.7s timer per tile (live frames render off the Metal path, not via
-      `@Published`, so a poll — not an observer — drives it). HOST links the new core
-      getter but does NOT call it (no behavior change ⇒ **no host restart needed**; GUI
-      relaunch only). Wiring: `src/terminal/render.zig` (`trailingBlankRows`),
-      `src/apprt/embedded.zig` + `include/ghostty.h` (export), `Surface
-      View/SurfaceView_AppKit.swift` (`trailingBlankRows()` accessor),
-      `AgentDashboard/AgentPreviewTile.swift` (`bottomAnchorOffset` + `.offset` + timer).
-      Tests: `render.zig` (`trailingBlankRows*`, run via `-Dtest-filter=trailingBlankRows`),
-      `macos/Tests/AgentDashboard/AgentDashboardTests.swift` (`BottomAnchorOffsetTests`).
+    - **Smart bottom-anchor — skip empty rows AND the info-less footer (fork-only,
+      always on, no config, PURE-SWIFT / ZERO Zig).** A bottom-anchored thumbnail of a
+      partially-filled screen (a fresh agent chat, a TUI not yet at the bottom) wastes
+      the preview on empty trailing rows; worse, an idle Claude Code/Codex agent ALWAYS
+      pins its input box + mode/status lines at the bottom, so the meaningful content is
+      pushed off-view. So the preview shifts the bottom-anchored mirror DOWN by the
+      number of trailing rows to drop — blanks PLUS a detected footer — so the LAST row
+      of CONTENT lands at the bottom (the dropped rows fall below the clip). It does NOT
+      collapse interior repeated/blank lines (the native Metal mirror renders the host
+      grid as-is — no seam to inject a "… N more …" marker; that would need a separate
+      self-rendered text preview that loses color/TUI fidelity — deliberately not done).
+      - **Row source is the existing `cachedVisibleContents`, NOT a new core getter.**
+        Under pty-host the GUI mirror's `dumpText` is row-accurate (exactly one text line
+        per grid row, no soft-wrap, blank rows preserved, every row newline-terminated),
+        so `realSurface.cachedVisibleContents.get()` split on `\n` (drop one trailing "")
+        IS the viewport grid. (An EARLIER attempt added a Zig `RenderState.trailingBlankRows()`
+        core getter + C export for a grid-accurate blank count — reverted in favor of this,
+        since the mirror text is already row-accurate and pure-Swift keeps it GUI-only +
+        tunable with no host-linking change.) `read_text`'s general path is NOT usable for
+        a row count (it uses `unwrap=true` + trims trailing blanks) — but the **mirror**
+        path (the only one the dashboard hits) does neither, which is what makes this work.
+      - **Footer detection is CONSERVATIVE — never hides content** (the load-bearing
+        design constraint, found by reading real screens): a `working` agent showing the
+        `/workflows` viewer is a TALL box that IS content with a help line under it, and a
+        permission prompt is a SMALL box with a real question — neither may be skipped.
+        `AgentMirrorPreview.chromeTrailingSkip(rows:)` (pure, tested) only skips the footer
+        when ALL hold, else just trailing blanks: (1) a horizontal-rule row (`─`×≥12, the
+        input-box border — ASCII `-` does NOT count, so markdown rules are safe) sits
+        within `maxStatusLines` (3) short lines of the last content; (2) its matching top
+        rule is within `maxBoxRows` (6) — a SMALL box, so the tall `/workflows` panel is
+        rejected; (3) the box interior is empty-ish (only `❯`/`>`/box-border/whitespace —
+        a typed command or a permission question makes it non-empty → shown). Handles both
+        Claude Code footer shapes (full-width `───`/`❯`/`───` rules and rounded `╭─╮`/`│ │`/
+        `╰─╯` boxes).
+      - The offset is a pure, tested `AgentMirrorPreview.bottomAnchorOffset(skipRows:…)`
+        (clamped to `rows-1` so an all-blank screen keeps one row visible), refreshed by
+        `refreshSkipRows()` on a light 1.0s per-tile timer (live frames render off the
+        Metal path, not via `@Published`, so a poll — not an observer — drives it).
+        Limitation: a placeholder prompt (`❯ Try "…"`) reads as non-empty interior → the
+        box is shown (conservative); most active agents show a bare `❯`. **GUI-only, no
+        Zig/host change, GUI relaunch to pick up.** Wiring: `AgentDashboard/AgentPreviewTile.swift`
+        (`chromeTrailingSkip` + `isRuleRow`/`isEmptyInteriorRow`/`isBlankRow` +
+        `bottomAnchorOffset` + `refreshSkipRows` + `.offset` + timer). Tests:
+        `macos/Tests/AgentDashboard/AgentDashboardTests.swift` (`ChromeTrailingSkipTests`
+        — grounded in real captured footers — + `BottomAnchorOffsetTests`).
   - **Detection is HOST-GATED on a NEW protocol frame.** Under `.client` the GUI mirror
     can't read the foreground process, so the host pushes the raw foreground pid via an
     additive `foreground_pid` frame (**protocol minor bumped 3→4**); the GUI walks that

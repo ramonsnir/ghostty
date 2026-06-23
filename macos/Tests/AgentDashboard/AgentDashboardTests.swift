@@ -75,7 +75,7 @@ struct BottomAnchorOffsetTests {
     @Test func zeroWhenNoTrailingBlanks() {
         // A full screen (no trailing blanks) is unchanged — plain bottom-anchor.
         let off = AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 0, rows: 40, cellH: 30, backing: 2, scale: 0.5)
+            skipRows: 0, rows: 40, cellH: 30, backing: 2, scale: 0.5)
         #expect(off == 0)
     }
 
@@ -83,7 +83,7 @@ struct BottomAnchorOffsetTests {
         // 10 blank trailing rows of a 40-row grid: shift down by 10 scaled rows.
         // Per-row scaled height = (cellH / backing) * scale = (30/2)*0.5 = 7.5.
         let off = AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 10, rows: 40, cellH: 30, backing: 2, scale: 0.5)
+            skipRows: 10, rows: 40, cellH: 30, backing: 2, scale: 0.5)
         #expect(abs(off - 75) < 0.0001)   // 10 * 7.5
     }
 
@@ -93,25 +93,119 @@ struct BottomAnchorOffsetTests {
         let bk: CGFloat = 2, cellH: CGFloat = 30, scale: CGFloat = 0.5
         let scaledRowH = (cellH / bk) * scale
         let off = AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 24, rows: 24, cellH: cellH, backing: bk, scale: scale)
+            skipRows: 24, rows: 24, cellH: cellH, backing: bk, scale: scale)
         #expect(abs(off - CGFloat(23) * scaledRowH) < 0.0001)
     }
 
     @Test func zeroForDegenerateInputs() {
         // No cell size / no scale / single-row grid → no offset (never NaN/inf).
         #expect(AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 5, rows: 40, cellH: 0, backing: 2, scale: 0.5) == 0)
+            skipRows: 5, rows: 40, cellH: 0, backing: 2, scale: 0.5) == 0)
         #expect(AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 5, rows: 40, cellH: 30, backing: 2, scale: 0) == 0)
+            skipRows: 5, rows: 40, cellH: 30, backing: 2, scale: 0) == 0)
         #expect(AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 1, rows: 1, cellH: 30, backing: 2, scale: 0.5) == 0)
+            skipRows: 1, rows: 1, cellH: 30, backing: 2, scale: 0.5) == 0)
     }
 
     @Test func zeroBackingTreatedAsTwo() {
         // backing 0 is treated as 2 (matches `geometry`), so no divide-by-zero.
         let off = AgentMirrorPreview.bottomAnchorOffset(
-            trailingBlankRows: 4, rows: 40, cellH: 30, backing: 0, scale: 0.5)
+            skipRows: 4, rows: 40, cellH: 30, backing: 0, scale: 0.5)
         #expect(abs(off - 4 * (30.0 / 2.0) * 0.5) < 0.0001)
+    }
+}
+
+// MARK: - AgentMirrorPreview.chromeTrailingSkip (pure; skip blanks + footer)
+
+struct ChromeTrailingSkipTests {
+    // A full-width horizontal rule, as Claude Code draws the input box border.
+    private static let rule = String(repeating: "─", count: 60)
+
+    @Test func skipsClaudeCodeInputBoxAndModeLines() {
+        // Real Claude Code footer shape: content, then ─/❯/─ input box, then two
+        // status/mode lines. Everything from the top rule down is skipped so the
+        // last CONTENT line ("last content line") lands at the bottom.
+        let rows = [
+            "  some earlier output",
+            "  last content line",
+            Self.rule,                       // input box top border
+            "❯ ",                            // empty prompt interior
+            Self.rule,                       // input box bottom border
+            "  🟢 ctx:63%",                  // status line
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · PR #1762",  // mode line
+        ]
+        // Skip the 5 footer rows (top rule … last mode line); keep both content.
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 5)
+    }
+
+    @Test func skipsFooterWithTrailingBlankRows() {
+        // Same footer but with trailing blank rows after the mode line: blanks +
+        // footer are all skipped.
+        let rows = [
+            "  content",
+            Self.rule, "❯ ", Self.rule,
+            "  ⏵⏵ auto mode on",
+            "", "",
+        ]
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 6)
+    }
+
+    @Test func keepsTallContentBox() {
+        // The /workflows viewer is a TALL rounded box that IS content, with a help
+        // line below it. The top border is far above the bottom border (> maxBoxRows)
+        // so it is NOT mistaken for the input box — nothing is skipped.
+        var rows = ["  ✻ Waiting for 1 dynamic workflow to finish", ""]
+        rows.append(" ╭ Phases " + String(repeating: "─", count: 40) + "╮")  // tall box top
+        for _ in 0..<12 { rows.append(" │  some live workflow row" + String(repeating: " ", count: 10) + "│") }
+        rows.append(" ╰" + String(repeating: "─", count: 48) + "╯")          // tall box bottom
+        rows.append(" ↑↓ select · x stop workflow · p pause · esc back · s save")
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
+    }
+
+    @Test func keepsPermissionPromptBox() {
+        // A small box whose interior has a real question/options must NOT be
+        // skipped (the user needs to see it).
+        let rows = [
+            "  Edit file src/main.zig?",
+            Self.rule,
+            "❯ 1. Yes",
+            "  2. No, and tell Claude what to do differently",
+            Self.rule,
+        ]
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
+    }
+
+    @Test func onlyTrailingBlanksWhenNoFooter() {
+        // No input box at the bottom → only trailing blank rows are skipped.
+        let rows = ["  line a", "  line b", "", "", ""]
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 3)
+    }
+
+    @Test func allBlankSkipsEverything() {
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: ["", "", ""]) == 3)
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: []) == 0)
+    }
+
+    @Test func doesNotSkipBoxBuriedUnderManyStatusLines() {
+        // If the input box is more than maxStatusLines (3) above the last content,
+        // it's not treated as the bottom footer (avoids eating content).
+        let rows = [
+            "  content",
+            Self.rule, "❯ ", Self.rule,
+            "  s1", "  s2", "  s3", "  s4",   // 4 status-ish lines (> maxStatusLines)
+        ]
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
+    }
+
+    @Test func ruleRowDetectionIgnoresAsciiDashes() {
+        // ASCII '-' (markdown table separators etc.) is NOT a box rule, so a row
+        // of ASCII dashes is treated as content, not an input-box border.
+        let rows = [
+            "  content",
+            String(repeating: "-", count: 60),  // ASCII dashes — not a rule
+            "  more content",
+        ]
+        #expect(AgentMirrorPreview.chromeTrailingSkip(rows: rows) == 0)
     }
 }
 

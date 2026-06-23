@@ -1771,21 +1771,6 @@ pub const CAPI = struct {
         ptr.deinit();
     }
 
-    /// Returns the number of trailing blank rows in the surface's viewport —
-    /// rows at the bottom whose cells contain no text. Used by the macOS Agent
-    /// Dashboard preview (ramon fork) to anchor a thumbnail at the last row with
-    /// content instead of the absolute bottom, so a partially-filled screen
-    /// fills the preview. Reads the host render mirror under the `.client`
-    /// (pty-host) backend — the only screen state present in this process — and
-    /// returns 0 when there is no mirror (e.g. the `.exec` backend), so the
-    /// caller falls back to a plain bottom-anchor.
-    export fn ghostty_surface_trailing_blank_rows(surface: *Surface) u32 {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
-        const mirror = surface.core_surface.renderer_state.mirror orelse return 0;
-        return mirror.trailingBlankRows();
-    }
-
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_refresh(surface: *Surface) void {
         surface.refresh();
