@@ -48,13 +48,17 @@ struct AgentDashboardView: View {
             // Full-width rows in a List so `.onMove` gives drag-to-reorder for
             // free (the dashboard is already a single column). The list chrome is
             // stripped (plain style, hidden separators/background, clear rows) so
-            // the tiles keep their card look. Reordering does NOT remount the
-            // mirror previews — `ForEach` identity stays `entry.id` and the
-            // mirror's `.id(sessionID)` is untouched.
+            // the tiles keep their card look. Row insets are zeroed on the LEADING
+            // and TRAILING edges so tiles span EDGE-TO-EDGE (no side gutter) — only
+            // a small top/bottom inset remains to separate stacked cards. (Plain
+            // `List` otherwise reserves a horizontal gutter; explicit zero insets
+            // override it.) Reordering does NOT remount the mirror previews —
+            // `ForEach` identity stays `entry.id` and the mirror's `.id(sessionID)`
+            // is untouched.
             List {
                 if !ptyHostEnabled {
                     banner("Live previews require pty-host. Showing metadata-only tiles.")
-                        .listRowInsets(EdgeInsets(top: 12, leading: 12, bottom: 0, trailing: 12))
+                        .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 0, trailing: 0))
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
                         .moveDisabled(true)
@@ -69,7 +73,7 @@ struct AgentDashboardView: View {
                         onDismiss: { model.dismissSuggestion(entry.id) },
                         onSetNote: { text in model.setUserNotes(entry.id, text) }
                     )
-                    .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
                 }
