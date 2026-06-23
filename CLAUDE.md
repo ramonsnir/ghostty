@@ -976,7 +976,12 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   to release unless `HEAD == ramon-fork`. **One-time per machine:** Developer ID cert in the login keychain;
   Sparkle private key in the keychain (`sign_update` uses it automatically — no file);
   `sign_update`+`generate_keys` on PATH (copied to `~/.local/bin`) and `create-dmg`
-  (`npm i -g create-dmg`); a notary keychain profile —
+  (`npm i -g create-dmg`). **nvm note:** when `create-dmg`/`node` live under nvm and
+  aren't on a non-login/GUI shell's PATH (and `node`/`npm` are recursive lazy-load
+  shims), the script SELF-HEALS — it `unset -f node npm` and prepends the nvm node bin
+  that has `create-dmg`, so an unattended/monitor run from such a shell still works (no
+  manual PATH setup). A Homebrew `create-dmg` already on PATH makes that a no-op. A
+  notary keychain profile —
   `xcrun notarytool store-credentials ghostty-ramon-notary --key <AuthKey.p8> --key-id <ID> --issuer <UUID>`.
   **NOTARY GOTCHA (cost me a real chase):** a freshly-enrolled Apple Developer account's
   FIRST notarizations can sit `status: In Progress` for HOURS (Apple-side provisioning /
