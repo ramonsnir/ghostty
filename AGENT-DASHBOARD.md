@@ -135,6 +135,16 @@ A hook-backed tile shows one of three states next to its badge:
   on the same surface within ~3s never swallows the `⏳` waiting push. The waiting
   auto-unhide lands once, on entering waiting, so you *can* re-hide a still-waiting tile
   (a bell, which re-rings, cannot).
+- **⚙ background** (neutral/blue **"⚙ background" chip** + quiet **"N shell running"**
+  pill) — the agent reported `waiting`, BUT Claude Code's footer still shows one or more
+  **background shells running** (a `run_in_background` / Ctrl-B command). It is then
+  waiting on its OWN work, not on you, so the tile is **DEMOTED**: it does NOT sort to the
+  top, does NOT auto-unhide, and fires NO Web Push — and no premature suggested reply is
+  shown. The shell count is read from the live viewport (no hook tells us about background
+  shells). When the shell finishes it normally wakes the agent (Claude Code injects a
+  task-notification → the agent works, then genuinely waits), and that fresh transition
+  re-arms the real **waiting** chip + push. So "Set up DMG…" running a ~20-min background
+  build no longer reads as "needs you".
 - **idle** (dim) — the agent finished its turn (`Stop`) or the session ended
   (`SessionEnd`).
 

@@ -54,7 +54,17 @@ struct AgentPreviewTile: View {
     /// the bell's clear-on-focus is what makes leaving a `.waiting` status around
     /// non-annoying.
     private var bellRinging: Bool { entry.bell }
-    private var waitingForInput: Bool { entry.agentState == .waiting }
+
+    /// (ramon fork / Agent hooks) The agent has reported `.waiting` but ALSO has a
+    /// live background shell churning (read from Claude Code's footer — see
+    /// `AgentMirrorPreview.backgroundShellCount`). It is then waiting on its OWN
+    /// work, not on the user, so the tile is DEMOTED: it shows a neutral
+    /// "⚙ background" chip (not the amber "waiting ⚠" nag), keeps the "needs input"
+    /// pill / premature suggested-reply hidden, and (model-side) is excluded from
+    /// the attention sort + the phone push. When the shell exits and the agent
+    /// genuinely turns to the user, a fresh hook event re-arms the real waiting.
+    private var hasBackgroundWork: Bool { entry.backgroundShells > 0 }
+    private var waitingForInput: Bool { entry.agentState == .waiting && !hasBackgroundWork }
 
     /// Fixed height of the preview area. Kept deliberately SHORTER than a
     /// full-width terminal scales to, so the bottom-anchored mirror clips the
@@ -265,7 +275,13 @@ struct AgentPreviewTile: View {
         case .working:
             chip("working", fg: .blue, bg: Color.blue.opacity(0.18))
         case .waiting:
-            chip("waiting ⚠", fg: Self.bellAmber, bg: Self.bellAmber.opacity(0.2))
+            // Background-busy → neutral "⚙ background" (it's working on its own
+            // shell, not nagging); otherwise the amber "waiting ⚠" needs-you chip.
+            if hasBackgroundWork {
+                chip("⚙ background", fg: .blue, bg: Color.blue.opacity(0.18))
+            } else {
+                chip("waiting ⚠", fg: Self.bellAmber, bg: Self.bellAmber.opacity(0.2))
+            }
         case .idle:
             chip("idle", fg: .secondary, bg: Color.secondary.opacity(0.15))
         case .none:
@@ -375,6 +391,14 @@ struct AgentPreviewTile: View {
                 // Hook-driven status: persists until the agent reports a new state
                 // (NOT cleared by focus, unlike the bell frame/icon).
                 pill("needs input", color: Self.bellAmber)
+            } else if entry.agentState == .waiting, hasBackgroundWork {
+                // Demoted waiting: a quiet, NON-amber info pill (it isn't a nag —
+                // the agent is waiting on its own background shell, not the user).
+                pill(
+                    entry.backgroundShells == 1
+                        ? "1 shell running"
+                        : "\(entry.backgroundShells) shells running",
+                    color: .secondary)
             }
         }
         .padding(.horizontal, 8)
@@ -410,6 +434,9 @@ struct AgentPreviewTile: View {
     @ViewBuilder
     private var suggestionRow: some View {
         if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty,
+           // Background-busy waiting is not a real "your turn" yet → don't surface a
+           // premature suggested reply (mirrors the demoted chip/pill).
+           !hasBackgroundWork,
            Self.shouldShowSuggestion(
                confidence: entry.annotation?.confidence, agentState: entry.agentState) {
             let style = Self.suggestionStyle(confidence: entry.annotation?.confidence)
@@ -836,5 +863,62 @@ struct AgentMirrorPreview: View {
             return false
         }
         return true
+    }
+
+    // MARK: - Background-shell detection (ramon fork / Agent hooks)
+
+    /// How many trailing rows to scan for Claude Code's background-shell footer
+    /// indicator. The indicator always lives in the bottom status line(s), so a
+    /// small window both bounds the cost and keeps false positives out of the
+    /// scrollback content above the footer.
+    private static let bgShellScanRows = 8
+
+    /// PURE: the number of BACKGROUND SHELLS Claude Code reports as still running,
+    /// read from its bottom status line — `0` when none. Used to DEMOTE a tile
+    /// that the hook reports as `.waiting`: an agent that has finished its turn but
+    /// still has a background shell churning is waiting on its OWN work, not on the
+    /// user, so it must not nag (see `AgentDashboardModel.needsAttention` /
+    /// `applyAgentState`).
+    ///
+    /// Claude Code renders the count in its footer in two shapes, both of which we
+    /// match (a digit run immediately before the word "shell"):
+    ///   - idle / auto mode:  `⏵⏵ auto mode on · 1 shell · ← for age…`
+    ///   - processing:        `✻ Crunched for 1m 48s · 1 shell still running`
+    ///
+    /// We only consider STATUS lines (real text, no box-drawing — same test the
+    /// footer skip uses), so a `│ … shell … │` box-interior content row is never
+    /// mistaken for the indicator. `rows` is the row-accurate viewport (top-first).
+    static func backgroundShellCount(rows: [String]) -> Int {
+        let start = max(0, rows.count - bgShellScanRows)
+        var count = 0
+        for row in rows[start...] where isStatusLine(row) {
+            if let n = shellCount(inStatusLine: row) { count = max(count, n) }
+        }
+        return count
+    }
+
+    /// PURE: extract `N` from a `… N shell[s] …` status line, or nil if the line
+    /// carries no `<digits> shell` token. A single space between the number and
+    /// "shell" is tolerated (the `· 1 shell ·` form); a non-digit/non-space char
+    /// before "shell" (e.g. a letter, as in "myshell") yields no count.
+    static func shellCount(inStatusLine s: String) -> Int? {
+        let chars = Array(s)
+        let needle = Array("shell")
+        var best: Int? = nil
+        var i = 0
+        while i + needle.count <= chars.count {
+            if Array(chars[i ..< i + needle.count]) == needle {
+                var j = i - 1
+                if j >= 0 && chars[j] == " " { j -= 1 }   // tolerate one space
+                var digits = ""
+                while j >= 0, chars[j].isNumber {
+                    digits = String(chars[j]) + digits
+                    j -= 1
+                }
+                if let n = Int(digits) { best = max(best ?? 0, n) }
+            }
+            i += 1
+        }
+        return best
     }
 }

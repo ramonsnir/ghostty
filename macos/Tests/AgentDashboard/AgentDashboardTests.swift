@@ -280,6 +280,64 @@ struct ChromeTrailingSkipTests {
     }
 }
 
+// MARK: - AgentMirrorPreview.backgroundShellCount (pure; Claude Code footer)
+
+struct BackgroundShellCountTests {
+    // Grounded in the REAL footers captured from a live "background build" session
+    // (the case this feature was built for).
+    @Test func autoModeFooterReportsOneShell() {
+        let rows = [
+            "  some agent output",
+            "─────────────────────────────────────────",
+            "❯ ",
+            "─────────────────────────────────────────",
+            "  ⏵⏵ auto mode on · 1 shell · ← for age…",
+        ]
+        #expect(AgentMirrorPreview.backgroundShellCount(rows: rows) == 1)
+    }
+
+    @Test func spinnerFooterReportsOneShell() {
+        let rows = ["✻ Crunched for 1m 48s · 1 shell still running"]
+        #expect(AgentMirrorPreview.backgroundShellCount(rows: rows) == 1)
+    }
+
+    @Test func pluralShellsParsed() {
+        #expect(AgentMirrorPreview.backgroundShellCount(
+            rows: ["  ⏵⏵ auto mode on · 2 shells · ← for age…"]) == 2)
+    }
+
+    @Test func noIndicatorIsZero() {
+        let rows = [
+            "  some agent output",
+            "  ⏵⏵ auto mode on · ← for age…",   // no shell token
+        ]
+        #expect(AgentMirrorPreview.backgroundShellCount(rows: rows) == 0)
+    }
+
+    @Test func wordShellWithoutCountIsZero() {
+        // "shell" in content with no preceding digit must NOT match.
+        #expect(AgentMirrorPreview.backgroundShellCount(
+            rows: ["wrote a shell script", "ran the shell"]) == 0)
+        // A letter immediately before "shell" (no number) is not a count.
+        #expect(AgentMirrorPreview.shellCount(inStatusLine: "myshell") == nil)
+    }
+
+    @Test func onlyTrailingRowsScanned() {
+        // A "1 shell" far ABOVE the scan window (footer) is ignored — the indicator
+        // only ever lives in the bottom status line.
+        var rows = ["history: 1 shell started earlier"]
+        rows.append(contentsOf: Array(repeating: "  content", count: 12))
+        #expect(AgentMirrorPreview.backgroundShellCount(rows: rows) == 0)
+    }
+
+    @Test func boxInteriorContentNotMistaken() {
+        // A filled box-interior row carrying "shell" is NOT a status line (it has
+        // box-drawing borders), so it never counts.
+        let rows = ["│ run 3 shell tests │"]
+        #expect(AgentMirrorPreview.backgroundShellCount(rows: rows) == 0)
+    }
+}
+
 // MARK: - AgentPreviewTile.suggestionStyle (pure; confidence dimming)
 
 struct SuggestionStyleTests {
@@ -906,7 +964,8 @@ struct AgentDashboardSortTests {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
               agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
-              annotation: nil, userNotes: nil, suggestionDismissed: false)
+              annotation: nil, userNotes: nil, suggestionDismissed: false,
+              backgroundShells: 0)
     }
 
     @Test func bellFirst() {
@@ -959,7 +1018,8 @@ struct AgentDashboardSortTests {
               bell: bell, hidden: false, sessionID: session,
               agentState: waiting ? .waiting : nil,
               lastTool: nil, lastPrompt: nil, hookBacked: false,
-              annotation: nil, userNotes: nil, suggestionDismissed: false)
+              annotation: nil, userNotes: nil, suggestionDismissed: false,
+              backgroundShells: 0)
     }
 
     @Test func manualRankOrdersPlacedTiles() {
@@ -1135,6 +1195,69 @@ struct AgentDashboardHookStateTests {
         let entered = model.applyAgentState(a, payload(.waiting, message: "input?"))
         #expect(entered == true)
         #expect(model.agentStates[a] == .waiting)
+    }
+
+    @Test func backgroundBusyWaitingIsNotAnAttentionEdge() {
+        // (ramon fork / Agent hooks) Entering `.waiting` while a background shell is
+        // running is DEMOTED: it is NOT an attention edge (returns false, so the
+        // controller fires no push) and does NOT auto-unhide. The state is still
+        // recorded as `.waiting` and the entry carries the shell count for the chip.
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working))
+        model.hide(a)
+
+        // working -> waiting WITH a background shell: demoted.
+        let entered = model.applyAgentState(a, payload(.waiting, message: "?"),
+                                            backgroundShells: 1)
+        #expect(entered == false)              // no push edge
+        #expect(model.hidden.contains(a))      // NOT auto-unhidden
+        #expect(model.agentStates[a] == .waiting)
+    }
+
+    @Test func waitingAfterBackgroundWorkAndWakeIsAnAttentionEdge() {
+        // The realistic recovery flow: a demoted waiting (background shell running)
+        // → the shell completes and WAKES the agent (Claude Code injects a
+        // task-notification → `working`) → the agent finishes and GENUINELY waits
+        // (no shells). That last transition has prev == .working, so it IS an
+        // attention edge and fires the push. (A bare demoted-waiting → genuine-waiting
+        // with NO intervening wake is deliberately NOT a fresh edge — prev is already
+        // `.waiting` — but in practice the shell's completion always wakes the agent.)
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        #expect(model.applyAgentState(a, payload(.waiting, message: "a"),
+                                      backgroundShells: 1) == false)   // demoted, no edge
+        _ = model.applyAgentState(a, payload(.working, tool: "Bash"))  // shell woke it
+        #expect(model.applyAgentState(a, payload(.waiting, message: "b"),
+                                      backgroundShells: 0) == true)     // genuine edge
+    }
+
+    @Test func entriesCarryBackgroundShellCountViaReader() {
+        // The injected reader drives the entry's `backgroundShells` for the chip/sort.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.backgroundShellReader = { _ in 2 }
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.waiting, message: "?"))
+        #expect(model.entries.first(where: { $0.id == a })?.backgroundShells == 2)
+    }
+
+    @Test func nonWaitingEntriesHaveZeroBackgroundShells() {
+        // A working tile never pays the viewport read — its count is always 0 even
+        // if the reader would report shells.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.backgroundShellReader = { _ in 3 }
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        _ = model.applyAgentState(a, payload(.working))
+        #expect(model.entries.first(where: { $0.id == a })?.backgroundShells == 0)
     }
 
     @Test func waitingRepublishDoesNotReEnter() {
@@ -1462,11 +1585,14 @@ struct AgentDashboardHookStateTests {
 
 @MainActor
 struct AgentDashboardWaitingSortTests {
-    private func entry(_ id: UUID, bell: Bool, state: AgentState?) -> AgentEntry {
+    private func entry(
+        _ id: UUID, bell: Bool, state: AgentState?, backgroundShells: Int = 0
+    ) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
               agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil,
-              annotation: nil, userNotes: nil, suggestionDismissed: false)
+              annotation: nil, userNotes: nil, suggestionDismissed: false,
+              backgroundShells: backgroundShells)
     }
 
     @Test func waitingBeatsWorking() {
@@ -1487,6 +1613,37 @@ struct AgentDashboardWaitingSortTests {
         ]).map(\.id)
         // Both attention tiles precede the quiet one; quiet is last.
         #expect(sorted.last == quiet)
+    }
+
+    @Test func backgroundBusyWaitingIsDemotedFromAttention() {
+        // (ramon fork / Agent hooks) A `.waiting` tile with a live background shell
+        // is DEMOTED — it is waiting on its own work, not the user. Fixed UUIDs make
+        // the tiebreak deterministic: working < bgWaiting lexically.
+        let working = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let bgWaiting = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        // Genuine waiting (no shells) floats above working regardless of UUID.
+        let genuine = AgentDashboardModel.sorted([
+            entry(working, bell: false, state: .working),
+            entry(bgWaiting, bell: false, state: .waiting, backgroundShells: 0),
+        ]).map(\.id)
+        #expect(genuine.first == bgWaiting)        // attention beats uuid
+        // Background-busy waiting is demoted → not attention → falls to UUID order,
+        // so the working tile (smaller UUID) is now first.
+        let demoted = AgentDashboardModel.sorted([
+            entry(working, bell: false, state: .working),
+            entry(bgWaiting, bell: false, state: .waiting, backgroundShells: 1),
+        ]).map(\.id)
+        #expect(demoted.first == working)
+    }
+
+    @Test func bellStillFloatsEvenWithBackgroundShell() {
+        // A bell is a real event: it floats the tile even if a background shell runs.
+        let ring = UUID(), quiet = UUID()
+        let sorted = AgentDashboardModel.sorted([
+            entry(quiet, bell: false, state: .working),
+            entry(ring, bell: true, state: .waiting, backgroundShells: 2),
+        ]).map(\.id)
+        #expect(sorted.first == ring)
     }
 }
 
@@ -1847,7 +2004,8 @@ struct AgentDashboardOriginTests {
                      bell: bell, hidden: false, sessionID: session,
                      agentState: waiting ? .waiting : nil,
                      lastTool: nil, lastPrompt: nil, hookBacked: false,
-                     annotation: ann, userNotes: nil, suggestionDismissed: false)
+                     annotation: ann, userNotes: nil, suggestionDismissed: false,
+                     backgroundShells: 0)
     }
 
     // MARK: pure origin/grouping/filter
