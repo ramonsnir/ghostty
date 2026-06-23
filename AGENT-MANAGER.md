@@ -78,10 +78,18 @@ When a session is **waiting** on you, its tile shows a proposed reply with three
   changes** (a new prompt/tool/state or a real screen change), so a reply you rejected
   doesn't keep coming back unchanged.
 
-Each suggestion shows an inline **confidence %** — the manager's honest self-rating of
-how well the reply advances your stated goal. A low-confidence suggestion (below ~50%) is
-**dimmed** rather than hidden: every suggestion is still shown, but a weak "had to say
-something" reply reads as secondary while a strong, goal-advancing one is full-strength.
+**The manager proposes a reply ONLY when it would actually move the session forward** —
+it answers a question the agent is blocked on, makes a decision it's waiting for, or
+gives concrete next direction grounded in your goals. When it has nothing value-adding
+to say (the agent is just finishing/notifying, or it would only be guessing), it
+**abstains and shows nothing** — no "OK, thanks" filler. So an agent that's waiting but
+not truly blocked on *you* will often show just its status summary, which is correct.
+
+Each shown suggestion has an inline **confidence %** — the manager's honest self-rating
+of how grounded/advancing it is. Very-low-confidence replies are **suppressed** (hidden
+entirely); borderline ones (≈35–50%) are **dimmed** so strong, goal-advancing ones stand
+out. Want more (or fewer) suggestions on a session? Give it **notes** (below) — concrete
+goals make more replies "grounded"; vague sessions correctly stay quiet.
 
 Each tile also has a **notes** field: type the session's goal/guidance there (e.g.
 "after the fix, add tests and update the changelog") and the manager weights it in
@@ -116,12 +124,13 @@ if the goal is ambiguous."
   exists); confirm `mcp-listen`/`mcp-token` are set.
 - **Summaries look generic?** That's the no-hooks fallback (viewport-only). Install the
   Claude Code hooks so your prompt + working/waiting state reach the summarizer.
-- **No suggestion on a waiting tile?** Suggestions need the hooks (the `waiting` state
-  comes from them) and only fire after the ~20s manager debounce; a session the hooks
-  never marked `waiting` won't get one. The summary still works without hooks. (The
-  manager runs on its OWN budget separate from the summarizer, so a busy multi-agent
-  fleet no longer starves it of suggestions — if you ever see summaries but never
-  suggestions again, that's a regression worth reporting.)
+- **No suggestion on a waiting tile?** Often correct: the manager **abstains** unless it
+  has a grounded, value-adding reply (it won't pad with acknowledgments). It also needs the
+  hooks (the `waiting` state comes from them), fires only after the ~20s debounce, and
+  suppresses anything it rates low-confidence. To get a suggestion where you expect one,
+  add **notes** stating the goal so a reply becomes "grounded." (Separately: the manager has
+  its OWN budget, so a busy fleet doesn't starve it — if you see summaries but the manager
+  *never* suggests on ANY genuinely-blocked tile, that's a regression worth reporting.)
 
 ## Cost & privacy
 
