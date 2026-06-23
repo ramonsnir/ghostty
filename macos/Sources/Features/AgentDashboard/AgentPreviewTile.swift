@@ -79,10 +79,19 @@ struct AgentPreviewTile: View {
     /// (0.5) → shown (an un-rated/legacy annotation is never hidden).
     static let CONF_SUPPRESS_THRESHOLD: Double = 0.35
 
-    /// Whether a suggestion with this (optional) confidence should be SHOWN at all.
-    /// PURE + unit-tested. `nil` ⇒ shown (treated as mid 0.5).
-    static func shouldShowSuggestion(confidence: Double?) -> Bool {
-        (confidence ?? 0.5) >= CONF_SUPPRESS_THRESHOLD
+    /// Whether a suggestion with this (optional) confidence should be SHOWN at all,
+    /// given the agent's (optional) current `agentState`. PURE + unit-tested.
+    /// `confidence` `nil` ⇒ treated as mid 0.5. `agentState`:
+    /// - `.working` ⇒ NEVER shown — a suggestion is only meaningful when the agent is
+    ///   waiting on the user; while it's actively working, surfacing a stale reply
+    ///   (left over from a prior `.waiting` turn, before the manager re-evaluates) is
+    ///   noise at best and a footgun at worst. The manager only WRITES suggestions on
+    ///   `waiting` tiles, but the annotation persists across the waiting→working edge,
+    ///   so this view gate is what keeps a working tile clean.
+    /// - any other state (`.waiting`/`.idle`/`nil`) ⇒ gated on the confidence floor only.
+    static func shouldShowSuggestion(confidence: Double?, agentState: AgentState? = nil) -> Bool {
+        if agentState == .working { return false }
+        return (confidence ?? 0.5) >= CONF_SUPPRESS_THRESHOLD
     }
 
     /// PURE style for a suggestion given its (optional) confidence. Factored out for
@@ -393,7 +402,8 @@ struct AgentPreviewTile: View {
     @ViewBuilder
     private var suggestionRow: some View {
         if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty,
-           Self.shouldShowSuggestion(confidence: entry.annotation?.confidence) {
+           Self.shouldShowSuggestion(
+               confidence: entry.annotation?.confidence, agentState: entry.agentState) {
             let style = Self.suggestionStyle(confidence: entry.annotation?.confidence)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
