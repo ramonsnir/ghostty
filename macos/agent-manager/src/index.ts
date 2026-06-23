@@ -543,8 +543,11 @@ async function main(): Promise<void> {
     if (!stopped) queueTimer = setTimeout(() => void queueTick(), QUEUE_POLL_INTERVAL_MS);
   };
 
-  await tick();
+  // Start the INDEPENDENT queue loop FIRST, so it is never delayed (or blocked
+  // forever) by the slow — or occasionally hanging — first summarizer/manager sweep
+  // in `tick`. Both loops then run concurrently on the event loop.
   if (deps.queue !== undefined) void queueTick();
+  await tick();
 }
 
 // Only start the poll loop when this module is the program ENTRY POINT (i.e.
