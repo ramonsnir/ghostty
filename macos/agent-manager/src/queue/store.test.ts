@@ -11,8 +11,10 @@ import {
   finalizeRecord,
   isAssignmentState,
   loadLifetimeDispatched,
+  loadDispatched,
   loadStore,
   makePendingRecord,
+  parseDispatched,
   parseLifetimeDispatched,
   parseStore,
   persistStore,
@@ -102,6 +104,45 @@ test("persistStore writes + loadLifetimeDispatched reads back the counter", () =
   persistStore(io, [asgn()], 12);
   assert.equal(loadLifetimeDispatched(io), 12);
   assert.equal(loadStore(io).length, 1);
+});
+
+test("serializeStore persists the dispatched latch; parseDispatched round-trips it (deduped)", () => {
+  const text = serializeStore([asgn()], 3, ["K-1", "K-2", "K-1"]);
+  assert.deepEqual(parseDispatched(text).sort(), ["K-1", "K-2"]);
+  // The records + counter still round-trip alongside the latch.
+  assert.equal(parseStore(text).length, 1);
+  assert.equal(parseLifetimeDispatched(text), 3);
+});
+
+test("parseDispatched tolerates absent / garbage / wrong-shape / non-string entries => []", () => {
+  assert.deepEqual(parseDispatched(null), []);
+  assert.deepEqual(parseDispatched(""), []);
+  assert.deepEqual(parseDispatched("not json"), []);
+  assert.deepEqual(parseDispatched("[1,2,3]"), []); // top-level array, not an object
+  assert.deepEqual(parseDispatched('{"records":[]}'), []); // no dispatched field (pre-upgrade)
+  assert.deepEqual(parseDispatched('{"dispatched":"K-1"}'), []); // not an array
+  assert.deepEqual(parseDispatched('{"dispatched":["K-1",2,"",null,"K-1"]}'), ["K-1"]); // strings only, deduped
+});
+
+test("persistStore writes + loadDispatched reads back the latch", () => {
+  const io = memIO();
+  persistStore(io, [asgn()], 5, ["K-7", "K-9"]);
+  assert.deepEqual(loadDispatched(io).sort(), ["K-7", "K-9"]);
+  // The latch is independent of the records + counter on the same file.
+  assert.equal(loadLifetimeDispatched(io), 5);
+  assert.equal(loadStore(io).length, 1);
+});
+
+test("loadDispatched returns [] when the seam read throws", () => {
+  const io: StoreIO = {
+    read() {
+      throw new Error("boom");
+    },
+    write() {
+      /* noop */
+    },
+  };
+  assert.deepEqual(loadDispatched(io), []);
 });
 
 test("loadLifetimeDispatched returns 0 when the seam read throws", () => {
