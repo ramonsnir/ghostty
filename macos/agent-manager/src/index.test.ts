@@ -471,6 +471,46 @@ test("runSweep: the manager is NOT starved when the summarizer budget is exhaust
   assert.equal(deps.managerBudget.active, 0, "manager budget released");
 });
 
+test("runSweep: a LOW-confidence suggestion is SUPPRESSED (not written)", async () => {
+  // Quality gate: filler the model rated below suppressBelow is treated as abstain —
+  // nothing is written to the tile (shows the summary only).
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "waiting" })],
+    screens: { s1: "All done — anything else?" },
+  });
+  const lowConf: SuggestFn = async () =>
+    '{"suggestion":"Sounds good, I will continue.","confidence":0.2}';
+  const { deps, suggestCalls } = makeDeps({ fake, summarize: okSummary, suggest: lowConf });
+
+  await runSweep(deps);
+
+  assert.equal(suggestCalls.length, 1, "manager was consulted");
+  assert.equal(
+    fake.setCalls.find((c) => c.ann.suggestion !== undefined),
+    undefined,
+    "no suggestion written (suppressed below the confidence floor)",
+  );
+  // The attempt is still recorded (debounce) so it doesn't re-fire every poll.
+  assert.ok(deps.lastSuggestionBySession.get("s1"), "suppressed attempt is debounced");
+});
+
+test("runSweep: an ABSTAIN (empty suggestion) writes nothing", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "waiting" })],
+    screens: { s1: "Task finished." },
+  });
+  const abstain: SuggestFn = async () => '{"suggestion":"","confidence":0}';
+  const { deps } = makeDeps({ fake, summarize: okSummary, suggest: abstain });
+
+  await runSweep(deps);
+
+  assert.equal(
+    fake.setCalls.find((c) => c.ann.suggestion !== undefined),
+    undefined,
+    "abstain → no suggestion written",
+  );
+});
+
 test("runSweep: a WORKING agent never triggers the manager pass", async () => {
   const fake = makeFakeClient({
     surfaces: [makeSurface({ id: "s1", agentState: "working" })],
