@@ -52,8 +52,25 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 GHOSTTY_BUILD="$(git rev-list --count HEAD)"
 GHOSTTY_COMMIT="$(git rev-parse --short HEAD)"
-TAG="build-${GHOSTTY_BUILD}"
-echo ">> Releasing $TAG ($GHOSTTY_COMMIT) to $REPO"
+GHOSTTY_COMMIT_LONG="$(git rev-parse HEAD)"
+# Tag is UNIQUE per commit (the count alone can repeat across rebases/merges, which
+# would clobber a prior release); the GitHub release will --target this exact commit.
+TAG="build-${GHOSTTY_BUILD}-${GHOSTTY_COMMIT}"
+echo ">> Releasing $TAG to $REPO"
+
+# Releases build the LOCAL working tree, so the built commit must be on GitHub for a
+# coherent release (tag = built commit = the DMG's source). Guard + push FIRST.
+# `git push fork` uses the pinned refspec (ramon-fork -> fork/main) regardless of the
+# checked-out branch, so the release MUST be cut from ramon-fork's tip.
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse ramon-fork)" ]; then
+  echo "ERROR: HEAD ($GHOSTTY_COMMIT) is not ramon-fork's tip — releases must be cut from ramon-fork."; exit 1
+fi
+if [ "${RELEASE_YES:-}" != "1" ] && [ -t 0 ]; then
+  read -r -p ">> Push ramon-fork -> fork/main and publish $TAG? [y/N] " _ans
+  case "$_ans" in y|Y|yes|YES) ;; *) echo "aborted"; exit 1 ;; esac
+fi
+echo ">> [0/8] push ramon-fork -> fork/main (so the release tags the exact built commit)"
+git push fork
 
 # ---- 1. xcframework + ghostty-host -----------------------------------------
 echo ">> [1/8] zig build (xcframework + ghostty-host)"
@@ -127,7 +144,7 @@ python3 dist/macos/fork_appcast.py
 test -f "$WORKDIR/appcast.xml"
 
 # Idempotent publish (no destructive delete window).
-gh release create "$TAG" --repo "$REPO" \
+gh release create "$TAG" --repo "$REPO" --target "$GHOSTTY_COMMIT_LONG" \
   --title "Ghostty (ramon) build $GHOSTTY_BUILD ($GHOSTTY_COMMIT)" \
   --notes "Local fork build from $GHOSTTY_COMMIT." --latest 2>/dev/null || true
 gh release upload "$TAG" "$DMG" "$WORKDIR/appcast.xml" --repo "$REPO" --clobber

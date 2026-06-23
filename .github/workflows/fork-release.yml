@@ -284,7 +284,7 @@ jobs:
           echo "$SPARKLE_PRIVATE_KEY" > signing.key
           sign_update -f signing.key Ghostty.dmg > sign_update.txt
           rm -f signing.key
-          export GHOSTTY_DMG_URL="https://github.com/${{ github.repository }}/releases/download/build-${GHOSTTY_BUILD}/Ghostty.dmg"
+          export GHOSTTY_DMG_URL="https://github.com/${{ github.repository }}/releases/download/build-${GHOSTTY_BUILD}-${GHOSTTY_COMMIT}/Ghostty.dmg"
           export GHOSTTY_PUBDATE="$(date -u +'%a, %d %b %Y %H:%M:%S +0000')"
           # Track what actually shipped rather than a hardcoded floor: read the
           # bundle's LSMinimumSystemVersion (fall back to 13.0 if absent).
@@ -300,13 +300,13 @@ jobs:
           GHOSTTY_BUILD: ${{ steps.version.outputs.build }}
           GHOSTTY_COMMIT: ${{ steps.version.outputs.commit }}
         run: |
-          TAG="build-${GHOSTTY_BUILD}"
-          # The tag is a function of HEAD (commit count), so a workflow_dispatch
-          # re-run on the same commit reuses it. Make publish idempotent WITHOUT a
-          # destructive delete window (a delete-then-failed-create would leave
-          # `releases/latest/download/...` 404ing): create the release if it doesn't
-          # exist, then (re)upload assets with --clobber, then ensure it's `latest`.
-          gh release create "$TAG" \
+          # Unique per commit (count can repeat across rebases/merges) + tag the EXACT
+          # built commit. A workflow_dispatch re-run on the same commit reuses the tag.
+          TAG="build-${GHOSTTY_BUILD}-${GHOSTTY_COMMIT}"
+          # Idempotent publish WITHOUT a destructive delete window (a delete-then-failed-
+          # create would leave `releases/latest/download/...` 404ing): create the release
+          # if it doesn't exist, then (re)upload assets with --clobber, then ensure latest.
+          gh release create "$TAG" --target "${{ github.sha }}" \
             --title "Ghostty (ramon) build ${GHOSTTY_BUILD} (${GHOSTTY_COMMIT})" \
             --notes "Automated fork build from ${GHOSTTY_COMMIT}." \
             --latest 2>/dev/null || true

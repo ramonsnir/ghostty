@@ -963,7 +963,17 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   release that never even published. Notarization is Apple's FREE service; only the CI
   *runner time* costs money, so doing it locally is $0 (notary slowness = wall-clock
   only). Release assets are free and separate from Git LFS. Run it from `ramon-fork`
-  on the main tree. **One-time per machine:** Developer ID cert in the login keychain;
+  on the main tree. **It PUSHES `ramon-fork` → `fork/main` FIRST (after a `[y/N]`
+  confirmation; `RELEASE_YES=1` skips the prompt for unattended/monitor runs), then
+  tags the release at the EXACT built commit** (`gh release create --target <sha>`),
+  with a UNIQUE per-commit tag `build-<N>-<shortsha>`. This is load-bearing: the script
+  builds the LOCAL working tree, so without the push the released binary's source isn't
+  on GitHub and `gh` would otherwise tag `fork/main`'s (stale) head — the binary/tag/
+  build-number mismatch that bit us once (released `build-16645` from local `f174b8a27`
+  while the tag pointed at the older pushed `243f953`). Distinct commits → distinct
+  preserved releases (old ones never deleted; only the `--latest` pointer moves);
+  re-running on the SAME commit re-publishes that one tag idempotently. A guard refuses
+  to release unless `HEAD == ramon-fork`. **One-time per machine:** Developer ID cert in the login keychain;
   Sparkle private key in the keychain (`sign_update` uses it automatically — no file);
   `sign_update`+`generate_keys` on PATH (copied to `~/.local/bin`) and `create-dmg`
   (`npm i -g create-dmg`); a notary keychain profile —
