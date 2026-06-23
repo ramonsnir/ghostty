@@ -1329,6 +1329,15 @@ final class WebMonitorServer {
         /// True when this surface has an active (unacknowledged) bell, so the
         /// phone can flag it and offer to clear it (POST .../bell).
         let bell: Bool
+        /// (ramon fork) True iff the Agent Dashboard's detector matched this surface
+        /// as a CLI agent. Only meaningful when the dashboard is running (see the
+        /// top-level `agentDashboard` flag); false otherwise. Drives the page's
+        /// "agents only" filter.
+        let isAgent: Bool
+        /// (ramon fork) True iff the user has hidden this surface in the Agent
+        /// Dashboard. Only meaningful when the dashboard is running. Drives the
+        /// page's "hide hidden" filter.
+        let hidden: Bool
     }
 
     /// MUST be called on main. Iterates AppKit surfaces (thin) and defers the
@@ -1337,6 +1346,18 @@ final class WebMonitorServer {
     /// split layout — so we group by the window's tab group and number the tabs.
     private func surfacesJSON() -> Data {
         var rows: [SurfaceRow] = []
+        // (ramon fork) Pull the Agent Dashboard's agent/hidden sets so the page can
+        // offer "agents only" / "hide hidden" filters mirroring the dashboard. The
+        // controller's existence == "the dashboard is running"; when it's nil the
+        // page disables the filters. Value types only. `webMonitorFilterState()` is
+        // @MainActor (the controller is); `surfacesJSON()` is always invoked on the
+        // main hop (see the `.surfacesList` handler), so `assumeIsolated` is sound —
+        // matching MCPLayout.surfaceRows' on-main contract.
+        let filter: (agents: Set<UUID>, hidden: Set<UUID>)? =
+            MainActor.assumeIsolated {
+                (NSApp.delegate as? AppDelegate)?.agentDashboard?.webMonitorFilterState()
+            }
+        let dashboardRunning = filter != nil
         // Assign a stable window-group index per tab group (or standalone window)
         // in the order we first encounter it.
         var groupIndex: [ObjectIdentifier: Int] = [:]
@@ -1365,23 +1386,31 @@ final class WebMonitorServer {
                 rows.append(SurfaceRow(
                     id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
                     window: win, tab: tabIdx, tabTitle: tabTitle,
-                    splitIndex: splitIdx, splitCount: leaves.count, bell: view.bell))
+                    splitIndex: splitIdx, splitCount: leaves.count, bell: view.bell,
+                    isAgent: filter?.agents.contains(view.id) ?? false,
+                    hidden: filter?.hidden.contains(view.id) ?? false))
             }
         }
-        return Self.surfacesJSONData(rows)
+        return Self.surfacesJSONData(rows, agentDashboard: dashboardRunning)
     }
 
-    /// Pure JSON shaping for the surfaces list (testable; no AppKit).
-    static func surfacesJSONData(_ rows: [SurfaceRow]) -> Data {
+    /// Pure JSON shaping for the surfaces list (testable; no AppKit). Returns an
+    /// OBJECT `{agentDashboard: Bool, surfaces: [...]}` — `agentDashboard` tells the
+    /// page whether the Agent Dashboard is running (and thus whether the agent/hidden
+    /// filters are usable); `surfaces` is the per-row array. Each row's `isAgent` /
+    /// `hidden` are only meaningful when `agentDashboard` is true.
+    static func surfacesJSONData(_ rows: [SurfaceRow], agentDashboard: Bool) -> Data {
         let arr: [[String: Any]] = rows.map {
             [
                 "id": $0.id, "title": $0.title, "pwd": $0.pwd,
                 "window": $0.window, "tab": $0.tab, "tabTitle": $0.tabTitle,
                 "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
-                "bell": $0.bell,
+                "bell": $0.bell, "isAgent": $0.isAgent, "hidden": $0.hidden,
             ]
         }
-        return (try? JSONSerialization.data(withJSONObject: arr)) ?? Data("[]".utf8)
+        let obj: [String: Any] = ["agentDashboard": agentDashboard, "surfaces": arr]
+        return (try? JSONSerialization.data(withJSONObject: obj))
+            ?? Data("{\"agentDashboard\":false,\"surfaces\":[]}".utf8)
     }
 
     /// Whether a cached-at timestamp is still fresh at `now` for the given TTL.
@@ -1760,6 +1789,20 @@ final class WebMonitorServer {
       button.danger.tapped { background: #c25555; color: #fff; border-color: #c25555; }
       button:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
       #list { padding: 8px; }
+      /* (ramon fork) Agent filters above the session list. Hidden while viewing a
+         split (the list itself is hidden then too). Greys out when the Agent
+         Dashboard isn't running (filters are then n/a). */
+      /* Not sticky: the header already sticks at top:0, so a second sticky bar
+         would slide under it on scroll. The filters live just below the header and
+         scroll with the list. */
+      #filterbar { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+                   padding: 9px 12px; background: #161922; border-bottom: 1px solid #2a2e3b; }
+      #filterbar label { display: inline-flex; gap: 6px; align-items: center; color: #c8cedb;
+                         font-size: 13px; user-select: none; -webkit-user-select: none; }
+      #filterbar input[type=checkbox] { width: 16px; height: 16px; accent-color: #f0a35e; }
+      #filterbar.disabled { opacity: 0.5; }
+      #filterbar.disabled label { color: #8b93a7; }
+      #filternote { color: #8b93a7; font-size: 11px; flex: 1 1 100%; }
       .grouphdr { padding: 10px 6px 5px; margin-top: 10px; border-bottom: 1px solid #2a2e3b; }
       .grouphdr:first-child { margin-top: 0; }
       .grouphdr .loc { color: #8b93a7; font-size: 11px; font-weight: bold; letter-spacing: .04em;
@@ -1832,6 +1875,15 @@ final class WebMonitorServer {
              spellcheck="false" inputmode="text" enterkeyhint="go"
              aria-label="Token">
       <button id="tokenconnect">Connect</button>
+    </div>
+    <!-- (ramon fork) Agent filters. Mirror the Agent Dashboard: "Agents only" keeps
+         only detected CLI-agent splits; "Hide hidden" drops splits hidden in the
+         dashboard. Both default ON and persist (localStorage). Disabled when the
+         dashboard isn't running. -->
+    <div id="filterbar">
+      <label><input type="checkbox" id="f-agents"> Agents only</label>
+      <label><input type="checkbox" id="f-visible"> Hide hidden</label>
+      <span id="filternote"></span>
     </div>
     <div id="list"></div>
     <div id="viewer">
@@ -1913,6 +1965,10 @@ final class WebMonitorServer {
       var tokenConnect = document.getElementById("tokenconnect");
       var banner = document.getElementById("banner");
       var listEl = document.getElementById("list");
+      var filterBar = document.getElementById("filterbar");
+      var fAgents = document.getElementById("f-agents");
+      var fVisible = document.getElementById("f-visible");
+      var filterNote = document.getElementById("filternote");
       var viewer = document.getElementById("viewer");
       var screenEl = document.getElementById("screen");
       var jumpBtn = document.getElementById("jumpbottom");
@@ -2026,6 +2082,21 @@ final class WebMonitorServer {
       // do we suppress the "Loading…" placeholder so background refreshes
       // (~3s) re-render rows in place without flashing/losing scroll.
       var listLoaded = false;
+      // Enable/disable the agent filters depending on whether the Agent Dashboard
+      // is running. When it isn't, the checkboxes are disabled (their persisted
+      // checked state is kept, just not applied) and a note explains why.
+      function applyFilterAvailability(dashboard) {
+        fAgents.disabled = !dashboard;
+        fVisible.disabled = !dashboard;
+        if (dashboard) {
+          filterBar.classList.remove("disabled");
+          filterNote.textContent = "";
+        } else {
+          filterBar.classList.add("disabled");
+          filterNote.textContent = "Agent Dashboard not running \\u2014 filters unavailable.";
+        }
+      }
+
       function loadList() {
         // Show the placeholder only on the FIRST/empty load. On a background
         // refresh the rows are diffed/replaced in place (see below) so the
@@ -2035,11 +2106,30 @@ final class WebMonitorServer {
           if (r.status === 401) throw new Error("401");
           if (!r.ok) throw new Error("HTTP " + r.status);
           return r.json();
-        }).then(function (rows) {
+        }).then(function (data) {
           clearBannerIfNotError();
           listLoaded = true;
-          if (!rows.length) {
+          // The /api/surfaces response is {agentDashboard:Bool, surfaces:[...]}.
+          var allRows = (data && data.surfaces) || [];
+          var dashboard = !!(data && data.agentDashboard);
+          applyFilterAvailability(dashboard);
+          // Filters only apply when the dashboard is running (its agent/hidden
+          // signal would be meaningless otherwise — never silently hide rows).
+          var agentsOnly = dashboard && fAgents.checked;
+          var hideHidden = dashboard && fVisible.checked;
+          var rows = allRows.filter(function (row) {
+            if (agentsOnly && !row.isAgent) return false;
+            if (hideHidden && row.hidden) return false;
+            return true;
+          });
+          if (!allRows.length) {
             listEl.innerHTML = "<div class='empty'>No active sessions.</div>";
+            return;
+          }
+          if (!rows.length) {
+            // Surfaces exist but all were filtered out — say so rather than imply
+            // there are no sessions, so the filters never read as a dead end.
+            listEl.innerHTML = "<div class='empty'>No sessions match the filters.</div>";
             return;
           }
           // Group the panes by window + tab so the list mirrors the Mac layout.
@@ -2275,6 +2365,7 @@ final class WebMonitorServer {
         disposeStream();
         viewer.style.display = "none";
         listEl.style.display = "block";
+        filterBar.style.display = "flex";
         backBtn.style.display = "none";
         curEl.textContent = "";
         jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
@@ -2296,8 +2387,9 @@ final class WebMonitorServer {
         var want = current;
         fetch(url("/api/surfaces"), { headers: headers() })
           .then(function (r) { return r && r.ok ? r.json() : null; })
-          .then(function (rows) {
-            if (!rows || current !== want) return;  // navigated away meanwhile
+          .then(function (data) {
+            if (!data || current !== want) return;  // navigated away meanwhile
+            var rows = data.surfaces || [];
             var hit = null;
             for (var i = 0; i < rows.length; i++) { if (rows[i].id === want) { hit = rows[i]; break; } }
             if (hit) setClearBellVisible(!!hit.bell);
@@ -2310,6 +2402,7 @@ final class WebMonitorServer {
         setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
         refreshBellButton();
         listEl.style.display = "none";
+        filterBar.style.display = "none";
         viewer.style.display = "block";
         backBtn.style.display = "inline-block";
         curEl.textContent = title || "";
@@ -2359,6 +2452,13 @@ final class WebMonitorServer {
       function prefSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
       // Restore the saved poll-fallback view mode (wrap/font controls were removed).
       modeEl.value = prefGet("ghostty_mode", modeEl.value);
+
+      // Agent filters: default ON (only non-hidden agents) and persist per device.
+      // Toggling re-renders the list immediately against the cached fetch.
+      fAgents.checked = prefGet("ghostty_filter_agents", "1") === "1";
+      fVisible.checked = prefGet("ghostty_filter_visible", "1") === "1";
+      fAgents.onchange = function () { prefSet("ghostty_filter_agents", fAgents.checked ? "1" : "0"); loadList(); };
+      fVisible.onchange = function () { prefSet("ghostty_filter_visible", fVisible.checked ? "1" : "0"); loadList(); };
 
       document.getElementById("refresh").onclick = poll;
       modeEl.onchange = function () { prefSet("ghostty_mode", modeEl.value); poll(true); };

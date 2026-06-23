@@ -105,6 +105,12 @@ is loopback, hence identical; only your `ts.net` hostname differs:
    `…/?token=<secret>` once — it's then stashed in `sessionStorage` and sent via the
    `X-Ghostty-Token` header.
 2. You get a **list of live surfaces** (title + cwd). Tap one to open it.
+   - **Agent filters** sit above the list: **Agents only** (keep only splits the
+     **Agent Dashboard** detects as a CLI agent) and **Hide hidden** (drop splits you've
+     hidden in the dashboard). Both default **ON** (so by default you see only your
+     non-hidden agents) and are remembered per device. They mirror the dashboard exactly,
+     so they're **disabled** (greyed, with a note) when the Agent Dashboard isn't running.
+     Turn both off to see every surface again.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
    (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up),
    in the **same JetBrains Mono Nerd Font Ghostty uses** (vendored as woff2 and served by the
@@ -208,7 +214,7 @@ real scrollback can't come from the GUI. Instead:
 | `GET /` | the embedded mobile page (`?token=` accepted here when a token is set) |
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
-| `GET /api/surfaces` | JSON `[{id,title,pwd}]` of live surfaces |
+| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,isAgent,hidden}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden` drive the list filters and are only meaningful when it is) |
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |

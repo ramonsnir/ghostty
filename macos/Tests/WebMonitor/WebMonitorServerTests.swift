@@ -589,19 +589,29 @@ struct WebMonitorServerTests {
 
     // MARK: - surfacesJSONData (pure shaping)
 
-    @Test func surfacesJSONEmpty() {
-        let d = WebMonitorServer.surfacesJSONData([])
-        #expect(String(data: d, encoding: .utf8) == "[]")
+    /// Decode the `{agentDashboard, surfaces}` envelope to its surfaces array.
+    private func surfacesArray(_ d: Data) throws -> [[String: Any]]? {
+        let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any]
+        return obj?["surfaces"] as? [[String: Any]]
+    }
+
+    @Test func surfacesJSONEmpty() throws {
+        let d = WebMonitorServer.surfacesJSONData([], agentDashboard: false)
+        let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any]
+        #expect(obj?["agentDashboard"] as? Bool == false)
+        #expect((obj?["surfaces"] as? [[String: Any]])?.isEmpty == true)
     }
 
     @Test func surfacesJSONShape() throws {
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "id-1", title: "Title One", pwd: "/home/x",
-                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 0, splitCount: 2, bell: false),
+                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 0, splitCount: 2,
+                  bell: false, isAgent: false, hidden: false),
             .init(id: "id-2", title: "", pwd: "",
-                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 1, splitCount: 2, bell: true),
-        ])
-        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
+                  window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 1, splitCount: 2,
+                  bell: true, isAgent: false, hidden: false),
+        ], agentDashboard: true)
+        let arr = try surfacesArray(d)
         #expect(arr?.count == 2)
         #expect(arr?[0]["id"] as? String == "id-1")
         #expect(arr?[0]["title"] as? String == "Title One")
@@ -616,9 +626,10 @@ struct WebMonitorServerTests {
         // phone list show how panes are organized on the Mac.
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "a", title: "A", pwd: "", window: 1, tab: 2,
-                  tabTitle: "Editor", splitIndex: 0, splitCount: 3, bell: false),
-        ])
-        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
+                  tabTitle: "Editor", splitIndex: 0, splitCount: 3,
+                  bell: false, isAgent: false, hidden: false),
+        ], agentDashboard: false)
+        let arr = try surfacesArray(d)
         #expect(arr?[0]["window"] as? Int == 1)
         #expect(arr?[0]["tab"] as? Int == 2)
         #expect(arr?[0]["tabTitle"] as? String == "Editor")
@@ -633,12 +644,48 @@ struct WebMonitorServerTests {
         let hostilePwd = "/tmp/\"quoted\"\\back\nslash\u{1F4A9}"
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "id-1", title: hostileTitle, pwd: hostilePwd,
-                  window: 0, tab: 0, tabTitle: "", splitIndex: 0, splitCount: 1, bell: false),
-        ])
-        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]]
+                  window: 0, tab: 0, tabTitle: "", splitIndex: 0, splitCount: 1,
+                  bell: false, isAgent: false, hidden: false),
+        ], agentDashboard: false)
+        let arr = try surfacesArray(d)
         #expect(arr?.count == 1)
         #expect(arr?[0]["title"] as? String == hostileTitle)
         #expect(arr?[0]["pwd"] as? String == hostilePwd)
+    }
+
+    @Test func surfacesJSONCarriesAgentDashboardFlag() throws {
+        // The top-level flag tells the page whether the agent/hidden filters are
+        // usable (the Agent Dashboard is running).
+        let on = try JSONSerialization.jsonObject(
+            with: WebMonitorServer.surfacesJSONData([], agentDashboard: true)) as? [String: Any]
+        #expect(on?["agentDashboard"] as? Bool == true)
+        let off = try JSONSerialization.jsonObject(
+            with: WebMonitorServer.surfacesJSONData([], agentDashboard: false)) as? [String: Any]
+        #expect(off?["agentDashboard"] as? Bool == false)
+    }
+
+    @Test func surfacesJSONCarriesAgentAndHiddenFlags() throws {
+        // Per-row agent/hidden flags drive the page's "agents only" / "hide hidden"
+        // filters; they're emitted unconditionally as plain bools.
+        let d = WebMonitorServer.surfacesJSONData([
+            .init(id: "agent-shown", title: "claude", pwd: "", window: 0, tab: 0,
+                  tabTitle: "", splitIndex: 0, splitCount: 1,
+                  bell: false, isAgent: true, hidden: false),
+            .init(id: "agent-hidden", title: "codex", pwd: "", window: 0, tab: 0,
+                  tabTitle: "", splitIndex: 0, splitCount: 1,
+                  bell: false, isAgent: true, hidden: true),
+            .init(id: "plain", title: "zsh", pwd: "", window: 0, tab: 0,
+                  tabTitle: "", splitIndex: 0, splitCount: 1,
+                  bell: false, isAgent: false, hidden: false),
+        ], agentDashboard: true)
+        let arr = try surfacesArray(d)
+        #expect(arr?.count == 3)
+        #expect(arr?[0]["isAgent"] as? Bool == true)
+        #expect(arr?[0]["hidden"] as? Bool == false)
+        #expect(arr?[1]["isAgent"] as? Bool == true)
+        #expect(arr?[1]["hidden"] as? Bool == true)
+        #expect(arr?[2]["isAgent"] as? Bool == false)
+        #expect(arr?[2]["hidden"] as? Bool == false)
     }
 
     // MARK: - decideRoute (the PURE, security-load-bearing router)
@@ -949,6 +996,23 @@ struct WebMonitorServerTests {
         #expect(page.contains("/bell"))
         #expect(page.contains("bellflag"))
         #expect(page.contains("row.bell"))
+    }
+
+    @Test func htmlPageHasAgentFilters() {
+        let page = WebMonitorServer.htmlPage
+        // The agent filters (checkboxes), their persistence, and the disabled
+        // handling when the dashboard isn't running must all be wired in the page.
+        #expect(page.contains("id=\"filterbar\""))
+        #expect(page.contains("id=\"f-agents\""))
+        #expect(page.contains("id=\"f-visible\""))
+        #expect(page.contains("applyFilterAvailability"))
+        // Filters read the new response envelope, default ON, and persist.
+        #expect(page.contains("data.surfaces"))
+        #expect(page.contains("data.agentDashboard"))
+        #expect(page.contains("ghostty_filter_agents"))
+        #expect(page.contains("ghostty_filter_visible"))
+        #expect(page.contains("row.isAgent"))
+        #expect(page.contains("row.hidden"))
     }
 
     @Test func htmlPageControlsAreCompact() {

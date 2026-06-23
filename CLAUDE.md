@@ -172,13 +172,34 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     woff2 if you want a different face. NOT exempt from the iOS-target exclusion set in
     `project.pbxproj` (listed alongside xterm.{js,css}). GUI-only — relaunch, no host restart.
   - **HTTP API:** `GET /` (page); `GET /xterm.js`, `GET /xterm.css` (vendored assets, `?token=`
-    accepted like the bootstrap); `GET /api/surfaces` (`[{id,title,pwd}]`); `GET
+    accepted like the bootstrap); `GET /api/surfaces` (`{agentDashboard:Bool,
+    surfaces:[{id,title,pwd,…,isAgent,hidden}]}` — the response is an OBJECT, not a bare
+    array; see the agent-filters note below); `GET
     /api/surface/{uuid}/stream` (raw-byte xterm source; needs `pty-host`); `GET
     /api/surface/{uuid}/screen?mode=viewport|scrollback` (plain-text fallback, reuses
     `cachedVisibleContents`/`cachedScreenContents`); `POST /api/surface/{uuid}/input`; `POST
     /api/surface/{uuid}/scroll` (`{"dy":±ticks}`). Unknown id/path → 404, wrong method → 405,
     bad/negative/oversized Content-Length → 400, chunked → 411, oversized → 413, bad Host → 403,
     throttled (token mode) → 429.
+  - **Agent filters (fork-only, GUI-only) — list-only "Agents only" / "Hide hidden".** The
+    page's session list has two checkboxes that MIRROR the Agent Dashboard: keep only detected
+    CLI-agent splits, and/or drop splits hidden in the dashboard. Both DEFAULT ON (so the phone
+    opens showing only your non-hidden agents) and persist per device in `localStorage`
+    (`ghostty_filter_agents`/`ghostty_filter_visible`). Filtering is PAGE-SIDE in `loadList`; the
+    server just enriches each `/api/surfaces` row with `isAgent`/`hidden` and adds the top-level
+    `agentDashboard` flag (whether the dashboard controller exists). The signal comes from
+    `AgentDashboardController.webMonitorFilterState()` (`model.liveAgentIDs` + `model.hidden`,
+    value types, read on the existing main hop in `surfacesJSON()` via `MainActor.assumeIsolated`
+    like `MCPLayout.surfaceRows`). When the dashboard ISN'T running (`agentDashboard:false`) the
+    checkboxes are DISABLED + greyed with a note and no filtering is applied — "filters can be
+    disabled" by design. The detector pauses while the dashboard panel is hidden/occluded, so
+    `isAgent` reflects last-known detection then (acceptable). ZERO host/Zig change; GUI relaunch
+    to pick up. Wiring: `AgentDashboardController.webMonitorFilterState()`,
+    `WebMonitorServer.swift` (`SurfaceRow.isAgent`/`.hidden`, `surfacesJSON()` read,
+    `surfacesJSONData(_:agentDashboard:)` now returns the OBJECT envelope, page filter bar +
+    `applyFilterAvailability` + `loadList`/`refreshBellButton` parse `data.surfaces`). Tests:
+    `WebMonitorServerTests` (`surfacesJSONCarriesAgentDashboardFlag`,
+    `surfacesJSONCarriesAgentAndHiddenFlags`, `htmlPageHasAgentFilters`, updated `surfacesJSON*`).
   - **Input = REAL key/wheel events, NOT paste (critical):** `ghostty_surface_text` routes
     through `completeClipboardPaste` (clipboard path) — pasted `\n` is a literal newline (never
     submits), control bytes aren't real keys, and newline pastes trip Mac paste-protection. So
