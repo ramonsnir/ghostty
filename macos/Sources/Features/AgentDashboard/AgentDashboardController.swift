@@ -1291,6 +1291,17 @@ final class AgentDashboardController: NSWindowController {
         model.hookSnapshot()
     }
 
+    /// (ramon fork / Web Monitor) The current detected-agent + hidden surface ids,
+    /// so the web monitor's list filters ("agents only" / "hide hidden") mirror the
+    /// dashboard exactly. Value types only; MUST be called on main (the model is
+    /// `@MainActor`). `agents` is the live agent universe (same set the tiles use);
+    /// `hidden` is the user's hide set (keyed by surface UUID). The mere existence
+    /// of this controller is what the web monitor reads as "the dashboard is
+    /// running" — so when it's nil the filters are offered disabled.
+    func webMonitorFilterState() -> (agents: Set<UUID>, hidden: Set<UUID>) {
+        (model.liveAgentIDs, model.hidden)
+    }
+
     /// (ramon fork / Agent hooks) Post `.ghosttyAgentNeedsAttention` for `id`,
     /// looking up the live title/pwd from `TerminalController.all` on main (this
     /// touches AppKit, so it lives on the controller, not the model). Observed by
