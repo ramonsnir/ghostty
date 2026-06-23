@@ -631,6 +631,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `index.test.ts` (suppression end-to-end + confidence carry); Swift `AgentDashboardTests`
       (`suggestionStyle` + dismissed-flag lifecycle), `MCPServerTests` (`suggestionDismissed`
       JSON). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **FIX — manager was never suggesting in a busy fleet (own budget + maxTurns).** Symptom:
+    summaries appeared but ZERO suggestions; the sidecar log showed only summarizer lines.
+    Two causes: (1) the manager pass SHARED the summarizer's single `ConcurrencyBudget` and
+    ran SECOND in `runSweep`, so with ≥`cfg.maxConcurrent` due summaries every sweep (≈12
+    agents vs cap 10) the summarizer grabbed all slots and the manager's `tryAcquire()` always
+    failed → it never reached its model call. (2) `maxTurns:1` frequently returned
+    `subtype=error_max_turns` (the SDK doesn't always settle a clean result in one turn even
+    with `tools:[]`), so summarize/suggest calls errored + retried, keeping the shared budget
+    saturated. **Fix (sidecar-only):** the manager now has its OWN `ConcurrencyBudget`
+    (`ManagerConfig.maxConcurrent`, default 4) — `runSweep` pass 2 + `manageOne` use
+    `deps.managerBudget`, never `deps.budget` — so a busy summarizer can't starve it; and
+    `model.ts` `maxTurns` 1→3 (no tool loop, so still one text answer — just headroom to reach
+    a success result). Regression test: `index.test.ts` "manager is NOT starved when the
+    summarizer budget is exhausted". Deploy is a sidecar rebuild + restart only (the GUI's
+    `AgentManagerController` respawns it from the repo `dist` — no app relaunch).
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

@@ -118,7 +118,10 @@ if the goal is ambiguous."
   Claude Code hooks so your prompt + working/waiting state reach the summarizer.
 - **No suggestion on a waiting tile?** Suggestions need the hooks (the `waiting` state
   comes from them) and only fire after the ~20s manager debounce; a session the hooks
-  never marked `waiting` won't get one. The summary still works without hooks.
+  never marked `waiting` won't get one. The summary still works without hooks. (The
+  manager runs on its OWN budget separate from the summarizer, so a busy multi-agent
+  fleet no longer starves it of suggestions — if you ever see summaries but never
+  suggestions again, that's a regression worth reporting.)
 
 ## Cost & privacy
 
