@@ -545,18 +545,6 @@ extension Ghostty {
             }
         }
 
-        /// (ramon fork / Agent Dashboard) The number of trailing blank rows in
-        /// the viewport — rows at the bottom with no text. The dashboard preview
-        /// uses this to anchor a thumbnail at the last row with content instead
-        /// of the absolute bottom, so a partially-filled screen fills the
-        /// preview rather than wasting it on empty trailing rows. 0 when there is
-        /// no surface / no host render mirror (e.g. the `.exec` backend), so the
-        /// caller falls back to a plain bottom-anchor.
-        func trailingBlankRows() -> Int {
-            guard let surface = self.surface else { return 0 }
-            return Int(ghostty_surface_trailing_blank_rows(surface))
-        }
-
         func setCursorShape(_ shape: ghostty_action_mouse_shape_e) {
             switch shape {
             case GHOSTTY_MOUSE_SHAPE_DEFAULT:

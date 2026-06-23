@@ -561,14 +561,14 @@ struct AgentMirrorPreview: View {
 
     @StateObject private var surfaceView: Ghostty.SurfaceView
 
-    /// Number of trailing blank rows in the host viewport, polled from the real
-    /// surface so the bottom-anchored thumbnail can rise to the last row with
-    /// content (a fresh agent chat / a TUI that hasn't reached the bottom would
-    /// otherwise waste the preview on empty rows). Live frames render off the
-    /// Metal path, not SwiftUI, so this is refreshed on a light timer rather
-    /// than from `@Published` changes.
-    @State private var trailingBlankRows: Int = 0
-    private let blankPoll = Timer.publish(every: 0.7, on: .main, in: .common).autoconnect()
+    /// Number of trailing rows to drop below the bottom-anchored thumbnail —
+    /// empty rows PLUS an information-less footer (the agent's input box + its
+    /// mode/status lines) — so the preview rises to the last row of actual
+    /// CONTENT. Computed by `chromeTrailingSkip` from the real surface's viewport
+    /// text, polled on a light timer (live frames render off the Metal path, not
+    /// SwiftUI, so an observer wouldn't fire).
+    @State private var skipRows: Int = 0
+    private let skipPoll = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     init(ghostty: Ghostty.App, sessionID: UInt64, realSurface: Ghostty.SurfaceView) {
         self.ghostty = ghostty
@@ -598,11 +598,12 @@ struct AgentMirrorPreview: View {
                 cellH: cellH,
                 backing: backing,
                 container: geo.size)
-            // Skip empty trailing rows: shift the bottom-anchored mirror down so
-            // the last row with content lands at the bottom of the preview (the
-            // blank rows fall below the clip). 0 for a full screen → unchanged.
+            // Skip empty trailing rows + the input-box/mode-line footer: shift
+            // the bottom-anchored mirror down so the last row of CONTENT lands at
+            // the bottom of the preview (the skipped rows fall below the clip).
+            // 0 for a full screen with no detectable footer → unchanged.
             let anchorOffset = AgentMirrorPreview.bottomAnchorOffset(
-                trailingBlankRows: trailingBlankRows, rows: rows,
+                skipRows: skipRows, rows: rows,
                 cellH: cellH, backing: backing, scale: g.scale)
 
             // Horizontal scroll for splits wider than `referenceColumns`; narrow
@@ -620,9 +621,9 @@ struct AgentMirrorPreview: View {
                     .allowsHitTesting(false)
                     .frame(width: g.naturalW, height: g.naturalH)
                     .scaleEffect(g.scale, anchor: .bottomLeading)
-                    // Shift down by the trailing-blank-rows height so the last
-                    // row with content sits at the bottom (the blanks fall below
-                    // the clip). Render-only — does not affect layout/measurement.
+                    // Shift down by the skipped-rows height so the last row of
+                    // content sits at the bottom (blanks + footer fall below the
+                    // clip). Render-only — does not affect layout/measurement.
                     .offset(y: anchorOffset)
                     // Bound the scaled content to its on-screen size so the
                     // ScrollView measures `scaledW` (not the larger unscaled
@@ -638,15 +639,25 @@ struct AgentMirrorPreview: View {
                         if let surface = surfaceView.surface {
                             ghostty_surface_set_focus(surface, false)
                         }
-                        trailingBlankRows = realSurface.trailingBlankRows()
+                        refreshSkipRows()
                     }
-                    .onReceive(blankPoll) { _ in
-                        let n = realSurface.trailingBlankRows()
-                        if n != trailingBlankRows { trailingBlankRows = n }
-                    }
+                    .onReceive(skipPoll) { _ in refreshSkipRows() }
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
+    }
+
+    /// Recompute `skipRows` from the real surface's current viewport text. Under
+    /// pty-host the GUI mirror's `cachedVisibleContents` is row-accurate (one
+    /// line per grid row, no soft-wrap, blanks preserved) — the dumpText path
+    /// terminates every row with a newline, so a single trailing "" is dropped to
+    /// land exactly on the grid rows. Cheap (the read is ~500ms-cached).
+    private func refreshSkipRows() {
+        let text = realSurface.cachedVisibleContents.get()
+        var lines = text.components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        let n = AgentMirrorPreview.chromeTrailingSkip(rows: lines)
+        if n != skipRows { skipRows = n }
     }
 
     /// The number of columns that fill the preview's WIDTH. This sets a UNIFORM
@@ -700,22 +711,120 @@ struct AgentMirrorPreview: View {
     }
 
     /// PURE: the vertical offset (points, DOWNWARD) to shift the bottom-anchored
-    /// scaled mirror so the LAST row with content sits at the bottom of the
-    /// preview, dropping `trailingBlankRows` empty rows below the clip. Factored
-    /// out for unit testing.
+    /// scaled mirror so the LAST row of content sits at the bottom of the
+    /// preview, dropping `skipRows` trailing rows (blanks + footer) below the
+    /// clip. Factored out for unit testing.
     ///
-    /// Returns 0 when there are no trailing blanks (a full screen) → identical
-    /// to a plain bottom-anchor. Clamped to `rows - 1` so at least one row stays
-    /// anchored, i.e. an all-blank screen shows a single blank row instead of
-    /// scrolling the (empty) grid fully out of view. The per-row scaled height
-    /// matches `geometry`'s: `(cellH / backing) * scale`.
+    /// Returns 0 when there's nothing to skip → identical to a plain bottom-
+    /// anchor. Clamped to `rows - 1` so at least one row stays anchored, i.e. an
+    /// all-blank screen shows a single row instead of scrolling the grid fully
+    /// out of view. The per-row scaled height matches `geometry`'s:
+    /// `(cellH / backing) * scale`.
     static func bottomAnchorOffset(
-        trailingBlankRows: Int, rows: Int, cellH: CGFloat, backing: CGFloat, scale: CGFloat
+        skipRows: Int, rows: Int, cellH: CGFloat, backing: CGFloat, scale: CGFloat
     ) -> CGFloat {
-        guard trailingBlankRows > 0, rows > 1, cellH > 0, scale > 0 else { return 0 }
+        guard skipRows > 0, rows > 1, cellH > 0, scale > 0 else { return 0 }
         let bk = backing > 0 ? backing : 2.0
-        let clamped = min(trailingBlankRows, rows - 1)
+        let clamped = min(skipRows, rows - 1)
         let scaledRowH = (cellH / bk) * scale
         return CGFloat(clamped) * scaledRowH
+    }
+
+    // MARK: - Footer detection (skip information-less chrome)
+
+    /// Caps for the footer heuristic. These keep detection CONSERVATIVE — biased
+    /// toward showing content — so a tall content box (e.g. the `/workflows`
+    /// viewer) or a permission/choice prompt is never mistaken for the chrome
+    /// input box and hidden.
+    private static let maxStatusLines = 3   // mode/help lines below the input box
+    private static let maxBoxRows = 6       // the input box is small; a tall box is content
+    private static let ruleMinDashes = 12   // a horizontal rule is a long ── run
+
+    /// PURE: how many trailing viewport rows to drop from a bottom-anchored
+    /// thumbnail = trailing blank rows PLUS, when present, an information-less
+    /// footer (the agent's input box and the mode/status lines below it). `rows`
+    /// is the row-accurate viewport, top-first (under pty-host the GUI mirror is
+    /// exactly one text line per grid row — no soft-wrap, blanks preserved).
+    ///
+    /// The footer is only skipped when ALL hold (else just trailing blanks), so
+    /// real content is never hidden:
+    ///   1. a horizontal-rule row (the input box border) sits within
+    ///      `maxStatusLines` short lines of the last content row,
+    ///   2. its matching top rule is within `maxBoxRows` (a SMALL box — not a
+    ///      tall content box like the `/workflows` panel),
+    ///   3. the box interior is empty-ish (just the `❯`/`>`/border + whitespace —
+    ///      not a typed command or a permission question).
+    static func chromeTrailingSkip(rows: [String]) -> Int {
+        let n = rows.count
+        if n == 0 { return 0 }
+
+        // 1. Trailing blank rows.
+        var i = n - 1
+        while i >= 0 && isBlankRow(rows[i]) { i -= 1 }
+        if i < 0 { return n }                  // all blank
+        let blanks = n - 1 - i
+        let lastContent = i
+
+        // 2. Walk up at most `maxStatusLines` non-rule status lines to the input
+        //    box's bottom rule.
+        var b = -1
+        var k = lastContent
+        var status = 0
+        while k >= 0 && status <= maxStatusLines {
+            if isRuleRow(rows[k]) { b = k; break }
+            status += 1
+            k -= 1
+        }
+        if b < 0 { return blanks }             // no input box near the bottom
+
+        // 3. Find the matching top rule within `maxBoxRows` (a small box).
+        var t = -1
+        var j = b - 1
+        var depth = 0
+        while j >= 0 && depth < maxBoxRows {
+            if isRuleRow(rows[j]) { t = j; break }
+            depth += 1
+            j -= 1
+        }
+        if t < 0 { return blanks }             // box too tall → content, not chrome
+
+        // 4. Interior must be empty-ish (the chrome input box, not a question).
+        if t + 1 < b {
+            for r in (t + 1)..<b where !isEmptyInteriorRow(rows[r]) { return blanks }
+        }
+
+        // 5. Footer = rows [top ... n-1]; absorb one blank separator above it.
+        var top = t
+        if top - 1 >= 0 && isBlankRow(rows[top - 1]) { top -= 1 }
+        return n - top
+    }
+
+    /// A blank row: empty or whitespace-only (the mirror already trims a row's
+    /// trailing cells, so a truly empty grid row arrives as "").
+    static func isBlankRow(_ s: String) -> Bool {
+        s.allSatisfy { $0 == " " || $0 == "\t" } || s.isEmpty
+    }
+
+    /// A horizontal-rule row: a long run of box-drawing horizontal line chars
+    /// (`─`, U+2500) — the input box's top/bottom border (full-width rule or a
+    /// rounded `╭──╮`/`╰──╯` border). `─` is essentially never in plain content,
+    /// so this is a clean signal.
+    static func isRuleRow(_ s: String) -> Bool {
+        var dashes = 0
+        for u in s.unicodeScalars where u.value == 0x2500 { dashes += 1 }
+        return dashes >= ruleMinDashes
+    }
+
+    /// An empty-ish input-box interior row: nothing but the prompt marker
+    /// (`❯`/`>`), box-drawing borders (`│` etc.), and whitespace. Real typed
+    /// text or a permission question makes it non-empty → the box is shown.
+    static func isEmptyInteriorRow(_ s: String) -> Bool {
+        for u in s.unicodeScalars {
+            if u.value == 0x20 || u.value == 0x09 { continue }          // space/tab
+            if u.value == 0x276F || u.value == 0x3E { continue }        // ❯  >
+            if (0x2500...0x257F).contains(u.value) { continue }         // box drawing
+            return false
+        }
+        return true
     }
 }
