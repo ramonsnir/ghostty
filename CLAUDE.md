@@ -461,7 +461,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
         rejected; (3) the box interior is empty-ish (only `❯`/`>`/box-border/whitespace —
         a typed command or a permission question makes it non-empty → shown). Handles both
         Claude Code footer shapes (full-width `───`/`❯`/`───` rules and rounded `╭─╮`/`│ │`/
-        `╰─╯` boxes).
+        `╰─╯` boxes). When a footer IS found it also drops the ENTIRE blank gap above it
+        (not just one separator) — a near-empty session has content at the TOP, a big blank
+        gap, then the footer pinned at the bottom, so absorbing the whole gap lands the last
+        real content row at the bottom instead of a blank row mid-gap.
       - The offset is a pure, tested `AgentMirrorPreview.bottomAnchorOffset(skipRows:…)`
         (clamped to `rows-1` so an all-blank screen keeps one row visible), refreshed by
         `refreshSkipRows()` on a light 1.0s per-tile timer (live frames render off the

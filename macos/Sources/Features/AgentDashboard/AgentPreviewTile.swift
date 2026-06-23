@@ -793,9 +793,14 @@ struct AgentMirrorPreview: View {
             for r in (t + 1)..<b where !isEmptyInteriorRow(rows[r]) { return blanks }
         }
 
-        // 5. Footer = rows [top ... n-1]; absorb one blank separator above it.
+        // 5. Footer = rows [top ... n-1]. Also drop the ENTIRE blank gap above
+        //    it — once the footer is gone those blanks are effectively trailing,
+        //    so the last row of real content lands at the bottom. (A near-empty
+        //    Claude Code session puts content at the top, a big blank gap, then
+        //    the footer pinned at the bottom; absorbing only one separator left
+        //    the anchor on a blank row → a near-empty preview.)
         var top = t
-        if top - 1 >= 0 && isBlankRow(rows[top - 1]) { top -= 1 }
+        while top - 1 >= 0 && isBlankRow(rows[top - 1]) { top -= 1 }
         return n - top
     }
 
