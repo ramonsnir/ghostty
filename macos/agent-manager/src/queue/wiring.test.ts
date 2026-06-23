@@ -6,8 +6,23 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
-import { sanitizeProviderEnv, normalizeExecCode } from "./wiring.js";
+import { sanitizeProviderEnv, normalizeExecCode, expandHome } from "./wiring.js";
+
+// expandHome — the provider-cwd `~` expansion (execFile does NOT expand `~`, so a literal
+// `~/repo` cwd fails ENOENT and every provider call silently skips). §workdir.
+test("expandHome: '~' and '~/x' expand to the home dir; other paths pass through", () => {
+  assert.equal(expandHome("~"), homedir());
+  assert.equal(expandHome("~/git/ExampleOS"), join(homedir(), "git/ExampleOS"));
+  assert.equal(expandHome("/abs/path"), "/abs/path");
+  assert.equal(expandHome("rel/path"), "rel/path");
+  // Only a LEADING ~/ is a home ref; a mid-path ~ is left alone.
+  assert.equal(expandHome("/x/~/y"), "/x/~/y");
+  // A bare "~user" form is not expanded (we only handle the current user's home).
+  assert.equal(expandHome("~other/x"), "~other/x");
+});
 
 test("sanitizeProviderEnv: strips the MCP token + Ghostty control vars, keeps the rest", () => {
   const base: NodeJS.ProcessEnv = {

@@ -76,6 +76,20 @@ export function normalizeExecCode(err: unknown): number {
 }
 
 /**
+ * Expand a leading `~` / `~/` to the user's home dir. PURE — exported for unit testing.
+ * The template `workdir` is authored with `~` (the spec says it is expanded "macOS-side"
+ * for the agent SPLIT, which the GUI does), but the PROVIDER commands run here in the
+ * sidecar via `execFile`, which does NOT expand `~` in its `cwd` — a literal `~/foo` cwd
+ * makes `execFile` fail with ENOENT (it can't chdir there), so EVERY provider call silently
+ * fails (ok:false → no dispatch). So we expand it before handing the cwd to `execFile`.
+ */
+export function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
+}
+
+/**
  * The production process-runner: spawn an argv via `execFile` (NO shell — the genericity
  * boundary's safety, §13) with a tight timeout + a SANITIZED/merged env (Ghostty/MCP
  * credentials stripped — see sanitizeProviderEnv). NEVER rejects for a non-zero exit
@@ -95,7 +109,7 @@ export const realExec: Exec = (argv: string[], opts: ExecOptions = {}): Promise<
       args,
       {
         timeout: opts.timeoutMs,
-        cwd: opts.cwd,
+        cwd: opts.cwd === undefined ? undefined : expandHome(opts.cwd),
         env,
         maxBuffer: 4 * 1024 * 1024,
         windowsHide: true,
