@@ -31,6 +31,28 @@ IDENTITY="${IDENTITY:-Developer ID Application: Ramon Snir (72PSTG4224)}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-ghostty-ramon-notary}"
 APP="macos/build/Release/Ghostty.app"
 
+# ---- make node + create-dmg resolvable (nvm-friendly) ----------------------
+# This release is almost always cut from this Mac, often from a non-login / GUI
+# shell (or an unattended monitor run) where nvm's lazy-load shims aren't
+# initialized: `node`/`npm` are recursive shell functions that error with
+# "_load_nvm: command not found", and the real node bin (plus a globally
+# `npm i -g`'d create-dmg) isn't on PATH. Drop the shims and, ONLY if create-dmg
+# isn't already found, prepend the nvm node bin that has it (else the newest).
+# A no-op when create-dmg is already on PATH (e.g. a Homebrew install).
+unset -f node npm 2>/dev/null || true
+if ! command -v create-dmg >/dev/null 2>&1; then
+  for _bin in $(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -Vr); do
+    if [ -x "$_bin/create-dmg" ]; then PATH="$_bin:$PATH"; break; fi
+  done
+  # Still missing? At least put the newest node on PATH so create-dmg's
+  # `#!/usr/bin/env node` shebang resolves once it's installed.
+  if ! command -v create-dmg >/dev/null 2>&1; then
+    _newest_node_bin="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+    [ -n "$_newest_node_bin" ] && PATH="$_newest_node_bin:$PATH"
+  fi
+fi
+export PATH
+
 # ---- preconditions (fail fast with actionable messages) --------------------
 [ -f build.zig ] || { echo "ERROR: run from the repo root (build.zig not found)"; exit 1; }
 command -v gh         >/dev/null || { echo "ERROR: gh not installed"; exit 1; }
