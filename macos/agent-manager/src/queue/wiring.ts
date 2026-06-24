@@ -9,6 +9,7 @@
 
 import { execFile } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -218,6 +219,26 @@ function runStatePath(
 }
 
 /**
+ * (migration) Whether to MIGRATE a pre-parallel single-run state file
+ * (`<basename>.state.json`) to the scope-suffixed path. PURE (the caller supplies the
+ * existence bits). True ONLY when the scoped path DIFFERS from the legacy path (the run has
+ * a non-empty scope), the scoped file is ABSENT, and the legacy file EXISTS — i.e. a run
+ * whose durable state predates the scope-suffix rename (the `queue-parallel` change). This
+ * preserves `lifetimeDispatched` + the live maxItems edit + the in-flight assignment records
+ * across the upgrade instead of silently starting the count over at 0. Done ONLY on the
+ * rehydrate path (a run that WAS active); a fresh `start` must NOT adopt a stale bare file.
+ * Exported for unit testing.
+ */
+export function shouldMigrateLegacyState(
+  scopedPath: string,
+  legacyPath: string,
+  scopedExists: boolean,
+  legacyExists: boolean,
+): boolean {
+  return scopedPath !== legacyPath && !scopedExists && legacyExists;
+}
+
+/**
  * (§8a) Build the production RUN FACTORY a `start` command uses: load+validate the template
  * by basename, wire a per-run file StoreIO under `stateDir` (named by the basename + the
  * param SCOPE so parallel scoped runs of one template don't collide on disk, yet a run
@@ -274,7 +295,24 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
       continue;
     }
     const runParams = rec.params ?? {};
-    const storeIO = makeFileStoreIO(runStatePath(stateDir, rec.template, res.template, runParams));
+    const scopedPath = runStatePath(stateDir, rec.template, res.template, runParams);
+    // (migration) An in-flight run whose state file predates the scope-suffix rename lives at
+    // the bare `<basename>.state.json`. Rename it to the scoped path so its lifetimeDispatched
+    // + live cap + assignment records survive the upgrade (otherwise rehydrate would read an
+    // absent scoped file → start the count over at 0 + re-adopt orphans). Best-effort: a
+    // failed rename just falls back to a fresh state (never throws into startup).
+    const legacyPath = join(stateDir, `${rec.template}.state.json`);
+    if (shouldMigrateLegacyState(scopedPath, legacyPath, existsSync(scopedPath), existsSync(legacyPath))) {
+      try {
+        renameSync(legacyPath, scopedPath);
+        console.log(
+          `agent-manager: queue: migrated legacy state for "${rec.template}" → scope-suffixed file`,
+        );
+      } catch (err) {
+        console.error(`agent-manager: queue: legacy state migration failed for "${rec.template}": ${String(err)}`);
+      }
+    }
+    const storeIO = makeFileStoreIO(scopedPath);
     runs.push(
       makeQueueRun(res.template, storeIO, {
         templateName: rec.template,

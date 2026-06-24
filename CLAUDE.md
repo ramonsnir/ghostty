@@ -978,6 +978,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       via `scopeSlug(runIdentityScope(...))`) so parallel runs of one template don't collide on disk;
       rehydration recomputes the same path. **Separate tabs are automatic** — each run starts with an empty
       `occupied` set, so its first dispatch's `splitPlan` returns `firstTab` → a new tab per run.
+    - **(3a) State-file MIGRATION across the rename (bug fix).** The scope-suffix renamed the per-run
+      state file (`example.state.json` → `example.<slug>.state.json`), so a run that was IN FLIGHT across
+      the upgrade rehydrated under the NEW path, found no file, and **reset `lifetimeDispatched` to 0** (it
+      also lost the live maxItems edit + re-adopted its agents as orphans). Fix: `rehydrateActiveRuns`
+      RENAMES a surviving bare `<basename>.state.json` to the scoped path on first rehydrate (pure decision
+      `shouldMigrateLegacyState(scoped, legacy, scopedExists, legacyExists)` — migrate only when the scoped
+      file is absent, the legacy exists, and the paths differ; best-effort rename). Done ONLY on the
+      rehydrate path (a run that WAS active) — a FRESH `start` must NOT adopt a stale bare file. Normal
+      restarts (no rename) already persisted the count via the stable scoped path; this only covers the
+      one-time upgrade boundary. Wiring: `wiring.ts` (`shouldMigrateLegacyState` + the rename in
+      `rehydrateActiveRuns`); test: `wiring.test.ts` (`shouldMigrateLegacyState`).
     `makeQueueRun` computes `runName`/`identityScope` from (template + params); a `runName` collision from a
     DIFFERENT identity is rejected (no clobber). Wiring: sidecar — `templates.ts` (`runDisplayName`/
     `runIdentityScope`/`scopeSlug`), `runner.ts` (`QueueRun.runName`/`.identityScope` + identity usages),
