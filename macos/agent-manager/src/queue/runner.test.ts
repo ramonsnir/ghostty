@@ -25,6 +25,7 @@ import {
 } from "./runner.js";
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
+import type { QueueStatusReport } from "./status.js";
 import { loadStore, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
@@ -93,6 +94,7 @@ interface QueueFake {
     sendKey: Array<{ id: string; key: string }>;
     list: number;
     status: string[];
+    reports: QueueStatusReport[];
   };
 }
 
@@ -105,6 +107,7 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     sendKey: [],
     list: 0,
     status: [],
+    reports: [],
   };
   let spawnIdx = 0;
   const spawns = spec.spawns ?? [];
@@ -134,6 +137,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     },
     async sendKey(id: string, key: string): Promise<void> {
       calls.sendKey.push({ id, key });
+    },
+    async reportQueueStatus(status: QueueStatusReport): Promise<void> {
+      calls.reports.push(status);
     },
   } as unknown as McpClient;
 
@@ -498,6 +504,39 @@ test("runQueueSweep: maxItems override '0' (unlimited) dispatches PAST the templ
   await runQueueSweep(deps); // dispatch — unlimited override beats the template cap of 2
 
   assert.equal(fake.calls.spawn.length, 3, "unlimited override dispatches all 3 (> template maxItems 2)");
+});
+
+// ---------------------------------------------------------------------------
+// (3c) §11 health: a sweep PUSHES a run-level status (starting on arm, then counts).
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: reports queue health — 'starting' on the arm sweep, then waiting/next", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A","title":"Alpha"},{"id":"B","title":"Beta"},{"id":"C"}]',
+    spawns: [{ id: "s-a", sessionId: 1 }],
+  });
+  // maxItems override 1 so the cap is visible in the report (dispatched/cap).
+  const t = tmpl({ params: [{ name: "maxItems", target: "maxItems", default: "1" }] });
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "1" } });
+  let now = 6_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm sweep: no list fetched yet → "starting"
+  const first = fake.calls.reports.at(-1)!;
+  assert.equal(first.queueName, "backlog");
+  assert.equal(first.present, true);
+  assert.equal(first.phase, "starting");
+  assert.equal(first.maxItems, 1);
+
+  now += 5000;
+  await runQueueSweep(deps); // dispatch sweep: A dispatched (cap 1), B/C waiting
+  const last = fake.calls.reports.at(-1)!;
+  assert.equal(last.phase, "running");
+  assert.equal(last.active, 1, "A is running");
+  assert.equal(last.dispatched, 1);
+  assert.equal(last.queued, 2, "B + C waiting (A excluded as active)");
+  assert.deepEqual(last.next.map((n) => n.key), ["B", "C"]);
 });
 
 // ---------------------------------------------------------------------------

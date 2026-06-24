@@ -19,6 +19,7 @@
 // crash on a transient MCP failure — the caller logs + continues.
 
 import type { QueueCommand } from "./queue/commands.js";
+import type { QueueStatusReport } from "./queue/status.js";
 
 /** Thrown for any MCP transport / protocol / tool failure. The loop catches it. */
 export class McpError extends Error {
@@ -181,6 +182,26 @@ export class McpClient {
     if (ann.queueUrl !== undefined) args.queueUrl = ann.queueUrl;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.
     await this.call("set_surface_annotation", args);
+  }
+
+  /**
+   * (Agent Queue, §11 health) Push the run-level health snapshot to the GUI so the Agent
+   * Dashboard can show the queue's presence + backlog + what's next — even before any
+   * split spawns. Fire-and-forget from the caller's view (the runner catches errors); the
+   * wire args mirror `QueueStatusReport` 1:1 (`maxItems` is a number or null = unlimited).
+   */
+  async reportQueueStatus(status: QueueStatusReport): Promise<void> {
+    await this.call("report_queue_status", {
+      queueName: status.queueName,
+      present: status.present,
+      phase: status.phase,
+      queued: status.queued,
+      listOk: status.listOk,
+      active: status.active,
+      dispatched: status.dispatched,
+      maxItems: status.maxItems,
+      next: status.next,
+    });
   }
 
   /**

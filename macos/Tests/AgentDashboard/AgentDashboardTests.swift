@@ -2173,3 +2173,78 @@ struct AgentDashboardOriginTests {
         #expect(model.sections.flatMap { $0.entries }.map(\.sessionID) == [1])
     }
 }
+
+/// (ramon fork / Agent Queue, §11 health) Tests for the queue-health pieces: the
+/// status apply/clear, the present-queue empty-section grouping (so the bar shows with
+/// no/all-hidden tiles), and the pure header text formatting.
+@MainActor
+struct AgentQueueHealthTests {
+    private func status(
+        _ name: String, present: Bool = true, phase: String = "running",
+        queued: Int = 0, listOk: Bool = true, active: Int = 0, dispatched: Int = 0,
+        maxItems: Int? = nil, next: [QueueStatus.NextItem] = []
+    ) -> QueueStatus {
+        .init(queueName: name, present: present, phase: phase, queued: queued,
+              listOk: listOk, active: active, dispatched: dispatched,
+              maxItems: maxItems, next: next)
+    }
+
+    // MARK: - groupByOrigin present-queue injection
+
+    @Test func presentQueueGetsEmptySectionWhenNoTiles() {
+        // The "scary blank" / all-hidden fix: a present queue with NO entries still
+        // produces a section (so its bar/header renders).
+        let sections = AgentDashboardModel.groupByOrigin([], presentQueues: ["ExampleOS"])
+        #expect(sections.map(\.id) == ["ExampleOS"])
+        #expect(sections.first?.entries.isEmpty == true)
+    }
+
+    @Test func presentQueueNotDuplicatedAndOtherExcluded() {
+        // A present queue that already has tiles isn't duplicated; `(other)` is never
+        // injected as a queue even if (defensively) passed in.
+        let e = AgentEntry(id: UUID(), realView: nil, title: "t", pwd: "/x", agent: nil,
+                           bell: false, hidden: false, sessionID: 1,
+                           agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
+                           annotation: AgentAnnotation(queueName: "ExampleOS"),
+                           userNotes: nil, suggestionDismissed: false, backgroundShells: 0)
+        let sections = AgentDashboardModel.groupByOrigin(
+            [e], presentQueues: ["ExampleOS", AgentDashboardModel.otherOrigin])
+        #expect(sections.map(\.id) == ["ExampleOS"])      // no dup, no (other) injected
+        #expect(sections.first?.entries.count == 1)
+    }
+
+    // MARK: - applyQueueStatus store / clear + sections
+
+    @Test func applyStoresAndClearsByPresence() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", queued: 5))
+        #expect(model.queueStatuses["ExampleOS"]?.queued == 5)
+        // A present:false report removes it.
+        model.applyQueueStatus(status("ExampleOS", present: false))
+        #expect(model.queueStatuses["ExampleOS"] == nil)
+    }
+
+    @Test func sectionsShowPresentQueueWithNoTiles() {
+        // No agents at all, but a queue reported present → sections has its header section.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", queued: 3))
+        #expect(model.entries.isEmpty)
+        #expect(model.sections.map(\.id) == ["ExampleOS"])
+    }
+
+    // MARK: - QueueHealthFormat.healthText
+
+    @Test func healthTextStartingUntilFirstList() {
+        #expect(QueueHealthFormat.healthText(status("Q", listOk: false)) == "reading the queue…")
+    }
+
+    @Test func healthTextShowsWaitingRunningAndCap() {
+        let s = status("Q", queued: 7, listOk: true, active: 2, dispatched: 2, maxItems: 3)
+        #expect(QueueHealthFormat.healthText(s) == "7 waiting · 2 running · 2/3")
+    }
+
+    @Test func healthTextUnlimitedCapIsInfinity() {
+        let s = status("Q", queued: 0, listOk: true, active: 1, dispatched: 4, maxItems: nil)
+        #expect(QueueHealthFormat.healthText(s) == "0 waiting · 1 running · 4/∞")
+    }
+}

@@ -367,10 +367,10 @@ struct MCPServerTests {
             "new_tab", "close_surface", "perform_action", "set_surface_annotation",
             // Agent Queue (§8): the supervisor's "hands".
             "spawn_split_command", "force_close_surface", "signal_attention",
-            "take_queue_commands",
+            "take_queue_commands", "report_queue_status",
         ]
         #expect(names == expected)
-        #expect(tools.count == 17)
+        #expect(tools.count == 18)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -930,6 +930,43 @@ struct MCPServerTests {
         #expect(d["action"] as? String == "start")
         #expect(d["template"] == nil)
         #expect(d["run"] == nil)
+    }
+
+    // MARK: - Agent Queue: report_queue_status payload parsing (§11 health)
+
+    @Test func queueStatusPayloadParsesFullArgs() {
+        let p = QueueStatusPayload.fromArguments([
+            "queueName": "ExampleOS", "present": true, "phase": "running",
+            "queued": 7, "listOk": true, "active": 2, "dispatched": 2, "maxItems": 3,
+            "next": [["key": "EX-1", "title": "Fix seed"], ["key": "EX-2"]],
+        ])
+        let s = p?.status
+        #expect(s?.queueName == "ExampleOS")
+        #expect(s?.present == true)
+        #expect(s?.phase == "running")
+        #expect(s?.queued == 7)
+        #expect(s?.active == 2)
+        #expect(s?.maxItems == 3)
+        #expect(s?.next.count == 2)
+        #expect(s?.next.first?.key == "EX-1")
+        #expect(s?.next.first?.title == "Fix seed")
+        #expect(s?.next.last?.title == nil)
+    }
+
+    @Test func queueStatusPayloadRejectsMissingName() {
+        #expect(QueueStatusPayload.fromArguments(["queued": 3]) == nil)
+        #expect(QueueStatusPayload.fromArguments(["queueName": "  "]) == nil)
+    }
+
+    @Test func queueStatusPayloadDefaultsAndUnlimited() {
+        // present defaults true; maxItems absent ⇒ nil (unlimited); next absent ⇒ [].
+        let s = QueueStatusPayload.fromArguments(["queueName": "Q"])?.status
+        #expect(s?.present == true)
+        #expect(s?.maxItems == nil)
+        #expect(s?.next.isEmpty == true)
+        // present:false round-trips (the "run gone" report).
+        let gone = QueueStatusPayload.fromArguments(["queueName": "Q", "present": false])?.status
+        #expect(gone?.present == false)
     }
 
     // MARK: - Agent Queue: take_queue_commands envelope shaping

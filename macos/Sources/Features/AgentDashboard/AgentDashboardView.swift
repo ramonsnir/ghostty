@@ -30,8 +30,11 @@ struct AgentDashboardView: View {
             // only meant to surface when agents EXIST but previews can't render —
             // which is handled by the in-grid banner below, never here.
             degraded(title: "No terminals open.", detail: "Open a terminal to see running agents here.")
-        } else if model.entries.isEmpty {
-            // Either every agent is hidden, or there are terminals but no agents.
+        } else if model.entries.isEmpty && model.queueStatuses.isEmpty {
+            // Either every agent is hidden, or there are terminals but no agents — AND no
+            // queue is running. (§11 health) When a queue IS present we fall through to the
+            // sectioned list instead, so its bar — controls + "N waiting · next: …" — stays
+            // visible even with zero/all-hidden tiles (the queue is still there).
             let hiddenLive = model.hiddenCount(among: model.liveAgentIDs)
             if hiddenLive > 0 {
                 // (6) All agents hidden → collapse to the chip (rendered in footer);
@@ -109,6 +112,7 @@ struct AgentDashboardView: View {
                     if !(model.sections.count == 1 && section.isOther) {
                         OriginSectionHeader(
                             section: section,
+                            status: model.queueStatuses[section.id],
                             onPause: { model.sendRunCommand(.pause, run: section.id) },
                             onResume: { model.sendRunCommand(.resume, run: section.id) },
                             onStop: { model.sendRunCommand(.stop, run: section.id) },
@@ -296,36 +300,73 @@ struct AgentDashboardView: View {
 /// it — `textContent`-safe; it is untrusted queue-template / annotation data).
 private struct OriginSectionHeader: View {
     let section: AgentDashboardModel.OriginSection
+    /// (§11 health) The run's latest health snapshot, when the supervisor has reported
+    /// one. nil for `(other)` and for a queue that hasn't reported yet.
+    let status: QueueStatus?
     let onPause: () -> Void
     let onResume: () -> Void
     let onStop: () -> Void
     let onAbort: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(section.id)
-                .font(.caption.weight(.semibold))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Text("\(section.count)")
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .background(Color.secondary.opacity(0.18))
-                .clipShape(Capsule())
-            Spacer(minLength: 4)
-            if !section.isOther {
-                // Cheap run-control intents (§8/§11). Pause and Resume are both
-                // offered (the model holds no run state, so we can't know which is
-                // active — the sidecar treats the inactive one as a no-op).
-                queueButton("pause", help: "Pause: stop dispatching new agents", action: onPause)
-                queueButton("play", help: "Resume dispatching", action: onResume)
-                queueButton("stop", help: "Stop: drain, no new agents", action: onStop)
-                queueButton("xmark.octagon", help: "Abort: force-close all agents in this run", action: onAbort)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(section.id)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(section.count)")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.18))
+                    .clipShape(Capsule())
+                Spacer(minLength: 4)
+                if !section.isOther {
+                    // Cheap run-control intents (§8/§11). Pause and Resume are both
+                    // offered (the model holds no run state, so we can't know which is
+                    // active — the sidecar treats the inactive one as a no-op).
+                    queueButton("pause", help: "Pause: stop dispatching new agents", action: onPause)
+                    queueButton("play", help: "Resume dispatching", action: onResume)
+                    queueButton("stop", help: "Stop: drain, no new agents", action: onStop)
+                    queueButton("xmark.octagon", help: "Abort: force-close all agents in this run", action: onAbort)
+                }
+            }
+            // (§11 health) The run-level status line: a phase chip + "running/waiting/
+            // progress" + the next items — so you can SEE the queue is alive and what it's
+            // about to do, even before any split spawns.
+            if let status {
+                HStack(spacing: 6) {
+                    phaseChip(status.phase)
+                    Text(QueueHealthFormat.healthText(status))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if !status.next.isEmpty {
+                        Text("next: " + status.next.prefix(3).map(\.key).joined(separator: ", "))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(status.next.map { $0.title ?? $0.key }.joined(separator: "\n"))
+                    }
+                    Spacer(minLength: 0)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func phaseChip(_ phase: String) -> some View {
+        let color = QueueHealthFormat.phaseColor(phase)
+        Text(phase)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.16))
+            .clipShape(Capsule())
     }
 
     private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
@@ -334,6 +375,34 @@ private struct OriginSectionHeader: View {
         }
         .buttonStyle(.borderless)
         .help(help)
+    }
+}
+
+/// (ramon fork / Agent Queue, §11 health) PURE formatting for the queue bar's status
+/// line — split out (internal) so it is unit-testable independent of the SwiftUI view.
+enum QueueHealthFormat {
+    /// The status summary text (excluding the phase chip + the "next:" list).
+    /// "reading the queue…" until the first successful list; otherwise "{queued} waiting"
+    /// (+ "· {active} running" when any) + "· {dispatched}/{cap}" progress (∞ = unlimited)
+    /// — so a reached maxItems cap (e.g. 1/1) is visible at a glance.
+    static func healthText(_ s: QueueStatus) -> String {
+        guard s.listOk else { return "reading the queue…" }
+        var parts: [String] = ["\(s.queued) waiting"]
+        if s.active > 0 { parts.append("\(s.active) running") }
+        let cap = s.maxItems.map(String.init) ?? "∞"
+        parts.append("\(s.dispatched)/\(cap)")
+        return parts.joined(separator: " · ")
+    }
+
+    /// The accent color for a phase chip.
+    static func phaseColor(_ phase: String) -> Color {
+        switch phase {
+        case "running": return .green
+        case "starting": return .blue
+        case "paused", "draining": return .orange
+        case "disabled": return .red
+        default: return .secondary
+        }
     }
 }
 

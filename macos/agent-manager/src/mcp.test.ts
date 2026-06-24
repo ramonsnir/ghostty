@@ -239,6 +239,31 @@ test("spawnSplitCommand: forwards the item env (GHOSTTY_ITEM_*) and omits an emp
   assert.equal("env" in noEnv.args, false, "absent env omitted from the payload");
 });
 
+test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxItems null kept)", async () => {
+  const { method, name, args } = await captureCall('{"ok":true}', (c) =>
+    c.reportQueueStatus({
+      queueName: "ExampleOS",
+      present: true,
+      phase: "running",
+      queued: 7,
+      listOk: true,
+      active: 2,
+      dispatched: 2,
+      maxItems: null,
+      next: [{ key: "EX-1", title: "Fix seed" }, { key: "EX-2" }],
+    }),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "report_queue_status");
+  assert.equal(args.queueName, "ExampleOS");
+  assert.equal(args.present, true);
+  assert.equal(args.phase, "running");
+  assert.equal(args.queued, 7);
+  assert.equal(args.active, 2);
+  assert.equal(args.maxItems, null);
+  assert.deepEqual(args.next, [{ key: "EX-1", title: "Fix seed" }, { key: "EX-2" }]);
+});
+
 test("sendKey: encodes the send_key tool with id + key", async () => {
   const { method, name, args } = await captureCall('{"ok":true}', (c) =>
     c.sendKey("s9", "ctrl_d"),
