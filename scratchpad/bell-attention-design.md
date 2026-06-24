@@ -99,4 +99,21 @@ channels, fail-open timers) came from. The two-tier model only ever ADDS emphasi
 - Core: config-key parse test.
 
 ## Review log
-- (pending)
+- **Slices 1–3 reviewed** (multi-lens workflow `bell-attention-review`, 4 lenses +
+  adversarial verify of blocker/major findings). Verdict **PASS / overall 98**:
+  correctness 98, design 99, threading 98, tests 96. **Zero blockers, zero majors.**
+  Design judged faithful to the additive/never-subtractive model; the deferred
+  rendering correctly out of scope.
+  - One verified MINOR (tests lens): `serializeContext`'s `bellRang` clause — the only
+    thing that asks Haiku for the `attention` verdict — had no direct test (the
+    runSweep tests stub `summarize`, so a regression would silently kill promotion).
+    **FIXED**: added two pure `serializeContext` assertions (emits the clause on
+    bellRang; absent otherwise). Sidecar now 376 tests pass.
+  - Polish nit (direct `parseSummary.attention` round-trip) was already covered.
+- **Build/test gate**: Zig lib+xcframework built; Debug app BUILD SUCCEEDED; sidecar
+  376 `node --test` pass + typecheck; Swift MCPServerTests + MCPAnnotationTests
+  TEST SUCCEEDED (19-tool count + set_attention guards). Reviewable in Debug.
+
+## Remaining (next slices, NOT done)
+- Slice 4: the quiet/loud RENDERING split (deferred — the bell-features debate).
+- Slice 5: route the rate-limit alert through `set_attention` (unify) — optional.

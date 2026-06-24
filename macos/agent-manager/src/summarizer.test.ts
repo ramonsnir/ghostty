@@ -404,6 +404,29 @@ test("serializeContext: leads with the actionable signals (state + request)", ()
   assert.ok(text.indexOf("User request:") < text.indexOf("Recent terminal output"));
 });
 
+// (ramon fork / Bell Attention) The bellRang clause is the ONLY thing that asks
+// Haiku for the `attention` verdict — if it regresses the whole promotion path
+// silently dies, and the runSweep tests can't catch it (they stub the model). So
+// assert serializeContext actually emits it on bellRang, and omits it otherwise.
+test("serializeContext: bellRang emits the bell clause asking for `attention`", () => {
+  const text = serializeContext(
+    buildContext(snap({ agentState: "working" }, "out"), undefined, cfg, true),
+  );
+  assert.match(text, /A terminal bell just rang on this surface/);
+  assert.match(text, /return `attention`/);
+});
+
+test("serializeContext: no bellRang (false or omitted) => the bell clause is absent", () => {
+  const off = serializeContext(
+    buildContext(snap({ agentState: "working" }, "out"), undefined, cfg, false),
+  );
+  assert.doesNotMatch(off, /terminal bell just rang/i);
+  const omitted = serializeContext(
+    buildContext(snap({ agentState: "working" }, "out"), undefined, cfg),
+  );
+  assert.doesNotMatch(omitted, /terminal bell just rang/i);
+});
+
 test("buildContext: prompt window uses promptTailLines (wider than the fingerprint)", () => {
   // 30 lines: the tight fingerprint window (20) would drop the earliest, but the
   // wider prompt window (40) keeps all 30 so the model sees more task context.
