@@ -9,7 +9,28 @@ import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { sanitizeProviderEnv, normalizeExecCode, expandHome } from "./wiring.js";
+import {
+  sanitizeProviderEnv,
+  normalizeExecCode,
+  expandHome,
+  shouldMigrateLegacyState,
+} from "./wiring.js";
+
+// shouldMigrateLegacyState — the rehydrate-path decision to rename a pre-parallel
+// `<basename>.state.json` to the scope-suffixed file, so lifetimeDispatched / live cap /
+// records survive the upgrade instead of resetting to 0.
+test("shouldMigrateLegacyState: migrates only when scoped is absent, legacy exists, paths differ", () => {
+  const scoped = "/s/example.132if54.state.json";
+  const legacy = "/s/example.state.json";
+  // The migration case: an in-flight scoped run with no scoped file yet but a legacy one.
+  assert.equal(shouldMigrateLegacyState(scoped, legacy, false, true), true);
+  // Scoped file already present (already migrated / fresh scoped run) → no migration.
+  assert.equal(shouldMigrateLegacyState(scoped, legacy, true, true), false);
+  // No legacy file (nothing to migrate) → no migration.
+  assert.equal(shouldMigrateLegacyState(scoped, legacy, false, false), false);
+  // Empty-scope run: scoped path === legacy path (the bare file IS the path) → no migration.
+  assert.equal(shouldMigrateLegacyState(legacy, legacy, false, true), false);
+});
 
 // expandHome — the provider-cwd `~` expansion (execFile does NOT expand `~`, so a literal
 // `~/repo` cwd fails ENOENT and every provider call silently skips). §workdir.
