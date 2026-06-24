@@ -226,3 +226,18 @@ export function applyCommands(
   }
   return changed;
 }
+
+/**
+ * Register REHYDRATED runs (restored from `active-runs.json` at sidecar startup) into the
+ * registry — keyed by each run's `runName` IDENTITY, the SAME key a `start` command uses
+ * (see `applyCommand`). This MUST match: control commands (pause/resume/stop/abort/
+ * set_max_items) target the `runName` the dashboard shows, so a restored run keyed by
+ * anything else (it was `template.name`) makes EVERY command a silent "unknown run" no-op —
+ * and two parallel scoped runs of one template would collide on the bare name. Keying by
+ * `runName` here is what makes a restored run behave identically to a freshly started one.
+ * PURE. A `runName` collision between two restored runs keeps the LAST (degenerate; distinct
+ * scopes yield distinct runNames). Exported for unit testing.
+ */
+export function registerRehydratedRuns(registry: RunRegistry, runs: QueueRun[]): void {
+  for (const run of runs) registry.set(run.runName, run);
+}
