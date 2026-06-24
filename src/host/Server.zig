@@ -83,6 +83,23 @@ reaper_thread: ?std.Thread = null,
 /// so there is never a conns/dead_conns ownership race with deinit.
 reaper_running: std.atomic.Value(bool) = .init(true),
 
+/// Idle-leak fix: a SEPARATE, PERIODIC reaper for dead (child-exited / start-failed),
+/// zero-subscriber sessions. The .client GUI never sends an explicit Close, so a parked
+/// dead session (its Session never destroyed, its io thread never joined) would leak
+/// forever (threads + fds + the 256 KiB raw_ring). Unlike the conn reaper above
+/// (signal-driven via `reaper_signal`), session death is never signaled, so this thread
+/// wakes on a TIMED wait (~5 s) and scans the registry (`reapSessionsOnce`). The event is
+/// ONE-SHOT: set ONLY by deinit to signal shutdown (never reset); a timeout just means
+/// "time to scan".
+session_reaper_thread: ?std.Thread = null,
+session_reaper_event: std.Thread.ResetEvent = .{},
+session_reaper_running: std.atomic.Value(bool) = .init(true),
+
+/// Idle-leak fix: monotonic-ms epoch captured at init. `monoNowMs()` measures the
+/// reaper's grace window against it. `std.time.milliTimestamp()` is deliberately NOT
+/// used (wall-clock can jump under NTP and skew/break the grace window). Set in init().
+mono_epoch: std.time.Instant = undefined,
+
 host_pid: i32,
 host_start_epoch: i64,
 
@@ -170,6 +187,20 @@ pub const SessionEntry = struct {
     /// Set by the owner thread when the child exited on its own. The Session is
     /// still valid (NOT destroyed) so reattach can recover state.
     child_dead: bool = false,
+    /// Idle-leak fix: monotonic-ms grace anchor for the session reaper. Stamped (via
+    /// `e.server.monoNowMs()`) when the owner thread first marks the entry dead — both
+    /// the child-exit arm and the start-fail arm — and RE-anchored to "now" whenever the
+    /// AGGREGATE subscriber count drops to 0 on a child_dead entry (last-detach anchoring:
+    /// the grace measures time-since-nobody-watching). null while the session is live.
+    /// Written under `mutex`.
+    dead_at_ms: ?i64 = null,
+    /// Idle-leak fix: set true in the start-FAIL arm of sessionOwnerThread (alongside
+    /// session_alive=false). Distinguishes a start-failed parked orphan (REAPABLE) from
+    /// an entry that is mid-destroy (session_alive=false is also set there, but AFTER
+    /// teardown + only on the already-removed entry). reapEligible uses it as a
+    /// first-class branch so the start-fail orphan is reaped, not masked by !session_alive.
+    /// Written under `mutex`.
+    start_failed: bool = false,
     /// True until the owner thread has called `Session.destroy()`. Once false,
     /// `e.session` is a freed pointer and MUST NOT be dereferenced. Guarded by
     /// `mutex`.
@@ -645,14 +676,18 @@ pub fn init(alloc: Allocator, path: []const u8) !*Server {
         .sessions = std.AutoHashMap(u64, *SessionEntry).init(alloc),
         .host_pid = std.c.getpid(),
         .host_start_epoch = std.time.timestamp(),
+        // Idle-leak fix: monotonic epoch for the reaper grace window (NOT wall-clock).
+        .mono_epoch = std.time.Instant.now() catch unreachable,
     };
 
     return self;
 }
 
-/// Spawn the accept + reaper threads. Returns immediately.
+/// Spawn the accept + conn-reaper + session-reaper threads. Returns immediately.
 pub fn start(self: *Server) !void {
     self.reaper_thread = try std.Thread.spawn(.{}, reaperLoop, .{self});
+    // Idle-leak fix: the periodic dead-session reaper.
+    self.session_reaper_thread = try std.Thread.spawn(.{}, sessionReaperLoop, .{self});
     self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
 }
 
@@ -727,6 +762,117 @@ fn reapConn(self: *Server, conn: *Conn) void {
     conn.subscribed_render.deinit();
     conn.reader.deinit(self.alloc);
     self.alloc.destroy(conn);
+}
+
+/// Idle-leak fix: the grace window a dead (child-exited / start-failed), zero-subscriber
+/// session lingers before the reaper reclaims it. 1 hour: generous enough that a restart
+/// hiccup or stepping away and back does not lose the dead session's final viewport +
+/// exit status (a within-grace reattach still recovers both), yet bounded far below the
+/// multi-day thread/fd accumulation this fixes. Last-detach anchored (see the re-anchor
+/// in handleDetach/unsubscribeAll), so the window measures time-since-nobody-watching.
+const dead_session_grace_ms: i64 = 3_600_000;
+
+/// Idle-leak fix: monotonic milliseconds since `mono_epoch`. NOT wall-clock
+/// (std.time.milliTimestamp can jump under NTP and skew the grace window). Lock-free, so
+/// it is safe to call inside an `e.mutex` critical section (no new lock/order).
+pub fn monoNowMs(self: *Server) i64 {
+    const now = std.time.Instant.now() catch unreachable;
+    return @intCast(now.since(self.mono_epoch) / std.time.ns_per_ms);
+}
+
+/// Idle-leak fix: PURE eligibility predicate for the session reaper (decoupled from
+/// thread timing so it is unit-testable as a truth table). An entry is reapable iff it is
+/// a parked DEAD orphan — a normally child-dead session (`session_alive && child_dead`,
+/// parked at sessionOwnerThread's child-exit park) OR a start-FAILED one
+/// (`!session_alive && start_failed`, parked at the start-fail park) — AND has ZERO
+/// subscribers (no GUI is viewing its final screen) AND its grace window has elapsed. A
+/// genuinely-destroying entry (`!session_alive && !start_failed`) and a LIVE detached
+/// child (`!child_dead`) are NEVER eligible.
+pub fn reapEligible(
+    child_dead: bool,
+    session_alive: bool,
+    start_failed: bool,
+    teardown_requested: bool,
+    subscriber_count: usize,
+    dead_at_ms: ?i64,
+    now_ms: i64,
+    grace_ms: i64,
+) bool {
+    // Defensive/belt-and-suspenders: teardown_requested is set ONLY inside teardownEntry,
+    // which runs only AFTER the entry was fetchRemove'd from the registry — so a reaper
+    // scan (which iterates the registry) can never observe it true. The genuine
+    // anti-double-free is the single-owner fetchRemove gate (a racing Close wins the
+    // remove and the reaper then finds nothing).
+    if (teardown_requested) return false;
+    const reapable_state =
+        (session_alive and child_dead) or
+        (!session_alive and start_failed);
+    if (!reapable_state) return false;
+    // A GUI viewing the final screen (any of the three subscriber lists) keeps it.
+    if (subscriber_count != 0) return false;
+    const dead_at = dead_at_ms orelse return false;
+    return (now_ms - dead_at) >= grace_ms;
+}
+
+/// Idle-leak fix: the periodic dead-session reaper loop. Wakes on a ~5 s timed wait (or
+/// immediately when deinit sets the ONE-SHOT shutdown event) and reaps eligible entries.
+/// The event is set ONLY by deinit, so a successful wait => shutdown; a timeout
+/// (error.Timeout, swallowed) => time to scan. No `.reset()` is ever called.
+fn sessionReaperLoop(self: *Server) void {
+    while (true) {
+        self.session_reaper_event.timedWait(5 * std.time.ns_per_s) catch {};
+        if (!self.session_reaper_running.load(.acquire)) break;
+        self.reapSessionsOnce(self.monoNowMs(), dead_session_grace_ms);
+    }
+}
+
+/// Idle-leak fix: one reaper scan. Collect-then-act (mirrors handleClose's discipline):
+/// under registry_mutex, scan the registry and `fetchRemove` every eligible entry into a
+/// local list (the subscriber-count read + eligibility decision + removal all happen in
+/// the SAME registry_mutex region, so a racing handleAttach — which serializes on
+/// registry_mutex — cannot subscribe to an entry being removed). RELEASE registry_mutex,
+/// THEN teardownEntry each removed entry (teardownEntry must NEVER be called under
+/// registry_mutex — it would risk a lock-order deadlock). The fetchRemove is the
+/// single-owner gate: a racing explicit Close / deinit can never also grab the same entry.
+/// `now_ms` / `grace_ms` are parameters so a test can drive a scan deterministically with
+/// a tiny grace.
+pub fn reapSessionsOnce(self: *Server, now_ms: i64, grace_ms: i64) void {
+    var to_reap: std.ArrayList(*SessionEntry) = .empty;
+    defer to_reap.deinit(self.alloc);
+    {
+        self.registry_mutex.lock();
+        defer self.registry_mutex.unlock();
+        var it = self.sessions.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+            const eligible = blk: {
+                e.mutex.lock();
+                defer e.mutex.unlock();
+                const subs = e.subscribers.items.len +
+                    e.raw_subscribers.items.len +
+                    e.render_subscribers.items.len;
+                break :blk reapEligible(
+                    e.child_dead,
+                    e.session_alive,
+                    e.start_failed,
+                    e.teardown_requested,
+                    subs,
+                    e.dead_at_ms,
+                    now_ms,
+                    grace_ms,
+                );
+            };
+            // OOM building the reap list: skip this entry this scan (it stays registered,
+            // retried next scan) — NEVER remove-without-teardown (that would leak it).
+            if (eligible) to_reap.append(self.alloc, e) catch continue;
+        }
+        // Remove the collected entries from the registry NOW (still under registry_mutex)
+        // so a racing handleAttach/handleClose sees them gone before we release the lock.
+        for (to_reap.items) |e| _ = self.sessions.remove(e.session_id);
+    }
+    // Tear down OUTSIDE registry_mutex (teardownEntry wakes + joins the owner thread,
+    // which runs Session.destroy() on its OWN thread — Phase-1 invariant preserved).
+    for (to_reap.items) |e| self.teardownEntry(e);
 }
 
 fn acceptLoop(self: *Server) void {
@@ -923,6 +1069,41 @@ fn unsubscribeAll(self: *Server, conn: *Conn) void {
         self.registry_mutex.lock();
         defer self.registry_mutex.unlock();
         if (self.sessions.get(sid.*)) |e| e.removeRenderSubscriber(conn);
+    }
+    // Idle-leak fix: FOURTH region — last-detach grace re-anchor. Now that this conn is
+    // off ALL THREE subscriber lists above, re-anchor any child_dead entry whose AGGREGATE
+    // subscriber count just dropped to 0 (the grace measures time-since-nobody-watching).
+    // The three removal loops above run in SEPARATE registry_mutex regions, so the aggregate
+    // is only 0 after the third — hence this fourth pass. Iterate the UNION of the three
+    // subscribed-id sets (a conn may hold a raw/render sub for a session it never
+    // grid-subscribed); a duplicate id across sets is harmless (the stamp is idempotent).
+    var ait = conn.subscribed.keyIterator();
+    while (ait.next()) |sid| self.reanchorIfLastDetach(sid.*);
+    var arit = conn.subscribed_raw.keyIterator();
+    while (arit.next()) |sid| self.reanchorIfLastDetach(sid.*);
+    var arndit = conn.subscribed_render.keyIterator();
+    while (arndit.next()) |sid| self.reanchorIfLastDetach(sid.*);
+}
+
+/// Idle-leak fix: if `sid` is a child_dead entry whose AGGREGATE subscriber count (all
+/// three lists) is now 0, re-anchor its reaper grace window to "now" (last-detach
+/// anchoring). NULL-GUARDED: registry_mutex is released between unsubscribeAll's removal
+/// regions and this call, so a racing handleClose could have fetchRemove'd + freed the
+/// entry in the gap — `get` returns null and we skip it (a missed re-anchor only shifts
+/// the window, never a UAF; reapEligible re-reads the aggregate + fetchRemoves atomically
+/// at reap time). Idempotent. Takes registry_mutex (canonical order) then e.mutex.
+fn reanchorIfLastDetach(self: *Server, sid: u64) void {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    const e = self.sessions.get(sid) orelse return;
+    e.mutex.lock();
+    defer e.mutex.unlock();
+    if (e.child_dead and
+        e.subscribers.items.len == 0 and
+        e.raw_subscribers.items.len == 0 and
+        e.render_subscribers.items.len == 0)
+    {
+        e.dead_at_ms = self.monoNowMs();
     }
 }
 
@@ -1227,6 +1408,20 @@ fn dispatch(self: *Server, conn: *Conn, frame: protocol.Frame) !void {
                 e.removeRenderSubscriber(conn);
                 _ = conn.subscribed_render.remove(detach.session_id);
                 // Child stays alive (Session NOT stopped).
+                // Idle-leak fix: last-detach anchoring — this single handler dropped the
+                // conn from all three lists in ONE registry_mutex region, so if the
+                // AGGREGATE is now 0 on a child_dead entry, re-anchor the grace window.
+                // registry_mutex is already held; inline the e.mutex check (calling
+                // reanchorIfLastDetach would re-lock registry_mutex — not recursive).
+                e.mutex.lock();
+                if (e.child_dead and
+                    e.subscribers.items.len == 0 and
+                    e.raw_subscribers.items.len == 0 and
+                    e.render_subscribers.items.len == 0)
+                {
+                    e.dead_at_ms = self.monoNowMs();
+                }
+                e.mutex.unlock();
             }
         },
 
@@ -1751,6 +1946,13 @@ fn sessionOwnerThread(e: *SessionEntry) void {
         //      requested; the park below returns immediately.
         e.mutex.lock();
         e.child_dead = true;
+        // Idle-leak fix: anchor the reaper grace window at child-death. buffered_child_exited
+        // was already recorded by onChildExited during renderTick (before render_stop.notify
+        // returned the render loop), so the anchor never precedes the buffered exit (a
+        // within-grace reattach always replays it). A child that exits while ALREADY detached
+        // has no subscriber to later drop, so this is its anchor; an attached one re-anchors
+        // at last-detach. e.server.monoNowMs() is lock-free (no new lock order under e.mutex).
+        e.dead_at_ms = e.server.monoNowMs();
         e.mutex.unlock();
     } else |err| {
         log.err("session start failed err={}", .{err});
@@ -1768,6 +1970,11 @@ fn sessionOwnerThread(e: *SessionEntry) void {
         e.mutex.lock();
         e.child_dead = true;
         e.session_alive = false;
+        // Idle-leak fix: mark this a start-FAILED orphan (reapable via reapEligible's
+        // !session_alive && start_failed branch) and anchor its grace window, so the
+        // reaper reclaims it after grace instead of leaking the parked owner until deinit.
+        e.start_failed = true;
+        e.dead_at_ms = e.server.monoNowMs();
         e.mutex.unlock();
     }
 
@@ -2493,6 +2700,18 @@ pub fn deinit(self: *Server) void {
     // Closing the listen fd unblocks the accept thread.
     posix.close(self.listen_fd);
     if (self.accept_thread) |t| t.join();
+
+    // Idle-leak fix: stop + join the SESSION reaper before draining the registry, so it
+    // is never mid-teardownEntry (which frees an entry) when the drain loop runs. Clear
+    // the running flag FIRST (so the woken thread observes it via the event's
+    // release/acquire), then set the ONE-SHOT shutdown event, then join. Even an
+    // interleaving with the conn-quiesce spin or the drain would be race-free (the reaper
+    // touches only self.sessions + teardownEntry, never conns, and every reap goes through
+    // the single-owner fetchRemove gate the drain also uses), but join-before-drain keeps
+    // it clean.
+    self.session_reaper_running.store(false, .release);
+    self.session_reaper_event.set();
+    if (self.session_reaper_thread) |t| t.join();
 
     // QUIESCE read threads BEFORE touching the registry (constraint 1). Shut
     // every live conn's fd so its read thread breaks out of read()/dispatch,
