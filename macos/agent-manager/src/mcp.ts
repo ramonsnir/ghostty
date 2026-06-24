@@ -277,6 +277,19 @@ export class McpClient {
   }
 
   /**
+   * (bell-attention) set_attention — set/clear the sticky "attention needed" STATE on
+   * a surface (the loud Tier-2 treatment: strong tab marker, dashboard sort+highlight,
+   * push). Distinct from `signal_attention` (a one-shot bell ring): this is a persistent
+   * state the GUI clears on focus. The bell-attention pass calls it with `on:true` when
+   * Haiku promotes a bell. `reason` is an optional human note. Throws McpError on failure.
+   */
+  async setAttention(id: string, on: boolean, reason?: string): Promise<void> {
+    const args: Record<string, unknown> = { id, on };
+    if (reason !== undefined) args.reason = reason;
+    await this.call("set_attention", args);
+  }
+
+  /**
    * (Agent Queue, §8a) take_queue_commands — DRAIN + clear the GUI's in-memory FIFO of
    * GUI→sidecar control commands. Returns the drained commands (a `{commands:[...]}`
    * envelope on the wire). TOLERANT: a malformed payload, a non-array `commands`, or any

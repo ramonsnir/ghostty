@@ -25,6 +25,7 @@ import {
   stripFences,
   truncateCodePoints,
   alertEdge,
+  bellRoseEdge,
   SUMMARY_MAX_LEN,
   type LastSummary,
   type SurfaceSnapshot,
@@ -548,4 +549,33 @@ test("alertEdge: tag -> none => clear", () => {
 
 test("alertEdge: none -> none => none", () => {
   assert.equal(alertEdge(undefined, undefined), "none");
+});
+
+// ---------------------------------------------------------------------------
+// Bell-attention (ramon fork): parseSummary.attention + bellRoseEdge
+// ---------------------------------------------------------------------------
+
+test("parseSummary: parses attention boolean when present", () => {
+  assert.equal(parseSummary('{"summary":"x","attention":true}')?.attention, true);
+  assert.equal(parseSummary('{"summary":"x","attention":false}')?.attention, false);
+  assert.equal(parseSummary('{"summary":"x","attention":"yes"}')?.attention, true);
+});
+
+test("parseSummary: absent attention => undefined (omitted)", () => {
+  assert.equal("attention" in (parseSummary('{"summary":"x"}') ?? {}), false);
+});
+
+test("bellRoseEdge: false/undefined -> true => rising edge", () => {
+  assert.equal(bellRoseEdge(undefined, true), true);
+  assert.equal(bellRoseEdge(false, true), true);
+});
+
+test("bellRoseEdge: held true (true -> true) => not an edge", () => {
+  assert.equal(bellRoseEdge(true, true), false);
+});
+
+test("bellRoseEdge: any -> false => not an edge (and re-arms)", () => {
+  assert.equal(bellRoseEdge(true, false), false);
+  assert.equal(bellRoseEdge(false, false), false);
+  assert.equal(bellRoseEdge(undefined, false), false);
 });

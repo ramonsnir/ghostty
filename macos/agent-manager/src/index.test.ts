@@ -51,6 +51,8 @@ interface FakeClientSpec {
   readThrows?: Set<string>;
   /** ids that should throw from signalAttention. */
   signalThrows?: Set<string>;
+  /** ids that should throw from setAttention. */
+  attentionThrows?: Set<string>;
   /** when true, listSurfaces throws. */
   listThrows?: boolean;
 }
@@ -60,14 +62,16 @@ interface FakeClient {
   setCalls: Array<{ id: string; ann: Annotation }>;
   readCalls: string[];
   signalCalls: Array<{ id: string; reason?: string }>;
+  attentionCalls: Array<{ id: string; on: boolean; reason?: string }>;
 }
 
-/** Build a structurally-typed fake McpClient (cast to the class — runSweep only
- *  ever calls listSurfaces/readSurface/setAnnotation/signalAttention). */
+/** Build a structurally-typed fake McpClient (cast to the class — runSweep only ever
+ *  calls listSurfaces/readSurface/setAnnotation/signalAttention/setAttention). */
 function makeFakeClient(spec: FakeClientSpec): FakeClient {
   const setCalls: Array<{ id: string; ann: Annotation }> = [];
   const readCalls: string[] = [];
   const signalCalls: Array<{ id: string; reason?: string }> = [];
+  const attentionCalls: Array<{ id: string; on: boolean; reason?: string }> = [];
   const client = {
     async listSurfaces(): Promise<Surface[]> {
       if (spec.listThrows) throw new Error("list boom");
@@ -85,8 +89,12 @@ function makeFakeClient(spec: FakeClientSpec): FakeClient {
       if (spec.signalThrows?.has(id)) throw new Error(`signal boom ${id}`);
       signalCalls.push({ id, reason });
     },
+    async setAttention(id: string, on: boolean, reason?: string): Promise<void> {
+      if (spec.attentionThrows?.has(id)) throw new Error(`attention boom ${id}`);
+      attentionCalls.push({ id, on, reason });
+    },
   } as unknown as McpClient;
-  return { client, setCalls, readCalls, signalCalls };
+  return { client, setCalls, readCalls, signalCalls, attentionCalls };
 }
 
 interface DepsSpec {
@@ -95,6 +103,8 @@ interface DepsSpec {
   now?: number;
   last?: Map<string, LastSummary>;
   alerts?: Map<string, string>;
+  bellFilter?: boolean;
+  bellsSeen?: Map<string, boolean>;
   budgetMax?: number;
 }
 
@@ -117,6 +127,8 @@ function makeDeps(spec: DepsSpec): {
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
     alertBySession: spec.alerts ?? new Map<string, string>(),
+    bellFilter: spec.bellFilter ?? false,
+    bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
   };
   return { deps, summarizeCalls };
 }
@@ -595,4 +607,139 @@ test("bell: dead-surface alert records are pruned each sweep", async () => {
   await runSweep(deps);
 
   assert.equal(deps.alertBySession.has("s1"), false, "stale alert record dropped");
+});
+
+// ---------------------------------------------------------------------------
+// Bell-attention (ramon fork): a bell rising-edge forces a classify, and Haiku's
+// `attention` verdict PROMOTES the bell to the sticky "attention needed" state via
+// set_attention. Only when bellFilter is on; only on a rising edge; never for a
+// non-agent; and `attention` is acted on ONLY for a bell-triggered classify.
+// ---------------------------------------------------------------------------
+
+const attnTrue: SummarizeFn = async () =>
+  '{"summary":"Needs you: approve deploy?","attention":true}';
+const attnFalse: SummarizeFn = async () =>
+  '{"summary":"Workflow running in the background","attention":false}';
+
+// A debounced agent surface: preGate/shouldSummarize would normally SKIP it, so any
+// classify that happens is attributable to the bell force-through.
+function debouncedAgent(over: Partial<Surface> = {}) {
+  const surface = makeSurface({ id: "s1", agentState: "working", ...over });
+  const last = new Map<string, LastSummary>([
+    ["s1", { fingerprint: "fp", atMs: 1_000_000 - 1000, summary: "old" }],
+  ]);
+  return { surface, last };
+}
+
+test("bell-attention: bellFilter OFF ⇒ a bell never forces a classify (byte-identical)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, last, bellFilter: false });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "debounced surface stays skipped");
+  assert.equal(fake.attentionCalls.length, 0);
+});
+
+test("bell-attention: a rising bell on a debounced agent forces a classify + promotes when attention:true", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "bell forced a classify past debounce");
+  assert.equal(fake.attentionCalls.length, 1, "promoted to attention needed");
+  assert.deepEqual(fake.attentionCalls[0], {
+    id: "s1",
+    on: true,
+    reason: "Needs you: approve deploy?",
+  });
+  assert.equal(deps.bellSeenBySession.get("s1"), true, "bell state recorded");
+});
+
+test("bell-attention: attention:false ⇒ classified but NOT promoted (quiet raw bell stands)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "launched workflow" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnFalse, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "still classified");
+  assert.equal(fake.attentionCalls.length, 0, "not promoted");
+});
+
+test("bell-attention: only a RISING edge forces — a held bell does not re-classify", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  // Pre-seed the bell as already-seen-high: no rising edge this sweep.
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    last,
+    bellFilter: true,
+    bellsSeen: new Map([["s1", true]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "held bell does not force a classify");
+  assert.equal(fake.attentionCalls.length, 0);
+});
+
+test("bell-attention: a bell on a NON-agent surface is never read/classified/promoted", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", processName: "vim", bell: true })],
+    screens: { s1: "x" },
+  });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.readCalls.length, 0, "non-agent not read");
+  assert.equal(summarizeCalls.length, 0);
+  assert.equal(fake.attentionCalls.length, 0);
+});
+
+test("bell-attention: `attention` is acted on ONLY for a bell-triggered classify", async () => {
+  // A normally-due (changed) agent surface with NO bell: even if the model returns
+  // attention:true, the loop must NOT promote (bellRang is false).
+  const surface = makeSurface({ id: "s1", agentState: "working", bell: false });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "fresh output" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "summarized as usual");
+  assert.equal(fake.attentionCalls.length, 0, "no promotion without a bell");
+});
+
+test("bell-attention: a failed set_attention is swallowed (annotation still written)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({
+    surfaces: [surface],
+    screens: { s1: "permission prompt" },
+    attentionThrows: new Set(["s1"]),
+  });
+  const { deps } = makeDeps({ fake, summarize: attnTrue, last, bellFilter: true });
+
+  await runSweep(deps); // must not throw
+
+  assert.equal(fake.setCalls.length, 1, "annotation still written despite the promote failure");
+  assert.equal(deps.budget.active, 0, "budget released");
+});
+
+test("bell-attention: dead-surface bell records are pruned each sweep", async () => {
+  const fake = makeFakeClient({ surfaces: [] }); // s1 gone
+  const { deps } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    bellFilter: true,
+    bellsSeen: new Map([["s1", true]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(deps.bellSeenBySession.has("s1"), false, "stale bell record dropped");
 });

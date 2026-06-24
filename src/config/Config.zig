@@ -2955,6 +2955,17 @@ keybind: Keybinds = .{},
 // macOS apprt reads this via the `agentManagerNodePath` Swift getter.
 @"agent-manager-node-path": ?[:0]const u8 = null,
 
+/// (ramon fork / Bell Attention) Opt-in two-tier bell handling. When true AND the
+/// Agent Manager is running, a raw terminal bell renders QUIET (a low-key indicator,
+/// no dock bounce / sound / push / dashboard auto-unhide), and the Agent Manager
+/// sidecar PROMOTES only the bells Haiku judges worth interrupting you for into a
+/// louder "attention needed" state (strong tab marker, dashboard sort+highlight,
+/// push). Purely additive — the raw bell always fires immediately, so nothing is ever
+/// lost; the sidecar only ever turns the volume UP. Default false ⇒ bells behave
+/// exactly as today. Fork-only — keep it in `~/.config/ghostty-ramon/config` (an
+/// official Ghostty sharing `~/.config/ghostty/config` would error on it).
+@"agent-manager-bell-filter": bool = false,
+
 /// (ramon fork / Agent Queue Supervisor) Master enable for the Agent Queue
 /// Supervisor — the deterministic supervisor "pass 3" the Agent Manager
 /// sidecar runs (no LLM in the control path) that starts, tracks, and tears
@@ -11388,6 +11399,7 @@ test "agent-manager: parse and default" {
         try cfg.finalize();
         try testing.expectEqual(false, cfg.@"agent-manager");
         try testing.expect(cfg.@"agent-manager-node-path" == null);
+        try testing.expectEqual(false, cfg.@"agent-manager-bell-filter");
     }
 
     {
@@ -11396,11 +11408,13 @@ test "agent-manager: parse and default" {
         var it: TestIterator = .{ .data = &.{
             "--agent-manager=true",
             "--agent-manager-node-path=/usr/local/bin/node",
+            "--agent-manager-bell-filter=true",
         } };
         try cfg.loadIter(alloc, &it);
         try cfg.finalize();
         try testing.expectEqual(true, cfg.@"agent-manager");
         try testing.expectEqualStrings("/usr/local/bin/node", cfg.@"agent-manager-node-path".?);
+        try testing.expectEqual(true, cfg.@"agent-manager-bell-filter");
     }
 }
 
