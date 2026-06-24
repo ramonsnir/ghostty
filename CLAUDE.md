@@ -659,6 +659,49 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     into the model call; `model.ts summarize()` then passes `env:{...process.env,
     CLAUDE_CONFIG_DIR}` (spread so HOME/PATH/OAuth survive — only the config dir is re-pointed).
     SIDECAR-only: edit the file + restart the sidecar (the GUI respawns it; no app relaunch).
+  - **Attention bell on rate-limit (fork-only, sidecar-only, ZERO Swift/Zig/host change).**
+    The summarizer doubles as an attention watchdog: when a session hits the Claude
+    usage/rate-limit BLOCKING prompt ("Stop and wait for limit to reset / Ask your admin
+    for more usage" — which halts the agent WITHOUT ringing a terminal bell), the sidecar
+    rings the bell via the EXISTING MCP `signalAttention` tool (`client.signalAttention`,
+    already used by the Queue's leave-and-bell) — fanning out to the 🔔 tab title, dashboard
+    aggregate, web monitor, and push, all off the one `.ghosttyBellDidRing` post. **No new
+    MCP tool / no Swift / no host work** — the bell path already existed; this just triggers
+    it. **HAIKU IS THE SOLE CLASSIFIER — NO regex/text match (deliberate, see below).** An
+    extensible `alert?: string` field was added to the Haiku STRUCTURED OUTPUT contract
+    (`src/prompts.ts`, parsed in `parseSummary` → `ParsedSummary.alert`, lower-cased/trimmed);
+    the prompt tells Haiku to judge the CURRENT/LIVE state at the BOTTOM of the screen and set
+    `"rate_limited"` only while the agent is actually halted on that prompt right now — NOT
+    when the same text merely sits scrolled-up in history. **Why no deterministic regex
+    backstop (the design pivot — an earlier version had one, removed):** a regex matches the
+    text ANYWHERE in the viewport, so it (a) can't detect RECOVERY (the prompt scrolls up but
+    stays in view → would never clear) and (b) on the idle-skip/model-fail paths would
+    re-scan and FALSELY RE-RING after Haiku had already cleared it. Only a whole-screen
+    classifier can tell "live prompt" from "scrolled-up history", so the regex was dropped
+    entirely. The alert state therefore changes ONLY when a Haiku call SUCCEEDS + parses:
+    `maybeSignalAlert(parsed.alert)` runs on the due path only; idle-skip / parse-fail /
+    model-throw branches LEAVE the alert state untouched (a held alert stays armed, nothing
+    rings or clears without a fresh classify). EDGE-TRIGGERED via a per-surface
+    `alertBySession: Map<id,tag>` on `LoopDeps` (pure `alertEdge(prev,current)` →
+    ring/clear/none): rings ONCE on a rising/changed edge, clears when Haiku reports no alert
+    (this is how recovery un-rings, immune to scrolled-up text), re-arms after; cleaned up
+    alongside `lastBySession` for dead surfaces; a failed `signalAttention` rolls the record
+    back so a later sweep retries. **HONEST COST of pure-Haiku:** if the summarizer's OWN
+    account is the rate-limited one, its calls fail and the FIRST detection can't fire (a held
+    alert still stays armed; only the initial ring is at risk) — mitigate by routing the
+    summarizer to a SEPARATE account (the existing Account-routing feature; the recommended
+    watchdog setup). Detection still lands on the change-edge: the prompt appearing changes
+    the screen → `shouldSummarize` returns `changed` (beats idle-skip) → Haiku runs → rings;
+    latency ≈ debounce + a sweep (~5–15s). Wiring: sidecar ONLY — `prompts.ts` (contract +
+    `alert` rule), `summarizer.ts` (`ParsedSummary.alert` + `parseSummary` parse +
+    `ALERT_RATE_LIMITED` + pure `alertEdge`), `index.ts` (`LoopDeps.alertBySession` +
+    `maybeSignalAlert` edge handler on the success branch only + `alertReason` + dead-id prune
+    + main init). Tests: `summarizer.test.ts` (`alertEdge` + `parseSummary` alert parsing) +
+    `index.test.ts` (`bell:` group — ring-once, held-no-rering-under-idle-skip, recovery-clears,
+    scrolled-up-text-inert, model-failure-leaves-untouched, model-alert-rings-regardless-of-text,
+    changed-tag-rerings, failed-ring rollback, non-agent never rung, dead-id prune). **Rebuilt
+    sidecar `dist` + a sidecar restart (kill the node child or relaunch the GUI) is enough; no
+    host/Zig change, no GUI relaunch needed for the GUI itself.**
   - **NO reply-suggestion feature (removed end-to-end).** An earlier "manager" pass proposed
     replies on `waiting` tiles (Approve/Edit/Dismiss + a per-tile notes field); it drained quota
     for low value and is GONE — both the TS sidecar pass (`manager.ts` + `model.ts suggest()` +

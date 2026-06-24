@@ -14,6 +14,43 @@ it only annotates the tile), and bills through your existing Claude Code auth (n
 key). Its Haiku traffic can optionally be routed to a **separate account** so it never
 drains your main quota (see *Account routing* below).
 
+## Rate-limit (and other) attention bells
+
+The summarizer also doubles as an **attention watchdog**: when a session hits the
+Claude **usage/rate-limit prompt** — the interactive *"Stop and wait for limit to
+reset / Ask your admin for more usage"* screen that silently halts the agent without
+ringing a bell — the sidecar **rings the bell for that surface** (via the MCP
+`signal_attention` tool). That fans out exactly like a real terminal bell: the 🔔 tab
+title, the Agent Dashboard aggregate, the web monitor, and a phone push all light up,
+so you notice even when you've stepped away.
+
+**Haiku is the sole classifier — there is no text/regex match.** The summary call
+already reads the screen every time it runs; it now also returns an optional `alert`
+tag in its structured output, and it is told to judge the **current, live** state at
+the bottom of the screen — so it sets `rate_limited` only while the agent is *actually
+halted on that prompt right now*, and drops it the moment the agent resumes (even if the
+old prompt text is still scrolled up in view). The loop rings on the **rising edge** of
+that tag and clears when Haiku reports no alert — so:
+
+- It **rings once** when the prompt appears and won't nag every 5s while it sits there.
+- **Recovery un-rings correctly** — as soon as Haiku reclassifies the live screen, the
+  bell re-arms. Stale text scrolled up in history never (re-)fires it, because the
+  decision isn't a substring match.
+
+Why no regex backstop: a regex matches the text *anywhere* in the viewport and can't
+tell a live prompt from one scrolled up in history — so it would both miss recovery and
+*falsely re-ring* after recovery. Letting Haiku own the whole decision is what fixes
+both. To recognize a new condition, just teach the summarizer prompt a new `alert` tag
+(`macos/agent-manager/src/prompts.ts`) — no code change.
+
+> **One caveat — route the summarizer to a separate account.** Because the watchdog is
+> the summarizer's own Haiku call, if that call bills to *the same account that just got
+> rate-limited*, it fails too and the **first** detection can't fire (a held alert still
+> stays armed; only the initial ring is at risk). Point the summarizer at a different
+> account via **[Account routing](#account-routing-optional--bill-the-summarizer-to-a-separate-account)**
+> so the watchdog survives the very limit it is watching for. This is the recommended
+> setup.
+
 ## How it works (one paragraph)
 
 A small **TypeScript sidecar** (`macos/agent-manager/`, built with the Claude Agent
