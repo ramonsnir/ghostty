@@ -108,6 +108,13 @@ extension Ghostty {
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
 
+        /// (ramon fork / Bell Attention) The sticky "attention needed" state — the loud
+        /// Tier-2 signal the Agent Manager sidecar PROMOTES a notable bell into via the
+        /// MCP `set_attention` tool (`.ghosttyAttentionDidChange`). Distinct from `bell`
+        /// (a one-shot raw ring): this persists until the user focuses the surface.
+        /// Cleared on focus, exactly like `bell`.
+        @Published private(set) var attentionNeeded: Bool = false
+
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
         var initialSize: NSSize?
@@ -374,6 +381,13 @@ extension Ghostty {
                 selector: #selector(ghosttyBellDidRing(_:)),
                 name: .ghosttyBellDidRing,
                 object: self)
+            // (ramon fork / Bell Attention) The set_attention tool posts with
+            // object:nil + userInfo[surfaceID], so observe globally and filter by id.
+            center.addObserver(
+                self,
+                selector: #selector(ghosttyAttentionDidChange(_:)),
+                name: .ghosttyAttentionDidChange,
+                object: nil)
             center.addObserver(
                 self,
                 selector: #selector(windowDidChangeScreen),
@@ -494,6 +508,10 @@ extension Ghostty {
 
                 // We unset our bell state if we gained focus
                 bell = false
+
+                // (ramon fork / Bell Attention) Focusing the surface means the user
+                // has seen it — clear the sticky "attention needed" state too.
+                attentionNeeded = false
 
                 // Remove any notifications for this surface once we gain focus.
                 if !notificationIdentifiers.isEmpty {
@@ -883,6 +901,17 @@ extension Ghostty {
             if features.contains(.title) || features.contains(.border) {
                 bell = true
             }
+        }
+
+        /// (ramon fork / Bell Attention) Apply a `set_attention` result for THIS
+        /// surface: set/clear the sticky `attentionNeeded` state. Filtered by surfaceID
+        /// since the notification is posted globally (object:nil).
+        @objc private func ghosttyAttentionDidChange(_ notification: SwiftUI.Notification) {
+            guard let info = notification.userInfo,
+                  let uuid = info[AgentStateUserInfoKey.surfaceID] as? UUID,
+                  uuid == self.id else { return }
+            let on = (info[AgentStateUserInfoKey.attention] as? Bool) ?? false
+            attentionNeeded = on
         }
 
         @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {

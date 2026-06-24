@@ -105,6 +105,18 @@ extension Notification.Name {
     ///            AgentStateUserInfoKey.annotation: AgentAnnotation]
     static let ghosttyAgentAnnotationDidChange =
         Notification.Name("com.mitchellh.ghostty.ghosttyAgentAnnotationDidChange")
+
+    /// (ramon fork / Bell Attention) Posted on MAIN by the MCP `set_attention`
+    /// handler after it resolves the tool's `id` to a live surface UUID. Observed by
+    /// the SurfaceView for that id, which sets/clears its sticky `attentionNeeded`
+    /// state (the loud Tier-2 treatment). This is DISTINCT from `.ghosttyBellDidRing`
+    /// (a one-shot raw bell) — `set_attention` is a sticky state the sidecar promotes
+    /// a bell into, cleared on focus.
+    /// userInfo: [AgentStateUserInfoKey.surfaceID: UUID,
+    ///            AgentStateUserInfoKey.attention: Bool,
+    ///            AgentStateUserInfoKey.reason: String]   // "" if none
+    static let ghosttyAttentionDidChange =
+        Notification.Name("com.mitchellh.ghostty.ghosttyAttentionDidChange")
 }
 
 /// userInfo keys for the two notifications above. String keys are intentionally
@@ -116,4 +128,6 @@ enum AgentStateUserInfoKey {
     static let pwd        = "pwd"        // String
     static let message    = "message"    // String
     static let annotation = "annotation" // AgentAnnotation
+    static let attention  = "attention"  // Bool (ramon fork / Bell Attention)
+    static let reason     = "reason"     // String (ramon fork / Bell Attention)
 }

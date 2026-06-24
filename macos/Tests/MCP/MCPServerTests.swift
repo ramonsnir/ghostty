@@ -352,9 +352,11 @@ struct MCPServerTests {
             // Agent Queue (§8): the supervisor's "hands".
             "spawn_split_command", "force_close_surface", "signal_attention",
             "take_queue_commands", "report_queue_status",
+            // Bell Attention: promote a bell to the sticky attention state.
+            "set_attention",
         ]
         #expect(names == expected)
-        #expect(tools.count == 18)
+        #expect(tools.count == 19)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -509,6 +511,23 @@ struct MCPServerTests {
         switch MCPTools.dispatch(name: "send_key", arguments: ["key": "enter"], server: server) {
         case .invalidParams: break
         default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    // (ramon fork / Bell Attention) set_attention pre-hop guards.
+    @Test func dispatchSetAttentionMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "set_attention", arguments: ["on": true], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for missing id")
+        }
+    }
+
+    @Test func dispatchSetAttentionMissingOnInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "set_attention", arguments: ["id": UUID().uuidString], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for missing on")
         }
     }
 

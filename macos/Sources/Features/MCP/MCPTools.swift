@@ -189,6 +189,24 @@ enum MCPTools {
             ],
         ],
         [
+            // (ramon fork / Bell Attention) set/clear the sticky "attention needed"
+            // state on a surface — the loud Tier-2 treatment the bell-attention pass
+            // promotes a notable bell into. Distinct from signal_attention (a one-shot
+            // bell ring); this is a sticky state the GUI clears on focus.
+            "name": "set_attention",
+            "description": "Set or clear a surface's sticky 'attention needed' state (the loud treatment: strong tab marker, dashboard sort/highlight, push). Used by the Agent Manager's bell-attention pass to PROMOTE a bell Haiku judged worth interrupting the user for. Unlike signal_attention (a one-shot ring), this is a persistent state the GUI clears when the user focuses the surface. Provide 'id' and 'on' (true to set, false to clear); 'reason' is an optional human-readable note. This NEVER sends input to the agent.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "string", "description": "Surface UUID from list_surfaces."],
+                    "on": ["type": "boolean", "description": "true = set attention; false = clear."],
+                    "reason": ["type": "string", "description": "Optional human-readable note (e.g. the one-line summary)."],
+                ],
+                "required": ["id", "on"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
             // (ramon fork / Agent Queue, §8.1)
             "name": "spawn_split_command",
             "description": "Agent Queue: spawn one agent split running a command, returning the NEW surface's stable identity {id (UUID), sessionId (the pty-host session id; 0 when there is no host session)}. With firstTab:true, opens the run's first TAB (from app defaults in cwd); otherwise SPLITS the targetUUID surface in the given direction. The command is run as the new surface's first input in an interactive shell (it does NOT replace the shell); interior newlines are collapsed so exactly one trailing submit is sent. SAFETY/GENERICITY: item context MUST be passed via the 'env' map (e.g. GHOSTTY_ITEM_KEY/TITLE/URL) — which is set on the new split's environment so the launched shell inherits it — and NEVER string-spliced into 'command' (that would be shell injection). 'command' is the template launch line passed VERBATIM. 'cwd' is NOT tilde-expanded (use an absolute path).",
@@ -393,6 +411,13 @@ enum MCPTools {
                 return .invalidParams("empty annotation: provide at least one of summary/phase/needsUser/queueKey/queueName/queueUrl")
             }
             let ok = server.applyAnnotation(uuid: uuid, annotation: payload.annotation)
+            return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
+
+        case "set_attention":
+            guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
+            guard let on = arguments["on"] as? Bool else { return .invalidParams("missing or invalid on") }
+            let reason = (arguments["reason"] as? String) ?? ""
+            let ok = server.setAttention(uuid: uuid, on: on, reason: reason)
             return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
 
         case "spawn_split_command":

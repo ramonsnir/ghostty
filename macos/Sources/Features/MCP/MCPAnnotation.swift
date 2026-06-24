@@ -78,4 +78,24 @@ extension MCPServer {
         }
         return true
     }
+
+    /// (ramon fork / Bell Attention) Resolve `uuid` on MAIN and, if it exists, post
+    /// `.ghosttyAttentionDidChange` so the target SurfaceView sets/clears its sticky
+    /// `attentionNeeded` state (the loud Tier-2 treatment). The sidecar's bell pass
+    /// calls this with `on:true` when Haiku promotes a bell; the GUI clears it on
+    /// focus. Same resolve-on-main + post-on-main shape as `applyAnnotation`.
+    func setAttention(uuid: UUID, on: Bool, reason: String) -> Bool {
+        let exists = DispatchQueue.main.sync {
+            MCPLayout.surface(forUUID: uuid) != nil
+        }
+        guard exists else { return false }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .ghosttyAttentionDidChange, object: nil,
+                userInfo: [AgentStateUserInfoKey.surfaceID: uuid,
+                           AgentStateUserInfoKey.attention: on,
+                           AgentStateUserInfoKey.reason: reason])
+        }
+        return true
+    }
 }

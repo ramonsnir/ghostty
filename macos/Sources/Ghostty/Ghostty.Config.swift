@@ -895,6 +895,18 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Bell Attention) Opt-in two-tier bell handling. When true AND
+        // the Agent Manager is running, the sidecar promotes only notable bells to the
+        // sticky "attention needed" state. Default false. The GUI forwards this to the
+        // sidecar as GHOSTTY_BELL_FILTER=1.
+        var agentManagerBellFilter: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-manager-bell-filter"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
         // nil/empty when unset (the controller falls back to a login-shell probe).
         var agentManagerNodePath: String? {
