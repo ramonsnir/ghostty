@@ -194,6 +194,14 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   show their item key + link.
 - **Control:** per-queue **Pause / Resume / Stop (drain) / Abort** from the section header.
   Stop = finish in-flight, dispatch no more; Abort = close everything and clear the run.
+- **Health bar:** each running queue's section header shows a live status line — a phase chip
+  (**starting → running → paused / draining / disabled**) plus **"N waiting · M running ·
+  dispatched/cap"** (the cap is `∞` when unlimited, so a reached `maxItems` like `1/1` is
+  obvious) and **"next: …"** the upcoming item keys. This appears the moment you start a queue
+  — **before any split spawns** ("starting · reading the queue…") — so it's never a scary
+  blank, and the bar (with its controls) **stays visible even when every tile is hidden or
+  there are no agents yet**, so you can always see the queue is there and what's next. The
+  supervisor pushes this every ~5s; a finished/aborted run's section disappears.
 
 ## What it guarantees
 

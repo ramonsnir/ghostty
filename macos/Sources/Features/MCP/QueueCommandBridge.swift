@@ -79,3 +79,98 @@ extension Notification.Name {
 enum QueueCommandUserInfoKey {
     static let command = "command"  // QueueCommand
 }
+
+// MARK: - Queue HEALTH (§11) — sidecar → GUI run-level status push
+
+/// (ramon fork / Agent Queue, §11 health) The run-level health snapshot the sidecar
+/// supervisor PUSHES each sweep via the `report_queue_status` MCP tool, so the Agent
+/// Dashboard can show — even BEFORE any split spawns — that a queue is present and what
+/// it's about to do. Mirrors the TS `QueueStatusReport` (macos/agent-manager/src/queue/
+/// status.ts). PURE value type, safe across the main hop.
+struct QueueStatus: Equatable, Sendable {
+    /// One "what's next" entry (key + optional title).
+    struct NextItem: Equatable, Sendable {
+        let key: String
+        let title: String?
+    }
+
+    /// The run NAME (= dashboard origin) this status is for.
+    let queueName: String
+    /// false ⇒ the run was removed (drained/aborted/quit) — the dashboard clears it.
+    let present: Bool
+    /// Coarse lifecycle phase for the header chip.
+    let phase: String       // "starting"|"running"|"paused"|"draining"|"disabled"
+    /// Count of actionable items waiting (not currently active) — the backlog.
+    let queued: Int
+    /// Whether the last `list` fetch succeeded (false ⇒ "starting"/provider error).
+    let listOk: Bool
+    /// Agents currently running (slot-occupying assignments).
+    let active: Int
+    /// Lifetime dispatches so far.
+    let dispatched: Int
+    /// Effective lifetime cap, or nil for unlimited.
+    let maxItems: Int?
+    /// Up to a few of the next actionable items.
+    let next: [NextItem]
+}
+
+/// PURE, unit-tested parser of the `report_queue_status` tool arguments → `QueueStatus`.
+/// `queueName` is REQUIRED (non-empty); everything else defaults sanely so a partial
+/// payload still yields a usable status. `maxItems` is a number or null/absent (unlimited).
+struct QueueStatusPayload {
+    let status: QueueStatus
+
+    static func fromArguments(_ arguments: [String: Any]) -> QueueStatusPayload? {
+        guard let queueName = (arguments["queueName"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !queueName.isEmpty
+        else { return nil }
+
+        func int(_ key: String) -> Int { (arguments[key] as? NSNumber)?.intValue ?? 0 }
+        let present = (arguments["present"] as? Bool) ?? true
+        let phase = (arguments["phase"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "running"
+        let listOk = (arguments["listOk"] as? Bool) ?? false
+        // maxItems: a number = cap; null/absent = unlimited (nil).
+        let maxItems = (arguments["maxItems"] as? NSNumber)?.intValue
+
+        var next: [QueueStatus.NextItem] = []
+        if let rawNext = arguments["next"] as? [[String: Any]] {
+            for entry in rawNext {
+                guard let key = (entry["key"] as? String), !key.isEmpty else { continue }
+                let title = (entry["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                next.append(QueueStatus.NextItem(key: key, title: title))
+            }
+        }
+
+        return QueueStatusPayload(status: QueueStatus(
+            queueName: queueName, present: present, phase: phase,
+            queued: int("queued"), listOk: listOk, active: int("active"),
+            dispatched: int("dispatched"), maxItems: maxItems, next: next))
+    }
+}
+
+extension Notification.Name {
+    /// (ramon fork / Agent Queue, §11) Posted on MAIN by `MCPServer.applyQueueStatus`
+    /// when the sidecar reports a run's health. `AgentDashboardController` observes it
+    /// (stores the status per run; drops it when `present == false`).
+    /// userInfo: [QueueCommandUserInfoKey.status: QueueStatus]
+    static let ghosttyQueueStatusDidChange =
+        Notification.Name("com.mitchellh.ghostty.ghosttyQueueStatusDidChange")
+}
+
+extension QueueCommandUserInfoKey {
+    static let status = "status"  // QueueStatus
+}
+
+extension MCPServer {
+    /// Handle a `report_queue_status` tool call: post `.ghosttyQueueStatusDidChange` on
+    /// MAIN so the dashboard can store/render the run-level health. Run-level (no surface
+    /// to resolve), so unlike `applyAnnotation` it never fails — always returns true.
+    func applyQueueStatus(_ status: QueueStatus) -> Bool {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .ghosttyQueueStatusDidChange, object: nil,
+                userInfo: [QueueCommandUserInfoKey.status: status])
+        }
+        return true
+    }
+}

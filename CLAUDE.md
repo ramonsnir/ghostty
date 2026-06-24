@@ -933,6 +933,37 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `MCPServerTests`/`MCPAnnotationTests`/`AgentDashboardTests`/`QueuePaletteTests`, Zig
     `agent-queue` config + `start_agent_queue` binding. **GUI relaunch + rebuilt sidecar
     `dist` to enable; no host restart.**
+  - **QUEUE HEALTH bar (§11, sidecar→GUI push).** The dashboard shows each running queue's
+    health in its section header — even BEFORE any split spawns and even when every tile is
+    hidden/filtered (the "scary blank at start" + "all hidden" fixes). The supervisor PUSHES
+    a run-level snapshot EVERY 5s sweep (incl. the dispatch-suppressed arm sweep) via a new
+    MCP tool **`report_queue_status`**: `{queueName, present, phase, queued, listOk, active,
+    dispatched, maxItems|null, next:[{key,title?}]}`. The header renders a phase chip
+    (starting/running/paused/draining/disabled) + `QueueHealthFormat.healthText` ("N waiting ·
+    M running · dispatched/cap", ∞ = unlimited — so a reached `maxItems` like `1/1` is
+    obvious) + "next: KEY,KEY,…". **`present:false`** (reported on drain/abort/quit removal)
+    clears the section. The "show with no tiles" behavior: `AgentDashboardModel.groupByOrigin`
+    gained a `presentQueues` param that injects an EMPTY section for any present queue with no
+    (visible) entries, and `sections` passes the (filter-minus) `queueStatuses` keys; the
+    `content` body now falls through to the sectioned list (not the "no agents" placeholder)
+    whenever `queueStatuses` is non-empty. **The ~170s "only one item, then a delay" the user
+    saw was NOT serialization** — the engine dispatches up to min(concurrency, grid, maxTotal,
+    maxItemsRemaining) per 5s sweep; the gap was the 2nd item only becoming actionable in the
+    `list` later. Health-bar visibility makes that observable. Sidecar wiring: `status.ts`
+    (pure `queueStatusReport` + `QueueStatusReport`), `runner.ts` (`lastListItems`/`lastListOk`
+    cache + `effectiveMaxItemsCap` + `reportQueueStatus`/`reportRunGone` each sweep, single
+    funnel for the dispatch-decision returns so the report ALWAYS fires), `mcp.ts`
+    (`reportQueueStatus`). Swift: `QueueCommandBridge.swift` (`QueueStatus` +
+    `QueueStatusPayload.fromArguments` + `.ghosttyQueueStatusDidChange` +
+    `MCPServer.applyQueueStatus`), `MCPTools.swift` (schema + dispatch), `MCPServer`
+    (handler), `AgentDashboardController.swift` (`queueStatuses` @Published + `applyQueueStatus`
+    + `subscribeQueueStatus` + `groupByOrigin(presentQueues:)` + `sections`),
+    `AgentDashboardView.swift` (`OriginSectionHeader` status line + `QueueHealthFormat` +
+    the `content` fall-through). Tests: sidecar `status.test.ts` + `mcp.test.ts`
+    (`reportQueueStatus`) + `runner.test.ts` (a sweep reports starting→counts); Swift
+    `MCPServerTests` (`queueStatusPayload*`, `toolsListHasAllTools` now 18) +
+    `AgentDashboardTests` (`AgentQueueHealthTests`: apply/clear, empty-section grouping,
+    `healthText`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

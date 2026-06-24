@@ -322,6 +322,14 @@ final class AgentDashboardModel: ObservableObject {
     /// hook state above), and pruned on `rebuild(live:)` for vanished surfaces.
     @Published private(set) var annotations: [UUID: AgentAnnotation] = [:]
 
+    /// (ramon fork / Agent Queue, §11 health) The latest run-level health per queue NAME,
+    /// pushed by the supervisor via `report_queue_status`. `@Published` so the section
+    /// headers re-render. Drives the queue bar's "N waiting · next: …" + the
+    /// SHOW-EVEN-WITH-NO-TILES behavior: a present queue here gets a section/header even
+    /// when it has zero (or all-hidden) tiles. A `present:false` report removes the entry.
+    /// In-memory only (the sidecar re-reports every sweep).
+    @Published private(set) var queueStatuses: [String: QueueStatus] = [:]
+
     // MARK: - User notes (ramon fork / Agent Manager Phase 2)
 
     /// The user's per-session free-text NOTES (goals/guidance for the manager),
@@ -622,6 +630,18 @@ final class AgentDashboardModel: ObservableObject {
         if annotation.suggestion != nil { suggestionDismissed.remove(id) }
         annotations[id] = annotations[id]?.merging(annotation) ?? annotation
         rebuildEntriesFromCurrentState()
+    }
+
+    /// (ramon fork / Agent Queue, §11 health) Store/clear a run's health snapshot.
+    /// `present` ⇒ store (the header shows it + the queue gets a section even with no
+    /// tiles); `!present` ⇒ remove (the run was torn down). `@Published`, so the
+    /// dashboard re-renders; no entries rebuild needed (sections reads `queueStatuses`).
+    func applyQueueStatus(_ status: QueueStatus) {
+        if status.present {
+            queueStatuses[status.queueName] = status
+        } else {
+            queueStatuses.removeValue(forKey: status.queueName)
+        }
     }
 
     /// (ramon fork / Agent Manager Phase 2) Clear ONLY the suggestion field for a
@@ -1045,13 +1065,23 @@ final class AgentDashboardModel: ObservableObject {
     /// `(other)` catch-all LAST. Within a section the input order is preserved
     /// (the caller passes the global `sorted(...)` order, so attention-first /
     /// manual / recency carries into each section). Unit-tested.
-    static func groupByOrigin(_ entries: [AgentEntry]) -> [OriginSection] {
+    static func groupByOrigin(
+        _ entries: [AgentEntry],
+        presentQueues: Set<String> = []
+    ) -> [OriginSection] {
         var order: [String] = []           // first-seen origin order (for tie-stable grouping)
         var buckets: [String: [AgentEntry]] = [:]
         for e in entries {
             let o = origin(of: e)
             if buckets[o] == nil { order.append(o) }
             buckets[o, default: []].append(e)
+        }
+        // (§11 health) Ensure every PRESENT queue gets a section even with NO entries —
+        // so its bar (controls + status) stays visible before any split spawns AND when
+        // every tile is hidden/filtered. `(other)` is never a queue, so it's excluded.
+        for q in presentQueues where q != otherOrigin && buckets[q] == nil {
+            buckets[q] = []
+            order.append(q)
         }
         // Queue origins sorted case-insensitively, `(other)` always last.
         let origins = order.sorted { a, b in
@@ -1077,7 +1107,10 @@ final class AgentDashboardModel: ObservableObject {
     /// filter-bar toggle list both see the full origin set.
     var sections: [OriginSection] {
         let filtered = AgentDashboardModel.applyOriginFilter(entries, excluded: excludedOrigins)
-        return AgentDashboardModel.groupByOrigin(filtered)
+        // (§11 health) Present queues (minus any the user filtered out) get a section even
+        // with no tiles — so the bar stays put while a queue is starting / all hidden.
+        let present = Set(queueStatuses.keys).subtracting(excludedOrigins)
+        return AgentDashboardModel.groupByOrigin(filtered, presentQueues: present)
     }
 
     /// Toggle an origin's inclusion in the view. Excluded ⇄ included. Persists.
@@ -1182,6 +1215,7 @@ final class AgentDashboardController: NSWindowController {
         subscribeChurn()
         subscribeAgentState()
         subscribeAnnotation()
+        subscribeQueueStatus()
         rebuildControllerObservers()
     }
 
@@ -1350,6 +1384,21 @@ final class AgentDashboardController: NSWindowController {
                       let annotation = note.userInfo?[AgentStateUserInfoKey.annotation] as? AgentAnnotation
                 else { return }
                 self.model.applyAnnotation(id, annotation)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Queue, §11 health) Observe `.ghosttyQueueStatusDidChange`
+    /// posted by the MCP `report_queue_status` handler and hand the run-level health to
+    /// the model. Registered unconditionally (like the annotation/state subscribers).
+    private func subscribeQueueStatus() {
+        NotificationCenter.default.publisher(for: .ghosttyQueueStatusDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let status = note.userInfo?[QueueCommandUserInfoKey.status] as? QueueStatus
+                else { return }
+                self.model.applyQueueStatus(status)
             }
             .store(in: &cancellables)
     }

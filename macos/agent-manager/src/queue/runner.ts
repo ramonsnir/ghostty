@@ -66,6 +66,7 @@ import {
   type StoreIO,
 } from "./store.js";
 import { resolveMaxItemsOverride, resolveParamsEnv } from "./templates.js";
+import { queueStatusReport, type QueueStatusReport } from "./status.js";
 import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
 
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
@@ -174,6 +175,12 @@ export interface QueueRun {
    *  run when this is true AND `active.size === 0`. Reset to false at the top of every
    *  per-run sweep; never persisted. */
   sawEmptyListThisSweep: boolean;
+  /** (§11 health) The most recent `list` items seen by a dispatch sweep (null until the
+   *  first list fetch) + whether that fetch SUCCEEDED. Cached purely to build the
+   *  run-level health report (`report_queue_status`) each sweep without an extra provider
+   *  call — the dashboard's "N waiting / next: …" reads from this. Not persisted. */
+  lastListItems: WorkItem[] | null;
+  lastListOk: boolean;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -209,7 +216,18 @@ export function makeQueueRun(
     draining: opts.draining ?? false,
     aborting: false,
     sawEmptyListThisSweep: false,
+    lastListItems: null,
+    lastListOk: false,
   };
+}
+
+/** (§11 health) The run's EFFECTIVE lifetime cap: the §8b maxItems override if set
+ *  (0 ⇒ unlimited ⇒ null), else the template `maxItems`. PURE. Shared by the dispatch
+ *  gate and the health report so they agree. */
+export function effectiveMaxItemsCap(run: QueueRun): number | null {
+  const override = resolveMaxItemsOverride(run.template, run.params);
+  const cap = override === undefined ? run.template.maxItems : override;
+  return cap <= 0 ? null : cap;
 }
 
 /** The injectable seams the supervisor pass needs (mirrors LoopDeps). */
@@ -331,6 +349,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         await abortRun(run, surfaces, deps);
         deps.registry.delete(name);
         registryChanged = true;
+        await reportRunGone(deps, name);
         log(`run "${name}" ABORTED — all assignments force-closed, run removed`);
         continue;
       }
@@ -342,6 +361,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
       if (run.draining && drainComplete(run)) {
         deps.registry.delete(name);
         registryChanged = true;
+        await reportRunGone(deps, name);
         log(`run "${name}" DRAINED — no slot-occupying assignments, run removed`);
       } else if (
         // QUIT-WHEN-EMPTY (§8a): the template opted in AND this sweep saw a SUCCESSFUL
@@ -355,6 +375,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
       ) {
         deps.registry.delete(name);
         registryChanged = true;
+        await reportRunGone(deps, name);
         log(`run "${name}" QUIT — queue empty and no active agents (quitWhenEmpty)`);
       }
     } catch (err) {
@@ -553,23 +574,82 @@ async function runOne(
   // --- 4) DISPATCH new candidates (SUPPRESSED on the very first sweep) -------------
   // reconciledOnce is set true above THIS sweep, but the SUPPRESSION applies to the
   // first sweep's dispatch: we only dispatch when the run had ALREADY reconciled at
-  // least once BEFORE this sweep. We track that with a separate one-shot below.
+  // least once BEFORE this sweep. All decision branches funnel to a single report+return
+  // below so the run-level HEALTH report fires EVERY sweep (incl. the arm sweep) — that
+  // is the "queue is present, here's what's next" signal the dashboard shows before any
+  // split spawns.
+  let dispatched = 0;
   if (!run.dispatchArmed) {
     run.dispatchArmed = true; // arm for the NEXT sweep; suppress dispatch THIS sweep
-    return 0;
+  } else if (run.disabled) {
+    // SELF-DISABLED (§2): a prior spawn returned sessionID 0 (no pty-host) → dormant.
+    // Reconcile + state-advance + close still ran above; launch nothing new.
+  } else if (run.paused || run.draining) {
+    // PAUSED / DRAINING (§8a): keep tracking + closing (done above), dispatch NOTHING new.
+  } else {
+    dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining);
   }
 
-  // SELF-DISABLED (§2): a prior spawn returned sessionID 0 (no pty-host) → the run is
-  // dormant and dispatches nothing. Reconcile + state-advance + close still run above so
-  // anything already live is tended, but NO new untrackable agent is launched.
-  if (run.disabled) return 0;
+  // --- 5) REPORT run-level health (§11), AFTER dispatch so the counts are fresh. -----
+  await reportQueueStatus(run, deps);
+  return dispatched;
+}
 
-  // PAUSED / DRAINING (§8a): keep tracking + closing (done above) but dispatch NOTHING new.
-  // A paused run resumes dispatch on `resume`; a draining run is removed by the caller once
-  // its active set empties.
-  if (run.paused || run.draining) return 0;
+/** (§11 health) Build + push the run-level health report via the MCP client. Best-effort
+ *  (a failed report is logged, never thrown into the sweep). `present:true` (the run is
+ *  live); the caller reports `present:false` separately when it removes a run. */
+async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> {
+  if (deps.client.reportQueueStatus === undefined) return; // optional client capability
+  const occupying = [...run.active.values()].filter(occupiesSlot);
+  // Exclude from the backlog/next: everything currently tracked (active map, any state)
+  // PLUS the §7.1 dispatch latch — those keys are NOT eligible to dispatch, so showing
+  // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
+  const exclude = new Set<string>([...run.active.keys(), ...run.dispatched]);
+  const report: QueueStatusReport = queueStatusReport({
+    queueName: run.template.name,
+    present: true,
+    paused: run.paused,
+    draining: run.draining,
+    disabled: run.disabled,
+    dispatchArmed: run.dispatchArmed,
+    activeCount: occupying.length,
+    excludeKeys: exclude,
+    listItems: run.lastListItems,
+    listOk: run.lastListOk,
+    dispatched: run.lifetimeDispatched,
+    maxItemsCap: effectiveMaxItemsCap(run),
+  });
+  try {
+    await deps.client.reportQueueStatus(report);
+  } catch (err) {
+    errlog(`report_queue_status "${run.template.name}": ${msg(err)}`);
+  }
+}
 
-  return dispatchCandidates(run, deps, nowMs, globalRemaining);
+/** (§11 health) Report that a run is GONE (removed) so the dashboard clears its section.
+ *  Best-effort; called right after a drain/abort/quit removal. */
+async function reportRunGone(deps: QueueDeps, name: string): Promise<void> {
+  if (deps.client.reportQueueStatus === undefined) return;
+  try {
+    await deps.client.reportQueueStatus(
+      queueStatusReport({
+        queueName: name,
+        present: false,
+        paused: false,
+        draining: false,
+        disabled: false,
+        dispatchArmed: true,
+        activeCount: 0,
+        excludeKeys: new Set<string>(),
+        listItems: null,
+        listOk: false,
+        dispatched: 0,
+        maxItemsCap: null,
+      }),
+    );
+  } catch (err) {
+    errlog(`report_queue_status gone "${name}": ${msg(err)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -831,17 +911,12 @@ async function dispatchCandidates(
   // excluded, §6).
   const activeCount = slotOccupancy(run);
   const slots = remainingSlots(t, activeCount, globalRemaining);
-  // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap.
-  // `undefined` ⇒ use the template's `maxItems`; `0` ⇒ unlimited (no lifetime cap, so
-  // maxItemsRemaining is Infinity — selectCandidates' Math.min(slots, Infinity) = slots);
-  // a positive N ⇒ that cap. The global `agent-queue-max-total` + grid/concurrency still
-  // bound an unlimited run.
-  const override = resolveMaxItemsOverride(t, run.params);
-  const effectiveMax = override === undefined ? t.maxItems : override;
+  // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap
+  // (null = unlimited ⇒ Infinity remaining; selectCandidates' Math.min(slots, Infinity) =
+  // slots). The global `agent-queue-max-total` + grid/concurrency still bound an unlimited run.
+  const cap = effectiveMaxItemsCap(run);
   const maxItemsRemaining =
-    effectiveMax <= 0
-      ? Number.POSITIVE_INFINITY
-      : Math.max(0, effectiveMax - run.lifetimeDispatched);
+    cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - run.lifetimeDispatched);
   if (slots <= 0 || maxItemsRemaining <= 0) return 0;
 
   // Fetch the provider list (skip the tick on any failure — never throws). Use the
@@ -855,6 +930,12 @@ async function dispatchCandidates(
     });
     items = res.items;
     run.sawEmptyListThisSweep = res.ok && res.items.length === 0;
+    // (§11 health) Cache the list for the run-level status report. Only a SUCCESSFUL
+    // fetch updates the cached items (a failed/skip fetch keeps the last good list so the
+    // header doesn't flicker to "0 waiting" on a transient provider blip); listOk tracks
+    // the latest fetch either way.
+    run.lastListOk = res.ok;
+    if (res.ok) run.lastListItems = res.items;
     // RE-ARM the §7.1 dispatch latch: a previously-dispatched key that a SUCCESSFUL list no
     // longer reports has LEFT the actionable set (claimed/blocked/labeled/moved off the
     // queried state) — clear it so it is eligible again IF it later reappears. Only a

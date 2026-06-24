@@ -239,6 +239,37 @@ enum MCPTools {
             "description": "Agent Queue: DRAIN and return the GUI's in-memory FIFO of local control commands (start/stop/abort/pause/resume) enqueued by the command palette / dashboard buttons / a keybind. Returns {commands:[{action, template?, run?}, …]} and CLEARS the FIFO. The sidecar's supervisor pass calls this each sweep to learn which queues to start/pause/stop/abort. Empty when nothing is pending.",
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
+        [
+            // (ramon fork / Agent Queue, §11 health)
+            "name": "report_queue_status",
+            "description": "Agent Queue: PUSH a run's health snapshot to the GUI Agent Dashboard so it can show the queue's presence + backlog + what's next — even BEFORE any split spawns and even when every tile is hidden/filtered. The supervisor calls this each sweep. 'queueName' (= run/origin name) is required; 'present:false' tells the dashboard the run was removed (clear its section). 'phase' is one of starting/running/paused/draining/disabled; 'queued' is how many items are waiting (not yet dispatched), 'active' how many agents are running, 'dispatched' the lifetime count, 'maxItems' the cap (omit/null = unlimited), 'next' a few upcoming items [{key,title?}].",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "queueName": ["type": "string"],
+                    "present": ["type": "boolean", "default": true],
+                    "phase": ["type": "string", "enum": ["starting", "running", "paused", "draining", "disabled"]],
+                    "queued": ["type": "integer"],
+                    "listOk": ["type": "boolean"],
+                    "active": ["type": "integer"],
+                    "dispatched": ["type": "integer"],
+                    "maxItems": ["type": ["integer", "null"], "description": "Lifetime cap; null/omitted = unlimited."],
+                    "next": [
+                        "type": "array",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "key": ["type": "string"],
+                                "title": ["type": "string"],
+                            ],
+                            "required": ["key"],
+                        ],
+                    ],
+                ],
+                "required": ["queueName"],
+                "additionalProperties": false,
+            ],
+        ],
     ]
 
     // MARK: - dispatch
@@ -412,6 +443,13 @@ enum MCPTools {
             let reason = arguments["reason"] as? String
             let ok = server.signalAttention(uuid: uuid, reason: reason)
             return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
+
+        case "report_queue_status":
+            guard let payload = QueueStatusPayload.fromArguments(arguments) else {
+                return .invalidParams("missing or empty queueName")
+            }
+            let ok = server.applyQueueStatus(payload.status)
+            return ok ? .ok(["ok": true]) : .toolError("queue status not applied")
 
         case "take_queue_commands":
             // dispatch() ALREADY runs on the server serial `queue` (handleRPC is a
