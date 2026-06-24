@@ -124,6 +124,23 @@ test("validateTemplate: a maxItems-target param needs no env and is parsed", () 
   ]);
 });
 
+test("validateTemplate: an optional valuesCommand argv is parsed; a malformed one is rejected", () => {
+  const ok = goodTemplateObj();
+  ok.params = [
+    { name: "project", env: "LINEAR_PROJECT", valuesCommand: ["python3", "list-projects.py"] },
+  ];
+  const r = validateTemplate(ok);
+  assert.equal(r.ok, true);
+  if (r.ok) {
+    assert.deepEqual(r.template.params[0].valuesCommand, ["python3", "list-projects.py"]);
+  }
+  for (const vc of [[], "notarray", [""], [123]]) {
+    const bad = goodTemplateObj();
+    bad.params = [{ name: "project", env: "LINEAR_PROJECT", valuesCommand: vc }];
+    assert.equal(validateTemplate(bad).ok, false, JSON.stringify(vc));
+  }
+});
+
 test("validateTemplate: rejects bad target, a 2nd maxItems param", () => {
   for (const params of [
     [{ name: "p", target: "bogus" }], // unknown target

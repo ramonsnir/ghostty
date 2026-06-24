@@ -128,8 +128,10 @@ run with no file edits:
   "name": "ExampleOS",
   // … workdir / agent / provider as above …
   "params": [
-    { "name": "project",    "env": "LINEAR_PROJECT",    "label": "Linear project",       "default": "Acme Foods", "required": true },
-    { "name": "milestones", "env": "LINEAR_MILESTONES", "label": "Milestone(s), comma-sep", "default": "Visual Prototype" },
+    { "name": "project",    "env": "LINEAR_PROJECT",    "label": "Linear project",       "required": true,
+      "valuesCommand": ["python3", "/abs/path/list-projects.py"] },
+    { "name": "milestones", "env": "LINEAR_MILESTONES", "label": "Milestone(s), comma-sep",
+      "valuesCommand": ["python3", "/abs/path/list-milestones.py"] },
     { "name": "maxItems",   "target": "maxItems",       "label": "Max items (0 = unlimited)", "default": "1" }
   ]
 }
@@ -145,15 +147,26 @@ run with no file edits:
     `maxItems`. A maxItems param needs no `env` (it tunes the engine, not the provider), and a
     template may declare at most one. This is the recommended way to vary run size — leave
     `maxItems` in the template as a sane fallback and pick the real number at start.
+- **Live preview (success signal):** once the required fields are filled, the form runs your
+  `list` command with the entered values and shows **how many items would be queued** plus a
+  sample of their titles — so a typo (wrong project name → "no matching items" / a provider
+  error) is caught before you start, not after.
+- **Value suggestions (stop typing exact names):** a param may declare an optional
+  **`valuesCommand`** — an argv that prints a JSON array of suggested values (bare strings, or
+  `{ "value": …, "label": … }` objects). The form runs it and shows a small menu next to the
+  field; pick one to fill it. The command runs with the OTHER fields exported as env, so a
+  **dependent** suggester works: a milestones `valuesCommand` that reads `$LINEAR_PROJECT` lists
+  the chosen project's milestones (and an empty list when no project is selected yet), and
+  re-runs when you change the project. `valuesCommand` is GUI-only (the engine never runs it).
 - `required: true` blocks the start until that field is non-empty (the Start button stays
   disabled; the engine also rejects it).
 - The chosen values are remembered for the run and **re-applied across a restart** (scope AND
   the maxItems override).
 - A template with **no `params`** starts immediately, exactly as before.
-- Stays generic: the *template* names the env var / opts into the maxItems prompt — Ghostty has
-  no knowledge of Linear (or any tracker). Keep secrets (e.g. a `LINEAR_API_KEY`) in your
-  provider's own env file; use `params` only for the per-run scope / size you want to be asked
-  about.
+- Stays generic: the *template* names the env var / opts into the maxItems prompt / points at a
+  `valuesCommand` — Ghostty has no knowledge of Linear (or any tracker). Keep secrets (e.g. a
+  `LINEAR_API_KEY`) in your provider's own env file; use `params` only for the per-run scope /
+  size you want to be asked about.
 
 Provider contract (the genericity boundary):
 - **`list`** → stdout is a JSON array; `keyField`/`titleField`/`urlField` map fields onto each

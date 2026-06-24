@@ -852,6 +852,39 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     sweep below list size + `"0"` unlimited dispatches PAST the template cap), plus the existing
     `commands.test.ts`/`store.test.ts`/`mcp.test.ts` and Swift `QueuePaletteTests`. **A rebuilt
     sidecar `dist` is enough (the GUI respawns it); no GUI relaunch / host / Zig change.**
+  - **START-FORM LIVE PREVIEW + VALUE SUGGESTIONS (§8b UX, GUI-only, no sidecar/host/Zig change).**
+    The start-form is no longer blind free-text — two GUI-SIDE probes run the template's
+    provider commands directly (via `Process`, off-main, debounced ~0.35s, generation-guarded so
+    stale results are discarded) as fields change:
+    - **Live `list` PREVIEW** — once all REQUIRED fields are filled, the form runs
+      `provider.list.command` with the CURRENT values as provider env and shows a success signal:
+      "N items would be queued" + a sample of titles, or "no matching items" (amber), or the
+      provider's last stderr line (red). Catches typos immediately (wrong project → empty/error).
+      Gated on `canStart` so it doesn't spam "missing scope" errors while you're still typing.
+    - **Per-param VALUE SUGGESTIONS** — a param may declare an OPTIONAL `valuesCommand` (argv) that
+      prints a JSON array of suggested values (bare strings OR `{value,label?}`). The form runs it
+      with the current values as env and shows a small menu next to the field; picking one fills it
+      (no typing exact names). Because the env carries the OTHER fields, a DEPENDENT provider works:
+      milestones' `valuesCommand` reads `$LINEAR_PROJECT` and re-runs when the project field changes
+      (empty list when no project chosen). Every `valuesCommand` re-runs on each debounced change
+      (simple + handles dependencies; a failed probe keeps the prior list rather than blanking).
+    - **The probe is the GUI running the provider, NOT the sidecar** — the sidecar is the MCP client
+      and can't be queried by the GUI, so the form execs the argv itself via `/usr/bin/env <argv>`
+      (so a bare `python3`/`node` resolves on PATH) in the template `workdir`, inheriting the GUI env
+      + the form's provider env. The env build mirrors the sidecar's `resolveParamsEnv`
+      (`QueueProviderProbe.providerEnv`: env-target non-blank only; maxItems/blank skipped).
+    - **Schema:** `QueueParam.valuesCommand?: string[]` (TS type + `validateParams` validates it as an
+      optional argv even though only the GUI runs it; `env` stays optional). Wiring: sidecar —
+      `types.ts`/`templates.ts` (`valuesCommand` field + validation); Swift — `QueuePalette.swift`
+      (`QueueParamSpec` gains `env`/`isMaxItems`/`valuesCommand`; new `QueueTemplateProbe` +
+      `templateProbe()`; `QueueParamProber` @MainActor debounced probe model; `QueueProviderProbe`
+      pure `providerEnv`/`parseValues`/`previewState` + the blocking `run`; `QueueParamFormView` adds
+      the suggestion menus + preview footer). Linear value scripts live in the untracked config
+      (`example-projects.py` = all projects; `example-milestones.py` = milestones for `$LINEAR_PROJECT`,
+      `[]` when none). Tests: sidecar `templates.test.ts` (valuesCommand validate); Swift
+      `QueuePaletteTests` (`templateParamsParsesTargetAndValuesCommand`, `templateProbe*`,
+      `providerEnv*`, `parseValues*`, `previewState*`). **GUI relaunch to pick up (Swift change); the
+      `valuesCommand` field needs no sidecar restart (the running sidecar ignores unknown param fields).**
   - **GRID layout** (§12): all of a run's splits in ONE tab, auto-arranged up to `cols×rows`
     filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
     splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are

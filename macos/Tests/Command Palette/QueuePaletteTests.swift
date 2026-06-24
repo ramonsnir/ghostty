@@ -79,7 +79,8 @@ struct QueuePaletteTests {
     }
 
     /// A template's `params` array is parsed: `name` required, `label` defaults to
-    /// `name`, `default`/`required` carried; the GUI-irrelevant `env` is ignored.
+    /// `name`, `default`/`required`/`env` carried (the GUI needs `env` to build the
+    /// preview/suggestion provider env).
     @Test func templateParamsParsesDeclaredParams() throws {
         let base = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: base) }
@@ -91,9 +92,98 @@ struct QueuePaletteTests {
         """)
         let params = QueuePaletteView.templateParams(dir: base.path, basename: "example")
         #expect(params == [
-            QueueParamSpec(name: "project", label: "Project", defaultValue: "Acme Foods", required: true),
-            QueueParamSpec(name: "milestones", label: "milestones", defaultValue: "", required: false),
+            QueueParamSpec(name: "project", label: "Project", defaultValue: "Acme Foods", required: true, env: "LINEAR_PROJECT"),
+            QueueParamSpec(name: "milestones", label: "milestones", defaultValue: "", required: false, env: "LINEAR_MILESTONES"),
         ])
+    }
+
+    /// `target:"maxItems"` (no env) and an optional `valuesCommand` are parsed onto the spec.
+    @Test func templateParamsParsesTargetAndValuesCommand() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("example.json"), """
+        { "name": "ExampleOS", "params": [
+            { "name": "project", "env": "LINEAR_PROJECT", "valuesCommand": ["python3", "projects.py"] },
+            { "name": "maxItems", "target": "maxItems", "default": "1" }
+        ] }
+        """)
+        let params = QueuePaletteView.templateParams(dir: base.path, basename: "example")
+        #expect(params == [
+            QueueParamSpec(name: "project", label: "project", defaultValue: "", required: false,
+                           env: "LINEAR_PROJECT", isMaxItems: false, valuesCommand: ["python3", "projects.py"]),
+            QueueParamSpec(name: "maxItems", label: "maxItems", defaultValue: "1", required: false,
+                           env: nil, isMaxItems: true, valuesCommand: nil),
+        ])
+    }
+
+    // MARK: - templateProbe (preview)
+
+    /// `templateProbe` reads workdir + provider.list bits; returns nil without a list command.
+    @Test func templateProbeReadsListCommandOrNil() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("q.json"), """
+        { "name": "Q", "workdir": "/tmp/repo",
+          "provider": { "list": { "command": ["python3", "list.py"], "keyField": "identifier", "titleField": "title" } } }
+        """)
+        let probe = QueuePaletteView.templateProbe(dir: base.path, basename: "q")
+        #expect(probe == QueueTemplateProbe(workdir: "/tmp/repo", listCommand: ["python3", "list.py"],
+                                            titleField: "title", keyField: "identifier"))
+        // No provider.list → nil.
+        try write(base.appendingPathComponent("p.json"), #"{ "name": "P", "workdir": "/x" }"#)
+        #expect(QueuePaletteView.templateProbe(dir: base.path, basename: "p") == nil)
+    }
+
+    // MARK: - QueueProviderProbe pure helpers
+
+    /// providerEnv exports each non-blank "env"-target param under its env var; maxItems
+    /// and blank values are skipped (mirrors the sidecar's resolveParamsEnv).
+    @Test func providerEnvSkipsMaxItemsAndBlanks() {
+        let params = [
+            QueueParamSpec(name: "project", label: "p", defaultValue: "", required: true, env: "LINEAR_PROJECT"),
+            QueueParamSpec(name: "ms", label: "m", defaultValue: "", required: false, env: "LINEAR_MILESTONES"),
+            QueueParamSpec(name: "maxItems", label: "x", defaultValue: "1", required: false, env: nil, isMaxItems: true),
+        ]
+        let env = QueueProviderProbe.providerEnv(
+            params: params, values: ["project": "Acme", "ms": "  ", "maxItems": "2"])
+        #expect(env == ["LINEAR_PROJECT": "Acme"])  // blank ms + maxItems omitted
+    }
+
+    /// parseValues accepts bare strings and {value,label} objects; ignores garbage.
+    @Test func parseValuesAcceptsStringsAndObjects() {
+        let strings = Data(#"["Acme", "Globex", ""]"#.utf8)
+        #expect(QueueProviderProbe.parseValues(strings) == [
+            QueueSuggestion(value: "Acme", label: "Acme"),
+            QueueSuggestion(value: "Globex", label: "Globex"),
+        ])
+        let objects = Data(#"[{"value":"v1","label":"One"}, {"value":"v2"}, {"label":"no value"}, 5]"#.utf8)
+        #expect(QueueProviderProbe.parseValues(objects) == [
+            QueueSuggestion(value: "v1", label: "One"),
+            QueueSuggestion(value: "v2", label: "v2"),
+        ])
+        #expect(QueueProviderProbe.parseValues(Data("not json".utf8)).isEmpty)
+        #expect(QueueProviderProbe.parseValues(Data(#"{"not":"array"}"#.utf8)).isEmpty)
+    }
+
+    /// previewState maps a probe result into the form's state.
+    @Test func previewStateMapsResults() {
+        // failure → .failure
+        if case .failure(let m) = QueueProviderProbe.previewState(
+            from: .failure("boom"), titleField: "title", keyField: "id") {
+            #expect(m == "boom")
+        } else { Issue.record("expected .failure") }
+        // empty array → .empty
+        #expect(QueueProviderProbe.previewState(
+            from: .success(Data("[]".utf8)), titleField: "title", keyField: "id") == .empty)
+        // unparseable → .failure
+        if case .failure = QueueProviderProbe.previewState(
+            from: .success(Data("nope".utf8)), titleField: "title", keyField: "id") {} else {
+            Issue.record("expected .failure for unparseable")
+        }
+        // items: total + sampled titles (titleField, fallback keyField)
+        let data = Data(#"[{"title":"First","id":"A"},{"id":"B"},{"title":"Third","id":"C"}]"#.utf8)
+        #expect(QueueProviderProbe.previewState(from: .success(data), titleField: "title", keyField: "id")
+                == .items(total: 3, sample: ["First", "B", "Third"]))
     }
 
     /// A template with no `params` (or a missing file) yields an empty list — the
