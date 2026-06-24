@@ -13,6 +13,10 @@ struct AgentEntry: Identifiable {
     let pwd: String
     let agent: AgentKind?
     let bell: Bool
+    /// (ramon fork / Bell Attention) The sticky "attention needed" state the Agent
+    /// Manager promoted this surface into via set_attention. Floats the tile to the
+    /// top + drives a tile marker; cleared on focus (like `bell`).
+    let attention: Bool
     let hidden: Bool
     let sessionID: UInt64
     /// (ramon fork / Agent hooks) The hook-reported agent lifecycle state, or
@@ -221,6 +225,17 @@ final class AgentDashboardModel: ObservableObject {
     /// sort and bell-only auto-unhide.
     private(set) var bells: [UUID: Bool] = [:]
 
+    /// (ramon fork / Bell Attention) Latest merged "attention needed" state across all
+    /// live controllers (set by the Agent Manager via set_attention). Drives the
+    /// attention-first sort + auto-unhide + tile marker, ALWAYS (independent of the
+    /// `bellFilter` tone-down — a promotion is a real "needs you").
+    private(set) var attention: [UUID: Bool] = [:]
+
+    /// (ramon fork / Bell Attention) Mirrors `agent-manager-bell-filter`. When true, a
+    /// RAW bell no longer floats/auto-unhides a tile (only a promoted attention does);
+    /// the tile still shows its subtle bell dot. Default false ⇒ upstream behavior.
+    private let bellFilter: Bool
+
     /// Latest detector results, keyed by surface UUID.
     private(set) var agents: [UUID: AgentKind] = [:]
 
@@ -337,8 +352,10 @@ final class AgentDashboardModel: ObservableObject {
         store: HideStore,
         agentStateStore: AgentStateStore = InMemoryAgentStateStore(),
         orderStore: OrderStore = InMemoryOrderStore(),
-        originFilterStore: OriginFilterStore = InMemoryOriginFilterStore()
+        originFilterStore: OriginFilterStore = InMemoryOriginFilterStore(),
+        bellFilter: Bool = false
     ) {
+        self.bellFilter = bellFilter
         self.store = store
         self.agentStore = agentStateStore
         self.orderStore = orderStore
@@ -426,13 +443,35 @@ final class AgentDashboardModel: ObservableObject {
     /// ringing agent. Output / rebuild never auto-unhide (variant b).
     func applyBells(_ next: [UUID: Bool]) {
         var changed = false
-        for (id, ringing) in next where ringing {
+        // (ramon fork / Bell Attention) Under the tone-down filter a RAW bell no longer
+        // auto-unhides — only a promoted attention does (see `applyAttention`). The
+        // tile's subtle bell dot still shows; it just won't yank a hidden tile back.
+        if !bellFilter {
+            for (id, ringing) in next where ringing {
+                if hidden.contains(id) {
+                    hidden.remove(id)
+                    changed = true
+                }
+            }
+        }
+        bells = next
+        if changed { store.save(hidden) }
+        rebuildEntriesFromCurrentState()
+    }
+
+    /// (ramon fork / Bell Attention) Apply a fresh merged "attention needed" map. A
+    /// surface the Agent Manager PROMOTED is never left hidden (same rule as a ringing
+    /// bell, and unconditional — a promotion is always a real "needs you"). Drives the
+    /// attention-first sort + the tile marker via `rebuildEntriesFromCurrentState`.
+    func applyAttention(_ next: [UUID: Bool]) {
+        var changed = false
+        for (id, on) in next where on {
             if hidden.contains(id) {
                 hidden.remove(id)
                 changed = true
             }
         }
-        bells = next
+        attention = next
         if changed { store.save(hidden) }
         rebuildEntriesFromCurrentState()
     }
@@ -591,6 +630,7 @@ final class AgentDashboardModel: ObservableObject {
         // Drop stale per-id state for surfaces that vanished.
         let liveIDs = Set(live.map(\.id))
         bells = bells.filter { liveIDs.contains($0.key) }
+        attention = attention.filter { liveIDs.contains($0.key) }
         agents = agents.filter { liveIDs.contains($0.key) }
         lastSeen = lastSeen.filter { liveIDs.contains($0.key) }
         // Prune hook state for vanished surfaces exactly like the other per-id
@@ -769,6 +809,7 @@ final class AgentDashboardModel: ObservableObject {
                     pwd: s.pwd,
                     agent: agents[s.id],
                     bell: bells[s.id] ?? false,
+                    attention: attention[s.id] ?? false,
                     hidden: hidden.contains(s.id),
                     sessionID: s.sessionID,
                     agentState: agentStates[s.id],
@@ -789,7 +830,8 @@ final class AgentDashboardModel: ObservableObject {
             manualOrder.enumerated().map { ($1, $0) },
             uniquingKeysWith: { first, _ in first })
         entries = AgentDashboardModel.sorted(
-            built.filter { !$0.hidden }, lastSeen: lastSeen, manualRank: manualRank)
+            built.filter { !$0.hidden }, lastSeen: lastSeen, manualRank: manualRank,
+            bellFilter: bellFilter)
     }
 
     // MARK: - Sort (pure, testable)
@@ -801,8 +843,11 @@ final class AgentDashboardModel: ObservableObject {
     /// (ramon fork / Agent hooks) A `.waiting` tile with a live background shell
     /// is DEMOTED — it is waiting on its own work, not the user, so it does NOT
     /// float to the top. A bell still floats it (a bell is a real event).
-    private static func needsAttention(_ e: AgentEntry) -> Bool {
-        e.bell || (e.agentState == .waiting && e.backgroundShells == 0)
+    private static func needsAttention(_ e: AgentEntry, bellFilter: Bool = false) -> Bool {
+        // (ramon fork / Bell Attention) A promoted `attention` always floats the tile.
+        // A raw bell floats it only when the tone-down filter is OFF (flag-off keeps the
+        // upstream "bell floats" behavior; flag-on leaves floating to a real promotion).
+        e.attention || (e.bell && !bellFilter) || (e.agentState == .waiting && e.backgroundShells == 0)
     }
 
     /// Whether the agent is idle — done with its turn and free for new work.
@@ -831,13 +876,14 @@ final class AgentDashboardModel: ObservableObject {
     static func sorted(
         _ entries: [AgentEntry],
         lastSeen: [UUID: Date] = [:],
-        manualRank: [UInt64: Int] = [:]
+        manualRank: [UInt64: Int] = [:],
+        bellFilter: Bool = false
     ) -> [AgentEntry] {
         func rank(_ e: AgentEntry) -> Int? {
             e.sessionID == 0 ? nil : manualRank[e.sessionID]
         }
         return entries.sorted { a, b in
-            let aa = needsAttention(a), ba = needsAttention(b)
+            let aa = needsAttention(a, bellFilter: bellFilter), ba = needsAttention(b, bellFilter: bellFilter)
             if aa != ba { return aa && !ba }
             let ra = rank(a), rb = rank(b)
             // Unplaced (nil) sorts before placed (non-nil): new agents at top.
@@ -1055,7 +1101,8 @@ final class AgentDashboardController: NSWindowController {
             store: UserDefaultsHideStore(),
             agentStateStore: UserDefaultsAgentStateStore(),
             orderStore: UserDefaultsOrderStore(),
-            originFilterStore: UserDefaultsOriginFilterStore())
+            originFilterStore: UserDefaultsOriginFilterStore(),
+            bellFilter: ghostty.config.agentManagerBellFilter)
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
         let panel = AgentDashboardPanel(pinned: ghostty.config.agentDashboardPin)
@@ -1330,6 +1377,13 @@ final class AgentDashboardController: NSWindowController {
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.mergeAndApplyBells() }
                 .store(in: &bag)
+            // (ramon fork / Bell Attention) Mirror the bell subscription for the
+            // per-surface attentionNeeded state → the model's attention map.
+            controller
+                .surfaceValuesPublisher(valueKeyPath: \.attentionNeeded, publisherKeyPath: \.$attentionNeeded)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.mergeAndApplyAttention() }
+                .store(in: &bag)
             controller.$surfaceTree
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in
@@ -1340,6 +1394,7 @@ final class AgentDashboardController: NSWindowController {
             controllerCancellables[ObjectIdentifier(controller)] = bag
         }
         mergeAndApplyBells()
+        mergeAndApplyAttention()
     }
 
     /// Merge every live controller's per-surface bell into one `[UUID: Bool]`.
@@ -1351,6 +1406,18 @@ final class AgentDashboardController: NSWindowController {
             }
         }
         model.applyBells(merged)
+    }
+
+    /// (ramon fork / Bell Attention) Merge every live controller's per-surface
+    /// attentionNeeded into one `[UUID: Bool]` and hand it to the model.
+    private func mergeAndApplyAttention() {
+        var merged: [UUID: Bool] = [:]
+        for controller in TerminalController.all {
+            for view in controller.surfaceTree {
+                merged[view.id] = view.attentionNeeded
+            }
+        }
+        model.applyAttention(merged)
     }
 
     // MARK: - Reconcile

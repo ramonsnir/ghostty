@@ -37,7 +37,16 @@ struct AgentPreviewTile: View {
     /// Keeping the strong frame/icon tied to the bell (not the hook) is deliberate:
     /// the bell's clear-on-focus is what makes leaving a `.waiting` status around
     /// non-annoying.
-    private var bellRinging: Bool { entry.bell }
+    /// (ramon fork / Bell Attention) The amber frame + header icon fire for a raw bell
+    /// AND for a promoted "attention needed" state (the loud Tier-2 signal). The exact
+    /// raw-bell-under-filter cosmetics (e.g. a dimmer dot vs. the full amber frame) are
+    /// the deferred bell-features-vs-attention-features visual; today both read as the
+    /// existing amber so a promotion is unmistakably visible.
+    private var bellRinging: Bool { entry.bell || entry.attention }
+
+    /// (ramon fork / Bell Attention) The surface was explicitly promoted by the Agent
+    /// Manager (set_attention) — drives a distinct "needs you" pill.
+    private var attentionNeeded: Bool { entry.attention }
 
     /// (ramon fork / Agent hooks) The agent has reported `.waiting` but ALSO has a
     /// live background shell churning (read from Claude Code's footer — see
@@ -323,7 +332,11 @@ struct AgentPreviewTile: View {
                     .truncationMode(.tail)
             }
             Spacer(minLength: 4)
-            if waitingForInput {
+            if attentionNeeded {
+                // (ramon fork / Bell Attention) The Agent Manager promoted this surface
+                // (e.g. a bell it judged worth interrupting you for). Cleared on focus.
+                pill("needs you", color: Self.bellAmber)
+            } else if waitingForInput {
                 // Hook-driven status: persists until the agent reports a new state
                 // (NOT cleared by focus, unlike the bell frame/icon).
                 pill("needs input", color: Self.bellAmber)

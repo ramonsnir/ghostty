@@ -298,6 +298,10 @@ class AppDelegate: NSObject,
             let server = WebMonitorServer(
                 listen: webMonitorListen,
                 token: ghostty.config.webMonitorToken)
+            // (ramon fork / Bell Attention) Tell the push subsystem to drop raw-bell
+            // pushes when the tone-down filter is on (the promoted attention pushes
+            // instead). Set BEFORE start() so the first events see the right policy.
+            server.push.bellFilter = ghostty.config.agentManagerBellFilter
             server.start()
             self.webMonitor = server
         }
@@ -368,6 +372,13 @@ class AppDelegate: NSObject,
             self,
             selector: #selector(ghosttyBellDidRing(_:)),
             name: .ghosttyBellDidRing,
+            object: nil
+        )
+        // (ramon fork / Bell Attention) Loud dock/sound for a promoted attention state.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttyAttentionDidChange(_:)),
+            name: .ghosttyAttentionDidChange,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -791,6 +802,11 @@ class AppDelegate: NSObject,
         // ringing surface's true focus state. The notification object is the
         // ringing surfaceView. If we can't resolve it, fall back to the
         // out-of-focus (existing) set so we never silently drop the bell.
+        // (ramon fork / Bell Attention) Under the tone-down filter, a RAW bell does
+        // NOT make sound or bounce the dock — those loud effects move to the promoted
+        // attention state (`ghosttyAttentionDidChange`). Flag off ⇒ identical to before.
+        if ghostty.config.agentManagerBellFilter { return }
+
         let features: Ghostty.Config.BellFeatures
         if let surfaceView = notification.object as? Ghostty.SurfaceView {
             features = surfaceView.bellFeaturesForCurrentFocus(ghostty.config)
@@ -812,6 +828,27 @@ class AppDelegate: NSObject,
 
         if features.contains(.attention) {
             // Bounce the dock icon if we're not focused.
+            NSApp.requestUserAttention(.informationalRequest)
+        }
+    }
+
+    /// (ramon fork / Bell Attention) The loud Tier-2 dock/sound for a surface the
+    /// Agent Manager PROMOTED via `set_attention` (posted as `.ghosttyAttentionDidChange`
+    /// with `attention==true`). Mirrors the raw-bell sound/bounce but is driven by the
+    /// promoted state, so it fires whether or not the tone-down filter is on. We use the
+    /// out-of-focus `bell-features` set (a promotion means the user is away from it).
+    @objc private func ghosttyAttentionDidChange(_ notification: Notification) {
+        guard (notification.userInfo?[AgentStateUserInfoKey.attention] as? Bool) == true
+        else { return }
+        let features = ghostty.config.bellFeatures
+        if features.contains(.system) { NSSound.beep() }
+        if features.contains(.audio),
+           let configPath = ghostty.config.bellAudioPath,
+           let sound = NSSound(contentsOfFile: configPath.path, byReference: false) {
+            sound.volume = ghostty.config.bellAudioVolume
+            sound.play()
+        }
+        if features.contains(.attention) {
             NSApp.requestUserAttention(.informationalRequest)
         }
     }

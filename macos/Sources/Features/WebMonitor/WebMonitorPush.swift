@@ -203,7 +203,17 @@ final class WebPushManager {
     private struct PushKey: Hashable { let id: UUID; let kind: PushKind }
     private static let debounceInterval: TimeInterval = 3
 
+    /// (ramon fork / Bell Attention) When true (mirrors `agent-manager-bell-filter`,
+    /// set by AppDelegate at startup), a RAW bell does NOT push — only a promoted
+    /// `set_attention` does (via `attentionStateObserver`). Default false ⇒ raw bells
+    /// push exactly as before.
+    var bellFilter = false
+
     private var bellObserver: NSObjectProtocol?
+    /// (ramon fork / Bell Attention) Observes `.ghosttyAttentionDidChange` so a
+    /// surface the Agent Manager PROMOTES via `set_attention` pushes to the phone
+    /// (the loud Tier-2 signal). Independent of the bell-features tone-down.
+    private var attentionStateObserver: NSObjectProtocol?
     /// (ramon fork / Agent hooks) Observes `.ghosttyAgentNeedsAttention` so an
     /// agent that ENTERS `.waiting` (a Claude Code `Notification` hook event,
     /// resolved to a surface by the MCP `/agent-state` handler and re-posted by
@@ -284,7 +294,24 @@ final class WebPushManager {
                 forName: Notification.Name.ghosttyBellDidRing, object: nil, queue: .main
             ) { [weak self] note in
                 guard let self, let view = note.object as? Ghostty.SurfaceView else { return }
+                // (ramon fork / Bell Attention) Under the tone-down filter, a raw bell
+                // does NOT push — the sidecar promotes the notable ones to attention.
+                if self.bellFilter { return }
                 self.onBell(id: view.id, title: view.title, pwd: view.pwd)
+            }
+            // (ramon fork / Bell Attention) A promoted attention state pushes (loud
+            // tier). userInfo carries surfaceID + attention + reason + title + pwd
+            // (value types, enriched by MCPServer.setAttention on its main hop).
+            self.attentionStateObserver = NotificationCenter.default.addObserver(
+                forName: .ghosttyAttentionDidChange, object: nil, queue: .main
+            ) { [weak self] note in
+                guard let self,
+                      let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,
+                      (note.userInfo?[AgentStateUserInfoKey.attention] as? Bool) == true else { return }
+                let title = note.userInfo?[AgentStateUserInfoKey.title] as? String ?? ""
+                let pwd = note.userInfo?[AgentStateUserInfoKey.pwd] as? String
+                let reason = note.userInfo?[AgentStateUserInfoKey.reason] as? String ?? ""
+                self.onAttention(id: id, title: title, pwd: pwd, message: reason)
             }
             // (ramon fork / Agent hooks) Push on agent-waiting, alongside the bell.
             // The userInfo is the pinned value-type payload from AgentStateBridge;
@@ -312,6 +339,10 @@ final class WebPushManager {
             if let obs = self.attentionObserver {
                 NotificationCenter.default.removeObserver(obs)
                 self.attentionObserver = nil
+            }
+            if let obs = self.attentionStateObserver {
+                NotificationCenter.default.removeObserver(obs)
+                self.attentionStateObserver = nil
             }
         }
     }

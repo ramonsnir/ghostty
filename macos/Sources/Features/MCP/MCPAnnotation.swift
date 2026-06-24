@@ -85,16 +85,21 @@ extension MCPServer {
     /// calls this with `on:true` when Haiku promotes a bell; the GUI clears it on
     /// focus. Same resolve-on-main + post-on-main shape as `applyAnnotation`.
     func setAttention(uuid: UUID, on: Bool, reason: String) -> Bool {
-        let exists = DispatchQueue.main.sync {
-            MCPLayout.surface(forUUID: uuid) != nil
+        // Capture title/pwd as VALUE TYPES on the main hop (never a SurfaceView across
+        // the hop) so the push observer can render a notification without a view ref.
+        let info: (title: String, pwd: String)? = DispatchQueue.main.sync {
+            guard let v = MCPLayout.surface(forUUID: uuid) else { return nil }
+            return (v.title, v.pwd ?? "")
         }
-        guard exists else { return false }
+        guard let info else { return false }
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: .ghosttyAttentionDidChange, object: nil,
                 userInfo: [AgentStateUserInfoKey.surfaceID: uuid,
                            AgentStateUserInfoKey.attention: on,
-                           AgentStateUserInfoKey.reason: reason])
+                           AgentStateUserInfoKey.reason: reason,
+                           AgentStateUserInfoKey.title: info.title,
+                           AgentStateUserInfoKey.pwd: info.pwd])
         }
         return true
     }

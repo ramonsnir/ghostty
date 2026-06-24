@@ -874,9 +874,9 @@ struct AgentDashboardConfigTests {
 
 @MainActor
 struct AgentDashboardSortTests {
-    private func entry(_ id: UUID, bell: Bool) -> AgentEntry {
+    private func entry(_ id: UUID, bell: Bool, attention: Bool = false) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: 0,
+              bell: bell, attention: attention, hidden: false, sessionID: 0,
               agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
               annotation: nil,
               backgroundShells: 0)
@@ -890,6 +890,31 @@ struct AgentDashboardSortTests {
         let entries = [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: true)]
         let sorted = AgentDashboardModel.sorted(entries)
         #expect(sorted.first?.id == ring)
+    }
+
+    // (ramon fork / Bell Attention) The promoted attention state floats a tile first,
+    // always (independent of the bellFilter tone-down).
+    @Test func attentionFloatsFirst() {
+        let promoted = UUID(); let q1 = UUID(); let q2 = UUID()
+        let entries = [entry(q1, bell: false), entry(q2, bell: false),
+                       entry(promoted, bell: false, attention: true)]
+        #expect(AgentDashboardModel.sorted(entries).first?.id == promoted)
+        #expect(AgentDashboardModel.sorted(entries, bellFilter: true).first?.id == promoted)
+    }
+
+    // (ramon fork / Bell Attention) With the tone-down filter ON, a RAW bell no longer
+    // floats the tile (only a promotion does); with it OFF, a bell floats as upstream.
+    @Test func rawBellFloatGatedByFilter() {
+        let ring = UUID(); let q1 = UUID(); let q2 = UUID()
+        let entries = [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: true)]
+        // Filter off: bell floats first (upstream behavior).
+        #expect(AgentDashboardModel.sorted(entries, bellFilter: false).first?.id == ring)
+        // Filter on: the bell is inert, so order is the pure UUID tie-break (no float) —
+        // identical to the order with the bell cleared entirely.
+        let filtered = AgentDashboardModel.sorted(entries, bellFilter: true).map(\.id)
+        let noBell = AgentDashboardModel.sorted(
+            [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: false)]).map(\.id)
+        #expect(filtered == noBell)
     }
 
     @Test func uuidTieBreakStable() {
@@ -927,9 +952,10 @@ struct AgentDashboardSortTests {
 
     // MARK: - Manual order (ramon fork / Agent Dashboard)
 
-    private func entry(_ id: UUID, session: UInt64, bell: Bool = false, waiting: Bool = false) -> AgentEntry {
+    private func entry(_ id: UUID, session: UInt64, bell: Bool = false, waiting: Bool = false,
+                       attention: Bool = false) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: session,
+              bell: bell, attention: attention, hidden: false, sessionID: session,
               agentState: waiting ? .waiting : nil,
               lastTool: nil, lastPrompt: nil, hookBacked: false,
               annotation: nil,
@@ -1437,7 +1463,7 @@ struct AgentDashboardWaitingSortTests {
         _ id: UUID, bell: Bool, state: AgentState?, backgroundShells: Int = 0
     ) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: 0,
+              bell: bell, attention: false, hidden: false, sessionID: 0,
               agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil,
               annotation: nil,
               backgroundShells: backgroundShells)
@@ -1527,11 +1553,11 @@ struct AgentDashboardWaitingSortTests {
         let idle = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
         let entries = [
             AgentEntry(id: working, realView: nil, title: "t", pwd: "/x", agent: nil,
-                       bell: false, hidden: false, sessionID: 10, agentState: .working,
+                       bell: false, attention: false, hidden: false, sessionID: 10, agentState: .working,
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
                        backgroundShells: 0),
             AgentEntry(id: idle, realView: nil, title: "t", pwd: "/x", agent: nil,
-                       bell: false, hidden: false, sessionID: 20, agentState: .idle,
+                       bell: false, attention: false, hidden: false, sessionID: 20, agentState: .idle,
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
                        backgroundShells: 0),
         ]
@@ -1768,7 +1794,7 @@ struct AgentDashboardOriginTests {
             ? AgentAnnotation(queueKey: queueKey, queueName: queueName, queueUrl: queueUrl)
             : nil
         return .init(id: id, realView: nil, title: "t", pwd: "/x", agent: AgentKind("claude"),
-                     bell: bell, hidden: false, sessionID: session,
+                     bell: bell, attention: false, hidden: false, sessionID: session,
                      agentState: waiting ? .waiting : nil,
                      lastTool: nil, lastPrompt: nil, hookBacked: false,
                      annotation: ann,
@@ -1955,7 +1981,7 @@ struct AgentQueueHealthTests {
         // A present queue that already has tiles isn't duplicated; `(other)` is never
         // injected as a queue even if (defensively) passed in.
         let e = AgentEntry(id: UUID(), realView: nil, title: "t", pwd: "/x", agent: nil,
-                           bell: false, hidden: false, sessionID: 1,
+                           bell: false, attention: false, hidden: false, sessionID: 1,
                            agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
                            annotation: AgentAnnotation(queueName: "ExampleOS"),
                            backgroundShells: 0)
