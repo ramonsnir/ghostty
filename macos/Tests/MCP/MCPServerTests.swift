@@ -908,6 +908,19 @@ struct MCPServerTests {
         #expect(d["run"] == nil)
     }
 
+    @Test func queueCommandJSONObjectSetMaxItemsCarriesRunAndValue() {
+        // setMaxItems serializes to the snake_case action the sidecar whitelists, and
+        // carries the run name + the raw maxItems value string.
+        let d = QueueCommand(action: .setMaxItems, run: "ExampleOS", maxItems: "10").jsonObject
+        #expect(d["action"] as? String == "set_max_items")
+        #expect(d["run"] as? String == "ExampleOS")
+        #expect(d["maxItems"] as? String == "10")
+        #expect(d["template"] == nil)
+        // An empty value is omitted (the sidecar would ignore it anyway).
+        let empty = QueueCommand(action: .setMaxItems, run: "Q", maxItems: "").jsonObject
+        #expect(empty["maxItems"] == nil)
+    }
+
     // MARK: - Agent Queue: report_queue_status payload parsing (§11 health)
 
     @Test func queueStatusPayloadParsesFullArgs() {

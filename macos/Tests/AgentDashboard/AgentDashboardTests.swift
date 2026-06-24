@@ -1994,6 +1994,13 @@ struct AgentQueueHealthTests {
         #expect(QueueHealthFormat.progressText(status("Q", dispatched: 4, maxItems: nil)) == "4/∞")
     }
 
+    @Test func capDraftPrefillsFiniteCapAndBlankForUnlimited() {
+        // The cap editor's custom field pre-fills with the current finite cap…
+        #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 2, maxItems: 3)) == "3")
+        // …and is blank for an unlimited cap (user picks ∞ or types a number).
+        #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 4, maxItems: nil)) == "")
+    }
+
     // MARK: - applyQueueStatus carries next/running items (for the dropdowns)
 
     @Test func surfaceIDResolvesByQueueNameAndKey() {

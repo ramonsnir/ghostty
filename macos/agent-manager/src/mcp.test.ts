@@ -374,6 +374,23 @@ test("coerceQueueCommands: drops non-object entries and unrecognized actions, ke
   ]);
 });
 
+test("coerceQueueCommands: carries set_max_items + its string maxItems value (non-strings dropped)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "set_max_items", run: "r", maxItems: "10" },
+      { action: "set_max_items", run: "r2", maxItems: "unlimited" },
+      { action: "set_max_items", run: "r3", maxItems: 7 }, // non-string maxItems dropped, action kept
+      { action: "set_max_items", run: "r4" }, // no value (kept; reducer ignores)
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "set_max_items", run: "r", maxItems: "10" },
+    { action: "set_max_items", run: "r2", maxItems: "unlimited" },
+    { action: "set_max_items", run: "r3" },
+    { action: "set_max_items", run: "r4" },
+  ]);
+});
+
 test("coerceQueueCommands: parses start-time params (§8b) — string values only, non-strings dropped", () => {
   const out = coerceQueueCommands({
     commands: [

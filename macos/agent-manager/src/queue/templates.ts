@@ -443,6 +443,25 @@ export function resolveParamsEnv(
 const MAXITEMS_UNLIMITED_TOKENS = new Set(["0", "unlimited", "none", "inf", "infinity", "∞"]);
 
 /**
+ * Parse a raw maxItems VALUE string. PURE. SHARED by the start-time param resolution
+ * (`resolveMaxItemsOverride`) and the live `set_max_items` command (the dashboard cap
+ * control). Returns:
+ *   - `null` for an explicit "unlimited" token ("0"/"unlimited"/"none"/"inf"/"∞") — NO cap.
+ *   - a positive integer N for an explicit numeric cap.
+ *   - `undefined` for blank or garbage — the CALLER decides the fallback (start-time uses
+ *     the template default; the live command IGNORES it / keeps the current cap). Garbage
+ *     never silently means "spawn forever".
+ */
+export function parseMaxItemsValue(raw: string): number | null | undefined {
+  const s = raw.trim().toLowerCase();
+  if (s === "") return undefined;
+  if (MAXITEMS_UNLIMITED_TOKENS.has(s)) return null; // explicit unlimited
+  const n = Number(s);
+  if (Number.isInteger(n) && n > 0) return n; // explicit positive cap
+  return undefined; // garbage
+}
+
+/**
  * (§8b) Resolve the run's maxItems OVERRIDE from a "maxItems"-target param's answer. PURE.
  * Returns:
  *   - `undefined` when the template declares no maxItems param, OR the answer is blank, OR
@@ -459,12 +478,9 @@ export function resolveMaxItemsOverride(
 ): number | undefined {
   const p = template.params.find((q) => paramTarget(q) === "maxItems");
   if (p === undefined) return undefined;
-  const raw = (values[p.name] ?? p.default ?? "").trim().toLowerCase();
-  if (raw === "") return undefined; // blank → template default
-  if (MAXITEMS_UNLIMITED_TOKENS.has(raw)) return 0; // explicit unlimited
-  const n = Number(raw);
-  if (Number.isInteger(n) && n > 0) return n; // explicit positive cap
-  return undefined; // garbage → template default (safe finite)
+  const parsed = parseMaxItemsValue(values[p.name] ?? p.default ?? "");
+  if (parsed === undefined) return undefined; // blank/garbage → template default
+  return parsed === null ? 0 : parsed; // null (unlimited) → 0 (the override's unlimited sentinel)
 }
 
 /**

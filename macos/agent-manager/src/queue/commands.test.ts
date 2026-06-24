@@ -159,6 +159,69 @@ test("applyCommand abort: sets the aborting flag (run kept until the supervisor 
   assert.equal(reg.size, 1, "abort does NOT remove the run itself (the supervisor does this sweep)");
 });
 
+test("applyCommand set_max_items: sets the live cap (number) on a live run", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: "10" }, factory);
+  assert.equal(res.kind, "maxItemsSet");
+  assert.equal(res.runName, "r");
+  assert.equal(reg.get("r")!.maxItemsLive, 10);
+});
+
+test("applyCommand set_max_items: 'unlimited'/'0' tokens set the live cap to null (no cap)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  for (const v of ["unlimited", "0", "none", "∞"]) {
+    const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: v }, factory);
+    assert.equal(res.kind, "maxItemsSet", `"${v}" applies`);
+    assert.equal(reg.get("r")!.maxItemsLive, null, `"${v}" → unlimited (null)`);
+  }
+});
+
+test("applyCommand set_max_items: a blank/garbage value is IGNORED (no change, no removed cap)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  reg.get("r")!.maxItemsLive = 5; // a prior live cap
+  for (const v of ["", "  ", "abc", "-3", "2.5"]) {
+    const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: v }, factory);
+    assert.equal(res.kind, "noop", `"${v}" is ignored`);
+    assert.equal(reg.get("r")!.maxItemsLive, 5, `"${v}" leaves the prior cap untouched`);
+  }
+});
+
+test("applyCommand set_max_items: unknown run / missing run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  assert.equal(
+    applyCommand(reg, { action: "set_max_items", run: "ghost", maxItems: "5" }, factory).kind,
+    "noop",
+  );
+  assert.equal(
+    applyCommand(reg, { action: "set_max_items", maxItems: "5" }, factory).kind,
+    "noop",
+  );
+  assert.equal(reg.get("r")!.maxItemsLive, undefined, "the real run is untouched");
+});
+
+test("applyCommands: a set_max_items is a persistence-affecting change", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommands(reg, [{ action: "start", template: "f" }], factory);
+  assert.equal(
+    applyCommands(reg, [{ action: "set_max_items", run: "r", maxItems: "3" }], factory),
+    true,
+  );
+  // An ignored (garbage) value does NOT mark the set changed.
+  assert.equal(
+    applyCommands(reg, [{ action: "set_max_items", run: "r", maxItems: "junk" }], factory),
+    false,
+  );
+});
+
 test("applyCommand: pause/resume/stop/abort for an unknown run is a no-op", () => {
   const reg: RunRegistry = new Map();
   const { factory } = makeFactory({});

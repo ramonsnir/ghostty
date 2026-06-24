@@ -256,6 +256,7 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
         paused: rec.paused,
         draining: rec.draining,
         params: rec.params ?? {},
+        maxItemsLive: rec.maxItemsLive,
       }),
     );
   }

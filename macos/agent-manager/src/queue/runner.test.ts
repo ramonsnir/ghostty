@@ -18,6 +18,7 @@ import {
   runQueueSweep,
   makeQueueRun,
   occupiesSlot,
+  effectiveMaxItemsCap,
   DEFAULT_PENDING_GRACE_MS,
   type QueueDeps,
   type QueueRun,
@@ -483,6 +484,51 @@ test("runQueueSweep: maxItems override '0' (unlimited) dispatches PAST the templ
   await runQueueSweep(deps); // dispatch — unlimited override beats the template cap of 2
 
   assert.equal(fake.calls.spawn.length, 3, "unlimited override dispatches all 3 (> template maxItems 2)");
+});
+
+// ---------------------------------------------------------------------------
+// (live maxItems edit) effectiveMaxItemsCap respects a run.maxItemsLive override.
+// ---------------------------------------------------------------------------
+
+test("effectiveMaxItemsCap: a live override WINS over the start-time param and template cap", () => {
+  const t = tmpl({ maxItems: 2, params: [{ name: "maxItems", target: "maxItems", default: "1" }] });
+  // No live edit → start-time param (1) wins over the template (2).
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "1" } });
+  assert.equal(effectiveMaxItemsCap(run), 1);
+  // A live numeric edit wins over both.
+  run.maxItemsLive = 10;
+  assert.equal(effectiveMaxItemsCap(run), 10);
+  // A live null edit means UNLIMITED (null), beating the finite param/template.
+  run.maxItemsLive = null;
+  assert.equal(effectiveMaxItemsCap(run), null);
+});
+
+test("runQueueSweep: BUMPING the live cap re-enables dispatch past an already-reached cap", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  // Start capped at 1 (template huge, param caps to 1).
+  const t = tmpl({ params: [{ name: "maxItems", target: "maxItems", default: "1" }] });
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "1" } });
+  let now = 7_500_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — capped to ONE
+  assert.equal(fake.calls.spawn.length, 1, "starts capped at 1");
+
+  // BUMP the live cap to 3 (as a set_max_items command would) — no restart.
+  run.maxItemsLive = 3;
+  now += 5000;
+  await runQueueSweep(deps); // now dispatches the remaining two (lifetimeDispatched 1 → 3)
+  assert.equal(fake.calls.spawn.length, 3, "bumping the live cap re-enables dispatch past the reached cap");
 });
 
 // ---------------------------------------------------------------------------
