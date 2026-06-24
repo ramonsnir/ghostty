@@ -162,6 +162,14 @@ run with no file edits:
   disabled; the engine also rejects it).
 - The chosen values are remembered for the run and **re-applied across a restart** (scope AND
   the maxItems override).
+- **The run is NAMED after its scope, and different scopes run in PARALLEL.** A live run's name
+  (the dashboard section header, its tiles' origin, and the pause/stop target) is the template's
+  `name` plus the chosen env-param **values**, e.g. **"ExampleOS · Acme · v2.0"**. Starting the
+  same template again with a **different** scope (another project/milestone) does **not** dedup
+  to the first run — it starts a **second run in parallel**, in its **own tab**, so you can drive
+  several milestones of one generic template at once. Re-starting with the **same** scope is still
+  an idempotent no-op (it won't double up). (`maxItems` is excluded from the name — it tunes the
+  engine, not the scope; use the live cap editor to change a running run's cap.)
 - A template with **no `params`** starts immediately, exactly as before.
 - Stays generic: the *template* names the env var / opts into the maxItems prompt / points at a
   `valuesCommand` — Ghostty has no knowledge of Linear (or any tracker). Keep secrets (e.g. a
@@ -185,8 +193,9 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 
 - **Start:** the `start_agent_queue` keybind action (bind it in your fork config, e.g.
   `keybind = ctrl+a>q=start_agent_queue`) or the **"Start Agent Queue…"** command-palette
-  entry — opens a fuzzy picker of your templates; choose one and the sidecar starts the run
-  on its next sweep. `start_agent_queue:<template-name>` skips the picker.
+  entry — opens a fuzzy picker of your templates **shown by each template's `name`** (e.g.
+  "ExampleOS", not the file's `example.json`); choose one and the sidecar starts the run on
+  its next sweep. `start_agent_queue:<template-name>` (the file basename) skips the picker.
 - **Watch:** the Agent Dashboard now **groups tiles by origin** — one section per running
   queue (plus `(other)` for non-queue agents) — with a per-tile origin **marker** and a
   top **filter bar** to include/exclude origins (see everything, only one queue, or mute a

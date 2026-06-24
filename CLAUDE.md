@@ -928,11 +928,13 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     raw string is posted (the sidecar parses it, so a fat-finger never silently removes the cap).
     Bumping the cap above `lifetimeDispatched` re-enables dispatch on the next sweep (`maxItemsRemaining`
     recomputes); LOWERING it only stops FUTURE dispatch — running agents are never killed. **NOTE the
-    run-identity semantics (why a second start can't do this):** a run is keyed by template BASENAME and
-    a re-`start` of an already-active template is an idempotent NO-OP that IGNORES the second start's
-    params (milestone/maxItems) — so you cannot run the same template twice (the second start does
-    nothing) and cannot change a live run's scope by re-starting; `set_max_items` is the in-place edit.
-    To run two milestones concurrently you need two template FILES with distinct `name`s. Engine: a new
+    run-identity semantics** (UPDATED by the per-scope-identity change — see the "PER-SCOPE RUN IDENTITY"
+    bullet below): a run is keyed by its `runName` IDENTITY (template `name` + resolved env-param scope),
+    and a re-`start` with the SAME (template + scope) is an idempotent NO-OP — but a re-`start` with a
+    DIFFERENT scope (another milestone) now starts a SECOND run IN PARALLEL (no longer ignored). So two
+    milestones concurrently no longer needs two template files — start the one template twice with
+    different scopes. What a re-start still CANNOT do is change a LIVE run's cap (or scope) in place;
+    `set_max_items` is the in-place cap edit. Engine: a new
     mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
     consults FIRST (over the start-time param + template cap); persisted in the active-runs record
     (`maxItemsLive`) so a restart re-applies it. A shared pure `parseMaxItemsValue` (null=unlimited,
@@ -950,6 +952,40 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
     Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
     **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **PER-SCOPE RUN IDENTITY — one template, parallel runs per project/milestone (palette shows the
+    template `name`).** Three coupled changes so a generic template (e.g. Example) is re-usable in
+    parallel for different env-param scopes:
+    - **(1) Palette shows the template `name`, not the filename.** The "Start Agent Queue…" picker lists
+      each template by its JSON `name` (e.g. "ExampleOS"), not the file basename ("example"), sorted by
+      display name. The START command + `templateParams`/`templateProbe` still key off the BASENAME (the
+      sidecar loads templates by it). `QueuePalette.discoverTemplates` now returns `[QueueTemplateEntry]`
+      (`basename` + `displayName`, read via the new `templateDisplayName`, basename fallback); the option
+      title + the param-form title use `displayName`; `QueueParamPrompt` gained `displayName`.
+    - **(2) A run's live IDENTITY is `runName` = `template.name` + its non-empty ENV-param VALUES,
+      " · "-joined** (e.g. "ExampleOS · Acme · v2.0"; maxItems params excluded — engine tuning, not
+      scope). `runName` REPLACES `template.name` everywhere the run identity flows: the annotation
+      `queueName` (dispatchOne + restampAnnotation), the §11 health report, the `activeRunRecords` name,
+      and the reconcile `projectLiveSurfaces` filter — so two scoped runs of one template are shown
+      (separate dashboard sections) AND controlled (pause/stop/abort/set_max_items target the `runName`)
+      independently. Pure helper `runDisplayName(template, values)` in `templates.ts`.
+    - **(3) Dedup is now per-SCOPE, so different scopes run IN PARALLEL (separate tabs).** `applyCommand`
+      builds the candidate run, then dedups on (basename + `identityScope`) where `identityScope` =
+      `runIdentityScope(template, values)` = the resolved provider env (sorted `name=value`, pure). Same
+      (template + scope) = idempotent no-op (unchanged); DIFFERENT scope = a second run, keyed in the
+      registry by its `runName`. The per-run STATE FILE gets a scope-hash suffix (`<basename>.<slug>.state.json`
+      via `scopeSlug(runIdentityScope(...))`) so parallel runs of one template don't collide on disk;
+      rehydration recomputes the same path. **Separate tabs are automatic** — each run starts with an empty
+      `occupied` set, so its first dispatch's `splitPlan` returns `firstTab` → a new tab per run.
+    `makeQueueRun` computes `runName`/`identityScope` from (template + params); a `runName` collision from a
+    DIFFERENT identity is rejected (no clobber). Wiring: sidecar — `templates.ts` (`runDisplayName`/
+    `runIdentityScope`/`scopeSlug`), `runner.ts` (`QueueRun.runName`/`.identityScope` + identity usages),
+    `commands.ts` (scope-aware dedup + key-by-`runName`), `wiring.ts` (`runStatePath` scope-suffixed state
+    file, factory + rehydrate). macOS — `QueuePalette.swift` (`QueueTemplateEntry` + `templateDisplayName` +
+    `discoverTemplates` return type + `QueueParamPrompt.displayName` + option/form titles). Tests: sidecar
+    `templates.test.ts` (`runDisplayName`/`runIdentityScope`/`scopeSlug`), `commands.test.ts` (parallel
+    different-scope start + same-scope no-op + factory-consulted-on-restart); Swift `QueuePaletteTests`
+    (`discoverUsesJSONNameForDisplayAndSort`, `templateDisplayNameFallsBackToBasename`, updated discovery
+    assertions to `[QueueTemplateEntry]`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
