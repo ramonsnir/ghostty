@@ -255,10 +255,20 @@ struct AgentDashboardView: View {
                         .padding(.vertical, 1)
                         .background(Color.secondary.opacity(0.18))
                         .clipShape(Capsule())
-                    Text(agent.title.isEmpty ? "(untitled)" : agent.title)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    // Clicking the NAME focuses (jumps to) that split — raise its
+                    // window, select its tab, un-zoom if hidden — WITHOUT unhiding it
+                    // from the dashboard. "Show" (below) is the unhide affordance.
+                    Button {
+                        focusHidden(agent.id)
+                        showHiddenPopover = false
+                    } label: {
+                        Text(agent.title.isEmpty ? "(untitled)" : agent.title)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .buttonStyle(.link)
+                    .help("Jump to this split")
                     Spacer(minLength: 4)
                     Button("Show") { model.show(agent.id) }
                         .buttonStyle(.borderless)
@@ -269,6 +279,26 @@ struct AgentDashboardView: View {
         }
         .padding(12)
         .frame(width: 240)
+    }
+
+    /// Focus (jump to) a hidden split by id without unhiding it: raise its window,
+    /// select its tab, un-zoom if hidden, and flash the present highlight — the same
+    /// path a visible tile's tap uses (`AgentPreviewTile.jump`). Deferred to the next
+    /// runloop so the present runs AFTER AppKit settles the panel's key-window change
+    /// from this click (see the note in `AgentPreviewTile.jump`).
+    private func focusHidden(_ id: UUID) {
+        DispatchQueue.main.async {
+            for controller in TerminalController.all {
+                for v in controller.surfaceTree where v.id == id {
+                    controller.unzoomIfHidden(v)
+                    NotificationCenter.default.post(
+                        name: Ghostty.Notification.ghosttyPresentTerminal,
+                        object: v
+                    )
+                    return
+                }
+            }
+        }
     }
 
     private func degraded(title: String, detail: String) -> some View {
