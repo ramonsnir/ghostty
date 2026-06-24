@@ -475,8 +475,12 @@ private struct OriginSectionHeader: View {
     private func capEditorPopover(_ status: QueueStatus) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Lifetime cap (maxItems)").font(.caption.weight(.semibold))
+            // lineLimit(nil) is explicit so an inherited limit can't collapse this to one
+            // truncated line; fixedSize(vertical) lets it grow to however many lines it needs.
             Text("Dispatched \(status.dispatched) of \(status.maxItems.map(String.init) ?? "∞"). Raising it lets the run pick up more items; lowering it only stops FUTURE dispatch — running agents keep going.")
                 .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 6) {
                 ForEach(["1", "2", "5", "10"], id: \.self) { v in
@@ -497,7 +501,7 @@ private struct OriginSectionHeader: View {
             }
         }
         .padding(12)
-        .frame(width: 240)
+        .frame(width: 300)
     }
 
     private func commitCap(_ value: String) {
