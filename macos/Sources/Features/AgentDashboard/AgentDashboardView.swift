@@ -301,6 +301,11 @@ private struct OriginSectionHeader: View {
     let onStop: () -> Void
     let onAbort: () -> Void
 
+    // Stop and Abort discard in-flight work and have no undo, so they confirm
+    // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
+    @State private var confirmStop = false
+    @State private var confirmAbort = false
+
     var body: some View {
         HStack(spacing: 6) {
             Text(section.id)
@@ -321,11 +326,31 @@ private struct OriginSectionHeader: View {
                 // active — the sidecar treats the inactive one as a no-op).
                 queueButton("pause", help: "Pause: stop dispatching new agents", action: onPause)
                 queueButton("play", help: "Resume dispatching", action: onResume)
-                queueButton("stop", help: "Stop: drain, no new agents", action: onStop)
-                queueButton("xmark.octagon", help: "Abort: force-close all agents in this run", action: onAbort)
+                queueButton("stop", help: "Stop: drain, no new agents") { confirmStop = true }
+                queueButton("xmark.octagon", help: "Abort: force-close all agents in this run") { confirmAbort = true }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .confirmationDialog(
+            "Stop queue “\(section.id)”?",
+            isPresented: $confirmStop,
+            titleVisibility: .visible
+        ) {
+            Button("Stop (drain)", action: onStop)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Stops dispatching new agents. In-flight agents finish their current work, then the run is removed. This can't be undone — you'd have to re-start the queue.")
+        }
+        .confirmationDialog(
+            "Abort queue “\(section.id)”?",
+            isPresented: $confirmAbort,
+            titleVisibility: .visible
+        ) {
+            Button("Abort (force-close all)", role: .destructive, action: onAbort)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Immediately force-closes all \(section.count) agent split\(section.count == 1 ? "" : "s") in this run, discarding any in-progress work.")
+        }
     }
 
     private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
