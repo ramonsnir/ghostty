@@ -928,11 +928,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     raw string is posted (the sidecar parses it, so a fat-finger never silently removes the cap).
     Bumping the cap above `lifetimeDispatched` re-enables dispatch on the next sweep (`maxItemsRemaining`
     recomputes); LOWERING it only stops FUTURE dispatch — running agents are never killed. **NOTE the
-    run-identity semantics (why a second start can't do this):** a run is keyed by template BASENAME and
-    a re-`start` of an already-active template is an idempotent NO-OP that IGNORES the second start's
-    params (milestone/maxItems) — so you cannot run the same template twice (the second start does
-    nothing) and cannot change a live run's scope by re-starting; `set_max_items` is the in-place edit.
-    To run two milestones concurrently you need two template FILES with distinct `name`s. Engine: a new
+    run-identity semantics (why a second start can't change a LIVE run's cap):** after the `queue-parallel`
+    merge a run is keyed by **template basename + resolved scope** (`identityScope` = the resolved provider
+    env, e.g. project/milestone — see `commands.ts applyCommand`). A re-`start` with the SAME basename AND
+    SAME scope is an idempotent NO-OP that ignores the second start's maxItems — so you can't rescope or
+    re-cap a live run by re-starting it; `set_max_items` is the in-place edit. A DIFFERENT scope of the same
+    template is a DISTINCT run that proceeds in PARALLEL (own tab + state file), so two milestones run at
+    once from ONE template — you do NOT need two template files (this supersedes the earlier basename-only
+    dedup). Engine: a new
     mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
     consults FIRST (over the start-time param + template cap); persisted in the active-runs record
     (`maxItemsLive`) so a restart re-applies it. A shared pure `parseMaxItemsValue` (null=unlimited,
