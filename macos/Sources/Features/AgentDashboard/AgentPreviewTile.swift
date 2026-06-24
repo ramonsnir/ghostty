@@ -139,13 +139,15 @@ struct AgentPreviewTile: View {
         let label = (key?.isEmpty == false) ? "\(name) · \(key!)" : name
         return AnyView(
             Text(label)
-                .font(.caption2.weight(.medium))
+                .font(.caption2.weight(.semibold))
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
-                .foregroundStyle(Color.accentColor)
-                .background(Color.accentColor.opacity(0.16))
+                // High-contrast: white on a solid accent fill (was accent-on-faint-accent,
+                // i.e. blue-on-dark-blue, which was hard to read).
+                .foregroundStyle(Color.white)
+                .background(Color.accentColor)
                 .clipShape(Capsule())
                 .help("Queue: \(name)" + (key.map { " · \($0)" } ?? ""))
         )

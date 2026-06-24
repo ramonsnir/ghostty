@@ -951,6 +951,27 @@ final class AgentDashboardModel: ObservableObject {
         originFilterStore.save(excludedOrigins)
     }
 
+    /// SOLO an origin: show ONLY this origin (exclude all others). Clicking the
+    /// already-soloed origin clears the filter (show all) — a toggle. This is the
+    /// filter bar's badge tap behavior ("show only that", not "hide that"). PURE
+    /// helper `soloExclusion` computes the new exclusion set for testability.
+    func soloOrigin(_ origin: String) {
+        let target = AgentDashboardModel.soloExclusion(origin, known: knownOrigins, current: excludedOrigins)
+        excludedOrigins = target
+        originFilterStore.save(excludedOrigins)
+    }
+
+    /// (pure, testable) The exclusion set for a solo tap: every known origin EXCEPT
+    /// `origin` — UNLESS that's already the current exclusion (origin is the sole shown
+    /// one), in which case clear (show all). Mirrors the "tap to isolate, tap again to
+    /// reset" toggle.
+    static func soloExclusion(
+        _ origin: String, known: Set<String>, current: Set<String>
+    ) -> Set<String> {
+        let others = known.subtracting([origin])
+        return current == others ? [] : others
+    }
+
     /// Re-include every origin (clear the filter). Persists. No-op when empty.
     func showAllOrigins() {
         guard !excludedOrigins.isEmpty else { return }

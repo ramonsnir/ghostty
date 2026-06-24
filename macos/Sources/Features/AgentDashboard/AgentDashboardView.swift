@@ -170,20 +170,24 @@ struct AgentDashboardView: View {
                 ForEach(origins, id: \.self) { origin in
                     let included = !model.excludedOrigins.contains(origin)
                     Button {
-                        model.toggleOrigin(origin)
+                        // Tap to SHOW ONLY this origin (solo); tap the soloed one again to
+                        // show all. (Was: tap to hide that origin.)
+                        model.soloOrigin(origin)
                     } label: {
                         Text(origin)
-                            .font(.caption2.weight(.medium))
+                            .font(.caption2.weight(.semibold))
                             .lineLimit(1)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 2)
-                            .background(included ? Color.accentColor.opacity(0.22) : Color.secondary.opacity(0.12))
-                            .foregroundStyle(included ? Color.accentColor : Color.secondary)
+                            // High-contrast: WHITE on a solid accent fill when shown; muted
+                            // grey when filtered out (blue-on-dark-blue was unreadable).
+                            .foregroundStyle(included ? Color.white : Color.secondary)
+                            .background(included ? Color.accentColor : Color.secondary.opacity(0.18))
                             .clipShape(Capsule())
-                            .opacity(included ? 1.0 : 0.6)
+                            .opacity(included ? 1.0 : 0.55)
                     }
                     .buttonStyle(.plain)
-                    .help(included ? "Hide \(origin) from the view" : "Show \(origin)")
+                    .help(included ? "Show only \(origin)" : "Show only \(origin)")
                 }
                 if !model.excludedOrigins.isEmpty {
                     Button { model.showAllOrigins() } label: {

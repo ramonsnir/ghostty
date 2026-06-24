@@ -1868,6 +1868,37 @@ struct AgentDashboardOriginTests {
         #expect(model.sections.map(\.id) == ["alpha", "beta"])
     }
 
+    @Test func soloExclusionIsolatesAndToggles() {
+        // Pure helper: solo X → exclude all others; solo X again (already isolated) → clear.
+        let known: Set<String> = ["alpha", "beta", "(other)"]
+        let isolated = AgentDashboardModel.soloExclusion("alpha", known: known, current: [])
+        #expect(isolated == ["beta", "(other)"])
+        // Tapping the already-soloed origin clears (show all).
+        #expect(AgentDashboardModel.soloExclusion("alpha", known: known, current: isolated) == [])
+        // Soloing a different origin re-isolates to it.
+        #expect(AgentDashboardModel.soloExclusion("beta", known: known, current: isolated) == ["alpha", "(other)"])
+    }
+
+    @Test func soloOriginPersistsAndFiltersSections() {
+        let filterStore = InMemoryOriginFilterStore()
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(), originFilterStore: filterStore)
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, AgentAnnotation(queueName: "alpha"))
+        model.applyAnnotation(b, AgentAnnotation(queueName: "beta"))
+
+        // Solo alpha → only alpha shown (beta excluded); persisted.
+        model.soloOrigin("alpha")
+        #expect(model.excludedOrigins == ["beta"])
+        #expect(model.sections.map(\.id) == ["alpha"])
+        // Solo alpha again → show all.
+        model.soloOrigin("alpha")
+        #expect(model.excludedOrigins.isEmpty)
+        #expect(model.sections.map(\.id) == ["alpha", "beta"])
+    }
+
     @Test func excludedFilterLoadsFromStoreAtInit() {
         let model = AgentDashboardModel(
             store: InMemoryHideStore(),
