@@ -65,7 +65,12 @@ import {
   type LiveSurface,
   type StoreIO,
 } from "./store.js";
-import { resolveMaxItemsOverride, resolveParamsEnv } from "./templates.js";
+import {
+  resolveMaxItemsOverride,
+  resolveParamsEnv,
+  runDisplayName,
+  runIdentityScope,
+} from "./templates.js";
 import { queueStatusReport, type QueueStatusReport } from "./status.js";
 import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
 
@@ -100,6 +105,17 @@ export interface QueueRun {
    *  and the dedup identity for a `start` command (re-starting the same template basename is
    *  a no-op). Defaults to `template.name` for runs created without a basename (tests). */
   templateName: string;
+  /** (parallel runs) The run's DISPLAY name + IDENTITY: `template.name` plus the run's
+   *  non-empty env-param VALUES (e.g. "ExampleOS · Acme · v2.0"). This — NOT `template.name`
+   *  — is the dashboard origin, the annotation `queueName`, the health-report name, the
+   *  active-run record name, and the reconcile filter, so two scoped runs of one template
+   *  are shown + controlled as DISTINCT runs. Computed from `template` + `params` at
+   *  construction; defaults to `template.name` when the run has no env params. */
+  runName: string;
+  /** (parallel runs) The canonical, order-independent scope identity (`runIdentityScope`):
+   *  the resolved provider env. Two `start`s of the same template with this same scope are an
+   *  idempotent no-op; different scopes run in PARALLEL. Used by `applyCommand`'s dedup. */
+  identityScope: string;
   /** The store seam for THIS run's durable records (one file per run). */
   storeIO: StoreIO;
   /** (§8b) The resolved START-TIME parameter answers (param name → value) the run was
@@ -198,11 +214,14 @@ export function makeQueueRun(
     params?: Record<string, string>;
   } = {},
 ): QueueRun {
+  const params = opts.params ?? {};
   return {
     template,
     templateName: opts.templateName ?? template.name,
+    runName: runDisplayName(template, params),
+    identityScope: runIdentityScope(template, params),
     storeIO,
-    params: opts.params ?? {},
+    params,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
@@ -278,7 +297,7 @@ export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
   for (const run of registry.values()) {
     const rec: ActiveRunRecord = {
       template: run.templateName,
-      name: run.template.name,
+      name: run.runName,
       paused: run.paused,
       draining: run.draining,
     };
@@ -503,7 +522,10 @@ async function runOne(
 
   // --- 1) RECONCILE (always first; §9) --------------------------------------------
   // Project the live surfaces carrying THIS run's annotation into LiveSurface views.
-  const liveForRun = projectLiveSurfaces(surfaces, t.name);
+  // (parallel runs) Filter by the run's IDENTITY name (`runName`), which is what
+  // dispatchOne/restampAnnotation stamp as the surface annotation queueName — so two
+  // scoped runs of one template never adopt each other's tiles.
+  const liveForRun = projectLiveSurfaces(surfaces, run.runName);
   const records = loadStore(run.storeIO);
   const plan = reconcile(records, liveForRun, nowMs, deps.pendingGraceMs);
 
@@ -550,7 +572,7 @@ async function runOne(
       run.disabled = true;
       run.cooldown.set(action.assignment.key, cooldownUntil(nowMs));
       errlog(
-        `run "${t.name}": ${action.assignment.key} surface never attached a host session ` +
+        `run "${run.runName}": ${action.assignment.key} surface never attached a host session ` +
           `(no pty-host, §2) — supervisor self-DISABLED for this run`,
       );
     }
@@ -609,7 +631,7 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
   // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
   const exclude = new Set<string>([...run.active.keys(), ...run.dispatched]);
   const report: QueueStatusReport = queueStatusReport({
-    queueName: run.template.name,
+    queueName: run.runName,
     present: true,
     paused: run.paused,
     draining: run.draining,
@@ -628,7 +650,7 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
   try {
     await deps.client.reportQueueStatus(report);
   } catch (err) {
-    errlog(`report_queue_status "${run.template.name}": ${msg(err)}`);
+    errlog(`report_queue_status "${run.runName}": ${msg(err)}`);
   }
 }
 
@@ -703,7 +725,7 @@ async function restampAnnotation(
   try {
     await deps.client.setAnnotation(a.surfaceUUID, {
       queueKey: a.key,
-      queueName: run.template.name,
+      queueName: run.runName,
       ...(a.url !== undefined ? { queueUrl: a.url } : {}),
     });
   } catch (err) {
@@ -790,7 +812,7 @@ async function advanceStates(
           await signal(deps, updated.surfaceUUID, `agent for ${updated.key} exited early`);
         }
         run.idleAnchor.delete(a.key);
-        log(`run "${run.template.name}": ${updated.key} EXITED early — bell rung, slot freed`);
+        log(`run "${run.runName}": ${updated.key} EXITED early — bell rung, slot freed`);
       }
     }
   }
@@ -837,7 +859,7 @@ async function runCloseSequences(
     if (live === undefined) {
       finishAndCooldown(run, a, deps.now());
       changed = true;
-      log(`run "${run.template.name}": ${a.key} surface gone → cooldown`);
+      log(`run "${run.runName}": ${a.key} surface gone → cooldown`);
       continue;
     }
 
@@ -861,7 +883,7 @@ async function runCloseSequences(
       // If the child is ALREADY exited this very sweep, fall through to force-close;
       // otherwise defer to a later sweep so the child can exit cleanly.
       if (!live.exited) {
-        log(`run "${run.template.name}": ${a.key} exit keys sent; awaiting child exit`);
+        log(`run "${run.runName}": ${a.key} exit keys sent; awaiting child exit`);
         continue;
       }
     }
@@ -872,7 +894,7 @@ async function runCloseSequences(
     const elapsed = deps.now() - progress.sinceMs;
     if (live.exited || elapsed >= awaitMs) {
       if (!live.exited) {
-        log(`run "${run.template.name}": ${a.key} await-exit timed out (${elapsed}ms); force-closing`);
+        log(`run "${run.runName}": ${a.key} await-exit timed out (${elapsed}ms); force-closing`);
       }
       try {
         await deps.client.forceCloseSurface(uuid);
@@ -881,7 +903,7 @@ async function runCloseSequences(
       }
       finishAndCooldown(run, a, deps.now());
       changed = true;
-      log(`run "${run.template.name}": ${a.key} closed → cooldown`);
+      log(`run "${run.runName}": ${a.key} closed → cooldown`);
     }
     // else: still within the await window and not yet exited → keep polling next sweep.
   }
@@ -967,7 +989,7 @@ async function dispatchCandidates(
       }
     }
   } catch (err) {
-    errlog(`run "${t.name}": list provider failed: ${msg(err)}`);
+    errlog(`run "${run.runName}": list provider failed: ${msg(err)}`);
     return 0;
   }
   // Dispatch gate (applied AFTER the fetch+cache+re-arm above): nothing to dispatch when
@@ -1043,8 +1065,10 @@ async function dispatchOne(
   if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
   const sp = splitPlan(slot, occupied, t.grid.fill, t.grid.cols, t.grid.rows);
 
-  // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a).
-  const pending = makePendingRecord(t.name, item.key, slot, nowMs, {
+  // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
+  // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
+  // + the reconcile filter, so parallel scoped runs of one template never cross-adopt (§9).
+  const pending = makePendingRecord(run.runName, item.key, slot, nowMs, {
     title: item.title,
     url: item.url,
   });
@@ -1105,7 +1129,7 @@ async function dispatchOne(
     // eligible to retry on the next list (mirrors the lifetime-counter rollback).
     run.dispatched.delete(item.key);
     persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
-    errlog(`run "${t.name}": spawn ${item.key} failed: ${msg(err)}`);
+    errlog(`run "${run.runName}": spawn ${item.key} failed: ${msg(err)}`);
     return false;
   }
 
@@ -1141,11 +1165,11 @@ async function dispatchOne(
   try {
     await deps.client.setAnnotation(spawned.id, {
       queueKey: item.key,
-      queueName: t.name,
+      queueName: run.runName,
       ...(item.url !== undefined ? { queueUrl: item.url } : {}),
     });
   } catch (err) {
-    errlog(`run "${t.name}": annotate ${item.key}: ${msg(err)}`);
+    errlog(`run "${run.runName}": annotate ${item.key}: ${msg(err)}`);
   }
 
   // (g) Optional fire-and-forget claim (a LATENCY optimization, never correctness §7).
@@ -1159,7 +1183,7 @@ async function dispatchOne(
     });
   }
 
-  log(`run "${t.name}": dispatched ${item.key} → slot ${slot} (session ${spawned.sessionId})`);
+  log(`run "${run.runName}": dispatched ${item.key} → slot ${slot} (session ${spawned.sessionId})`);
   return true;
 }
 

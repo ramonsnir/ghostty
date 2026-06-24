@@ -78,7 +78,7 @@ test("applyCommand start: the start-time params (§8b) are passed through to the
   assert.deepEqual(reg.get("backlog")!.params, { project: "Acme", milestones: "Q3" }, "stored on the run");
 });
 
-test("applyCommand start: re-start of the same template basename is an idempotent NO-OP", () => {
+test("applyCommand start: re-start of the same template + SAME scope is an idempotent NO-OP", () => {
   const reg: RunRegistry = new Map();
   const { factory, calls } = makeFactory({ "backlog-file": "backlog" });
   applyCommand(reg, { action: "start", template: "backlog-file" }, factory);
@@ -87,8 +87,57 @@ test("applyCommand start: re-start of the same template basename is an idempoten
   assert.equal(res.kind, "noop", "second start is a no-op");
   assert.equal(res.runName, "backlog");
   assert.equal(reg.size, 1, "still one run");
+  // The load-bearing invariant: the EXISTING run object is NOT recreated (its in-flight
+  // tracking survives). The factory IS now consulted on the duplicate (to compute the
+  // candidate's resolved identity before deduping), but the throwaway run is discarded.
   assert.equal(reg.get("backlog"), first, "the existing run object is NOT recreated");
-  assert.deepEqual(calls, ["backlog-file"], "factory NOT invoked again on the re-start");
+  assert.deepEqual(calls, ["backlog-file", "backlog-file"], "factory consulted to resolve identity");
+});
+
+test("applyCommand start: SAME template, DIFFERENT param scope → runs in PARALLEL", () => {
+  // A template with two env params (project/milestone) so the resolved scope drives identity.
+  const reg: RunRegistry = new Map();
+  const t = tmpl("ExampleOS");
+  t.params = [
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "milestone", env: "LINEAR_MILESTONE" },
+  ];
+  const factory: RunFactory = (basename, params) =>
+    makeQueueRun(t, memStore(), { templateName: basename, params });
+
+  const a = applyCommand(
+    reg,
+    { action: "start", template: "example", params: { project: "Acme", milestone: "M1" } },
+    factory,
+  );
+  const b = applyCommand(
+    reg,
+    { action: "start", template: "example", params: { project: "Acme", milestone: "M2" } },
+    factory,
+  );
+  assert.equal(a.kind, "started");
+  assert.equal(b.kind, "started", "a different scope is NOT deduped — it starts in parallel");
+  assert.equal(reg.size, 2, "two parallel runs of the same template coexist");
+  assert.equal(a.runName, "ExampleOS · Acme · M1");
+  assert.equal(b.runName, "ExampleOS · Acme · M2");
+  assert.ok(reg.has("ExampleOS · Acme · M1") && reg.has("ExampleOS · Acme · M2"),
+    "keyed by the composite runName");
+});
+
+test("applyCommand start: SAME template + SAME scope → idempotent NO-OP (not parallel)", () => {
+  const reg: RunRegistry = new Map();
+  const t = tmpl("ExampleOS");
+  t.params = [{ name: "project", env: "LINEAR_PROJECT" }];
+  const factory: RunFactory = (basename, params) =>
+    makeQueueRun(t, memStore(), { templateName: basename, params });
+
+  const a = applyCommand(reg, { action: "start", template: "example", params: { project: "Acme" } }, factory);
+  const first = reg.get("ExampleOS · Acme");
+  const b = applyCommand(reg, { action: "start", template: "example", params: { project: "Acme" } }, factory);
+  assert.equal(a.kind, "started");
+  assert.equal(b.kind, "noop", "the same scope is an idempotent re-start");
+  assert.equal(reg.size, 1, "still one run for that scope");
+  assert.equal(reg.get("ExampleOS · Acme"), first, "existing run not recreated");
 });
 
 test("applyCommand start: a name collision from a DIFFERENT basename is REJECTED (no clobber)", () => {

@@ -10,10 +10,22 @@ import {
   missingRequiredParams,
   resolveMaxItemsOverride,
   resolveParamsEnv,
+  runDisplayName,
+  runIdentityScope,
+  scopeSlug,
   validateTemplate,
   type TemplateFs,
 } from "./templates.js";
-import type { QueueTemplate } from "./types.js";
+import type { QueueParam, QueueTemplate } from "./types.js";
+
+/** Validate `goodTemplateObj()` (optionally with `params`) into a typed QueueTemplate. */
+function goodTemplate(params?: QueueParam[]): QueueTemplate {
+  const obj = goodTemplateObj();
+  if (params !== undefined) obj.params = params;
+  const r = validateTemplate(obj);
+  if (!r.ok) throw new Error(`bad template: ${r.errors.join("; ")}`);
+  return r.template;
+}
 
 /** A minimal VALID template object (the smallest input that validates). */
 function goodTemplateObj(): Record<string, unknown> {
@@ -423,4 +435,73 @@ test("makeTemplateLoader: valid JSON but invalid template surfaces validator err
   const r = loader.load();
   assert.equal(r.ok, false);
   if (!r.ok) assert.ok(r.errors.some((e) => e.includes("name")));
+});
+
+// ---------------------------------------------------------------------------
+// (parallel runs) runDisplayName / runIdentityScope / scopeSlug — the per-scope run
+// identity that lets one template run in parallel for different project/milestone tuples.
+// ---------------------------------------------------------------------------
+
+test("runDisplayName: no env params → just the template name", () => {
+  assert.equal(runDisplayName(goodTemplate([])), "my-team backlog");
+});
+
+test("runDisplayName: appends each non-empty env-param VALUE (declared order), ' · '-joined", () => {
+  const t = goodTemplate([
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "milestone", env: "LINEAR_MILESTONE" },
+  ]);
+  assert.equal(
+    runDisplayName(t, { project: "Acme", milestone: "v2.0" }),
+    "my-team backlog · Acme · v2.0",
+  );
+  // A blank value (no answer, no default) is skipped; remaining values still appended.
+  assert.equal(runDisplayName(t, { project: "Acme" }), "my-team backlog · Acme");
+  // A param `default` is used when there is no answer.
+  const t2 = goodTemplate([{ name: "project", env: "LINEAR_PROJECT", default: "Globex" }]);
+  assert.equal(runDisplayName(t2), "my-team backlog · Globex");
+});
+
+test("runDisplayName: maxItems params are EXCLUDED (engine tuning, not scope)", () => {
+  const t = goodTemplate([
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "max", target: "maxItems" },
+  ]);
+  assert.equal(runDisplayName(t, { project: "Acme", max: "3" }), "my-team backlog · Acme");
+});
+
+test("runIdentityScope: same resolved env → SAME scope regardless of answer ORDER", () => {
+  const t = goodTemplate([
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "milestone", env: "LINEAR_MILESTONE" },
+  ]);
+  const s1 = runIdentityScope(t, { project: "Acme", milestone: "M1" });
+  const s2 = runIdentityScope(t, { milestone: "M1", project: "Acme" });
+  assert.equal(s1, s2, "order-independent (keys are sorted)");
+});
+
+test("runIdentityScope: different scope → different identity; maxItems is ignored", () => {
+  const t = goodTemplate([
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "max", target: "maxItems" },
+  ]);
+  assert.notEqual(
+    runIdentityScope(t, { project: "Acme" }),
+    runIdentityScope(t, { project: "Globex" }),
+  );
+  // maxItems does not reach the provider env, so it does NOT change the run identity.
+  assert.equal(
+    runIdentityScope(t, { project: "Acme", max: "1" }),
+    runIdentityScope(t, { project: "Acme", max: "9" }),
+  );
+  // No env params (or all blank) → empty scope.
+  assert.equal(runIdentityScope(goodTemplate([])), "");
+});
+
+test("scopeSlug: empty scope → '' (bare basename); non-empty → a stable filename-safe slug", () => {
+  assert.equal(scopeSlug(""), "");
+  const a = scopeSlug("LINEAR_PROJECT=Acme");
+  assert.ok(a.length > 0 && /^[a-z0-9]+$/.test(a), "base36, filename-safe");
+  assert.equal(scopeSlug("LINEAR_PROJECT=Acme"), a, "deterministic");
+  assert.notEqual(scopeSlug("LINEAR_PROJECT=Globex"), a, "distinct scopes → distinct slugs");
 });

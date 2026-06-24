@@ -439,6 +439,64 @@ export function resolveParamsEnv(
   return out;
 }
 
+/**
+ * (parallel runs) The run's DISPLAY name = the template `name` plus each non-empty
+ * ENV-param VALUE (in declared order), joined with " · ". So the SAME template pointed at
+ * different scopes yields distinct, human-readable run names — e.g. a "ExampleOS" template
+ * started for project "Acme" / milestone "v2.0" reads "ExampleOS · Acme · v2.0". maxItems
+ * params (engine tuning, not scope) are excluded; a template with no env params (or all
+ * blank) just yields `template.name` (the prior behavior). PURE. This name is the run's
+ * IDENTITY everywhere downstream (dashboard origin, annotation queueName, health report,
+ * active-run record) so two scoped runs of one template show + are controlled separately.
+ */
+export function runDisplayName(
+  template: QueueTemplate,
+  values: Record<string, string> = {},
+): string {
+  const parts: string[] = [];
+  for (const p of template.params) {
+    if (paramTarget(p) !== "env") continue; // maxItems tunes the engine, not the scope name
+    const v = (values[p.name] ?? p.default ?? "").trim();
+    if (v.length > 0) parts.push(v);
+  }
+  return parts.length === 0 ? template.name : `${template.name} · ${parts.join(" · ")}`;
+}
+
+/**
+ * (parallel runs) A canonical, order-INDEPENDENT identity for a run's SCOPE: the resolved
+ * provider env (env-param `name=value`) sorted + space-joined. Two `start`s with the same
+ * template AND the same resolved scope share this string (an idempotent re-start no-op);
+ * different scopes differ, so they run in PARALLEL. Built from `resolveParamsEnv` so the
+ * identity is exactly what the provider commands are scoped by. PURE.
+ */
+export function runIdentityScope(
+  template: QueueTemplate,
+  values: Record<string, string> = {},
+): string {
+  const env = resolveParamsEnv(template, values);
+  return Object.keys(env)
+    .sort()
+    .map((k) => `${k}=${env[k]}`)
+    .join(" ");
+}
+
+/**
+ * (parallel runs) A short, filename-safe slug of a run's identity scope, so parallel runs
+ * of ONE template get DISTINCT per-run state files on disk instead of clobbering each other.
+ * An EMPTY scope → "" (the caller then uses the bare basename, byte-compatible with the
+ * pre-parallel single-run state file). A non-empty scope → an FNV-1a 32-bit hash in base36
+ * (deterministic + collision-resistant enough for a handful of concurrent scopes). PURE.
+ */
+export function scopeSlug(scope: string): string {
+  if (scope.length === 0) return "";
+  let h = 0x811c9dc5;
+  for (let i = 0; i < scope.length; i++) {
+    h ^= scope.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
 /** Tokens (case-insensitive) a maxItems answer may use to mean "no cap". */
 const MAXITEMS_UNLIMITED_TOKENS = new Set(["0", "unlimited", "none", "inf", "infinity", "∞"]);
 

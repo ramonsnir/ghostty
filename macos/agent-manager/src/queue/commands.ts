@@ -9,8 +9,10 @@
 // (the run FACTORY + a clock are injected) so it is unit-testable with no MCP / fs.
 //
 // Run lifecycle (§8a):
-//   start{template}  → load+validate the template by BASENAME; create a QueueRun if no run
-//                      with that template's name is already active (re-start = NO-OP, idempotent).
+//   start{template}  → load+validate the template by BASENAME; create a QueueRun unless a run
+//                      with the SAME (basename + resolved param scope) is already active
+//                      (re-start of the same scope = NO-OP, idempotent). A DIFFERENT scope of
+//                      the same template (e.g. another project/milestone) starts in PARALLEL.
 //   pause{run}       → set the run's `paused` flag (skip dispatch; keep tracking + closing).
 //   resume{run}      → clear `paused`.
 //   stop{run}        → set `draining` (no new dispatch; the run is removed once its active set empties).
@@ -23,12 +25,13 @@ import type { QueueRun } from "./runner.js";
 
 /** A drained GUI→sidecar control command (§8a). `template` is the template BASENAME
  *  (the `*.json` filename minus extension) for `start`; `run` is the active run NAME
- *  (= `template.name`, the dashboard origin) for pause/resume/stop/abort. */
+ *  (the run's `runName` IDENTITY = `template.name` + its env-param scope, the dashboard
+ *  origin) for pause/resume/stop/abort. */
 export interface QueueCommand {
   action: "start" | "stop" | "abort" | "pause" | "resume";
   /** The template basename to start (start only). */
   template?: string;
-  /** The active run name to pause/resume/stop/abort. */
+  /** The active run name (its `runName`) to pause/resume/stop/abort. */
   run?: string;
   /** (§8b) START-TIME parameter answers (param name → value) collected by the GUI prompt,
    *  passed through to the factory (start only). Absent when the template declares no params. */
@@ -45,7 +48,9 @@ export type RunFactory = (
   params?: Record<string, string>,
 ) => QueueRun | null;
 
-/** The active-run registry: live runs keyed by run NAME (= `template.name`). */
+/** The active-run registry: live runs keyed by run NAME (the `runName` IDENTITY =
+ *  `template.name` + the run's env-param scope), so parallel scoped runs of one template
+ *  coexist under distinct keys. */
 export type RunRegistry = Map<string, QueueRun>;
 
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
@@ -78,36 +83,43 @@ export function applyCommand(
         errlog(`start command with no template — ignored`);
         return { kind: "noop" };
       }
-      // Idempotent: if a run started from this template basename is already active, do
-      // NOT recreate it (a second start would reset its in-flight tracking). Key dedup off
-      // the template BASENAME so it matches before we know the (loaded) run name.
-      for (const run of registry.values()) {
-        if (run.templateName === basename) {
-          return { kind: "noop", runName: run.template.name };
-        }
-      }
+      // Build the candidate run FIRST so we have its resolved IDENTITY (the basename + its
+      // `identityScope` = the resolved provider env) and its display `runName` before we
+      // dedup. The factory only loads+validates the template + creates an in-memory object
+      // (no store write until dispatch), so building a candidate we may discard is cheap
+      // (the template loader is mtime-cached).
       const run = factory(basename, cmd.params);
       if (run === null) {
         // The factory logged the validation/load/required-param error; a failed start is a no-op.
         return { kind: "noop" };
       }
-      // The run NAME (origin) keys the registry. GUARD a name collision: if a DIFFERENT
-      // basename's run already occupies this name, reject the second start rather than
-      // last-wins clobber it (which would orphan the first run's active map + store file
-      // until reconcile/prune). The common single-file double-start is already caught by
-      // the basename dedup above; this only fires for two distinct templates declaring the
-      // same `name`.
-      const existing = registry.get(run.template.name);
-      if (existing !== undefined && existing.templateName !== basename) {
+      // Idempotent: a run with the SAME template basename AND the SAME resolved scope
+      // (project/milestone/…) is already active → NO-OP (a second identical start must not
+      // reset its in-flight tracking). A DIFFERENT scope of the same template is a DISTINCT
+      // run that proceeds in PARALLEL (its own tab, its own state file) — the headline
+      // requirement: the Example queue is re-used in parallel for different project/milestone
+      // tuples, never collapsed into one.
+      for (const existing of registry.values()) {
+        if (existing.templateName === basename && existing.identityScope === run.identityScope) {
+          return { kind: "noop", runName: existing.runName };
+        }
+      }
+      // The run's IDENTITY name (`runName`) keys the registry. GUARD a name collision: if a
+      // DIFFERENT identity already occupies this display name (two distinct templates/scopes
+      // that happen to render the same name), reject the second rather than last-wins clobber
+      // it (which would orphan the first run's active map + store file until reconcile/prune).
+      // The common same-template same-scope double-start is already caught by the dedup above.
+      const clash = registry.get(run.runName);
+      if (clash !== undefined) {
         errlog(
-          `start of template "${basename}" REJECTED — its name "${run.template.name}" ` +
-            `is already in use by template "${existing.templateName}"`,
+          `start of template "${basename}" REJECTED — run name "${run.runName}" ` +
+            `is already in use (template "${clash.templateName}")`,
         );
         return { kind: "noop" };
       }
-      registry.set(run.template.name, run);
-      log(`run "${run.template.name}" STARTED (template ${basename})`);
-      return { kind: "started", runName: run.template.name };
+      registry.set(run.runName, run);
+      log(`run "${run.runName}" STARTED (template ${basename})`);
+      return { kind: "started", runName: run.runName };
     }
     case "pause":
     case "resume":

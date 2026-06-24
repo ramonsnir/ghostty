@@ -30,8 +30,11 @@ import {
   makeTemplateLoader,
   missingRequiredParams,
   realTemplateFs,
+  runIdentityScope,
+  scopeSlug,
   type LoadResult,
 } from "./templates.js";
+import type { QueueTemplate } from "./types.js";
 
 /**
  * Env-var names (and prefixes) STRIPPED from the inherited process env before it is
@@ -196,11 +199,31 @@ export function loadTemplateByName(
 }
 
 /**
+ * (parallel runs) The per-run STATE FILE path under `stateDir`. Parallel runs of ONE
+ * template (different param scopes) must NOT share a state file, so a NON-EMPTY scope adds
+ * a short scope-hash suffix (`<basename>.<slug>.state.json`); an EMPTY scope keeps the bare
+ * `<basename>.state.json` (byte-compatible with the pre-parallel single-run file). The
+ * factory + rehydration derive it identically from (basename + template + params), so a
+ * started run rehydrates to the SAME file. Path-only (no I/O).
+ */
+function runStatePath(
+  stateDir: string,
+  basename: string,
+  template: QueueTemplate,
+  params: Record<string, string>,
+): string {
+  const slug = scopeSlug(runIdentityScope(template, params));
+  const file = slug === "" ? `${basename}.state.json` : `${basename}.${slug}.state.json`;
+  return join(stateDir, file);
+}
+
+/**
  * (§8a) Build the production RUN FACTORY a `start` command uses: load+validate the template
- * by basename, wire a per-run file StoreIO under `stateDir` (named by the basename so it is
- * stable across restarts), and construct the QueueRun (carrying the basename for reload +
- * the optional rehydrated paused/draining flags). Returns null on a bad/absent template
- * (logged here) so `applyCommand` treats it as a failed start.
+ * by basename, wire a per-run file StoreIO under `stateDir` (named by the basename + the
+ * param SCOPE so parallel scoped runs of one template don't collide on disk, yet a run
+ * rehydrates to the same file across restarts), and construct the QueueRun (carrying the
+ * basename for reload + the optional rehydrated paused/draining flags). Returns null on a
+ * bad/absent template (logged here) so `applyCommand` treats it as a failed start.
  */
 export function makeFileRunFactory(
   templatesDir: string,
@@ -223,8 +246,9 @@ export function makeFileRunFactory(
       );
       return null;
     }
-    const storeIO = makeFileStoreIO(join(stateDir, `${basename}.state.json`));
-    return makeQueueRun(res.template, storeIO, { templateName: basename, params: params ?? {} });
+    const runParams = params ?? {};
+    const storeIO = makeFileStoreIO(runStatePath(stateDir, basename, res.template, runParams));
+    return makeQueueRun(res.template, storeIO, { templateName: basename, params: runParams });
   };
 }
 
@@ -249,13 +273,14 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
       );
       continue;
     }
-    const storeIO = makeFileStoreIO(join(stateDir, `${rec.template}.state.json`));
+    const runParams = rec.params ?? {};
+    const storeIO = makeFileStoreIO(runStatePath(stateDir, rec.template, res.template, runParams));
     runs.push(
       makeQueueRun(res.template, storeIO, {
         templateName: rec.template,
         paused: rec.paused,
         draining: rec.draining,
-        params: rec.params ?? {},
+        params: runParams,
       }),
     );
   }
