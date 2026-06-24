@@ -244,6 +244,36 @@ poll_interval_ms: u64 = 100,
 /// The previous RenderState snapshot, for diffing.
 prev_snapshot: ?RenderState.Snapshot = null,
 
+/// Idle-CPU fix: the PERSISTED core RenderState, reused across render ticks so an
+/// idle tick's `update` short-circuits on the terminal's own dirty bits (no per-row
+/// cell rebuild, no fromRenderState projection, no diff, no push). Previously
+/// renderTick built a fresh `.empty` RenderStateCore every tick (a full per-row
+/// rebuild + ~grid-sized alloc) ~10 Hz per live session regardless of activity.
+///
+/// OWNER-THREAD-ONLY: touched ONLY by renderTick -> updateRenderStateLocked /
+/// projectSnapshotLocked, under render_mutex. It is NEVER read or mutated by the
+/// attach-seed paths (Server.pushFullFrames / pushFullFramesTo), which run on the
+/// ATTACHING READ THREAD and keep using captureSnapshotLocked's OWN throwaway
+/// `.empty` RS — sharing this would consume the dirty-clear meant for the owner's
+/// next tick (a cross-thread missed-frame bug). `.empty` is its first state, so the
+/// first tick does the full rebuild exactly as before. Freed in destroy().
+render_state: RenderStateCore = .empty,
+
+/// Idle-CPU fix: the previous cursor-state gate (cursor visibility / blink / DECSCUSR
+/// style / password-input). These four `cursorEql` fields change WITHOUT dirtying any
+/// cell and are absent from ModeFrame, so the capture gate must detect them itself —
+/// a cells-dirty-only gate would silently drop a cursor hide/style change on an
+/// otherwise-clean grid (the GUI mirror would keep a stale cursor). Cursor POSITION /
+/// cell / viewport stay covered by cells_dirty / viewport_dirty. A pure VALUE field
+/// (no heap), so it needs no cleanup in destroy(). null until the first tick.
+/// Owner-thread-only under render_mutex.
+prev_cursor_gate: ?CursorGate = null,
+
+/// Test instrumentation: number of times projectSnapshotLocked actually projected a
+/// full Snapshot. Lets a test assert an idle (clean) tick skips the projection
+/// entirely (the idle-CPU fix). Bumped only inside projectSnapshotLocked.
+snapshots_projected: usize = 0,
+
 /// Phase 2a render-tick push hook. Set by the Server so it can serialize and
 /// broadcast a GridFrame (+ ModeFrame) to subscribers on each tick. Invoked at
 /// the END of renderTick with the just-captured Snapshot (still owned by the
@@ -1250,6 +1280,101 @@ pub fn captureSnapshotLocked(self: *Session, alloc: Allocator) !RenderState.Snap
     return try RenderState.Snapshot.fromRenderState(alloc, &rs);
 }
 
+/// Idle-CPU fix: the four `cursorEql` fields that change WITHOUT dirtying a cell and
+/// are absent from ModeFrame (cursor visibility / blink / DECSCUSR visual style /
+/// password-input). The capture gate compares this across ticks so a DECTCEM/DECSCUSR/
+/// password change on an otherwise-clean grid still forces a capture + push. Pure
+/// value type (no heap), compared with std.meta.eql.
+pub const CursorGate = struct {
+    visible: bool,
+    blinking: bool,
+    password: bool,
+    style: terminalpkg.CursorStyle,
+};
+
+/// Read the cursor-state gate fields cheaply (O(1), no grid walk) from the live
+/// terminal — the SAME sources `RenderState.update` reads (render.zig:313-316):
+/// the cursor_visible / cursor_blinking modes, t.flags.password_input, and the
+/// DECSCUSR visual style `s.cursor.cursor_style`. NOTE: `cursor_style` is the DECSCUSR
+/// visual style (what cursorEql compares as cursor_visual_style), NOT `s.cursor.style`
+/// (the SGR style, which cursorEql does NOT compare). Caller holds render_mutex.
+fn cursorGateLocked(self: *Session) CursorGate {
+    const t = &self.io.terminal;
+    return .{
+        .visible = t.modes.get(.cursor_visible),
+        .blinking = t.modes.get(.cursor_blinking),
+        .password = t.flags.password_input,
+        .style = t.screens.active.cursor.cursor_style,
+    };
+}
+
+/// Idle-CPU fix: update the PERSISTED `render_state` against the live terminal and
+/// apply the search-highlight overlay, returning whether the update marked cells dirty
+/// (`render_state.dirty != .false`) — the capture gate's `cells_dirty` term. On an idle
+/// (clean) tick `update` short-circuits per-row (render.zig:453: no cell rebuild) and
+/// leaves dirty `.false`, so renderTick skips the expensive projection. Caller holds
+/// render_mutex (this runs `update` against the live terminal, like captureSnapshotLocked).
+///
+/// `search_changed` is captured by renderTick BEFORE its `search_dirty` read-and-clear
+/// and threaded in. Whenever a search overlay is ACTIVE (or a search change just landed)
+/// we force `update`'s real full-redraw branch by INVALIDATING the cached dims
+/// (`render_state.rows = 0; .cols = 0`) — NOT by writing `dirty = .full`, which `update`'s
+/// redraw decision never reads (render.zig:270-303). The forced redraw rebuilds every row
+/// and clears `row_highlights[y]` (render.zig:473) before the append-only
+/// `updateHighlightsFlattened` re-applies the current matches, so the overlay can never
+/// double/stale rows over `update`'s partial path (and a `clearSearch`'s final tick clears
+/// the prior highlights). `update` re-stores the correct dims after the redraw decision
+/// (render.zig:307-308), so the bogus 0 only affects the decision, not the rebuild geometry.
+fn updateRenderStateLocked(self: *Session, alloc: Allocator, search_changed: bool) !bool {
+    // (a) gate pre-reset: `update` only ever SETS dirty (.partial/.full); it never
+    // resets it to .false at entry (render.zig:631-641), so a stale value from a prior
+    // tick would defeat the gate. Reset it unconditionally before `update`.
+    self.render_state.dirty = .false;
+
+    // (b) force `update`'s full-redraw branch while a search overlay is present (or a
+    // search change just landed), so the append-only highlight overlay never doubles
+    // or strands a row. Invalidate the cached dims (NOT dirty = .full — see doc above).
+    const overlay_active = self.search_selected != null or self.search_matches.len > 0;
+    if (search_changed or overlay_active) {
+        self.render_state.rows = 0;
+        self.render_state.cols = 0;
+    }
+
+    // (c) update the persisted RS against the live terminal.
+    try self.render_state.update(alloc, self.renderer_state.terminal);
+
+    // (d) apply stored host search highlights (no-op when no search is active),
+    // mirroring captureSnapshotLocked's flatten order (selected first so it wins).
+    if (self.search_selected) |sel| {
+        try self.render_state.updateHighlightsFlattened(
+            alloc,
+            highlight_tag_search_match_selected,
+            &.{sel},
+        );
+    }
+    if (self.search_matches.len > 0) {
+        try self.render_state.updateHighlightsFlattened(
+            alloc,
+            highlight_tag_search_match,
+            self.search_matches,
+        );
+    }
+
+    return self.render_state.dirty != .false;
+}
+
+/// Idle-CPU fix: project the PERSISTED `render_state` to a pointer-free Snapshot (the
+/// ~grid-sized alloc). Called ONLY on a capture tick (renderTick's `must_capture`), so
+/// an idle tick pays nothing here. Forces `.full` so every emitted frame is byte-
+/// identical to today's fresh-`.empty`-RS projection — the never-run-in-production
+/// `.partial` wire path stays OFF; the idle win comes from the gate skipping this call,
+/// not from partial frames. Caller holds render_mutex.
+fn projectSnapshotLocked(self: *Session, alloc: Allocator) !RenderState.Snapshot {
+    self.snapshots_projected += 1;
+    self.render_state.dirty = .full;
+    return try RenderState.Snapshot.fromRenderState(alloc, &self.render_state);
+}
+
 /// --- Slice 3c: host-side OSC8 hover links ---
 ///
 /// Compute the OSC8 hyperlink-cell set for a hover at viewport `(x, y)`,
@@ -1453,38 +1578,45 @@ pub fn renderTick(self: *Session) !usize {
     var force_push = false;
     // Slice B1 (findings SEL-1 / SEL-LOCK-1): drain any pending selection-text
     // update staged by selectDrag/selectClear in the SAME render_mutex critical
-    // section that captures the snapshot, so the selection_text we broadcast and
+    // section that updates the render state, so the selection_text we broadcast and
     // the row.selection highlight in this frame share one point-in-time read. The
     // drained text is owned by self.alloc and freed after the callback runs.
     var sel_text_pending = false;
     var sel_text_present = false;
     var sel_text: ?[:0]const u8 = null;
     // Phase D: read the authoritative at-prompt bit under the SAME render_mutex
-    // critical section that captures the snapshot (cursorIsAtPrompt reads terminal
-    // cursor/prompt state the io thread mutates under this lock). Pushed below
-    // only when it flips vs. prev_at_prompt.
+    // critical section (cursorIsAtPrompt reads terminal cursor/prompt state the io
+    // thread mutates under this lock). Pushed below only when it flips. Read EVERY
+    // tick, ungated — the bit can flip on a clean grid.
     var at_prompt_now = false;
-    var snapshot = blk: {
+    // Idle-CPU fix: whether the persisted-RS update marked cells dirty, and whether a
+    // cursor visibility/blink/style/password change was detected this tick (the two
+    // capture-gate terms computed under the lock). The just-projected snapshot is
+    // non-null ONLY on a capture tick; on a skipped (clean) tick it stays null and
+    // prev_snapshot is RETAINED unchanged (correct baseline for the next dirty tick).
+    var cells_dirty = false;
+    var cursor_state_changed = false;
+    var maybe_snapshot: ?RenderState.Snapshot = null;
+    {
         self.render_mutex.lock();
         defer self.render_mutex.unlock();
         at_prompt_now = self.io.terminal.cursorIsAtPrompt();
-        force_push = self.search_dirty;
+        // Capture search_dirty BEFORE clearing it (finding SD-RACE-1) and thread it
+        // into updateRenderStateLocked so the search-overlay force-redraw AND the final
+        // clearing tick after a clearSearch both see it.
+        const search_changed = self.search_dirty;
+        force_push = search_changed;
         self.search_dirty = false;
-        // Slice B1: a pure selection change (or clear) must also force the
-        // frame even when no cells differ — row.selection is captured below.
+        // Slice B1: a pure selection change (or clear) must also force the frame even
+        // when no cells differ — row.selection is captured by the projection.
         if (self.selection_dirty) force_push = true;
         self.selection_dirty = false;
-        // 2nd reattach-scrollback mechanism: a scroll/jump must ship its frame
-        // even when the scrolled viewport's rows equal the (possibly stale)
-        // prev_snapshot — otherwise the GUI scrolls and sees nothing change.
+        // 2nd reattach-scrollback mechanism: a scroll/jump must ship its frame even
+        // when the scrolled viewport's rows equal the (possibly stale) prev_snapshot.
         if (self.viewport_dirty) force_push = true;
         self.viewport_dirty = false;
-        // Final push-gate term (audit): a mode-only flip dirties no cells and
-        // doesn't move the cursor, so without this it would be suppressed and the
-        // GUI's ModeFrame (shipped only inside onRender) would go stale. Compare
-        // the current mode set to the last seen (id 0 — session_id is constant and
-        // irrelevant to the comparison) and force the push on a change, so onRender
-        // ships the current ModeFrame. fromTerminal requires render_mutex (held).
+        // Mode-only flip (audit): dirties no cells and doesn't move the cursor, so
+        // force the push on a change so onRender ships the current ModeFrame.
         {
             const mode_now = protocol.ModeFrame.fromTerminal(0, &self.io.terminal);
             if (self.prev_mode == null or !std.meta.eql(self.prev_mode.?, mode_now)) {
@@ -1492,13 +1624,25 @@ pub fn renderTick(self: *Session) !usize {
                 self.prev_mode = mode_now;
             }
         }
-        // Capture FIRST (it can error: OOM in rs.update/highlights). Only AFTER
-        // it succeeds do we take ownership of the staged sel_text — otherwise a
-        // capture error would propagate out of this block before the outer
-        // `defer free` registers, leaking the taken buffer AND losing the staged
-        // text (sel_text_dirty already cleared). Capturing first keeps self the
-        // owner on the error path (freed in deinit; dirty flag stays set).
-        const snap = try self.captureSnapshotLocked(self.alloc);
+        // Idle-CPU fix — cursor-state gate (Slice 8 superset): cursor visibility
+        // (DECTCEM), blink + visual style (DECSCUSR), and password-input change
+        // `cursorEql` fields WITHOUT dirtying a cell and are absent from ModeFrame, so
+        // cells_dirty / prev_mode would miss them. A cheap O(1) read vs prev_cursor_gate
+        // catches them so the capture+push still fires (cursor POSITION/cell/viewport
+        // stay covered by cells_dirty/viewport_dirty). Runs EVERY tick, ungated.
+        {
+            const cur_gate = self.cursorGateLocked();
+            cursor_state_changed = self.prev_cursor_gate == null or
+                !std.meta.eql(self.prev_cursor_gate.?, cur_gate);
+            self.prev_cursor_gate = cur_gate;
+        }
+        // Idle-CPU fix: update the PERSISTED render state (an idle tick short-circuits
+        // inside `update` — no per-row rebuild). Returns whether cells are dirty.
+        cells_dirty = try self.updateRenderStateLocked(self.alloc, search_changed);
+        // Slice B1 (SEL-1 / SEL-LOCK-1): stage any pending selection-text update.
+        // HOISTED out of the capture gate so it runs EVERY tick under render_mutex — a
+        // pending sel_text must never stall on a clean tick. Runs AFTER the (fallible)
+        // update so an update error keeps self the owner of sel_text (dirty stays set).
         sel_text_pending = self.sel_text_dirty;
         self.sel_text_dirty = false;
         if (sel_text_pending) {
@@ -1507,63 +1651,53 @@ pub fn renderTick(self: *Session) !usize {
             self.sel_text = null;
             self.sel_text_present = false;
         }
-        break :blk snap;
-    };
-    errdefer snapshot.deinit(self.alloc);
+        // Idle-CPU fix — the capture gate: project a Snapshot ONLY when a frame will
+        // actually ship. cells_dirty is TRUE on any active-overlay tick (the dims-reset
+        // forces update's redraw branch); force_push carries search/selection/viewport/
+        // mode; cursor_state_changed carries the DECTCEM/DECSCUSR case; first-frame
+        // (prev_snapshot == null) always captures. A clean tick with none of these skips
+        // the projection/diff/push entirely — the idle-CPU win.
+        const must_capture = cells_dirty or force_push or cursor_state_changed or
+            (self.prev_snapshot == null);
+        if (must_capture) {
+            maybe_snapshot = try self.projectSnapshotLocked(self.alloc);
+        }
+    }
     defer if (sel_text) |t| self.alloc.free(t);
 
-    // Phase-1 stdout-diff harness (on_render == null): the printed render diff
-    // IS the product, so emit it. Server mode (on_render != null): we only need
-    // the changed-row count for the push gate below — printing the full screen
-    // to stdout ~10 Hz per session is pure noise (it bypasses std.log, so no
-    // log level can suppress it), so count without printing.
-    const changed = if (self.on_render == null)
-        try RenderState.printDiff(self.alloc, self.prev_snapshot, snapshot)
-    else
-        RenderState.countChanges(self.prev_snapshot, snapshot);
+    // `changed` defaults to 0 for a skipped (clean) tick — byte-identical to today's
+    // clean tick (changed == 0, nothing pushed). The tail reads it unconditionally.
+    var changed: usize = 0;
+    if (maybe_snapshot) |snap_val| {
+        var snapshot = snap_val;
+        errdefer snapshot.deinit(self.alloc);
 
-    // Slice 8: a cursor-only move (arrow keys) changes NO rows, so
-    // `changed`==0 and the row-diff gate below would suppress the push,
-    // leaving the GUI mirror's cursor stranded. Detect a render-affecting
-    // cursor change vs. the last pushed snapshot (null prev => first frame =>
-    // treat as changed) and widen the gate to include it. This does NOT
-    // reintroduce idle spam: cursorEql compares real position/visibility/style
-    // only (NOT the blink-phase placeholder), so a steady idle cursor compares
-    // equal and pushes nothing.
-    const cursor_changed = if (self.prev_snapshot) |prev|
-        !prev.cursorEql(snapshot)
-    else
-        true;
+        // Phase-1 stdout-diff harness (on_render == null): the printed render diff IS
+        // the product. Server mode (on_render != null): only the changed-row count is
+        // needed for the push gate — printing ~10 Hz per session is pure noise.
+        changed = if (self.on_render == null)
+            try RenderState.printDiff(self.alloc, self.prev_snapshot, snapshot)
+        else
+            RenderState.countChanges(self.prev_snapshot, snapshot);
 
-    if (self.prev_snapshot) |*prev| prev.deinit(self.alloc);
-    self.prev_snapshot = snapshot;
+        // Slice 8: a cursor-only move changes NO rows, so widen the push gate by the
+        // cursor diff vs the last pushed snapshot (null prev => first frame => changed).
+        const cursor_changed = if (self.prev_snapshot) |prev|
+            !prev.cursorEql(snapshot)
+        else
+            true;
 
-    // Phase 2a render-tick push: hand the just-captured snapshot to the Server
-    // (if wired) so it can serialize + broadcast a GridFrame + ModeFrame. The
-    // snapshot stays owned by self.prev_snapshot; the callback must not free it.
-    // No-op in the Phase-1 stdout-diff path (on_render == null).
-    //
-    // Gate on `changed > 0` (finding SR-3): renderTick is driven by the
-    // periodic poll_timer (~10 Hz in production) as well as real output, and
-    // every captured Snapshot is currently .full, so pushing unconditionally
-    // would broadcast a full GridFrame + ModeFrame to every subscriber ~10
-    // times/sec on a completely idle session — a steady-state bandwidth/CPU
-    // drain and a divergence from the frozen cadence contract (plan §2.2:
-    // render-tick only when output marked something dirty). A freshly-attached
-    // GUI still gets immediate state because (re)attach pushes a full frame via
-    // Server.pushFullFrames independent of the tick; only redundant idle ticks
-    // are suppressed. FOLLOWUP (Phase 2b): persist a RenderState across ticks so
-    // capture can emit .partial and the poll-timer path stops forcing .full.
-    //
-    // Slice 3b: a pure search command mutates row.highlights but no cells, so
-    // `changed` may still be > 0 because Snapshot.Row.eql compares highlights
-    // (RenderState.zig:281-282) — but the diff can also be 0 when the search is
-    // CLEARED and the cleared frame must still ship. `force_push` (the
-    // read-and-clear of `search_dirty` captured under render_mutex above) forces
-    // the push in that case so the highlight delta reaches subscribers.
-    if (changed > 0 or force_push or cursor_changed) {
-        if (self.on_render) |cb| {
-            cb(self.on_render_ctx.?, self, &self.prev_snapshot.?);
+        if (self.prev_snapshot) |*prev| prev.deinit(self.alloc);
+        self.prev_snapshot = snapshot;
+
+        // Push when anything render-affecting changed. The push set is EXACTLY today's
+        // (changed > 0 OR force_push OR cursor_changed); must_capture above is a superset
+        // of this, so a must_capture tick whose diff turns out empty projects but pushes
+        // nothing — identical to today (which always projected then gated the push).
+        if (changed > 0 or force_push or cursor_changed) {
+            if (self.on_render) |cb| {
+                cb(self.on_render_ctx.?, self, &self.prev_snapshot.?);
+            }
         }
     }
 
@@ -1681,6 +1815,10 @@ pub fn destroy(self: *Session) void {
 
     self.io.deinit();
     if (self.prev_snapshot) |*s| s.deinit(self.alloc);
+
+    // Idle-CPU fix: free the persisted render state. The render loop has stopped and
+    // the IO thread is joined (stop() above), so the owner thread is the sole owner.
+    self.render_state.deinit(self.alloc);
 
     // H1 (Phase 2b): free the RAW-output ring. stop() above joined the IO
     // thread, so the observer (the only writer) can no longer fire — this is
