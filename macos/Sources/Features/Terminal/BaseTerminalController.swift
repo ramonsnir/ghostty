@@ -60,6 +60,13 @@ class BaseTerminalController: NSWindowController,
     /// True when any surface in this controller currently has an active bell.
     @Published private(set) var bell: Bool = false
 
+    /// (ramon fork / Bell Attention) True when any surface in this controller is in the
+    /// sticky "attention needed" state (the loud Tier-2 signal the Agent Manager promotes
+    /// a notable bell into via set_attention). Aggregated across the tab exactly like
+    /// `bell`; drives the loud title marker (and, in AppDelegate, the dock) regardless of
+    /// the `agent-manager-bell-filter` tone-down.
+    @Published private(set) var attentionNeeded: Bool = false
+
     /// (ramon fork) True when the tree is zoomed AND some leaf OUTSIDE the zoomed
     /// subtree has an active bell. Drives the hidden-split bell badge in TerminalView,
     /// since hidden splits aren't in the SwiftUI hierarchy and can't show their own
@@ -100,6 +107,10 @@ class BaseTerminalController: NSWindowController,
 
     /// Cancellable for aggregating bell state across all surfaces in this controller.
     private var bellStateCancellable: AnyCancellable?
+
+    /// (ramon fork / Bell Attention) Cancellable aggregating `attentionNeeded` across
+    /// all surfaces in this controller (mirrors `bellStateCancellable`).
+    private var attentionStateCancellable: AnyCancellable?
 
     /// (ramon fork) Cancellable deriving `zoomedHiddenBell` from the tree + per-surface bells.
     private var zoomedHiddenBellCancellable: AnyCancellable?
@@ -158,6 +169,9 @@ class BaseTerminalController: NSWindowController,
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
+
+        // (ramon fork / Bell Attention) Aggregate the per-surface attention state.
+        setupAttentionNotificationPublisher()
 
         // (ramon fork) Derive the hidden-split bell badge state. Must run AFTER the
         // `surfaceTree` assignment above so the combineLatest produces an initial
@@ -1185,8 +1199,8 @@ class BaseTerminalController: NSWindowController,
             // change, and replays the current aggregate on resubscribe so an active
             // 🔔 persists across focus changes.
             titleSurface.$title
-                .combineLatest($bell)
-                .map { [weak self] in self?.computeTitle(title: $0, bell: $1) ?? "" }
+                .combineLatest($bell, $attentionNeeded)
+                .map { [weak self] in self?.computeTitle(title: $0, bell: $1, attention: $2) ?? "" }
                 .sink { [weak self] in self?.titleDidChange(to: $0) }
                 .store(in: &focusedSurfaceCancellables)
         } else {
@@ -1195,9 +1209,14 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
-    private func computeTitle(title: String, bell: Bool) -> String {
+    private func computeTitle(title: String, bell: Bool, attention: Bool = false) -> String {
         var result = title
-        if bell && ghostty.config.bellFeatures.contains(.title) {
+        // (ramon fork / Bell Attention) The loud title 🔔 fires on the promoted
+        // attention state ALWAYS, and on a raw bell ONLY when the tone-down filter is
+        // off (so flag-off is byte-identical; flag-on drops the raw-bell 🔔 and leaves
+        // the marker to a real promotion). The raw-bell case keeps the bell-features gate.
+        let rawBellTitle = bell && !derivedConfig.bellFilter && ghostty.config.bellFeatures.contains(.title)
+        if attention || rawBellTitle {
             result = "🔔 \(result)"
         }
 
@@ -1215,7 +1234,7 @@ class BaseTerminalController: NSWindowController,
         if let titleOverride {
             // Use the window-level aggregate bell so the override title's 🔔 reflects
             // ANY surface in the tab ringing (matching the computed-title listener).
-            window.title = computeTitle(title: titleOverride, bell: self.bell)
+            window.title = computeTitle(title: titleOverride, bell: self.bell, attention: self.attentionNeeded)
             return
         }
 
@@ -1852,12 +1871,17 @@ class BaseTerminalController: NSWindowController,
         let windowStepResize: Bool
         let focusFollowsMouse: Bool
         let splitPreserveZoom: Ghostty.Config.SplitPreserveZoom
+        // (ramon fork / Bell Attention) When true, a raw bell's LOUD effects (title 🔔,
+        // dock, push, dashboard unhide/sort) are toned down; only the promoted
+        // attention state drives them. Default false ⇒ behavior identical to upstream.
+        let bellFilter: Bool
 
         init() {
             self.macosTitlebarProxyIcon = .visible
             self.windowStepResize = false
             self.focusFollowsMouse = false
             self.splitPreserveZoom = .init()
+            self.bellFilter = false
         }
 
         init(_ config: Ghostty.Config) {
@@ -1865,6 +1889,7 @@ class BaseTerminalController: NSWindowController,
             self.windowStepResize = config.windowStepResize
             self.focusFollowsMouse = config.focusFollowsMouse
             self.splitPreserveZoom = config.splitPreserveZoom
+            self.bellFilter = config.agentManagerBellFilter
         }
     }
 }
@@ -1930,6 +1955,22 @@ extension BaseTerminalController {
                     object: self,
                     userInfo: [Notification.Name.terminalWindowHasBellKey: hasBell]
                 )
+            }
+    }
+
+    /// (ramon fork / Bell Attention) Maintain the window-level `attentionNeeded`
+    /// aggregate (any surface in the tab needing attention) — mirrors
+    /// `setupBellNotificationPublisher`. Drives the loud title marker; the dock reads it
+    /// off `$attentionNeeded` directly. No app-wide notification needed (no dock-badge
+    /// equivalent keyed on a notification yet).
+    private func setupAttentionNotificationPublisher() {
+        attentionStateCancellable = surfaceValuesPublisher(
+            valueKeyPath: \.attentionNeeded, publisherKeyPath: \.$attentionNeeded)
+            .map { $0.values.contains(true) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] hasAttention in
+                self?.attentionNeeded = hasAttention
             }
     }
 
