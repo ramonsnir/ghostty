@@ -586,11 +586,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   summarizer** on top of the Agent Dashboard: each agent tile shows a live, one-line
   semantic status (needs-you-FIRST, then task+phase — e.g. "Waiting: which DB to migrate?",
   "Implementing auth fix — writing tests") instead of just the raw working/waiting chip.
-  **Phases 1 + 2 are BUILT** (`.claude/plans/agent-manager-design.md`, local): Phase 1 =
-  the summarizer (below); **Phase 2 = an Opus manager that SUGGESTS replies** (suggest-only,
-  see its own bullet below). Phase 3 = opt-in auto-apply, Phase 4 = a cross-session
-  coordinator — NOT built yet. **See `AGENT-MANAGER.md` for user-facing config/usage.** The
-  load-bearing facts for an agent touching this code:
+  It is **read-only** — it annotates the tile and NEVER types into a session. **See
+  `AGENT-MANAGER.md` for user-facing config/usage.** The load-bearing facts for an agent
+  touching this code:
   - **A warm TypeScript Agent SDK sidecar is the brain; the MCP server is its hands.**
     `claude -p` was rejected (cold-boots the CLI per call). Instead a persistent TS program
     (`macos/agent-manager/`, `@anthropic-ai/claude-agent-sdk`, NOT in `Ghostty.xcodeproj`,
@@ -603,7 +601,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `isAgentSurface`/`shouldSummarize`/`fingerprint`/debounce/skip-idle/`ConcurrencyBudget`),
     `read_surface`s the viewport, composes a prompt (baked base `src/prompts.ts` + the
     `~/.config/ghostty-ramon/agent-manager/summarizer.md` override, mtime-cached), makes ONE
-    Haiku call (`src/model.ts`: `tools:[]`, `maxTurns:1`, NO `mcpServers` — the summary call
+    Haiku call (`src/model.ts`: `tools:[]`, `maxTurns:3`, NO `mcpServers` — the summary call
     touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
     dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
     Node's built-in `node --test`.
@@ -630,9 +628,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     unaffected. The sidecar is spawned/supervised via `Process` (lazy, bounded restart
     backoff — both pure + tested), torn down on quit, run with `GHOSTTY_AGENT_MANAGER=1` so
     its own model activity can't recurse through the agent-state hook.
-  - **Phase 0/1 = read-only; ZERO autonomous send, ZERO host/Zig protocol change.** The only
-    Zig change is two additive default-off config keys. Safety stays at the MCP boundary
-    (later auto-apply will be a separate server-gated tool, not trusted to the sidecar).
+  - **Read-only; ZERO autonomous send, ZERO host/Zig protocol change.** The only Zig change
+    is two additive default-off config keys.
     Wiring: core — `src/config/Config.zig` (`agent-manager`/`agent-manager-node-path` + parse
     test); macOS — `macos/Sources/Features/AgentManager/AgentManagerController.swift`,
     `macos/Sources/Features/MCP/MCPAnnotation.swift` (`set_surface_annotation` tool + pure
@@ -650,104 +647,30 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     **GUI relaunch only** to enable (no host restart); the sidecar must be built
     (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
     the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
-  - **PHASE 2 — manager SUGGEST-ONLY (built; refined by Phase 2.1 below).** On a `waiting` tile
-    the manager proposes a reply the user can **Approve / Edit / Dismiss**; as of Phase 2.1
-    Approve TYPES the (possibly edited) reply into the agent AND submits it in one user-initiated
-    tap (was: type-without-submit). **ZERO autonomous send** — the sidecar/manager has
-    no send tools; the ONLY send path is Swift, gated behind an explicit Approve tap. Pieces:
-    - **Manager pass (`macos/agent-manager/src/manager.ts`, `MANAGER_MODEL=claude-opus-4-8`):**
-      a SECOND sweep pass alongside the summarizer, gated `waiting`-only with its own debounce
-      + unchanged-skip (`shouldSuggest`), fed goals (`userNotes` + recent prompts) + screen,
-      writing a `suggestion` via the merge tool. Like the summarizer it runs `tools:[]` / no
-      `mcpServers` (text-only). **SDK-persistence caveat:** the chosen "persistent per-session
-      conversation" is NOT cleanly supported by `@anthropic-ai/claude-agent-sdk` v0.3.185, so
-      it uses the documented **single-shot-with-accumulated-context** fallback (goals + prior
-      suggestion + screen fed each call) — revisit if the SDK gains clean session resume.
-    - **Annotation channel is now a MERGE:** `set_surface_annotation` takes summary-OR-suggestion
-      and MERGES partial updates into the stored per-surface `AgentAnnotation`, so the summarizer
-      (`summary`) and manager (`suggestion`) update INDEPENDENTLY without clobbering
-      (`AgentAnnotationPayload.fromArguments` is the partial parser; the model merges).
-    - **Per-session `userNotes`** (distinct from `notes`=summary): a persisted-by-`sessionID`
-      store mirroring `AgentStateStore` (rehydrated on rebuild), a tile `TextField`, and a
-      `list_surfaces.userNotes` enrichment fed to the manager as explicit goals (omitted-when-nil
-      — absent until you type a note).
-    - **Safety helper (UNUSED in Phase 2):** `macos/Sources/Features/MCP/MCPSafety.swift` —
-      a pure destructive-reply denylist (`isAffirmativeReply`, dangerous-screen patterns) +
-      tests, staged for the Phase-3 auto-apply gate; no Phase-2 path calls it.
-    - Wiring: sidecar — `manager.ts` (+`prompts.ts` `MANAGER_BASE_PROMPT` + `manager.md`
-      override + `model.ts` `suggest()` + `index.ts` second pass); macOS — `MCPAnnotation.swift`
-      (merge), `AgentStateBridge.swift` (`AgentAnnotation`), `AgentDashboardController.swift`
-      (`userNotes` store + merge + observer), `AgentPreviewTile.swift` (suggestion render +
-      Approve/Edit/Dismiss + notes field), `MCPInput.swift` (the type-without-submit helper
-      Approve calls), `MCPLayout.swift`/`MCPTools.swift` (`userNotes`), `MCPSafety.swift`
-      (+iOS exclusion). Tests: `MCPSafetyTests.swift`, the merge/`userNotes` cases in
-      `MCPAnnotationTests`/`MCPServerTests`/`AgentDashboardTests`, and the sidecar
-      `manager.test.ts` (+ updated `index`/`model`/`prompt` suites). **GUI relaunch + a rebuilt
-      sidecar `dist` to enable; no host/Zig change.**
-  - **PHASE 2.1 — polish (built; still SUGGEST-ONLY, no autonomous send).** Three changes:
-    - **Approve = TYPE + SUBMIT (one tap).** Approve now types the (possibly edited) reply AND
-      sends a real Return so it submits in a single user-initiated tap — no second keystroke.
-      Still a human tap, not autonomy: `AgentDashboardController.approveSuggestion` calls
-      `MCPInput.sendText(submit: true)` (was `false`), reusing the real-key path (Return =
-      `KeySpec(keycode: 36)`). `MCPInput.singleLine` STILL collapses INTERIOR newlines so a
-      multi-line edit produces exactly ONE trailing Return, not N partial submits — only the
-      final trailing Return flipped from suppressed to appended.
-    - **Dismiss suppresses re-suggestion until a meaningful change.** "Meaningful" = the
-      summarizer's `fingerprint` (agentState|lastPrompt|lastTool + viewport tail) changes.
-      Swift: `AgentDashboardModel` tracks per-surface `suggestionDismissed` (set on Dismiss,
-      cleared when a merge carries a NEW `suggestion`), plumbed `suggestionDismissed: Bool`
-      identically to `userNotes` → `HookSnapshotEntry` → `MCPLayout.SurfaceRow` →
-      `list_surfaces` JSON (emitted UNCONDITIONALLY, a plain bool) → TS `Surface.suggestionDismissed?`.
-      Sidecar: per-session `suppressedFingerprint` on the loop deps (like the summarizer's
-      `lastBySession`); the PURE `shouldSuggest` skips while
-      `suppressedFingerprint != null && currentFp == suppressedFingerprint`, and a changed
-      fingerprint clears the suppression + re-suggests. Both stores reset independently on a
-      fresh suggestion (Swift dashboard flag + TS loop memory) so UI and loop agree.
-    - **Suggestion confidence + dim-the-weak.** Manager output JSON gains `confidence` (0..1 =
-      the manager's honest self-rating of goal-advancement; `MANAGER_BASE_PROMPT` defines the
-      ~0.8–1.0 / ~0.0–0.4 / mid scale). TS `parseSuggestion` parses + clamps to [0,1],
-      defaulting ~0.5 when absent/invalid; written via `set_surface_annotation { suggestion,
-      confidence }` (Swift `AgentAnnotation.confidence` already shipped in Phase 0). The tile
-      renders EVERY suggestion but visually de-emphasizes ones below
-      `AgentPreviewTile.CONF_DIM_THRESHOLD` (0.5) via the pure, tested
-      `suggestionStyle(confidence:)` (reduced opacity + secondary color) and shows a small inline
-      `%` indicator. Tests: sidecar `manager.test.ts` (`shouldSuggest` dismissed cases +
-      `parseSuggestion` confidence clamp), `mcp.test.ts` (`setAnnotation` confidence forwarding),
-      `index.test.ts` (suppression end-to-end + confidence carry); Swift `AgentDashboardTests`
-      (`suggestionStyle` + dismissed-flag lifecycle), `MCPServerTests` (`suggestionDismissed`
-      JSON). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
-  - **FIX — manager was never suggesting in a busy fleet (own budget + maxTurns).** Symptom:
-    summaries appeared but ZERO suggestions; the sidecar log showed only summarizer lines.
-    Two causes: (1) the manager pass SHARED the summarizer's single `ConcurrencyBudget` and
-    ran SECOND in `runSweep`, so with ≥`cfg.maxConcurrent` due summaries every sweep (≈12
-    agents vs cap 10) the summarizer grabbed all slots and the manager's `tryAcquire()` always
-    failed → it never reached its model call. (2) `maxTurns:1` frequently returned
-    `subtype=error_max_turns` (the SDK doesn't always settle a clean result in one turn even
-    with `tools:[]`), so summarize/suggest calls errored + retried, keeping the shared budget
-    saturated. **Fix (sidecar-only):** the manager now has its OWN `ConcurrencyBudget`
-    (`ManagerConfig.maxConcurrent`, default 4) — `runSweep` pass 2 + `manageOne` use
-    `deps.managerBudget`, never `deps.budget` — so a busy summarizer can't starve it; and
-    `model.ts` `maxTurns` 1→3 (no tool loop, so still one text answer — just headroom to reach
-    a success result). Regression test: `index.test.ts` "manager is NOT starved when the
-    summarizer budget is exhausted". Deploy is a sidecar rebuild + restart only (the GUI's
-    `AgentManagerController` respawns it from the repo `dist` — no app relaunch).
-  - **QUALITY — directive-or-ABSTAIN (stop the filler).** The manager used to pad with
-    pleasantries ("OK, thanks", "yes, I'll do that") because `MANAGER_BASE_PROMPT` told it to
-    "propose a safe, conservative reply" even when the goals didn't determine one. Now the
-    prompt says: PROPOSE a reply ONLY if it (a) answers a blocked question, (b) makes a needed
-    decision, or (c) gives concrete next direction — AND is GROUNDED in the goals/screen;
-    OTHERWISE **ABSTAIN** by returning an EMPTY suggestion (`{"suggestion":"","confidence":0}`),
-    which `parseSuggestion` maps to null → the loop writes NOTHING (silent; the tile shows just
-    the summary). Acknowledgments are explicitly banned. **Code backstop:**
-    `ManagerConfig.suppressBelow` (default 0.35) — `manageOne` treats a parsed suggestion rated
-    below the floor as an abstain (write nothing, debounce), so padding the model rates low is
-    suppressed even if it doesn't emit the empty form; the tile's `CONF_DIM_THRESHOLD` (0.5)
-    then dims the 0.35-0.5 band that IS shown. Net: substantive/directive suggestions or
-    silence — no filler. Tunable live via the `manager.md` override. Tests: `index.test.ts`
-    (low-confidence SUPPRESSED + empty-suggestion ABSTAIN write nothing). Verified live (a
-    busy fleet now yields directive suggestions + silent abstentions, no "OK thanks"). NOTE:
-    `error_max_turns` still occurs intermittently even at `maxTurns:3` (summarizer path) — it
-    is caught + skipped, harmless, and a separate lower-priority SDK quirk.
+  - **Account routing (optional) — bill the summarizer to a SEPARATE account.** By default the
+    summarizer inherits the ambient Claude Code auth (works with NO multi-account setup); set a
+    spec in `~/.config/ghostty-ramon/agent-manager/account` (sibling of `summarizer.md`) OR the
+    `GHOSTTY_AGENT_MANAGER_ACCOUNT` env (env wins) to route its Haiku calls to a specific
+    account. The spec is a bare account NAME → `~/.claude-accounts/<name>` (the `claude-accounts`
+    convention) or an absolute/`~` PATH used directly as `CLAUDE_CONFIG_DIR`; a spec that doesn't
+    resolve to a real dir is ignored (warn + inherit, so a stale name never breaks anyone). The
+    resolver (`src/account.ts`: `readAccountSpec`/`resolveAccountDir`, PURE over an injected fs
+    seam + `account.test.ts`) feeds `LoopDeps.summarizerConfigDir`, which `summarizeOne` threads
+    into the model call; `model.ts summarize()` then passes `env:{...process.env,
+    CLAUDE_CONFIG_DIR}` (spread so HOME/PATH/OAuth survive — only the config dir is re-pointed).
+    SIDECAR-only: edit the file + restart the sidecar (the GUI respawns it; no app relaunch).
+  - **DORMANT Swift suggestion UI (unused; slated for GUI-side removal).** The sidecar's
+    suggest-only "manager" pass was REMOVED (it drained quota and was low-value), so NOTHING now
+    writes a `suggestion` annotation. The Agent Dashboard's Swift side still CARRIES the suggestion
+    UI — `AgentPreviewTile` Approve/Edit/Dismiss + the notes `TextField`,
+    `AgentDashboardController.approveSuggestion`/`userNotes`, the `AgentAnnotation.suggestion`/
+    `confidence`/`suggestionDismissed` + `Surface.userNotes` fields, `MCPInput`'s submit helper,
+    and `MCPSafety.swift` — but it never renders (no suggestion ever arrives). Treat it as dead
+    pending a GUI cleanup. The `set_surface_annotation` MERGE tool still ACCEPTS `suggestion`/
+    `confidence` (a no-op contract now; the merge is also how the Agent Queue writes
+    `queueKey`/`queueName`/`queueUrl`, so the tool itself stays). No Zig/host change was involved
+    in the removal — it was entirely the TS sidecar (`manager.ts` + `model.ts suggest()` +
+    `MANAGER_BASE_PROMPT` + the manager override loader + the second sweep pass, all deleted).
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default) — turns the Agent
   Dashboard/Manager into an active **supervisor + driver**: start a **queue** from a
@@ -765,11 +688,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     PROVIDER as argv elements (`{key}`) and the AGENT as **`GHOSTTY_ITEM_*` env vars** —
     NEVER string-spliced into a shell line (the one injection seam, closed). Completion is
     **status-only** (idleness alone never completes — no false positives).
-  - **Engine = a deterministic THIRD pass in the existing TS sidecar** (`macos/agent-manager/`,
+  - **Engine = a deterministic, independent loop in the existing TS sidecar** (`macos/agent-manager/`,
     `src/queue/{types,provider,grid,templates,store,supervisor,runner,wiring,commands}.ts`) —
-    NO LLM in the control path (summarizer/manager passes are orthogonal, still run on the
-    tiles). It has its OWN `ConcurrencyBudget` (the manager-starvation lesson). Pure core
-    (selectCandidates/nextState/grid/reconcile/applyCommand) is `node --test`-tested.
+    NO LLM in the control path (the summarizer pass is orthogonal, still runs on the tiles on
+    its own timer). It has its OWN `ConcurrencyBudget` (the starvation lesson — a slow LLM pass
+    must never deny it a slot). Pure core (selectCandidates/nextState/grid/reconcile/applyCommand)
+    is `node --test`-tested.
   - **HARD DEPS, self-disables silently otherwise (§2):** pty-host (detection `agentKind` +
     STABLE session ids for persistence — `sessionID==0` without it) AND the Claude
     agent-state hooks (the close-gate keys off hook-driven `agentState==idle` held

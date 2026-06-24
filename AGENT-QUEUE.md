@@ -26,7 +26,7 @@ item reports a terminal state **and** its agent has been idle a few seconds, typ
 template's exit keys and **force-closes** the split. The whole thing is restart-proof:
 run state is persisted by the sidecar and re-adopted (by stable host session id) after a
 sidecar **or** GUI restart, so it never double-dispatches an item or orphans a live
-agent. Everything else — bells, the dashboard, per-tile summaries/suggestions, web-push —
+agent. Everything else — bells, the dashboard, per-tile summaries, web-push —
 keeps working; queue splits are ordinary agent tiles, now **grouped by their queue**.
 
 ## Requirements
@@ -225,15 +225,15 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 ## Cost & privacy
 
 The queue engine itself is plain deterministic code — **no model calls**. The per-tile
-summaries/suggestions on queue tiles are the normal Agent Manager passes (Haiku/Opus via
-your Claude Code auth; no API key). Your provider commands run locally with a sanitized env
+summaries on queue tiles are the normal Agent Manager summarizer (Haiku via your Claude
+Code auth; no API key). Your provider commands run locally with a sanitized env
 (the `mcp-token` and other `GHOSTTY_*` credentials are stripped before a provider script
 sees them).
 
 ## Status / roadmap
 
-v1 = start / track / close, suggest-only on the tiles (no autonomous replies — that stays
-gated behind your Approve tap). Not yet: priority/dependency ordering beyond the source
-`list`, cross-machine coordination, Codex auto-close. Design notes + the review ledger:
+v1 = start / track / close (no autonomous replies). Not yet: priority/dependency ordering
+beyond the source `list`, cross-machine coordination, Codex auto-close. Design notes + the
+review ledger:
 `scratchpad/agent-queue-design.md` (local).
 ```

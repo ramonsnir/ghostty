@@ -7,9 +7,7 @@ import assert from "node:assert/strict";
 import {
   composeSystemPrompt,
   makeOverrideLoader,
-  makeManagerOverrideLoader,
   summarizerOverridePath,
-  managerOverridePath,
   type OverrideFs,
 } from "./prompt.js";
 
@@ -104,29 +102,4 @@ test("composeSystemPrompt: present override appended with delimiter", () => {
   assert.match(out, /^BASE/);
   assert.match(out, /USER NOTES/);
   assert.match(out, /Prefer verbs\.$/); // trimmed
-});
-
-// --- manager override loader (Phase 2) --------------------------------------
-
-test("managerOverridePath: builds the expected manager.md path", () => {
-  assert.equal(
-    managerOverridePath("/home/x"),
-    "/home/x/.config/ghostty-ramon/agent-manager/manager.md",
-  );
-});
-
-test("makeManagerOverrideLoader: reads manager.md (not summarizer.md)", () => {
-  const MGR = managerOverridePath(HOME);
-  const fs: OverrideFs = {
-    statMtimeMs(path) {
-      assert.equal(path, MGR);   // must hit manager.md, not summarizer.md
-      return 100;
-    },
-    readText(path) {
-      assert.equal(path, MGR);
-      return "Manager note.";
-    },
-  };
-  const loader = makeManagerOverrideLoader(HOME, fs);
-  assert.equal(loader.load(), "Manager note.");
 });

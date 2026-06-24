@@ -12,7 +12,6 @@ import assert from "node:assert/strict";
 import { runSweep, runQueueSweepSafe, type LoopDeps } from "../index.js";
 import type { McpClient, Surface, SurfaceScreen, Annotation } from "../mcp.js";
 import { DEFAULT_CONFIG, ConcurrencyBudget } from "../summarizer.js";
-import { DEFAULT_MANAGER_CONFIG, MANAGER_MODEL } from "../manager.js";
 import { makeOverrideLoader, type OverrideFs } from "../prompt.js";
 
 import {
@@ -243,15 +242,7 @@ function makeLoopDeps(client: McpClient): LoopDeps {
     now: () => 1_000_000,
     summarize: okSummary,
     lastBySession: new Map(),
-    managerOverrides: makeOverrideLoader("/home/test", noOverrideFs),
-    managerCfg: { ...DEFAULT_MANAGER_CONFIG },
-    managerModel: MANAGER_MODEL,
-    suggest: async () => {
-      throw new Error("unexpected manager call");
-    },
-    lastSuggestionBySession: new Map(),
-    managerBudget: new ConcurrencyBudget(DEFAULT_MANAGER_CONFIG.maxConcurrent),
-    // queue intentionally OMITTED → pass 3 is a no-op.
+    // queue intentionally OMITTED → the queue pass is a no-op.
   };
 }
 
@@ -353,71 +344,59 @@ test("runQueueSweep: first sweep is dispatch-suppressed; second sweep dispatches
 });
 
 // ---------------------------------------------------------------------------
-// (3) The supervisor is NOT starved when the summarizer/manager budgets are
-//     exhausted (mirrors the existing manager-not-starved test): pass 3 runs with
-//     its OWN budget after passes 1+2 settle, so a busy summarizer/manager fleet
-//     never denies it a dispatch slot.
+// (3) The supervisor is NOT starved when the summarizer budget is exhausted:
+//     the queue runs on its OWN timer with its OWN budget, so a busy summarizer
+//     fleet never denies it a dispatch slot.
 // ---------------------------------------------------------------------------
 
-test("runSweep: the supervisor is NOT starved when summarizer + manager budgets are exhausted", async () => {
-  // A busy fleet of working/waiting agents would exhaust the summarizer (cap 1) and
-  // manager (cap 1) budgets; the queue pass must STILL dispatch its candidate.
+test("runSweep: the supervisor is NOT starved when the summarizer budget is exhausted", async () => {
+  // A busy fleet of working agents would exhaust the summarizer (cap 1) budget; the
+  // queue must STILL dispatch its candidate.
   const queueRun = makeQueueRun(tmpl(), memStore());
   const fake = makeQueueFake({
     surfaces: [
       surface({ id: "a1", agentState: "working" }),
-      surface({ id: "w1", agentState: "waiting", userNotes: "ship" }),
+      surface({ id: "a2", agentState: "working" }),
     ],
     listJson: '[{"id":"Q-1","title":"queued work"}]',
     spawns: [{ id: "spawned-q1", sessionId: 777 }],
   });
   let now = 2_000_000;
   const deps = makeLoopDeps(fake.client);
-  // Tiny shared budgets so passes 1+2 fully consume them.
+  // Tiny summarizer budget so the pass fully consumes it.
   deps.cfg = { ...DEFAULT_CONFIG, maxConcurrent: 1 };
   deps.budget = new ConcurrencyBudget(1);
-  deps.managerBudget = new ConcurrencyBudget(1);
-  // Count pass-1/pass-2 model calls so we can PROVE the busy fleet was actually
-  // processed (not silently skipped) at the time the queue still dispatched — without
-  // that, a green result wouldn't distinguish "queue not starved" from "passes 1+2
-  // never ran". (Budgets are released by the time runSweep returns, so we assert the
-  // work happened + the structural guarantee below, not a mid-sweep budget snapshot.)
+  // Count summarizer model calls so we can PROVE the busy fleet was actually processed
+  // (not silently skipped) at the time the queue still dispatched — without that, a
+  // green result wouldn't distinguish "queue not starved" from "the pass never ran".
   let summarizeCalls = 0;
-  let suggestCalls = 0;
   deps.summarize = async () => {
     summarizeCalls += 1;
     return '{"summary":"ok"}';
   };
-  deps.suggest = async () => {
-    suggestCalls += 1;
-    return '{"suggestion":"go","confidence":0.9}';
-  };
   deps.now = () => now;
   deps.queue = makeQueueDeps(fake, [queueRun], () => now);
 
-  // The structural guarantee that makes starvation IMPOSSIBLE: the queue pass owns a
-  // budget object DISTINCT from both the summarizer and the manager budgets, so passes
-  // 1+2 consuming theirs can never deny the queue a slot.
+  // The structural guarantee that makes starvation IMPOSSIBLE: the queue owns a budget
+  // object DISTINCT from the summarizer's, so the summarizer consuming its budget can
+  // never deny the queue a slot.
   assert.notEqual(deps.queue!.budget, deps.budget, "queue budget != summarizer budget");
-  assert.notEqual(deps.queue!.budget, deps.managerBudget, "queue budget != manager budget");
 
   // The queue runs on its OWN independent timer (`runQueueSweepSafe`), DECOUPLED from
-  // the slow LLM summarizer/manager passes (`runSweep`) — so it can never be blocked or
-  // starved by them, even when their budgets are exhausted or their model calls are slow.
-  // Drive the LLM passes once (consuming their budgets), then the queue's own loop twice
-  // (arm + dispatch).
-  await runSweep(deps); // summarizer + manager (no queue inside runSweep anymore)
+  // the slow LLM summarizer pass (`runSweep`) — so it can never be blocked or starved
+  // by it, even when its budget is exhausted or its model calls are slow. Drive the
+  // summarizer once (consuming its budget), then the queue's own loop twice (arm + dispatch).
+  await runSweep(deps); // summarizer (no queue inside runSweep)
   await runQueueSweepSafe(deps); // queue's own loop: first call arms (dispatch-suppressed)
   assert.equal(fake.calls.spawn.length, 0, "queue suppressed on its first sweep");
   now += 5000;
-  await runQueueSweepSafe(deps); // queue dispatches, independent of the LLM passes
+  await runQueueSweepSafe(deps); // queue dispatches, independent of the summarizer
 
-  assert.equal(fake.calls.spawn.length, 1, "queue dispatched independently of the LLM passes");
+  assert.equal(fake.calls.spawn.length, 1, "queue dispatched independently of the summarizer");
   assert.equal(deps.queue!.budget.active, 0, "queue budget released");
-  // Passes 1+2 genuinely ran against the busy fleet (so the queue dispatched ALONGSIDE
-  // real summarizer/manager work, not because the fleet was idle).
+  // The summarizer genuinely ran against the busy fleet (so the queue dispatched
+  // ALONGSIDE real summarizer work, not because the fleet was idle).
   assert.ok(summarizeCalls >= 1, "summarizer ran against the busy fleet");
-  assert.ok(suggestCalls >= 1, "manager ran against the waiting agent");
 });
 
 // ---------------------------------------------------------------------------

@@ -1,11 +1,16 @@
-// (ramon fork / Agent Manager) Phase-1 single-shot model call. Wraps the Agent
-// SDK `query()` for ONE non-agentic Haiku summary: NO mcpServers (the summary
-// touches no tools — it is handed the screen text and returns prose), tools:[]
-// (disables ALL built-ins — the load-bearing safety knob), maxTurns:1 (true
-// single shot), model "claude-haiku-4-5". The final text is read off the RESULT
-// message's `.result` field (narrow subtype:"success" first). Auth/billing ride
-// the Claude Code CLI's own OAuth — we do NOT pass options.env (omitting it lets
-// the spawned `claude` inherit process.env incl. HOME/PATH + GHOSTTY_AGENT_MANAGER).
+// (ramon fork / Agent Manager) Single-shot model call. Wraps the Agent SDK
+// `query()` for ONE non-agentic Haiku summary: NO mcpServers (the summary touches
+// no tools — it is handed the screen text and returns prose), tools:[] (disables
+// ALL built-ins — the load-bearing safety knob), maxTurns:3 (headroom — see below),
+// model "claude-haiku-4-5". The final text is read off the RESULT message's
+// `.result` field (narrow subtype:"success" first).
+//
+// Auth/billing ride the Claude Code CLI's own OAuth. By default we do NOT pass
+// options.env, so the spawned `claude` inherits process.env (OAuth creds + HOME/
+// PATH + GHOSTTY_AGENT_MANAGER) and bills the ambient account. When `req.configDir`
+// is set (see account.ts), we pass env = {...process.env, CLAUDE_CONFIG_DIR} —
+// spreading process.env so HOME/PATH/OAuth are PRESERVED and only the config dir is
+// overridden — which routes auth/billing to that specific account.
 //
 // Returns the RAW assistant text for summarizer.parseSummary to validate. THROWS
 // on a spawn-time failure or an error-subtype result so the loop catches + logs
@@ -21,6 +26,9 @@ export interface SummarizeRequest {
   user: string;
   /** Optional model override; defaults to SUMMARIZER_MODEL. */
   model?: string;
+  /** Optional CLAUDE_CONFIG_DIR for the spawned `claude` — routes auth/billing to
+   *  a specific account (see account.ts). OMITTED ⇒ inherit the ambient auth. */
+  configDir?: string;
 }
 
 /** The query() function signature we depend on — injectable for tests. */
@@ -47,9 +55,13 @@ export async function summarize(
       // the higher ceiling just lets the query reach a success result instead of erroring.
       model: req.model ?? SUMMARIZER_MODEL,
       systemPrompt: req.system,
-      // NOTE: options.env is intentionally OMITTED so the spawned claude inherits
-      // process.env (OAuth creds + HOME/PATH + GHOSTTY_AGENT_MANAGER). Setting it
-      // would REPLACE the env and break auth.
+      // env: by default OMITTED so the spawned claude inherits process.env (OAuth
+      // creds + HOME/PATH + GHOSTTY_AGENT_MANAGER). When a configDir is set we pass
+      // {...process.env, CLAUDE_CONFIG_DIR} — spreading so we PRESERVE the rest of
+      // the env (HOME/PATH/OAuth) and only re-point the config dir to the account.
+      ...(req.configDir
+        ? { env: { ...process.env, CLAUDE_CONFIG_DIR: req.configDir } }
+        : {}),
     },
   });
 
@@ -69,31 +81,4 @@ export async function summarize(
     }
   }
   throw new Error("summarize: query produced no result message");
-}
-
-// (ramon fork / Agent Manager Phase 2) The manager's single-shot call. IDENTICAL
-// shape to `summarize` (no mcpServers, tools:[], maxTurns:1, read `.result` off the
-// success result) — the manager is just as non-agentic and SUGGEST-ONLY: it emits
-// text and structurally CANNOT send (no tools to call). The only difference is the
-// default model (Opus). Reuses the SAME injectable `QueryFn` seam.
-
-export interface SuggestRequest {
-  system: string;
-  user: string;
-  /** Optional model override; the caller passes the manager model. */
-  model: string;
-}
-
-/**
- * Run a single-shot suggestion call and return the raw assistant text. THROWS on
- * an error-subtype result or a spawn-time failure. `queryFn` defaults to the real
- * SDK `query` but is injectable so the manager loop can be tested without spawning.
- */
-export async function suggest(
-  req: SuggestRequest,
-  queryFn: QueryFn = query,
-): Promise<string> {
-  // Delegate to summarize: same options, the model passed through. (summarize's
-  // model param defaults only when undefined, so an explicit model wins.)
-  return summarize({ system: req.system, user: req.user, model: req.model }, queryFn);
 }

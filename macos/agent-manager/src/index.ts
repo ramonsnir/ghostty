@@ -1,15 +1,19 @@
-// (ramon fork / Agent Manager) Phase-1 sidecar: the SUMMARIZER. A standalone
-// Node/TS program (built with npm/tsc; NOT in Ghostty.xcodeproj). It is the
-// deterministic TS control loop that REPLACES the Phase-0 one-shot round-trip
-// prover: every POLL_INTERVAL it lists the live surfaces via Ghostty's MCP
-// server, applies PURE debounce/skip-idle/budget gates (summarizer.ts), and for
-// each due agent surface reads the viewport, makes a SINGLE-SHOT Haiku call
-// (model.ts), parses the strict JSON (summarizer.parseSummary), and writes the
-// one-line `summary` (+ optional phase/needsUser) back via set_surface_annotation.
+// (ramon fork / Agent Manager) The sidecar. A standalone Node/TS program (built
+// with npm/tsc; NOT in Ghostty.xcodeproj). It runs two independent, self-paced
+// loops:
+//   1. The SUMMARIZER (this file's `runSweep`): every POLL_INTERVAL it lists the
+//      live surfaces via Ghostty's MCP server, applies PURE debounce/skip-idle/
+//      budget gates (summarizer.ts), and for each due agent surface reads the
+//      viewport, makes a SINGLE-SHOT Haiku call (model.ts), parses the strict JSON
+//      (summarizer.parseSummary), and writes the one-line `summary` (+ optional
+//      phase/needsUser) back via set_surface_annotation. It is READ-ONLY: no
+//      autonomous send (no send_text/send_key/perform_action) — it only describes.
+//   2. The AGENT QUEUE SUPERVISOR (queue/, `runQueueSweepSafe`): a deterministic,
+//      LLM-free dispatch/track/close loop on its OWN timer (decoupled so the slow
+//      summarizer can never starve it). Armed only when a queue is configured.
 //
-// SCOPE — Phase 1 is the SUMMARIZER ONLY: READ-ONLY. No autonomous send (no
-// send_text/send_key/perform_action), no manager/coordinator logic, no
-// suggestions. The summarizer writes ONLY the `summary` (+ phase/needsUser).
+// The summarizer's Haiku calls bill against the ambient Claude Code auth by
+// default; an optional account spec (account.ts) routes them to a separate account.
 //
 // Config (env, set by the Swift AgentManagerController; mirrors macos/mcp-shim):
 //   GHOSTTY_MCP_URL      MCP server URL (default http://127.0.0.1:8765/mcp)
@@ -26,19 +30,14 @@
 // logged + skipped — one bad surface never stops the loop; the loop never exits
 // on its own.
 
+import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 
 import { McpClient, McpError, type Surface } from "./mcp.js";
-import { SUMMARIZER_BASE_PROMPT, MANAGER_BASE_PROMPT } from "./prompts.js";
-import {
-  makeOverrideLoader,
-  makeManagerOverrideLoader,
-  type OverrideLoader,
-} from "./prompt.js";
-import {
-  summarize as defaultSummarize,
-  suggest as defaultSuggest,
-} from "./model.js";
+import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
+import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
+import { summarize as defaultSummarize } from "./model.js";
+import { readAccountSpec, resolveAccountDir } from "./account.js";
 import {
   DEFAULT_CONFIG,
   ConcurrencyBudget,
@@ -52,19 +51,6 @@ import {
   type SummarizerConfig,
   type SurfaceSnapshot,
 } from "./summarizer.js";
-import {
-  DEFAULT_MANAGER_CONFIG,
-  MANAGER_MODEL,
-  assembleGoals,
-  buildContext as buildManagerContext,
-  composePrompt as composeManagerPrompt,
-  fingerprint as managerFingerprint,
-  parseSuggestion,
-  shouldSuggest,
-  type LastSuggestion,
-  type ManagerConfig,
-  type ManagerSnapshot,
-} from "./manager.js";
 import {
   runQueueSweep,
   DEFAULT_PENDING_GRACE_MS,
@@ -85,7 +71,7 @@ import {
   realExec,
 } from "./queue/wiring.js";
 
-/** Poll interval between list_surfaces sweeps (summarizer/manager). */
+/** Poll interval between list_surfaces sweeps (the summarizer pass). */
 const POLL_INTERVAL_MS = 5000;
 
 /** Poll interval for the INDEPENDENT Agent Queue supervisor loop (decoupled from the
@@ -104,14 +90,10 @@ function parsePositiveInt(v: string | undefined, def: number): number {
 }
 
 /** The single-shot model call seam (defaults to the real SDK-backed summarize).
- *  Injectable so the loop can be exercised without spawning the CLI. */
+ *  Injectable so the loop can be exercised without spawning the CLI. `configDir`
+ *  (optional) routes the spawned `claude`'s auth/billing to a specific account. */
 export type SummarizeFn = (
-  req: { system: string; user: string },
-) => Promise<string>;
-
-/** The single-shot manager call seam (defaults to model.ts `suggest`). */
-export type SuggestFn = (
-  req: { system: string; user: string; model: string },
+  req: { system: string; user: string; configDir?: string },
 ) => Promise<string>;
 
 export interface LoopDeps {
@@ -125,27 +107,16 @@ export interface LoopDeps {
   /** Per-session memory of the last successful summary, keyed by surface id.
    *  Held on deps (NOT module scope) so a test can seed/inspect it. */
   lastBySession: Map<string, LastSummary>;
+  /** Optional CLAUDE_CONFIG_DIR for the summarizer's model calls — routes auth/billing
+   *  to a specific claude-accounts account (see account.ts). Omitted ⇒ inherit the
+   *  ambient auth (the default; works with no claude-accounts installed). */
+  summarizerConfigDir?: string;
 
-  // --- Phase 2 manager pass (ramon fork / Agent Manager) ---
-  /** Manager override loader (manager.md), mtime-cached. */
-  managerOverrides: OverrideLoader;
-  /** Manager gate config (waiting-only + its own debounce). */
-  managerCfg: ManagerConfig;
-  /** The manager model id (default MANAGER_MODEL). */
-  managerModel: string;
-  /** The manager call. Injectable; defaults to model.ts `suggest`. */
-  suggest: SuggestFn;
-  /** Per-session memory of the last suggestion attempt, keyed by surface id. */
-  lastSuggestionBySession: Map<string, LastSuggestion>;
-  /** The manager's OWN concurrency budget, separate from `budget` (the summarizer's),
-   *  so a busy summarizer can never starve the manager pass of slots. */
-  managerBudget: ConcurrencyBudget;
-
-  // --- Pass 3: the Agent Queue Supervisor (ramon fork / Agent Queue) ---
-  /** The supervisor pass's seams. OPTIONAL: when omitted (or carrying no runs), pass 3
-   *  is a NO-OP and the summarizer + manager behavior is byte-identical to before — so
-   *  a build with no queue configured behaves exactly as the Phase-1/2 sidecar did. Its
-   *  OWN ConcurrencyBudget lives inside `QueueDeps` (the starvation lesson). */
+  // --- The Agent Queue Supervisor (ramon fork / Agent Queue) ---
+  /** The supervisor pass's seams. OPTIONAL: when omitted (or carrying no runs), the
+   *  queue pass is a NO-OP and the summarizer behavior is byte-identical — so a build
+   *  with no queue configured behaves exactly as the summarizer-only sidecar. Its OWN
+   *  ConcurrencyBudget lives inside `QueueDeps` (the starvation lesson). */
   queue?: QueueDeps;
 }
 
@@ -204,7 +175,7 @@ async function summarizeOne(
       ctx,
     );
 
-    const raw = await deps.summarize({ system, user });
+    const raw = await deps.summarize({ system, user, configDir: deps.summarizerConfigDir });
     const parsed = parseSummary(raw);
     if (!parsed) {
       // Spent a model call but got nothing usable — throttle the retry.
@@ -241,118 +212,11 @@ async function summarizeOne(
 }
 
 /**
- * (ramon fork / Agent Manager Phase 2) Suggest a reply for ONE WAITING surface
- * end-to-end: assemble goals, read the viewport, run the full waiting/debounce/
- * unchanged gate, and (if due) compose, call the Opus manager, parse, and write
- * the `suggestion` annotation via the MERGE channel (summary untouched). SUGGEST-
- * ONLY: this NEVER sends input — it writes an annotation the user approves in the
- * tile. Catches its OWN errors. Assumes a budget slot was acquired by the caller
- * and releases it (finally). Mirrors `summarizeOne` exactly.
- */
-async function manageOne(surface: Surface, deps: LoopDeps): Promise<void> {
-  const prev = deps.lastSuggestionBySession.get(surface.id);
-  const goals = assembleGoals(surface.userNotes, [surface.lastPrompt]);
-
-  // Advance the per-session debounce clock on a SPENT attempt (failed/unparseable),
-  // preserving the prior fingerprint + suggestion (and the armed suppression) so a
-  // genuine change still re-fires once debounce passes — same backoff discipline as
-  // summarizeOne.recordAttempt.
-  const recordAttempt = (): void => {
-    deps.lastSuggestionBySession.set(surface.id, {
-      fingerprint: prev?.fingerprint ?? "",
-      atMs: deps.now(),
-      suggestion: prev?.suggestion ?? "",
-      suppressedFingerprint: prev?.suppressedFingerprint ?? null,
-    });
-  };
-
-  try {
-    const screen = await deps.client.readSurface(surface.id);
-    const snapshot: ManagerSnapshot = { surface, viewport: screen.text };
-
-    const decision = shouldSuggest(snapshot, goals, prev, deps.now(), deps.managerCfg);
-    // (Phase 2.1) Persist a suppression ARM (or CLEAR) the decision asks for, even
-    // when not due — so the dismissed-but-unchanged state is remembered without a
-    // model call and without advancing the debounce clock. `undefined` ⇒ leave as-is.
-    if (!decision.due) {
-      if (decision.suppressedFingerprint !== undefined && prev !== undefined) {
-        deps.lastSuggestionBySession.set(surface.id, {
-          ...prev,
-          suppressedFingerprint: decision.suppressedFingerprint,
-        });
-      } else if (decision.suppressedFingerprint !== undefined) {
-        // No prior record yet (e.g. dismissed before any suggestion); seed one
-        // carrying only the arm so the suppression persists across sweeps.
-        deps.lastSuggestionBySession.set(surface.id, {
-          fingerprint: "",
-          atMs: 0,
-          suggestion: "",
-          suppressedFingerprint: decision.suppressedFingerprint,
-        });
-      }
-      return; // not-waiting / debounce / unchanged / dismissed → skip (no model call)
-    }
-
-    const ctx = buildManagerContext(snapshot, goals, prev?.suggestion, deps.managerCfg);
-    const { system, user } = composeManagerPrompt(
-      MANAGER_BASE_PROMPT,
-      deps.managerOverrides.load(),
-      ctx,
-    );
-
-    const raw = await deps.suggest({ system, user, model: deps.managerModel });
-    const parsed = parseSuggestion(raw);
-    if (!parsed) {
-      // ABSTAIN: empty/unparseable reply (the prompt's empty-suggestion abstain lands
-      // here) — write NOTHING, just throttle the retry.
-      recordAttempt();
-      return;
-    }
-    if (parsed.confidence < deps.managerCfg.suppressBelow) {
-      // The model padded with a low-value reply but rated it low (per the prompt) —
-      // SUPPRESS it (treat as abstain): show nothing rather than filler. Throttle.
-      recordAttempt();
-      log(
-        `surface ${surface.id}: suggestion suppressed (conf ${parsed.confidence.toFixed(2)} < ${deps.managerCfg.suppressBelow})`,
-      );
-      return;
-    }
-
-    // MERGE channel: write the suggestion + its confidence; the summarizer's summary
-    // is kept (the Swift side merges partial annotations).
-    await deps.client.setAnnotation(surface.id, {
-      suggestion: parsed.suggestion,
-      confidence: parsed.confidence,
-    });
-
-    deps.lastSuggestionBySession.set(surface.id, {
-      fingerprint: managerFingerprint(snapshot, goals, deps.managerCfg),
-      atMs: deps.now(),
-      suggestion: parsed.suggestion,
-      // A fresh suggestion CLEARS suppression (mirrors the Swift applyAnnotation
-      // un-dismiss). Both stores reset independently, per the contract.
-      suppressedFingerprint: null,
-    });
-    log(`surface ${surface.id}: suggestion "${parsed.suggestion}" (conf ${parsed.confidence.toFixed(2)})`);
-  } catch (err) {
-    recordAttempt();
-    const what = err instanceof McpError ? "mcp" : "model";
-    errlog(
-      `surface ${surface.id}: manager ${what} error: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  } finally {
-    deps.managerBudget.release();
-  }
-}
-
-/**
- * One sweep: list surfaces, then run TWO passes sharing the loop's MCP client +
- * concurrency budget — (1) the SUMMARIZER (every due agent surface) and (2) the
- * MANAGER (every due WAITING agent surface). Awaits all fired calls so the budget
- * is settled before the next sweep. Catches list_surfaces failure (logs + returns)
- * so a transient MCP outage just skips a sweep. Exported for testing the gating.
+ * One sweep: list surfaces, then run the SUMMARIZER pass over every due agent
+ * surface, sharing the loop's MCP client + concurrency budget. Awaits all fired
+ * calls so the budget is settled before the next sweep. Catches list_surfaces
+ * failure (logs + returns) so a transient MCP outage just skips a sweep. Exported
+ * for testing the gating.
  */
 export async function runSweep(deps: LoopDeps): Promise<void> {
   let surfaces: Surface[];
@@ -365,19 +229,15 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     return;
   }
 
-  // Drop session records for surfaces that no longer exist (closed/exited) — both
-  // the summarizer's and the manager's per-session memory.
+  // Drop session records for surfaces that no longer exist (closed/exited).
   const liveIds = new Set(surfaces.map((s) => s.id));
   for (const id of [...deps.lastBySession.keys()]) {
     if (!liveIds.has(id)) deps.lastBySession.delete(id);
   }
-  for (const id of [...deps.lastSuggestionBySession.keys()]) {
-    if (!liveIds.has(id)) deps.lastSuggestionBySession.delete(id);
-  }
 
   const fired: Array<Promise<void>> = [];
 
-  // Pass 1: SUMMARIZER (unchanged behavior).
+  // SUMMARIZER pass.
   for (const surface of surfaces) {
     // Cheap pre-gate from row fields only (no read_surface yet): skip non-agent
     // + debounced surfaces. The viewport-aware fingerprint/idle decision happens
@@ -397,33 +257,18 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     fired.push(summarizeOne(surface, deps));
   }
 
-  // Pass 2: MANAGER (ramon fork / Phase 2). Only WAITING agents are candidates;
-  // the cheap pre-check skips non-waiting/non-agent/debounced surfaces WITHOUT a
-  // read, so a non-waiting fleet never spends a manager slot. Shares the same
-  // budget — when the summarizer exhausted it, the manager simply waits a sweep.
-  for (const surface of surfaces) {
-    if (surface.exited) continue;
-    if (surface.agentState !== "waiting") continue;
-    const last = deps.lastSuggestionBySession.get(surface.id);
-    if (last && deps.now() - last.atMs < deps.managerCfg.debounceMs) continue;
-    // The manager's OWN budget — NOT the summarizer's — so a busy summarizer
-    // (≥cap due summaries this sweep) can never starve the manager pass.
-    if (!deps.managerBudget.tryAcquire()) break; // manager budget exhausted this sweep
-    fired.push(manageOne(surface, deps));
-  }
-
   await Promise.all(fired);
-  // NOTE: the AGENT QUEUE SUPERVISOR (pass 3) is NOT run here. It is a deterministic,
+  // NOTE: the AGENT QUEUE SUPERVISOR is NOT run here. It is a deterministic,
   // latency-sensitive loop that must NOT be gated behind the (slow, LLM-bound)
-  // summarizer/manager passes above — with many agents, `Promise.all(fired)` can take
-  // tens of seconds, which would starve the queue's dispatch/track/close cadence. So
-  // the queue runs on its OWN independent timer (`runQueueLoop` in main), decoupled
-  // from this sweep entirely. See `runQueueSweep`.
+  // summarizer pass above — with many agents, `Promise.all(fired)` can take tens of
+  // seconds, which would starve the queue's dispatch/track/close cadence. So the
+  // queue runs on its OWN independent timer (`queueTick` in main), decoupled from
+  // this sweep entirely. See `runQueueSweep`.
 }
 
 /** One queue-supervisor sweep, error-isolated (a bad provider/run never stops the loop).
  *  Driven by its OWN timer in `main` so the deterministic queue is never blocked by the
- *  slow summarizer/manager passes in `runSweep`. A NO-OP when no queue is configured. */
+ *  slow summarizer pass in `runSweep`. A NO-OP when no queue is configured. */
 export async function runQueueSweepSafe(deps: LoopDeps): Promise<void> {
   if (deps.queue === undefined) return;
   try {
@@ -438,8 +283,22 @@ async function main(): Promise<void> {
   const token = process.env.GHOSTTY_MCP_TOKEN;
 
   const cfg: SummarizerConfig = { ...DEFAULT_CONFIG };
-  const managerCfg: ManagerConfig = { ...DEFAULT_MANAGER_CONFIG };
   const client = new McpClient({ url, token });
+
+  // Optional summarizer ACCOUNT routing (see account.ts). Default ⇒ inherit the
+  // ambient Claude Code auth (works with no claude-accounts installed). When set,
+  // the summarizer's model calls bill against the configured account's CLAUDE_CONFIG_DIR.
+  const home = homedir();
+  const accountSpec = readAccountSpec(home);
+  const summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
+  if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
+    errlog(
+      `summarizer account "${accountSpec.trim()}" did not resolve to a directory; using default auth`,
+    );
+  } else if (summarizerConfigDir) {
+    log(`summarizer billing routed to CLAUDE_CONFIG_DIR=${summarizerConfigDir}`);
+  }
+
   const deps: LoopDeps = {
     client,
     overrides: makeOverrideLoader(),
@@ -448,19 +307,14 @@ async function main(): Promise<void> {
     now: () => Date.now(),
     summarize: defaultSummarize,
     lastBySession: new Map<string, LastSummary>(),
-    managerOverrides: makeManagerOverrideLoader(),
-    managerCfg,
-    managerModel: MANAGER_MODEL,
-    suggest: defaultSuggest,
-    lastSuggestionBySession: new Map<string, LastSuggestion>(),
-    managerBudget: new ConcurrencyBudget(managerCfg.maxConcurrent),
+    summarizerConfigDir,
   };
 
-  // Pass 3: the AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on AND
-  // at least one valid template loads from the templates dir. The Swift controller sets
+  // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on AND at
+  // least one valid template loads from the templates dir. The Swift controller sets
   // GHOSTTY_AGENT_QUEUE=1 (master enable) + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
-  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys; absent ⇒ pass 3 stays a
-  // no-op and the summarizer + manager behavior is byte-identical.
+  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys; absent ⇒ the queue stays
+  // a no-op and the summarizer behavior is byte-identical.
   if (process.env.GHOSTTY_AGENT_QUEUE === "1") {
     const templatesDir = process.env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR ?? defaultTemplatesDir();
     const stateDir = defaultStateDir();
@@ -500,7 +354,7 @@ async function main(): Promise<void> {
     );
   }
 
-  log(`summarizer + manager started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
+  log(`summarizer started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
 
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
@@ -533,10 +387,10 @@ async function main(): Promise<void> {
 
   // INDEPENDENT queue loop (ramon fork / Agent Queue): the deterministic supervisor
   // runs on its OWN self-paced timer, NOT inside `tick`/`runSweep`. This decouples the
-  // latency-sensitive queue (dispatch/track/close) from the slow LLM summarizer/manager
-  // passes — with many agents a single `runSweep` can take tens of seconds, which would
-  // otherwise starve the queue. Only armed when a queue is configured. Same
-  // non-overlapping self-pace as `tick`.
+  // latency-sensitive queue (dispatch/track/close) from the slow LLM summarizer pass —
+  // with many agents a single `runSweep` can take tens of seconds, which would otherwise
+  // starve the queue. Only armed when a queue is configured. Same non-overlapping
+  // self-pace as `tick`.
   const queueTick = async (): Promise<void> => {
     if (stopped) return;
     await runQueueSweepSafe(deps); // self-isolating; no-op when no queue configured
@@ -544,8 +398,8 @@ async function main(): Promise<void> {
   };
 
   // Start the INDEPENDENT queue loop FIRST, so it is never delayed (or blocked
-  // forever) by the slow — or occasionally hanging — first summarizer/manager sweep
-  // in `tick`. Both loops then run concurrently on the event loop.
+  // forever) by the slow — or occasionally hanging — first summarizer sweep in
+  // `tick`. Both loops then run concurrently on the event loop.
   if (deps.queue !== undefined) void queueTick();
   await tick();
 }

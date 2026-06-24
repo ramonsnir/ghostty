@@ -7,7 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { summarize, suggest, SUMMARIZER_MODEL, type QueryFn } from "./model.js";
+import { summarize, SUMMARIZER_MODEL, type QueryFn } from "./model.js";
 
 /**
  * Build a fake `queryFn` that yields the given message-like objects in order.
@@ -130,35 +130,25 @@ test("summarize: honors a model override", async () => {
   assert.equal(params.options.model, "claude-sonnet-4-5");
 });
 
-// --- suggest (Phase 2 manager call) -----------------------------------------
+// --- account routing via configDir ------------------------------------------
 
-test("suggest: returns the success .result text", async () => {
-  const q = fakeQuery([{ type: "result", subtype: "success", result: '{"suggestion":"go"}' }]);
-  const text = await suggest({ system: "S", user: "U", model: "claude-opus-4-8" }, q);
-  assert.equal(text, '{"suggestion":"go"}');
-});
-
-test("suggest: passes the Opus model + the SAME safety flags (no tools, no mcp, no env)", async () => {
-  const cap: { params?: unknown } = {};
-  const q = recordingQuery([{ type: "result", subtype: "success", result: "ok" }], cap);
-  await suggest({ system: "SYS", user: "USR", model: "claude-opus-4-8" }, q);
-  const params = cap.params as {
-    prompt: string;
-    options: { tools: unknown; maxTurns: number; model: string; systemPrompt: string; mcpServers?: unknown; env?: unknown };
-  };
-  assert.equal(params.prompt, "USR");
-  assert.equal(params.options.systemPrompt, "SYS");
-  assert.equal(params.options.model, "claude-opus-4-8");
-  assert.deepEqual(params.options.tools, []);   // manager has NO tools — cannot send
-  assert.equal(params.options.maxTurns, 3);
-  assert.equal(params.options.mcpServers, undefined);
-  assert.equal(params.options.env, undefined);
-});
-
-test("suggest: error-subtype result throws", async () => {
-  const q = fakeQuery([{ type: "result", subtype: "error_during_execution", errors: ["boom"] }]);
-  await assert.rejects(
-    () => suggest({ system: "S", user: "U", model: "claude-opus-4-8" }, q),
-    (e: unknown) => e instanceof Error && /boom/.test(e.message),
-  );
+test("summarize: configDir sets options.env CLAUDE_CONFIG_DIR but PRESERVES process.env", async () => {
+  process.env.__AM_TEST__ = "preserved";
+  try {
+    const cap: { params?: unknown } = {};
+    const q = recordingQuery(
+      [{ type: "result", subtype: "success", result: "ok" }],
+      cap,
+    );
+    await summarize({ system: "S", user: "U", configDir: "/acct/dir" }, q);
+    const params = cap.params as {
+      options: { env?: Record<string, string | undefined> };
+    };
+    assert.ok(params.options.env, "env passed when configDir is set");
+    assert.equal(params.options.env!.CLAUDE_CONFIG_DIR, "/acct/dir");
+    // The rest of process.env is spread in (HOME/PATH/OAuth preserved).
+    assert.equal(params.options.env!.__AM_TEST__, "preserved");
+  } finally {
+    delete process.env.__AM_TEST__;
+  }
 });
