@@ -40,9 +40,39 @@ struct QueuePaletteTests {
         let sub = base.appendingPathComponent("subdir", isDirectory: true)
         try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
 
-        let names = QueuePaletteView.discoverTemplates(dir: base.path)
-        // Sorted case-insensitively: "alpha" before "Backlog".
-        #expect(names == ["alpha", "Backlog"])
+        let entries = QueuePaletteView.discoverTemplates(dir: base.path)
+        // Sorted case-insensitively: "alpha" before "Backlog". With no `name` field the
+        // displayName falls back to the basename.
+        #expect(entries.map(\.basename) == ["alpha", "Backlog"])
+        #expect(entries.map(\.displayName) == ["alpha", "Backlog"])
+    }
+
+    /// The displayed name is the template JSON's `name` field (not the file basename), and
+    /// the list is SORTED by that display name — so a "example.json" with `{"name":"ExampleOS"}`
+    /// shows as "ExampleOS". A file with no `name` falls back to its basename.
+    @Test func discoverUsesJSONNameForDisplayAndSort() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        try write(base.appendingPathComponent("example.json"), #"{ "name": "ExampleOS" }"#)
+        try write(base.appendingPathComponent("zoo.json"), #"{ "name": "Aardvark" }"#)
+        try touch(base.appendingPathComponent("plain.json"))   // no name → basename "plain"
+
+        let entries = QueuePaletteView.discoverTemplates(dir: base.path)
+        // Sorted by displayName: "Aardvark" (zoo) < "ExampleOS" (example) < "plain" (plain).
+        #expect(entries.map(\.displayName) == ["Aardvark", "ExampleOS", "plain"])
+        #expect(entries.map(\.basename) == ["zoo", "example", "plain"])
+    }
+
+    /// `templateDisplayName` reads the trimmed `name`; missing file / no `name` → basename.
+    @Test func templateDisplayNameFallsBackToBasename() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("example.json"), #"{ "name": "  ExampleOS  " }"#)
+        try write(base.appendingPathComponent("nameless.json"), #"{ "workdir": "/x" }"#)
+        #expect(QueuePaletteView.templateDisplayName(dir: base.path, basename: "example") == "ExampleOS")
+        #expect(QueuePaletteView.templateDisplayName(dir: base.path, basename: "nameless") == "nameless")
+        #expect(QueuePaletteView.templateDisplayName(dir: base.path, basename: "missing") == "missing")
     }
 
     /// Two entries that collapse to the same basename (differing only in the `.json`
@@ -54,8 +84,8 @@ struct QueuePaletteTests {
         try touch(base.appendingPathComponent("queue.json"))
         try touch(base.appendingPathComponent("queue.JSON"))
 
-        let names = QueuePaletteView.discoverTemplates(dir: base.path)
-        #expect(names == ["queue"])
+        let entries = QueuePaletteView.discoverTemplates(dir: base.path)
+        #expect(entries.map(\.basename) == ["queue"])
     }
 
     /// An unreadable / absent directory yields an empty list (never throws).

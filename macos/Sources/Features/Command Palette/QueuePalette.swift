@@ -134,9 +134,11 @@ struct QueuePaletteView: View {
             )]
         }
 
-        return templates.map { name in
+        return templates.map { entry in
             CommandOption(
-                title: name,
+                // Show the template's human `name` (e.g. "ExampleOS"); the START command
+                // still carries the file `basename` (the sidecar loads templates by it).
+                title: entry.displayName,
                 subtitle: "Start a queue run from this template",
                 leadingIcon: "square.stack.3d.up"
             ) {
@@ -145,14 +147,15 @@ struct QueuePaletteView: View {
                 // enqueue the start intent directly — the SAME path
                 // `Ghostty.App.startAgentQueue` uses for the `:<name>` form and the
                 // dashboard control buttons.
-                let params = Self.templateParams(dir: dir, basename: name)
+                let params = Self.templateParams(dir: dir, basename: entry.basename)
                 if params.isEmpty {
-                    Self.postStart(template: name, params: nil)
+                    Self.postStart(template: entry.basename, params: nil)
                 } else {
                     prompt.active = QueueParamPrompt(
-                        template: name,
+                        template: entry.basename,
+                        displayName: entry.displayName,
                         params: params,
-                        probe: Self.templateProbe(dir: dir, basename: name)
+                        probe: Self.templateProbe(dir: dir, basename: entry.basename)
                     )
                 }
             }
@@ -172,31 +175,59 @@ struct QueuePaletteView: View {
     }
 
     /// (testable, pure filesystem) Discover the queue templates under `dir`: every
-    /// immediate child whose name ends in `.json` (case-insensitive), returned as
-    /// the BASENAME minus the `.json` extension, deduped, sorted case-insensitively.
-    /// `dir` is tilde-expanded; an unreadable dir yields an empty list. Hidden files
-    /// are skipped (a leading-dot template is not a real queue template).
+    /// immediate child whose name ends in `.json` (case-insensitive), as a
+    /// `QueueTemplateEntry` carrying both the `basename` (the `*.json` filename minus
+    /// extension — the START command's `template` + the key for params/probe) AND the
+    /// human `displayName` read from the template JSON's `name` field (so the palette
+    /// shows e.g. "ExampleOS" rather than the file's "example"; falls back to the
+    /// basename when the file has no `name`). Deduped by basename; sorted
+    /// case-insensitively by displayName (basename tie-break). `dir` is tilde-expanded;
+    /// an unreadable dir yields an empty list. Hidden files are skipped.
     static func discoverTemplates(
         dir: String,
         fileManager fm: FileManager = .default
-    ) -> [String] {
+    ) -> [QueueTemplateEntry] {
         let expanded = (dir as NSString).expandingTildeInPath
         guard let entries = try? fm.contentsOfDirectory(atPath: expanded) else { return [] }
 
         var seen = Set<String>()
-        var names: [String] = []
+        var out: [QueueTemplateEntry] = []
         for entry in entries {
             guard !entry.hasPrefix(".") else { continue }
             let ns = entry as NSString
             guard ns.pathExtension.lowercased() == "json" else { continue }
             let base = ns.deletingPathExtension
             guard !base.isEmpty, seen.insert(base).inserted else { continue }
-            names.append(base)
+            out.append(QueueTemplateEntry(
+                basename: base,
+                displayName: Self.templateDisplayName(dir: dir, basename: base, fileManager: fm)
+            ))
         }
 
-        return names.sorted {
-            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        return out.sorted {
+            let c = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+            if c != .orderedSame { return c == .orderedAscending }
+            return $0.basename.localizedCaseInsensitiveCompare($1.basename) == .orderedAscending
         }
+    }
+
+    /// (testable, pure filesystem) A template's human DISPLAY name: the trimmed `name`
+    /// field from its `<dir>/<basename>.json`, or the `basename` when the file is
+    /// missing/unreadable, not an object, or has no non-empty `name`. `dir` is
+    /// tilde-expanded here (same as the other readers).
+    static func templateDisplayName(
+        dir: String,
+        basename: String,
+        fileManager fm: FileManager = .default
+    ) -> String {
+        let expanded = (dir as NSString).expandingTildeInPath
+        let path = (expanded as NSString).appendingPathComponent("\(basename).json")
+        guard let data = fm.contents(atPath: path),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let name = (obj["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else { return basename }
+        return name
     }
 
     /// (§8b, testable, pure filesystem) Read a template's declared `params` from its
@@ -274,6 +305,17 @@ struct QueuePaletteView: View {
     }
 }
 
+// MARK: - Template discovery entry
+
+/// One discovered queue template offered by the palette. The `basename` is the
+/// `*.json` filename minus extension (the START command's `template`, and the key for
+/// `templateParams`/`templateProbe`); the `displayName` is the template JSON's `name`
+/// field (what the user sees), falling back to the basename when the file has no `name`.
+struct QueueTemplateEntry: Equatable {
+    let basename: String
+    let displayName: String
+}
+
 // MARK: - §8b start-time params: model + spec + form
 
 /// (§8b) One start-time parameter to prompt for (the GUI-facing projection of the
@@ -328,7 +370,10 @@ struct QueueTemplateProbe: Equatable {
 /// (§8b) A pending param prompt: which template + the fields to fill + the optional
 /// preview probe (list command + workdir) so the form can show a live success signal.
 struct QueueParamPrompt: Equatable {
+    /// The template BASENAME — what the START command carries (the sidecar loads by it).
     let template: String
+    /// The template's human display name (its JSON `name`) — shown in the form title.
+    let displayName: String
     let params: [QueueParamSpec]
     let probe: QueueTemplateProbe?
 }
@@ -390,7 +435,7 @@ struct QueueParamFormView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Start “\(prompt.template)”")
+            Text("Start “\(prompt.displayName)”")
                 .font(.headline)
 
             ForEach(prompt.params, id: \.name) { p in
