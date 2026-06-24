@@ -24,6 +24,7 @@ import {
   shouldSummarize,
   stripFences,
   truncateCodePoints,
+  alertEdge,
   SUMMARY_MAX_LEN,
   type LastSummary,
   type SurfaceSnapshot,
@@ -508,4 +509,43 @@ test("ConcurrencyBudget: release floors at zero", () => {
   b.release();
   b.release();
   assert.equal(b.active, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Attention detection (ramon fork): detectAlert / alertEdge / parseSummary.alert
+// ---------------------------------------------------------------------------
+
+test("parseSummary: parses an alert tag (lower-cased + trimmed)", () => {
+  const r = parseSummary('{"summary":"Rate limited","alert":" Rate_Limited "}');
+  assert.equal(r?.alert, "rate_limited");
+});
+
+test("parseSummary: absent alert => undefined", () => {
+  const r = parseSummary('{"summary":"Building"}');
+  assert.equal(r?.alert, undefined);
+});
+
+test("parseSummary: empty/non-string alert => undefined", () => {
+  assert.equal(parseSummary('{"summary":"x","alert":""}')?.alert, undefined);
+  assert.equal(parseSummary('{"summary":"x","alert":123}')?.alert, undefined);
+});
+
+test("alertEdge: none -> tag => ring", () => {
+  assert.equal(alertEdge(undefined, "rate_limited"), "ring");
+});
+
+test("alertEdge: same tag held => none", () => {
+  assert.equal(alertEdge("rate_limited", "rate_limited"), "none");
+});
+
+test("alertEdge: changed tag => ring", () => {
+  assert.equal(alertEdge("rate_limited", "something_else"), "ring");
+});
+
+test("alertEdge: tag -> none => clear", () => {
+  assert.equal(alertEdge("rate_limited", undefined), "clear");
+});
+
+test("alertEdge: none -> none => none", () => {
+  assert.equal(alertEdge(undefined, undefined), "none");
 });

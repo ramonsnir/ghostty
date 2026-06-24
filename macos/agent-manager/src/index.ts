@@ -47,6 +47,8 @@ import {
   fingerprint,
   parseSummary,
   shouldSummarize,
+  alertEdge,
+  ALERT_RATE_LIMITED,
   type LastSummary,
   type SummarizerConfig,
   type SurfaceSnapshot,
@@ -107,6 +109,12 @@ export interface LoopDeps {
   /** Per-session memory of the last successful summary, keyed by surface id.
    *  Held on deps (NOT module scope) so a test can seed/inspect it. */
   lastBySession: Map<string, LastSummary>;
+  /** Per-session memory of the last ATTENTION alert tag (e.g. "rate_limited")
+   *  seen for a surface, keyed by surface id. Drives the edge-triggered bell:
+   *  signal_attention fires once when an alert first appears and re-arms only
+   *  after the alert clears (the screen changes). Held on deps so a test can
+   *  seed/inspect it; cleaned up alongside lastBySession when a surface dies. */
+  alertBySession: Map<string, string>;
   /** Optional CLAUDE_CONFIG_DIR for the summarizer's model calls — routes auth/billing
    *  to a specific claude-accounts account (see account.ts). Omitted ⇒ inherit the
    *  ambient auth (the default; works with no claude-accounts installed). */
@@ -162,6 +170,9 @@ async function summarizeOne(
     const decision = shouldSummarize(snapshot, prev, deps.now(), cfg);
     // A SKIP spent no model call, so do NOT advance the debounce clock — that keeps
     // a real change caught at the very next poll rather than delayed by debounceMs.
+    // The attention alert is the MODEL's verdict (below), so an idle-skip — where no
+    // model call runs — deliberately LEAVES the alert state untouched: a held alert
+    // stays armed (no re-ring), and nothing rings or clears without a fresh classify.
     if (!decision.due) return; // unchanged/idle on the real viewport — skip
 
     // Prefer the loop's own record for continuity; fall back to the round-tripped
@@ -178,7 +189,8 @@ async function summarizeOne(
     const raw = await deps.summarize({ system, user, configDir: deps.summarizerConfigDir });
     const parsed = parseSummary(raw);
     if (!parsed) {
-      // Spent a model call but got nothing usable — throttle the retry.
+      // Spent a model call but got nothing usable — throttle the retry. No usable
+      // classify this sweep ⇒ leave the alert state untouched (see the idle note).
       recordAttempt();
       errlog(`surface ${surface.id}: model reply not parseable; skipping`);
       return;
@@ -195,10 +207,18 @@ async function summarizeOne(
       atMs: deps.now(),
       summary: parsed.summary,
     });
+    // The model is the SOLE judge of the attention alert: ring on a rising edge,
+    // clear when it reports no alert (the screen changed and Haiku no longer sees
+    // the live condition — this is how recovery un-rings, immune to scrolled-up text).
+    await maybeSignalAlert(deps, surface, parsed.alert);
     log(`surface ${surface.id}: "${parsed.summary}"`);
   } catch (err) {
     // A read/model/annotate failure — throttle the retry so a persistently failing
-    // surface costs at most one attempt per debounceMs, not one per poll.
+    // surface costs at most one attempt per debounceMs, not one per poll. No fresh
+    // classify ⇒ the alert state is left untouched (a held alert stays armed). NOTE:
+    // if the summarizer's OWN account is the one rate-limited, its calls fail here and
+    // the watchdog goes blind — route the summarizer to a separate account (see
+    // AGENT-MANAGER.md "Account routing") so the watchdog survives the main limit.
     recordAttempt();
     const what = err instanceof McpError ? "mcp" : "model";
     errlog(
@@ -208,6 +228,47 @@ async function summarizeOne(
     );
   } finally {
     deps.budget.release();
+  }
+}
+
+/** A short human-readable note for an alert tag, passed to signal_attention. */
+function alertReason(alert: string): string {
+  if (alert === ALERT_RATE_LIMITED) return "Rate limited — waiting for you";
+  return `Attention: ${alert}`;
+}
+
+/**
+ * Edge-triggered attention bell for one surface. Compares `alert` (the alert tag
+ * for THIS read, or undefined) against the last-seen tag and, on a rising/changed
+ * edge, calls signal_attention (which fans out to the tab bell, dashboard, web
+ * monitor, and push). Records the new tag so a held alert never re-rings; clears
+ * the record when the alert goes away so the next occurrence rings again. Catches
+ * its OWN errors (a failed ring rolls back the record so a later sweep retries),
+ * so it never escapes into summarizeOne's flow.
+ */
+async function maybeSignalAlert(
+  deps: LoopDeps,
+  surface: Surface,
+  alert: string | undefined,
+): Promise<void> {
+  const edge = alertEdge(deps.alertBySession.get(surface.id), alert);
+  if (edge === "ring") {
+    // Record FIRST so a slow signal_attention can't double-fire from an overlapping
+    // sweep; roll back below if the call fails so the edge is retried.
+    deps.alertBySession.set(surface.id, alert as string);
+    try {
+      await deps.client.signalAttention(surface.id, alertReason(alert as string));
+      log(`surface ${surface.id}: alert "${alert}" -> rang attention`);
+    } catch (err) {
+      deps.alertBySession.delete(surface.id);
+      errlog(
+        `surface ${surface.id}: signal_attention failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  } else if (edge === "clear") {
+    deps.alertBySession.delete(surface.id);
   }
 }
 
@@ -233,6 +294,9 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
   const liveIds = new Set(surfaces.map((s) => s.id));
   for (const id of [...deps.lastBySession.keys()]) {
     if (!liveIds.has(id)) deps.lastBySession.delete(id);
+  }
+  for (const id of [...deps.alertBySession.keys()]) {
+    if (!liveIds.has(id)) deps.alertBySession.delete(id);
   }
 
   const fired: Array<Promise<void>> = [];
@@ -307,6 +371,7 @@ async function main(): Promise<void> {
     now: () => Date.now(),
     summarize: defaultSummarize,
     lastBySession: new Map<string, LastSummary>(),
+    alertBySession: new Map<string, string>(),
     summarizerConfigDir,
   };
 

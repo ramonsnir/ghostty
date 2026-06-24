@@ -49,6 +49,8 @@ interface FakeClientSpec {
   screens?: Record<string, string>;
   /** ids that should throw from readSurface. */
   readThrows?: Set<string>;
+  /** ids that should throw from signalAttention. */
+  signalThrows?: Set<string>;
   /** when true, listSurfaces throws. */
   listThrows?: boolean;
 }
@@ -57,13 +59,15 @@ interface FakeClient {
   client: McpClient;
   setCalls: Array<{ id: string; ann: Annotation }>;
   readCalls: string[];
+  signalCalls: Array<{ id: string; reason?: string }>;
 }
 
 /** Build a structurally-typed fake McpClient (cast to the class — runSweep only
- *  ever calls listSurfaces/readSurface/setAnnotation). */
+ *  ever calls listSurfaces/readSurface/setAnnotation/signalAttention). */
 function makeFakeClient(spec: FakeClientSpec): FakeClient {
   const setCalls: Array<{ id: string; ann: Annotation }> = [];
   const readCalls: string[] = [];
+  const signalCalls: Array<{ id: string; reason?: string }> = [];
   const client = {
     async listSurfaces(): Promise<Surface[]> {
       if (spec.listThrows) throw new Error("list boom");
@@ -77,8 +81,12 @@ function makeFakeClient(spec: FakeClientSpec): FakeClient {
     async setAnnotation(id: string, ann: Annotation): Promise<void> {
       setCalls.push({ id, ann });
     },
+    async signalAttention(id: string, reason?: string): Promise<void> {
+      if (spec.signalThrows?.has(id)) throw new Error(`signal boom ${id}`);
+      signalCalls.push({ id, reason });
+    },
   } as unknown as McpClient;
-  return { client, setCalls, readCalls };
+  return { client, setCalls, readCalls, signalCalls };
 }
 
 interface DepsSpec {
@@ -86,6 +94,7 @@ interface DepsSpec {
   summarize: SummarizeFn;
   now?: number;
   last?: Map<string, LastSummary>;
+  alerts?: Map<string, string>;
   budgetMax?: number;
 }
 
@@ -107,6 +116,7 @@ function makeDeps(spec: DepsSpec): {
     now: () => spec.now ?? 1_000_000,
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
+    alertBySession: spec.alerts ?? new Map<string, string>(),
   };
   return { deps, summarizeCalls };
 }
@@ -403,4 +413,186 @@ test("runSweep: configDir is undefined when no account is configured (inherit au
 
   assert.equal(summarizeCalls.length, 1);
   assert.equal(summarizeCalls[0].configDir, undefined);
+});
+
+
+// ---------------------------------------------------------------------------
+// Rate-limit / attention bell (ramon fork): the MODEL is the sole classifier.
+// The loop rings on a rising edge of the model's `alert` field and clears when
+// the model reports no alert. There is NO regex on the viewport — only Haiku's
+// verdict moves the bell, so scrolled-up history can never (re-)ring it and
+// recovery un-rings as soon as the model reclassifies.
+// ---------------------------------------------------------------------------
+
+// A viewport that CONTAINS the rate-limit prompt text. The loop must ignore the
+// text itself — only the model's `alert` verdict matters — so these tests pair it
+// with a model that does / does not flag the alert to prove the text is inert.
+const RATE_LIMIT_SCREEN =
+  "Claude usage limit reached\n\nWhat do you want to do?\n\n  1. Stop and wait for limit to reset\n  2. Ask your admin for more usage\n\nEnter to confirm · Esc to cancel";
+
+const rateLimitedSummary: SummarizeFn = async () =>
+  '{"summary":"Rate limited — waiting for reset","alert":"rate_limited"}';
+const noAlertSummary: SummarizeFn = async () => '{"summary":"Back to writing tests"}';
+
+test("bell: model flags rate_limited => rings exactly once + records the tag", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: RATE_LIMIT_SCREEN },
+  });
+  const { deps } = makeDeps({ fake, summarize: rateLimitedSummary });
+
+  await runSweep(deps);
+
+  assert.equal(fake.signalCalls.length, 1, "rang attention exactly once");
+  assert.equal(fake.signalCalls[0].id, "s1");
+  assert.match(fake.signalCalls[0].reason ?? "", /rate limited/i);
+  assert.equal(deps.alertBySession.get("s1"), "rate_limited");
+});
+
+test("bell: a held alert under idle-skip does not re-ring (no model call, stays armed)", async () => {
+  const viewport = RATE_LIMIT_SCREEN;
+  const surface = makeSurface({ id: "s1", agentState: "working", idleSeconds: 999 });
+  const fp = fingerprint({ surface, viewport }, DEFAULT_CONFIG);
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: viewport } });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: rateLimitedSummary,
+    now: DEFAULT_CONFIG.debounceMs + 100_000,
+    last: new Map([["s1", { fingerprint: fp, atMs: 0, summary: "Rate limited" }]]),
+    alerts: new Map([["s1", "rate_limited"]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "idle-skip: no model call");
+  assert.equal(fake.signalCalls.length, 0, "held alert must not re-ring");
+  assert.equal(deps.alertBySession.get("s1"), "rate_limited", "alert left armed");
+});
+
+test("bell: recovery — model reports NO alert => clears the armed tag, no ring", async () => {
+  // The viewport STILL contains the rate-limit text (scrolled up), but the model
+  // judges the live state has recovered and omits `alert`. The bell must clear.
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: RATE_LIMIT_SCREEN + "\n\n❯ npm test\nall green" },
+  });
+  const { deps } = makeDeps({
+    fake,
+    summarize: noAlertSummary,
+    alerts: new Map([["s1", "rate_limited"]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(fake.signalCalls.length, 0, "no ring when the model reports no alert");
+  assert.equal(deps.alertBySession.has("s1"), false, "armed tag cleared / re-armed");
+});
+
+test("bell: scrolled-up text alone never rings — only the model's verdict does", async () => {
+  // Not pre-armed; viewport contains the text; model says no alert => nothing happens.
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: RATE_LIMIT_SCREEN },
+  });
+  const { deps } = makeDeps({ fake, summarize: noAlertSummary });
+
+  await runSweep(deps);
+
+  assert.equal(fake.signalCalls.length, 0, "viewport text is inert without a model alert");
+  assert.equal(deps.alertBySession.has("s1"), false);
+});
+
+test("bell: a failed model call leaves the alert state UNTOUCHED (held stays armed)", async () => {
+  const boom: SummarizeFn = async () => {
+    throw new Error("summarizer account also rate limited");
+  };
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: RATE_LIMIT_SCREEN },
+  });
+  const { deps } = makeDeps({
+    fake,
+    summarize: boom,
+    alerts: new Map([["s1", "rate_limited"]]),
+  });
+
+  await runSweep(deps);
+
+  // No fresh classify => no ring and no clear. (The honest cost of pure-Haiku: a
+  // FIRST detection can't happen while the summarizer's own calls fail — mitigated
+  // by routing the summarizer to a separate account.)
+  assert.equal(fake.signalCalls.length, 0, "no ring on model failure");
+  assert.equal(deps.alertBySession.get("s1"), "rate_limited", "held alert untouched");
+});
+
+test("bell: model alert rings regardless of the on-screen text", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "an opaque TUI with no recognizable prompt text" },
+  });
+  const { deps } = makeDeps({ fake, summarize: rateLimitedSummary });
+
+  await runSweep(deps);
+
+  assert.equal(fake.signalCalls.length, 1, "the model's verdict alone drives the bell");
+  assert.equal(deps.alertBySession.get("s1"), "rate_limited");
+});
+
+test("bell: a changed alert tag re-rings", async () => {
+  const otherAlert: SummarizeFn = async () =>
+    '{"summary":"Something else needs you","alert":"needs_input"}';
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "..." },
+  });
+  const { deps } = makeDeps({
+    fake,
+    summarize: otherAlert,
+    alerts: new Map([["s1", "rate_limited"]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(fake.signalCalls.length, 1, "a different tag is a fresh edge");
+  assert.equal(deps.alertBySession.get("s1"), "needs_input");
+});
+
+test("bell: a failed signal_attention rolls back so a later sweep retries", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: RATE_LIMIT_SCREEN },
+    signalThrows: new Set(["s1"]),
+  });
+  const { deps } = makeDeps({ fake, summarize: rateLimitedSummary });
+
+  await runSweep(deps);
+
+  assert.equal(deps.alertBySession.has("s1"), false, "rolled back after a failed ring");
+});
+
+test("bell: a non-agent surface is never read, classified, or rung", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", processName: "vim" })],
+    screens: { s1: RATE_LIMIT_SCREEN },
+  });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: rateLimitedSummary });
+
+  await runSweep(deps);
+
+  assert.equal(fake.readCalls.length, 0, "non-agent is pre-gated out (no read)");
+  assert.equal(summarizeCalls.length, 0, "and never classified");
+  assert.equal(fake.signalCalls.length, 0, "and never rung");
+});
+
+test("bell: dead-surface alert records are pruned each sweep", async () => {
+  const fake = makeFakeClient({ surfaces: [] }); // s1 is gone
+  const { deps } = makeDeps({
+    fake,
+    summarize: rateLimitedSummary,
+    alerts: new Map([["s1", "rate_limited"]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(deps.alertBySession.has("s1"), false, "stale alert record dropped");
 });
