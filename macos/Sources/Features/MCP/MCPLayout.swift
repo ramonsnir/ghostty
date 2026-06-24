@@ -55,6 +55,10 @@ enum MCPLayout {
         let splitCount: Int
         let focused: Bool
         let bell: Bool
+        /// (ramon fork / Bell Attention) The sticky "attention needed" state — set by
+        /// the Agent Manager via set_attention, cleared on focus. Exposed so an
+        /// orchestrator (and live debugging) can read the promotion state back.
+        let attentionNeeded: Bool
         let exited: Bool
         /// COARSE heuristic = inverse of `needsConfirmQuit`, NOT a true OSC 133
         /// shell-prompt signal. The plan accepts this as the documented fallback
@@ -156,6 +160,7 @@ enum MCPLayout {
                     window: win, tab: tabIdx, tabTitle: tabTitle,
                     splitIndex: splitIdx, splitCount: leaves.count,
                     focused: view.focused, bell: view.bell,
+                    attentionNeeded: view.attentionNeeded,
                     exited: exited, atPrompt: atPrompt,
                     processName: view.foregroundProcessName,
                     command: view.foregroundCommand,
@@ -179,6 +184,7 @@ enum MCPLayout {
                 "window": $0.window, "tab": $0.tab, "tabTitle": $0.tabTitle,
                 "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
                 "focused": $0.focused, "bell": $0.bell,
+                "attentionNeeded": $0.attentionNeeded,
                 "exited": $0.exited, "atPrompt": $0.atPrompt,
             ]
             // fork: omit the new fields when unknown (null) — honest absence

@@ -422,7 +422,7 @@ struct MCPServerTests {
             id: "ABC", title: "vim", pwd: "/tmp",
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
-            focused: true, bell: false, exited: false, atPrompt: true,
+            focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
             notes: "Implementing fix", agentKind: "claude", sessionID: 4242)
@@ -439,6 +439,7 @@ struct MCPServerTests {
         #expect(d["splitCount"] as? Int == 3)
         #expect(d["focused"] as? Bool == true)
         #expect(d["bell"] as? Bool == false)
+        #expect(d["attentionNeeded"] as? Bool == false)
         #expect(d["exited"] as? Bool == false)
         #expect(d["atPrompt"] as? Bool == true)
         #expect(d["processName"] as? String == "bash")
@@ -462,7 +463,7 @@ struct MCPServerTests {
             id: "ABC", title: "vim", pwd: "/tmp",
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
-            focused: true, bell: false, exited: false, atPrompt: true,
+            focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
             agentKind: nil, sessionID: 0)
