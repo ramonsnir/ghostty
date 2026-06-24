@@ -237,6 +237,10 @@ struct AgentPreviewTile: View {
                 // the same color under its cells, so the seam is invisible.
                 .background(ghostty.config.backgroundColor)
                 .clipped()
+                // (ramon fork / Agent Manager) The Haiku summary, shown LARGE +
+                // semi-transparent over the TOP of the live preview so it's readable
+                // at a glance, and FADED OUT on hover to reveal the terminal beneath.
+                .overlay(alignment: .top) { summaryOverlay }
                 // Re-create the mirror SurfaceView if the session id changes for a
                 // stable tile id (the @StateObject is otherwise keyed only by the
                 // ForEach UUID, so it would keep the old session).
@@ -257,25 +261,42 @@ struct AgentPreviewTile: View {
         }
     }
 
+    // MARK: - Summary overlay
+
+    /// (ramon fork / Agent Manager) The Haiku summary as a LARGE, semi-transparent
+    /// frosted band over the TOP of the live preview — readable at a glance without
+    /// stealing its own row (the old tiny footer line). It FADES OUT on hover so the
+    /// terminal underneath is fully revealed; `.allowsHitTesting(false)` keeps taps
+    /// (jump) + scroll passing through to the mirror. Absent ⇒ nothing drawn (the raw
+    /// preview shows), so a manager-less / un-summarized tile is unchanged.
+    @ViewBuilder
+    private var summaryOverlay: some View {
+        if let summary = entry.annotation?.summary, !summary.isEmpty {
+            Text(summary)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+                .opacity(hovering ? 0 : 0.92)
+                .animation(.easeInOut(duration: 0.15), value: hovering)
+                .allowsHitTesting(false)
+        }
+    }
+
     // MARK: - Footer
 
     @ViewBuilder
     private var footer: some View {
-        // (ramon fork / Agent Manager) The manager's one-line annotation summary,
-        // shown above the metadata row when present (any state). It is the semantic
-        // status line; the colored state chip in the header still reflects the
-        // authoritative hook state (design §5.1). Mirrors the prompt subtitle's
-        // modifier set. When absent, the tile falls back to the prompt subtitle
-        // below (and the chip alone), so a manager-less tile is unchanged.
-        if let summary = entry.annotation?.summary, !summary.isEmpty {
-            Text(summary)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-        } else if entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
+        // (ramon fork / Agent Manager) When the summary is absent, a working tile
+        // still shows its latest prompt as a small subtitle (the summary itself now
+        // renders LARGE over the preview — see `summaryOverlay`). The colored state
+        // chip in the header reflects the authoritative hook state (design §5.1).
+        if entry.annotation?.summary == nil || entry.annotation!.summary!.isEmpty,
+           entry.agentState == .working, let prompt = entry.lastPrompt, !prompt.isEmpty {
             Text(prompt)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
