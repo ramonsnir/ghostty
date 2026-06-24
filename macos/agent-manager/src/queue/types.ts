@@ -87,20 +87,34 @@ export interface AgentSpec {
 export type OnAgentExit = "leave-and-bell";
 
 /**
+ * Where a resolved param value is DELIVERED (§8b):
+ *   - "env"      (default): exported under `env` into the PROVIDER's environment (the
+ *                `list`/`status`/`claim` commands read it) — scopes "what to work on".
+ *   - "maxItems": sets the run's lifetime dispatch cap (overrides the template `maxItems`)
+ *                instead of going to the provider. Parsed as a non-negative integer; `0`
+ *                (or "unlimited") = no cap. Lets the user pick maxItems at start time
+ *                (e.g. 1/2 for a careful run, unlimited otherwise) without editing files.
+ */
+export type QueueParamTarget = "env" | "maxItems";
+
+/**
  * (§8b) A START-TIME PARAMETER the template declares (e.g. a Linear project or
- * milestone). The GUI prompts for each when the queue is started; the resolved value is
- * injected into the PROVIDER's environment under `env` (the `list`/`status`/`claim`
- * commands read it), so the SAME generic template can be pointed at a different scope per
- * run without editing files. Keeps the design generic: the TEMPLATE names the env var;
- * Ghostty never hard-codes "Linear". A param scopes "what to work on" and is delivered ONLY
- * to the provider commands, NOT to the agent (the agent gets per-item `GHOSTTY_ITEM_*`).
+ * milestone, or the run's maxItems). The GUI prompts for each when the queue is started;
+ * the resolved value is delivered per `target` — for the default "env" target it is
+ * injected into the PROVIDER's environment under `env` (so the SAME generic template can
+ * be pointed at a different scope per run without editing files); for "maxItems" it sets
+ * the run's dispatch cap. Keeps the design generic: the TEMPLATE names the env var / opts
+ * into the maxItems prompt; Ghostty never hard-codes "Linear". An env param is delivered
+ * ONLY to the provider commands, NOT to the agent (the agent gets per-item `GHOSTTY_ITEM_*`).
  */
 export interface QueueParam {
   /** Identifier the GUI/command keys the user's answer by (e.g. "project"). */
   name: string;
+  /** Where the value goes (default "env"). See QueueParamTarget. */
+  target?: QueueParamTarget;
   /** The env var the resolved value is exported as to the provider commands (e.g.
-   *  "LINEAR_PROJECT"). */
-  env: string;
+   *  "LINEAR_PROJECT"). REQUIRED for the "env" target; ignored for "maxItems". */
+  env?: string;
   /** Human prompt label (defaults to `name` when absent). */
   label?: string;
   /** Pre-filled value in the prompt (the common case is "accept the default"). */

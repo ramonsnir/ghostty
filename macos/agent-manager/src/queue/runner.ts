@@ -65,7 +65,7 @@ import {
   type LiveSurface,
   type StoreIO,
 } from "./store.js";
-import { resolveParamsEnv } from "./templates.js";
+import { resolveMaxItemsOverride, resolveParamsEnv } from "./templates.js";
 import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
 
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
@@ -831,7 +831,17 @@ async function dispatchCandidates(
   // excluded, §6).
   const activeCount = slotOccupancy(run);
   const slots = remainingSlots(t, activeCount, globalRemaining);
-  const maxItemsRemaining = Math.max(0, t.maxItems - run.lifetimeDispatched);
+  // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap.
+  // `undefined` ⇒ use the template's `maxItems`; `0` ⇒ unlimited (no lifetime cap, so
+  // maxItemsRemaining is Infinity — selectCandidates' Math.min(slots, Infinity) = slots);
+  // a positive N ⇒ that cap. The global `agent-queue-max-total` + grid/concurrency still
+  // bound an unlimited run.
+  const override = resolveMaxItemsOverride(t, run.params);
+  const effectiveMax = override === undefined ? t.maxItems : override;
+  const maxItemsRemaining =
+    effectiveMax <= 0
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, effectiveMax - run.lifetimeDispatched);
   if (slots <= 0 || maxItemsRemaining <= 0) return 0;
 
   // Fetch the provider list (skip the tick on any failure — never throws). Use the

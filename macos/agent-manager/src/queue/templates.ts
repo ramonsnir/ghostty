@@ -24,6 +24,7 @@ import type {
   ProviderSpec,
   ProviderStatusSpec,
   QueueParam,
+  QueueParamTarget,
   QueueTemplate,
 } from "./types.js";
 
@@ -412,13 +413,18 @@ function validateOnAgentExit(v: unknown, errors: string[]): OnAgentExit {
   return TEMPLATE_DEFAULTS.onAgentExit;
 }
 
+/** A param's effective target (defaults to "env" when unset). PURE. */
+function paramTarget(p: QueueParam): QueueParamTarget {
+  return p.target ?? "env";
+}
+
 /**
  * (§8b) Resolve the template's declared params + the user's answers into the ENV map handed
- * to the provider commands. PURE. For each declared param, the value is `values[name]` when
- * present, else the param's `default`, else "" — and it is exported under `param.env`. An
- * empty value is still set (the provider sees an empty var) UNLESS it's the empty-string
- * default-of-absent, in which case it is omitted so the provider's own env-file fallback can
- * apply. Undeclared keys in `values` are ignored (only declared params flow through).
+ * to the provider commands. PURE. For each declared ENV param, the value is `values[name]`
+ * when present, else the param's `default`, else "" — and it is exported under `param.env`.
+ * An empty value is omitted so the provider's own env-file fallback can apply. Non-"env"
+ * params (e.g. "maxItems") are SKIPPED — they never reach the provider env. Undeclared keys
+ * in `values` are ignored (only declared params flow through).
  */
 export function resolveParamsEnv(
   template: QueueTemplate,
@@ -426,10 +432,39 @@ export function resolveParamsEnv(
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const p of template.params) {
+    if (paramTarget(p) !== "env") continue; // only env-target params go to the provider
     const v = values[p.name] ?? p.default ?? "";
-    if (v.length > 0) out[p.env] = v;
+    if (v.length > 0 && p.env !== undefined) out[p.env] = v;
   }
   return out;
+}
+
+/** Tokens (case-insensitive) a maxItems answer may use to mean "no cap". */
+const MAXITEMS_UNLIMITED_TOKENS = new Set(["0", "unlimited", "none", "inf", "infinity", "∞"]);
+
+/**
+ * (§8b) Resolve the run's maxItems OVERRIDE from a "maxItems"-target param's answer. PURE.
+ * Returns:
+ *   - `undefined` when the template declares no maxItems param, OR the answer is blank, OR
+ *     the answer is garbage (non-integer) — the caller then uses the template's `maxItems`
+ *     (a safe finite default; garbage never silently means "spawn forever").
+ *   - `0` for an explicit "unlimited" answer ("0"/"unlimited"/"none"/"inf"/"∞") — the caller
+ *     treats 0 as NO lifetime cap.
+ *   - a positive integer N for an explicit numeric cap.
+ * Only the FIRST maxItems-target param is honored (the validator already rejects a second).
+ */
+export function resolveMaxItemsOverride(
+  template: QueueTemplate,
+  values: Record<string, string> = {},
+): number | undefined {
+  const p = template.params.find((q) => paramTarget(q) === "maxItems");
+  if (p === undefined) return undefined;
+  const raw = (values[p.name] ?? p.default ?? "").trim().toLowerCase();
+  if (raw === "") return undefined; // blank → template default
+  if (MAXITEMS_UNLIMITED_TOKENS.has(raw)) return 0; // explicit unlimited
+  const n = Number(raw);
+  if (Number.isInteger(n) && n > 0) return n; // explicit positive cap
+  return undefined; // garbage → template default (safe finite)
 }
 
 /**
@@ -454,42 +489,62 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
  * Validate the optional START-TIME `params` (§8b). PURE. Absent ⇒ `[]` (no prompt — the
- * prior behavior). Each entry needs a non-empty `name` and an `env` that is a valid env-var
- * name (the value is exported under it to the provider); `label`/`default` are optional
- * strings; `required` an optional bool. A malformed entry pushes an error (so the start
- * fails loudly rather than silently dropping a param). Duplicate `name`s or `env`s are
- * rejected (an ambiguous prompt / clobbered env).
+ * prior behavior). Each entry needs a non-empty `name`; `target` is "env" (default) or
+ * "maxItems". An "env"-target param needs an `env` that is a valid env-var name (the value
+ * is exported under it to the provider); a "maxItems"-target param ignores `env` and there
+ * may be AT MOST ONE (a second is rejected). `label`/`default` are optional strings;
+ * `required` an optional bool. A malformed entry pushes an error (so the start fails loudly
+ * rather than silently dropping a param). Duplicate `name`s or `env`s are rejected (an
+ * ambiguous prompt / clobbered env).
  */
 function validateParams(v: unknown, errors: string[]): QueueParam[] {
   if (v === undefined) return [];
   if (!Array.isArray(v)) {
-    errors.push("params must be an array of {name,env,label?,default?,required?}");
+    errors.push("params must be an array of {name,target?,env?,label?,default?,required?}");
     return [];
   }
   const out: QueueParam[] = [];
   const names = new Set<string>();
   const envs = new Set<string>();
+  let sawMaxItems = false;
   for (const raw of v) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-      errors.push("each param must be an object {name,env,…}");
+      errors.push("each param must be an object {name,…}");
       continue;
     }
     const r = raw as Record<string, unknown>;
     const name = r.name;
-    const env = r.env;
     if (typeof name !== "string" || name.length === 0) {
       errors.push("param.name must be a non-empty string");
       continue;
     }
-    if (typeof env !== "string" || !ENV_NAME_RE.test(env)) {
-      errors.push(`param "${name}": env must be a valid env-var name (got ${JSON.stringify(env)})`);
-      continue;
+    let target: QueueParamTarget = "env";
+    if (r.target !== undefined) {
+      if (r.target === "env" || r.target === "maxItems") {
+        target = r.target;
+      } else {
+        errors.push(`param "${name}": target must be "env" or "maxItems"`);
+        continue;
+      }
+    }
+    const env = r.env;
+    if (target === "env") {
+      if (typeof env !== "string" || !ENV_NAME_RE.test(env)) {
+        errors.push(`param "${name}": env must be a valid env-var name (got ${JSON.stringify(env)})`);
+        continue;
+      }
+    } else {
+      // maxItems target: env is ignored; at most one such param.
+      if (sawMaxItems) {
+        errors.push(`param "${name}": only one "maxItems" param is allowed`);
+        continue;
+      }
     }
     if (names.has(name)) {
       errors.push(`duplicate param name "${name}"`);
       continue;
     }
-    if (envs.has(env)) {
+    if (target === "env" && typeof env === "string" && envs.has(env)) {
       errors.push(`duplicate param env "${env}"`);
       continue;
     }
@@ -506,11 +561,16 @@ function validateParams(v: unknown, errors: string[]): QueueParam[] {
       continue;
     }
     names.add(name);
-    envs.add(env);
-    const p: QueueParam = { name, env };
+    const p: QueueParam = { name };
+    if (target !== "env") p.target = target;
+    if (target === "env" && typeof env === "string") {
+      envs.add(env);
+      p.env = env;
+    }
     if (typeof r.label === "string") p.label = r.label;
     if (typeof r.default === "string") p.default = r.default;
     if (r.required === true) p.required = true;
+    if (target === "maxItems") sawMaxItems = true;
     out.push(p);
   }
   return out;
