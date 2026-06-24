@@ -242,6 +242,9 @@ test("validateTemplate: minimal good template fills defaults", () => {
   assert.equal(t.maxItems, TEMPLATE_DEFAULTS.maxItems);
   assert.deepEqual(t.grid, TEMPLATE_DEFAULTS.grid);
   assert.deepEqual(t.intervals, TEMPLATE_DEFAULTS.intervals);
+  // The aligned default: list every 60s, status every 30s (honored by the runner's
+  // interval throttling, not just stored). Pinned so an accidental edit is caught.
+  assert.deepEqual(TEMPLATE_DEFAULTS.intervals, { listMs: 60000, statusMs: 30000 });
   assert.equal(t.onAgentExit, "leave-and-bell");
   assert.equal(t.closeOnComplete, true);
   assert.equal(t.closeStableSeconds, TEMPLATE_DEFAULTS.closeStableSeconds);

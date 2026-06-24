@@ -94,7 +94,7 @@ shell the engine just runs.
   "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // auto-layout; fill columns before rows
   "quitWhenEmpty": false,                    // true => the run quits when the queue drains
                                              //   AND no agents are left (even before maxItems)
-  "intervals": { "listMs": 45000, "statusMs": 20000 },
+  "intervals": { "listMs": 60000, "statusMs": 30000 },  // provider call cadence (see note below)
   "provider": {
     // LIST: print the actionable items as a JSON array. Expected to ALREADY exclude
     // blocked / claimed / done items (the queue has no dependency graph by design).
@@ -189,6 +189,19 @@ Provider contract (the genericity boundary):
 - **`claim {key}`** → optional, fire-and-forget.
 - Item fields reach the **provider** as argv elements (`{key}`) and the **agent** as
   `GHOSTTY_ITEM_*` env vars — they are never string-spliced into a shell line.
+
+**`intervals` — how often the provider is actually called.** The supervisor runs a ~5s
+internal sweep (reconcile / close finished splits / apply dashboard commands / refresh the
+health bar all happen every sweep), but it does **not** run your `list`/`status` commands every
+sweep — those are throttled to `intervals.listMs` / `intervals.statusMs`. So with the defaults
+(`listMs: 60000`, `statusMs: 30000`) your tracker is queried for new work at most once a minute
+and each running item's completion is checked at most every 30s. Lower them if you want the
+queue to notice newly-unblocked items / completed items faster (at the cost of more API calls);
+raise them to be gentler on a rate-limited provider. Two consequences worth knowing: a
+**completed** item's split closes within ~`statusMs` of it actually finishing, and bumping a
+running queue's **maxItems** (or resuming it) re-enables dispatch but the *new* agent spawns on
+the next `list` poll (≤`listMs`) — the dashboard cap/phase updates instantly, only the spawn
+waits for the poll.
 
 There's a no-Linear demo (a fake `list`/`status` that drains as you `touch` marker files)
 to try the mechanics first — see `scratchpad/queue-example/` in this checkout.

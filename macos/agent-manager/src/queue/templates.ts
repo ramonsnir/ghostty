@@ -36,7 +36,7 @@ export const TEMPLATE_DEFAULTS = {
   concurrency: 1,
   maxItems: 100,
   grid: { cols: 3, rows: 3, fill: "columns" as GridFill },
-  intervals: { listMs: 45000, statusMs: 20000 },
+  intervals: { listMs: 60000, statusMs: 30000 },
   onAgentExit: "leave-and-bell" as OnAgentExit,
   closeOnComplete: true,
   closeStableSeconds: 5,
