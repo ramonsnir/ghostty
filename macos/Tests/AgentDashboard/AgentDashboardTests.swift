@@ -627,6 +627,56 @@ struct AgentDashboardModelTests {
         #expect(model.entries.map(\.id).contains(a))
     }
 
+    // (ramon fork / Bell Attention) A surface the Agent Manager PROMOTES via
+    // set_attention must never stay hidden, and the promotion floats + marks the tile.
+    @Test func attentionAutoUnhidesAndMarks() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        model.hide(a)
+        #expect(model.hidden.contains(a))
+
+        model.applyAttention([a: true])
+        #expect(!model.hidden.contains(a), "a promoted tile must be unhidden")
+        #expect(!store.load().contains(a), "hide store updated")
+        #expect(model.entries.first?.attention == true, "tile marked + floated")
+    }
+
+    // (ramon fork / Bell Attention) With the tone-down filter ON, a RAW bell must NOT
+    // auto-unhide a hidden tile (only a promotion does). Guards the `if !bellFilter`
+    // branch in applyBells — a regression dropping it would otherwise pass green.
+    @Test func bellFilterOnRawBellDoesNotUnhide() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store, bellFilter: true)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        model.hide(a)
+
+        model.applyBells([a: true])     // raw bell under the filter
+        #expect(model.hidden.contains(a), "a raw bell must not unhide under the filter")
+
+        // ...but a promotion still does.
+        model.applyAttention([a: true])
+        #expect(!model.hidden.contains(a), "a promotion unhides even under the filter")
+    }
+
+    // (ramon fork / Bell Attention) Filter OFF: applyBells still auto-unhides (the new
+    // gate collapses to upstream behavior).
+    @Test func bellFilterOffRawBellStillUnhides() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store, bellFilter: false)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        model.hide(a)
+
+        model.applyBells([a: true])
+        #expect(!model.hidden.contains(a), "filter off ⇒ raw bell unhides as upstream")
+    }
+
     @Test func bellFalseKeepsHidden() {
         // Negative complement of the auto-unhide path (LOCKED #1 / spec §4.2):
         // a hidden agent that is NOT ringing must STAY hidden through applyBells.
