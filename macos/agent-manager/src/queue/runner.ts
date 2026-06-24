@@ -351,7 +351,18 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
   }
   if (commands.length > 0) {
     const changed = applyCommands(deps.registry, commands, deps.factory);
-    if (changed) persistActiveRunSet(deps);
+    if (changed) {
+      persistActiveRunSet(deps);
+      // SNAPPY FEEDBACK: push each run's health snapshot IMMEDIATELY after a command applies,
+      // BEFORE this sweep's provider round-trips (the per-agent `status` probes + the `list`
+      // fetch). Otherwise a pause/resume/stop/set_max_items only reflects in the dashboard at
+      // the END of the sweep (after those Linear calls) — the visible "really slow" lag. The
+      // normal end-of-sweep report still runs and refreshes the live counts. Skip ABORTING
+      // runs (the sweep removes them + reports `present:false` below — no point flashing them).
+      for (const run of deps.registry.values()) {
+        if (!run.aborting) await reportQueueStatus(run, deps);
+      }
+    }
   }
 
   // No runs in the registry (none started / all drained-or-aborted-away) ⇒ nothing to
