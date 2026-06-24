@@ -343,6 +343,9 @@ private struct OriginSectionHeader: View {
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
     @State private var confirmStop = false
     @State private var confirmAbort = false
+    // (§11 health) The "N waiting" / "M running" count dropdowns (items + Linear links).
+    @State private var showWaiting = false
+    @State private var showRunning = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -376,16 +379,19 @@ private struct OriginSectionHeader: View {
             if let status {
                 HStack(spacing: 6) {
                     phaseChip(status.phase)
-                    Text(QueueHealthFormat.healthText(status))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    if !status.next.isEmpty {
-                        Text("next: " + status.next.prefix(3).map(\.key).joined(separator: ", "))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .help(status.next.map { $0.title ?? $0.key }.joined(separator: "\n"))
+                    if status.listOk {
+                        // Clickable counts → a dropdown of the items with Linear links
+                        // (mirrors the hidden-agents popover).
+                        countButton("\(status.queued) waiting", items: status.next,
+                                    total: status.queued, show: $showWaiting,
+                                    emptyText: "Nothing waiting.")
+                        countButton("\(status.active) running", items: status.running,
+                                    total: status.active, show: $showRunning,
+                                    emptyText: "Nothing running.")
+                        Text(QueueHealthFormat.progressText(status))
+                            .font(.caption2).foregroundStyle(.secondary)
+                    } else {
+                        Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
                 }
@@ -433,22 +439,81 @@ private struct OriginSectionHeader: View {
         .buttonStyle(.borderless)
         .help(help)
     }
+
+    /// A clickable count chip ("N waiting" / "M running") that opens a popover listing
+    /// the items with Linear links. Styled as a subtle link so it reads as a count.
+    private func countButton(
+        _ label: String, items: [QueueStatus.Item], total: Int,
+        show: Binding<Bool>, emptyText: String
+    ) -> some View {
+        Button { show.wrappedValue.toggle() } label: {
+            Text(label).font(.caption2)
+        }
+        .buttonStyle(.link)
+        .help("Show items")
+        .popover(isPresented: show, arrowEdge: .bottom) {
+            itemsPopover(title: label, items: items, total: total, emptyText: emptyText)
+        }
+    }
+
+    /// The popover body for a count chip: one row per item (key badge · title · Linear
+    /// link), plus a "… and N more" note when the list was capped below the total. All
+    /// text via `Text`/`Link` (SwiftUI escapes it — the key/title/url are untrusted
+    /// tracker data; only http(s) urls are made clickable).
+    @ViewBuilder
+    private func itemsPopover(
+        title: String, items: [QueueStatus.Item], total: Int, emptyText: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline)
+            if items.isEmpty {
+                Text(emptyText).font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(items) { item in
+                    HStack(spacing: 6) {
+                        Text(item.key)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.18))
+                            .clipShape(Capsule())
+                        itemLink(item)
+                        Spacer(minLength: 4)
+                    }
+                }
+                if total > items.count {
+                    Text("… and \(total - items.count) more")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(12)
+        .frame(width: 420)
+    }
+
+    /// The item's title as a Linear `Link` when it carries an http(s) url; else plain text.
+    @ViewBuilder
+    private func itemLink(_ item: QueueStatus.Item) -> some View {
+        let text = (item.title?.isEmpty == false) ? item.title! : item.key
+        if let urlString = item.url,
+           let url = URL(string: urlString),
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            Link(text, destination: url)
+                .font(.caption).lineLimit(1).truncationMode(.middle)
+        } else {
+            Text(text).font(.caption).foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+        }
+    }
 }
 
 /// (ramon fork / Agent Queue, §11 health) PURE formatting for the queue bar's status
 /// line — split out (internal) so it is unit-testable independent of the SwiftUI view.
 enum QueueHealthFormat {
-    /// The status summary text (excluding the phase chip + the "next:" list).
-    /// "reading the queue…" until the first successful list; otherwise "{queued} waiting"
-    /// (+ "· {active} running" when any) + "· {dispatched}/{cap}" progress (∞ = unlimited)
-    /// — so a reached maxItems cap (e.g. 1/1) is visible at a glance.
-    static func healthText(_ s: QueueStatus) -> String {
-        guard s.listOk else { return "reading the queue…" }
-        var parts: [String] = ["\(s.queued) waiting"]
-        if s.active > 0 { parts.append("\(s.active) running") }
+    /// The lifetime-progress suffix shown after the clickable counts: "{dispatched}/{cap}"
+    /// with ∞ for an unlimited cap — so a reached maxItems (e.g. 1/1) is visible at a glance.
+    static func progressText(_ s: QueueStatus) -> String {
         let cap = s.maxItems.map(String.init) ?? "∞"
-        parts.append("\(s.dispatched)/\(cap)")
-        return parts.joined(separator: " · ")
+        return "\(s.dispatched)/\(cap)"
     }
 
     /// The accent color for a phase chip.

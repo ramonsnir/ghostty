@@ -6,10 +6,12 @@
 
 import type { WorkItem } from "./types.js";
 
-/** One "what's next" entry for the dashboard header (key + optional title). */
-export interface QueueNextItem {
+/** One item reference for the dashboard header dropdowns (key + optional title + the
+ *  Linear/tracker URL, so a "0 waiting"/"N running" click can link out). */
+export interface QueueItemRef {
   key: string;
   title?: string;
+  url?: string;
 }
 
 /** The run-level health snapshot the GUI dashboard renders. Mirrors the Swift
@@ -31,8 +33,12 @@ export interface QueueStatusReport {
   dispatched: number;
   /** Effective lifetime cap, or null for unlimited. */
   maxItems: number | null;
-  /** Up to `nextLimit` of the next actionable items (not currently active). */
-  next: QueueNextItem[];
+  /** Up to `nextLimit` of the next actionable items (not currently active) — the
+   *  "N waiting" dropdown. May be shorter than `queued` (capped); each carries its URL. */
+  next: QueueItemRef[];
+  /** The currently-RUNNING items (one per slot-occupying agent) — the "M running"
+   *  dropdown. `running.length === active`. Each carries its URL. */
+  running: QueueItemRef[];
 }
 
 /** Inputs for the pure status builder — primitives + the run's in-memory facts. */
@@ -45,8 +51,9 @@ export interface QueueStatusInputs {
   /** false until the run has reconciled+armed once (the very first sweep) — drives the
    *  "starting" phase so the dashboard shows the queue immediately, before any dispatch. */
   dispatchArmed: boolean;
-  /** How many agents are currently RUNNING (slot-occupying assignments). */
-  activeCount: number;
+  /** The currently-RUNNING items (slot-occupying assignments) with key/title/url. The
+   *  report's `active` count is `runningItems.length` and `running` echoes them. */
+  runningItems: ReadonlyArray<QueueItemRef>;
   /** Keys NOT eligible to dispatch (active assignments of any state + the §7.1 latch) —
    *  excluded from queued/next so the backlog reflects what would actually dispatch. */
   excludeKeys: ReadonlySet<string>;
@@ -81,6 +88,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       dispatched: input.dispatched,
       maxItems: input.maxItemsCap,
       next: [],
+      running: [],
     };
   }
 
@@ -105,19 +113,24 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
   else if (!input.dispatchArmed || !input.listOk) phase = "starting";
   else phase = "running";
 
+  // Map a WorkItem/ref → QueueItemRef, including title/url only when non-empty.
+  const toRef = (i: { key: string; title?: string; url?: string }): QueueItemRef => {
+    const ref: QueueItemRef = { key: i.key };
+    if (i.title !== undefined && i.title.length > 0) ref.title = i.title;
+    if (i.url !== undefined && i.url.length > 0) ref.url = i.url;
+    return ref;
+  };
+
   return {
     queueName: input.queueName,
     present: true,
     phase,
     queued: deduped.length,
     listOk: input.listOk,
-    active: input.activeCount,
+    active: input.runningItems.length,
     dispatched: input.dispatched,
     maxItems: input.maxItemsCap,
-    next: deduped.slice(0, nextLimit).map((i) =>
-      i.title !== undefined && i.title.length > 0
-        ? { key: i.key, title: i.title }
-        : { key: i.key },
-    ),
+    next: deduped.slice(0, nextLimit).map(toRef),
+    running: input.runningItems.map(toRef),
   };
 }
