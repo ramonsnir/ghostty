@@ -1001,6 +1001,17 @@ final class AgentDashboardModel: ObservableObject {
     /// state — this is a one-way control intent (single owner = the sidecar).
     func sendRunCommand(_ action: QueueCommand.Action, run: String) {
         guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        // OPTIMISTIC: reflect the phase change instantly (the sidecar's next push, ~one sweep
+        // later, reconciles). Without this the header lags a full sweep + its Linear round-trips.
+        if let existing = queueStatuses[run] {
+            switch action {
+            case .pause:  queueStatuses[run] = existing.withPhase("paused")
+            case .resume: queueStatuses[run] = existing.withPhase("running")
+            case .stop:   queueStatuses[run] = existing.withPhase("draining")
+            case .abort:  queueStatuses.removeValue(forKey: run)  // section clears immediately
+            default: break
+            }
+        }
         NotificationCenter.default.post(
             name: .ghosttyQueueCommand,
             object: nil,
@@ -1017,6 +1028,13 @@ final class AgentDashboardModel: ObservableObject {
     func setQueueMaxItems(run: String, value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !trimmed.isEmpty else { return }
+        // OPTIMISTIC: show a VALID cap instantly (the sidecar's next push reconciles, and
+        // corrects if it parsed differently). A blank/garbage value (`.none`) is left as-is —
+        // the sidecar ignores it, so we must not fake a change the engine won't make.
+        if let existing = queueStatuses[run],
+           case let .some(parsed) = QueueStatus.parseCapOptimistic(trimmed) {
+            queueStatuses[run] = existing.withMaxItems(parsed)
+        }
         NotificationCenter.default.post(
             name: .ghosttyQueueCommand,
             object: nil,

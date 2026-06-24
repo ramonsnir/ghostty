@@ -129,6 +129,39 @@ struct QueueStatus: Equatable, Sendable {
     /// The currently-RUNNING items (one per slot-occupying agent) — the "M running"
     /// dropdown. `running.count == active`.
     let running: [Item]
+
+    // MARK: - Optimistic edits (instant dashboard feedback before the sidecar confirms)
+
+    /// A copy with `maxItems` replaced (nil = unlimited). Used to reflect a cap edit
+    /// IMMEDIATELY in the header; the sidecar's next authoritative push reconciles it.
+    func withMaxItems(_ newMax: Int?) -> QueueStatus {
+        QueueStatus(
+            queueName: queueName, present: present, phase: phase, queued: queued,
+            listOk: listOk, active: active, dispatched: dispatched, maxItems: newMax,
+            next: next, running: running)
+    }
+
+    /// A copy with `phase` replaced — optimistic pause/resume/stop feedback.
+    func withPhase(_ newPhase: String) -> QueueStatus {
+        QueueStatus(
+            queueName: queueName, present: present, phase: newPhase, queued: queued,
+            listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
+            next: next, running: running)
+    }
+
+    /// (pure, testable) Parse the cap-editor's raw string the SAME way the sidecar's
+    /// `parseMaxItemsValue` does, for the optimistic update. Returns a DOUBLE optional so
+    /// "leave unchanged" is distinct from "set to unlimited":
+    ///   `.none`            → blank / garbage → caller should NOT optimistically change
+    ///   `.some(nil)`       → unlimited (`0`/`unlimited`/`none`/`inf`/`∞`) → set maxItems = nil
+    ///   `.some(.some(n))`  → a positive-integer cap
+    static func parseCapOptimistic(_ raw: String) -> Int?? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if s.isEmpty { return .none }
+        if ["0", "unlimited", "none", "inf", "infinity", "∞"].contains(s) { return .some(nil) }
+        if let n = Int(s), n > 0 { return .some(n) }
+        return .none
+    }
 }
 
 /// PURE, unit-tested parser of the `report_queue_status` tool arguments → `QueueStatus`.

@@ -997,6 +997,31 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
     Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
     **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **INSTANT command feedback (snappiness fix for ALL queue commands).** A queue command
+    (`set_max_items`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
+    NEXT health push — i.e. after the ~5s `QUEUE_POLL_INTERVAL_MS` poll gap AND that sweep's
+    provider round-trips (per-agent `status` probes + `list`), since `reportQueueStatus` is the
+    LAST step of a sweep. Felt like 5–15s ("really slow"). Two-part fix: **(GUI optimistic)**
+    `AgentDashboardModel.setQueueMaxItems`/`sendRunCommand` update the local `queueStatuses`
+    entry IMMEDIATELY before posting — cap via `QueueStatus.parseCapOptimistic` (mirrors the
+    sidecar's `parseMaxItemsValue`; `.none`=blank/garbage→leave as-is so we never fake a change
+    the engine ignores) + `withMaxItems`; phase via `withPhase` (pause→paused/resume→running/
+    stop→draining); abort removes the section. The sidecar's next authoritative push reconciles
+    (and corrects a mis-parsed value). **(Sidecar fast confirm)** `runQueueSweep` pushes
+    `reportQueueStatus` for every (non-aborting) run IMMEDIATELY after `applyCommands` changes
+    the registry — BEFORE the sweep's `status`/`list` round-trips — so the authoritative number
+    lands within the drain, not at sweep end. Wiring: `QueueCommandBridge.swift`
+    (`QueueStatus.withMaxItems`/`withPhase`/`parseCapOptimistic`),
+    `AgentDashboardController.swift` (optimistic mutation in both posters), `runner.ts`
+    (post-`applyCommands` immediate report loop). Tests: `AgentDashboardTests`
+    (`parseCapOptimisticMirrorsSidecar`, `setQueueMaxItemsOptimisticallyUpdatesCap`,
+    `sendRunCommandOptimisticallyUpdatesPhase`); the sidecar suite still green. **GUI relaunch +
+    rebuilt sidecar `dist`; no host/Zig change.** NOTE (separate, NOT fixed here): the template
+    `intervals.listMs`/`statusMs` knobs are currently **dead** — `runner.ts` calls `fetchListResult`
+    + `probeStatus` EVERY 5s sweep, ignoring them — so the provider (e.g. Linear) is hit every 5s
+    regardless of the configured 45/20s (or the user's 60/30s). Honoring those (gate provider calls
+    by last-call-time vs the intervals, keeping the sweep at 5s for reconcile/close/commands) is the
+    real "5s too frequent" fix — a follow-up.
   - **PER-SCOPE RUN IDENTITY — one template, parallel runs per project/milestone (palette shows the
     template `name`).** Three coupled changes so a generic template (e.g. Example) is re-usable in
     parallel for different env-param scopes:

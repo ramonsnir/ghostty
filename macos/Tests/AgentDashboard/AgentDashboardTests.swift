@@ -2001,6 +2001,50 @@ struct AgentQueueHealthTests {
         #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 4, maxItems: nil)) == "")
     }
 
+    // MARK: - OPTIMISTIC command feedback (instant dashboard update before the sidecar push)
+
+    @Test func parseCapOptimisticMirrorsSidecar() {
+        // number → cap; unlimited tokens → .some(nil); blank/garbage/negative → .none (ignore).
+        if case .some(.some(10)) = QueueStatus.parseCapOptimistic("10") {} else { Issue.record("10 → cap 10") }
+        if case .some(nil) = QueueStatus.parseCapOptimistic("unlimited") {} else { Issue.record("unlimited → nil") }
+        if case .some(nil) = QueueStatus.parseCapOptimistic("0") {} else { Issue.record("0 → nil") }
+        if case .none = QueueStatus.parseCapOptimistic("") {} else { Issue.record("blank → ignore") }
+        if case .none = QueueStatus.parseCapOptimistic("abc") {} else { Issue.record("garbage → ignore") }
+        if case .none = QueueStatus.parseCapOptimistic("-3") {} else { Issue.record("negative → ignore") }
+    }
+
+    @Test func setQueueMaxItemsOptimisticallyUpdatesCap() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", dispatched: 3, maxItems: 3))
+        // A numeric cap shows immediately (no waiting for the sidecar's next sweep).
+        model.setQueueMaxItems(run: "ExampleOS", value: "7")
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == 7)
+        // "unlimited" → nil (∞).
+        model.setQueueMaxItems(run: "ExampleOS", value: "unlimited")
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == nil)
+        // Garbage is NOT applied (the sidecar ignores it — don't fake a change).
+        model.applyQueueStatus(status("ExampleOS", dispatched: 3, maxItems: 5))
+        model.setQueueMaxItems(run: "ExampleOS", value: "abc")
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == 5)
+        // Unknown run: no optimistic entry conjured (just posts the command).
+        model.setQueueMaxItems(run: "Ghost", value: "9")
+        #expect(model.queueStatuses["Ghost"] == nil)
+    }
+
+    @Test func sendRunCommandOptimisticallyUpdatesPhase() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", phase: "running"))
+        model.sendRunCommand(.pause, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"]?.phase == "paused")
+        model.sendRunCommand(.resume, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"]?.phase == "running")
+        model.sendRunCommand(.stop, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"]?.phase == "draining")
+        // Abort clears the section immediately.
+        model.sendRunCommand(.abort, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"] == nil)
+    }
+
     // MARK: - applyQueueStatus carries next/running items (for the dropdowns)
 
     @Test func surfaceIDResolvesByQueueNameAndKey() {
