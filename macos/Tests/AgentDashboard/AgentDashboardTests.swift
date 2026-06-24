@@ -1645,6 +1645,52 @@ struct AgentDashboardWaitingSortTests {
         ]).map(\.id)
         #expect(sorted.first == ring)
     }
+
+    @Test func idleBeatsWorking() {
+        // (ramon fork / Agent hooks) An idle agent (free for new work) sorts
+        // above a working one. Fixed UUIDs make the tiebreak deterministic:
+        // working < idle lexically, so without the idle tier working would win.
+        let working = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let idle = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let sorted = AgentDashboardModel.sorted([
+            entry(working, bell: false, state: .working),
+            entry(idle, bell: false, state: .idle),
+        ]).map(\.id)
+        #expect(sorted.first == idle)
+    }
+
+    @Test func attentionStillOutranksIdle() {
+        // Idle floats above working, but a waiting tile (attention) still floats
+        // above idle.
+        let idle = UUID(), working = UUID(), waiting = UUID()
+        let sorted = AgentDashboardModel.sorted([
+            entry(idle, bell: false, state: .idle),
+            entry(working, bell: false, state: .working),
+            entry(waiting, bell: false, state: .waiting),
+        ]).map(\.id)
+        #expect(sorted == [waiting, idle, working])
+    }
+
+    @Test func manualOrderStillOutranksIdle() {
+        // An explicit manual rank takes precedence over idle-above-working: the
+        // idle tier only orders equal-rank peers. A working tile placed first
+        // stays first despite an idle peer placed second.
+        let working = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let idle = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+        let entries = [
+            AgentEntry(id: working, realView: nil, title: "t", pwd: "/x", agent: nil,
+                       bell: false, hidden: false, sessionID: 10, agentState: .working,
+                       lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
+                       userNotes: nil, suggestionDismissed: false, backgroundShells: 0),
+            AgentEntry(id: idle, realView: nil, title: "t", pwd: "/x", agent: nil,
+                       bell: false, hidden: false, sessionID: 20, agentState: .idle,
+                       lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
+                       userNotes: nil, suggestionDismissed: false, backgroundShells: 0),
+        ]
+        let rank: [UInt64: Int] = [10: 0, 20: 1]
+        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.id)
+        #expect(sorted == [working, idle])
+    }
 }
 
 // MARK: - unzoomIfHidden decision (pure transform over SplitTree)

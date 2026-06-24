@@ -947,17 +947,29 @@ final class AgentDashboardModel: ObservableObject {
         e.bell || (e.agentState == .waiting && e.backgroundShells == 0)
     }
 
+    /// Whether the agent is idle — done with its turn and free for new work.
+    /// (ramon fork / Agent hooks) Idle tiles sort ABOVE busy (working / unknown)
+    /// ones among equal-rank peers, so a finished agent is easy to spot and hand
+    /// the next task to. Below attention + manual order so neither is disturbed.
+    private static func isIdle(_ e: AgentEntry) -> Bool {
+        e.agentState == .idle
+    }
+
     /// Deterministic order, highest precedence first:
     ///   1. attention-first (bell OR waiting) — demands always float to the top;
     ///   2. user manual order (`manualRank`, keyed by host session id) — an
     ///      UNPLACED tile (no rank) sorts ABOVE a placed one, so a newly-appeared
     ///      agent floats to the top until the user places it; placed tiles sort
     ///      by ascending rank;
-    ///   3. most-recently-seen-as-agent (descending) — orders the unplaced tiles
-    ///      among themselves (and is a near-constant tie for placed ones);
-    ///   4. stable UUID tie-break.
+    ///   3. idle-above-busy — among equal-rank peers, an idle agent (free for new
+    ///      work) sorts above a working/unknown one. With no manual ranks set
+    ///      (the common case, all tiles unplaced + tied) this floats every idle
+    ///      tile above every busy one;
+    ///   4. most-recently-seen-as-agent (descending) — orders the remaining ties
+    ///      among themselves;
+    ///   5. stable UUID tie-break.
     /// A session id of 0 (no host session) is treated as never-placed: it can't
-    /// be ranked stably, so it falls through to recency/UUID.
+    /// be ranked stably, so it falls through to idle/recency/UUID.
     static func sorted(
         _ entries: [AgentEntry],
         lastSeen: [UUID: Date] = [:],
@@ -973,6 +985,9 @@ final class AgentDashboardModel: ObservableObject {
             // Unplaced (nil) sorts before placed (non-nil): new agents at top.
             if (ra == nil) != (rb == nil) { return ra == nil }
             if let ra, let rb, ra != rb { return ra < rb }
+            // Idle (free for new work) floats above busy tiles among equal-rank peers.
+            let ai = isIdle(a), bi = isIdle(b)
+            if ai != bi { return ai && !bi }
             let sa = lastSeen[a.id] ?? .distantPast
             let sb = lastSeen[b.id] ?? .distantPast
             if sa != sb { return sa > sb }
