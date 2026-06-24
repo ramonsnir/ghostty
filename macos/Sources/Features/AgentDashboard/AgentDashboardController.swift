@@ -365,6 +365,18 @@ final class AgentDashboardModel: ObservableObject {
         rebuildEntriesFromCurrentState()
     }
 
+    /// Force-close a surface from its tile (user gesture, escape hatch). Tears the split
+    /// down via the confirm-FREE path (`MCPLayout.forceClose`, the same one the queue's
+    /// auto-close uses) — so it works even on a live agent without popping the
+    /// confirm-close-surface modal. The caller is responsible for confirming first (the
+    /// tile shows a confirmation dialog). For a QUEUE tile this unblocks the run: once the
+    /// surface vanishes, the supervisor's next reconcile prunes the assignment and frees
+    /// the slot. The tile disappears on the next detector poll when the surface is gone.
+    /// No-op on an unresolved id. MUST be on main — the model is.
+    func closeSurface(_ id: UUID) {
+        _ = MCPLayout.forceClose(uuid: id)
+    }
+
     /// Manually reveal a single hidden surface. Persists.
     func show(_ id: UUID) {
         guard hidden.contains(id) else { return }

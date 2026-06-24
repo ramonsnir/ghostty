@@ -90,7 +90,8 @@ struct AgentDashboardView: View {
                             entry: entry,
                             ghostty: ghostty,
                             previewsEnabled: ptyHostEnabled,
-                            onHide: { model.hide(entry.id) }
+                            onHide: { model.hide(entry.id) },
+                            onClose: { model.closeSurface(entry.id) }
                         )
                         .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
                         .listRowSeparator(.hidden)

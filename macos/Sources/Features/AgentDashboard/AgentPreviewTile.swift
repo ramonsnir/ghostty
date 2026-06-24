@@ -13,8 +13,12 @@ struct AgentPreviewTile: View {
     /// When false (pty-host off), render a metadata-only tile (no mirror).
     let previewsEnabled: Bool
     let onHide: () -> Void
+    /// Force-close this split + free its (queue) slot — the escape hatch for a wedged
+    /// queue agent. Gated behind a confirmation (no undo: it ends the agent).
+    let onClose: () -> Void
 
     @State private var hovering = false
+    @State private var confirmClose = false
 
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
@@ -104,6 +108,13 @@ struct AgentPreviewTile: View {
                     .foregroundStyle(Self.bellAmber)
             }
             if hovering {
+                Button { confirmClose = true } label: {
+                    Image(systemName: "stop.circle")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red)
+                .help("Close this split (ends the agent; frees its queue slot)")
                 Button(action: onHide) {
                     Image(systemName: "xmark")
                         .font(.caption2)
@@ -116,6 +127,16 @@ struct AgentPreviewTile: View {
         .frame(height: 22)
         .contentShape(Rectangle())
         .onTapGesture { jump() }
+        .confirmationDialog(
+            "Close “\(entry.title)”?",
+            isPresented: $confirmClose,
+            titleVisibility: .visible
+        ) {
+            Button("Close split", role: .destructive, action: onClose)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Force-closes this split and ends the agent running in it, discarding any in-progress work. If it's a queue agent, this frees its queue slot so the queue can move on.")
+        }
     }
 
     private var badge: some View {
