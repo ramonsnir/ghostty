@@ -121,6 +121,17 @@ export interface QueueParam {
   default?: string;
   /** When true the start is REJECTED if the resolved value is empty. Default false. */
   required?: boolean;
+  /**
+   * OPTIONAL value-suggestion provider (a GUI-only affordance): an argv command that
+   * prints a JSON array of suggested values for this param — either bare strings
+   * (`["Acme","Globex"]`) or `{value,label?}` objects. The GUI runs it (with the CURRENT
+   * form values exported under the OTHER params' `env`, so a dependent provider — e.g.
+   * milestones for the selected project — sees `$LINEAR_PROJECT`) and shows the results
+   * as pickable suggestions, so the user doesn't have to type exact names. The SIDECAR
+   * does NOT run this (it never dispatches from a suggestion); it is validated here only
+   * so the template stays honest. Absent ⇒ no suggestions (free-text only).
+   */
+  valuesCommand?: string[];
 }
 
 /** A fully-parsed, validated queue template (§5). The runtime engine consumes this;

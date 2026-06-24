@@ -560,6 +560,14 @@ function validateParams(v: unknown, errors: string[]): QueueParam[] {
       errors.push(`param "${name}": required must be a boolean`);
       continue;
     }
+    // Optional value-suggestion provider (GUI-only): a non-empty argv. Validated here
+    // (so a malformed one fails the template loudly) even though only the GUI runs it.
+    let valuesCommand: string[] | undefined;
+    if (r.valuesCommand !== undefined) {
+      const vc = reqCommand(r.valuesCommand, `param "${name}": valuesCommand`, errors);
+      if (vc === undefined) continue;
+      valuesCommand = vc;
+    }
     names.add(name);
     const p: QueueParam = { name };
     if (target !== "env") p.target = target;
@@ -570,6 +578,7 @@ function validateParams(v: unknown, errors: string[]): QueueParam[] {
     if (typeof r.label === "string") p.label = r.label;
     if (typeof r.default === "string") p.default = r.default;
     if (r.required === true) p.required = true;
+    if (valuesCommand !== undefined) p.valuesCommand = valuesCommand;
     if (target === "maxItems") sawMaxItems = true;
     out.push(p);
   }
