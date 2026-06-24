@@ -455,9 +455,10 @@ test("bell: model flags rate_limited => rings exactly once + records the tag", a
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 1, "rang attention exactly once");
-  assert.equal(fake.signalCalls[0].id, "s1");
-  assert.match(fake.signalCalls[0].reason ?? "", /rate limited/i);
+  assert.equal(fake.attentionCalls.length, 1, "promoted attention exactly once");
+  assert.equal(fake.attentionCalls[0].id, "s1");
+  assert.equal(fake.attentionCalls[0].on, true);
+  assert.match(fake.attentionCalls[0].reason ?? "", /rate limited/i);
   assert.equal(deps.alertBySession.get("s1"), "rate_limited");
 });
 
@@ -477,7 +478,7 @@ test("bell: a held alert under idle-skip does not re-ring (no model call, stays 
   await runSweep(deps);
 
   assert.equal(summarizeCalls.length, 0, "idle-skip: no model call");
-  assert.equal(fake.signalCalls.length, 0, "held alert must not re-ring");
+  assert.equal(fake.attentionCalls.length, 0, "held alert must not re-promote");
   assert.equal(deps.alertBySession.get("s1"), "rate_limited", "alert left armed");
 });
 
@@ -496,7 +497,9 @@ test("bell: recovery — model reports NO alert => clears the armed tag, no ring
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 0, "no ring when the model reports no alert");
+  // The clearing edge un-promotes (set_attention off) and re-arms the tag.
+  assert.equal(fake.attentionCalls.filter((c) => c.on).length, 0, "no promotion on recovery");
+  assert.ok(fake.attentionCalls.some((c) => c.id === "s1" && c.on === false), "un-promoted");
   assert.equal(deps.alertBySession.has("s1"), false, "armed tag cleared / re-armed");
 });
 
@@ -510,7 +513,7 @@ test("bell: scrolled-up text alone never rings — only the model's verdict does
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 0, "viewport text is inert without a model alert");
+  assert.equal(fake.attentionCalls.length, 0, "viewport text is inert without a model alert");
   assert.equal(deps.alertBySession.has("s1"), false);
 });
 
@@ -533,7 +536,7 @@ test("bell: a failed model call leaves the alert state UNTOUCHED (held stays arm
   // No fresh classify => no ring and no clear. (The honest cost of pure-Haiku: a
   // FIRST detection can't happen while the summarizer's own calls fail — mitigated
   // by routing the summarizer to a separate account.)
-  assert.equal(fake.signalCalls.length, 0, "no ring on model failure");
+  assert.equal(fake.attentionCalls.length, 0, "no promotion on model failure");
   assert.equal(deps.alertBySession.get("s1"), "rate_limited", "held alert untouched");
 });
 
@@ -546,7 +549,8 @@ test("bell: model alert rings regardless of the on-screen text", async () => {
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 1, "the model's verdict alone drives the bell");
+  assert.equal(fake.attentionCalls.length, 1, "the model's verdict alone drives the promotion");
+  assert.equal(fake.attentionCalls[0].on, true);
   assert.equal(deps.alertBySession.get("s1"), "rate_limited");
 });
 
@@ -565,21 +569,22 @@ test("bell: a changed alert tag re-rings", async () => {
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 1, "a different tag is a fresh edge");
+  assert.equal(fake.attentionCalls.length, 1, "a different tag is a fresh edge");
+  assert.equal(fake.attentionCalls[0].on, true);
   assert.equal(deps.alertBySession.get("s1"), "needs_input");
 });
 
-test("bell: a failed signal_attention rolls back so a later sweep retries", async () => {
+test("bell: a failed set_attention rolls back so a later sweep retries", async () => {
   const fake = makeFakeClient({
     surfaces: [makeSurface({ id: "s1", agentState: "working" })],
     screens: { s1: RATE_LIMIT_SCREEN },
-    signalThrows: new Set(["s1"]),
+    attentionThrows: new Set(["s1"]),
   });
   const { deps } = makeDeps({ fake, summarize: rateLimitedSummary });
 
   await runSweep(deps);
 
-  assert.equal(deps.alertBySession.has("s1"), false, "rolled back after a failed ring");
+  assert.equal(deps.alertBySession.has("s1"), false, "rolled back after a failed promotion");
 });
 
 test("bell: a non-agent surface is never read, classified, or rung", async () => {
@@ -593,7 +598,7 @@ test("bell: a non-agent surface is never read, classified, or rung", async () =>
 
   assert.equal(fake.readCalls.length, 0, "non-agent is pre-gated out (no read)");
   assert.equal(summarizeCalls.length, 0, "and never classified");
-  assert.equal(fake.signalCalls.length, 0, "and never rung");
+  assert.equal(fake.attentionCalls.length, 0, "and never promoted");
 });
 
 test("bell: dead-surface alert records are pruned each sweep", async () => {

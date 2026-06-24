@@ -1960,9 +1960,10 @@ extension BaseTerminalController {
 
     /// (ramon fork / Bell Attention) Maintain the window-level `attentionNeeded`
     /// aggregate (any surface in the tab needing attention) — mirrors
-    /// `setupBellNotificationPublisher`. Drives the loud title marker; the dock reads it
-    /// off `$attentionNeeded` directly. No app-wide notification needed (no dock-badge
-    /// equivalent keyed on a notification yet).
+    /// `setupBellNotificationPublisher`. Drives the loud title marker, and posts the
+    /// SAME `.terminalWindowBellDidChangeNotification` the bell aggregate uses so the
+    /// app-wide dock badge recomputes (its handler re-reads state, which now includes
+    /// `attentionNeeded`).
     private func setupAttentionNotificationPublisher() {
         attentionStateCancellable = surfaceValuesPublisher(
             valueKeyPath: \.attentionNeeded, publisherKeyPath: \.$attentionNeeded)
@@ -1970,7 +1971,13 @@ extension BaseTerminalController {
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] hasAttention in
-                self?.attentionNeeded = hasAttention
+                guard let self else { return }
+                attentionNeeded = hasAttention
+                NotificationCenter.default.post(
+                    name: .terminalWindowBellDidChangeNotification,
+                    object: self,
+                    userInfo: [Notification.Name.terminalWindowHasBellKey: hasAttention]
+                )
             }
     }
 

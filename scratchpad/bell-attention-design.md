@@ -114,6 +114,23 @@ channels, fail-open timers) came from. The two-tier model only ever ADDS emphasi
   376 `node --test` pass + typecheck; Swift MCPServerTests + MCPAnnotationTests
   TEST SUCCEEDED (19-tool count + set_attention guards). Reviewable in Debug.
 
-## Remaining (next slices, NOT done)
-- Slice 4: the quiet/loud RENDERING split (deferred — the bell-features debate).
-- Slice 5: route the rate-limit alert through `set_attention` (unify) — optional.
+## Slice 4 + 5 (DONE)
+- **Slice 4 — full rendering** (committed): tab title (window attentionNeeded aggregate +
+  computeTitle rule), push (WebPushManager gate + attention observer + setAttention
+  userInfo enrich), dock/sound (AppDelegate), dashboard (applyAttention + needsAttention/
+  sorted bellFilter gating + AgentEntry.attention + subscription + tile "needs you" pill).
+- **Review round 2** (full diff incl. rendering): FAIL/92 — flag-OFF byte-identical
+  (verified), but TWO majors on flag-ON:
+  1. The filter SILENCED the rate-limit alert + Queue leave-and-bell (they rang via
+     signal_attention→.ghosttyBellDidRing, which the tone-down suppresses; signal_attention
+     never sets the sticky attentionNeeded). → **Slice 5 FIX**: route both through
+     `set_attention` (the always-loud tier). `maybeSignalAlert` now setAttention(true) on
+     the rising edge + setAttention(false) on clear; the Queue `signal()` wrapper →
+     setAttention. Rate-limit tests updated (signalCalls→attentionCalls); runner fake gains
+     setAttention→calls.signal so its leave-and-bell assertions hold.
+  2. Dock badge not two-tier (raw bell still badged under filter; a promotion never
+     badged). → **FIX**: `setDockBadge` counts `attentionNeeded || (bell && !bellFilter &&
+     bellFeatures.attention)`; the attention aggregate publisher posts
+     `.terminalWindowBellDidChangeNotification` so the badge recomputes on promotion.
+  (The single deferred raw-bell TILE cosmetic under the filter was correctly out of scope.)
+- Re-review after the fixes pending.

@@ -927,11 +927,17 @@ class AppDelegate: NSObject,
     }
 
     private func setDockBadge() {
-        let bellCount = NSApp.windows
+        // (ramon fork / Bell Attention) Two-tier badge: a promoted `attentionNeeded`
+        // window ALWAYS counts (the loud Tier-2 signal, exempt from the tone-down); a
+        // raw-bell window counts only when the filter is OFF (and bell-features wants
+        // the dock attention), so flag-off is byte-identical to upstream and flag-on
+        // badges only on real promotions.
+        let bellFilter = ghostty.config.agentManagerBellFilter
+        let rawBellBadges = ghostty.config.bellFeatures.contains(.attention) && !bellFilter
+        let count = NSApp.windows
             .compactMap { $0.windowController as? BaseTerminalController }
-            .reduce(0) { $0 + ($1.bell ? 1 : 0) }
-        let wantsBadge = ghostty.config.bellFeatures.contains(.attention) && bellCount > 0
-        let label = wantsBadge ? (bellCount > 99 ? "99+" : String(bellCount)) : nil
+            .reduce(0) { $0 + (($1.attentionNeeded || ($1.bell && rawBellBadges)) ? 1 : 0) }
+        let label = count > 0 ? (count > 99 ? "99+" : String(count)) : nil
         NSApp.dockTile.badgeLabel = label
         NSApp.dockTile.display()
     }

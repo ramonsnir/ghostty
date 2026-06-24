@@ -270,13 +270,20 @@ function alertReason(alert: string): string {
 }
 
 /**
- * Edge-triggered attention bell for one surface. Compares `alert` (the alert tag
- * for THIS read, or undefined) against the last-seen tag and, on a rising/changed
- * edge, calls signal_attention (which fans out to the tab bell, dashboard, web
- * monitor, and push). Records the new tag so a held alert never re-rings; clears
- * the record when the alert goes away so the next occurrence rings again. Catches
- * its OWN errors (a failed ring rolls back the record so a later sweep retries),
- * so it never escapes into summarizeOne's flow.
+ * Edge-triggered "needs you" promotion for one surface. Compares `alert` (the tag for
+ * THIS read, or undefined) against the last-seen tag and, on a rising/changed edge,
+ * sets the surface's STICKY attention state via `set_attention` (the always-loud
+ * Tier-2 signal — title marker, dock, push, dashboard float — that is EXEMPT from the
+ * `agent-manager-bell-filter` tone-down, so a rate-limit halt stays loud even with the
+ * filter on). On the clearing edge it sets attention OFF so a recovered surface
+ * un-promotes (it also clears on focus GUI-side). Records the tag so a held alert
+ * never re-fires; rolls back on failure so a later sweep retries. Catches its OWN
+ * errors so it never escapes into summarizeOne's flow.
+ *
+ * NOTE (review fix / slice 5): this used to call `signal_attention` (a one-shot
+ * `.ghosttyBellDidRing`), which the tone-down filter SILENCED — defeating the whole
+ * point of the watchdog when the filter was on. Routing through `set_attention`
+ * (the sticky attention tier) is the unification the design called for.
  */
 async function maybeSignalAlert(
   deps: LoopDeps,
@@ -285,22 +292,32 @@ async function maybeSignalAlert(
 ): Promise<void> {
   const edge = alertEdge(deps.alertBySession.get(surface.id), alert);
   if (edge === "ring") {
-    // Record FIRST so a slow signal_attention can't double-fire from an overlapping
+    // Record FIRST so a slow set_attention can't double-fire from an overlapping
     // sweep; roll back below if the call fails so the edge is retried.
     deps.alertBySession.set(surface.id, alert as string);
     try {
-      await deps.client.signalAttention(surface.id, alertReason(alert as string));
-      log(`surface ${surface.id}: alert "${alert}" -> rang attention`);
+      await deps.client.setAttention(surface.id, true, alertReason(alert as string));
+      log(`surface ${surface.id}: alert "${alert}" -> promoted (attention)`);
     } catch (err) {
       deps.alertBySession.delete(surface.id);
       errlog(
-        `surface ${surface.id}: signal_attention failed: ${
+        `surface ${surface.id}: set_attention failed: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
   } else if (edge === "clear") {
     deps.alertBySession.delete(surface.id);
+    // Best-effort un-promote on recovery (also cleared on focus GUI-side).
+    try {
+      await deps.client.setAttention(surface.id, false);
+    } catch (err) {
+      errlog(
+        `surface ${surface.id}: set_attention(off) failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 }
 
