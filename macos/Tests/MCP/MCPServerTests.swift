@@ -133,7 +133,7 @@ struct MCPServerTests {
         #expect(trailing[1].keycode == 36)
     }
 
-    // MARK: - singleLine (Phase-2 Approve SUGGEST-ONLY guard)
+    // MARK: - singleLine (queue spawn_split_command flattens its launch command)
 
     @Test func singleLineCollapsesAllNewlines() {
         // Interior \n -> space (NOT a Return); \r\n and \r too; leading/trailing trimmed.
@@ -142,22 +142,6 @@ struct MCPServerTests {
         #expect(MCPInput.singleLine("  hi  ") == "hi")
         #expect(MCPInput.singleLine("\n\nx\n\n") == "x")
         #expect(MCPInput.singleLine("plain") == "plain")
-    }
-
-    @Test func singleLineSuggestionEmitsNoReturn() {
-        // The load-bearing safety guard: singleLine STRIPS INTERIOR newlines, so a
-        // multi-line suggestion run through it produces NO Return KeySpec (keycode 36)
-        // from keySpecs(forText:). (Phase 2.1: Approve now submits, but via exactly ONE
-        // trailing Return appended by sendText(submit:true) — NOT one per interior
-        // newline. This test guards that interior-newline collapse, which turns N
-        // partial submits into the single intended one.)
-        let multiline = "Yes, proceed.\nUse the staging DB.\nrm -rf is fine here\n"
-        let sanitized = MCPInput.singleLine(multiline)
-        let specs = MCPInput.keySpecs(forText: sanitized)
-        #expect(specs.allSatisfy { $0.keycode != 36 })
-        // And the raw (un-sanitized) form WOULD have emitted Returns — proving the guard
-        // is necessary, not a no-op.
-        #expect(MCPInput.keySpecs(forText: multiline).contains { $0.keycode == 36 })
     }
 
     // MARK: - scrollDeltaClamped
@@ -439,8 +423,7 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
-            notes: "Implementing fix", userNotes: "migrate to postgres",
-            suggestionDismissed: true, agentKind: "claude", sessionID: 4242)
+            notes: "Implementing fix", agentKind: "claude", sessionID: 4242)
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -463,9 +446,6 @@ struct MCPServerTests {
         #expect(d["lastPrompt"] as? String == "do it")
         #expect(d["lastTool"] as? String == "Bash")
         #expect(d["notes"] as? String == "Implementing fix")
-        #expect(d["userNotes"] as? String == "migrate to postgres")
-        // fork / Agent Manager Phase 2.1: a plain bool, emitted unconditionally.
-        #expect(d["suggestionDismissed"] as? Bool == true)
         // fork / Agent Manager: the detector's agent kind rides through (the
         // foreground process is the `bash` pool wrapper, NOT "claude" — agentKind
         // is the reliable signal the summarizer uses).
@@ -483,7 +463,7 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
-            userNotes: nil, suggestionDismissed: false, agentKind: nil, sessionID: 0)
+            agentKind: nil, sessionID: 0)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
@@ -493,14 +473,10 @@ struct MCPServerTests {
         #expect(d["lastPrompt"] == nil)
         #expect(d["lastTool"] == nil)
         #expect(d["notes"] == nil)
-        #expect(d["userNotes"] == nil)
         #expect(d["agentKind"] == nil)
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)
-        // fork / Agent Manager Phase 2.1: suggestionDismissed is a plain bool, so it
-        // is ALWAYS present (false here), unlike the omit-when-nil optionals above.
-        #expect(d["suggestionDismissed"] as? Bool == false)
         // fork / Agent Queue (§8.4): sessionID is a plain integer, ALWAYS present —
         // 0 here (no host session). The supervisor self-disables on a 0.
         #expect((d["sessionID"] as? NSNumber)?.uint64Value == 0)

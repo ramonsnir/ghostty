@@ -338,92 +338,6 @@ struct BackgroundShellCountTests {
     }
 }
 
-// MARK: - AgentPreviewTile.suggestionStyle (pure; confidence dimming)
-
-struct SuggestionStyleTests {
-    @Test func strongConfidenceIsFullStrength() {
-        let s = AgentPreviewTile.suggestionStyle(confidence: 0.9)
-        #expect(s.dimmed == false)
-        #expect(s.opacity == 1.0)
-        #expect(s.percent == 90)
-    }
-
-    @Test func weakConfidenceIsDimmed() {
-        let s = AgentPreviewTile.suggestionStyle(confidence: 0.2)
-        #expect(s.dimmed == true)
-        #expect(s.opacity < 1.0)
-        #expect(s.percent == 20)
-    }
-
-    @Test func nilConfidenceDefaultsToMidNotDimmed() {
-        // A missing confidence reads as 0.5 (the threshold), so NOT dimmed.
-        let s = AgentPreviewTile.suggestionStyle(confidence: nil)
-        #expect(s.dimmed == false)
-        #expect(s.percent == 50)
-    }
-
-    @Test func atThresholdIsNotDimmed() {
-        // Strictly-below dims; exactly at the threshold is full-strength.
-        let s = AgentPreviewTile.suggestionStyle(confidence: AgentPreviewTile.CONF_DIM_THRESHOLD)
-        #expect(s.dimmed == false)
-    }
-
-    @Test func justBelowThresholdIsDimmed() {
-        let s = AgentPreviewTile.suggestionStyle(
-            confidence: AgentPreviewTile.CONF_DIM_THRESHOLD - 0.01)
-        #expect(s.dimmed == true)
-    }
-
-    @Test func outOfRangeConfidenceIsClamped() {
-        #expect(AgentPreviewTile.suggestionStyle(confidence: 1.8).percent == 100)
-        #expect(AgentPreviewTile.suggestionStyle(confidence: -0.4).percent == 0)
-        #expect(AgentPreviewTile.suggestionStyle(confidence: -0.4).dimmed == true)
-        #expect(AgentPreviewTile.suggestionStyle(confidence: 1.8).dimmed == false)
-    }
-
-    // MARK: - shouldShowSuggestion (pure; SUPPRESS floor)
-
-    @Test func suppressesBelowFloor() {
-        // The reported bug: a 25% suggestion must NOT render (it's below the 0.35 floor).
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.25) == false)
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.0) == false)
-        #expect(
-            AgentPreviewTile.shouldShowSuggestion(
-                confidence: AgentPreviewTile.CONF_SUPPRESS_THRESHOLD - 0.01) == false)
-    }
-
-    @Test func showsAtOrAboveFloor() {
-        #expect(
-            AgentPreviewTile.shouldShowSuggestion(
-                confidence: AgentPreviewTile.CONF_SUPPRESS_THRESHOLD) == true)
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.4) == true) // dimmed but shown
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9) == true)
-    }
-
-    @Test func nilConfidenceIsShown() {
-        // A legacy / un-rated annotation (nil) is treated as mid (0.5) → shown, never hidden.
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: nil) == true)
-    }
-
-    @Test func neverShownWhileWorking() {
-        // A suggestion is NEVER surfaced while the agent is actively working —
-        // regardless of how high its confidence is (the annotation persists across the
-        // waiting→working edge; the view gate keeps a working tile clean).
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: .working) == false)
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 1.0, agentState: .working) == false)
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: nil, agentState: .working) == false)
-    }
-
-    @Test func shownWhenNotWorking() {
-        // Waiting / idle / unknown states still gate on the confidence floor alone.
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: .waiting) == true)
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: .idle) == true)
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.9, agentState: nil) == true)
-        // …and the floor still applies in those states.
-        #expect(AgentPreviewTile.shouldShowSuggestion(confidence: 0.1, agentState: .waiting) == false)
-    }
-}
-
 // MARK: - matchAgent pure logic
 
 struct AgentDetectorTests {
@@ -632,7 +546,7 @@ struct AgentDashboardModelTests {
     }
 
     /// Like `live(_:)` but with explicit (uuid, sessionID) pairs — needed for the
-    /// userNotes write-through, which persists by the stable host session id.
+    /// agent-state persistence, which is keyed by the stable host session id.
     private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
         pairs.map { (id, sid) in
             .init(id: id, view: nil, title: "t", pwd: "/x", sessionID: sid)
@@ -964,7 +878,7 @@ struct AgentDashboardSortTests {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
               agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
-              annotation: nil, userNotes: nil, suggestionDismissed: false,
+              annotation: nil,
               backgroundShells: 0)
     }
 
@@ -1018,7 +932,7 @@ struct AgentDashboardSortTests {
               bell: bell, hidden: false, sessionID: session,
               agentState: waiting ? .waiting : nil,
               lastTool: nil, lastPrompt: nil, hookBacked: false,
-              annotation: nil, userNotes: nil, suggestionDismissed: false,
+              annotation: nil,
               backgroundShells: 0)
     }
 
@@ -1135,7 +1049,7 @@ struct AgentDashboardHookStateTests {
     }
 
     // (id, sessionID) overload — for tests that need a non-zero host session id
-    // (e.g. userNotes write-through persists by session id). Mirrors the same
+    // (e.g. agent-state persistence keyed by session id). Mirrors the same
     // helper in the other model test structs.
     private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
         pairs.map { (id, sid) in .init(id: id, view: nil, title: "t", pwd: "/x", sessionID: sid) }
@@ -1436,7 +1350,7 @@ struct AgentDashboardHookStateTests {
     // MARK: - Annotations (ramon fork / Agent Manager)
 
     private func annotation(_ summary: String) -> AgentAnnotation {
-        .init(summary: summary, suggestion: nil, phase: nil, needsUser: nil, confidence: nil)
+        .init(summary: summary, phase: nil, needsUser: nil)
     }
 
     @Test func applyAnnotationStoresAndRendersSummary() {
@@ -1451,42 +1365,21 @@ struct AgentDashboardHookStateTests {
     }
 
     @Test func applyAnnotationMergesPartialUpdates() {
-        // (Phase 2) Two independent partial updates — a summary then a suggestion —
-        // MERGE: each preserves the other's field rather than clobbering it.
+        // Two independent partial updates — a summary then a phase — MERGE: each
+        // preserves the other's field rather than clobbering it.
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
         model.rebuild(live: live([a]))
         model.applyAgents(agents([a]))
 
-        model.applyAnnotation(a, AgentAnnotation(
-            summary: "Implementing fix", suggestion: nil, phase: nil,
-            needsUser: nil, confidence: nil))
-        model.applyAnnotation(a, AgentAnnotation(
-            summary: nil, suggestion: "Approve it", phase: nil,
-            needsUser: nil, confidence: nil))
+        model.applyAnnotation(a, AgentAnnotation(summary: "Implementing fix"))
+        model.applyAnnotation(a, AgentAnnotation(phase: "testing"))
         #expect(model.annotations[a]?.summary == "Implementing fix")  // preserved
-        #expect(model.annotations[a]?.suggestion == "Approve it")     // added
-        // A later summary-only update keeps the suggestion.
+        #expect(model.annotations[a]?.phase == "testing")            // added
+        // A later summary-only update keeps the phase.
         model.applyAnnotation(a, annotation("Running tests"))
         #expect(model.annotations[a]?.summary == "Running tests")
-        #expect(model.annotations[a]?.suggestion == "Approve it")
-    }
-
-    @Test func dismissSuggestionClearsSuggestionKeepsSummary() {
-        let model = AgentDashboardModel(store: InMemoryHideStore())
-        let a = UUID()
-        model.rebuild(live: live([a]))
-        model.applyAgents(agents([a]))
-        model.applyAnnotation(a, AgentAnnotation(
-            summary: "Waiting on a decision", suggestion: "Approve", phase: "testing",
-            needsUser: true, confidence: nil))
-        model.dismissSuggestion(a)
-        #expect(model.annotations[a]?.suggestion == nil)              // cleared
-        #expect(model.annotations[a]?.summary == "Waiting on a decision")  // kept
-        #expect(model.annotations[a]?.phase == "testing")            // kept
-        #expect(model.annotations[a]?.needsUser == true)             // kept
-        // The tile sees no suggestion now.
-        #expect(model.entries.first { $0.id == a }?.annotation?.suggestion == nil)
+        #expect(model.annotations[a]?.phase == "testing")
     }
 
     @Test func annotationPrunedForVanishedSurface() {
@@ -1507,61 +1400,16 @@ struct AgentDashboardHookStateTests {
     @Test func hookSnapshotCarriesStateAndNotes() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
-        // sessionID non-zero so the userNotes write-through persists by session id.
         model.rebuild(live: live([(a, 11)]))
         model.applyAgents(agents([a]))
         _ = model.applyAgentState(a, payload(.working, tool: "Bash", prompt: "do it"))
         model.applyAnnotation(a, annotation("Implementing fix"))
-        model.setUserNotes(a, "migrate to postgres")
 
         let snap = model.hookSnapshot()
         #expect(snap[a]?.agentState == "working")
         #expect(snap[a]?.lastTool == "Bash")
         #expect(snap[a]?.lastPrompt == "do it")
         #expect(snap[a]?.notes == "Implementing fix")
-        #expect(snap[a]?.userNotes == "migrate to postgres")
-        // Phase 2.1: no dismissal yet → false in the snapshot.
-        #expect(snap[a]?.suggestionDismissed == false)
-    }
-
-    @Test func suggestionDismissedFlagLifecycle() {
-        // Dismiss SETS the flag; applying a NEW suggestion CLEARS it. A summary-only
-        // update (no suggestion) leaves it set. Surfaced on the entry + the snapshot.
-        let model = AgentDashboardModel(store: InMemoryHideStore())
-        let a = UUID()
-        model.rebuild(live: live([a]))
-        model.applyAgents(agents([a]))
-        // A suggestion arrives, then the user dismisses it.
-        model.applyAnnotation(a, AgentAnnotation(
-            summary: "Waiting", suggestion: "Approve", phase: nil,
-            needsUser: nil, confidence: 0.9))
-        model.dismissSuggestion(a)
-        #expect(model.suggestionDismissed.contains(a) == true)
-        #expect(model.entries.first { $0.id == a }?.suggestionDismissed == true)
-        #expect(model.hookSnapshot()[a]?.suggestionDismissed == true)
-        // A summary-only update does NOT clear the dismissed flag.
-        model.applyAnnotation(a, annotation("Still waiting"))
-        #expect(model.suggestionDismissed.contains(a) == true)
-        // A NEW suggestion clears it (the tile re-shows; list_surfaces flips to false).
-        model.applyAnnotation(a, AgentAnnotation(
-            summary: nil, suggestion: "Try this instead", phase: nil,
-            needsUser: nil, confidence: 0.8))
-        #expect(model.suggestionDismissed.contains(a) == false)
-        #expect(model.entries.first { $0.id == a }?.suggestionDismissed == false)
-        #expect(model.hookSnapshot()[a]?.suggestionDismissed == false)
-    }
-
-    @Test func suggestionDismissedPrunedForVanishedSurface() {
-        let model = AgentDashboardModel(store: InMemoryHideStore())
-        let a = UUID(), b = UUID()
-        model.rebuild(live: live([a, b]))
-        model.applyAgents(agents([a, b]))
-        model.applyAnnotation(a, AgentAnnotation(
-            summary: nil, suggestion: "s", phase: nil, needsUser: nil, confidence: nil))
-        model.dismissSuggestion(a)
-        #expect(model.suggestionDismissed.contains(a) == true)
-        model.rebuild(live: live([b]))
-        #expect(model.suggestionDismissed.contains(a) == false)
     }
 
     @Test func hookSnapshotIncludesDetectedAgentButOmitsUnknownSurface() {
@@ -1591,7 +1439,7 @@ struct AgentDashboardWaitingSortTests {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
               bell: bell, hidden: false, sessionID: 0,
               agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil,
-              annotation: nil, userNotes: nil, suggestionDismissed: false,
+              annotation: nil,
               backgroundShells: backgroundShells)
     }
 
@@ -1681,11 +1529,11 @@ struct AgentDashboardWaitingSortTests {
             AgentEntry(id: working, realView: nil, title: "t", pwd: "/x", agent: nil,
                        bell: false, hidden: false, sessionID: 10, agentState: .working,
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
-                       userNotes: nil, suggestionDismissed: false, backgroundShells: 0),
+                       backgroundShells: 0),
             AgentEntry(id: idle, realView: nil, title: "t", pwd: "/x", agent: nil,
                        bell: false, hidden: false, sessionID: 20, agentState: .idle,
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
-                       userNotes: nil, suggestionDismissed: false, backgroundShells: 0),
+                       backgroundShells: 0),
         ]
         let rank: [UInt64: Int] = [10: 0, 20: 1]
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.id)
@@ -1873,133 +1721,6 @@ struct AgentStatePersistenceTests {
     }
 }
 
-// MARK: - User notes persistence (ramon fork / Agent Manager Phase 2)
-
-@MainActor
-struct UserNotesPersistenceTests {
-    private func live(_ pairs: [(UUID, UInt64)]) -> [AgentDashboardModel.LiveSurface] {
-        pairs.map { (id, sid) in .init(id: id, view: nil, title: "t", pwd: "/x", sessionID: sid) }
-    }
-    private func agents(_ ids: [UUID]) -> [UUID: AgentKind] {
-        Dictionary(uniqueKeysWithValues: ids.map { ($0, AgentKind("claude")) })
-    }
-
-    // MARK: store round trip (UInt64 keys survive JSON string-keying)
-
-    @Test func userDefaultsStoreRoundTripsUInt64Keys() {
-        let suite = "ghostty-test-usernotes-roundtrip"
-        let d = UserDefaults(suiteName: suite)!
-        d.removePersistentDomain(forName: suite)
-        defer { d.removePersistentDomain(forName: suite) }
-        let store = UserDefaultsUserNotesStore(defaults: d)
-        store.save([42: "migrate to postgres", 7: "fix the flaky test"])
-        let loaded = store.load()
-        #expect(loaded[42] == "migrate to postgres")
-        #expect(loaded[7] == "fix the flaky test")
-    }
-
-    // MARK: hydrate on rebuild (by session id, onto a fresh UUID)
-
-    @Test func hydratesPersistedNoteOntoFreshUUIDBySessionID() {
-        let sid: UInt64 = 7
-        let model = AgentDashboardModel(
-            store: InMemoryHideStore(),
-            userNotesStore: InMemoryUserNotesStore([sid: "ship the migration"]))
-        let id = UUID()                              // a FRESH uuid (post-restart)
-        model.applyAgents(agents([id]))
-        model.rebuild(live: live([(id, sid)]))
-        #expect(model.userNotes[id] == "ship the migration")
-        #expect(model.entries.first { $0.id == id }?.userNotes == "ship the migration")
-    }
-
-    @Test func hydrateSkipsZeroSession() {
-        let model = AgentDashboardModel(
-            store: InMemoryHideStore(),
-            userNotesStore: InMemoryUserNotesStore([0: "orphan note"]))
-        let id = UUID()
-        model.applyAgents(agents([id]))
-        model.rebuild(live: live([(id, 0)]))         // sessionID 0 → never hydrated
-        #expect(model.userNotes[id] == nil)
-    }
-
-    @Test func noCrossSessionContamination() {
-        let a = UUID(), b = UUID()
-        let model = AgentDashboardModel(
-            store: InMemoryHideStore(),
-            userNotesStore: InMemoryUserNotesStore([1: "note-a", 2: "note-b"]))
-        model.applyAgents(agents([a, b]))
-        model.rebuild(live: live([(a, 1), (b, 2)]))
-        #expect(model.userNotes[a] == "note-a")
-        #expect(model.userNotes[b] == "note-b")
-    }
-
-    // MARK: write-through
-
-    @Test func writeThroughPersistsBySessionID() {
-        let sid: UInt64 = 99
-        let store = InMemoryUserNotesStore()
-        let model = AgentDashboardModel(store: InMemoryHideStore(), userNotesStore: store)
-        let id = UUID()
-        model.applyAgents(agents([id]))
-        model.rebuild(live: live([(id, sid)]))       // populate `live` so the sid resolves
-        model.setUserNotes(id, "use the new schema")
-        #expect(model.userNotes[id] == "use the new schema")
-        #expect(store.load()[sid] == "use the new schema")
-    }
-
-    @Test func writeThroughSkipsWhenSessionUnknown() {
-        let store = InMemoryUserNotesStore()
-        let model = AgentDashboardModel(store: InMemoryHideStore(), userNotesStore: store)
-        // No rebuild → `live` empty → session id unknown → nothing persisted (but
-        // the in-memory note is still set for the live UUID).
-        let id = UUID()
-        model.setUserNotes(id, "transient")
-        #expect(model.userNotes[id] == "transient")
-        #expect(store.load().isEmpty)
-    }
-
-    @Test func blankNoteRemovesAndPersistsRemoval() {
-        let sid: UInt64 = 5
-        let store = InMemoryUserNotesStore([sid: "old note"])
-        let model = AgentDashboardModel(store: InMemoryHideStore(), userNotesStore: store)
-        let id = UUID()
-        model.applyAgents(agents([id]))
-        model.rebuild(live: live([(id, sid)]))       // hydrates "old note"
-        #expect(model.userNotes[id] == "old note")
-        model.setUserNotes(id, "   ")                // blank → remove
-        #expect(model.userNotes[id] == nil)
-        #expect(store.load()[sid] == nil)            // removal persisted
-    }
-
-    @Test func noteTrimmedOnWrite() {
-        let model = AgentDashboardModel(store: InMemoryHideStore())
-        let id = UUID()
-        model.applyAgents(agents([id]))
-        model.rebuild(live: live([(id, 1)]))
-        model.setUserNotes(id, "  spaced goal  ")
-        #expect(model.userNotes[id] == "spaced goal")
-    }
-
-    @Test func noteDroppedFromMemoryForVanishedSurfaceButKeptBySession() {
-        let sid: UInt64 = 8
-        let store = InMemoryUserNotesStore()
-        let model = AgentDashboardModel(store: InMemoryHideStore(), userNotesStore: store)
-        let id = UUID()
-        model.applyAgents(agents([id]))
-        model.rebuild(live: live([(id, sid)]))
-        model.setUserNotes(id, "persist me")
-        // Surface closes (no longer live): in-memory entry pruned, persisted kept.
-        model.rebuild(live: live([]))
-        #expect(model.userNotes[id] == nil)          // pruned from the in-memory map
-        #expect(store.load()[sid] == "persist me")   // but persisted by session id
-        // Reappears under the SAME session id with a fresh UUID → rehydrates.
-        let id2 = UUID()
-        model.applyAgents(agents([id2]))
-        model.rebuild(live: live([(id2, sid)]))
-        #expect(model.userNotes[id2] == "persist me")
-    }
-}
-
 // MARK: - Panel pin (window level)
 
 @MainActor
@@ -2050,7 +1771,7 @@ struct AgentDashboardOriginTests {
                      bell: bell, hidden: false, sessionID: session,
                      agentState: waiting ? .waiting : nil,
                      lastTool: nil, lastPrompt: nil, hookBacked: false,
-                     annotation: ann, userNotes: nil, suggestionDismissed: false,
+                     annotation: ann,
                      backgroundShells: 0)
     }
 
@@ -2206,7 +1927,7 @@ struct AgentQueueHealthTests {
                            bell: false, hidden: false, sessionID: 1,
                            agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
                            annotation: AgentAnnotation(queueName: "ExampleOS"),
-                           userNotes: nil, suggestionDismissed: false, backgroundShells: 0)
+                           backgroundShells: 0)
         let sections = AgentDashboardModel.groupByOrigin(
             [e], presentQueues: ["ExampleOS", AgentDashboardModel.otherOrigin])
         #expect(sections.map(\.id) == ["ExampleOS"])      // no dup, no (other) injected

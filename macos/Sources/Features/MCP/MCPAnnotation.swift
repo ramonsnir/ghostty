@@ -18,12 +18,10 @@ import AppKit
 /// provided fields (so the model can MERGE it onto the prior stored annotation
 /// without clobbering — see `AgentDashboardModel.applyAnnotation`).
 ///
-/// (ramon fork / Agent Manager Phase 2) `summary` is no longer hard-required:
-/// AT LEAST ONE updatable field (summary, suggestion, phase, needsUser,
-/// confidence, queueKey, queueName, or queueUrl) must be present, else the call is
-/// rejected (a fully-empty body is still invalid). The summarizer (summary-only),
-/// the manager (suggestion-only), and the Agent Queue supervisor
-/// (queueKey/queueName/queueUrl at dispatch) all write through this same parser.
+/// AT LEAST ONE updatable field (summary, phase, needsUser, queueKey, queueName, or
+/// queueUrl) must be present, else the call is rejected (a fully-empty body is
+/// invalid). The summarizer (summary-only) and the Agent Queue supervisor
+/// (queueKey/queueName/queueUrl at dispatch) both write through this same parser.
 struct AgentAnnotationPayload {
     let annotation: AgentAnnotation
 
@@ -37,15 +35,12 @@ struct AgentAnnotationPayload {
             }
         }
         let summary = trimmedString("summary")
-        let suggestion = trimmedString("suggestion")
         let phase = trimmedString("phase")
         // needsUser is OPTIONAL: present-as-bool ⇒ that bool; absent or non-bool ⇒
         // nil (so a partial update omitting it leaves the prior value on merge).
         let needsUser = arguments["needsUser"] as? Bool
-        // confidence is a JSON number → NSNumber; missing/non-number ⇒ nil.
-        let confidence = (arguments["confidence"] as? NSNumber)?.doubleValue
         // (ramon fork / Agent Queue, §8.5) the queue tag fields — same partial-merge
-        // string semantics as summary/suggestion (present-and-non-blank ⇒ trimmed).
+        // string semantics as summary (present-and-non-blank ⇒ trimmed).
         let queueKey = trimmedString("queueKey")
         let queueName = trimmedString("queueName")
         let queueUrl = trimmedString("queueUrl")
@@ -53,14 +48,13 @@ struct AgentAnnotationPayload {
         // At least one updatable field must be present; otherwise the update is a
         // no-op and we reject it (mirrors the old "blank summary" rejection but for
         // an entirely empty body).
-        guard summary != nil || suggestion != nil || phase != nil
-            || needsUser != nil || confidence != nil
+        guard summary != nil || phase != nil
+            || needsUser != nil
             || queueKey != nil || queueName != nil || queueUrl != nil
         else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
-            summary: summary, suggestion: suggestion, phase: phase,
-            needsUser: needsUser, confidence: confidence,
+            summary: summary, phase: phase, needsUser: needsUser,
             queueKey: queueKey, queueName: queueName, queueUrl: queueUrl))
     }
 }

@@ -13,24 +13,8 @@ struct AgentPreviewTile: View {
     /// When false (pty-host off), render a metadata-only tile (no mirror).
     let previewsEnabled: Bool
     let onHide: () -> Void
-    /// (ramon fork / Agent Manager Phase 2.1) Approve the suggestion: TYPE the given
-    /// (possibly edited) text into the surface AND SUBMIT it (one trailing Return) in
-    /// one tap. User-initiated only — the sole send path; still SUGGEST-ONLY (a human
-    /// tap is the authorization, nothing autonomous). Dismiss clears it, keeps summary.
-    let onApprove: (String) -> Void
-    let onDismiss: () -> Void
-    /// (ramon fork / Agent Manager Phase 2) Commit the user's per-session note edit.
-    let onSetNote: (String) -> Void
 
     @State private var hovering = false
-
-    /// (ramon fork / Agent Manager Phase 2) Editable copy of the suggestion, seeded
-    /// from `entry.annotation?.suggestion` and reset whenever that changes (via
-    /// `.onChange`). Approve types whatever is in here; Edit just lets the user
-    /// alter it first.
-    @State private var editedSuggestion: String = ""
-    /// The user's per-session note, edited locally and committed on submit/blur.
-    @State private var noteText: String = ""
 
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
@@ -60,7 +44,7 @@ struct AgentPreviewTile: View {
     /// `AgentMirrorPreview.backgroundShellCount`). It is then waiting on its OWN
     /// work, not on the user, so the tile is DEMOTED: it shows a neutral
     /// "⚙ background" chip (not the amber "waiting ⚠" nag), keeps the "needs input"
-    /// pill / premature suggested-reply hidden, and (model-side) is excluded from
+    /// pill hidden, and (model-side) is excluded from
     /// the attention sort + the phone push. When the shell exits and the agent
     /// genuinely turns to the user, a fresh hook event re-arms the real waiting.
     private var hasBackgroundWork: Bool { entry.backgroundShells > 0 }
@@ -72,66 +56,11 @@ struct AgentPreviewTile: View {
     /// (request #3).
     private static let previewHeight: CGFloat = 220
 
-    /// (ramon fork / Agent Manager Phase 2.1) Suggestions with a confidence BELOW
-    /// this threshold are visually de-emphasized (dimmed) — every suggestion is still
-    /// rendered, but a weak "had to say something" reply reads as secondary while a
-    /// strong goal-advancing one is full-strength. A missing confidence is treated as
-    /// mid (0.5) — i.e. NOT dimmed (see `suggestionStyle`).
-    static let CONF_DIM_THRESHOLD: Double = 0.5
-
-    /// (ramon fork / Agent Manager) SUPPRESS floor — a suggestion whose confidence is
-    /// strictly BELOW this is NOT rendered at all (the tile shows only the summary), so
-    /// a low-value reply is hidden rather than dimmed. Belt-and-suspenders with the
-    /// sidecar's own `suppressBelow` gate (default 0.35, same value) — the sidecar
-    /// declines to WRITE sub-floor suggestions, and this also hides any already-stored
-    /// one (e.g. a stale annotation written before the sidecar gate, or one left over
-    /// from a moment the context scored higher). A `nil` confidence is treated as mid
-    /// (0.5) → shown (an un-rated/legacy annotation is never hidden).
-    static let CONF_SUPPRESS_THRESHOLD: Double = 0.35
-
-    /// Whether a suggestion with this (optional) confidence should be SHOWN at all,
-    /// given the agent's (optional) current `agentState`. PURE + unit-tested.
-    /// `confidence` `nil` ⇒ treated as mid 0.5. `agentState`:
-    /// - `.working` ⇒ NEVER shown — a suggestion is only meaningful when the agent is
-    ///   waiting on the user; while it's actively working, surfacing a stale reply
-    ///   (left over from a prior `.waiting` turn, before the manager re-evaluates) is
-    ///   noise at best and a footgun at worst. The manager only WRITES suggestions on
-    ///   `waiting` tiles, but the annotation persists across the waiting→working edge,
-    ///   so this view gate is what keeps a working tile clean.
-    /// - any other state (`.waiting`/`.idle`/`nil`) ⇒ gated on the confidence floor only.
-    static func shouldShowSuggestion(confidence: Double?, agentState: AgentState? = nil) -> Bool {
-        if agentState == .working { return false }
-        return (confidence ?? 0.5) >= CONF_SUPPRESS_THRESHOLD
-    }
-
-    /// PURE style for a suggestion given its (optional) confidence. Factored out for
-    /// unit testing (the view can't render headless). A `nil` confidence defaults to
-    /// mid (0.5) so an un-rated suggestion is shown full-strength; a value strictly
-    /// below `CONF_DIM_THRESHOLD` dims (reduced opacity + secondary label color).
-    struct SuggestionStyle: Equatable {
-        let opacity: Double
-        let dimmed: Bool
-        /// Whole-percent confidence for the inline indicator (e.g. 80 → "80%").
-        let percent: Int
-    }
-    static func suggestionStyle(
-        confidence: Double?, threshold: Double = CONF_DIM_THRESHOLD
-    ) -> SuggestionStyle {
-        let c = max(0.0, min(1.0, confidence ?? 0.5))
-        let dimmed = c < threshold
-        return SuggestionStyle(
-            opacity: dimmed ? 0.55 : 1.0,
-            dimmed: dimmed,
-            percent: Int((c * 100).rounded()))
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             header
             preview
             footer
-            suggestionRow
-            noteRow
         }
         .frame(maxWidth: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -146,24 +75,8 @@ struct AgentPreviewTile: View {
         .shadow(radius: hovering ? 6 : 0)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        // NOTE: no card-wide tap-to-jump — the suggestion buttons + the editable
-        // fields must take their own clicks/keystrokes. Jump is on the preview +
-        // header instead (see `preview`/`header`).
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(entry.agent?.command ?? "agent") — \(entry.title)")
-        .onAppear {
-            editedSuggestion = entry.annotation?.suggestion ?? ""
-            noteText = entry.userNotes ?? ""
-        }
-        // Reseed the editable copies if the underlying values change out from under
-        // the user (a fresh suggestion from the manager, or a rehydrated note).
-        // Single-param onChange closure for the macOS 13 deployment target.
-        .onChange(of: entry.annotation?.suggestion) { new in
-            editedSuggestion = new ?? ""
-        }
-        .onChange(of: entry.userNotes) { new in
-            noteText = new ?? ""
-        }
     }
 
     // MARK: - Header
@@ -418,112 +331,6 @@ struct AgentPreviewTile: View {
             .padding(.vertical, 1)
             .background(color.opacity(0.2))
             .clipShape(Capsule())
-    }
-
-    // MARK: - Suggestion (ramon fork / Agent Manager Phase 2)
-
-    /// The manager's proposed reply, shown with Approve / Edit / Dismiss when a
-    /// non-empty `suggestion` is present. Approve TYPES `editedSuggestion` into the
-    /// surface AND SUBMITS it (one trailing Return) — the ONLY send path, always
-    /// user-initiated. Edit makes the suggestion an editable field (it already IS one
-    /// — typing in it is "edit"); Dismiss clears the suggestion (leaving the summary
-    /// intact). STILL SUGGEST-ONLY: nothing autonomous can submit — the Approve TAP is
-    /// the human authorization; the sidecar/manager never sends. Every suggestion is
-    /// rendered, but a low-confidence one is visually de-emphasized (see
-    /// `suggestionStyle` / `CONF_DIM_THRESHOLD`).
-    @ViewBuilder
-    private var suggestionRow: some View {
-        if let suggestion = entry.annotation?.suggestion, !suggestion.isEmpty,
-           // Background-busy waiting is not a real "your turn" yet → don't surface a
-           // premature suggested reply (mirrors the demoted chip/pill).
-           !hasBackgroundWork,
-           Self.shouldShowSuggestion(
-               confidence: entry.annotation?.confidence, agentState: entry.agentState) {
-            let style = Self.suggestionStyle(confidence: entry.annotation?.confidence)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 4) {
-                    Image(systemName: "lightbulb")
-                        .font(.caption2)
-                        .foregroundStyle(style.dimmed ? Color.secondary : Self.bellAmber)
-                    Text("Suggested reply")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    // Inline confidence indicator: the manager's HONEST self-rating
-                    // of how well this reply advances the user's goal. A weak one is
-                    // dimmed (see `suggestionStyle`) and reads as secondary.
-                    Text("\(style.percent)%")
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .help("Manager confidence this reply advances your goal")
-                }
-                // Editable so the user can tweak before Approve (the "Edit" of
-                // Approve/Edit/Dismiss). Multi-line, capped height.
-                TextEditor(text: $editedSuggestion)
-                    .font(.caption2)
-                    .frame(minHeight: 24, maxHeight: 56)
-                    .scrollContentBackground(.hidden)
-                    .padding(4)
-                    .background(Color.black.opacity(0.05))
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                HStack(spacing: 6) {
-                    Spacer(minLength: 0)
-                    Button {
-                        onDismiss()
-                    } label: {
-                        Text("Dismiss").font(.caption2)
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Discard this suggestion (keeps the status line)")
-                    Button {
-                        // TYPE the (possibly edited) suggestion AND submit it in one
-                        // tap. Collapse INTERIOR newlines to spaces FIRST so a
-                        // multi-line edit produces exactly ONE trailing Return (the
-                        // intended submit) — not N partial submits through
-                        // keySpecs(forText:). approveSuggestion re-applies the same
-                        // guard then appends the single submit Return (sole send path,
-                        // user-initiated by this tap).
-                        let text = MCPInput.singleLine(editedSuggestion)
-                        guard !text.isEmpty else { return }
-                        onApprove(text)
-                    } label: {
-                        Text("Approve").font(.caption2.weight(.semibold))
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(MCPInput.singleLine(editedSuggestion).isEmpty)
-                    .help("Type this reply into the agent and submit it (sends a Return)")
-                }
-            }
-            .opacity(style.opacity)
-            .padding(.horizontal, 8)
-            .padding(.bottom, 6)
-        }
-    }
-
-    // MARK: - User note (ramon fork / Agent Manager Phase 2)
-
-    /// A compact per-session note field. Edits commit on submit (Return) / blur via
-    /// `onSetNote`; the model write-throughs to the persisted store. Always shown
-    /// (so the user can ADD a note), kept visually quiet.
-    @ViewBuilder
-    private var noteRow: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "note.text")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            TextField("Note / goal for the manager…", text: $noteText)
-                .font(.caption2)
-                .textFieldStyle(.plain)
-                .onSubmit { onSetNote(noteText) }
-        }
-        .padding(.horizontal, 8)
-        .padding(.bottom, 8)
-        // Commit when the pointer leaves the tile too (not just on Return), so an
-        // edit isn't lost if the user moves away without pressing Return.
-        .onChange(of: hovering) { isHovering in
-            if !isHovering, noteText != (entry.userNotes ?? "") {
-                onSetNote(noteText)
-            }
-        }
     }
 
     // MARK: - Jump

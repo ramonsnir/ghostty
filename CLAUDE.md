@@ -659,18 +659,22 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     into the model call; `model.ts summarize()` then passes `env:{...process.env,
     CLAUDE_CONFIG_DIR}` (spread so HOME/PATH/OAuth survive — only the config dir is re-pointed).
     SIDECAR-only: edit the file + restart the sidecar (the GUI respawns it; no app relaunch).
-  - **DORMANT Swift suggestion UI (unused; slated for GUI-side removal).** The sidecar's
-    suggest-only "manager" pass was REMOVED (it drained quota and was low-value), so NOTHING now
-    writes a `suggestion` annotation. The Agent Dashboard's Swift side still CARRIES the suggestion
-    UI — `AgentPreviewTile` Approve/Edit/Dismiss + the notes `TextField`,
-    `AgentDashboardController.approveSuggestion`/`userNotes`, the `AgentAnnotation.suggestion`/
-    `confidence`/`suggestionDismissed` + `Surface.userNotes` fields, `MCPInput`'s submit helper,
-    and `MCPSafety.swift` — but it never renders (no suggestion ever arrives). Treat it as dead
-    pending a GUI cleanup. The `set_surface_annotation` MERGE tool still ACCEPTS `suggestion`/
-    `confidence` (a no-op contract now; the merge is also how the Agent Queue writes
-    `queueKey`/`queueName`/`queueUrl`, so the tool itself stays). No Zig/host change was involved
-    in the removal — it was entirely the TS sidecar (`manager.ts` + `model.ts suggest()` +
-    `MANAGER_BASE_PROMPT` + the manager override loader + the second sweep pass, all deleted).
+  - **NO reply-suggestion feature (removed end-to-end).** An earlier "manager" pass proposed
+    replies on `waiting` tiles (Approve/Edit/Dismiss + a per-tile notes field); it drained quota
+    for low value and is GONE — both the TS sidecar pass (`manager.ts` + `model.ts suggest()` +
+    `MANAGER_BASE_PROMPT` + the manager override loader + the second sweep pass) AND the entire
+    Swift UI (`AgentPreviewTile` suggestion/notes rows + confidence dimming, `AgentDashboardController`
+    `approveSuggestion`/`dismissSuggestion`/`setUserNotes`/`userNotes`/`suggestionDismissed` +
+    the `UserNotesStore`, `AgentAnnotation.suggestion`/`confidence` + `Surface.userNotes`/
+    `suggestionDismissed`, `MCPSafety.swift`). `AgentAnnotation` / the `set_surface_annotation`
+    tool now carry ONLY `summary`/`phase`/`needsUser` + the Agent Queue tags
+    (`queueKey`/`queueName`/`queueUrl`); the MERGE tool stays because the Queue uses it. The
+    only send path left is the `send_text`/`send_key` MCP tools (used by the Queue's exit
+    prelude). No Zig/host change. Wiring touched: macOS — `AgentDashboard/{AgentStateBridge,
+    AgentDashboardController,AgentPreviewTile,AgentDashboardView}.swift`, `MCP/{MCPAnnotation,
+    MCPLayout,MCPTools,MCPInput}.swift` (deleted `MCPSafety.swift`), `project.pbxproj`; sidecar —
+    `mcp.ts` (dropped the dead `Surface`/`Annotation` fields). Tests updated in
+    `AgentDashboardTests`/`MCPAnnotationTests`/`MCPServerTests` + sidecar `mcp.test.ts`.
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default) — turns the Agent
   Dashboard/Manager into an active **supervisor + driver**: start a **queue** from a

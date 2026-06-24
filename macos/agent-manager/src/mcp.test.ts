@@ -77,7 +77,7 @@ test("parseToolJson: invalid JSON throws McpError", () => {
 // --- setAnnotation argument forwarding ---------------------------------------
 // setAnnotation only forwards fields that are present (a PARTIAL MERGE on the
 // Swift side). We stub the global fetch to capture the JSON-RPC body and assert
-// which `arguments` fields are forwarded — notably `confidence` (Phase 2.1).
+// which `arguments` fields are forwarded.
 
 /** Replace globalThis.fetch with a recorder that returns a benign ok envelope.
  *  Returns the captured tools/call `arguments` after the awaited call. */
@@ -111,22 +111,23 @@ async function captureSetAnnotationArgs(
   return capturedArgs;
 }
 
-test("setAnnotation: forwards confidence when provided", async () => {
-  const args = await captureSetAnnotationArgs("s1", { suggestion: "go", confidence: 0.9 });
+test("setAnnotation: forwards summary + phase when provided", async () => {
+  const args = await captureSetAnnotationArgs("s1", { summary: "Running tests", phase: "testing" });
   assert.equal(args.id, "s1");
-  assert.equal(args.suggestion, "go");
-  assert.equal(args.confidence, 0.9);
+  assert.equal(args.summary, "Running tests");
+  assert.equal(args.phase, "testing");
 });
 
-test("setAnnotation: forwards confidence 0 (present, not undefined)", async () => {
-  const args = await captureSetAnnotationArgs("s1", { suggestion: "go", confidence: 0 });
-  assert.equal(args.confidence, 0);
+test("setAnnotation: forwards needsUser false (present, not undefined)", async () => {
+  const args = await captureSetAnnotationArgs("s1", { summary: "ok", needsUser: false });
+  assert.equal(args.needsUser, false);
 });
 
-test("setAnnotation: omits confidence when undefined", async () => {
-  const args = await captureSetAnnotationArgs("s1", { suggestion: "go" });
-  assert.equal(args.suggestion, "go");
-  assert.equal("confidence" in args, false);
+test("setAnnotation: omits fields that are undefined", async () => {
+  const args = await captureSetAnnotationArgs("s1", { summary: "ok" });
+  assert.equal(args.summary, "ok");
+  assert.equal("phase" in args, false);
+  assert.equal("needsUser" in args, false);
 });
 
 // --- Agent Queue wrappers: envelope / encode --------------------------------

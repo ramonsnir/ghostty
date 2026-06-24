@@ -4,48 +4,31 @@ import Testing
 
 /// Unit tests for the PURE `set_surface_annotation` arguments parser
 /// (`AgentAnnotationPayload.fromArguments`) and the AppKit-free dispatch paths
-/// (missing id / missing summary → invalidParams). The main-hopping
-/// `applyAnnotation` handler is exercised only for its pre-hop validation here (it
-/// resolves a surface on main, which is covered by the integration build, not a
-/// unit test).
+/// (missing id / empty body → invalidParams). The main-hopping `applyAnnotation`
+/// handler is exercised only for its pre-hop validation here (it resolves a surface
+/// on main, which is covered by the integration build, not a unit test).
 struct MCPAnnotationTests {
 
     // MARK: - fromArguments (PURE)
 
     @Test func parsesSummaryOnly() {
-        // (Phase 2) A summary-only payload carries ONLY summary; every other field
-        // is nil (a PARTIAL update — needsUser nil, not false, so a merge won't
-        // clobber a prior true).
+        // A summary-only payload carries ONLY summary; every other field is nil (a
+        // PARTIAL update — needsUser nil, not false, so a merge won't clobber a prior true).
         let p = AgentAnnotationPayload.fromArguments(["summary": "Running tests"])
         #expect(p?.annotation.summary == "Running tests")
-        #expect(p?.annotation.suggestion == nil)
         #expect(p?.annotation.phase == nil)
         #expect(p?.annotation.needsUser == nil)   // absent ⇒ nil (partial update)
-        #expect(p?.annotation.confidence == nil)
-    }
-
-    @Test func parsesSuggestionOnly() {
-        // (Phase 2) summary is no longer required: a suggestion-only payload is
-        // valid and carries ONLY the suggestion.
-        let p = AgentAnnotationPayload.fromArguments(["suggestion": "Approve the migration"])
-        #expect(p?.annotation.suggestion == "Approve the migration")
-        #expect(p?.annotation.summary == nil)
-        #expect(p?.annotation.needsUser == nil)
     }
 
     @Test func parsesAllFields() {
         let p = AgentAnnotationPayload.fromArguments([
             "summary": "Waiting on a decision",
-            "suggestion": "Approve the migration",
             "phase": "testing",
             "needsUser": true,
-            "confidence": 0.8,
         ])
         #expect(p?.annotation.summary == "Waiting on a decision")
-        #expect(p?.annotation.suggestion == "Approve the migration")
         #expect(p?.annotation.phase == "testing")
         #expect(p?.annotation.needsUser == true)
-        #expect(p?.annotation.confidence == 0.8)
     }
 
     @Test func emptyBodyRejected() {
@@ -75,11 +58,11 @@ struct MCPAnnotationTests {
         #expect(AgentAnnotationPayload.fromArguments(["summary": ""]) == nil)
     }
 
-    @Test func blankSummaryWithSuggestionAccepted() {
-        // A blank summary + a real suggestion ⇒ valid (summary nil, suggestion set).
-        let p = AgentAnnotationPayload.fromArguments(["summary": "  ", "suggestion": "go"])
+    @Test func blankSummaryWithPhaseAccepted() {
+        // A blank summary + a real phase ⇒ valid (summary nil, phase set).
+        let p = AgentAnnotationPayload.fromArguments(["summary": "  ", "phase": "testing"])
         #expect(p?.annotation.summary == nil)
-        #expect(p?.annotation.suggestion == "go")
+        #expect(p?.annotation.phase == "testing")
     }
 
     @Test func summaryTrimmed() {
@@ -95,30 +78,16 @@ struct MCPAnnotationTests {
     }
 
     @Test func blankOptionalsBecomeNil() {
-        // An empty/whitespace suggestion/phase collapses to nil rather than "".
-        let p = AgentAnnotationPayload.fromArguments([
-            "summary": "ok", "suggestion": "  ", "phase": "",
-        ])
-        #expect(p?.annotation.suggestion == nil)
+        // An empty/whitespace phase collapses to nil rather than "".
+        let p = AgentAnnotationPayload.fromArguments(["summary": "ok", "phase": ""])
         #expect(p?.annotation.phase == nil)
     }
 
-    @Test func wrongTypedOptionalsBecomeNil() {
-        // needsUser non-bool ⇒ nil; confidence non-number ⇒ nil; suggestion
-        // non-string ⇒ nil. None reject the call (summary OK).
-        let p = AgentAnnotationPayload.fromArguments([
-            "summary": "ok", "needsUser": "yes", "confidence": "high", "suggestion": 7,
-        ])
+    @Test func wrongTypedNeedsUserBecomesNil() {
+        // needsUser non-bool ⇒ nil; does NOT reject the call (summary OK).
+        let p = AgentAnnotationPayload.fromArguments(["summary": "ok", "needsUser": "yes"])
         #expect(p != nil)
         #expect(p?.annotation.needsUser == nil)
-        #expect(p?.annotation.confidence == nil)
-        #expect(p?.annotation.suggestion == nil)
-    }
-
-    @Test func integerConfidenceCoerces() {
-        // A JSON integer arrives as NSNumber and coerces to Double.
-        let p = AgentAnnotationPayload.fromArguments(["summary": "ok", "confidence": 1])
-        #expect(p?.annotation.confidence == 1.0)
     }
 
     @Test func needsUserFalseExplicitlyKept() {
@@ -131,40 +100,24 @@ struct MCPAnnotationTests {
     // MARK: - merging (PURE)
 
     @Test func mergeOverlaysProvidedFieldsOnly() {
-        // A summary-only update preserves a prior suggestion; a suggestion-only
-        // update preserves a prior summary.
-        let base = AgentAnnotation(summary: "old summary", suggestion: "old sug",
-                                   phase: "coding", needsUser: true, confidence: 0.5)
-        let sumUpdate = AgentAnnotation(summary: "new summary", suggestion: nil,
-                                        phase: nil, needsUser: nil, confidence: nil)
+        // A summary-only update preserves a prior phase/needsUser/queue tag.
+        let base = AgentAnnotation(summary: "old summary", phase: "coding",
+                                   needsUser: true, queueKey: "ENG-1")
+        let sumUpdate = AgentAnnotation(summary: "new summary")
         let merged = base.merging(sumUpdate)
         #expect(merged.summary == "new summary")
-        #expect(merged.suggestion == "old sug")    // preserved
         #expect(merged.phase == "coding")          // preserved
         #expect(merged.needsUser == true)          // preserved (NOT clobbered to nil)
-        #expect(merged.confidence == 0.5)          // preserved
-    }
-
-    @Test func mergeSuggestionPreservesSummary() {
-        let base = AgentAnnotation(summary: "Implementing fix", suggestion: nil,
-                                   phase: nil, needsUser: nil, confidence: nil)
-        let sugUpdate = AgentAnnotation(summary: nil, suggestion: "Approve it",
-                                        phase: nil, needsUser: nil, confidence: nil)
-        let merged = base.merging(sugUpdate)
-        #expect(merged.summary == "Implementing fix")
-        #expect(merged.suggestion == "Approve it")
+        #expect(merged.queueKey == "ENG-1")        // preserved
     }
 
     @Test func mergeNeedsUserNilPreservesPrior() {
         // The needsUser merge wrinkle: an update omitting needsUser must not reset
         // a prior true; an explicit false CAN override.
-        let base = AgentAnnotation(summary: "s", suggestion: nil, phase: nil,
-                                   needsUser: true, confidence: nil)
-        let omit = AgentAnnotation(summary: "s2", suggestion: nil, phase: nil,
-                                   needsUser: nil, confidence: nil)
+        let base = AgentAnnotation(summary: "s", needsUser: true)
+        let omit = AgentAnnotation(summary: "s2")
         #expect(base.merging(omit).needsUser == true)
-        let explicitFalse = AgentAnnotation(summary: nil, suggestion: nil, phase: nil,
-                                            needsUser: false, confidence: nil)
+        let explicitFalse = AgentAnnotation(needsUser: false)
         #expect(base.merging(explicitFalse).needsUser == false)
     }
 
@@ -172,7 +125,7 @@ struct MCPAnnotationTests {
 
     @Test func parseQueueFieldsAlone() {
         // The supervisor tags a tile at dispatch with queueKey/queueName/queueUrl
-        // and NO summary/suggestion — that must be a VALID partial annotation.
+        // and NO summary — that must be a VALID partial annotation.
         let p = AgentAnnotationPayload.fromArguments([
             "id": UUID().uuidString,
             "queueKey": "ENG-123",
@@ -185,7 +138,6 @@ struct MCPAnnotationTests {
         #expect(p?.annotation.queueUrl == "https://example.test/ENG-123")
         // Untouched fields stay nil (partial update).
         #expect(p?.annotation.summary == nil)
-        #expect(p?.annotation.suggestion == nil)
     }
 
     @Test func parseQueueFieldsTrimAndBlankReject() {
@@ -201,8 +153,8 @@ struct MCPAnnotationTests {
     }
 
     @Test func mergeQueueFieldsSurviveSummaryOnlyUpdate() {
-        // A queue tag set at dispatch must survive a later summary-only or
-        // suggestion-only update (the summarizer/manager never touch queue fields).
+        // A queue tag set at dispatch must survive a later summary-only update
+        // (the summarizer never touches queue fields).
         let tagged = AgentAnnotation(
             queueKey: "ENG-9", queueName: "backlog", queueUrl: "https://x.test/9")
         let summaryUpdate = AgentAnnotation(summary: "Implementing fix")
@@ -235,8 +187,7 @@ struct MCPAnnotationTests {
 
     @Test func dispatchEmptyBodyInvalidParams() {
         // A valid id but NO updatable field fails fast BEFORE any main hop (mirrors
-        // send_key's pre-hop validation). (Phase 2: summary is no longer required,
-        // but an entirely empty body still rejects.)
+        // send_key's pre-hop validation).
         let server = MCPServer(listen: "127.0.0.1:8765", token: "")
         switch MCPTools.dispatch(name: "set_surface_annotation",
                                  arguments: ["id": UUID().uuidString], server: server) {

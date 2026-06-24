@@ -57,15 +57,6 @@ export interface Surface {
   lastPrompt?: string;
   lastTool?: string;
   notes?: string;
-  /** The user's per-session free-text NOTE/goal typed into the dashboard tile —
-   *  the STRONGEST goal signal for the manager. Omitted when unset. */
-  userNotes?: string;
-  /** (Phase 2.1) True iff the user DISMISSED the manager's current suggestion. The
-   *  manager suppresses re-suggesting while this is true AND the change fingerprint
-   *  is unchanged. The Swift side emits it as a plain bool (always present), but it
-   *  is typed OPTIONAL here so a pre-upgrade host that omits it still typechecks —
-   *  `undefined` reads as false (see shouldSuggest). */
-  suggestionDismissed?: boolean;
   agentKind?: string;
   /** (Agent Queue) The STABLE host session id (`ghostty_surface_session_id`) — the
    *  supervisor's persistence/re-adoption key (§9). OMITTED (=== undefined) when
@@ -82,24 +73,19 @@ export interface SurfaceScreen {
 }
 
 /** The annotation write payload. The summarizer writes `summary` (+ optional
- *  phase/needsUser); the manager (Phase 2) writes `suggestion`. Every field is
- *  OPTIONAL — set_surface_annotation is a PARTIAL MERGE on the Swift side, so a
+ *  phase/needsUser); the Agent Queue supervisor writes the queue tags. Every field
+ *  is OPTIONAL — set_surface_annotation is a PARTIAL MERGE on the Swift side, so a
  *  writer sends ONLY the field(s) it owns and the others keep their prior value.
  *  AT LEAST ONE field must be present. */
 export interface Annotation {
   summary?: string;
-  suggestion?: string;
   phase?: string;
   needsUser?: boolean;
-  /** (Phase 2.1) The manager's HONEST 0..1 self-rating of how well the suggested
-   *  reply advances the user's goal. Written alongside `suggestion`; the tile dims
-   *  a low-confidence one. */
-  confidence?: number;
   /** (Agent Queue, §8.5) The work-item dedup KEY tagging this surface as a queue tile.
    *  Written at dispatch (and re-stamped on reconcile when a GUI restart dropped the
    *  in-memory annotation map — the durable store is truth, §9). The dashboard derives
    *  the per-tile origin marker + grouping from `queueName`; reconcile reads `queueKey`
-   *  as the orphan-adoption hint. Partial-merge, like summary/suggestion. */
+   *  as the orphan-adoption hint. Partial-merge, like summary. */
   queueKey?: string;
   /** (Agent Queue, §8.5) The owning run's name = the dashboard ORIGIN (§11). */
   queueName?: string;
@@ -173,10 +159,8 @@ export class McpClient {
   async setAnnotation(id: string, ann: Annotation): Promise<void> {
     const args: Record<string, unknown> = { id };
     if (ann.summary !== undefined) args.summary = ann.summary;
-    if (ann.suggestion !== undefined) args.suggestion = ann.suggestion;
     if (ann.phase !== undefined) args.phase = ann.phase;
     if (ann.needsUser !== undefined) args.needsUser = ann.needsUser;
-    if (ann.confidence !== undefined) args.confidence = ann.confidence;
     if (ann.queueKey !== undefined) args.queueKey = ann.queueKey;
     if (ann.queueName !== undefined) args.queueName = ann.queueName;
     if (ann.queueUrl !== undefined) args.queueUrl = ann.queueUrl;

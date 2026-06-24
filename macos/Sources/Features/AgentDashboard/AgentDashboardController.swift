@@ -25,18 +25,10 @@ struct AgentEntry: Identifiable {
     /// True once this surface has EVER reported a hook event — hook state is
     /// authoritative thereafter and MUTES the `idleSeconds` heuristic.
     let hookBacked: Bool
-    /// (ramon fork / Agent Manager) The latest LLM annotation (summary/suggestion)
-    /// for this surface, or nil if the manager has not annotated it. In-memory ONLY
+    /// (ramon fork / Agent Manager) The latest LLM annotation (summary) for this
+    /// surface, or nil if the summarizer has not annotated it. In-memory ONLY
     /// (NO persistence).
     let annotation: AgentAnnotation?
-    /// (ramon fork / Agent Manager Phase 2) The user's per-session note for this
-    /// surface, or nil if unset. Persisted by host session id (unlike `annotation`).
-    let userNotes: String?
-    /// (ramon fork / Agent Manager Phase 2.1) True iff the user dismissed the current
-    /// suggestion. Surfaced to the sidecar (via `list_surfaces`) so the manager
-    /// suppresses re-suggesting until the change fingerprint shifts. Reset to false
-    /// when a NEW suggestion is applied. In-memory ONLY (no persistence).
-    let suggestionDismissed: Bool
     /// (ramon fork / Agent hooks) Number of background shells Claude Code reports
     /// still running for this surface (read from its footer; 0 when none / not a
     /// `.waiting` tile). A `.waiting` tile with `> 0` is waiting on its OWN work,
@@ -211,52 +203,6 @@ final class InMemoryOriginFilterStore: OriginFilterStore {
     func save(_ excluded: Set<String>) { self.excluded = excluded }
 }
 
-/// (ramon fork / Agent Manager Phase 2) Persistence boundary for the user's
-/// per-session NOTES — free-text goals/guidance the user types into a tile field
-/// for the Agent Manager (distinct from `notes`, which is the LLM summary
-/// round-trip). Injected for testability (mirrors `AgentStateStore`). Keyed by the
-/// stable HOST session id (`UInt64`) — NOT the surface UUID, which is freshly
-/// minted each GUI launch — so a note survives a relaunch by re-associating to the
-/// new UUID via the session id.
-protocol UserNotesStore {
-    func load() -> [UInt64: String]
-    func save(_ map: [UInt64: String])
-}
-
-/// Production user-notes store backed by the fork bundle-id `UserDefaults` domain.
-/// Session ids are stringified (a `UInt64` can exceed a plist number's safe range
-/// and JSON keys must be strings) — same shape as `UserDefaultsAgentStateStore`.
-struct UserDefaultsUserNotesStore: UserNotesStore {
-    static let key = "agentDashboardUserNotes"
-    let defaults: UserDefaults
-
-    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
-
-    func load() -> [UInt64: String] {
-        guard let data = defaults.data(forKey: Self.key),
-              let raw = try? JSONDecoder().decode([String: String].self, from: data)
-        else { return [:] }
-        var out: [UInt64: String] = [:]
-        for (k, v) in raw { if let sid = UInt64(k) { out[sid] = v } }
-        return out
-    }
-
-    func save(_ map: [UInt64: String]) {
-        var raw: [String: String] = [:]
-        for (k, v) in map { raw[String(k)] = v }
-        guard let data = try? JSONEncoder().encode(raw) else { return }
-        defaults.set(data, forKey: Self.key)
-    }
-}
-
-/// In-memory `UserNotesStore` for tests.
-final class InMemoryUserNotesStore: UserNotesStore {
-    private var map: [UInt64: String]
-    init(_ map: [UInt64: String] = [:]) { self.map = map }
-    func load() -> [UInt64: String] { map }
-    func save(_ map: [UInt64: String]) { self.map = map }
-}
-
 /// (ramon fork / Agent Dashboard, Layer 3) The single source of truth for the
 /// dashboard. `@MainActor`: every member touches AppKit / `SurfaceView` /
 /// `ghostty_surface_*` (which must be main-only). Detection runs off-main and
@@ -330,24 +276,6 @@ final class AgentDashboardModel: ObservableObject {
     /// In-memory only (the sidecar re-reports every sweep).
     @Published private(set) var queueStatuses: [String: QueueStatus] = [:]
 
-    // MARK: - User notes (ramon fork / Agent Manager Phase 2)
-
-    /// The user's per-session free-text NOTES (goals/guidance for the manager),
-    /// keyed by live surface UUID. `@Published` so the tile's note field re-renders.
-    /// Persisted by the stable host session id (see `userNotesStore` /
-    /// `restoredNotes`) so a note survives a GUI restart, rehydrated onto the fresh
-    /// UUID in `rebuild(live:)`. A blank note REMOVES the entry.
-    @Published private(set) var userNotes: [UUID: String] = [:]
-
-    // MARK: - Suggestion dismissal (ramon fork / Agent Manager Phase 2.1)
-
-    /// Surfaces whose CURRENT suggestion the user dismissed. Set by
-    /// `dismissSuggestion`; cleared for an id when `applyAnnotation` carries a NEW
-    /// suggestion. Surfaced to the sidecar via `hookSnapshot` → `list_surfaces` so
-    /// the manager suppresses re-suggesting until the change fingerprint shifts.
-    /// In-memory ONLY (no persistence), pruned on `rebuild(live:)`.
-    @Published private(set) var suggestionDismissed: Set<UUID> = []
-
     // MARK: - Origin filter (ramon fork / Agent Queue, §11)
 
     /// Origins (queue names, or `(other)`) the user has EXCLUDED from the view.
@@ -392,15 +320,6 @@ final class AgentDashboardModel: ObservableObject {
     private var restored: [UInt64: PersistedAgentState]
     private let agentStore: AgentStateStore
 
-    // MARK: - User-notes persistence (ramon fork / Agent Manager Phase 2)
-
-    /// Per-host-session-id user notes, persisted via `userNotesStore`. Loaded at
-    /// init, rehydrated onto fresh surface UUIDs in `rebuild(live:)`, written
-    /// through on every edit (`setUserNotes`). No prune: notes are user-typed +
-    /// low cardinality (the rebuild liveID filter bounds the in-memory map).
-    private var restoredNotes: [UInt64: String]
-    private let userNotesStore: UserNotesStore
-
     /// Drop persisted records older than this on load (a dead session lingering
     /// in UserDefaults). Generous: a live agent's record is refreshed by every
     /// hook event and the periodic touch below, so only genuinely-gone sessions
@@ -418,18 +337,15 @@ final class AgentDashboardModel: ObservableObject {
         store: HideStore,
         agentStateStore: AgentStateStore = InMemoryAgentStateStore(),
         orderStore: OrderStore = InMemoryOrderStore(),
-        userNotesStore: UserNotesStore = InMemoryUserNotesStore(),
         originFilterStore: OriginFilterStore = InMemoryOriginFilterStore()
     ) {
         self.store = store
         self.agentStore = agentStateStore
         self.orderStore = orderStore
-        self.userNotesStore = userNotesStore
         self.originFilterStore = originFilterStore
         self.hidden = store.load()
         self.manualOrder = orderStore.load()
         self.excludedOrigins = originFilterStore.load()
-        self.restoredNotes = userNotesStore.load()
         let loaded = agentStateStore.load()
         let pruned = AgentDashboardModel.prune(
             loaded, now: Date(),
@@ -617,17 +533,12 @@ final class AgentDashboardModel: ObservableObject {
     /// main from the controller's `.ghosttyAgentAnnotationDidChange` observer. NO
     /// persistence + NO coalesce: the sidecar already rate-limits its own writes.
     ///
-    /// (Phase 2) The incoming `annotation` carries ONLY the fields the writer
-    /// provided (a partial update — see `AgentAnnotationPayload.fromArguments`), so
-    /// we OVERLAY its non-nil fields onto the prior stored value via `merging(_:)`.
-    /// This lets the Haiku summarizer (summary) and the Opus manager (suggestion)
-    /// update the same surface independently without clobbering each other's field.
+    /// The incoming `annotation` carries ONLY the fields the writer provided (a
+    /// partial update — see `AgentAnnotationPayload.fromArguments`), so we OVERLAY its
+    /// non-nil fields onto the prior stored value via `merging(_:)`. This lets the
+    /// Haiku summarizer (summary) and the Agent Queue supervisor (queue tags) update
+    /// the same surface independently without clobbering each other's field.
     func applyAnnotation(_ id: UUID, _ annotation: AgentAnnotation) {
-        // (Phase 2.1) A merge carrying a NEW suggestion un-dismisses the surface, so
-        // the tile re-shows it and `list_surfaces.suggestionDismissed` flips back to
-        // false (the sidecar then independently clears its own suppression). A
-        // summary-only update (suggestion == nil) leaves the dismissed flag alone.
-        if annotation.suggestion != nil { suggestionDismissed.remove(id) }
         annotations[id] = annotations[id]?.merging(annotation) ?? annotation
         rebuildEntriesFromCurrentState()
     }
@@ -642,62 +553,6 @@ final class AgentDashboardModel: ObservableObject {
         } else {
             queueStatuses.removeValue(forKey: status.queueName)
         }
-    }
-
-    /// (ramon fork / Agent Manager Phase 2) Clear ONLY the suggestion field for a
-    /// surface, keeping the rest of the annotation (the summary status line stays).
-    /// Used by the tile's Dismiss action. No-op when there is no stored annotation.
-    func dismissSuggestion(_ id: UUID) {
-        guard let a = annotations[id] else { return }
-        annotations[id] = AgentAnnotation(
-            summary: a.summary, suggestion: nil, phase: a.phase,
-            needsUser: a.needsUser, confidence: a.confidence,
-            // (Agent Queue, §8.5) preserve the queue tag through a suggestion dismiss.
-            queueKey: a.queueKey, queueName: a.queueName, queueUrl: a.queueUrl)
-        // (Phase 2.1) Mark dismissed so the sidecar suppresses re-suggesting until the
-        // change fingerprint shifts (surfaced via list_surfaces.suggestionDismissed).
-        suggestionDismissed.insert(id)
-        rebuildEntriesFromCurrentState()
-    }
-
-    /// (ramon fork / Agent Manager Phase 2.1) TYPE `text` into the surface via REAL
-    /// key events AND SUBMIT it (append one trailing Return) — the ONLY send path,
-    /// always user-initiated (the tile's Approve button). Then clear the suggestion.
-    /// This is STILL SUGGEST-ONLY: the sidecar never sends; a human Approve tap is
-    /// the authorization, and Approve now both types and submits in that one tap (no
-    /// second keystroke). Edit still lets the user tweak the text before that tap.
-    ///
-    /// DEFENSE-IN-DEPTH: collapse ALL INTERIOR newlines to spaces FIRST. A multi-line
-    /// edit would otherwise make `keySpecs(forText:)` emit a REAL Return per embedded
-    /// `\n`/`\r` — i.e. several partial submits. `MCPInput.singleLine` neutralizes the
-    /// interior newlines (the documented sole send path) so exactly ONE Return is sent:
-    /// the intentional trailing submit (`submit:true`), never N partial ones.
-    func approveSuggestion(_ id: UUID, _ text: String) {
-        assert(Thread.isMainThread)  // MCPInput.sendText touches ghostty_surface_* on main
-        let safe = MCPInput.singleLine(text)
-        guard !safe.isEmpty else { dismissSuggestion(id); return }
-        _ = MCPInput.sendText(uuid: id, text: safe, submit: true)  // TYPE + SUBMIT (one Return)
-        dismissSuggestion(id)
-    }
-
-    /// (ramon fork / Agent Manager Phase 2) Set (or clear) the user's per-session
-    /// note for `id`. A blank/whitespace-only note REMOVES the entry (and persists
-    /// the removal). Writes through to the persisted store keyed by the surface's
-    /// stable host session id (skipped when the session id is unknown/0 — it can't
-    /// be re-associated across a relaunch). Rebuilds so the tile re-renders.
-    func setUserNotes(_ id: UUID, _ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            userNotes[id] = nil
-        } else {
-            userNotes[id] = trimmed
-        }
-        if let sid = sessionID(for: id), sid != 0 {
-            if trimmed.isEmpty { restoredNotes[sid] = nil }
-            else { restoredNotes[sid] = trimmed }
-            userNotesStore.save(restoredNotes)
-        }
-        rebuildEntriesFromCurrentState()
     }
 
     // MARK: - Reconciliation
@@ -736,13 +591,6 @@ final class AgentDashboardModel: ObservableObject {
         // (ramon fork / Agent Manager) Drop annotations for vanished surfaces too
         // (in-memory only, so nothing is persisted — just don't leak).
         annotations = annotations.filter { liveIDs.contains($0.key) }
-        // (ramon fork / Agent Manager Phase 2) Drop user notes for vanished
-        // surfaces from the in-memory map (the persisted store keeps them by
-        // session id so they rehydrate next time that session reappears).
-        userNotes = userNotes.filter { liveIDs.contains($0.key) }
-        // (ramon fork / Agent Manager Phase 2.1) Drop the dismissed flag for vanished
-        // surfaces (in-memory only).
-        suggestionDismissed = suggestionDismissed.intersection(liveIDs)
         // (ramon fork / hooks) Restore persisted state onto the (freshly-minted)
         // surface UUIDs by their stable host session id, and keep live records
         // fresh. This is what makes statuses survive a GUI restart.
@@ -802,14 +650,6 @@ final class AgentDashboardModel: ObservableObject {
         var dirty = false
         let nowS = Date().timeIntervalSince1970
         for s in live where s.sessionID != 0 {
-            // (ramon fork / Agent Manager Phase 2) Rehydrate the user note onto the
-            // fresh UUID from the persisted store (by stable session id) when we
-            // have no live note for it yet — survives a GUI restart. Edits go
-            // through `setUserNotes` (which keeps `restoredNotes` current), so
-            // there is no live-overrides-persisted reconciliation to do here.
-            if userNotes[s.id] == nil, let note = restoredNotes[s.sessionID] {
-                userNotes[s.id] = note
-            }
             if agentStates[s.id] == nil {
                 guard let rec = restored[s.sessionID],
                       let state = AgentState(rawValue: rec.state) else { continue }
@@ -853,15 +693,6 @@ final class AgentDashboardModel: ObservableObject {
         let lastPrompt: String?
         let lastTool: String?
         let notes: String?        // annotation summary (the LLM status round-trip)
-        /// (ramon fork / Agent Manager Phase 2) The user's per-session note (typed
-        /// into the tile), or nil. Distinct from `notes` (the LLM summary): this is
-        /// the strongest goal signal the manager feeds back in. Persisted by host
-        /// session id (survives a relaunch).
-        let userNotes: String?
-        /// (ramon fork / Agent Manager Phase 2.1) True iff the user dismissed the
-        /// current suggestion — the sidecar uses this to suppress re-suggesting until
-        /// the change fingerprint shifts.
-        let suggestionDismissed: Bool
         /// (ramon fork / Agent Manager) The DETECTED agent kind's command basename
         /// (e.g. "claude"/"codex") from the dashboard's authoritative subtree-walk
         /// detector, or nil. This is the signal the summarizer keys off to decide a
@@ -879,15 +710,12 @@ final class AgentDashboardModel: ObservableObject {
         let ids = Set(agentStates.keys)
             .union(lastPrompt.keys).union(lastTool.keys)
             .union(annotations.keys).union(agents.keys)
-            .union(userNotes.keys).union(suggestionDismissed)
         for id in ids {
             out[id] = HookSnapshotEntry(
                 agentState: agentStates[id]?.rawValue,
                 lastPrompt: lastPrompt[id],
                 lastTool: lastTool[id],
                 notes: annotations[id]?.summary,
-                userNotes: userNotes[id],
-                suggestionDismissed: suggestionDismissed.contains(id),
                 agentKind: agents[id]?.command)
         }
         return out
@@ -936,8 +764,6 @@ final class AgentDashboardModel: ObservableObject {
                     lastPrompt: lastPrompt[s.id],
                     hookBacked: hookBacked.contains(s.id),
                     annotation: annotations[s.id],
-                    userNotes: userNotes[s.id],
-                    suggestionDismissed: suggestionDismissed.contains(s.id),
                     // Only waiting tiles can be demoted, so only they pay the
                     // (cached) viewport read; everything else is 0.
                     backgroundShells: agentStates[s.id] == .waiting
@@ -1180,7 +1006,6 @@ final class AgentDashboardController: NSWindowController {
             store: UserDefaultsHideStore(),
             agentStateStore: UserDefaultsAgentStateStore(),
             orderStore: UserDefaultsOrderStore(),
-            userNotesStore: UserDefaultsUserNotesStore(),
             originFilterStore: UserDefaultsOriginFilterStore())
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 

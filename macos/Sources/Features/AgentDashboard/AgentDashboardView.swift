@@ -90,10 +90,7 @@ struct AgentDashboardView: View {
                             entry: entry,
                             ghostty: ghostty,
                             previewsEnabled: ptyHostEnabled,
-                            onHide: { model.hide(entry.id) },
-                            onApprove: { text in model.approveSuggestion(entry.id, text) },
-                            onDismiss: { model.dismissSuggestion(entry.id) },
-                            onSetNote: { text in model.setUserNotes(entry.id, text) }
+                            onHide: { model.hide(entry.id) }
                         )
                         .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
                         .listRowSeparator(.hidden)

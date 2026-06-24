@@ -120,15 +120,10 @@ enum MCPInput {
     }
 
     /// PURE: collapse ALL newlines (interior + leading/trailing) in `text` into
-    /// single spaces and trim, producing a strictly single-line string. This is the
-    /// load-bearing safety guard for the Phase-2.1 Approve path: `keySpecs(forText:)`
-    /// turns every embedded `\n`/`\r` into a REAL Return key event (native keycode 36),
-    /// which SUBMITS. Approve now intentionally submits in one tap — but it must send
-    /// exactly ONE trailing Return, not one per interior newline. Running a multi-line
-    /// suggestion through this first STRIPS the INTERIOR newlines so `keySpecs(forText:)`
-    /// emits no Return at all; the single intended submit is then the `submit:true`
-    /// APPENDED Return in `sendText`. So this guard turns N partial submits into the
-    /// one intended submit — it does NOT (any longer) suppress the submit itself.
+    /// single spaces and trim, producing a strictly single-line string. Used by the
+    /// Agent Queue's `spawn_split_command` to flatten a launch command (a multi-line
+    /// command would otherwise be split into several lines by `keySpecs(forText:)`,
+    /// each embedded `\n`/`\r` becoming a REAL Return key event / partial submit).
     static func singleLine(_ text: String) -> String {
         return text
             .replacingOccurrences(of: "\r\n", with: " ")
