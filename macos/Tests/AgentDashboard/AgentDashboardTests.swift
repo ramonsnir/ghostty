@@ -1996,6 +1996,16 @@ struct AgentQueueHealthTests {
 
     // MARK: - applyQueueStatus carries next/running items (for the dropdowns)
 
+    @Test func surfaceIDResolvesByQueueNameAndKey() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.applyAnnotation(a, AgentAnnotation(queueKey: "EX-1", queueName: "ExampleOS"))
+        model.applyAnnotation(b, AgentAnnotation(queueKey: "EX-2", queueName: "ExampleOS"))
+        #expect(model.surfaceID(forQueue: "ExampleOS", key: "EX-2") == b)
+        #expect(model.surfaceID(forQueue: "ExampleOS", key: "NOPE") == nil)   // unknown key
+        #expect(model.surfaceID(forQueue: "Other", key: "EX-1") == nil)      // wrong queue
+    }
+
     @Test func applyKeepsNextAndRunningItems() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         model.applyQueueStatus(status(

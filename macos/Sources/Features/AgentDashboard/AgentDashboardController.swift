@@ -555,6 +555,18 @@ final class AgentDashboardModel: ObservableObject {
         }
     }
 
+    /// (§11 health) Resolve a queue item (run name + work-item key) to its live surface
+    /// UUID by scanning the stored annotations — the supervisor stamps each running
+    /// split's surface with `queueName`/`queueKey`, so this finds the split to "go to"
+    /// from a running-dropdown row. Returns nil if no live surface carries that tag
+    /// (e.g. the agent just finished / its annotation was dropped).
+    func surfaceID(forQueue queueName: String, key: String) -> UUID? {
+        for (id, ann) in annotations where ann.queueName == queueName && ann.queueKey == key {
+            return id
+        }
+        return nil
+    }
+
     // MARK: - Reconciliation
 
     /// Snapshot of one live surface taken on main (value types + weak view).
