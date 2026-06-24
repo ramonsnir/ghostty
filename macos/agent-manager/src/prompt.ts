@@ -19,17 +19,9 @@ export const OVERRIDE_DIR = [".config", "ghostty-ramon", "agent-manager"];
 /** The fixed sub-path under the home directory for the summarizer override. */
 export const SUMMARIZER_OVERRIDE_RELPATH = [...OVERRIDE_DIR, "summarizer.md"];
 
-/** (Phase 2) The fixed sub-path for the manager (reply-suggester) override. */
-export const MANAGER_OVERRIDE_RELPATH = [...OVERRIDE_DIR, "manager.md"];
-
 /** Resolve the absolute path to the summarizer override for a given home dir. */
 export function summarizerOverridePath(home: string): string {
   return join(home, ...SUMMARIZER_OVERRIDE_RELPATH);
-}
-
-/** Resolve the absolute path to the manager override for a given home dir. */
-export function managerOverridePath(home: string): string {
-  return join(home, ...MANAGER_OVERRIDE_RELPATH);
 }
 
 /** Injectable filesystem seam (for tests). */
@@ -109,14 +101,6 @@ export function makeOverrideLoader(
   fs: OverrideFs = realOverrideFs,
 ): OverrideLoader {
   return makeOverrideLoaderForPath(summarizerOverridePath(home), fs);
-}
-
-/** (Phase 2) The manager override loader (manager.md). */
-export function makeManagerOverrideLoader(
-  home: string = homedir(),
-  fs: OverrideFs = realOverrideFs,
-): OverrideLoader {
-  return makeOverrideLoaderForPath(managerOverridePath(home), fs);
 }
 
 /**
