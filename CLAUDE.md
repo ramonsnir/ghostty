@@ -989,6 +989,19 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       restarts (no rename) already persisted the count via the stable scoped path; this only covers the
       one-time upgrade boundary. Wiring: `wiring.ts` (`shouldMigrateLegacyState` + the rename in
       `rehydrateActiveRuns`); test: `wiring.test.ts` (`shouldMigrateLegacyState`).
+    - **(3b) REHYDRATION must key the registry by `runName`, NOT `template.name` (bug fix).** The
+      `start` path (`applyCommand`) keys the registry by `run.runName`, but `index.ts` populated a
+      RESTORED run (from `active-runs.json` on restart) with `registry.set(run.template.name, run)` —
+      so after a restart a scoped run was keyed by the bare `"ExampleOS"` while the dashboard / health
+      report target its `runName` (`"ExampleOS · Acme Foods · Visual Prototype"`). Every control
+      command (`set_max_items`, pause, stop, abort) then `registry.get(cmd.run)`→undefined → silent
+      "unknown run" no-op (the "changing maxItems does nothing after restart" bug), and two parallel
+      scoped runs of one template would COLLIDE on the bare name. Fix: a shared
+      `registerRehydratedRuns(registry, runs)` in `commands.ts` keys by `run.runName` — the SAME key
+      `start` uses — and `index.ts` calls it instead of the inline loop. So a restored run behaves
+      identically to a freshly started one. Wiring: `commands.ts` (`registerRehydratedRuns`),
+      `index.ts` (call it). Tests: `commands.test.ts` (keyed-by-runName + `set_max_items` resolves
+      after rehydrate + two parallel scoped runs coexist).
     `makeQueueRun` computes `runName`/`identityScope` from (template + params); a `runName` collision from a
     DIFFERENT identity is rejected (no clobber). Wiring: sidecar — `templates.ts` (`runDisplayName`/
     `runIdentityScope`/`scopeSlug`), `runner.ts` (`QueueRun.runName`/`.identityScope` + identity usages),

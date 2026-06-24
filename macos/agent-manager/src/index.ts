@@ -56,7 +56,7 @@ import {
   DEFAULT_PENDING_GRACE_MS,
   type QueueDeps,
 } from "./queue/runner.js";
-import type { RunRegistry } from "./queue/commands.js";
+import { registerRehydratedRuns, type RunRegistry } from "./queue/commands.js";
 import { ConcurrencyBudget as QueueConcurrencyBudget } from "./queue/supervisor.js";
 import {
   persistActiveRuns as persistActiveRunsToIO,
@@ -327,9 +327,10 @@ async function main(): Promise<void> {
     // each sweep. A template merely existing on disk does NOT auto-run — only a
     // persisted/started run, or one a `start` command arms.
     const registry: RunRegistry = new Map();
-    for (const run of rehydrateActiveRuns(templatesDir, stateDir)) {
-      registry.set(run.template.name, run);
-    }
+    // Key restored runs by their `runName` IDENTITY — the SAME key `start` uses — so
+    // control commands (set_max_items/pause/stop/…) resolve against a rehydrated run, and
+    // parallel scoped runs of one template don't collide on the bare template name.
+    registerRehydratedRuns(registry, rehydrateActiveRuns(templatesDir, stateDir));
     const activeRunsIO = makeActiveRunsStoreIO(stateDir);
 
     deps.queue = {

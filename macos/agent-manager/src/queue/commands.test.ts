@@ -5,7 +5,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { applyCommand, applyCommands, type RunFactory, type RunRegistry } from "./commands.js";
+import {
+  applyCommand,
+  applyCommands,
+  registerRehydratedRuns,
+  type RunFactory,
+  type RunRegistry,
+} from "./commands.js";
 import { makeQueueRun, type QueueRun } from "./runner.js";
 import type { StoreIO } from "./store.js";
 import type { QueueTemplate } from "./types.js";
@@ -293,4 +299,41 @@ test("applyCommands: returns true when the batch changed the persisted set, fals
   assert.equal(applyCommands(reg, [{ action: "stop", run: "ghost" }], factory), false);
   // A re-start no-op changes nothing.
   assert.equal(applyCommands(reg, [{ action: "start", template: "f" }], factory), false);
+});
+
+test("registerRehydratedRuns: keys by runName (not template.name) so commands resolve after restart", () => {
+  // A scoped run: env param → runName = "ExampleOS · Acme" (NOT the bare "ExampleOS").
+  const t = tmpl("ExampleOS");
+  t.params = [{ name: "project", env: "LINEAR_PROJECT" }];
+  const run = makeQueueRun(t, memStore(), { templateName: "example", params: { project: "Acme" } });
+  assert.equal(run.runName, "ExampleOS · Acme");
+
+  const reg: RunRegistry = new Map();
+  registerRehydratedRuns(reg, [run]);
+  // Keyed by the composite runName — what the dashboard / health report target.
+  assert.ok(reg.has("ExampleOS · Acme"), "rehydrated run keyed by runName");
+  // REGRESSION: must NOT be keyed by the bare template.name (the bug that made every
+  // control command a silent 'unknown run' no-op after a restart).
+  assert.equal(reg.has("ExampleOS"), false, "NOT keyed by template.name");
+
+  // A set_max_items targeting the runName now resolves against the rehydrated run.
+  const { factory } = makeFactory({});
+  const res = applyCommand(
+    reg,
+    { action: "set_max_items", run: "ExampleOS · Acme", maxItems: "7" },
+    factory,
+  );
+  assert.equal(res.kind, "maxItemsSet");
+  assert.equal(reg.get("ExampleOS · Acme")!.maxItemsLive, 7);
+});
+
+test("registerRehydratedRuns: two parallel scoped runs of one template coexist (no bare-name collision)", () => {
+  const t = tmpl("ExampleOS");
+  t.params = [{ name: "project", env: "LINEAR_PROJECT" }];
+  const a = makeQueueRun(t, memStore(), { templateName: "example", params: { project: "Acme" } });
+  const b = makeQueueRun(t, memStore(), { templateName: "example", params: { project: "Globex" } });
+  const reg: RunRegistry = new Map();
+  registerRehydratedRuns(reg, [a, b]);
+  assert.equal(reg.size, 2, "both parallel scoped runs survive rehydration");
+  assert.ok(reg.has("ExampleOS · Acme") && reg.has("ExampleOS · Globex"));
 });
