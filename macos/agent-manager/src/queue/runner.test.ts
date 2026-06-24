@@ -44,7 +44,12 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     concurrency: 9,
     maxItems: 200,
     grid: { cols: 3, rows: 3, fill: "columns" },
-    intervals: { listMs: 45000, statusMs: 20000 },
+    // Throttle DISABLED in the shared fixture (0 = every sweep fetches list+status, the
+    // pre-throttle behavior) so the dispatch/state-machine tests below — which advance the
+    // clock by only ~5s between sweeps — keep exercising every-sweep provider calls. The
+    // interval THROTTLING itself is covered by the dedicated tests at the end of the file,
+    // which build templates with realistic intervals.
+    intervals: { listMs: 0, statusMs: 0 },
     provider: {
       list: { command: ["list"], keyField: "id", titleField: "title", urlField: "url" },
       status: { command: ["status", "{key}"], doneStates: ["done"] },
@@ -1944,4 +1949,143 @@ test("runQueueSweep: quitWhenEmpty does NOT quit on a FLAKY (non-zero) list", ()
     await runQueueSweep(deps); // list FAILS → not empty → must NOT quit
     assert.equal(deps.registry.size, 1, "a failed list never reads as empty (no quit)");
   })();
+});
+
+// ---------------------------------------------------------------------------
+// (interval throttling) Provider `list`/`status` calls are throttled to
+// intervals.listMs / intervals.statusMs — the 5s sweep stays the base cadence for
+// reconcile/close/commands/health, but the provider is NOT hit every sweep.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: list fetch is THROTTLED to intervals.listMs", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const t = tmpl({ intervals: { listMs: 30000, statusMs: 0 } });
+  const run = makeQueueRun(t, memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm — dispatch suppressed, no list fetch at all
+  assert.equal(fake.calls.list, 0, "arm sweep does not fetch the list");
+
+  now += 5000;
+  await runQueueSweep(deps); // first dispatch sweep — lastListAtMs is -Inf → fetches
+  assert.equal(fake.calls.list, 1, "first dispatch sweep fetches");
+
+  now += 5000; // +5s since the fetch < 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 1, "within listMs: no re-fetch");
+
+  now += 10000; // +15s since the fetch < 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 1, "still within listMs: no re-fetch");
+
+  now += 20000; // +35s since the fetch ≥ 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 2, "after listMs elapses: re-fetch");
+});
+
+test("runQueueSweep: a throttled (skipped) list sweep STILL reports health from the cache", async () => {
+  // The dashboard counts must stay live between list polls — reportQueueStatus reads the
+  // cached lastListItems, so a throttled sweep still pushes the same waiting count.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"}]',
+    spawns: [{ id: "s-a", sessionId: 1 }, { id: "s-b", sessionId: 2 }],
+  });
+  // Cap dispatch to 0 net effect on health by using a big concurrency but tracking the
+  // "waiting" count: list has 2 items, both dispatched on the fetch sweep, so 0 waiting after.
+  const t = tmpl({ intervals: { listMs: 30000, statusMs: 0 }, concurrency: 1 });
+  const run = makeQueueRun(t, memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // fetch: dispatch A (concurrency 1), B waiting
+  const afterFetch = fake.calls.reports.at(-1)!;
+  assert.equal(fake.calls.list, 1);
+  assert.equal(afterFetch.queued, 1, "B waiting after the fetch sweep");
+
+  now += 5000; // throttled sweep (no fetch)
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 1, "throttled: no second fetch");
+  const afterThrottle = fake.calls.reports.at(-1)!;
+  assert.equal(afterThrottle.queued, 1, "throttled sweep still reports the cached waiting count");
+});
+
+test("runQueueSweep: status probe is THROTTLED to intervals.statusMs", async () => {
+  let surfaces: Surface[] = [];
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1"}]',
+    spawns: [{ id: "spawned-1", sessionId: 900 }],
+    statusByKey: { "K-1": '{"state":"working"}' }, // never terminal → stays RUNNING, keeps being probed
+  });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+  // list throttling OFF (0) so it doesn't interfere; status throttled to 30s.
+  const t = tmpl({ intervals: { listMs: 0, statusMs: 30000 } });
+  const run = makeQueueRun(t, memStore());
+  let now = 2_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → SPAWNED (advanceStates ran before dispatch, active empty)
+  assert.equal(fake.calls.status.length, 0, "no probe the sweep it was spawned (not yet live)");
+
+  // The spawned surface now appears live + working.
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+
+  now += 5000;
+  await runQueueSweep(deps); // advanceStates: statusDue (-Inf) → probe #1, SPAWNED→RUNNING
+  assert.equal(fake.calls.status.length, 1, "first status probe fires once the agent is live");
+
+  now += 5000; // +5s since the probe < 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.status.length, 1, "within statusMs: no re-probe");
+
+  now += 30000; // ≥ 30s since the probe
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.status.length, 2, "after statusMs elapses: re-probe");
+});
+
+test("advanceStates: a due status sweep with NO live agent does not burn the interval", async () => {
+  // The window is consumed only when a probe actually fires. A SPAWNED assignment whose
+  // surface isn't live yet must NOT consume the status window — the next sweep (surface live)
+  // probes immediately rather than waiting a full interval.
+  let surfaces: Surface[] = [];
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1"}]',
+    spawns: [{ id: "spawned-1", sessionId: 900 }],
+    statusByKey: { "K-1": '{"state":"working"}' },
+  });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+  const t = tmpl({ intervals: { listMs: 0, statusMs: 30000 } });
+  const run = makeQueueRun(t, memStore());
+  let now = 5_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → SPAWNED; surface NOT live yet → no probe
+  assert.equal(fake.calls.status.length, 0);
+
+  // Surface still not live this sweep (host attach lag): SPAWNED but no live surface.
+  now += 5000;
+  await runQueueSweep(deps); // due, but no live agent → no probe, window NOT consumed
+  assert.equal(fake.calls.status.length, 0, "no probe when the agent isn't live");
+
+  // Surface finally appears — even though only 5s passed since the (no-op) due sweep, the
+  // probe fires NOW because the window was never consumed.
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.status.length, 1, "probes immediately once the agent is live (window not pre-burned)");
 });

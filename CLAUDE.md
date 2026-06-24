@@ -1016,12 +1016,40 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (post-`applyCommands` immediate report loop). Tests: `AgentDashboardTests`
     (`parseCapOptimisticMirrorsSidecar`, `setQueueMaxItemsOptimisticallyUpdatesCap`,
     `sendRunCommandOptimisticallyUpdatesPhase`); the sidecar suite still green. **GUI relaunch +
-    rebuilt sidecar `dist`; no host/Zig change.** NOTE (separate, NOT fixed here): the template
-    `intervals.listMs`/`statusMs` knobs are currently **dead** — `runner.ts` calls `fetchListResult`
-    + `probeStatus` EVERY 5s sweep, ignoring them — so the provider (e.g. Linear) is hit every 5s
-    regardless of the configured 45/20s (or the user's 60/30s). Honoring those (gate provider calls
-    by last-call-time vs the intervals, keeping the sweep at 5s for reconcile/close/commands) is the
-    real "5s too frequent" fix — a follow-up.
+    rebuilt sidecar `dist`; no host/Zig change.**
+  - **PROVIDER-CALL THROTTLING — honor `intervals.listMs`/`statusMs` (the real "5s too
+    frequent" fix).** The supervisor sweep stays at the 5s `QUEUE_POLL_INTERVAL_MS` base cadence
+    (reconcile / close / command-drain / §11 health report run EVERY sweep), but the PROVIDER
+    calls are now throttled to the template's `intervals` instead of firing every sweep — so a
+    tracker like Linear is hit at most once per `listMs` (`list`) and once per `statusMs`
+    (`status`), not every 5s. Previously both knobs were DEAD (`runner.ts` called `fetchListResult`
+    + `probeStatus` every sweep, ignoring `intervals`). Engine: two new non-persisted
+    `QueueRun.lastListAtMs`/`lastStatusAtMs` (init `NEGATIVE_INFINITY` ⇒ the first sweep always
+    fetches, and no `now===0` sentinel collision). `dispatchCandidates` skips the whole list
+    fetch+dispatch and returns 0 when `nowMs - lastListAtMs < intervals.listMs` — the §11 health
+    report (fired by `runOne` AFTER dispatch) reads the CACHED `lastListItems`/`lastListOk`, so the
+    dashboard counts stay live between polls; latch re-arm + quit-when-empty observation just wait
+    for the next due fetch. The window is consumed on the ATTEMPT (set before the fetch), so even a
+    FAILED list waits a full interval — a hard cap of one `list` call per `listMs` regardless of
+    outcome. `advanceStates` gates the per-agent `status` probe on `statusDue =
+    nowMs - lastStatusAtMs >= statusMs` (decided once for the whole batch so all agents share one
+    round); when not due, `statusTerminal` stays undefined so no status-driven completion happens
+    that sweep (idle-anchor fold + close-gate still run every sweep — completion is delayed at
+    most `statusMs`, never lost). The status window is consumed ONLY if a probe actually fired
+    (`probed` flag), so a due sweep with no live SPAWNED/RUNNING agent (host-attach lag) doesn't
+    burn the interval — the next sweep with a live agent probes immediately. BEHAVIOR NOTE: a
+    `set_max_items` bump / `resume` re-enables dispatch, but the NEW dispatch lands on the next
+    list-DUE sweep (≤`listMs`), not the next 5s sweep — the dashboard cap/phase still updates
+    INSTANTLY (the optimistic + fast-confirm path above); only the actual spawn waits for the
+    poll. **Default ALIGNED to `{listMs:60000, statusMs:30000}`** (was 45000/20000) and the user's
+    near-identical 60/30 override was REMOVED from `example.json` so config == default. Wiring:
+    `runner.ts` (`QueueRun.lastListAtMs`/`lastStatusAtMs` + `makeQueueRun` init + list gate in
+    `dispatchCandidates` + status gate in `advanceStates`), `templates.ts`
+    (`TEMPLATE_DEFAULTS.intervals` → 60000/30000). Tests: `runner.test.ts` (list throttled +
+    throttled-sweep-still-reports-from-cache + status throttled + due-sweep-no-agent-doesn't-burn;
+    the shared `tmpl()` fixture sets `intervals:{0,0}` = throttle-off so the existing every-sweep
+    dispatch/state tests are preserved), `templates.test.ts` (default pinned to 60000/30000).
+    **Sidecar-only — rebuilt `dist` + sidecar respawn (GUI relaunch); no host/Zig/GUI-Swift change.**
   - **PER-SCOPE RUN IDENTITY — one template, parallel runs per project/milestone (palette shows the
     template `name`).** Three coupled changes so a generic template (e.g. Example) is re-usable in
     parallel for different env-param scopes:

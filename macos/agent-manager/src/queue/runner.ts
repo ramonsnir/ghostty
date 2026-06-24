@@ -197,6 +197,16 @@ export interface QueueRun {
    *  call — the dashboard's "N waiting / next: …" reads from this. Not persisted. */
   lastListItems: WorkItem[] | null;
   lastListOk: boolean;
+  /** (interval throttling) Wall-clock ms of the LAST provider `list` fetch and the LAST
+   *  per-agent `status` probe round. The 5s sweep is the BASE cadence (reconcile / close /
+   *  command-drain / health report run every sweep), but the PROVIDER calls are throttled to
+   *  `template.intervals.listMs` / `.statusMs` — a `list` fetch happens only when
+   *  `nowMs - lastListAtMs >= intervals.listMs`, and the per-agent `status` probes only when
+   *  `nowMs - lastStatusAtMs >= intervals.statusMs`. Init `NEGATIVE_INFINITY` so the first
+   *  sweep always fetches (and to avoid a `nowMs===0` sentinel collision). Not persisted —
+   *  after a restart the first sweep re-fetches, which is correct. */
+  lastListAtMs: number;
+  lastStatusAtMs: number;
   /** (live maxItems edit) A run-level OVERRIDE of the lifetime cap, set by a `set_max_items`
    *  command WHILE the run is live (the dashboard cap control). Takes PRECEDENCE over the
    *  start-time/template cap in `effectiveMaxItemsCap`. `undefined` = no live edit (use the
@@ -246,6 +256,8 @@ export function makeQueueRun(
     sawEmptyListThisSweep: false,
     lastListItems: null,
     lastListOk: false,
+    lastListAtMs: Number.NEGATIVE_INFINITY,
+    lastStatusAtMs: Number.NEGATIVE_INFINITY,
   };
 }
 
@@ -772,6 +784,16 @@ async function advanceStates(
   nowMs: number,
 ): Promise<void> {
   let changed = false;
+  // (interval throttling) Probe provider `status` at most once per `intervals.statusMs`,
+  // not every 5s sweep. The idle-anchor fold (cheap, from the hook-driven agentState) and
+  // the close-gate still run EVERY sweep; only the provider round-trip is throttled. When a
+  // probe is NOT due, `statusTerminal` stays undefined for every agent → nextState makes no
+  // status-driven completion this sweep (it resumes on the next due sweep). Decided once for
+  // the whole batch so all agents share one round; the window is consumed (`lastStatusAtMs`
+  // advanced) ONLY if a probe actually fired, so a due sweep with no live SPAWNED/RUNNING
+  // agent doesn't burn the interval (the next sweep with an agent probes immediately).
+  const statusDue = nowMs - run.lastStatusAtMs >= run.template.intervals.statusMs;
+  let probed = false;
   for (const a of [...run.active.values()]) {
     // Terminal/transitional states are owned by the close loop / cooldown logic.
     if (
@@ -797,12 +819,13 @@ async function advanceStates(
     // Probe provider status ONLY for states that can complete (SPAWNED/RUNNING) and
     // only when the surface is still live (no point probing a gone surface).
     let statusTerminal: boolean | undefined = undefined;
-    if (surfaceLive && (a.state === "SPAWNED" || a.state === "RUNNING")) {
+    if (statusDue && surfaceLive && (a.state === "SPAWNED" || a.state === "RUNNING")) {
       const probe = await probeStatus(run.template.provider.status, a.key, deps.exec, {
         cwd: run.template.workdir,
         env: resolveParamsEnv(run.template, run.params),
       });
       statusTerminal = probe.terminal;
+      probed = true;
     }
 
     const ctx: NextStateContext = {
@@ -841,6 +864,9 @@ async function advanceStates(
       }
     }
   }
+  // Consume the status-probe window only when a probe actually fired this sweep (see the
+  // `statusDue`/`probed` note above).
+  if (probed) run.lastStatusAtMs = nowMs;
   if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
 }
 
@@ -975,6 +1001,18 @@ async function dispatchCandidates(
   // quit-when-empty observation, all of which must happen even when the run can't dispatch
   // (e.g. at its maxItems cap). The dispatch gate is applied AFTER the fetch instead (a
   // capped run that fetched `[]` shows "0 waiting · N running · N/N", not "reading the queue…").
+
+  // (interval throttling) Throttle the provider `list` fetch to `intervals.listMs` instead
+  // of hitting it every 5s sweep. When a fetch is NOT due, dispatch nothing THIS sweep and
+  // return — the §11 health report (fired by runOne after this returns) reads the CACHED
+  // `lastListItems`/`lastListOk` from the previous fetch, so the dashboard counts stay live;
+  // the latch re-arm + quit-when-empty observation simply wait for the next due fetch.
+  // `lastListAtMs` inits NEGATIVE_INFINITY so the first dispatch sweep always fetches. The
+  // window is consumed on the ATTEMPT (set before the fetch), so even a FAILED list waits a
+  // full interval before retrying — a hard cap of one provider `list` call per `listMs`,
+  // regardless of outcome (the point: stop hammering the provider every 5s).
+  if (nowMs - run.lastListAtMs < t.intervals.listMs) return 0;
+  run.lastListAtMs = nowMs;
 
   // Fetch the provider list (skip the tick on any failure — never throws). Use the
   // ok-distinguishing variant so quit-when-empty can tell a SUCCESSFUL empty list from a
