@@ -113,7 +113,13 @@ struct AgentDashboardView: View {
                             onPause: { model.sendRunCommand(.pause, run: section.id) },
                             onResume: { model.sendRunCommand(.resume, run: section.id) },
                             onStop: { model.sendRunCommand(.stop, run: section.id) },
-                            onAbort: { model.sendRunCommand(.abort, run: section.id) }
+                            onAbort: { model.sendRunCommand(.abort, run: section.id) },
+                            onGoToItem: { item in
+                                // Resolve the running item → its split UUID and jump to it.
+                                if let id = model.surfaceID(forQueue: section.id, key: item.key) {
+                                    focusHidden(id)
+                                }
+                            }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -338,6 +344,9 @@ private struct OriginSectionHeader: View {
     let onResume: () -> Void
     let onStop: () -> Void
     let onAbort: () -> Void
+    /// (§11 health) Jump to the split running a given queue item (the "go to" affordance in
+    /// the running dropdown). The parent resolves the item's surface + presents it.
+    let onGoToItem: (QueueStatus.Item) -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
@@ -384,10 +393,15 @@ private struct OriginSectionHeader: View {
                         // (mirrors the hidden-agents popover).
                         countButton("\(status.queued) waiting", items: status.next,
                                     total: status.queued, show: $showWaiting,
-                                    emptyText: "Nothing waiting.")
+                                    emptyText: "Nothing waiting.", onGoTo: nil)
+                        // Running items get a "go to" affordance → jump to that split.
                         countButton("\(status.active) running", items: status.running,
                                     total: status.active, show: $showRunning,
-                                    emptyText: "Nothing running.")
+                                    emptyText: "Nothing running.",
+                                    onGoTo: { item in
+                                        onGoToItem(item)
+                                        showRunning = false
+                                    })
                         Text(QueueHealthFormat.progressText(status))
                             .font(.caption2).foregroundStyle(.secondary)
                     } else {
@@ -444,7 +458,7 @@ private struct OriginSectionHeader: View {
     /// the items with Linear links. Styled as a subtle link so it reads as a count.
     private func countButton(
         _ label: String, items: [QueueStatus.Item], total: Int,
-        show: Binding<Bool>, emptyText: String
+        show: Binding<Bool>, emptyText: String, onGoTo: ((QueueStatus.Item) -> Void)?
     ) -> some View {
         Button { show.wrappedValue.toggle() } label: {
             Text(label).font(.caption2)
@@ -452,17 +466,19 @@ private struct OriginSectionHeader: View {
         .buttonStyle(.link)
         .help("Show items")
         .popover(isPresented: show, arrowEdge: .bottom) {
-            itemsPopover(title: label, items: items, total: total, emptyText: emptyText)
+            itemsPopover(title: label, items: items, total: total, emptyText: emptyText, onGoTo: onGoTo)
         }
     }
 
     /// The popover body for a count chip: one row per item (key badge · title · Linear
-    /// link), plus a "… and N more" note when the list was capped below the total. All
-    /// text via `Text`/`Link` (SwiftUI escapes it — the key/title/url are untrusted
-    /// tracker data; only http(s) urls are made clickable).
+    /// link), plus a "… and N more" note when the list was capped below the total. When
+    /// `onGoTo` is non-nil (the running list) each row also gets a "go to" button that
+    /// jumps to that split. All text via `Text`/`Link` (SwiftUI escapes it — the
+    /// key/title/url are untrusted tracker data; only http(s) urls are made clickable).
     @ViewBuilder
     private func itemsPopover(
-        title: String, items: [QueueStatus.Item], total: Int, emptyText: String
+        title: String, items: [QueueStatus.Item], total: Int, emptyText: String,
+        onGoTo: ((QueueStatus.Item) -> Void)?
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.headline)
@@ -478,6 +494,13 @@ private struct OriginSectionHeader: View {
                             .clipShape(Capsule())
                         itemLink(item)
                         Spacer(minLength: 4)
+                        if let onGoTo {
+                            Button { onGoTo(item) } label: {
+                                Image(systemName: "arrow.right.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Go to this split")
+                        }
                     }
                 }
                 if total > items.count {
@@ -489,6 +512,7 @@ private struct OriginSectionHeader: View {
         .padding(12)
         .frame(width: 420)
     }
+
 
     /// The item's title as a Linear `Link` when it carries an http(s) url; else plain text.
     @ViewBuilder
