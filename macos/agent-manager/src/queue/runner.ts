@@ -917,7 +917,11 @@ async function dispatchCandidates(
   const cap = effectiveMaxItemsCap(run);
   const maxItemsRemaining =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - run.lifetimeDispatched);
-  if (slots <= 0 || maxItemsRemaining <= 0) return 0;
+  // NOTE: do NOT early-return on a full slot/cap here — the list fetch below ALSO updates
+  // the §11 health cache (lastListOk/lastListItems), re-arms the §7.1 latch, and sets the
+  // quit-when-empty observation, all of which must happen even when the run can't dispatch
+  // (e.g. at its maxItems cap). The dispatch gate is applied AFTER the fetch instead (a
+  // capped run that fetched `[]` shows "0 waiting · N running · N/N", not "reading the queue…").
 
   // Fetch the provider list (skip the tick on any failure — never throws). Use the
   // ok-distinguishing variant so quit-when-empty can tell a SUCCESSFUL empty list from a
@@ -960,6 +964,9 @@ async function dispatchCandidates(
     errlog(`run "${t.name}": list provider failed: ${msg(err)}`);
     return 0;
   }
+  // Dispatch gate (applied AFTER the fetch+cache+re-arm above): nothing to dispatch when
+  // the slots/cap are exhausted (e.g. at maxItems) or the actionable list is empty.
+  if (slots <= 0 || maxItemsRemaining <= 0) return 0;
   if (items.length === 0) return 0;
 
   const candidates = selectCandidates(
