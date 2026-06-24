@@ -1934,11 +1934,11 @@ struct AgentQueueHealthTests {
     private func status(
         _ name: String, present: Bool = true, phase: String = "running",
         queued: Int = 0, listOk: Bool = true, active: Int = 0, dispatched: Int = 0,
-        maxItems: Int? = nil, next: [QueueStatus.NextItem] = []
+        maxItems: Int? = nil, next: [QueueStatus.Item] = [], running: [QueueStatus.Item] = []
     ) -> QueueStatus {
         .init(queueName: name, present: present, phase: phase, queued: queued,
               listOk: listOk, active: active, dispatched: dispatched,
-              maxItems: maxItems, next: next)
+              maxItems: maxItems, next: next, running: running)
     }
 
     // MARK: - groupByOrigin present-queue injection
@@ -1984,19 +1984,25 @@ struct AgentQueueHealthTests {
         #expect(model.sections.map(\.id) == ["ExampleOS"])
     }
 
-    // MARK: - QueueHealthFormat.healthText
+    // MARK: - QueueHealthFormat.progressText (dispatched/cap; ∞ = unlimited)
 
-    @Test func healthTextStartingUntilFirstList() {
-        #expect(QueueHealthFormat.healthText(status("Q", listOk: false)) == "reading the queue…")
+    @Test func progressTextShowsDispatchedOverCap() {
+        #expect(QueueHealthFormat.progressText(status("Q", dispatched: 2, maxItems: 3)) == "2/3")
     }
 
-    @Test func healthTextShowsWaitingRunningAndCap() {
-        let s = status("Q", queued: 7, listOk: true, active: 2, dispatched: 2, maxItems: 3)
-        #expect(QueueHealthFormat.healthText(s) == "7 waiting · 2 running · 2/3")
+    @Test func progressTextUnlimitedCapIsInfinity() {
+        #expect(QueueHealthFormat.progressText(status("Q", dispatched: 4, maxItems: nil)) == "4/∞")
     }
 
-    @Test func healthTextUnlimitedCapIsInfinity() {
-        let s = status("Q", queued: 0, listOk: true, active: 1, dispatched: 4, maxItems: nil)
-        #expect(QueueHealthFormat.healthText(s) == "0 waiting · 1 running · 4/∞")
+    // MARK: - applyQueueStatus carries next/running items (for the dropdowns)
+
+    @Test func applyKeepsNextAndRunningItems() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status(
+            "ExampleOS", queued: 1, active: 1,
+            next: [QueueStatus.Item(key: "EX-2", title: "Wait", url: "https://linear.app/x/EX-2")],
+            running: [QueueStatus.Item(key: "EX-1", title: "Run", url: "https://linear.app/x/EX-1")]))
+        #expect(model.queueStatuses["ExampleOS"]?.next.first?.url == "https://linear.app/x/EX-2")
+        #expect(model.queueStatuses["ExampleOS"]?.running.first?.key == "EX-1")
     }
 }

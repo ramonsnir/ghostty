@@ -251,7 +251,8 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       active: 2,
       dispatched: 2,
       maxItems: null,
-      next: [{ key: "EX-1", title: "Fix seed" }, { key: "EX-2" }],
+      next: [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }],
+      running: [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }],
     }),
   );
   assert.equal(method, "tools/call");
@@ -262,7 +263,8 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   assert.equal(args.queued, 7);
   assert.equal(args.active, 2);
   assert.equal(args.maxItems, null);
-  assert.deepEqual(args.next, [{ key: "EX-1", title: "Fix seed" }, { key: "EX-2" }]);
+  assert.deepEqual(args.next, [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }]);
+  assert.deepEqual(args.running, [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }]);
 });
 
 test("sendKey: encodes the send_key tool with id + key", async () => {

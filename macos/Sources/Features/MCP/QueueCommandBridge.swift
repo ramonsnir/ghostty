@@ -88,10 +88,13 @@ enum QueueCommandUserInfoKey {
 /// it's about to do. Mirrors the TS `QueueStatusReport` (macos/agent-manager/src/queue/
 /// status.ts). PURE value type, safe across the main hop.
 struct QueueStatus: Equatable, Sendable {
-    /// One "what's next" entry (key + optional title).
-    struct NextItem: Equatable, Sendable {
+    /// One item reference for the header dropdowns: key + optional title + the
+    /// Linear/tracker URL (so a click can link out). `Identifiable` for SwiftUI lists.
+    struct Item: Equatable, Sendable, Identifiable {
         let key: String
         let title: String?
+        let url: String?
+        var id: String { key }
     }
 
     /// The run NAME (= dashboard origin) this status is for.
@@ -110,8 +113,12 @@ struct QueueStatus: Equatable, Sendable {
     let dispatched: Int
     /// Effective lifetime cap, or nil for unlimited.
     let maxItems: Int?
-    /// Up to a few of the next actionable items.
-    let next: [NextItem]
+    /// Up to ~25 of the next actionable WAITING items (the "N waiting" dropdown). May be
+    /// shorter than `queued` (capped) — the view shows "… and N more" then.
+    let next: [Item]
+    /// The currently-RUNNING items (one per slot-occupying agent) — the "M running"
+    /// dropdown. `running.count == active`.
+    let running: [Item]
 }
 
 /// PURE, unit-tested parser of the `report_queue_status` tool arguments → `QueueStatus`.
@@ -132,19 +139,25 @@ struct QueueStatusPayload {
         // maxItems: a number = cap; null/absent = unlimited (nil).
         let maxItems = (arguments["maxItems"] as? NSNumber)?.intValue
 
-        var next: [QueueStatus.NextItem] = []
-        if let rawNext = arguments["next"] as? [[String: Any]] {
-            for entry in rawNext {
+        // Parse an array of {key, title?, url?} item refs (used for both next + running);
+        // each needs a non-empty key, title/url kept only when non-empty.
+        func items(_ k: String) -> [QueueStatus.Item] {
+            guard let raw = arguments[k] as? [[String: Any]] else { return [] }
+            var out: [QueueStatus.Item] = []
+            for entry in raw {
                 guard let key = (entry["key"] as? String), !key.isEmpty else { continue }
                 let title = (entry["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                next.append(QueueStatus.NextItem(key: key, title: title))
+                let url = (entry["url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                out.append(QueueStatus.Item(key: key, title: title, url: url))
             }
+            return out
         }
 
         return QueueStatusPayload(status: QueueStatus(
             queueName: queueName, present: present, phase: phase,
             queued: int("queued"), listOk: listOk, active: int("active"),
-            dispatched: int("dispatched"), maxItems: maxItems, next: next))
+            dispatched: int("dispatched"), maxItems: maxItems,
+            next: items("next"), running: items("running")))
     }
 }
 

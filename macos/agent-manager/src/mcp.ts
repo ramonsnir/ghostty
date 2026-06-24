@@ -184,7 +184,8 @@ export class McpClient {
       active: status.active,
       dispatched: status.dispatched,
       maxItems: status.maxItems,
-      next: status.next,
+      next: status.next,      // each carries key/title?/url?
+      running: status.running, // key/title?/url? per running agent
     });
   }
 

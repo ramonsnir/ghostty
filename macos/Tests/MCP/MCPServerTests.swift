@@ -914,7 +914,9 @@ struct MCPServerTests {
         let p = QueueStatusPayload.fromArguments([
             "queueName": "ExampleOS", "present": true, "phase": "running",
             "queued": 7, "listOk": true, "active": 2, "dispatched": 2, "maxItems": 3,
-            "next": [["key": "EX-1", "title": "Fix seed"], ["key": "EX-2"]],
+            "next": [["key": "EX-1", "title": "Fix seed", "url": "https://linear.app/x/EX-1"],
+                     ["key": "EX-2"]],
+            "running": [["key": "EX-9", "title": "Running", "url": "https://linear.app/x/EX-9"]],
         ])
         let s = p?.status
         #expect(s?.queueName == "ExampleOS")
@@ -926,7 +928,11 @@ struct MCPServerTests {
         #expect(s?.next.count == 2)
         #expect(s?.next.first?.key == "EX-1")
         #expect(s?.next.first?.title == "Fix seed")
+        #expect(s?.next.first?.url == "https://linear.app/x/EX-1")
         #expect(s?.next.last?.title == nil)
+        #expect(s?.next.last?.url == nil)
+        #expect(s?.running.first?.key == "EX-9")
+        #expect(s?.running.first?.url == "https://linear.app/x/EX-9")
     }
 
     @Test func queueStatusPayloadRejectsMissingName() {
@@ -940,6 +946,7 @@ struct MCPServerTests {
         #expect(s?.present == true)
         #expect(s?.maxItems == nil)
         #expect(s?.next.isEmpty == true)
+        #expect(s?.running.isEmpty == true)
         // present:false round-trips (the "run gone" report).
         let gone = QueueStatusPayload.fromArguments(["queueName": "Q", "present": false])?.status
         #expect(gone?.present == false)

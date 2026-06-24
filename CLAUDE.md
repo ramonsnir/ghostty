@@ -892,6 +892,22 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `MCPServerTests` (`queueStatusPayload*`, `toolsListHasAllTools` now 18) +
     `AgentDashboardTests` (`AgentQueueHealthTests`: apply/clear, empty-section grouping,
     `healthText`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+    - **Clickable count DROPDOWNS (mirrors the hidden-agents popover).** The "N waiting" and
+      "M running" counts in the header are buttons that open a popover listing those items
+      with **Linear links** (key badge · title · `Link` for http(s) urls; "… and N more" when
+      the waiting list is capped). This required the report to carry per-item DETAIL, not just
+      counts: `QueueStatusReport.next` items gained `url`, and a new `running: QueueItemRef[]`
+      (key/title/url per slot-occupying agent) was added — `runner.ts reportQueueStatus` builds
+      `runningItems` from the active assignments (title/url captured at dispatch) and sends
+      `nextLimit:25`; the pure builder's `active` is now `runningItems.length`. Swift mirrors it:
+      `QueueStatus.Item` (was `NextItem`, +`url`, `Identifiable`) + `running: [Item]`, parsed by a
+      shared `items(_:)` helper in `QueueStatusPayload`; `report_queue_status` schema gains `url`
+      on next + a `running` array; `OriginSectionHeader` renders `countButton`→`itemsPopover`
+      (Linear `Link` via `itemLink`, http(s)-gated like `queueURLLink`) and `QueueHealthFormat`
+      swapped `healthText`→`progressText` (just the "dispatched/cap" suffix; the counts are now
+      buttons). Tests: sidecar `status.test.ts` (next url + running echo) + `mcp.test.ts`
+      (running forward); Swift `MCPServerTests` (parse url+running) + `AgentDashboardTests`
+      (`progressText`, `applyKeepsNextAndRunningItems`). **GUI relaunch + rebuilt sidecar `dist`.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

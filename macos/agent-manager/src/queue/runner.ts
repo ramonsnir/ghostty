@@ -601,6 +601,9 @@ async function runOne(
 async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> {
   if (deps.client.reportQueueStatus === undefined) return; // optional client capability
   const occupying = [...run.active.values()].filter(occupiesSlot);
+  // The RUNNING items (key/title/url) for the "M running" dropdown — from the
+  // slot-occupying assignments (title/url were captured at dispatch from the work item).
+  const runningItems = occupying.map((a) => ({ key: a.key, title: a.title, url: a.url }));
   // Exclude from the backlog/next: everything currently tracked (active map, any state)
   // PLUS the §7.1 dispatch latch — those keys are NOT eligible to dispatch, so showing
   // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
@@ -612,12 +615,15 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     draining: run.draining,
     disabled: run.disabled,
     dispatchArmed: run.dispatchArmed,
-    activeCount: occupying.length,
+    runningItems,
     excludeKeys: exclude,
     listItems: run.lastListItems,
     listOk: run.lastListOk,
     dispatched: run.lifetimeDispatched,
     maxItemsCap: effectiveMaxItemsCap(run),
+    // A generous cap for the "N waiting" dropdown (the count itself is always exact);
+    // beyond this the GUI shows "… and N more".
+    nextLimit: 25,
   });
   try {
     await deps.client.reportQueueStatus(report);
@@ -639,7 +645,7 @@ async function reportRunGone(deps: QueueDeps, name: string): Promise<void> {
         draining: false,
         disabled: false,
         dispatchArmed: true,
-        activeCount: 0,
+        runningItems: [],
         excludeKeys: new Set<string>(),
         listItems: null,
         listOk: false,

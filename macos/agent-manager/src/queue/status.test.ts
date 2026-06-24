@@ -21,7 +21,7 @@ function input(over: Partial<QueueStatusInputs> = {}): QueueStatusInputs {
     draining: false,
     disabled: false,
     dispatchArmed: true,
-    activeCount: 0,
+    runningItems: [],
     excludeKeys: new Set<string>(),
     listItems: [],
     listOk: true,
@@ -58,7 +58,7 @@ test("backlog excludes active/latched keys + de-dupes; next is limited + carries
   const r = queueStatusReport(input({
     listItems: items("A", ["B", "Build it"], "C", "C", "D", "E", "F"), // C duplicated
     excludeKeys: new Set(["A"]),                                       // A active/latched
-    activeCount: 1,
+    runningItems: [{ key: "A", title: "Active A", url: "https://x/A" }],
     dispatched: 1,
     nextLimit: 3,
   }));
@@ -66,6 +66,15 @@ test("backlog excludes active/latched keys + de-dupes; next is limited + carries
   assert.equal(r.queued, 5);
   assert.equal(r.active, 1);
   assert.deepEqual(r.next, [{ key: "B", title: "Build it" }, { key: "C" }, { key: "D" }]);
+  // running echoes the runningItems (carrying url for the dropdown link).
+  assert.deepEqual(r.running, [{ key: "A", title: "Active A", url: "https://x/A" }]);
+});
+
+test("next carries item url (for the waiting-dropdown Linear link)", () => {
+  const r = queueStatusReport(input({
+    listItems: [{ key: "EX-9", title: "Fix it", url: "https://linear.app/x/EX-9" }],
+  }));
+  assert.deepEqual(r.next, [{ key: "EX-9", title: "Fix it", url: "https://linear.app/x/EX-9" }]);
 });
 
 test("maxItemsCap passes through (null = unlimited)", () => {
