@@ -275,7 +275,7 @@ struct AgentDashboardView: View {
             Button("Show all") { model.showAll(); showHiddenPopover = false }
         }
         .padding(12)
-        .frame(width: 240)
+        .frame(width: 560)
     }
 
     /// Focus (jump to) a hidden split by id without unhiding it: raise its window,
