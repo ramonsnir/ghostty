@@ -518,6 +518,45 @@ test("runQueueSweep: reports queue health — 'starting' on the arm sweep, then 
   assert.deepEqual(last.next.map((n) => n.key), ["B", "C"]);
 });
 
+test("runQueueSweep: a run AT its maxItems cap still reports health (not stuck 'reading the queue…')", async () => {
+  // Regression: the list fetch (which updates the §11 health cache) used to sit BEHIND the
+  // `maxItemsRemaining<=0` early-return, so a run rehydrated AT its cap never fetched →
+  // listOk stayed false → the bar was stuck on "reading the queue…". Now the fetch runs
+  // before the dispatch gate. Pre-seed the store at cap (1/1, A active) + a live surface
+  // for A, so the first dispatch sweep is at-cap from the start.
+  const seeded = JSON.stringify({
+    version: 1,
+    records: [{
+      queueName: "backlog", key: "A", sessionID: 1, gridSlot: 0,
+      state: "RUNNING", sinceMs: 0, surfaceUUID: "u-a-old", title: "Alpha",
+    }],
+    lifetimeDispatched: 1,
+    dispatched: ["A"],
+  });
+  const fake = makeQueueFake({
+    // A is live (matched by sessionID) + B is a new actionable item that can't dispatch (cap).
+    surfaces: [queueSurface({ id: "u-a-new", sessionID: 1, queueName: "backlog", queueKey: "A" })],
+    listJson: '[{"id":"A","title":"Alpha"},{"id":"B","title":"Beta"}]',
+    statusByKey: { A: '{"state":"working"}' },
+  });
+  const t = tmpl({ params: [{ name: "maxItems", target: "maxItems", default: "1" }] });
+  const run = makeQueueRun(t, memStore(seeded), { params: { maxItems: "1" } });
+  let now = 7_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // sweep 1: reconcile (adopts A) + arm (no fetch yet)
+  now += 5000;
+  await runQueueSweep(deps); // sweep 2: AT cap (1/1) — must STILL fetch the list for health
+  const last = fake.calls.reports.at(-1)!;
+  assert.equal(last.listOk, true, "at cap, the list is still fetched → not 'reading the queue…'");
+  assert.notEqual(last.phase, "starting");
+  assert.equal(last.dispatched, 1);
+  assert.equal(last.maxItems, 1);
+  assert.equal(last.active, 1, "A occupies the only slot");
+  assert.equal(last.queued, 1, "B is waiting (A excluded as active/latched)");
+  assert.deepEqual(last.next.map((n) => n.key), ["B"]);
+});
+
 // ---------------------------------------------------------------------------
 // (4) End-to-end mocked dispatch → RUNNING → done → close cycle (§6/§10).
 // ---------------------------------------------------------------------------
