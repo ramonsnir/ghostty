@@ -243,6 +243,24 @@ test("nextState: idle-debounce gate — idle must be HELD unchanged closeStableS
   );
 });
 
+test("nextState: a finished agent settled in WAITING (not idle) closes once held closeStableSeconds", () => {
+  // The real-world stuck case: a finished Claude Code agent fires Stop(idle), then a
+  // Notification "waiting for input" nudge flips it to waiting — so it ends in `waiting`,
+  // never `idle`. Quiescence (idle OR waiting) is what lets the queue close it.
+  const a = asgn({ state: "DONE_PENDING" });
+  const now = 100000;
+  // waiting, but not yet held the window -> hold.
+  assert.equal(
+    nextState(a, ctx({ agentState: "waiting", idleStableSinceMs: now - 4900, nowMs: now, closeStableSeconds: 5 })),
+    "DONE_PENDING",
+  );
+  // waiting held exactly closeStableSeconds -> CLOSING.
+  assert.equal(
+    nextState(a, ctx({ agentState: "waiting", idleStableSinceMs: now - 5000, nowMs: now, closeStableSeconds: 5 })),
+    "CLOSING",
+  );
+});
+
 test("nextState: closeOnComplete=false PINS DONE_PENDING — a stably-idle agent is NOT closed", () => {
   const a = asgn({ state: "DONE_PENDING" });
   const now = 100000;
@@ -274,9 +292,9 @@ test("nextState: closeOnComplete=false PINS DONE_PENDING — a stably-idle agent
 });
 
 test("nextState: a Codex/no-hooks agent (no agentState) NEVER reaches CLOSING (documented §14 limit)", () => {
-  // Codex emits no agent-state hooks, so a DONE_PENDING assignment never observes an
-  // idle agentState; the close gate (which keys on agentState==='idle') can therefore
-  // never fire — the split would need manual close. This pins that documented limitation.
+  // Codex emits no agent-state hooks, so a DONE_PENDING assignment never observes a
+  // quiescent agentState (idle/waiting); the close gate can therefore never fire — the
+  // split would need manual close. This pins that documented limitation.
   const a = asgn({ state: "DONE_PENDING" });
   const now = 100000;
   for (const elapsed of [0, 5000, 60000, 600000]) {
@@ -352,14 +370,22 @@ test("nextState: closeStableSeconds=0 closes on the FIRST stable-idle observatio
 // foldIdleAnchor — the idle-debounce anchor folding (a flap resets it).
 // ---------------------------------------------------------------------------
 
-test("foldIdleAnchor: idle with no prior anchor STARTS the clock; with a prior KEEPS it", () => {
-  assert.equal(foldIdleAnchor(undefined, "idle", 5000), 5000); // start
+test("foldIdleAnchor: quiescent (idle/waiting) with no prior anchor STARTS the clock; with a prior KEEPS it", () => {
+  assert.equal(foldIdleAnchor(undefined, "idle", 5000), 5000); // start on idle
   assert.equal(foldIdleAnchor(5000, "idle", 9000), 5000); // held — clock not reset
+  assert.equal(foldIdleAnchor(undefined, "waiting", 5000), 5000); // start on waiting too
+  assert.equal(foldIdleAnchor(5000, "waiting", 9000), 5000); // held on waiting
 });
 
-test("foldIdleAnchor: any non-idle observation RESETS the anchor (a flap)", () => {
+test("foldIdleAnchor: an idle<->waiting transition KEEPS the anchor (both are quiescent)", () => {
+  // A finished Claude Code agent fires Stop(idle) then a Notification(waiting) nudge.
+  // That transition must NOT reset the close clock — both states are quiescent.
+  assert.equal(foldIdleAnchor(5000, "waiting", 9000), 5000); // idle-anchored, now waiting -> kept
+  assert.equal(foldIdleAnchor(5000, "idle", 9000), 5000); // waiting-anchored, now idle -> kept
+});
+
+test("foldIdleAnchor: only working/undefined RESET the anchor (a flap)", () => {
   assert.equal(foldIdleAnchor(5000, "working", 9000), undefined);
-  assert.equal(foldIdleAnchor(5000, "waiting", 9000), undefined);
   assert.equal(foldIdleAnchor(5000, undefined, 9000), undefined);
 });
 

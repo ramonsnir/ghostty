@@ -144,16 +144,20 @@ export interface NextStateContext {
   /** Is the surface still present in `list_surfaces`? (false = closed/gone). */
   surfaceLive: boolean;
   /** The hook-driven agentState ("working"/"waiting"/"idle"/undefined). The close
-   *  gate keys on this — NEVER on `idleSeconds` (a repainting TUI never idles by
-   *  `idleSeconds`, §2). */
+   *  gate keys on this (QUIESCENT = idle OR waiting) — NEVER on `idleSeconds` (a
+   *  repainting TUI never idles by `idleSeconds`, §2). A finished Claude Code agent
+   *  reliably ends in `waiting` (its `Stop`→idle hook is immediately overwritten by a
+   *  `Notification` "waiting for input" nudge), so an idle-ONLY gate would never close
+   *  it — hence quiescence spans both. */
   agentState?: string;
   /** Did the surface's child process EXIT (process_exited)? (§6 EXITED). */
   exited: boolean;
-  /** ms-since-epoch the agentState last BECAME "idle" UNCHANGED (the idle-debounce
-   *  anchor). The loop stamps it when it observes idle and RESETS it to undefined on
-   *  any non-idle observation (a flap), so a stable idle of `closeStableSeconds`
-   *  requires `agentState==="idle"` held continuously. `undefined` = not currently
-   *  idle (or just flapped). */
+  /** ms-since-epoch the agentState last BECAME QUIESCENT (idle OR waiting) UNCHANGED
+   *  (the quiescence-debounce anchor). The loop stamps it when it observes a quiescent
+   *  state and RESETS it to undefined on any non-quiescent observation (a flap), so a
+   *  stable quiescence of `closeStableSeconds` requires the agent to stay quiescent
+   *  (idle↔waiting transitions DON'T reset it — both count) continuously. `undefined` =
+   *  not currently quiescent (working) or just flapped. */
   idleStableSinceMs?: number;
   /** Current time (ms-since-epoch), injected. */
   nowMs: number;
@@ -182,10 +186,13 @@ export interface NextStateContext {
  *     passes agentState as the detection proxy) → it is a live, detected agent.
  *   - RUNNING → DONE_PENDING: `statusTerminal === true` (the provider says done).
  *     The ONLY completion trigger.
- *   - DONE_PENDING → CLOSING: `agentState === "idle"` held UNCHANGED for
- *     `closeStableSeconds` — i.e. `idleStableSinceMs` is set AND `nowMs -
- *     idleStableSinceMs >= closeStableSeconds*1000` — AND `closeOnComplete !== false`.
- *     A flap (idleStableSinceMs undefined) HOLDS in DONE_PENDING (never closes early).
+ *   - DONE_PENDING → CLOSING: the agent is QUIESCENT (agentState `idle` OR `waiting`)
+ *     held UNCHANGED for `closeStableSeconds` — i.e. `idleStableSinceMs` is set AND
+ *     `nowMs - idleStableSinceMs >= closeStableSeconds*1000` — AND
+ *     `closeOnComplete !== false`. `waiting` counts because a finished Claude Code agent
+ *     reliably settles in `waiting` (its `Stop`→idle hook is overwritten by a later
+ *     `Notification` nudge), so an idle-ONLY gate would never close it.
+ *     A flap to working (idleStableSinceMs undefined) HOLDS in DONE_PENDING (never closes early).
  *     A template with `closeOnComplete === false` HOLDS in DONE_PENDING forever (the
  *     done split is left open for manual close, §5/§6/§10). `idleSeconds` is NEVER
  *     consulted (§10). EXCEPTION: a DONE_PENDING assignment whose CHILD has already
@@ -237,13 +244,13 @@ export function nextState(a: Assignment, ctx: NextStateContext): AssignmentState
       return "CLOSING";
     }
     if (
-      ctx.agentState === "idle" &&
+      isQuiescent(ctx.agentState) &&
       typeof ctx.idleStableSinceMs === "number" &&
       ctx.nowMs - ctx.idleStableSinceMs >= ctx.closeStableSeconds * 1000
     ) {
       return "CLOSING";
     }
-    return "DONE_PENDING"; // not stably idle / flapped → hold
+    return "DONE_PENDING"; // not stably quiescent / flapped → hold
   }
 
   // Completion: provider status terminal is the ONLY trigger (works from SPAWNED or
@@ -270,23 +277,33 @@ export function nextState(a: Assignment, ctx: NextStateContext): AssignmentState
   return s;
 }
 
+/** Is the agent QUIESCENT — settled, awaiting the queue's close (NOT actively
+ *  working)? True for `idle` AND `waiting`: a finished Claude Code agent reliably
+ *  ends in `waiting` (its `Stop`→idle hook is overwritten by a `Notification` nudge),
+ *  so both count as "done, ready to close". `working`/`undefined`/anything else is
+ *  NOT quiescent. PURE. */
+export function isQuiescent(agentState: string | undefined): boolean {
+  return agentState === "idle" || agentState === "waiting";
+}
+
 /**
- * Fold the idle-debounce ANCHOR. PURE. Given the PRIOR `idleStableSinceMs` and the
- * CURRENTLY-observed agentState + `nowMs`, return the next anchor:
- *   - agentState === "idle" AND a prior anchor exists  → KEEP the prior anchor
- *     (idle has been continuously held — do NOT reset the clock).
- *   - agentState === "idle" AND no prior anchor        → START the clock at `nowMs`.
- *   - any non-idle agentState (working/waiting/etc/undefined) → RESET to undefined
- *     (a flap; the next idle restarts the clock from scratch).
- * This is what makes "idle UNCHANGED for closeStableSeconds" a true HOLD that a flap
- * resets (§6/§10) — `nextState` reads the resulting anchor.
+ * Fold the quiescence-debounce ANCHOR. PURE. Given the PRIOR `idleStableSinceMs` and
+ * the CURRENTLY-observed agentState + `nowMs`, return the next anchor:
+ *   - QUIESCENT (idle OR waiting) AND a prior anchor exists → KEEP the prior anchor
+ *     (the agent has been continuously quiescent — do NOT reset the clock; an
+ *     idle↔waiting transition therefore KEEPS the hold running, since both qualify).
+ *   - QUIESCENT AND no prior anchor → START the clock at `nowMs`.
+ *   - NOT quiescent (working / undefined / etc) → RESET to undefined (a flap; the next
+ *     quiescent observation restarts the clock from scratch).
+ * This is what makes "quiescent UNCHANGED for closeStableSeconds" a true HOLD that a
+ * flap to working resets (§6/§10) — `nextState` reads the resulting anchor.
  */
 export function foldIdleAnchor(
   priorAnchorMs: number | undefined,
   agentState: string | undefined,
   nowMs: number,
 ): number | undefined {
-  if (agentState === "idle") {
+  if (isQuiescent(agentState)) {
     return typeof priorAnchorMs === "number" ? priorAnchorMs : nowMs;
   }
   return undefined;
