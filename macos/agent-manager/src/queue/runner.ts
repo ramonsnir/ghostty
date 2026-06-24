@@ -65,7 +65,12 @@ import {
   type LiveSurface,
   type StoreIO,
 } from "./store.js";
-import { resolveMaxItemsOverride, resolveParamsEnv } from "./templates.js";
+import {
+  resolveMaxItemsOverride,
+  resolveParamsEnv,
+  runDisplayName,
+  runIdentityScope,
+} from "./templates.js";
 import { queueStatusReport, type QueueStatusReport } from "./status.js";
 import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
 
@@ -100,6 +105,17 @@ export interface QueueRun {
    *  and the dedup identity for a `start` command (re-starting the same template basename is
    *  a no-op). Defaults to `template.name` for runs created without a basename (tests). */
   templateName: string;
+  /** (parallel runs) The run's DISPLAY name + IDENTITY: `template.name` plus the run's
+   *  non-empty env-param VALUES (e.g. "ExampleOS · Acme · v2.0"). This — NOT `template.name`
+   *  — is the dashboard origin, the annotation `queueName`, the health-report name, the
+   *  active-run record name, and the reconcile filter, so two scoped runs of one template
+   *  are shown + controlled as DISTINCT runs. Computed from `template` + `params` at
+   *  construction; defaults to `template.name` when the run has no env params. */
+  runName: string;
+  /** (parallel runs) The canonical, order-independent scope identity (`runIdentityScope`):
+   *  the resolved provider env. Two `start`s of the same template with this same scope are an
+   *  idempotent no-op; different scopes run in PARALLEL. Used by `applyCommand`'s dedup. */
+  identityScope: string;
   /** The store seam for THIS run's durable records (one file per run). */
   storeIO: StoreIO;
   /** (§8b) The resolved START-TIME parameter answers (param name → value) the run was
@@ -181,6 +197,13 @@ export interface QueueRun {
    *  call — the dashboard's "N waiting / next: …" reads from this. Not persisted. */
   lastListItems: WorkItem[] | null;
   lastListOk: boolean;
+  /** (live maxItems edit) A run-level OVERRIDE of the lifetime cap, set by a `set_max_items`
+   *  command WHILE the run is live (the dashboard cap control). Takes PRECEDENCE over the
+   *  start-time/template cap in `effectiveMaxItemsCap`. `undefined` = no live edit (use the
+   *  start-time/template cap); `null` = live-set to UNLIMITED; a positive number = the live
+   *  cap. Persisted in the active-runs record so a restart re-applies it. Reducing it below
+   *  what is already dispatched only stops FUTURE dispatch (running agents are never killed). */
+  maxItemsLive?: number | null;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -196,13 +219,18 @@ export function makeQueueRun(
     paused?: boolean;
     draining?: boolean;
     params?: Record<string, string>;
+    maxItemsLive?: number | null;
   } = {},
 ): QueueRun {
+  const params = opts.params ?? {};
   return {
     template,
     templateName: opts.templateName ?? template.name,
+    runName: runDisplayName(template, params),
+    identityScope: runIdentityScope(template, params),
     storeIO,
-    params: opts.params ?? {},
+    params,
+    maxItemsLive: opts.maxItemsLive,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
@@ -221,10 +249,12 @@ export function makeQueueRun(
   };
 }
 
-/** (§11 health) The run's EFFECTIVE lifetime cap: the §8b maxItems override if set
- *  (0 ⇒ unlimited ⇒ null), else the template `maxItems`. PURE. Shared by the dispatch
- *  gate and the health report so they agree. */
+/** (§11 health) The run's EFFECTIVE lifetime cap: the LIVE edit if set (the dashboard cap
+ *  control — `null` ⇒ unlimited), else the §8b maxItems override if set (0 ⇒ unlimited ⇒
+ *  null), else the template `maxItems`. PURE. Shared by the dispatch gate and the health
+ *  report so they agree. */
 export function effectiveMaxItemsCap(run: QueueRun): number | null {
+  if (run.maxItemsLive !== undefined) return run.maxItemsLive; // live edit wins (null = unlimited)
   const override = resolveMaxItemsOverride(run.template, run.params);
   const cap = override === undefined ? run.template.maxItems : override;
   return cap <= 0 ? null : cap;
@@ -278,13 +308,16 @@ export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
   for (const run of registry.values()) {
     const rec: ActiveRunRecord = {
       template: run.templateName,
-      name: run.template.name,
+      name: run.runName,
       paused: run.paused,
       draining: run.draining,
     };
     // Persist the start-time params (§8b) so a restart re-applies the same scope. Omit
     // when empty (no declared params / no answers) to keep the file tidy + back-compat.
     if (Object.keys(run.params).length > 0) rec.params = { ...run.params };
+    // Persist a LIVE maxItems edit so a restart re-applies it (null = unlimited; omitted
+    // when never live-edited, so a restart falls back to the start-time/template cap).
+    if (run.maxItemsLive !== undefined) rec.maxItemsLive = run.maxItemsLive;
     out.push(rec);
   }
   return out;
@@ -503,7 +536,10 @@ async function runOne(
 
   // --- 1) RECONCILE (always first; §9) --------------------------------------------
   // Project the live surfaces carrying THIS run's annotation into LiveSurface views.
-  const liveForRun = projectLiveSurfaces(surfaces, t.name);
+  // (parallel runs) Filter by the run's IDENTITY name (`runName`), which is what
+  // dispatchOne/restampAnnotation stamp as the surface annotation queueName — so two
+  // scoped runs of one template never adopt each other's tiles.
+  const liveForRun = projectLiveSurfaces(surfaces, run.runName);
   const records = loadStore(run.storeIO);
   const plan = reconcile(records, liveForRun, nowMs, deps.pendingGraceMs);
 
@@ -550,7 +586,7 @@ async function runOne(
       run.disabled = true;
       run.cooldown.set(action.assignment.key, cooldownUntil(nowMs));
       errlog(
-        `run "${t.name}": ${action.assignment.key} surface never attached a host session ` +
+        `run "${run.runName}": ${action.assignment.key} surface never attached a host session ` +
           `(no pty-host, §2) — supervisor self-DISABLED for this run`,
       );
     }
@@ -601,28 +637,34 @@ async function runOne(
 async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> {
   if (deps.client.reportQueueStatus === undefined) return; // optional client capability
   const occupying = [...run.active.values()].filter(occupiesSlot);
+  // The RUNNING items (key/title/url) for the "M running" dropdown — from the
+  // slot-occupying assignments (title/url were captured at dispatch from the work item).
+  const runningItems = occupying.map((a) => ({ key: a.key, title: a.title, url: a.url }));
   // Exclude from the backlog/next: everything currently tracked (active map, any state)
   // PLUS the §7.1 dispatch latch — those keys are NOT eligible to dispatch, so showing
   // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
   const exclude = new Set<string>([...run.active.keys(), ...run.dispatched]);
   const report: QueueStatusReport = queueStatusReport({
-    queueName: run.template.name,
+    queueName: run.runName,
     present: true,
     paused: run.paused,
     draining: run.draining,
     disabled: run.disabled,
     dispatchArmed: run.dispatchArmed,
-    activeCount: occupying.length,
+    runningItems,
     excludeKeys: exclude,
     listItems: run.lastListItems,
     listOk: run.lastListOk,
     dispatched: run.lifetimeDispatched,
     maxItemsCap: effectiveMaxItemsCap(run),
+    // A generous cap for the "N waiting" dropdown (the count itself is always exact);
+    // beyond this the GUI shows "… and N more".
+    nextLimit: 25,
   });
   try {
     await deps.client.reportQueueStatus(report);
   } catch (err) {
-    errlog(`report_queue_status "${run.template.name}": ${msg(err)}`);
+    errlog(`report_queue_status "${run.runName}": ${msg(err)}`);
   }
 }
 
@@ -639,7 +681,7 @@ async function reportRunGone(deps: QueueDeps, name: string): Promise<void> {
         draining: false,
         disabled: false,
         dispatchArmed: true,
-        activeCount: 0,
+        runningItems: [],
         excludeKeys: new Set<string>(),
         listItems: null,
         listOk: false,
@@ -697,7 +739,7 @@ async function restampAnnotation(
   try {
     await deps.client.setAnnotation(a.surfaceUUID, {
       queueKey: a.key,
-      queueName: run.template.name,
+      queueName: run.runName,
       ...(a.url !== undefined ? { queueUrl: a.url } : {}),
     });
   } catch (err) {
@@ -784,7 +826,7 @@ async function advanceStates(
           await signal(deps, updated.surfaceUUID, `agent for ${updated.key} exited early`);
         }
         run.idleAnchor.delete(a.key);
-        log(`run "${run.template.name}": ${updated.key} EXITED early — bell rung, slot freed`);
+        log(`run "${run.runName}": ${updated.key} EXITED early — bell rung, slot freed`);
       }
     }
   }
@@ -831,7 +873,7 @@ async function runCloseSequences(
     if (live === undefined) {
       finishAndCooldown(run, a, deps.now());
       changed = true;
-      log(`run "${run.template.name}": ${a.key} surface gone → cooldown`);
+      log(`run "${run.runName}": ${a.key} surface gone → cooldown`);
       continue;
     }
 
@@ -855,7 +897,7 @@ async function runCloseSequences(
       // If the child is ALREADY exited this very sweep, fall through to force-close;
       // otherwise defer to a later sweep so the child can exit cleanly.
       if (!live.exited) {
-        log(`run "${run.template.name}": ${a.key} exit keys sent; awaiting child exit`);
+        log(`run "${run.runName}": ${a.key} exit keys sent; awaiting child exit`);
         continue;
       }
     }
@@ -866,7 +908,7 @@ async function runCloseSequences(
     const elapsed = deps.now() - progress.sinceMs;
     if (live.exited || elapsed >= awaitMs) {
       if (!live.exited) {
-        log(`run "${run.template.name}": ${a.key} await-exit timed out (${elapsed}ms); force-closing`);
+        log(`run "${run.runName}": ${a.key} await-exit timed out (${elapsed}ms); force-closing`);
       }
       try {
         await deps.client.forceCloseSurface(uuid);
@@ -875,7 +917,7 @@ async function runCloseSequences(
       }
       finishAndCooldown(run, a, deps.now());
       changed = true;
-      log(`run "${run.template.name}": ${a.key} closed → cooldown`);
+      log(`run "${run.runName}": ${a.key} closed → cooldown`);
     }
     // else: still within the await window and not yet exited → keep polling next sweep.
   }
@@ -917,7 +959,11 @@ async function dispatchCandidates(
   const cap = effectiveMaxItemsCap(run);
   const maxItemsRemaining =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - run.lifetimeDispatched);
-  if (slots <= 0 || maxItemsRemaining <= 0) return 0;
+  // NOTE: do NOT early-return on a full slot/cap here — the list fetch below ALSO updates
+  // the §11 health cache (lastListOk/lastListItems), re-arms the §7.1 latch, and sets the
+  // quit-when-empty observation, all of which must happen even when the run can't dispatch
+  // (e.g. at its maxItems cap). The dispatch gate is applied AFTER the fetch instead (a
+  // capped run that fetched `[]` shows "0 waiting · N running · N/N", not "reading the queue…").
 
   // Fetch the provider list (skip the tick on any failure — never throws). Use the
   // ok-distinguishing variant so quit-when-empty can tell a SUCCESSFUL empty list from a
@@ -957,9 +1003,12 @@ async function dispatchCandidates(
       }
     }
   } catch (err) {
-    errlog(`run "${t.name}": list provider failed: ${msg(err)}`);
+    errlog(`run "${run.runName}": list provider failed: ${msg(err)}`);
     return 0;
   }
+  // Dispatch gate (applied AFTER the fetch+cache+re-arm above): nothing to dispatch when
+  // the slots/cap are exhausted (e.g. at maxItems) or the actionable list is empty.
+  if (slots <= 0 || maxItemsRemaining <= 0) return 0;
   if (items.length === 0) return 0;
 
   const candidates = selectCandidates(
@@ -1030,8 +1079,10 @@ async function dispatchOne(
   if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
   const sp = splitPlan(slot, occupied, t.grid.fill, t.grid.cols, t.grid.rows);
 
-  // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a).
-  const pending = makePendingRecord(t.name, item.key, slot, nowMs, {
+  // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
+  // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
+  // + the reconcile filter, so parallel scoped runs of one template never cross-adopt (§9).
+  const pending = makePendingRecord(run.runName, item.key, slot, nowMs, {
     title: item.title,
     url: item.url,
   });
@@ -1092,7 +1143,7 @@ async function dispatchOne(
     // eligible to retry on the next list (mirrors the lifetime-counter rollback).
     run.dispatched.delete(item.key);
     persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
-    errlog(`run "${t.name}": spawn ${item.key} failed: ${msg(err)}`);
+    errlog(`run "${run.runName}": spawn ${item.key} failed: ${msg(err)}`);
     return false;
   }
 
@@ -1128,11 +1179,11 @@ async function dispatchOne(
   try {
     await deps.client.setAnnotation(spawned.id, {
       queueKey: item.key,
-      queueName: t.name,
+      queueName: run.runName,
       ...(item.url !== undefined ? { queueUrl: item.url } : {}),
     });
   } catch (err) {
-    errlog(`run "${t.name}": annotate ${item.key}: ${msg(err)}`);
+    errlog(`run "${run.runName}": annotate ${item.key}: ${msg(err)}`);
   }
 
   // (g) Optional fire-and-forget claim (a LATENCY optimization, never correctness §7).
@@ -1146,7 +1197,7 @@ async function dispatchOne(
     });
   }
 
-  log(`run "${t.name}": dispatched ${item.key} → slot ${slot} (session ${spawned.sessionId})`);
+  log(`run "${run.runName}": dispatched ${item.key} → slot ${slot} (session ${spawned.sessionId})`);
   return true;
 }
 

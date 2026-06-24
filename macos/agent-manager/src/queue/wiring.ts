@@ -9,6 +9,7 @@
 
 import { execFile } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -30,8 +31,11 @@ import {
   makeTemplateLoader,
   missingRequiredParams,
   realTemplateFs,
+  runIdentityScope,
+  scopeSlug,
   type LoadResult,
 } from "./templates.js";
+import type { QueueTemplate } from "./types.js";
 
 /**
  * Env-var names (and prefixes) STRIPPED from the inherited process env before it is
@@ -196,11 +200,51 @@ export function loadTemplateByName(
 }
 
 /**
+ * (parallel runs) The per-run STATE FILE path under `stateDir`. Parallel runs of ONE
+ * template (different param scopes) must NOT share a state file, so a NON-EMPTY scope adds
+ * a short scope-hash suffix (`<basename>.<slug>.state.json`); an EMPTY scope keeps the bare
+ * `<basename>.state.json` (byte-compatible with the pre-parallel single-run file). The
+ * factory + rehydration derive it identically from (basename + template + params), so a
+ * started run rehydrates to the SAME file. Path-only (no I/O).
+ */
+function runStatePath(
+  stateDir: string,
+  basename: string,
+  template: QueueTemplate,
+  params: Record<string, string>,
+): string {
+  const slug = scopeSlug(runIdentityScope(template, params));
+  const file = slug === "" ? `${basename}.state.json` : `${basename}.${slug}.state.json`;
+  return join(stateDir, file);
+}
+
+/**
+ * (migration) Whether to MIGRATE a pre-parallel single-run state file
+ * (`<basename>.state.json`) to the scope-suffixed path. PURE (the caller supplies the
+ * existence bits). True ONLY when the scoped path DIFFERS from the legacy path (the run has
+ * a non-empty scope), the scoped file is ABSENT, and the legacy file EXISTS — i.e. a run
+ * whose durable state predates the scope-suffix rename (the `queue-parallel` change). This
+ * preserves `lifetimeDispatched` + the live maxItems edit + the in-flight assignment records
+ * across the upgrade instead of silently starting the count over at 0. Done ONLY on the
+ * rehydrate path (a run that WAS active); a fresh `start` must NOT adopt a stale bare file.
+ * Exported for unit testing.
+ */
+export function shouldMigrateLegacyState(
+  scopedPath: string,
+  legacyPath: string,
+  scopedExists: boolean,
+  legacyExists: boolean,
+): boolean {
+  return scopedPath !== legacyPath && !scopedExists && legacyExists;
+}
+
+/**
  * (§8a) Build the production RUN FACTORY a `start` command uses: load+validate the template
- * by basename, wire a per-run file StoreIO under `stateDir` (named by the basename so it is
- * stable across restarts), and construct the QueueRun (carrying the basename for reload +
- * the optional rehydrated paused/draining flags). Returns null on a bad/absent template
- * (logged here) so `applyCommand` treats it as a failed start.
+ * by basename, wire a per-run file StoreIO under `stateDir` (named by the basename + the
+ * param SCOPE so parallel scoped runs of one template don't collide on disk, yet a run
+ * rehydrates to the same file across restarts), and construct the QueueRun (carrying the
+ * basename for reload + the optional rehydrated paused/draining flags). Returns null on a
+ * bad/absent template (logged here) so `applyCommand` treats it as a failed start.
  */
 export function makeFileRunFactory(
   templatesDir: string,
@@ -223,8 +267,9 @@ export function makeFileRunFactory(
       );
       return null;
     }
-    const storeIO = makeFileStoreIO(join(stateDir, `${basename}.state.json`));
-    return makeQueueRun(res.template, storeIO, { templateName: basename, params: params ?? {} });
+    const runParams = params ?? {};
+    const storeIO = makeFileStoreIO(runStatePath(stateDir, basename, res.template, runParams));
+    return makeQueueRun(res.template, storeIO, { templateName: basename, params: runParams });
   };
 }
 
@@ -249,13 +294,32 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
       );
       continue;
     }
-    const storeIO = makeFileStoreIO(join(stateDir, `${rec.template}.state.json`));
+    const runParams = rec.params ?? {};
+    const scopedPath = runStatePath(stateDir, rec.template, res.template, runParams);
+    // (migration) An in-flight run whose state file predates the scope-suffix rename lives at
+    // the bare `<basename>.state.json`. Rename it to the scoped path so its lifetimeDispatched
+    // + live cap + assignment records survive the upgrade (otherwise rehydrate would read an
+    // absent scoped file → start the count over at 0 + re-adopt orphans). Best-effort: a
+    // failed rename just falls back to a fresh state (never throws into startup).
+    const legacyPath = join(stateDir, `${rec.template}.state.json`);
+    if (shouldMigrateLegacyState(scopedPath, legacyPath, existsSync(scopedPath), existsSync(legacyPath))) {
+      try {
+        renameSync(legacyPath, scopedPath);
+        console.log(
+          `agent-manager: queue: migrated legacy state for "${rec.template}" → scope-suffixed file`,
+        );
+      } catch (err) {
+        console.error(`agent-manager: queue: legacy state migration failed for "${rec.template}": ${String(err)}`);
+      }
+    }
+    const storeIO = makeFileStoreIO(scopedPath);
     runs.push(
       makeQueueRun(res.template, storeIO, {
         templateName: rec.template,
         paused: rec.paused,
         draining: rec.draining,
-        params: rec.params ?? {},
+        params: runParams,
+        maxItemsLive: rec.maxItemsLive,
       }),
     );
   }

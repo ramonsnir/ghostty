@@ -555,6 +555,18 @@ final class AgentDashboardModel: ObservableObject {
         }
     }
 
+    /// (§11 health) Resolve a queue item (run name + work-item key) to its live surface
+    /// UUID by scanning the stored annotations — the supervisor stamps each running
+    /// split's surface with `queueName`/`queueKey`, so this finds the split to "go to"
+    /// from a running-dropdown row. Returns nil if no live surface carries that tag
+    /// (e.g. the agent just finished / its annotation was dropped).
+    func surfaceID(forQueue queueName: String, key: String) -> UUID? {
+        for (id, ann) in annotations where ann.queueName == queueName && ann.queueKey == key {
+            return id
+        }
+        return nil
+    }
+
     // MARK: - Reconciliation
 
     /// Snapshot of one live surface taken on main (value types + weak view).
@@ -951,6 +963,27 @@ final class AgentDashboardModel: ObservableObject {
         originFilterStore.save(excludedOrigins)
     }
 
+    /// SOLO an origin: show ONLY this origin (exclude all others). Clicking the
+    /// already-soloed origin clears the filter (show all) — a toggle. This is the
+    /// filter bar's badge tap behavior ("show only that", not "hide that"). PURE
+    /// helper `soloExclusion` computes the new exclusion set for testability.
+    func soloOrigin(_ origin: String) {
+        let target = AgentDashboardModel.soloExclusion(origin, known: knownOrigins, current: excludedOrigins)
+        excludedOrigins = target
+        originFilterStore.save(excludedOrigins)
+    }
+
+    /// (pure, testable) The exclusion set for a solo tap: every known origin EXCEPT
+    /// `origin` — UNLESS that's already the current exclusion (origin is the sole shown
+    /// one), in which case clear (show all). Mirrors the "tap to isolate, tap again to
+    /// reset" toggle.
+    static func soloExclusion(
+        _ origin: String, known: Set<String>, current: Set<String>
+    ) -> Set<String> {
+        let others = known.subtracting([origin])
+        return current == others ? [] : others
+    }
+
     /// Re-include every origin (clear the filter). Persists. No-op when empty.
     func showAllOrigins() {
         guard !excludedOrigins.isEmpty else { return }
@@ -974,6 +1007,22 @@ final class AgentDashboardModel: ObservableObject {
             userInfo: [
                 QueueCommandUserInfoKey.command:
                     QueueCommand(action: action, run: run),
+            ])
+    }
+
+    /// (live maxItems edit) Post a `set_max_items` intent for a queue RUN — re-set its
+    /// lifetime dispatch cap WITHOUT restarting it. `value` is the raw user string
+    /// ("10", "unlimited"/"0"/…); the sidecar parses it (blank/garbage = ignored, so a
+    /// fat-finger never silently removes the cap). Same FIFO path as `sendRunCommand`.
+    func setQueueMaxItems(run: String, value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !trimmed.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .setMaxItems, run: run, maxItems: trimmed),
             ])
     }
 }

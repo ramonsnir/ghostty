@@ -935,6 +935,126 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `MCPServerTests` (`queueStatusPayload*`, `toolsListHasAllTools` now 18) +
     `AgentDashboardTests` (`AgentQueueHealthTests`: apply/clear, empty-section grouping,
     `healthText`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+    - **Clickable count DROPDOWNS (mirrors the hidden-agents popover).** The "N waiting" and
+      "M running" counts in the header are buttons that open a popover listing those items
+      with **Linear links** (key badge · title · `Link` for http(s) urls; "… and N more" when
+      the waiting list is capped). This required the report to carry per-item DETAIL, not just
+      counts: `QueueStatusReport.next` items gained `url`, and a new `running: QueueItemRef[]`
+      (key/title/url per slot-occupying agent) was added — `runner.ts reportQueueStatus` builds
+      `runningItems` from the active assignments (title/url captured at dispatch) and sends
+      `nextLimit:25`; the pure builder's `active` is now `runningItems.length`. Swift mirrors it:
+      `QueueStatus.Item` (was `NextItem`, +`url`, `Identifiable`) + `running: [Item]`, parsed by a
+      shared `items(_:)` helper in `QueueStatusPayload`; `report_queue_status` schema gains `url`
+      on next + a `running` array; `OriginSectionHeader` renders `countButton`→`itemsPopover`
+      (Linear `Link` via `itemLink`, http(s)-gated like `queueURLLink`) and `QueueHealthFormat`
+      swapped `healthText`→`progressText` (just the "dispatched/cap" suffix; the counts are now
+      buttons). Tests: sidecar `status.test.ts` (next url + running echo) + `mcp.test.ts`
+      (running forward); Swift `MCPServerTests` (parse url+running) + `AgentDashboardTests`
+      (`progressText`, `applyKeepsNextAndRunningItems`). **GUI relaunch + rebuilt sidecar `dist`.**
+  - **CLOSE-GATE fires on QUIESCENT (idle OR waiting), not idle-only (sidecar-only fix).** The
+    DONE_PENDING→CLOSING gate used to require `agentState==="idle"` held `closeStableSeconds`.
+    But a finished Claude Code agent reliably settles in **`waiting`** — its `Stop`→idle hook is
+    immediately overwritten by a `Notification` "waiting for input" nudge — so an idle-ONLY gate
+    NEVER fired and the completed split was never auto-closed (real stuck case: EX-1446 sat
+    DONE_PENDING with status=Done, agentState=waiting, forever). Fix: a pure `isQuiescent(agentState)`
+    = `idle || waiting`; `supervisor.ts` `nextState` gates on `isQuiescent`, and `foldIdleAnchor`
+    anchors the hold on EITHER state AND **keeps the anchor across an idle↔waiting transition**
+    (only `working`/`undefined` resets it) — so the `Stop`→`Notification` flip keeps the close clock
+    running instead of resetting it. Status-only completion is unchanged (idleness alone still never
+    completes); this only governs WHEN a provider-DONE item's split tears down. Tests:
+    `supervisor.test.ts` (close-on-waiting-held, foldIdleAnchor anchors-on-waiting + keeps-anchor-
+    across-transition). **Sidecar-only — rebuilt `dist` + sidecar restart; no GUI/host/Zig change.**
+  - **LIVE maxItems EDIT — change a running queue's cap from the dashboard, no restart (§8b).**
+    A new `set_max_items{run,maxItems}` command re-sets a LIVE run's lifetime dispatch cap WITHOUT
+    restarting it (the headline ask: bump 3→10 mid-run). The dashboard header's "dispatched/cap"
+    suffix is now **tap-to-edit** → a popover with preset buttons (1/2/5/10/∞) + a custom field; the
+    raw string is posted (the sidecar parses it, so a fat-finger never silently removes the cap).
+    Bumping the cap above `lifetimeDispatched` re-enables dispatch on the next sweep (`maxItemsRemaining`
+    recomputes); LOWERING it only stops FUTURE dispatch — running agents are never killed. **NOTE the
+    run-identity semantics** (UPDATED by the per-scope-identity change — see the "PER-SCOPE RUN
+    IDENTITY" bullet below): after the `queue-parallel` merge a run is keyed by **template basename +
+    resolved scope** (`identityScope` = the resolved provider env, e.g. project/milestone — see
+    `commands.ts applyCommand`). A re-`start` with the SAME basename AND SAME scope is an idempotent
+    NO-OP that ignores the second start's maxItems — so you can't rescope or re-cap a live run by
+    re-starting it; `set_max_items` is the in-place cap edit. A DIFFERENT scope of the same template is
+    a DISTINCT run that proceeds in PARALLEL (own tab + state file), so two milestones run at once from
+    ONE template — you do NOT need two template files (this supersedes the earlier basename-only dedup).
+    Engine: a new
+    mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
+    consults FIRST (over the start-time param + template cap); persisted in the active-runs record
+    (`maxItemsLive`) so a restart re-applies it. A shared pure `parseMaxItemsValue` (null=unlimited,
+    N=cap, undefined=blank/garbage→ignored) backs both this and the start-time `resolveMaxItemsOverride`.
+    Wiring: sidecar — `templates.ts` (`parseMaxItemsValue` + `resolveMaxItemsOverride` reuse), `runner.ts`
+    (`QueueRun.maxItemsLive` + `effectiveMaxItemsCap` + `makeQueueRun` opt + `activeRunRecords`),
+    `commands.ts` (`set_max_items` action + `maxItems` field + reducer case + `applyCommands` change-bit),
+    `store.ts` (`ActiveRunRecord.maxItemsLive` + tolerant parse), `wiring.ts` (rehydrate), `mcp.ts`
+    (`coerceQueueCommands` whitelists + carries `maxItems`). Swift — `QueueCommandBridge.swift`
+    (`QueueCommand.Action.setMaxItems`="set_max_items" + `maxItems` field + `jsonObject`),
+    `AgentDashboardController.swift` (`setQueueMaxItems(run:value:)`), `AgentDashboardView.swift`
+    (`OriginSectionHeader` cap button + `capEditorPopover` + `QueueHealthFormat.capDraft`). Tests:
+    sidecar `templates.test.ts` (`parseMaxItemsValue`), `commands.test.ts` (set_max_items apply/unlimited/
+    ignore-garbage/unknown-run/change-bit), `runner.test.ts` (`effectiveMaxItemsCap` live override + bump-
+    re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
+    Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
+    **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **PER-SCOPE RUN IDENTITY — one template, parallel runs per project/milestone (palette shows the
+    template `name`).** Three coupled changes so a generic template (e.g. Example) is re-usable in
+    parallel for different env-param scopes:
+    - **(1) Palette shows the template `name`, not the filename.** The "Start Agent Queue…" picker lists
+      each template by its JSON `name` (e.g. "ExampleOS"), not the file basename ("example"), sorted by
+      display name. The START command + `templateParams`/`templateProbe` still key off the BASENAME (the
+      sidecar loads templates by it). `QueuePalette.discoverTemplates` now returns `[QueueTemplateEntry]`
+      (`basename` + `displayName`, read via the new `templateDisplayName`, basename fallback); the option
+      title + the param-form title use `displayName`; `QueueParamPrompt` gained `displayName`.
+    - **(2) A run's live IDENTITY is `runName` = `template.name` + its non-empty ENV-param VALUES,
+      " · "-joined** (e.g. "ExampleOS · Acme · v2.0"; maxItems params excluded — engine tuning, not
+      scope). `runName` REPLACES `template.name` everywhere the run identity flows: the annotation
+      `queueName` (dispatchOne + restampAnnotation), the §11 health report, the `activeRunRecords` name,
+      and the reconcile `projectLiveSurfaces` filter — so two scoped runs of one template are shown
+      (separate dashboard sections) AND controlled (pause/stop/abort/set_max_items target the `runName`)
+      independently. Pure helper `runDisplayName(template, values)` in `templates.ts`.
+    - **(3) Dedup is now per-SCOPE, so different scopes run IN PARALLEL (separate tabs).** `applyCommand`
+      builds the candidate run, then dedups on (basename + `identityScope`) where `identityScope` =
+      `runIdentityScope(template, values)` = the resolved provider env (sorted `name=value`, pure). Same
+      (template + scope) = idempotent no-op (unchanged); DIFFERENT scope = a second run, keyed in the
+      registry by its `runName`. The per-run STATE FILE gets a scope-hash suffix (`<basename>.<slug>.state.json`
+      via `scopeSlug(runIdentityScope(...))`) so parallel runs of one template don't collide on disk;
+      rehydration recomputes the same path. **Separate tabs are automatic** — each run starts with an empty
+      `occupied` set, so its first dispatch's `splitPlan` returns `firstTab` → a new tab per run.
+    - **(3a) State-file MIGRATION across the rename (bug fix).** The scope-suffix renamed the per-run
+      state file (`example.state.json` → `example.<slug>.state.json`), so a run that was IN FLIGHT across
+      the upgrade rehydrated under the NEW path, found no file, and **reset `lifetimeDispatched` to 0** (it
+      also lost the live maxItems edit + re-adopted its agents as orphans). Fix: `rehydrateActiveRuns`
+      RENAMES a surviving bare `<basename>.state.json` to the scoped path on first rehydrate (pure decision
+      `shouldMigrateLegacyState(scoped, legacy, scopedExists, legacyExists)` — migrate only when the scoped
+      file is absent, the legacy exists, and the paths differ; best-effort rename). Done ONLY on the
+      rehydrate path (a run that WAS active) — a FRESH `start` must NOT adopt a stale bare file. Normal
+      restarts (no rename) already persisted the count via the stable scoped path; this only covers the
+      one-time upgrade boundary. Wiring: `wiring.ts` (`shouldMigrateLegacyState` + the rename in
+      `rehydrateActiveRuns`); test: `wiring.test.ts` (`shouldMigrateLegacyState`).
+    - **(3b) REHYDRATION must key the registry by `runName`, NOT `template.name` (bug fix).** The
+      `start` path (`applyCommand`) keys the registry by `run.runName`, but `index.ts` populated a
+      RESTORED run (from `active-runs.json` on restart) with `registry.set(run.template.name, run)` —
+      so after a restart a scoped run was keyed by the bare `"ExampleOS"` while the dashboard / health
+      report target its `runName` (`"ExampleOS · Acme Foods · Visual Prototype"`). Every control
+      command (`set_max_items`, pause, stop, abort) then `registry.get(cmd.run)`→undefined → silent
+      "unknown run" no-op (the "changing maxItems does nothing after restart" bug), and two parallel
+      scoped runs of one template would COLLIDE on the bare name. Fix: a shared
+      `registerRehydratedRuns(registry, runs)` in `commands.ts` keys by `run.runName` — the SAME key
+      `start` uses — and `index.ts` calls it instead of the inline loop. So a restored run behaves
+      identically to a freshly started one. Wiring: `commands.ts` (`registerRehydratedRuns`),
+      `index.ts` (call it). Tests: `commands.test.ts` (keyed-by-runName + `set_max_items` resolves
+      after rehydrate + two parallel scoped runs coexist).
+    `makeQueueRun` computes `runName`/`identityScope` from (template + params); a `runName` collision from a
+    DIFFERENT identity is rejected (no clobber). Wiring: sidecar — `templates.ts` (`runDisplayName`/
+    `runIdentityScope`/`scopeSlug`), `runner.ts` (`QueueRun.runName`/`.identityScope` + identity usages),
+    `commands.ts` (scope-aware dedup + key-by-`runName`), `wiring.ts` (`runStatePath` scope-suffixed state
+    file, factory + rehydrate). macOS — `QueuePalette.swift` (`QueueTemplateEntry` + `templateDisplayName` +
+    `discoverTemplates` return type + `QueueParamPrompt.displayName` + option/form titles). Tests: sidecar
+    `templates.test.ts` (`runDisplayName`/`runIdentityScope`/`scopeSlug`), `commands.test.ts` (parallel
+    different-scope start + same-scope no-op + factory-consulted-on-restart); Swift `QueuePaletteTests`
+    (`discoverUsesJSONNameForDisplayAndSort`, `templateDisplayNameFallsBackToBasename`, updated discovery
+    assertions to `[QueueTemplateEntry]`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

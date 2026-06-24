@@ -5,7 +5,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { applyCommand, applyCommands, type RunFactory, type RunRegistry } from "./commands.js";
+import {
+  applyCommand,
+  applyCommands,
+  registerRehydratedRuns,
+  type RunFactory,
+  type RunRegistry,
+} from "./commands.js";
 import { makeQueueRun, type QueueRun } from "./runner.js";
 import type { StoreIO } from "./store.js";
 import type { QueueTemplate } from "./types.js";
@@ -78,7 +84,7 @@ test("applyCommand start: the start-time params (§8b) are passed through to the
   assert.deepEqual(reg.get("backlog")!.params, { project: "Acme", milestones: "Q3" }, "stored on the run");
 });
 
-test("applyCommand start: re-start of the same template basename is an idempotent NO-OP", () => {
+test("applyCommand start: re-start of the same template + SAME scope is an idempotent NO-OP", () => {
   const reg: RunRegistry = new Map();
   const { factory, calls } = makeFactory({ "backlog-file": "backlog" });
   applyCommand(reg, { action: "start", template: "backlog-file" }, factory);
@@ -87,8 +93,57 @@ test("applyCommand start: re-start of the same template basename is an idempoten
   assert.equal(res.kind, "noop", "second start is a no-op");
   assert.equal(res.runName, "backlog");
   assert.equal(reg.size, 1, "still one run");
+  // The load-bearing invariant: the EXISTING run object is NOT recreated (its in-flight
+  // tracking survives). The factory IS now consulted on the duplicate (to compute the
+  // candidate's resolved identity before deduping), but the throwaway run is discarded.
   assert.equal(reg.get("backlog"), first, "the existing run object is NOT recreated");
-  assert.deepEqual(calls, ["backlog-file"], "factory NOT invoked again on the re-start");
+  assert.deepEqual(calls, ["backlog-file", "backlog-file"], "factory consulted to resolve identity");
+});
+
+test("applyCommand start: SAME template, DIFFERENT param scope → runs in PARALLEL", () => {
+  // A template with two env params (project/milestone) so the resolved scope drives identity.
+  const reg: RunRegistry = new Map();
+  const t = tmpl("ExampleOS");
+  t.params = [
+    { name: "project", env: "LINEAR_PROJECT" },
+    { name: "milestone", env: "LINEAR_MILESTONE" },
+  ];
+  const factory: RunFactory = (basename, params) =>
+    makeQueueRun(t, memStore(), { templateName: basename, params });
+
+  const a = applyCommand(
+    reg,
+    { action: "start", template: "example", params: { project: "Acme", milestone: "M1" } },
+    factory,
+  );
+  const b = applyCommand(
+    reg,
+    { action: "start", template: "example", params: { project: "Acme", milestone: "M2" } },
+    factory,
+  );
+  assert.equal(a.kind, "started");
+  assert.equal(b.kind, "started", "a different scope is NOT deduped — it starts in parallel");
+  assert.equal(reg.size, 2, "two parallel runs of the same template coexist");
+  assert.equal(a.runName, "ExampleOS · Acme · M1");
+  assert.equal(b.runName, "ExampleOS · Acme · M2");
+  assert.ok(reg.has("ExampleOS · Acme · M1") && reg.has("ExampleOS · Acme · M2"),
+    "keyed by the composite runName");
+});
+
+test("applyCommand start: SAME template + SAME scope → idempotent NO-OP (not parallel)", () => {
+  const reg: RunRegistry = new Map();
+  const t = tmpl("ExampleOS");
+  t.params = [{ name: "project", env: "LINEAR_PROJECT" }];
+  const factory: RunFactory = (basename, params) =>
+    makeQueueRun(t, memStore(), { templateName: basename, params });
+
+  const a = applyCommand(reg, { action: "start", template: "example", params: { project: "Acme" } }, factory);
+  const first = reg.get("ExampleOS · Acme");
+  const b = applyCommand(reg, { action: "start", template: "example", params: { project: "Acme" } }, factory);
+  assert.equal(a.kind, "started");
+  assert.equal(b.kind, "noop", "the same scope is an idempotent re-start");
+  assert.equal(reg.size, 1, "still one run for that scope");
+  assert.equal(reg.get("ExampleOS · Acme"), first, "existing run not recreated");
 });
 
 test("applyCommand start: a name collision from a DIFFERENT basename is REJECTED (no clobber)", () => {
@@ -159,6 +214,69 @@ test("applyCommand abort: sets the aborting flag (run kept until the supervisor 
   assert.equal(reg.size, 1, "abort does NOT remove the run itself (the supervisor does this sweep)");
 });
 
+test("applyCommand set_max_items: sets the live cap (number) on a live run", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: "10" }, factory);
+  assert.equal(res.kind, "maxItemsSet");
+  assert.equal(res.runName, "r");
+  assert.equal(reg.get("r")!.maxItemsLive, 10);
+});
+
+test("applyCommand set_max_items: 'unlimited'/'0' tokens set the live cap to null (no cap)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  for (const v of ["unlimited", "0", "none", "∞"]) {
+    const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: v }, factory);
+    assert.equal(res.kind, "maxItemsSet", `"${v}" applies`);
+    assert.equal(reg.get("r")!.maxItemsLive, null, `"${v}" → unlimited (null)`);
+  }
+});
+
+test("applyCommand set_max_items: a blank/garbage value is IGNORED (no change, no removed cap)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  reg.get("r")!.maxItemsLive = 5; // a prior live cap
+  for (const v of ["", "  ", "abc", "-3", "2.5"]) {
+    const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: v }, factory);
+    assert.equal(res.kind, "noop", `"${v}" is ignored`);
+    assert.equal(reg.get("r")!.maxItemsLive, 5, `"${v}" leaves the prior cap untouched`);
+  }
+});
+
+test("applyCommand set_max_items: unknown run / missing run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  assert.equal(
+    applyCommand(reg, { action: "set_max_items", run: "ghost", maxItems: "5" }, factory).kind,
+    "noop",
+  );
+  assert.equal(
+    applyCommand(reg, { action: "set_max_items", maxItems: "5" }, factory).kind,
+    "noop",
+  );
+  assert.equal(reg.get("r")!.maxItemsLive, undefined, "the real run is untouched");
+});
+
+test("applyCommands: a set_max_items is a persistence-affecting change", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommands(reg, [{ action: "start", template: "f" }], factory);
+  assert.equal(
+    applyCommands(reg, [{ action: "set_max_items", run: "r", maxItems: "3" }], factory),
+    true,
+  );
+  // An ignored (garbage) value does NOT mark the set changed.
+  assert.equal(
+    applyCommands(reg, [{ action: "set_max_items", run: "r", maxItems: "junk" }], factory),
+    false,
+  );
+});
+
 test("applyCommand: pause/resume/stop/abort for an unknown run is a no-op", () => {
   const reg: RunRegistry = new Map();
   const { factory } = makeFactory({});
@@ -181,4 +299,41 @@ test("applyCommands: returns true when the batch changed the persisted set, fals
   assert.equal(applyCommands(reg, [{ action: "stop", run: "ghost" }], factory), false);
   // A re-start no-op changes nothing.
   assert.equal(applyCommands(reg, [{ action: "start", template: "f" }], factory), false);
+});
+
+test("registerRehydratedRuns: keys by runName (not template.name) so commands resolve after restart", () => {
+  // A scoped run: env param → runName = "ExampleOS · Acme" (NOT the bare "ExampleOS").
+  const t = tmpl("ExampleOS");
+  t.params = [{ name: "project", env: "LINEAR_PROJECT" }];
+  const run = makeQueueRun(t, memStore(), { templateName: "example", params: { project: "Acme" } });
+  assert.equal(run.runName, "ExampleOS · Acme");
+
+  const reg: RunRegistry = new Map();
+  registerRehydratedRuns(reg, [run]);
+  // Keyed by the composite runName — what the dashboard / health report target.
+  assert.ok(reg.has("ExampleOS · Acme"), "rehydrated run keyed by runName");
+  // REGRESSION: must NOT be keyed by the bare template.name (the bug that made every
+  // control command a silent 'unknown run' no-op after a restart).
+  assert.equal(reg.has("ExampleOS"), false, "NOT keyed by template.name");
+
+  // A set_max_items targeting the runName now resolves against the rehydrated run.
+  const { factory } = makeFactory({});
+  const res = applyCommand(
+    reg,
+    { action: "set_max_items", run: "ExampleOS · Acme", maxItems: "7" },
+    factory,
+  );
+  assert.equal(res.kind, "maxItemsSet");
+  assert.equal(reg.get("ExampleOS · Acme")!.maxItemsLive, 7);
+});
+
+test("registerRehydratedRuns: two parallel scoped runs of one template coexist (no bare-name collision)", () => {
+  const t = tmpl("ExampleOS");
+  t.params = [{ name: "project", env: "LINEAR_PROJECT" }];
+  const a = makeQueueRun(t, memStore(), { templateName: "example", params: { project: "Acme" } });
+  const b = makeQueueRun(t, memStore(), { templateName: "example", params: { project: "Globex" } });
+  const reg: RunRegistry = new Map();
+  registerRehydratedRuns(reg, [a, b]);
+  assert.equal(reg.size, 2, "both parallel scoped runs survive rehydration");
+  assert.ok(reg.has("ExampleOS · Acme") && reg.has("ExampleOS · Globex"));
 });

@@ -400,6 +400,32 @@ test("serializeActiveRuns / parseActiveRuns: round-trips start-time params (§8b
   assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
 });
 
+test("serializeActiveRuns / parseActiveRuns: round-trips a live maxItems edit (number AND null)", () => {
+  const runs: ActiveRunRecord[] = [
+    { template: "example", name: "ExampleOS", paused: false, draining: false, maxItemsLive: 10 },
+    { template: "other", name: "Other", paused: false, draining: false, maxItemsLive: null },
+  ];
+  assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
+});
+
+test("parseActiveRuns: tolerates a malformed maxItemsLive (non-positive / non-int / string dropped)", () => {
+  // A garbage maxItemsLive is DROPPED (record kept without it → falls back to the param/template cap).
+  for (const v of ["0", "-2", "2.5", '"5"', "true"]) {
+    const recs = parseActiveRuns(`{"version":1,"runs":[{"template":"t","name":"t","maxItemsLive":${v}}]}`);
+    assert.equal(recs.length, 1, `v=${v} keeps the record`);
+    assert.equal(recs[0].maxItemsLive, undefined, `v=${v} drops the bad maxItemsLive`);
+  }
+  // null is explicitly honored (unlimited); a positive int is honored.
+  assert.equal(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","maxItemsLive":null}]}')[0].maxItemsLive,
+    null,
+  );
+  assert.equal(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","maxItemsLive":7}]}')[0].maxItemsLive,
+    7,
+  );
+});
+
 test("parseActiveRuns: tolerates a malformed params field (non-object / non-string values dropped)", () => {
   // non-object params → record kept WITHOUT params
   assert.deepEqual(

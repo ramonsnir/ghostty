@@ -1868,6 +1868,37 @@ struct AgentDashboardOriginTests {
         #expect(model.sections.map(\.id) == ["alpha", "beta"])
     }
 
+    @Test func soloExclusionIsolatesAndToggles() {
+        // Pure helper: solo X → exclude all others; solo X again (already isolated) → clear.
+        let known: Set<String> = ["alpha", "beta", "(other)"]
+        let isolated = AgentDashboardModel.soloExclusion("alpha", known: known, current: [])
+        #expect(isolated == ["beta", "(other)"])
+        // Tapping the already-soloed origin clears (show all).
+        #expect(AgentDashboardModel.soloExclusion("alpha", known: known, current: isolated) == [])
+        // Soloing a different origin re-isolates to it.
+        #expect(AgentDashboardModel.soloExclusion("beta", known: known, current: isolated) == ["alpha", "(other)"])
+    }
+
+    @Test func soloOriginPersistsAndFiltersSections() {
+        let filterStore = InMemoryOriginFilterStore()
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(), originFilterStore: filterStore)
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, AgentAnnotation(queueName: "alpha"))
+        model.applyAnnotation(b, AgentAnnotation(queueName: "beta"))
+
+        // Solo alpha → only alpha shown (beta excluded); persisted.
+        model.soloOrigin("alpha")
+        #expect(model.excludedOrigins == ["beta"])
+        #expect(model.sections.map(\.id) == ["alpha"])
+        // Solo alpha again → show all.
+        model.soloOrigin("alpha")
+        #expect(model.excludedOrigins.isEmpty)
+        #expect(model.sections.map(\.id) == ["alpha", "beta"])
+    }
+
     @Test func excludedFilterLoadsFromStoreAtInit() {
         let model = AgentDashboardModel(
             store: InMemoryHideStore(),
@@ -1903,11 +1934,11 @@ struct AgentQueueHealthTests {
     private func status(
         _ name: String, present: Bool = true, phase: String = "running",
         queued: Int = 0, listOk: Bool = true, active: Int = 0, dispatched: Int = 0,
-        maxItems: Int? = nil, next: [QueueStatus.NextItem] = []
+        maxItems: Int? = nil, next: [QueueStatus.Item] = [], running: [QueueStatus.Item] = []
     ) -> QueueStatus {
         .init(queueName: name, present: present, phase: phase, queued: queued,
               listOk: listOk, active: active, dispatched: dispatched,
-              maxItems: maxItems, next: next)
+              maxItems: maxItems, next: next, running: running)
     }
 
     // MARK: - groupByOrigin present-queue injection
@@ -1953,19 +1984,42 @@ struct AgentQueueHealthTests {
         #expect(model.sections.map(\.id) == ["ExampleOS"])
     }
 
-    // MARK: - QueueHealthFormat.healthText
+    // MARK: - QueueHealthFormat.progressText (dispatched/cap; ∞ = unlimited)
 
-    @Test func healthTextStartingUntilFirstList() {
-        #expect(QueueHealthFormat.healthText(status("Q", listOk: false)) == "reading the queue…")
+    @Test func progressTextShowsDispatchedOverCap() {
+        #expect(QueueHealthFormat.progressText(status("Q", dispatched: 2, maxItems: 3)) == "2/3")
     }
 
-    @Test func healthTextShowsWaitingRunningAndCap() {
-        let s = status("Q", queued: 7, listOk: true, active: 2, dispatched: 2, maxItems: 3)
-        #expect(QueueHealthFormat.healthText(s) == "7 waiting · 2 running · 2/3")
+    @Test func progressTextUnlimitedCapIsInfinity() {
+        #expect(QueueHealthFormat.progressText(status("Q", dispatched: 4, maxItems: nil)) == "4/∞")
     }
 
-    @Test func healthTextUnlimitedCapIsInfinity() {
-        let s = status("Q", queued: 0, listOk: true, active: 1, dispatched: 4, maxItems: nil)
-        #expect(QueueHealthFormat.healthText(s) == "0 waiting · 1 running · 4/∞")
+    @Test func capDraftPrefillsFiniteCapAndBlankForUnlimited() {
+        // The cap editor's custom field pre-fills with the current finite cap…
+        #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 2, maxItems: 3)) == "3")
+        // …and is blank for an unlimited cap (user picks ∞ or types a number).
+        #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 4, maxItems: nil)) == "")
+    }
+
+    // MARK: - applyQueueStatus carries next/running items (for the dropdowns)
+
+    @Test func surfaceIDResolvesByQueueNameAndKey() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.applyAnnotation(a, AgentAnnotation(queueKey: "EX-1", queueName: "ExampleOS"))
+        model.applyAnnotation(b, AgentAnnotation(queueKey: "EX-2", queueName: "ExampleOS"))
+        #expect(model.surfaceID(forQueue: "ExampleOS", key: "EX-2") == b)
+        #expect(model.surfaceID(forQueue: "ExampleOS", key: "NOPE") == nil)   // unknown key
+        #expect(model.surfaceID(forQueue: "Other", key: "EX-1") == nil)      // wrong queue
+    }
+
+    @Test func applyKeepsNextAndRunningItems() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status(
+            "ExampleOS", queued: 1, active: 1,
+            next: [QueueStatus.Item(key: "EX-2", title: "Wait", url: "https://linear.app/x/EX-2")],
+            running: [QueueStatus.Item(key: "EX-1", title: "Run", url: "https://linear.app/x/EX-1")]))
+        #expect(model.queueStatuses["ExampleOS"]?.next.first?.url == "https://linear.app/x/EX-2")
+        #expect(model.queueStatuses["ExampleOS"]?.running.first?.key == "EX-1")
     }
 }

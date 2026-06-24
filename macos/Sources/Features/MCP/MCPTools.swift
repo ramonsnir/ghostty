@@ -277,6 +277,19 @@ enum MCPTools {
                             "properties": [
                                 "key": ["type": "string"],
                                 "title": ["type": "string"],
+                                "url": ["type": "string"],
+                            ],
+                            "required": ["key"],
+                        ],
+                    ],
+                    "running": [
+                        "type": "array",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "key": ["type": "string"],
+                                "title": ["type": "string"],
+                                "url": ["type": "string"],
                             ],
                             "required": ["key"],
                         ],

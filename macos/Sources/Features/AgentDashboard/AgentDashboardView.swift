@@ -113,7 +113,16 @@ struct AgentDashboardView: View {
                             onPause: { model.sendRunCommand(.pause, run: section.id) },
                             onResume: { model.sendRunCommand(.resume, run: section.id) },
                             onStop: { model.sendRunCommand(.stop, run: section.id) },
-                            onAbort: { model.sendRunCommand(.abort, run: section.id) }
+                            onAbort: { model.sendRunCommand(.abort, run: section.id) },
+                            onGoToItem: { item in
+                                // Resolve the running item → its split UUID and jump to it.
+                                if let id = model.surfaceID(forQueue: section.id, key: item.key) {
+                                    focusHidden(id)
+                                }
+                            },
+                            onSetMaxItems: { value in
+                                model.setQueueMaxItems(run: section.id, value: value)
+                            }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -170,20 +179,24 @@ struct AgentDashboardView: View {
                 ForEach(origins, id: \.self) { origin in
                     let included = !model.excludedOrigins.contains(origin)
                     Button {
-                        model.toggleOrigin(origin)
+                        // Tap to SHOW ONLY this origin (solo); tap the soloed one again to
+                        // show all. (Was: tap to hide that origin.)
+                        model.soloOrigin(origin)
                     } label: {
                         Text(origin)
-                            .font(.caption2.weight(.medium))
+                            .font(.caption2.weight(.semibold))
                             .lineLimit(1)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 2)
-                            .background(included ? Color.accentColor.opacity(0.22) : Color.secondary.opacity(0.12))
-                            .foregroundStyle(included ? Color.accentColor : Color.secondary)
+                            // High-contrast: WHITE on a solid accent fill when shown; muted
+                            // grey when filtered out (blue-on-dark-blue was unreadable).
+                            .foregroundStyle(included ? Color.white : Color.secondary)
+                            .background(included ? Color.accentColor : Color.secondary.opacity(0.18))
                             .clipShape(Capsule())
-                            .opacity(included ? 1.0 : 0.6)
+                            .opacity(included ? 1.0 : 0.55)
                     }
                     .buttonStyle(.plain)
-                    .help(included ? "Hide \(origin) from the view" : "Show \(origin)")
+                    .help(included ? "Show only \(origin)" : "Show only \(origin)")
                 }
                 if !model.excludedOrigins.isEmpty {
                     Button { model.showAllOrigins() } label: {
@@ -275,7 +288,7 @@ struct AgentDashboardView: View {
             Button("Show all") { model.showAll(); showHiddenPopover = false }
         }
         .padding(12)
-        .frame(width: 240)
+        .frame(width: 560)
     }
 
     /// Focus (jump to) a hidden split by id without unhiding it: raise its window,
@@ -334,11 +347,24 @@ private struct OriginSectionHeader: View {
     let onResume: () -> Void
     let onStop: () -> Void
     let onAbort: () -> Void
+    /// (§11 health) Jump to the split running a given queue item (the "go to" affordance in
+    /// the running dropdown). The parent resolves the item's surface + presents it.
+    let onGoToItem: (QueueStatus.Item) -> Void
+    /// (live maxItems edit) Re-set this run's lifetime cap (the dashboard cap control). The
+    /// raw user string ("10"/"unlimited"/…) is posted as a `set_max_items` command; the
+    /// sidecar parses it (blank/garbage = ignored).
+    let onSetMaxItems: (String) -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
     @State private var confirmStop = false
     @State private var confirmAbort = false
+    // (§11 health) The "N waiting" / "M running" count dropdowns (items + Linear links).
+    @State private var showWaiting = false
+    @State private var showRunning = false
+    // (live maxItems edit) The "dispatched/cap" tap-to-edit popover + its draft field.
+    @State private var showCapEditor = false
+    @State private var capDraft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -372,16 +398,36 @@ private struct OriginSectionHeader: View {
             if let status {
                 HStack(spacing: 6) {
                     phaseChip(status.phase)
-                    Text(QueueHealthFormat.healthText(status))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    if !status.next.isEmpty {
-                        Text("next: " + status.next.prefix(3).map(\.key).joined(separator: ", "))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .help(status.next.map { $0.title ?? $0.key }.joined(separator: "\n"))
+                    if status.listOk {
+                        // Clickable counts → a dropdown of the items with Linear links
+                        // (mirrors the hidden-agents popover).
+                        countButton("\(status.queued) waiting", items: status.next,
+                                    total: status.queued, show: $showWaiting,
+                                    emptyText: "Nothing waiting.", onGoTo: nil)
+                        // Running items get a "go to" affordance → jump to that split.
+                        countButton("\(status.active) running", items: status.running,
+                                    total: status.active, show: $showRunning,
+                                    emptyText: "Nothing running.",
+                                    onGoTo: { item in
+                                        onGoToItem(item)
+                                        showRunning = false
+                                    })
+                        // The "dispatched/cap" suffix is tap-to-edit: open a small editor
+                        // to raise/lower the lifetime cap WITHOUT restarting the run.
+                        Button {
+                            capDraft = QueueHealthFormat.capDraft(status)
+                            showCapEditor = true
+                        } label: {
+                            Text(QueueHealthFormat.progressText(status))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Change the lifetime cap (maxItems) for this run")
+                        .popover(isPresented: $showCapEditor, arrowEdge: .bottom) {
+                            capEditorPopover(status)
+                        }
+                    } else {
+                        Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
                 }
@@ -422,6 +468,43 @@ private struct OriginSectionHeader: View {
             .clipShape(Capsule())
     }
 
+    /// (live maxItems edit) The tap-to-edit cap popover: quick presets + a custom field.
+    /// Commits the raw string (the sidecar parses + ignores garbage), so a fat-finger
+    /// never silently removes the cap.
+    @ViewBuilder
+    private func capEditorPopover(_ status: QueueStatus) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Lifetime cap (maxItems)").font(.caption.weight(.semibold))
+            Text("Dispatched \(status.dispatched) of \(status.maxItems.map(String.init) ?? "∞"). Raising it lets the run pick up more items; lowering it only stops FUTURE dispatch — running agents keep going.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach(["1", "2", "5", "10"], id: \.self) { v in
+                    Button(v) { commitCap(v) }.buttonStyle(.bordered)
+                }
+                Button("∞") { commitCap("unlimited") }
+                    .buttonStyle(.bordered)
+                    .help("Unlimited — no lifetime cap")
+            }
+            HStack(spacing: 6) {
+                TextField("custom", text: $capDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+                    .onSubmit { commitCap(capDraft) }
+                Button("Set") { commitCap(capDraft) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(capDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(12)
+        .frame(width: 240)
+    }
+
+    private func commitCap(_ value: String) {
+        onSetMaxItems(value)
+        showCapEditor = false
+    }
+
     private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemImage).font(.caption2)
@@ -429,22 +512,98 @@ private struct OriginSectionHeader: View {
         .buttonStyle(.borderless)
         .help(help)
     }
+
+    /// A clickable count chip ("N waiting" / "M running") that opens a popover listing
+    /// the items with Linear links. Styled as a subtle link so it reads as a count.
+    private func countButton(
+        _ label: String, items: [QueueStatus.Item], total: Int,
+        show: Binding<Bool>, emptyText: String, onGoTo: ((QueueStatus.Item) -> Void)?
+    ) -> some View {
+        Button { show.wrappedValue.toggle() } label: {
+            Text(label).font(.caption2)
+        }
+        .buttonStyle(.link)
+        .help("Show items")
+        .popover(isPresented: show, arrowEdge: .bottom) {
+            itemsPopover(title: label, items: items, total: total, emptyText: emptyText, onGoTo: onGoTo)
+        }
+    }
+
+    /// The popover body for a count chip: one row per item (key badge · title · Linear
+    /// link), plus a "… and N more" note when the list was capped below the total. When
+    /// `onGoTo` is non-nil (the running list) each row also gets a "go to" button that
+    /// jumps to that split. All text via `Text`/`Link` (SwiftUI escapes it — the
+    /// key/title/url are untrusted tracker data; only http(s) urls are made clickable).
+    @ViewBuilder
+    private func itemsPopover(
+        title: String, items: [QueueStatus.Item], total: Int, emptyText: String,
+        onGoTo: ((QueueStatus.Item) -> Void)?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline)
+            if items.isEmpty {
+                Text(emptyText).font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(items) { item in
+                    HStack(spacing: 6) {
+                        Text(item.key)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.18))
+                            .clipShape(Capsule())
+                        itemLink(item)
+                        Spacer(minLength: 4)
+                        if let onGoTo {
+                            Button { onGoTo(item) } label: {
+                                Image(systemName: "arrow.right.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Go to this split")
+                        }
+                    }
+                }
+                if total > items.count {
+                    Text("… and \(total - items.count) more")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(12)
+        .frame(width: 420)
+    }
+
+
+    /// The item's title as a Linear `Link` when it carries an http(s) url; else plain text.
+    @ViewBuilder
+    private func itemLink(_ item: QueueStatus.Item) -> some View {
+        let text = (item.title?.isEmpty == false) ? item.title! : item.key
+        if let urlString = item.url,
+           let url = URL(string: urlString),
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            Link(text, destination: url)
+                .font(.caption).lineLimit(1).truncationMode(.middle)
+        } else {
+            Text(text).font(.caption).foregroundStyle(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+        }
+    }
 }
 
 /// (ramon fork / Agent Queue, §11 health) PURE formatting for the queue bar's status
 /// line — split out (internal) so it is unit-testable independent of the SwiftUI view.
 enum QueueHealthFormat {
-    /// The status summary text (excluding the phase chip + the "next:" list).
-    /// "reading the queue…" until the first successful list; otherwise "{queued} waiting"
-    /// (+ "· {active} running" when any) + "· {dispatched}/{cap}" progress (∞ = unlimited)
-    /// — so a reached maxItems cap (e.g. 1/1) is visible at a glance.
-    static func healthText(_ s: QueueStatus) -> String {
-        guard s.listOk else { return "reading the queue…" }
-        var parts: [String] = ["\(s.queued) waiting"]
-        if s.active > 0 { parts.append("\(s.active) running") }
+    /// The lifetime-progress suffix shown after the clickable counts: "{dispatched}/{cap}"
+    /// with ∞ for an unlimited cap — so a reached maxItems (e.g. 1/1) is visible at a glance.
+    static func progressText(_ s: QueueStatus) -> String {
         let cap = s.maxItems.map(String.init) ?? "∞"
-        parts.append("\(s.dispatched)/\(cap)")
-        return parts.joined(separator: " · ")
+        return "\(s.dispatched)/\(cap)"
+    }
+
+    /// (live maxItems edit) The pre-fill for the cap editor's custom field: the current
+    /// FINITE cap as a string, or "" for an unlimited cap (the field starts empty so the
+    /// user either picks ∞ or types a number). PURE, unit-tested.
+    static func capDraft(_ s: QueueStatus) -> String {
+        s.maxItems.map(String.init) ?? ""
     }
 
     /// The accent color for a phase chip.
