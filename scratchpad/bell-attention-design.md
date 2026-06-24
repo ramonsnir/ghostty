@@ -114,6 +114,22 @@ channels, fail-open timers) came from. The two-tier model only ever ADDS emphasi
   376 `node --test` pass + typecheck; Swift MCPServerTests + MCPAnnotationTests
   TEST SUCCEEDED (19-tool count + set_attention guards). Reviewable in Debug.
 
+## LIVE TEST on the Debug build (PASS — both halves end-to-end)
+Driven via the Debug MCP (:8767), nothing on Release/host/live-config:
+- **GUI delivery half:** `set_attention(true)` flips ONLY the target's `attentionNeeded`
+  (surfaceID filter correct); `(false)` clears; **clear-on-focus** works; the window
+  title gains/loses the `🔔` (the window aggregate → computeTitle), proven on an active
+  surface. Background-tab promotions show on their own tab title (per-tab controller) —
+  the visible window title correctly reflects the active tab.
+- **Detection half:** ran the flagged sidecar (`GHOSTTY_BELL_FILTER=1`) against a real
+  `claude` agent in nil. Sidecar log:
+  `bell rising edge -> force classify (agent=true)` → `bellRang classify -> attention=true`
+  → `bell promoted -> attention needed`, and `list_surfaces` showed `attn=true`. On an
+  IDLE claude the same ring yielded `attention=false` (no promote) — discrimination works
+  both ways. `attentionNeeded` exposed in `list_surfaces` made this scriptable. Added two
+  operational diagnostic logs (bell-edge + bellRang verdict). Residual unknown = Haiku
+  verdict QUALITY across diverse real screens (observed correct in both directions).
+
 ## Slice 4 + 5 (DONE)
 - **Slice 4 — full rendering** (committed): tab title (window attentionNeeded aggregate +
   computeTitle rule), push (WebPushManager gate + attention observer + setAttention

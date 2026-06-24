@@ -47,6 +47,7 @@ import {
   fingerprint,
   parseSummary,
   shouldSummarize,
+  isAgentSurface,
   alertEdge,
   bellRoseEdge,
   ALERT_RATE_LIMITED,
@@ -223,6 +224,9 @@ async function summarizeOne(
       atMs: deps.now(),
       summary: parsed.summary,
     });
+    if (bellRang) {
+      log(`surface ${surface.id}: bellRang classify -> attention=${parsed.attention} alert=${parsed.alert}`);
+    }
     // The model is the SOLE judge of the attention alert: ring on a rising edge,
     // clear when it reports no alert (the screen changed and Haiku no longer sees
     // the live condition — this is how recovery un-rings, immune to scrolled-up text).
@@ -357,6 +361,7 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     for (const s of surfaces) {
       if (bellRoseEdge(deps.bellSeenBySession.get(s.id), s.bell === true)) {
         forcedBell.add(s.id);
+        log(`surface ${s.id}: bell rising edge -> force classify (agent=${isAgentSurface(s, deps.cfg)})`);
       }
       deps.bellSeenBySession.set(s.id, s.bell === true);
     }
