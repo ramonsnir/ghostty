@@ -5,8 +5,8 @@ from a passive **observer** into an active **supervisor + driver**: you start a
 **queue** from a template ("work this repo + this Linear filter") and the manager
 opens a tab of splits, launches one CLI agent per work item, never doubles up on the
 same item, caps how many run at once, tracks each to completion, and closes its split
-when the item is **done** and the agent has gone **idle** — periodically re-polling the
-source for new / newly-unblocked items.
+when the item is **done** and the agent has gone **quiescent** (idle or waiting) —
+periodically re-polling the source for new / newly-unblocked items.
 
 It is **off by default**, macOS-only, and — this is the load-bearing design choice —
 **completely generic**: Ghostty links no Linear/GitHub/Jira client and knows nothing
@@ -22,8 +22,8 @@ command (which prints the actionable work items as JSON), dispatches up to your
 **concurrency** limit by opening splits via the in-app MCP server (`spawn_split_command`)
 each running the template's **agent command** with the item's fields delivered as
 environment variables, polls the template's **`status`** command per item, and once an
-item reports a terminal state **and** its agent has been idle a few seconds, types the
-template's exit keys and **force-closes** the split. The whole thing is restart-proof:
+item reports a terminal state **and** its agent has been quiescent (idle or waiting) a
+few seconds, types the template's exit keys and **force-closes** the split. The whole thing is restart-proof:
 run state is persisted by the sidecar and re-adopted (by stable host session id) after a
 sidecar **or** GUI restart, so it never double-dispatches an item or orphans a live
 agent. Everything else — bells, the dashboard, per-tile summaries, web-push —
@@ -39,8 +39,10 @@ The supervisor **self-disables silently** (one info log) unless all of these hol
    `agent-manager = true`, `mcp-listen`/`mcp-token` set, `node` resolvable, and
    `cd macos/agent-manager && npm ci && npm run build`.
 3. **Claude Code hooks installed** (the Agent-Dashboard ones) — the close-gate keys off the
-   hook-driven `working`/`idle` state. *Without the hooks a queue can dispatch and track but
-   will not auto-close* (Claude Code is a repainting TUI, so the idle heuristic never fires).
+   hook-driven agent state: it closes once the item is provider-`done` **and** the agent has
+   been **quiescent** (`idle` *or* `waiting`) for a few seconds. *Without the hooks a queue can
+   dispatch and track but will not auto-close* (Claude Code is a repainting TUI, so the
+   idle heuristic never fires).
    The hooks post to the **installed Release** on the default MCP port, so run real queues
    there, not a dev `+1/+2` build.
 
@@ -146,7 +148,9 @@ run with no file edits:
     run), or **`0`/`unlimited`** for no cap. Blank or non-numeric falls back to the template's
     `maxItems`. A maxItems param needs no `env` (it tunes the engine, not the provider), and a
     template may declare at most one. This is the recommended way to vary run size — leave
-    `maxItems` in the template as a sane fallback and pick the real number at start.
+    `maxItems` in the template as a sane fallback and pick the real number at start. You can
+    also **change this cap while the run is live** from the dashboard health bar (tap
+    `dispatched/cap`) — see *Watch & control* below.
 - **Live preview (success signal):** once the required fields are filled, the form runs your
   `list` command with the entered values and shows **how many items would be queued** plus a
   sample of their titles — so a typo (wrong project name → "no matching items" / a provider
@@ -206,11 +210,21 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 - **Health bar:** each running queue's section header shows a live status line — a phase chip
   (**starting → running → paused / draining / disabled**) plus **"N waiting · M running ·
   dispatched/cap"** (the cap is `∞` when unlimited, so a reached `maxItems` like `1/1` is
-  obvious) and **"next: …"** the upcoming item keys. This appears the moment you start a queue
-  — **before any split spawns** ("starting · reading the queue…") — so it's never a scary
-  blank, and the bar (with its controls) **stays visible even when every tile is hidden or
-  there are no agents yet**, so you can always see the queue is there and what's next. The
-  supervisor pushes this every ~5s; a finished/aborted run's section disappears.
+  obvious) and **"next: …"** the upcoming item keys. The **N waiting / M running** counts are
+  clickable dropdowns listing those items with Linear links (and a "go to" jump for running
+  ones). This appears the moment you start a queue — **before any split spawns** ("starting ·
+  reading the queue…") — so it's never a scary blank, and the bar (with its controls) **stays
+  visible even when every tile is hidden or there are no agents yet**, so you can always see the
+  queue is there and what's next. The supervisor pushes this every ~5s; a finished/aborted run's
+  section disappears.
+- **Change the cap live:** the **`dispatched/cap`** part of the health bar is **tap-to-edit** —
+  click it for a small popover (presets `1 / 2 / 5 / 10 / ∞` + a custom field) to raise or lower
+  a *running* queue's `maxItems` **without restarting it** (e.g. bump `3 → 10` mid-run). Raising
+  it re-enables dispatch on the next sweep; lowering it only stops *future* dispatch — agents
+  already running are never killed. (A blank/garbage entry is ignored, so a fat-finger can't
+  silently remove the cap.) Note a same-scope re-`start` is a no-op, so it can't change a live
+  run's cap — this editor is the only in-place way; see *parallel runs* under **Start-time
+  parameters** above.
 
 ## What it guarantees
 
@@ -233,9 +247,11 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 - **Restart-proof** — a started queue, its tiles, and its in-flight items survive a sidecar
   or GUI restart with no re-dispatch and no orphaned agents. (A *host* restart loses all
   RAM-only sessions, as always.)
-- **Closes cleanly** — only when the item is provider-`done` **and** its agent has been idle
-  `closeStableSeconds`, after making the agent's child process exit (so no confirmation
-  dialog stalls the teardown).
+- **Closes cleanly** — only when the item is provider-`done` **and** its agent has been
+  quiescent (idle *or* waiting) for `closeStableSeconds`, after making the agent's child
+  process exit (so no confirmation dialog stalls the teardown). (Waiting counts because a
+  finished Claude Code agent reliably settles in `waiting`, not `idle` — an idle-only gate
+  would leave the completed split open forever.)
 - **A crashed agent is never silently lost** — its split stays for you to inspect and the
   bell rings across the dashboard, web monitor, and push (`onAgentExit: leave-and-bell`).
 

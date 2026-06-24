@@ -928,13 +928,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     raw string is posted (the sidecar parses it, so a fat-finger never silently removes the cap).
     Bumping the cap above `lifetimeDispatched` re-enables dispatch on the next sweep (`maxItemsRemaining`
     recomputes); LOWERING it only stops FUTURE dispatch — running agents are never killed. **NOTE the
-    run-identity semantics** (UPDATED by the per-scope-identity change — see the "PER-SCOPE RUN IDENTITY"
-    bullet below): a run is keyed by its `runName` IDENTITY (template `name` + resolved env-param scope),
-    and a re-`start` with the SAME (template + scope) is an idempotent NO-OP — but a re-`start` with a
-    DIFFERENT scope (another milestone) now starts a SECOND run IN PARALLEL (no longer ignored). So two
-    milestones concurrently no longer needs two template files — start the one template twice with
-    different scopes. What a re-start still CANNOT do is change a LIVE run's cap (or scope) in place;
-    `set_max_items` is the in-place cap edit. Engine: a new
+    run-identity semantics** (UPDATED by the per-scope-identity change — see the "PER-SCOPE RUN
+    IDENTITY" bullet below): after the `queue-parallel` merge a run is keyed by **template basename +
+    resolved scope** (`identityScope` = the resolved provider env, e.g. project/milestone — see
+    `commands.ts applyCommand`). A re-`start` with the SAME basename AND SAME scope is an idempotent
+    NO-OP that ignores the second start's maxItems — so you can't rescope or re-cap a live run by
+    re-starting it; `set_max_items` is the in-place cap edit. A DIFFERENT scope of the same template is
+    a DISTINCT run that proceeds in PARALLEL (own tab + state file), so two milestones run at once from
+    ONE template — you do NOT need two template files (this supersedes the earlier basename-only dedup).
+    Engine: a new
     mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
     consults FIRST (over the start-time param + template cap); persisted in the active-runs record
     (`maxItemsLive`) so a restart re-applies it. A shared pure `parseMaxItemsValue` (null=unlimited,
