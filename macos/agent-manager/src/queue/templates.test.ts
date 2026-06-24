@@ -8,6 +8,7 @@ import {
   TEMPLATE_DEFAULTS,
   makeTemplateLoader,
   missingRequiredParams,
+  parseMaxItemsValue,
   resolveMaxItemsOverride,
   resolveParamsEnv,
   validateTemplate,
@@ -164,6 +165,21 @@ test("resolveParamsEnv: skips a maxItems-target param (never reaches provider en
     ],
   } as unknown as QueueTemplate;
   assert.deepEqual(resolveParamsEnv(t, { maxItems: "5" }), { LINEAR_PROJECT: "Acme" });
+});
+
+test("parseMaxItemsValue: unlimited tokens → null, positive int → N, blank/garbage → undefined", () => {
+  // Unlimited tokens (case-insensitive, trimmed) → null (NO cap).
+  for (const v of ["0", "unlimited", "UNLIMITED", "  none ", "inf", "infinity", "∞"]) {
+    assert.equal(parseMaxItemsValue(v), null, `"${v}" → null (unlimited)`);
+  }
+  // Positive integers → the number.
+  assert.equal(parseMaxItemsValue("1"), 1);
+  assert.equal(parseMaxItemsValue(" 10 "), 10);
+  assert.equal(parseMaxItemsValue("100"), 100);
+  // Blank / garbage / non-positive-int → undefined (caller decides the fallback).
+  for (const v of ["", "   ", "abc", "1.5", "-3", "2x", "NaN"]) {
+    assert.equal(parseMaxItemsValue(v), undefined, `"${v}" → undefined`);
+  }
 });
 
 test("resolveMaxItemsOverride: blank/garbage → undefined, unlimited tokens → 0, positive int → N", () => {

@@ -1009,6 +1009,22 @@ final class AgentDashboardModel: ObservableObject {
                     QueueCommand(action: action, run: run),
             ])
     }
+
+    /// (live maxItems edit) Post a `set_max_items` intent for a queue RUN — re-set its
+    /// lifetime dispatch cap WITHOUT restarting it. `value` is the raw user string
+    /// ("10", "unlimited"/"0"/…); the sidecar parses it (blank/garbage = ignored, so a
+    /// fat-finger never silently removes the cap). Same FIFO path as `sendRunCommand`.
+    func setQueueMaxItems(run: String, value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !trimmed.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .setMaxItems, run: run, maxItems: trimmed),
+            ])
+    }
 }
 
 /// (ramon fork / Agent Dashboard, Layer 3) Owns the panel, the SwiftUI host

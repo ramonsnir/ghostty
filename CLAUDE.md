@@ -908,6 +908,48 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       buttons). Tests: sidecar `status.test.ts` (next url + running echo) + `mcp.test.ts`
       (running forward); Swift `MCPServerTests` (parse url+running) + `AgentDashboardTests`
       (`progressText`, `applyKeepsNextAndRunningItems`). **GUI relaunch + rebuilt sidecar `dist`.**
+  - **CLOSE-GATE fires on QUIESCENT (idle OR waiting), not idle-only (sidecar-only fix).** The
+    DONE_PENDING→CLOSING gate used to require `agentState==="idle"` held `closeStableSeconds`.
+    But a finished Claude Code agent reliably settles in **`waiting`** — its `Stop`→idle hook is
+    immediately overwritten by a `Notification` "waiting for input" nudge — so an idle-ONLY gate
+    NEVER fired and the completed split was never auto-closed (real stuck case: EX-1446 sat
+    DONE_PENDING with status=Done, agentState=waiting, forever). Fix: a pure `isQuiescent(agentState)`
+    = `idle || waiting`; `supervisor.ts` `nextState` gates on `isQuiescent`, and `foldIdleAnchor`
+    anchors the hold on EITHER state AND **keeps the anchor across an idle↔waiting transition**
+    (only `working`/`undefined` resets it) — so the `Stop`→`Notification` flip keeps the close clock
+    running instead of resetting it. Status-only completion is unchanged (idleness alone still never
+    completes); this only governs WHEN a provider-DONE item's split tears down. Tests:
+    `supervisor.test.ts` (close-on-waiting-held, foldIdleAnchor anchors-on-waiting + keeps-anchor-
+    across-transition). **Sidecar-only — rebuilt `dist` + sidecar restart; no GUI/host/Zig change.**
+  - **LIVE maxItems EDIT — change a running queue's cap from the dashboard, no restart (§8b).**
+    A new `set_max_items{run,maxItems}` command re-sets a LIVE run's lifetime dispatch cap WITHOUT
+    restarting it (the headline ask: bump 3→10 mid-run). The dashboard header's "dispatched/cap"
+    suffix is now **tap-to-edit** → a popover with preset buttons (1/2/5/10/∞) + a custom field; the
+    raw string is posted (the sidecar parses it, so a fat-finger never silently removes the cap).
+    Bumping the cap above `lifetimeDispatched` re-enables dispatch on the next sweep (`maxItemsRemaining`
+    recomputes); LOWERING it only stops FUTURE dispatch — running agents are never killed. **NOTE the
+    run-identity semantics (why a second start can't do this):** a run is keyed by template BASENAME and
+    a re-`start` of an already-active template is an idempotent NO-OP that IGNORES the second start's
+    params (milestone/maxItems) — so you cannot run the same template twice (the second start does
+    nothing) and cannot change a live run's scope by re-starting; `set_max_items` is the in-place edit.
+    To run two milestones concurrently you need two template FILES with distinct `name`s. Engine: a new
+    mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
+    consults FIRST (over the start-time param + template cap); persisted in the active-runs record
+    (`maxItemsLive`) so a restart re-applies it. A shared pure `parseMaxItemsValue` (null=unlimited,
+    N=cap, undefined=blank/garbage→ignored) backs both this and the start-time `resolveMaxItemsOverride`.
+    Wiring: sidecar — `templates.ts` (`parseMaxItemsValue` + `resolveMaxItemsOverride` reuse), `runner.ts`
+    (`QueueRun.maxItemsLive` + `effectiveMaxItemsCap` + `makeQueueRun` opt + `activeRunRecords`),
+    `commands.ts` (`set_max_items` action + `maxItems` field + reducer case + `applyCommands` change-bit),
+    `store.ts` (`ActiveRunRecord.maxItemsLive` + tolerant parse), `wiring.ts` (rehydrate), `mcp.ts`
+    (`coerceQueueCommands` whitelists + carries `maxItems`). Swift — `QueueCommandBridge.swift`
+    (`QueueCommand.Action.setMaxItems`="set_max_items" + `maxItems` field + `jsonObject`),
+    `AgentDashboardController.swift` (`setQueueMaxItems(run:value:)`), `AgentDashboardView.swift`
+    (`OriginSectionHeader` cap button + `capEditorPopover` + `QueueHealthFormat.capDraft`). Tests:
+    sidecar `templates.test.ts` (`parseMaxItemsValue`), `commands.test.ts` (set_max_items apply/unlimited/
+    ignore-garbage/unknown-run/change-bit), `runner.test.ts` (`effectiveMaxItemsCap` live override + bump-
+    re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
+    Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
+    **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

@@ -181,6 +181,13 @@ export interface QueueRun {
    *  call — the dashboard's "N waiting / next: …" reads from this. Not persisted. */
   lastListItems: WorkItem[] | null;
   lastListOk: boolean;
+  /** (live maxItems edit) A run-level OVERRIDE of the lifetime cap, set by a `set_max_items`
+   *  command WHILE the run is live (the dashboard cap control). Takes PRECEDENCE over the
+   *  start-time/template cap in `effectiveMaxItemsCap`. `undefined` = no live edit (use the
+   *  start-time/template cap); `null` = live-set to UNLIMITED; a positive number = the live
+   *  cap. Persisted in the active-runs record so a restart re-applies it. Reducing it below
+   *  what is already dispatched only stops FUTURE dispatch (running agents are never killed). */
+  maxItemsLive?: number | null;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -196,6 +203,7 @@ export function makeQueueRun(
     paused?: boolean;
     draining?: boolean;
     params?: Record<string, string>;
+    maxItemsLive?: number | null;
   } = {},
 ): QueueRun {
   return {
@@ -203,6 +211,7 @@ export function makeQueueRun(
     templateName: opts.templateName ?? template.name,
     storeIO,
     params: opts.params ?? {},
+    maxItemsLive: opts.maxItemsLive,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
@@ -221,10 +230,12 @@ export function makeQueueRun(
   };
 }
 
-/** (§11 health) The run's EFFECTIVE lifetime cap: the §8b maxItems override if set
- *  (0 ⇒ unlimited ⇒ null), else the template `maxItems`. PURE. Shared by the dispatch
- *  gate and the health report so they agree. */
+/** (§11 health) The run's EFFECTIVE lifetime cap: the LIVE edit if set (the dashboard cap
+ *  control — `null` ⇒ unlimited), else the §8b maxItems override if set (0 ⇒ unlimited ⇒
+ *  null), else the template `maxItems`. PURE. Shared by the dispatch gate and the health
+ *  report so they agree. */
 export function effectiveMaxItemsCap(run: QueueRun): number | null {
+  if (run.maxItemsLive !== undefined) return run.maxItemsLive; // live edit wins (null = unlimited)
   const override = resolveMaxItemsOverride(run.template, run.params);
   const cap = override === undefined ? run.template.maxItems : override;
   return cap <= 0 ? null : cap;
@@ -285,6 +296,9 @@ export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
     // Persist the start-time params (§8b) so a restart re-applies the same scope. Omit
     // when empty (no declared params / no answers) to keep the file tidy + back-compat.
     if (Object.keys(run.params).length > 0) rec.params = { ...run.params };
+    // Persist a LIVE maxItems edit so a restart re-applies it (null = unlimited; omitted
+    // when never live-edited, so a restart falls back to the start-time/template cap).
+    if (run.maxItemsLive !== undefined) rec.maxItemsLive = run.maxItemsLive;
     out.push(rec);
   }
   return out;

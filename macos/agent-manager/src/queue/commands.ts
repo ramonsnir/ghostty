@@ -15,24 +15,31 @@
 //   resume{run}      → clear `paused`.
 //   stop{run}        → set `draining` (no new dispatch; the run is removed once its active set empties).
 //   abort{run}       → set `aborting` (exit+force-close ALL its assignments this sweep, then remove).
+//   set_max_items{run,maxItems} → re-set a LIVE run's lifetime cap (the dashboard cap control)
+//                      without restarting it; persisted so a restart re-applies it.
 //
 // A command naming an UNKNOWN run (pause/resume/stop/abort with no matching active run) or a
 // start whose template fails to load is a logged NO-OP — never a throw into the loop.
 
 import type { QueueRun } from "./runner.js";
+import { parseMaxItemsValue } from "./templates.js";
 
 /** A drained GUI→sidecar control command (§8a). `template` is the template BASENAME
  *  (the `*.json` filename minus extension) for `start`; `run` is the active run NAME
- *  (= `template.name`, the dashboard origin) for pause/resume/stop/abort. */
+ *  (= `template.name`, the dashboard origin) for pause/resume/stop/abort/set_max_items. */
 export interface QueueCommand {
-  action: "start" | "stop" | "abort" | "pause" | "resume";
+  action: "start" | "stop" | "abort" | "pause" | "resume" | "set_max_items";
   /** The template basename to start (start only). */
   template?: string;
-  /** The active run name to pause/resume/stop/abort. */
+  /** The active run name to pause/resume/stop/abort/set_max_items. */
   run?: string;
   /** (§8b) START-TIME parameter answers (param name → value) collected by the GUI prompt,
    *  passed through to the factory (start only). Absent when the template declares no params. */
   params?: Record<string, string>;
+  /** (live maxItems edit) The new lifetime-cap VALUE for `set_max_items` — a raw string the
+   *  dashboard cap control collected ("10", "unlimited"/"0"/…, etc.), parsed by
+   *  `parseMaxItemsValue` (blank/garbage = ignored). Absent for other actions. */
+  maxItems?: string;
 }
 
 /** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME (+ the
@@ -55,7 +62,14 @@ const errlog = (msg: string): void => console.error(`agent-manager: queue: ${msg
 export interface ApplyResult {
   /** "started" when a new run was created; "noop" when an idempotent re-start (or an
    *  unknown-run / failed-start no-op); else the flag mutation that occurred. */
-  kind: "started" | "paused" | "resumed" | "stopping" | "aborting" | "noop";
+  kind:
+    | "started"
+    | "paused"
+    | "resumed"
+    | "stopping"
+    | "aborting"
+    | "maxItemsSet"
+    | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
 }
@@ -143,6 +157,30 @@ export function applyCommand(
       log(`run "${name}" ABORTING`);
       return { kind: "aborting", runName: name };
     }
+    case "set_max_items": {
+      // (live maxItems edit) Re-set a LIVE run's lifetime cap without restarting it. The
+      // value is parsed exactly like the start-time maxItems param (null = unlimited; a
+      // positive integer = the cap); a blank/garbage value is IGNORED (no change) so a bad
+      // dashboard entry never silently removes the cap.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`set_max_items command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`set_max_items for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      const parsed = parseMaxItemsValue(cmd.maxItems ?? "");
+      if (parsed === undefined) {
+        errlog(`set_max_items for run "${name}" with invalid value "${cmd.maxItems ?? ""}" — ignored`);
+        return { kind: "noop" };
+      }
+      run.maxItemsLive = parsed; // null = unlimited; number = cap
+      log(`run "${name}" maxItems set LIVE to ${parsed === null ? "unlimited" : parsed}`);
+      return { kind: "maxItemsSet", runName: name };
+    }
     default: {
       // Exhaustive guard for an unknown action (tolerant — a malformed drained command).
       errlog(`unknown queue command action "${String((cmd as { action?: unknown }).action)}" — ignored`);
@@ -152,9 +190,10 @@ export function applyCommand(
 }
 
 /** Apply a BATCH of drained commands in order, returning true if ANY of them changed the
- *  active-run SET (a start, or a flag the active-runs persistence captures: pause/resume/
- *  stop). Abort is NOT counted as a persistence change here — the run is removed this sweep
- *  and the caller re-persists after the removal regardless. PURE (delegates to applyCommand). */
+ *  active-run SET (a start, or a field the active-runs persistence captures: pause/resume/
+ *  stop/set_max_items — the last persists the live cap so a restart re-applies it). Abort is
+ *  NOT counted as a persistence change here — the run is removed this sweep and the caller
+ *  re-persists after the removal regardless. PURE (delegates to applyCommand). */
 export function applyCommands(
   registry: RunRegistry,
   cmds: QueueCommand[],
@@ -167,7 +206,8 @@ export function applyCommands(
       res.kind === "started" ||
       res.kind === "paused" ||
       res.kind === "resumed" ||
-      res.kind === "stopping"
+      res.kind === "stopping" ||
+      res.kind === "maxItemsSet"
     ) {
       changed = true;
     }

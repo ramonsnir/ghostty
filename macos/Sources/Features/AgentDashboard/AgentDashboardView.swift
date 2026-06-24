@@ -119,6 +119,9 @@ struct AgentDashboardView: View {
                                 if let id = model.surfaceID(forQueue: section.id, key: item.key) {
                                     focusHidden(id)
                                 }
+                            },
+                            onSetMaxItems: { value in
+                                model.setQueueMaxItems(run: section.id, value: value)
                             }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
@@ -347,6 +350,10 @@ private struct OriginSectionHeader: View {
     /// (§11 health) Jump to the split running a given queue item (the "go to" affordance in
     /// the running dropdown). The parent resolves the item's surface + presents it.
     let onGoToItem: (QueueStatus.Item) -> Void
+    /// (live maxItems edit) Re-set this run's lifetime cap (the dashboard cap control). The
+    /// raw user string ("10"/"unlimited"/…) is posted as a `set_max_items` command; the
+    /// sidecar parses it (blank/garbage = ignored).
+    let onSetMaxItems: (String) -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
@@ -355,6 +362,9 @@ private struct OriginSectionHeader: View {
     // (§11 health) The "N waiting" / "M running" count dropdowns (items + Linear links).
     @State private var showWaiting = false
     @State private var showRunning = false
+    // (live maxItems edit) The "dispatched/cap" tap-to-edit popover + its draft field.
+    @State private var showCapEditor = false
+    @State private var capDraft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -402,8 +412,20 @@ private struct OriginSectionHeader: View {
                                         onGoToItem(item)
                                         showRunning = false
                                     })
-                        Text(QueueHealthFormat.progressText(status))
-                            .font(.caption2).foregroundStyle(.secondary)
+                        // The "dispatched/cap" suffix is tap-to-edit: open a small editor
+                        // to raise/lower the lifetime cap WITHOUT restarting the run.
+                        Button {
+                            capDraft = QueueHealthFormat.capDraft(status)
+                            showCapEditor = true
+                        } label: {
+                            Text(QueueHealthFormat.progressText(status))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Change the lifetime cap (maxItems) for this run")
+                        .popover(isPresented: $showCapEditor, arrowEdge: .bottom) {
+                            capEditorPopover(status)
+                        }
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
@@ -444,6 +466,43 @@ private struct OriginSectionHeader: View {
             .padding(.vertical, 1)
             .background(color.opacity(0.16))
             .clipShape(Capsule())
+    }
+
+    /// (live maxItems edit) The tap-to-edit cap popover: quick presets + a custom field.
+    /// Commits the raw string (the sidecar parses + ignores garbage), so a fat-finger
+    /// never silently removes the cap.
+    @ViewBuilder
+    private func capEditorPopover(_ status: QueueStatus) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Lifetime cap (maxItems)").font(.caption.weight(.semibold))
+            Text("Dispatched \(status.dispatched) of \(status.maxItems.map(String.init) ?? "∞"). Raising it lets the run pick up more items; lowering it only stops FUTURE dispatch — running agents keep going.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach(["1", "2", "5", "10"], id: \.self) { v in
+                    Button(v) { commitCap(v) }.buttonStyle(.bordered)
+                }
+                Button("∞") { commitCap("unlimited") }
+                    .buttonStyle(.bordered)
+                    .help("Unlimited — no lifetime cap")
+            }
+            HStack(spacing: 6) {
+                TextField("custom", text: $capDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+                    .onSubmit { commitCap(capDraft) }
+                Button("Set") { commitCap(capDraft) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(capDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(12)
+        .frame(width: 240)
+    }
+
+    private func commitCap(_ value: String) {
+        onSetMaxItems(value)
+        showCapEditor = false
     }
 
     private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
@@ -538,6 +597,13 @@ enum QueueHealthFormat {
     static func progressText(_ s: QueueStatus) -> String {
         let cap = s.maxItems.map(String.init) ?? "∞"
         return "\(s.dispatched)/\(cap)"
+    }
+
+    /// (live maxItems edit) The pre-fill for the cap editor's custom field: the current
+    /// FINITE cap as a string, or "" for an unlimited cap (the field starts empty so the
+    /// user either picks ∞ or types a number). PURE, unit-tested.
+    static func capDraft(_ s: QueueStatus) -> String {
+        s.maxItems.map(String.init) ?? ""
     }
 
     /// The accent color for a phase chip.

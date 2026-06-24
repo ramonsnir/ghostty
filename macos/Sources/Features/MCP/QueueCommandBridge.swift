@@ -19,47 +19,57 @@ import Foundation
 /// (macos/agent-manager/src/queue/commands.ts) and the wire shape
 /// `take_queue_commands` returns. `template` is the template BASENAME (the
 /// `*.json` filename minus extension) for `start`; `run` is the active run NAME
-/// (= `template.name`, the dashboard origin) for pause/resume/stop/abort. Unused
-/// fields are nil (omitted from the wire JSON).
+/// (= `template.name`, the dashboard origin) for pause/resume/stop/abort/setMaxItems.
+/// Unused fields are nil (omitted from the wire JSON).
 struct QueueCommand: Equatable, Sendable {
-    /// The five recognized actions. A raw-value enum so it round-trips to the
+    /// The recognized actions. A raw-value enum so it round-trips to the
     /// lowercase strings the sidecar's `coerceQueueCommands` whitelists.
+    /// `setMaxItems` serializes to the snake_case `"set_max_items"` the sidecar
+    /// expects (a live lifetime-cap edit — the dashboard cap control).
     enum Action: String, Equatable, Sendable {
         case start, stop, abort, pause, resume
+        case setMaxItems = "set_max_items"
     }
 
     let action: Action
     /// The template basename to start (start only).
     let template: String?
-    /// The active run name to pause/resume/stop/abort.
+    /// The active run name to pause/resume/stop/abort/setMaxItems.
     let run: String?
     /// (§8b) START-TIME parameter answers (param name → value) collected by the
     /// queue palette's prompt, passed through to the sidecar factory (start only).
     /// nil/empty when the template declares no params.
     let params: [String: String]?
+    /// (live maxItems edit) The new lifetime-cap VALUE for `setMaxItems` — the raw
+    /// string the dashboard cap control collected ("10", "unlimited"/"0"/…). The
+    /// sidecar parses it (blank/garbage = ignored). nil for other actions.
+    let maxItems: String?
 
     init(
         action: Action,
         template: String? = nil,
         run: String? = nil,
-        params: [String: String]? = nil
+        params: [String: String]? = nil,
+        maxItems: String? = nil
     ) {
         self.action = action
         self.template = template
         self.run = run
         self.params = params
+        self.maxItems = maxItems
     }
 
     /// PURE: the wire dict drained by `take_queue_commands`. `action` is always
-    /// present; `template`/`run` are emitted only when non-nil (mirrors the
-    /// sidecar's tolerant `coerceQueueCommands`, which only keeps non-empty
-    /// strings); `params` is emitted only when non-nil AND non-empty (the sidecar
-    /// drops empty/non-string entries regardless). Unit-tested.
+    /// present; `template`/`run`/`maxItems` are emitted only when non-nil and
+    /// non-empty (mirrors the sidecar's tolerant `coerceQueueCommands`, which only
+    /// keeps non-empty strings); `params` is emitted only when non-nil AND non-empty
+    /// (the sidecar drops empty/non-string entries regardless). Unit-tested.
     var jsonObject: [String: Any] {
         var d: [String: Any] = ["action": action.rawValue]
         if let template, !template.isEmpty { d["template"] = template }
         if let run, !run.isEmpty { d["run"] = run }
         if let params, !params.isEmpty { d["params"] = params }
+        if let maxItems, !maxItems.isEmpty { d["maxItems"] = maxItems }
         return d
     }
 }
