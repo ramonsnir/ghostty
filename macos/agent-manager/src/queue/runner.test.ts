@@ -450,6 +450,57 @@ test("runQueueSweep: a single list with the SAME key twice dispatches exactly on
 });
 
 // ---------------------------------------------------------------------------
+// (3b) §8b maxItems start-time override caps / unlimits a sweep's dispatch.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: a maxItems-param override CAPS dispatch below the list size", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]', // three actionable items
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  // Template maxItems is huge (200) + concurrency 9, so ONLY the override limits dispatch.
+  const t = tmpl({ params: [{ name: "maxItems", target: "maxItems", default: "100" }] });
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "1" } });
+  let now = 4_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — capped to ONE by the override
+
+  assert.equal(fake.calls.spawn.length, 1, "override maxItems=1 caps the sweep to one spawn");
+  assert.equal(run.active.size, 1);
+});
+
+test("runQueueSweep: maxItems override '0' (unlimited) dispatches PAST the template maxItems", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  // Template maxItems is only 2; the "0" override must override it to UNLIMITED so all 3 go.
+  const t = tmpl({ maxItems: 2, params: [{ name: "maxItems", target: "maxItems" }] });
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "0" } });
+  let now = 4_500_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — unlimited override beats the template cap of 2
+
+  assert.equal(fake.calls.spawn.length, 3, "unlimited override dispatches all 3 (> template maxItems 2)");
+});
+
+// ---------------------------------------------------------------------------
 // (4) End-to-end mocked dispatch → RUNNING → done → close cycle (§6/§10).
 // ---------------------------------------------------------------------------
 

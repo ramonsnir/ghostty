@@ -129,21 +129,31 @@ run with no file edits:
   // … workdir / agent / provider as above …
   "params": [
     { "name": "project",    "env": "LINEAR_PROJECT",    "label": "Linear project",       "default": "Acme Foods", "required": true },
-    { "name": "milestones", "env": "LINEAR_MILESTONES", "label": "Milestone(s), comma-sep", "default": "Visual Prototype" }
+    { "name": "milestones", "env": "LINEAR_MILESTONES", "label": "Milestone(s), comma-sep", "default": "Visual Prototype" },
+    { "name": "maxItems",   "target": "maxItems",       "label": "Max items (0 = unlimited)", "default": "1" }
   ]
 }
 ```
 
 - On **Start**, a small form appears with one field per param, pre-filled with its `default`
-  — usually you just press Enter. Each value is set as `param.env` in the environment your
-  `list`/`status`/`claim` commands run with (so your script reads `$LINEAR_PROJECT`, etc.).
+  — usually you just press Enter. Each value is delivered per its **`target`**:
+  - **`"env"` (the default)** → exported as `param.env` in the environment your
+    `list`/`status`/`claim` commands run with (so your script reads `$LINEAR_PROJECT`, etc.).
+  - **`"maxItems"`** → sets the **run's lifetime dispatch cap** for this start, overriding the
+    template's `maxItems`. Enter a positive number to cap it (e.g. `1` or `2` for a careful
+    run), or **`0`/`unlimited`** for no cap. Blank or non-numeric falls back to the template's
+    `maxItems`. A maxItems param needs no `env` (it tunes the engine, not the provider), and a
+    template may declare at most one. This is the recommended way to vary run size — leave
+    `maxItems` in the template as a sane fallback and pick the real number at start.
 - `required: true` blocks the start until that field is non-empty (the Start button stays
   disabled; the engine also rejects it).
-- The chosen values are remembered for the run and **re-applied across a restart**.
+- The chosen values are remembered for the run and **re-applied across a restart** (scope AND
+  the maxItems override).
 - A template with **no `params`** starts immediately, exactly as before.
-- Stays generic: the *template* names the env var — Ghostty has no knowledge of Linear (or
-  any tracker). Keep secrets (e.g. a `LINEAR_API_KEY`) in your provider's own env file; use
-  `params` only for the per-run scope you want to be asked about.
+- Stays generic: the *template* names the env var / opts into the maxItems prompt — Ghostty has
+  no knowledge of Linear (or any tracker). Keep secrets (e.g. a `LINEAR_API_KEY`) in your
+  provider's own env file; use `params` only for the per-run scope / size you want to be asked
+  about.
 
 Provider contract (the genericity boundary):
 - **`list`** → stdout is a JSON array; `keyField`/`titleField`/`urlField` map fields onto each

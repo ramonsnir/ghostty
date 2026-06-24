@@ -8,6 +8,7 @@ import {
   TEMPLATE_DEFAULTS,
   makeTemplateLoader,
   missingRequiredParams,
+  resolveMaxItemsOverride,
   resolveParamsEnv,
   validateTemplate,
   type TemplateFs,
@@ -102,6 +103,82 @@ test("missingRequiredParams: only required-and-empty (no answer + no default) ar
   assert.deepEqual(missingRequiredParams(t, {}), ["project"]);
   assert.deepEqual(missingRequiredParams(t, { project: "Acme" }), []);
   assert.deepEqual(missingRequiredParams(t, { project: "" }), ["project"]);
+});
+
+// ---------------------------------------------------------------------------
+// §8b maxItems-target param: validate + resolveParamsEnv skip + resolveMaxItemsOverride.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: a maxItems-target param needs no env and is parsed", () => {
+  const obj = goodTemplateObj();
+  obj.params = [
+    { name: "project", env: "LINEAR_PROJECT", required: true },
+    { name: "maxItems", target: "maxItems", label: "Max items", default: "1" },
+  ];
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.template.params, [
+    { name: "project", env: "LINEAR_PROJECT", required: true },
+    { name: "maxItems", target: "maxItems", label: "Max items", default: "1" },
+  ]);
+});
+
+test("validateTemplate: rejects bad target, a 2nd maxItems param", () => {
+  for (const params of [
+    [{ name: "p", target: "bogus" }], // unknown target
+    [
+      { name: "a", target: "maxItems" },
+      { name: "b", target: "maxItems" },
+    ], // two maxItems params
+  ]) {
+    const obj = goodTemplateObj();
+    obj.params = params;
+    const r = validateTemplate(obj);
+    assert.equal(r.ok, false, JSON.stringify(params));
+  }
+});
+
+test("resolveParamsEnv: skips a maxItems-target param (never reaches provider env)", () => {
+  const t = {
+    params: [
+      { name: "project", env: "LINEAR_PROJECT", default: "Acme" },
+      { name: "maxItems", target: "maxItems", default: "2" },
+    ],
+  } as unknown as QueueTemplate;
+  assert.deepEqual(resolveParamsEnv(t, { maxItems: "5" }), { LINEAR_PROJECT: "Acme" });
+});
+
+test("resolveMaxItemsOverride: blank/garbage → undefined, unlimited tokens → 0, positive int → N", () => {
+  const t = {
+    params: [{ name: "maxItems", target: "maxItems", default: "1" }],
+  } as unknown as QueueTemplate;
+  // No template maxItems param → no override.
+  const noParam = { params: [] } as unknown as QueueTemplate;
+  assert.equal(resolveMaxItemsOverride(noParam, { maxItems: "3" }), undefined);
+  // Explicit positive integers.
+  assert.equal(resolveMaxItemsOverride(t, { maxItems: "2" }), 2);
+  assert.equal(resolveMaxItemsOverride(t, { maxItems: "100" }), 100);
+  // Unlimited tokens (case-insensitive) → 0.
+  for (const v of ["0", "unlimited", "UNLIMITED", "none", "inf", "∞"]) {
+    assert.equal(resolveMaxItemsOverride(t, { maxItems: v }), 0, v);
+  }
+  // An explicitly-CLEARED answer ("") is a real answer (?? only falls back on
+  // null/undefined), so it does NOT use the param default → undefined (template default).
+  assert.equal(resolveMaxItemsOverride(t, { maxItems: "" }), undefined);
+  // No answer at all → the param default ("1") applies.
+  assert.equal(resolveMaxItemsOverride(t, {}), 1);
+  // Garbage / non-integer → undefined (caller uses template maxItems, a safe finite).
+  for (const v of ["abc", "1.5", "-3", "2x"]) {
+    assert.equal(resolveMaxItemsOverride(t, { maxItems: v }), undefined, v);
+  }
+});
+
+test("resolveMaxItemsOverride: a blank default with a blank answer → undefined", () => {
+  const t = {
+    params: [{ name: "maxItems", target: "maxItems" }], // no default
+  } as unknown as QueueTemplate;
+  assert.equal(resolveMaxItemsOverride(t, {}), undefined);
 });
 
 // ---------------------------------------------------------------------------

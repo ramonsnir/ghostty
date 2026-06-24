@@ -819,30 +819,39 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (`commands.ts applyCommand`), persists the active-run SET (`active-runs.json`) + rehydrates
     it on restart. **A template merely on disk does NOT auto-run** (replaced Phase-1
     `loadRuns(all)`) — only a started/persisted run.
-  - **START-TIME PARAMS (§8b) — prompt for project/milestone/etc. at start, don't hard-code.**
-    A template can declare `params: [{name, env, label?, default?, required?}]`; on start the
-    QueuePalette PROMPTS for each (a form, pre-filled with `default`), and each answer is
-    injected into the PROVIDER command env under `param.env` (the `list`/`status`/`claim`
-    calls read it) — so ONE generic template is re-pointed at a different scope per run with no
-    file edits. STAYS GENERIC: the TEMPLATE names the env var; Ghostty never hard-codes
-    "Linear". A param scopes "what to work on" and is delivered ONLY to the provider, NOT the
-    agent (the agent gets per-item `GHOSTTY_ITEM_*`). Resolution is `answer ?? default ?? omit`
-    (`resolveParamsEnv`, pure); a REQUIRED param with no answer+no default REJECTS the start
-    (`missingRequiredParams`, enforced in the factory + the GUI Start button is disabled).
-    Params persist in the active-runs record (`params` map) so a restart re-applies the same
-    scope. A template with no params starts directly (prior behavior). Wiring: sidecar —
-    `types.ts` (`QueueParam` + `QueueTemplate.params`), `templates.ts` (`validateParams` +
-    `resolveParamsEnv`/`missingRequiredParams`), `runner.ts` (`QueueRun.params` + provider-call
-    env + `activeRunRecords`), `commands.ts` (`QueueCommand.params` + `RunFactory(basename,
-    params?)`), `store.ts` (`ActiveRunRecord.params` parse/serialize), `mcp.ts`
-    (`coerceQueueCommands` params), `wiring.ts` (factory enforces required + passes params,
-    rehydrate re-applies); Swift — `QueueCommandBridge.swift` (`QueueCommand.params` + wire),
-    `Command Palette/QueuePalette.swift` (`templateParams` JSON parse + `QueueParamFormView`
-    prompt + two-step flow). Tests: sidecar `templates.test.ts`/`commands.test.ts`/
-    `store.test.ts`/`mcp.test.ts`/`runner.test.ts` (validate/resolve/required, command carry,
-    persist round-trip, coerce, provider-env injection); Swift `QueuePaletteTests`
-    (`templateParams*`, `canStart*`, `startCommand*Params`). **GUI relaunch (for the prompt) +
-    a rebuilt sidecar `dist`; no host/Zig change.**
+  - **START-TIME PARAMS (§8b) — prompt for project/milestone/maxItems/etc. at start, don't hard-code.**
+    A template can declare `params: [{name, target?, env?, label?, default?, required?}]`; on start the
+    QueuePalette PROMPTS for each (a form, pre-filled with `default`), and each answer is delivered
+    per its `target`. **`target` (default `"env"`)** picks the delivery: an `"env"` param is
+    injected into the PROVIDER command env under `param.env` (the `list`/`status`/`claim` calls
+    read it) — so ONE generic template is re-pointed at a different scope per run with no file
+    edits; a **`"maxItems"`** param instead sets the RUN's lifetime dispatch cap (overriding the
+    template `maxItems`), so the user picks 1/2/unlimited at start (the headline ask — "run it
+    careful with maxItems=1, or unlimited"). STAYS GENERIC: the TEMPLATE names the env var / opts
+    into the maxItems prompt; Ghostty never hard-codes "Linear". An env param scopes "what to work
+    on" and is delivered ONLY to the provider, NOT the agent (the agent gets per-item
+    `GHOSTTY_ITEM_*`); a maxItems param reaches NEITHER (it tunes the engine). Env resolution is
+    `answer ?? default ?? omit` (`resolveParamsEnv`, pure); a REQUIRED param with no answer+no
+    default REJECTS the start (`missingRequiredParams`, enforced in the factory + the GUI Start
+    button is disabled). The maxItems override (`resolveMaxItemsOverride`, pure): blank/garbage →
+    `undefined` (use the template `maxItems`, a safe finite); `"0"`/`"unlimited"`/`"none"`/`"inf"`/`"∞"`
+    → unlimited (no lifetime cap — `maxItemsRemaining` is Infinity in `dispatchCandidates`, the
+    global `agent-queue-max-total`+grid+concurrency still bound it); a positive integer → that cap.
+    Validation: `target` must be `"env"`|`"maxItems"`; an env param needs a valid `env`; AT MOST ONE
+    maxItems param (a 2nd is rejected). Params persist in the active-runs record (`params` map) so a
+    restart re-applies the same scope AND maxItems. A template with no params starts directly (prior
+    behavior). **The Swift palette is UNCHANGED** — its `templateParams` parser reads name/label/
+    default/required and is `env`/`target`-agnostic, so the maxItems param prompts like any other
+    with no GUI code change. Wiring: sidecar ONLY — `types.ts` (`QueueParam.target`/`QueueParamTarget`,
+    `env` now optional), `templates.ts` (`validateParams` target + `resolveParamsEnv` skips non-env +
+    new `resolveMaxItemsOverride`), `runner.ts` (`dispatchCandidates` applies the override). The
+    env-param plumbing (`runner.ts` `QueueRun.params`, `commands.ts`, `store.ts`, `mcp.ts`,
+    `wiring.ts`, `QueueCommandBridge.swift`, `QueuePalette.swift`) is unchanged — the maxItems answer
+    just rides the existing `params` map. Tests: sidecar `templates.test.ts` (target validate +
+    `resolveParamsEnv` skip + `resolveMaxItemsOverride` cases), `runner.test.ts` (override CAPS a
+    sweep below list size + `"0"` unlimited dispatches PAST the template cap), plus the existing
+    `commands.test.ts`/`store.test.ts`/`mcp.test.ts` and Swift `QueuePaletteTests`. **A rebuilt
+    sidecar `dist` is enough (the GUI respawns it); no GUI relaunch / host / Zig change.**
   - **GRID layout** (§12): all of a run's splits in ONE tab, auto-arranged up to `cols×rows`
     filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
     splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are
