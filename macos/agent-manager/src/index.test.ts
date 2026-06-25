@@ -8,7 +8,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSweep, type LoopDeps, type SummarizeFn } from "./index.js";
+import {
+  runSweep,
+  makeCoalescedRunner,
+  type LoopDeps,
+  type SummarizeFn,
+} from "./index.js";
 import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
@@ -802,4 +807,61 @@ test("bell-attention v2: only a CONFIDENT attention:false suppresses", async () 
   await runSweep(deps);
 
   assert.equal(fake.attentionCalls.length, 0, "explicit false is the ONLY thing that suppresses");
+});
+
+// (bell-attention v2 slice 4) makeCoalescedRunner — concurrent callers coalesce
+// into non-overlapping runs, with a single re-run when a wake arrives mid-flight.
+test("coalesce: serial calls run once each (no coalescing when idle)", async () => {
+  let runs = 0;
+  const run = makeCoalescedRunner(async () => {
+    runs++;
+  });
+  await run();
+  await run();
+  assert.equal(runs, 2);
+});
+
+test("coalesce: a wake DURING a run triggers exactly one re-run", async () => {
+  let runs = 0;
+  let release!: () => void;
+  let gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const run = makeCoalescedRunner(async () => {
+    runs++;
+    await gate; // park the first run so we can fire concurrent calls
+  });
+  const first = run(); // starts running, parked on gate
+  // Two more calls arrive while running: they must coalesce to ONE re-run.
+  const second = run();
+  const third = run();
+  // Re-arm the gate so the coalesced re-run can also complete promptly.
+  const firstGate = gate;
+  gate = Promise.resolve();
+  release(); // let the first run finish; firstGate resolves
+  void firstGate;
+  await Promise.all([first, second, third]);
+  assert.equal(runs, 2, "first run + exactly one coalesced re-run");
+});
+
+test("coalesce: re-run is suppressed when isStopped() is true", async () => {
+  let runs = 0;
+  let stopped = false;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const run = makeCoalescedRunner(
+    async () => {
+      runs++;
+      await gate;
+    },
+    () => stopped,
+  );
+  const first = run();
+  void run(); // wake while running
+  stopped = true; // but we are stopping
+  release();
+  await first;
+  assert.equal(runs, 1, "no re-run after stop even though a wake arrived");
 });

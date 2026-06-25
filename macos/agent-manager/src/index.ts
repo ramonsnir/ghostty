@@ -82,6 +82,47 @@ const POLL_INTERVAL_MS = 5000;
  *  slow LLM passes — see `runQueueSweepSafe` / `queueTick`). */
 const QUEUE_POLL_INTERVAL_MS = 5000;
 
+/** (bell-attention v2 slice 4) The bell-reactive long-poll park window. Below the MCP
+ *  tool's 120s ceiling and the connection caps; on timeout the loop simply re-parks. */
+const BELL_WAIT_MS = 60000;
+/** Backoff before re-parking after a failed `wait_for_event` (MCP down / restarting), so
+ *  a wedged server doesn't spin the loop. */
+const BELL_WAIT_RETRY_MS = 3000;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * (bell-attention v2 slice 4) Wrap an async run so concurrent callers COALESCE instead
+ * of overlapping: while one run is in flight, additional calls set a re-run flag and
+ * return immediately; when the run finishes it loops once more iff a wake arrived (and we
+ * are not stopped). This lets the 5s summarizer timer AND the bell-reactive long-poll both
+ * request a sweep without ever running two sweeps at once (the design's non-overlap
+ * invariant). PURE over its injected `run`/`isStopped` — unit-tested.
+ */
+export function makeCoalescedRunner(
+  run: () => Promise<void>,
+  isStopped: () => boolean = () => false,
+): () => Promise<void> {
+  let running = false;
+  let again = false;
+  return async (): Promise<void> => {
+    if (running) {
+      again = true;
+      return;
+    }
+    running = true;
+    try {
+      do {
+        again = false;
+        await run();
+      } while (again && !isStopped());
+    } finally {
+      running = false;
+    }
+  };
+}
+
 const log = (msg: string): void => console.log(`agent-manager: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: ${msg}`);
 
@@ -537,11 +578,12 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  // Self-pacing loop: run a sweep, then schedule the next POLL_INTERVAL_MS after
-  // it settles (no overlap). setTimeout (not setInterval) avoids piling sweeps
-  // when a sweep runs long.
-  const tick = async (): Promise<void> => {
-    if (stopped) return;
+  // (bell-attention v2 slice 4) Both the 5s timer and the bell-reactive long-poll run
+  // sweeps through this COALESCED runner, so a bell event can wake an immediate classify
+  // without ever overlapping the periodic sweep (which would race the shared bell-edge /
+  // alert bookkeeping in `deps`). The sweep itself does all the work; the reactive loop
+  // only wakes it.
+  const runSweepCoalesced = makeCoalescedRunner(async () => {
     try {
       await runSweep(deps);
     } catch (err) {
@@ -549,7 +591,40 @@ async function main(): Promise<void> {
       // loop can never die from an unexpected throw.
       errlog(`sweep error: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }, () => stopped);
+
+  // Self-pacing loop: run a sweep, then schedule the next POLL_INTERVAL_MS after
+  // it settles (no overlap). setTimeout (not setInterval) avoids piling sweeps
+  // when a sweep runs long.
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    await runSweepCoalesced();
     if (!stopped) timer = setTimeout(() => void tick(), POLL_INTERVAL_MS);
+  };
+
+  // (bell-attention v2 slice 4) BELL-REACTIVE loop: long-poll wait_for_event(bell) and
+  // wake an immediate classify so a promotion lands in ~1-2s instead of up to
+  // POLL_INTERVAL_MS (sound-only until then). The 5s `tick` stays as the backstop (it
+  // also drives summaries + catches any missed event). Only armed when bell promotion is
+  // enabled (`bellFilter`); without it there is no attention tier to promote into. The
+  // loop NEVER exits on error (fail-open: a recovered MCP re-arms after a short backoff).
+  const bellReactiveLoop = async (): Promise<void> => {
+    while (!stopped) {
+      let ev: { id: string; type: string } | null;
+      try {
+        ev = await deps.client.waitForEvent({ types: ["bell"], timeoutMs: BELL_WAIT_MS });
+      } catch (err) {
+        errlog(`bell wait failed: ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(BELL_WAIT_RETRY_MS);
+        continue;
+      }
+      if (stopped) return;
+      if (ev) {
+        log(`bell event on ${ev.id} -> wake immediate classify`);
+        void runSweepCoalesced();
+      }
+      // ev === null ⇒ park timeout; just loop and re-park.
+    }
   };
 
   // INDEPENDENT queue loop (ramon fork / Agent Queue): the deterministic supervisor
@@ -568,6 +643,12 @@ async function main(): Promise<void> {
   // forever) by the slow — or occasionally hanging — first summarizer sweep in
   // `tick`. Both loops then run concurrently on the event loop.
   if (deps.queue !== undefined) void queueTick();
+  // (bell-attention v2 slice 4) Arm the bell-reactive loop only when bell promotion is on
+  // (it needs the attention tier to promote into) AND we have the waitForEvent capability.
+  if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
+    log("bell-attention: event-driven classify ENABLED (wait_for_event)");
+    void bellReactiveLoop();
+  }
   await tick();
 }
 

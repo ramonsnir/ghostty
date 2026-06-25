@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   extractToolText,
   parseToolJson,
+  parseWaitForEvent,
   coerceQueueCommands,
   McpError,
   McpClient,
@@ -404,4 +405,35 @@ test("coerceQueueCommands: parses start-time params (§8b) — string values onl
     { action: "start", template: "t2" },
     { action: "start", template: "t3" },
   ]);
+});
+
+// (bell-attention v2 slice 4) parseWaitForEvent — the wait_for_event payload parser.
+test("parseWaitForEvent: fired bell event => {id,type}", () => {
+  const out = parseWaitForEvent(
+    JSON.stringify({ event: { id: "abc", type: "bell" } }),
+  );
+  assert.deepEqual(out, { id: "abc", type: "bell" });
+});
+
+test("parseWaitForEvent: timeout ({event:null}) => null", () => {
+  assert.equal(parseWaitForEvent(JSON.stringify({ event: null })), null);
+});
+
+test("parseWaitForEvent: missing/partial fields => null", () => {
+  assert.equal(parseWaitForEvent(JSON.stringify({ event: { id: "x" } })), null);
+  assert.equal(parseWaitForEvent(JSON.stringify({ event: { type: "bell" } })), null);
+  assert.equal(parseWaitForEvent(JSON.stringify({ event: {} })), null);
+  assert.equal(parseWaitForEvent(JSON.stringify({})), null);
+});
+
+test("parseWaitForEvent: non-string fields => null", () => {
+  assert.equal(
+    parseWaitForEvent(JSON.stringify({ event: { id: 1, type: 2 } })),
+    null,
+  );
+});
+
+test("parseWaitForEvent: malformed JSON => null (no throw)", () => {
+  assert.equal(parseWaitForEvent("not json"), null);
+  assert.equal(parseWaitForEvent(""), null);
 });
