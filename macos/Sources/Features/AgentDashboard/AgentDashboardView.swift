@@ -448,13 +448,16 @@ private struct OriginSectionHeader: View {
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
-                    // (backlog graph) The "N backlog" button → the dependency-graph canvas.
-                    // Shown whenever the run is reporting a board (provider.graph on). Lives
-                    // inside the status line because a section only exists once the run has
-                    // reported health (pushed every sweep), so `status` is always present here.
-                    if let graph {
-                        backlogButton(graph)
-                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            // (backlog graph) The "N backlog" button → the dependency-graph canvas, on its
+            // OWN full-width row so the narrow sidebar can never squeeze it out of the
+            // crowded status line (phase + waiting + running + cap). Shown whenever the run
+            // is reporting a board (provider.graph on).
+            if let graph {
+                HStack(spacing: 6) {
+                    backlogButton(graph)
                     Spacer(minLength: 0)
                 }
             }
