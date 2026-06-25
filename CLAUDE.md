@@ -647,6 +647,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     **GUI relaunch only** to enable (no host restart); the sidecar must be built
     (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
     the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
+    **⚠️ COLLEAGUE / DMG LIMITATION (NOT bundled).** `resolveSidecarDir()` prefers a bundled
+    `Contents/Resources/agent-manager` but the release (`fork-release.yml`) does **NOT** bundle
+    the sidecar (unlike the host + `ghostty-mcp` shim, which ARE), so on a colleague's DMG install
+    the `#filePath` dev fallback is a build-machine path that doesn't exist → **the Agent Manager +
+    Agent Queue self-disable** (the sidecar `Process` never spawns; the controller's backoff gives
+    up). It fails CLOSED (one log line, no crash) and everything compiled into the app — the Agent
+    Dashboard previews + hook-driven chips + the per-tile Close button, the Web Monitor, the MCP
+    server, splits/host — still works. Also requires `node` on PATH (the §8 self-disable gate). So
+    these two features are effectively **Ramon-dev-only** today; shipping them to colleagues needs
+    a CI step to build + bundle + sign `macos/agent-manager/{dist,node_modules}` into
+    `Contents/Resources/agent-manager` (the resolver already prefers it) plus a node story — a
+    deliberate follow-up, not done.
   - **Account routing (optional) — bill the summarizer to a SEPARATE account.** By default the
     summarizer inherits the ambient Claude Code auth (works with NO multi-account setup); set a
     spec in `~/.config/ghostty-ramon/agent-manager/account` (sibling of `summarizer.md`) OR the
@@ -902,6 +914,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `MCPServerTests`/`MCPAnnotationTests`/`AgentDashboardTests`/`QueuePaletteTests`, Zig
     `agent-queue` config + `start_agent_queue` binding. **GUI relaunch + rebuilt sidecar
     `dist` to enable; no host restart.**
+  - **Per-tile CLOSE button (GUI-only, queue tiles only) — the wedged-slot escape hatch.** On
+    hover each tile shows the existing **Hide ✕** (view-only declutter; the split keeps
+    running) and, ONLY on a **queue-owned** tile (one carrying a `queueName` annotation), a red
+    **⏹ `stop.circle`** that **force-closes** the split: it ends the agent + frees the queue
+    slot (the surface vanishing makes the next sweep reconcile + prune the record). It routes
+    through the confirm-FREE `MCPLayout.forceClose` (same path the queue's own auto-close uses),
+    so it works on a live agent without the `confirm-close-surface` modal — gated behind a
+    confirmation dialog (no undo). It's the manual remedy when auto-close is wedged (e.g. a
+    stuck-`working` hook). Queue-only by design: on a non-queue `(other)` agent a force-close is
+    an unscoped "kill this terminal" next to the harmless Hide. Wiring:
+    `AgentPreviewTile.swift` (`isQueueOwned` = `entry.annotation?.queueName` non-empty + the
+    `onClose` button + `confirmationDialog`), `AgentDashboardController.swift`
+    (`AgentDashboardModel.closeSurface(_:)` → `MCPLayout.forceClose`), `AgentDashboardView.swift`
+    (`onClose:` wiring). Tests: `AgentDashboardTests` (`capDraft*` neighborhood; the button +
+    gating are SwiftUI, not unit-tested). **GUI-only, GUI relaunch to pick up; no sidecar/host/Zig change.**
   - **QUEUE HEALTH bar (§11, sidecar→GUI push).** The dashboard shows each running queue's
     health in its section header — even BEFORE any split spawns and even when every tile is
     hidden/filtered (the "scary blank at start" + "all hidden" fixes). The supervisor PUSHES
