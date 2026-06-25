@@ -33,6 +33,14 @@ test("parseConfig: overlays known numeric/boolean keys", () => {
   assert.equal(c.promptTailLines, DEFAULT_CONFIG.promptTailLines);
 });
 
+test("parseConfig: overlays rateLimitBackoffMaxMs in range, rejects out-of-range", () => {
+  assert.equal(parseConfig({ rateLimitBackoffMaxMs: 120000 }).rateLimitBackoffMaxMs, 120000);
+  assert.equal(
+    parseConfig({ rateLimitBackoffMaxMs: 99_999_999 }).rateLimitBackoffMaxMs,
+    DEFAULT_CONFIG.rateLimitBackoffMaxMs,
+  );
+});
+
 test("parseConfig: rejects out-of-range / wrong-type values (keeps base)", () => {
   const c = parseConfig({
     changeRatioThreshold: 5, // > 1 → ignored

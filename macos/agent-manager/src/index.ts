@@ -47,6 +47,7 @@ import {
   preGate,
   changeSignals,
   changeTail,
+  backoffDelayMs,
   parseSummary,
   shouldSummarize,
   alertEdge,
@@ -117,6 +118,13 @@ export interface LoopDeps {
    *  after the alert clears (the screen changes). Held on deps so a test can
    *  seed/inspect it; cleaned up alongside lastBySession when a surface dies. */
   alertBySession: Map<string, string>;
+  /** Adaptive RATE-LIMIT BACKOFF state (account-WIDE, not per-session). When the
+   *  summarizer's own model calls keep failing — its account is rate-limited / returns
+   *  no usable summary — `failureStreak` rises and `nextProbeMs` pushes the next probe
+   *  out (exponential, capped by `cfg.rateLimitBackoffMaxMs`). While backed off the
+   *  sweep makes at most ONE probe call per window; the first SUCCESS resets the streak
+   *  to 0 and normal cadence resumes. Held on deps so a test can seed/inspect it. */
+  summarizerBackoff: { failureStreak: number; nextProbeMs: number };
   /** Optional CLAUDE_CONFIG_DIR for the summarizer's model calls — routes auth/billing
    *  to a specific claude-accounts account (see account.ts). Omitted ⇒ inherit the
    *  ambient auth (the default; works with no claude-accounts installed). */
@@ -139,10 +147,16 @@ export interface LoopDeps {
  * the sweep — so the gate and the recorded fingerprint share the SAME basis
  * (the freshly-read viewport tail), keeping idle-skip honest.
  */
+/** The outcome of one summarizeOne attempt, for the rate-limit backoff aggregator:
+ *  "ok" = a model call SUCCEEDED + parsed (the account works); "fail" = a call was
+ *  made but threw / returned no usable summary (rate-limited or junk); "skip" = no
+ *  model call happened (the full gate said not-due). */
+type SummarizeResult = "ok" | "fail" | "skip";
+
 async function summarizeOne(
   surface: Surface,
   deps: LoopDeps,
-): Promise<void> {
+): Promise<SummarizeResult> {
   const { client, overrides, cfg } = deps;
   const prev = deps.lastBySession.get(surface.id);
 
@@ -176,7 +190,7 @@ async function summarizeOne(
     // The attention alert is the MODEL's verdict (below), so an idle-skip — where no
     // model call runs — deliberately LEAVES the alert state untouched: a held alert
     // stays armed (no re-ring), and nothing rings or clears without a fresh classify.
-    if (!decision.due) return; // unchanged/idle on the real viewport — skip
+    if (!decision.due) return "skip"; // unchanged/idle on the real viewport — skip
 
     // Prefer the loop's own record for continuity; fall back to the round-tripped
     // `notes` (our last summary echoed by list_surfaces). `||` so the "" sentinel
@@ -196,7 +210,7 @@ async function summarizeOne(
       // classify this sweep ⇒ leave the alert state untouched (see the idle note).
       recordAttempt();
       errlog(`surface ${surface.id}: model reply not parseable; skipping`);
-      return;
+      return "fail";
     }
 
     await client.setAnnotation(surface.id, {
@@ -216,6 +230,7 @@ async function summarizeOne(
     // the live condition — this is how recovery un-rings, immune to scrolled-up text).
     await maybeSignalAlert(deps, surface, parsed.alert);
     log(`surface ${surface.id}: "${parsed.summary}"`);
+    return "ok";
   } catch (err) {
     // A read/model/annotate failure — throttle the retry so a persistently failing
     // surface costs at most one attempt per debounceMs, not one per poll. No fresh
@@ -230,6 +245,7 @@ async function summarizeOne(
         err instanceof Error ? err.message : String(err)
       }`,
     );
+    return "fail";
   } finally {
     deps.budget.release();
   }
@@ -303,29 +319,67 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     if (!liveIds.has(id)) deps.alertBySession.delete(id);
   }
 
-  const fired: Array<Promise<void>> = [];
+  // Cheap pre-gate from row fields only (no read_surface yet): drop non-agent /
+  // hidden / debounced surfaces. The viewport-aware change/idle decision happens
+  // inside summarizeOne after the read, so the gate and the recorded tail share the
+  // same basis.
+  const candidates = surfaces.filter(
+    (s) => preGate(s, deps.lastBySession.get(s.id), deps.now(), deps.cfg).pass,
+  );
 
-  // SUMMARIZER pass.
-  for (const surface of surfaces) {
-    // Cheap pre-gate from row fields only (no read_surface yet): skip non-agent
-    // + debounced surfaces. The viewport-aware fingerprint/idle decision happens
-    // inside summarizeOne after the read, so the gate and the recorded
-    // fingerprint share the same basis.
-    const pre = preGate(surface, deps.lastBySession.get(surface.id), deps.now(), deps.cfg);
-    if (!pre.pass) continue;
-    // NOTE: because the loop is self-paced + non-overlapping (a sweep fully
-    // settles before the next setTimeout), `cfg.maxConcurrent` doubles as a
-    // per-sweep BATCH cap: at most maxConcurrent tiles are summarized per
-    // POLL_INTERVAL_MS sweep, so with N>maxConcurrent due tiles a full refresh
-    // takes ceil(N/maxConcurrent) sweeps. This is fine for Phase 1 (it also
-    // rate-limits a many-tile setup); it is not the cross-overlap global cap the
-    // design's wording might imply, but is functionally equivalent given no
-    // overlap.
+  // RATE-LIMIT BACKOFF (account-wide): while the summarizer's own calls keep failing,
+  // slow WAY down and make at most ONE probe call per window until one succeeds (the
+  // limit reset). `failureStreak === 0` is the normal path.
+  const bo = deps.summarizerBackoff;
+  if (bo.failureStreak > 0) {
+    if (deps.now() < bo.nextProbeMs) return; // still cooling down — no model calls
+    // PROBE: try candidates sequentially until ONE makes a real model call (not a
+    // gate-skip), so a leading quiescent tile can't waste the probe without testing
+    // the account. The first real result decides recovery vs. continued backoff.
+    let probed: SummarizeResult | null = null;
+    for (const surface of candidates) {
+      if (!deps.budget.tryAcquire()) break;
+      const r = await summarizeOne(surface, deps);
+      if (r !== "skip") { probed = r; break; }
+    }
+    if (probed === "ok") {
+      log(`rate-limit backoff cleared after ${bo.failureStreak} failure(s); resuming`);
+      bo.failureStreak = 0;
+      bo.nextProbeMs = 0;
+    } else if (probed === "fail") {
+      bo.failureStreak += 1;
+      const delay = backoffDelayMs(bo.failureStreak, deps.cfg.debounceMs, deps.cfg.rateLimitBackoffMaxMs);
+      bo.nextProbeMs = deps.now() + delay;
+      log(`rate-limit backoff: probe failed (streak ${bo.failureStreak}); next probe in ${Math.round(delay / 1000)}s`);
+    }
+    // probed === null ⇒ no real call this sweep (all gate-skipped); leave the backoff
+    // untouched and retry on the next sweep.
+    return;
+  }
+
+  // NORMAL path: fire due surfaces concurrently (bounded by the budget = per-sweep
+  // batch cap). NOTE: because the loop is self-paced + non-overlapping (a sweep fully
+  // settles before the next setTimeout), `cfg.maxConcurrent` doubles as a per-sweep
+  // BATCH cap: at most maxConcurrent tiles are summarized per POLL_INTERVAL_MS sweep.
+  const fired: Array<Promise<SummarizeResult>> = [];
+  for (const surface of candidates) {
     if (!deps.budget.tryAcquire()) break; // budget exhausted this sweep
     fired.push(summarizeOne(surface, deps));
   }
 
-  await Promise.all(fired);
+  const results = await Promise.all(fired);
+  // ENTER backoff iff this sweep made calls and EVERY one failed (a success anywhere
+  // means the account is healthy ⇒ stay normal). A success resets; otherwise arm the
+  // first backoff window so the next sweep probes instead of firing the whole batch.
+  if (results.includes("ok")) {
+    bo.failureStreak = 0;
+    bo.nextProbeMs = 0;
+  } else if (results.includes("fail")) {
+    bo.failureStreak += 1;
+    const delay = backoffDelayMs(bo.failureStreak, deps.cfg.debounceMs, deps.cfg.rateLimitBackoffMaxMs);
+    bo.nextProbeMs = deps.now() + delay;
+    log(`rate-limit backoff engaged: ${results.filter((r) => r === "fail").length} call(s) failed; next probe in ${Math.round(delay / 1000)}s`);
+  }
   // NOTE: the AGENT QUEUE SUPERVISOR is NOT run here. It is a deterministic,
   // latency-sensitive loop that must NOT be gated behind the (slow, LLM-bound)
   // summarizer pass above — with many agents, `Promise.all(fired)` can take tens of
@@ -391,6 +445,7 @@ async function main(): Promise<void> {
     summarize: defaultSummarize,
     lastBySession: new Map<string, LastSummary>(),
     alertBySession: new Map<string, string>(),
+    summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     summarizerConfigDir,
   };
 

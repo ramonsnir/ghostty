@@ -17,6 +17,7 @@ import {
   changeSignals,
   changeTail,
   tailChangeRatio,
+  backoffDelayMs,
   isQuiescent,
   normalizeChangeLine,
   lineMultiset,
@@ -199,6 +200,24 @@ test("tailChangeRatio: spinner-only animation (via changeTail) => 0", () => {
   const prev = changeTail(`${base}\n⠋ Thinking… (3s · esc to interrupt)`, cfg);
   const cur = changeTail(`${base}\n⠙ Thinking… (41s · esc to interrupt)`, cfg);
   assert.equal(tailChangeRatio(prev, cur), 0);
+});
+
+test("backoffDelayMs: streak 0 (or less) => 0 (normal cadence)", () => {
+  assert.equal(backoffDelayMs(0, 30000, 600000), 0);
+  assert.equal(backoffDelayMs(-3, 30000, 600000), 0);
+});
+
+test("backoffDelayMs: exponential in the streak, base at streak 1", () => {
+  assert.equal(backoffDelayMs(1, 30000, 600000), 30000);
+  assert.equal(backoffDelayMs(2, 30000, 600000), 60000);
+  assert.equal(backoffDelayMs(3, 30000, 600000), 120000);
+  assert.equal(backoffDelayMs(4, 30000, 600000), 240000);
+});
+
+test("backoffDelayMs: capped at maxMs (and overflow-safe for a huge streak)", () => {
+  assert.equal(backoffDelayMs(5, 30000, 600000), 480000);
+  assert.equal(backoffDelayMs(6, 30000, 600000), 600000); // would be 960000, capped
+  assert.equal(backoffDelayMs(100, 30000, 600000), 600000); // no overflow
 });
 
 test("isQuiescent: waiting/idle true; working/undefined false", () => {

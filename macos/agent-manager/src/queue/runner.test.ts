@@ -267,6 +267,7 @@ function makeLoopDeps(client: McpClient): LoopDeps {
     summarize: okSummary,
     lastBySession: new Map(),
     alertBySession: new Map(),
+    summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     // queue intentionally OMITTED → the queue pass is a no-op.
   };
 }

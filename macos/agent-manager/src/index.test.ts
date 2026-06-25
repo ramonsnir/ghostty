@@ -97,6 +97,7 @@ interface DepsSpec {
   last?: Map<string, LastSummary>;
   alerts?: Map<string, string>;
   budgetMax?: number;
+  backoff?: { failureStreak: number; nextProbeMs: number };
 }
 
 function makeDeps(spec: DepsSpec): {
@@ -118,6 +119,7 @@ function makeDeps(spec: DepsSpec): {
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
     alertBySession: spec.alerts ?? new Map<string, string>(),
+    summarizerBackoff: spec.backoff ?? { failureStreak: 0, nextProbeMs: 0 },
   };
   return { deps, summarizeCalls };
 }
@@ -600,4 +602,116 @@ test("bell: dead-surface alert records are pruned each sweep", async () => {
   await runSweep(deps);
 
   assert.equal(deps.alertBySession.has("s1"), false, "stale alert record dropped");
+});
+
+// ---------------------------------------------------------------------------
+// Rate-limit backoff (account-wide adaptive slowdown)
+// ---------------------------------------------------------------------------
+
+test("backoff: an all-fail sweep engages backoff (streak 1, next probe armed)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const failing: SummarizeFn = async () => {
+    throw new Error("model down");
+  };
+  const now = 1_000_000;
+  const { deps } = makeDeps({ fake, summarize: failing, now });
+
+  await runSweep(deps);
+
+  assert.equal(deps.summarizerBackoff.failureStreak, 1, "streak incremented");
+  // base debounce = 30000 => first window is 30000ms out.
+  assert.equal(deps.summarizerBackoff.nextProbeMs, now + 30000);
+});
+
+test("backoff: a success keeps the streak at 0 (normal cadence)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const { deps } = makeDeps({ fake, summarize: okSummary });
+
+  await runSweep(deps);
+
+  assert.equal(deps.summarizerBackoff.failureStreak, 0);
+  assert.equal(deps.summarizerBackoff.nextProbeMs, 0);
+});
+
+test("backoff: while cooling down, the sweep makes NO model calls", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const now = 1_000_000;
+  // Seeded: already backing off, next probe far in the future.
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    now,
+    backoff: { failureStreak: 3, nextProbeMs: now + 100_000 },
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "no model call while cooling down");
+  assert.equal(fake.readCalls.length, 0, "not even a read");
+  assert.equal(deps.summarizerBackoff.failureStreak, 3, "streak untouched");
+});
+
+test("backoff: after the window, ONE probe fires and a success resets the streak", async () => {
+  const fake = makeFakeClient({
+    surfaces: [
+      makeSurface({ id: "s1", agentState: "working" }),
+      makeSurface({ id: "s2", agentState: "working" }),
+    ],
+  });
+  const now = 1_000_000;
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    now,
+    backoff: { failureStreak: 3, nextProbeMs: now }, // window elapsed (now >= nextProbeMs)
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "exactly ONE probe call, not the whole batch");
+  assert.equal(deps.summarizerBackoff.failureStreak, 0, "recovered");
+  assert.equal(deps.summarizerBackoff.nextProbeMs, 0);
+});
+
+test("backoff: after the window, a FAILED probe extends the backoff (streak++)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [
+      makeSurface({ id: "s1", agentState: "working" }),
+      makeSurface({ id: "s2", agentState: "working" }),
+    ],
+  });
+  const failing: SummarizeFn = async () => {
+    throw new Error("still limited");
+  };
+  const now = 1_000_000;
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: failing,
+    now,
+    backoff: { failureStreak: 3, nextProbeMs: now },
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "only one probe even on failure");
+  assert.equal(deps.summarizerBackoff.failureStreak, 4, "streak extended");
+  assert.equal(deps.summarizerBackoff.nextProbeMs, now + 240000, "4th window = 30000*2^3");
+});
+
+test("backoff: an unparseable reply counts as a failure (engages backoff)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const junk: SummarizeFn = async () => "not json at all";
+  const { deps } = makeDeps({ fake, summarize: junk });
+
+  await runSweep(deps);
+
+  assert.equal(deps.summarizerBackoff.failureStreak, 1, "unparseable => fail => backoff");
 });

@@ -641,6 +641,32 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     quiescent/hidden truth table), `config.test.ts` (NEW), `index.test.ts` (record shape).
     **GUI relaunch (for the `hidden` field) + rebuilt sidecar `dist` + sidecar restart; no
     host/Zig change.**
+  - **RATE-LIMIT AUTO-BACKOFF (sidecar-only) — when the summarizer's OWN account is
+    rate-limited, slow way down until one call succeeds (the limit resets).** When the
+    summarizer bills to a depleted account, its `summarize()` calls fail (throw) or return
+    an unusable/unparseable reply — and without this it would keep firing one call per
+    surface per `debounceMs`, hammering the limited account. An ACCOUNT-WIDE adaptive
+    backoff (`LoopDeps.summarizerBackoff = {failureStreak, nextProbeMs}`, pure
+    `backoffDelayMs(streak, base, max) = min(max, base·2^(streak-1))`, default cap
+    `cfg.rateLimitBackoffMaxMs` 600000) governs `runSweep`: `summarizeOne` now returns
+    `"ok"|"fail"|"skip"` ("ok" = a model call parsed = account healthy; "fail" = threw OR
+    unparseable; "skip" = gate not-due, no call). NORMAL sweep fires the due batch
+    concurrently and aggregates — ANY "ok" resets the streak to 0; else if any "fail",
+    streak++ and arm `nextProbeMs`. BACKED-OFF sweep (streak>0): if `now < nextProbeMs`
+    return with ZERO calls; once the window elapses, probe candidates SEQUENTIALLY until
+    ONE makes a real call (not a gate-skip, so a leading quiescent tile can't waste the
+    probe) — "ok" clears the backoff + logs "resuming", "fail" extends it. So a depleted
+    account is poked ~once per 10 min (one probe), and the first success snaps back to full
+    cadence — fully automatic. Unparseable counts as "fail" deliberately (a rate-limit
+    message often renders as un-parseable text, not an exception, so "until one SUCCEEDS"
+    means "until one returns a real summary"). Wiring: sidecar ONLY — `summarizer.ts`
+    (`rateLimitBackoffMaxMs` cfg + `backoffDelayMs`), `config.ts` (parse the key), `index.ts`
+    (`summarizerBackoff` on `LoopDeps` + `SummarizeResult` return + `runSweep`
+    gate/probe/aggregate + `main` init). Tests: `summarizer.test.ts` (`backoffDelayMs`),
+    `config.test.ts` (parse), `index.test.ts` (`backoff:` group — engage-on-all-fail,
+    success-keeps-0, cooldown-no-calls, one-probe-recovers, failed-probe-extends,
+    unparseable-is-fail). **Rebuilt sidecar `dist` + sidecar restart only; no GUI/host/Zig
+    change.**
   - **Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha).** Under
     the `claude-pool` wrapper the surface's foreground process is `bash` (and even bare,
     `claude` reports its versioned-binary basename e.g. `2.1.185`), so a
