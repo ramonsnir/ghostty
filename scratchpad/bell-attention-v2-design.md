@@ -63,7 +63,11 @@ always-on-pre-v2 effects dashboard,push,monitor (these were ungated/always-on be
 so keeping them on the bell tier by default = "defaults reproduce today"); thus a raw bell
 by default fires bounce+badge (via the `attention` alias) + title + dashboard + push +
 monitor. `attention-features` = title,border,bounce,badge,dashboard,push,monitor. Turning the
-filter ON is when a user would dial `bell-features` down to `system,audio`.
+filter ON is when a user would dial `bell-features` down. NOTE the parse is ADDITIVE over the
+BellFeatures TYPE defaults (`parsePackedStruct` starts from `BellFeatures{}` = attention+title
+TRUE, the rest FALSE — NOT reset-to-listed), so the dial-down needs explicit negation:
+`bell-features = system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor` (a bare
+`system,audio` leaves attention(bounce+badge)+title ON). Pinned by a Config.zig test.
 
 ## Separate bell vs attention state + clearing (P5 included)
 Two INDEPENDENT per-surface states, each rendered per its tier's features:
@@ -162,8 +166,9 @@ since §78 was flagged "for Ramon's review of this doc."
 The COMPILED default `bell-features` reproduces today (it carries attention,title +
 dashboard,push,monitor). BUT the shared on-disk `~/.config/ghostty/config` (mirrored in
 `example/ghostty/config`) explicitly sets `bell-features = system,attention,title,border`,
-and the parser is RESET-to-listed — so on the real machine dashboard/push/monitor end up
-FALSE on the bell tier. With the filter OFF (default), the v2 consumers now gate those
+and the parse is ADDITIVE over the TYPE defaults (attention+title TRUE, the rest — incl.
+dashboard/push/monitor — FALSE), so since that line doesn't list dashboard/push/monitor they
+end up FALSE on the bell tier. With the filter OFF (default), the v2 consumers now gate those
 three on `bell-features` (`bellDashboard`/`bellPush`/`monitorBell`), so a raw bell would
 STOP auto-unhiding the dashboard tile, web-pushing, and lighting the web-monitor indicator
 — a regression vs today for THIS machine (the compiled default alone would not regress).

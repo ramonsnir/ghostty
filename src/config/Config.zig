@@ -3236,8 +3236,16 @@ keybind: Keybinds = .{},
 // (ramon fork / Bell Attention v2) Default includes the fork effects that fire on a
 // raw bell today (dashboard auto-unhide, web push, web-monitor) so that with the filter
 // OFF the two-tier consumer routing reproduces today's behavior byte-for-byte. (system/
-// audio/border stay off by default, matching upstream.) When you enable the filter you'd
-// typically dial this down to e.g. `system,audio` and let `attention-features` be loud.
+// audio/border stay off by default, matching upstream.)
+//
+// IMPORTANT — parsing is ADDITIVE over the TYPE field defaults, NOT reset-to-listed.
+// `parsePackedStruct` starts from `BellFeatures{}` (so `attention` and `title` are TRUE,
+// the other flags FALSE) and then turns the listed flags on (or off with a `no-` prefix).
+// So providing `bell-features = system,audio` does NOT silence the loud effects — it
+// leaves `attention` (the dock bounce+badge alias) and `title` (the 🔔) ON. To actually
+// dial the bell tier down when enabling the filter you MUST negate them explicitly, e.g.
+// `bell-features = system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor`,
+// and let `attention-features` carry the loud effects on a promotion.
 @"bell-features": BellFeatures = .{ .dashboard = true, .push = true, .monitor = true },
 
 /// (Fork-only.) Bell features to enable when the ringing surface is truly in
@@ -3266,8 +3274,10 @@ keybind: Keybinds = .{},
 /// fires `attention-features`; a confidently-ignored bell fires only `bell-features`.
 /// Only meaningful when `agent-manager-bell-filter = true`. The default is the "loud"
 /// set (title, border, dock bounce+badge, dashboard, push, web-monitor) — i.e. when
-/// you enable the filter you'd typically also dial `bell-features` down to
-/// `system,audio`. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+/// you enable the filter you'd typically also dial `bell-features` down (remember the
+/// parse is additive over the type defaults, so the dial-down needs explicit negation:
+/// `bell-features = system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor`).
+/// Fork-only — keep it in `~/.config/ghostty-ramon/config`.
 /// NOTE: there is deliberately NO `attention-features-focused` analog to
 /// `bell-features-focused`. The attention tier has no in-focus variant by design: a
 /// promotion means "the user is away", and `attentionNeeded` is CLEARED the moment the
@@ -11409,9 +11419,12 @@ test "attention-features: parse, shared vocabulary, loud default" {
         var cfg = try Config.default(alloc);
         defer cfg.deinit();
         var it: TestIterator = .{ .data = &.{
-            // Providing a value RESETS the set to the listed flags (zero + OR), so this
-            // routes `push` to the bell tier and re-defines the attention tier as exactly
-            // title+border (dropping dashboard/push from the loud default).
+            // Parsing is ADDITIVE over the TYPE field defaults (parsePackedStruct starts
+            // from `BellFeatures{}` = attention+title TRUE, the rest FALSE), NOT
+            // reset-to-listed. So this routes `push` onto the bell tier (a new shared-
+            // vocabulary flag) and re-defines the attention tier starting from the TYPE
+            // defaults + title,border (so dashboard/push are FALSE — they're false in the
+            // TYPE default and not listed — while attention/title ride the type default).
             "--bell-features=push",
             "--attention-features=title,border",
         } };
@@ -11419,11 +11432,45 @@ test "attention-features: parse, shared vocabulary, loud default" {
         try cfg.finalize();
         // push is now routable to the BELL tier (the new shared-vocabulary flag parses).
         try testing.expectEqual(true, cfg.@"bell-features".push);
-        // ...and the attention tier is exactly what was listed (vocabulary parses both ways).
+        // The new flags default FALSE in the TYPE, so an un-listed one is off.
         try testing.expectEqual(false, cfg.@"attention-features".dashboard);
         try testing.expectEqual(false, cfg.@"attention-features".push);
         try testing.expectEqual(true, cfg.@"attention-features".title);
         try testing.expectEqual(true, cfg.@"attention-features".border);
+    }
+
+    // ADDITIVE-over-defaults, NOT reset: a value that doesn't list `attention`/`title`
+    // leaves them ON (they're TRUE in the BellFeatures TYPE default), so the documented
+    // "dial down to system,audio" does NOT silence the loud bell — you MUST negate them.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--bell-features=system,audio"} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"bell-features".system);
+        try testing.expectEqual(true, cfg.@"bell-features".audio);
+        // The load-bearing assertion the old test was missing: attention+title stay ON.
+        try testing.expectEqual(true, cfg.@"bell-features".attention);
+        try testing.expectEqual(true, cfg.@"bell-features".title);
+    }
+
+    // The REAL dial-down requires explicit negation.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--bell-features=system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"bell-features".system);
+        try testing.expectEqual(true, cfg.@"bell-features".audio);
+        try testing.expectEqual(false, cfg.@"bell-features".attention);
+        try testing.expectEqual(false, cfg.@"bell-features".title);
+        try testing.expectEqual(false, cfg.@"bell-features".dashboard);
+        try testing.expectEqual(false, cfg.@"bell-features".push);
+        try testing.expectEqual(false, cfg.@"bell-features".monitor);
     }
 }
 
