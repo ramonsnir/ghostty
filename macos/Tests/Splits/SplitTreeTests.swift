@@ -1118,4 +1118,49 @@ struct SplitTreeTests {
         #expect(empty.hasBellOutsideZoom(bells: [:]) == false)
         #expect(empty.zoomedLeaves().isEmpty)
     }
+
+    // MARK: - largestLeafSplit (Agent Queue balanced BSP)
+
+    @Test func largestLeafSplitEmptyTreeIsNil() {
+        let tree = SplitTree<MockView>()
+        #expect(tree.largestLeafSplit(within: CGSize(width: 1600, height: 1000)) == nil)
+    }
+
+    @Test func largestLeafSplitSingleLeafFollowsAspect() {
+        let v1 = MockView()
+        let tree = SplitTree(view: v1)
+        // Wide bounds → split right; tall bounds → split down (full-tab leaf either way).
+        let wide = tree.largestLeafSplit(within: CGSize(width: 1600, height: 1000))
+        #expect(wide?.view === v1)
+        #expect(wide?.direction == .right)
+        let tall = tree.largestLeafSplit(within: CGSize(width: 800, height: 1200))
+        #expect(tall?.view === v1)
+        #expect(tall?.direction == .down)
+    }
+
+    @Test func largestLeafSplitTwoColumnsEachTallSplitsDown() throws {
+        // [v1 | v2], each half-width of a wide tab → 800×1000 (taller than wide). Equal
+        // area → first leaf (v1); its longer side is vertical → split DOWN.
+        let (tree, v1, _) = try Self.makeHorizontalSplit()
+        let pick = tree.largestLeafSplit(within: CGSize(width: 1600, height: 1000))
+        #expect(pick?.view === v1)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func largestLeafSplitPicksTheBiggestPane() throws {
+        // [v1 | [v2 / v3]] within 1600×1000: v1 = 800×1000 (area 800k); v2,v3 = 800×500
+        // (400k each). The biggest is v1 → split along its longer (vertical) side → DOWN.
+        let v1 = MockView(), v2 = MockView(), v3 = MockView()
+        var tree = SplitTree(view: v1)
+        tree = try tree.inserting(view: v2, at: v1, direction: .right)
+        tree = try tree.inserting(view: v3, at: v2, direction: .down)
+        let pick = tree.largestLeafSplit(within: CGSize(width: 1600, height: 1000))
+        #expect(pick?.view === v1)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func largestLeafSplitZeroBoundsIsNil() {
+        let tree = SplitTree(view: MockView())
+        #expect(tree.largestLeafSplit(within: .zero) == nil)
+    }
 }

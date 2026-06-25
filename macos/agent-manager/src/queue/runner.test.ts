@@ -1333,11 +1333,13 @@ test("runQueueSweep: a dispatch after an orphan adoption splits into the adopted
   await runQueueSweep(deps); // armed → dispatch NEW-1 alongside the adopted pane
   assert.equal(fake.calls.spawn.length, 1, "the new item dispatched");
   // The dispatch must SPLIT INTO the adopted pane's tab — NOT open a new tab. The
-  // adopted pane got a real grid slot (slot 0) on reconcile, so the refill targets it.
+  // adopted pane got a real grid slot (slot 0) on reconcile, so it anchors the tab; the
+  // split is BALANCED (the GUI picks the largest pane + direction), not a fixed direction.
   const spawnArgs = fake.calls.spawn[0];
   assert.notEqual(spawnArgs.firstTab, true, "refill must NOT open a new tab (firstTab absent)");
-  assert.equal(spawnArgs.direction, "right", "the refill splits beside the adopted pane");
-  assert.equal(spawnArgs.targetUUID, "orphan-1", "the split targets the adopted pane");
+  assert.equal(spawnArgs.balanced, true, "the refill is a balanced BSP split");
+  assert.equal(spawnArgs.direction, undefined, "balanced mode sends no explicit direction");
+  assert.equal(spawnArgs.targetUUID, "orphan-1", "the split anchors on the adopted pane's tab");
   // The adopted pane is still tracked (NOT clobbered/closed by the refill).
   assert.equal(run.active.has("ORPH-1"), true, "adopted pane survives the refill dispatch");
   assert.equal(run.active.has("NEW-1"), true, "new item tracked");
