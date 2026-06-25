@@ -1150,9 +1150,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       (`intervals.listMs`, reusing a `lastGraphAtMs` throttle), INDEPENDENT of dispatch (runs while
       paused/draining, skipped only when `disabled`), cached on `QueueRun.lastGraph`, and PUSHED via
       a new MCP tool **`report_queue_graph`** (`{queueName,present,backlog,nodes[]}`; `present:false`
-      on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE remainder:
-      non-terminal nodes NOT currently waiting/running (`backlogCount`, pure — exclude = the
-      actionable-list keys ∪ active assignment keys). STAYS GENERIC: the node's `done` (terminal,
+      on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE/SCHEDULABLE
+      remainder: non-terminal nodes that are NOT currently waiting/running AND NOT already
+      in-progress (`backlogCount`, pure — exclude = the actionable-list keys ∪ active assignment
+      keys, plus any node whose `stateType` is in `IN_PROGRESS_STATE_TYPES` = {`started`}). The
+      in-progress exclusion fixes the "2 backlog but only 1 schedulable" report: an In-Progress
+      issue is non-terminal and not in the actionable Todo `list`, so it WOULD have been counted as
+      backlog even though the queue can never dispatch it (the `list` provider only yields Todo).
+      It is still RENDERED in the DAG (blue node) — only the badge number drops it; an absent/unknown
+      `stateType` still counts (safe default). STAYS GENERIC: the node's `done` (terminal,
       excluded+dimmed) and `stateType` (color category) are PROVIDER-decided — Ghostty maps no
       tracker; `QueueBacklogColors` is a cosmetic category→color map with a neutral fallback. The
       DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
