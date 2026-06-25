@@ -106,5 +106,39 @@ aligns with fail-open.) Flag for Ramon's review of this doc.
 5. Web-monitor attention (P5) + crashed-sidecar GUI fallback.
 6. Build Debug + live verify (drive set_attention + a real-agent bell) + review.
 
+## Build status (v2)
+- **Slice 1** (sidecar fail-open decision + prompt nudge + tests) — DONE (commit 42abf1675).
+- **Slice 2** (Zig vocabulary + attention-features keys + tests) — DONE (97a23d703).
+- **Slice 3a** (Swift config getters + BellFeatures flags) — DONE (8b88feab7).
+- **Slice 3b-1** (bell-features default reproduces today) — DONE (6b1178e61).
+- **Slice 3b-2** (per-tier consumer routing: AppDelegate sound/dock + badge, title,
+  dashboard model, WebPush; replace the bellFilter gate) — DONE (2c4b996b4). Also bumped
+  the shell-completion comptime branch quota (the new keys overflowed it).
+- **Slice 3b-3** (two-tier surface border + zoom badge) — DONE (a05f5badb). Separate
+  bell/attention clearing (P5) confirmed already wired (focus clears both independently;
+  resetBell clears only bell; sidecar clears attention).
+- **Slice 4** (event-driven classify: waitForEvent + coalesced wake) — DONE (1e1fa9827).
+- **Slice 5a** (web-monitor `monitor` tier routing + P5 distinct attention + own clear) —
+  DONE (662c0c863).
+- **Slice 5b** (crashed-sidecar GUI fallback, §78) — DEFERRED, see below.
+- **Slice 6** (Debug build + live verify + ≥98 review) — pending.
+
+## OPEN DECISION for review — crashed-sidecar fallback (§78)
+Not implemented. The meaningful part of this fallback is the ATTENTION-TIER VISUALS
+(title/border/badge/bounce/dashboard/push/monitor) — under the intended "filter on"
+config SOUND is on the BELL tier, so it already fires on every raw bell regardless of
+the sidecar, i.e. a real bell is never fully silent. Delivering the visual fallback on a
+raw bell while the sidecar is DOWN requires one of:
+  (a) a principle-#3 EXCEPTION — the GUI posts `ghosttyAttentionDidChange(true)` for the
+      ringing surface when (bell-filter on && sidecar unhealthy). This drives every
+      attention-tier consumer with NO new wiring and self-clears on focus. #3's rationale
+      (no loud-then-retract) does NOT bite here because a DOWN sidecar never retracts.
+      RECOMMENDED.
+  (b) per-consumer health wiring — each consumer computes bell-features ∪ attention-
+      features when unhealthy. More code, more risk, respects #3 literally.
+Also needs a main-readable health signal from `AgentManagerController` (currently the
+Process/backoff state is private + on a background serial queue). Deferred to your call
+since §78 was flagged "for Ramon's review of this doc."
+
 ## Review log (v2)
-- (pending)
+- (pending — slice 6 multi-lens ≥98 review)
