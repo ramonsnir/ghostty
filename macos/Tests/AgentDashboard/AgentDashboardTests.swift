@@ -1924,6 +1924,49 @@ struct AgentDashboardOriginTests {
         // sections drops the excluded beta tile.
         #expect(model.sections.flatMap { $0.entries }.map(\.sessionID) == [1])
     }
+
+    @Test func filterBarVisibilityKeepsShowAllReachable() {
+        // Pure helper: the bar shows with 2+ origins (so the user can switch) AND
+        // whenever ANY exclusion is active — even with a single remaining origin.
+        // No origins, nothing excluded → no bar.
+        #expect(!AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: [], excludedOrigins: []))
+        // Single origin, nothing excluded → no bar (a single-origin fleet needs none).
+        #expect(!AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["(other)"], excludedOrigins: []))
+        // Two origins → bar (switch between them).
+        #expect(AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["alpha", "(other)"], excludedOrigins: []))
+        // THE TRAP: a stale exclusion left `(other)` excluded as the sole origin. The
+        // old `knownOrigins.count > 1` gate hid the bar → no reachable "Show all" →
+        // every tile silently filtered. The bar MUST stay visible here.
+        #expect(AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["(other)"], excludedOrigins: ["(other)"]))
+        // Even a stale exclusion of an origin no longer present keeps the bar (so the
+        // user can clear it via "Show all").
+        #expect(AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["(other)"], excludedOrigins: ["gone-queue"]))
+    }
+
+    @Test func staleOtherExclusionDoesNotTrapTheView() {
+        // End-to-end: a queue was soloed, then ended; only non-queue `(other)` agents
+        // remain but `(other)` is still excluded. The bar must show (escape hatch),
+        // and "Show all" must restore the tiles.
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            originFilterStore: InMemoryOriginFilterStore(["(other)"]))
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))  // no annotations → both `(other)`
+        // Single remaining origin, but it's excluded → the trap state.
+        #expect(model.knownOrigins == ["(other)"])
+        #expect(model.sections.flatMap { $0.entries }.isEmpty)  // everything filtered out
+        // The fix: the bar stays visible so "Show all" is reachable.
+        #expect(model.showsFilterBar)
+        // Recovering via "Show all" brings the tiles back.
+        model.showAllOrigins()
+        #expect(model.sections.flatMap { $0.entries }.map(\.sessionID).sorted() == [1, 2])
+    }
 }
 
 /// (ramon fork / Agent Queue, §11 health) Tests for the queue-health pieces: the
