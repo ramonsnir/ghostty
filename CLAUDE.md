@@ -1004,7 +1004,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
       blocked-by cycle is broken via a `resolving` guard) and ignores edges to keys outside the
       scope. The canvas window is one-per-run via `QueueBacklogWindowManager` (MainActor; strong
-      ref + `willClose` observer that drops both the window and itself — no leak/double-open).
+      ref + `willClose` observer that drops both the window and itself — no leak/double-open). Its
+      DEFAULT size is fit-to-content (the whole board, no scrolling) floored at a minimum and
+      CLAMPED to the display: shared geometry `QueueBacklogGeometry` (the card/gap constants the
+      view also uses) computes `preferredWindowSize(nodes)`, and `QueueBacklogWindowManager.defaultContentSize(nodes:screen:)`
+      floors it at `minContentSize` (480×360) + clamps to `screen − screenMargin` (both pure +
+      unit-tested).
       Wiring: sidecar — `types.ts` (`ProviderGraphSpec`/`GraphNode`/`QueueGraph`), `provider.ts`
       (`parseGraphOutput`/`fetchGraphResult`), `status.ts` (`QueueGraphReport`/`backlogCount`),
       `templates.ts` (`validateProviderGraph`), `runner.ts` (`QueueRun.lastGraph`/`lastGraphAtMs` +

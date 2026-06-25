@@ -65,6 +65,38 @@ enum QueueBacklogLayout {
     }
 }
 
+// MARK: - Geometry (shared by the view + the window-default sizing; pure, unit-tested)
+
+/// Card + spacing geometry for the canvas (points), plus the PURE size computations the
+/// view's layout and the window's default-size both use — so the window opens just big
+/// enough to show the whole board (the window manager clamps to the display).
+enum QueueBacklogGeometry {
+    static let cardW: CGFloat = 168
+    static let cardH: CGFloat = 70
+    static let hGap: CGFloat = 56     // gap to the right of each column
+    static let vGap: CGFloat = 18     // gap below each row
+    static let pad: CGFloat = 24      // padding around the board inside the scroll view
+    static let headerHeight: CGFloat = 44  // the title/legend bar above the board
+
+    /// The board (ZStack) content size for a set of columns: width = columns × (card+gap),
+    /// height = tallest column × (card+gap). Floored at one card so an empty board isn't 0.
+    static func boardSize(_ columns: [[QueueGraph.Node]]) -> CGSize {
+        let rows = columns.map(\.count).max() ?? 0
+        let w = CGFloat(columns.count) * (cardW + hGap)
+        let h = CGFloat(rows) * (cardH + vGap)
+        return CGSize(width: max(w, cardW), height: max(h, cardH))
+    }
+
+    /// The PREFERRED window CONTENT size to show the whole board without scrolling — the
+    /// board plus its surrounding padding plus the header bar. The window manager clamps
+    /// this to the display. PURE (unit-tested).
+    static func preferredWindowSize(_ nodes: [QueueGraph.Node]) -> CGSize {
+        let board = boardSize(QueueBacklogLayout.columns(nodes))
+        return CGSize(width: board.width + pad * 2,
+                      height: board.height + pad * 2 + headerHeight)
+    }
+}
+
 // MARK: - Canvas view
 
 /// The dependency-graph canvas for one queue run. Observes the model so it live-updates as
@@ -75,12 +107,12 @@ struct QueueBacklogCanvas: View {
     /// Jump to a live split for a node key (running items) — resolved + presented by the host.
     let onJumpToKey: (String) -> Void
 
-    // Card + spacing geometry (points). Columns grow rightward by dependency depth.
-    private let cardW: CGFloat = 168
-    private let cardH: CGFloat = 70
-    private let hGap: CGFloat = 56
-    private let vGap: CGFloat = 18
-    private let pad: CGFloat = 24
+    // Card + spacing geometry (points), from the shared QueueBacklogGeometry.
+    private let cardW = QueueBacklogGeometry.cardW
+    private let cardH = QueueBacklogGeometry.cardH
+    private let hGap = QueueBacklogGeometry.hGap
+    private let vGap = QueueBacklogGeometry.vGap
+    private let pad = QueueBacklogGeometry.pad
 
     private var graph: QueueGraph? { model.queueGraphs[runName] }
 
@@ -191,10 +223,7 @@ struct QueueBacklogCanvas: View {
     }
 
     private func canvasSize(_ cols: [[QueueGraph.Node]]) -> CGSize {
-        let rows = cols.map(\.count).max() ?? 0
-        let w = CGFloat(cols.count) * (cardW + hGap)
-        let h = CGFloat(rows) * (cardH + vGap)
-        return CGSize(width: max(w, cardW), height: max(h, cardH))
+        QueueBacklogGeometry.boardSize(cols)
     }
 }
 
@@ -343,6 +372,28 @@ final class QueueBacklogWindowManager {
     private var windows: [String: NSWindow] = [:]
     private var observers: [String: NSObjectProtocol] = [:]
 
+    /// A comfortable minimum so a tiny board (or none yet) still opens as a usable window.
+    static let minContentSize = CGSize(width: 480, height: 360)
+    /// Leave this much of the screen free so the title bar + edges stay reachable.
+    static let screenMargin: CGFloat = 80
+
+    /// PURE: the window's default CONTENT size — the board's preferred size (fit-to-content)
+    /// floored at `minContentSize` and clamped to `screen` (minus a margin) so a large graph
+    /// never opens bigger than the display. `screen` nil ⇒ no clamp (a sane fallback for a
+    /// headless/test context). Unit-tested.
+    static func defaultContentSize(nodes: [QueueGraph.Node], screen: CGSize?) -> CGSize {
+        let pref = QueueBacklogGeometry.preferredWindowSize(nodes)
+        var w = max(pref.width, minContentSize.width)
+        var h = max(pref.height, minContentSize.height)
+        if let screen {
+            // Clamp to the display, but never below the minimum (a small screen still gets a
+            // usable window even if that means it slightly exceeds the margin).
+            w = min(w, max(minContentSize.width, screen.width - screenMargin))
+            h = min(h, max(minContentSize.height, screen.height - screenMargin))
+        }
+        return CGSize(width: w, height: h)
+    }
+
     func open(runName: String, model: AgentDashboardModel, onJumpToKey: @escaping (String) -> Void) {
         if let existing = windows[runName] {
             existing.makeKeyAndOrderFront(nil)
@@ -350,8 +401,13 @@ final class QueueBacklogWindowManager {
             return
         }
         let root = QueueBacklogCanvas(model: model, runName: runName, onJumpToKey: onJumpToKey)
+        // Default size = big enough to show the whole board, clamped to the display so a huge
+        // graph never opens off-screen. A small board floors at a comfortable minimum.
+        let size = Self.defaultContentSize(
+            nodes: model.queueGraphs[runName]?.nodes ?? [],
+            screen: NSScreen.main?.visibleFrame.size)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 600),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.title = "Backlog — \(runName)"
