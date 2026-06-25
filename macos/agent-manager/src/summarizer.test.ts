@@ -18,6 +18,7 @@ import {
   changeTail,
   tailChangeRatio,
   backoffDelayMs,
+  effectiveDebounceMs,
   isQuiescent,
   normalizeChangeLine,
   lineMultiset,
@@ -243,18 +244,48 @@ test("shouldSummarize: non-agent => skip not-agent", () => {
   assert.deepEqual(d, { due: false, reason: "not-agent" });
 });
 
-test("shouldSummarize: hidden agent => skip hidden", () => {
-  // A tile the user hid in the dashboard is skipped (no Haiku call), even when first.
-  const d = shouldSummarize(snap({ agentState: "working", hidden: true }), undefined, 0, cfg);
+test("shouldSummarize: hidden agent + skipHidden => skip hidden", () => {
+  // With the explicit opt-out, a hidden tile is skipped (no Haiku call), even when first.
+  const d = shouldSummarize(
+    snap({ agentState: "working", hidden: true }), undefined, 0,
+    { ...cfg, skipHidden: true },
+  );
   assert.deepEqual(d, { due: false, reason: "hidden" });
 });
 
-test("shouldSummarize: hidden but skipHidden disabled => not skipped for hidden", () => {
-  const d = shouldSummarize(
-    snap({ agentState: "working", hidden: true }), undefined, 0,
-    { ...cfg, skipHidden: false },
-  );
+test("shouldSummarize: hidden agent (default, skipHidden false) => still summarized", () => {
+  // The DEFAULT keeps the rate-limit watchdog alive on hidden tiles: not skipped, just
+  // throttled to hiddenDebounceMs. First time it's still due.
+  const d = shouldSummarize(snap({ agentState: "working", hidden: true }), undefined, 0, cfg);
   assert.equal(d.reason, "first"); // falls through to the normal path
+});
+
+test("shouldSummarize: hidden agent uses the larger hiddenDebounceMs", () => {
+  // Past the regular debounce but within hiddenDebounceMs => still debounced (cheap),
+  // whereas a VISIBLE tile would already be re-due.
+  const s = snap({ agentState: "working", hidden: true }, "x");
+  const last = lastFrom(s, 1000);
+  const d = shouldSummarize(s, last, 1000 + cfg.debounceMs + 1, cfg);
+  assert.deepEqual(d, { due: false, reason: "debounce" });
+});
+
+test("shouldSummarize: hidden agent is due once past hiddenDebounceMs", () => {
+  const s = snap({ agentState: "working", hidden: true }, "x");
+  const last = lastFrom(s, 1000);
+  const d = shouldSummarize(s, last, 1000 + cfg.hiddenDebounceMs + 1, cfg);
+  assert.equal(d.due, true); // unchanged + non-quiescent => re-summarize past the hidden window
+});
+
+test("effectiveDebounceMs: hidden uses max(debounce, hiddenDebounce); visible uses debounce", () => {
+  const visible = makeSurface({ hidden: false });
+  const hidden = makeSurface({ hidden: true });
+  assert.equal(effectiveDebounceMs(visible, cfg), cfg.debounceMs);
+  assert.equal(effectiveDebounceMs(hidden, cfg), cfg.hiddenDebounceMs);
+  // floor: a misconfigured hiddenDebounceMs < debounceMs never beats the regular debounce.
+  assert.equal(
+    effectiveDebounceMs(hidden, { ...cfg, hiddenDebounceMs: 1 }),
+    cfg.debounceMs,
+  );
 });
 
 test("shouldSummarize: first time for an agent => due first", () => {
@@ -341,11 +372,22 @@ test("preGate: non-agent => not-agent", () => {
   );
 });
 
-test("preGate: hidden agent => hidden (avoids the read_surface)", () => {
+test("preGate: hidden agent + skipHidden => hidden (avoids the read_surface)", () => {
   assert.deepEqual(
-    preGate(makeSurface({ agentState: "working", hidden: true }), undefined, 0, cfg),
+    preGate(makeSurface({ agentState: "working", hidden: true }), undefined, 0,
+      { ...cfg, skipHidden: true }),
     { pass: false, reason: "hidden" },
   );
+});
+
+test("preGate: hidden agent (default) => candidate, but on the hidden debounce", () => {
+  const s = makeSurface({ agentState: "working", hidden: true });
+  // First time => candidate (watchdog covers hidden tiles by default).
+  assert.deepEqual(preGate(s, undefined, 0, cfg), { pass: true, reason: "candidate" });
+  // Past the regular debounce but within the hidden one => still debounced.
+  const last: LastSummary = { signals: "", tail: "", atMs: 1000, summary: "" };
+  assert.equal(preGate(s, last, 1000 + cfg.debounceMs + 1, cfg).reason, "debounce");
+  assert.equal(preGate(s, last, 1000 + cfg.hiddenDebounceMs + 1, cfg).pass, true);
 });
 
 test("preGate: agent, no last => candidate", () => {

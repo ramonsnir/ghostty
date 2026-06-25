@@ -605,16 +605,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
     dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
     Node's built-in `node --test`.
-  - **COST CONTROLS — skip-hidden + animation-proof fuzzy change + quiescent-skip +
+  - **COST CONTROLS — hidden-throttle + animation-proof fuzzy change + quiescent-skip +
     config (the "Haiku burns my usage" fix).** Four levers cut the call rate; the dominant
     sink was a quiescent (`waiting`/`idle`) agent whose ANIMATED footer (spinner / "esc to
     interrupt" / elapsed-time counter) flipped the old exact-hash `fingerprint` every poll,
-    so it re-summarized every debounce window forever. **(1) Skip hidden tiles:** the
-    dashboard's `hidden` set is now exposed through `list_surfaces` (Swift:
-    `HookSnapshotEntry.hidden` unioned from `model.hidden` → `MCPLayout.SurfaceRow.hidden`,
-    emitted only when true; TS: `Surface.hidden`), and BOTH `preGate` (so a hidden tile skips
-    the `read_surface` entirely) and `shouldSummarize` short-circuit `{reason:"hidden"}` when
-    `cfg.skipHidden` (default true). **(2) Fuzzy change detection (replaces the binary
+    so it re-summarized every debounce window forever. **(1) Throttle (not skip) hidden tiles
+    — UPDATED 2026-06-25 so the rate-limit watchdog survives hiding:** the dashboard's
+    `hidden` set is exposed through `list_surfaces` (Swift: `HookSnapshotEntry.hidden` unioned
+    from `model.hidden` → `MCPLayout.SurfaceRow.hidden`, emitted only when true; TS:
+    `Surface.hidden`). A hidden tile is now summarized on a MUCH LARGER per-session debounce
+    (`hiddenDebounceMs`, default 600000 = 10 min) via the pure `effectiveDebounceMs(surface,
+    cfg)` = `surface.hidden ? max(debounceMs, hiddenDebounceMs) : debounceMs`, consulted by the
+    debounce clause of BOTH `preGate` and `shouldSummarize`. **`skipHidden` is now default
+    FALSE** (was true) — it's the explicit opt-out for the OLD zero-cost behavior (when true,
+    both gates still short-circuit `{reason:"hidden"}` and skip the `read_surface` entirely).
+    **Why the flip:** the rate-limit attention bell (below) has Haiku as its SOLE classifier, so
+    a fully-skipped hidden tile NEVER rings — and hidden tiles are exactly the long-running,
+    stepped-away agents the watchdog is for. Throttling instead of skipping keeps the watchdog
+    alive on them within `hiddenDebounceMs` at a fraction of the visible-tile cost. **(2) Fuzzy change detection (replaces the binary
     `fingerprint`):** `LastSummary` now stores `signals` (exact hash of the AUTHORITATIVE hook
     tuple agentState|lastPrompt|lastTool — any diff = change) + `tail` (the NORMALIZED
     change-tail kept as TEXT). `changeTail` strips spinner glyphs (Braille U+2800–28FF + dot/
@@ -627,9 +635,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-summarizes so a `working` agent's phase still tracks. **(4) Config overlay
     (`src/config.ts`, no rebuild):** `~/.config/ghostty-ramon/agent-manager/config.json` (pure
     `parseConfig` overlay on `DEFAULT_CONFIG` over an injected `readFile`, restart-to-apply,
-    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→**30000**),
-    `changeRatioThreshold`, `skipHidden`, `idleSkipSeconds`, `maxConcurrent`,
-    `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
+    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→30000→**120000**
+    = 2 min), `hiddenDebounceMs` (default **600000** = 10 min), `changeRatioThreshold`,
+    `skipHidden` (default **false**), `idleSkipSeconds`, `maxConcurrent`, `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
     `changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
     `lineMultiset`, all pure + tested). Wiring: Swift — `AgentDashboardController.swift`
     (`HookSnapshotEntry.hidden`), `MCPLayout.swift` (`SurfaceRow.hidden` + JSON emit); sidecar
@@ -638,7 +646,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     in `main`, record `signals`/`tail`). Tests: Swift `MCPServerTests`
     (`surfacesJSONDataEmitsHiddenWhenTrue` + omit-when-false), `AgentDashboardTests`
     (`hookSnapshot` hidden bit); sidecar `summarizer.test.ts` (change-detection +
-    quiescent/hidden truth table), `config.test.ts` (NEW), `index.test.ts` (record shape).
+    quiescent/hidden truth table + `effectiveDebounceMs` + hidden-throttle/skip cases),
+    `config.test.ts` (NEW + `hiddenDebounceMs` parse), `index.test.ts` (record shape; backoff
+    windows now reference `cfg.debounceMs`).
     **GUI relaunch (for the `hidden` field) + rebuilt sidecar `dist` + sidecar restart; no
     host/Zig change.**
   - **RATE-LIMIT AUTO-BACKOFF (sidecar-only) — when the summarizer's OWN account is
