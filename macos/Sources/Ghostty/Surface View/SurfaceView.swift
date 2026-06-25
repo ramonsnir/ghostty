@@ -170,9 +170,16 @@ extension Ghostty {
                     )
                 }
 
-                // Show bell border if enabled
-                if ghostty.config.bellFeatures.contains(.border) {
-                    BellBorderOverlay(bell: surfaceView.bell)
+                // (ramon fork / Bell Attention v2) Two-tier amber border: a RAW bell
+                // shows it when bell-features routes `border`; a PROMOTED attention shows
+                // it when attention-features does (the default tier for `border`). Mount
+                // whenever either tier wants it; the overlay's value is the per-tier OR.
+                if ghostty.config.bellFeatures.contains(.border)
+                    || ghostty.config.attentionFeatures.contains(.border) {
+                    BellBorderOverlay(bell:
+                        (surfaceView.bell && ghostty.config.bellFeatures.contains(.border))
+                        || (surfaceView.attentionNeeded
+                            && ghostty.config.attentionFeatures.contains(.border)))
                 }
 
                 // Show a highlight effect when this surface needs attention
