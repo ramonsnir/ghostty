@@ -409,7 +409,6 @@ test("parseGraphOutput: {nodes:[…]} maps all fields", () => {
           done: false,
           labels: ["Design needed", "Customer"],
           blockedBy: ["A-9"],
-          priority: 2,
           priorityLabel: "High",
         },
       ],
@@ -425,7 +424,6 @@ test("parseGraphOutput: {nodes:[…]} maps all fields", () => {
       done: false,
       labels: ["Design needed", "Customer"],
       blockedBy: ["A-9"],
-      priority: 2,
       priorityLabel: "High",
     },
   ]);
@@ -467,20 +465,19 @@ test("parseGraphOutput: non-string label/edge entries are dropped; a bare string
   assert.deepEqual(out, [{ key: "A-1", done: false, labels: ["ok"], blockedBy: ["A-9"] }]);
 });
 
-test("parseGraphOutput: duplicate keys collapse to first; priority only when finite", () => {
+test("parseGraphOutput: duplicate keys collapse to first", () => {
   const out = parseGraphOutput(
     JSON.stringify({
       nodes: [
-        { key: "A-1", state: "first", priority: 1 },
+        { key: "A-1", state: "first" },
         { key: "A-1", state: "dupe" },
-        { key: "A-2", priority: "high" },
+        { key: "A-2" },
       ],
     }),
   );
   assert.equal(out.length, 2);
   assert.equal(out[0].state, "first");
-  assert.equal(out[0].priority, 1);
-  assert.equal(out[1].priority, undefined);
+  assert.equal(out[1].key, "A-2");
 });
 
 test("parseGraphOutput: garbage / non-array / wrong-shape => []", () => {

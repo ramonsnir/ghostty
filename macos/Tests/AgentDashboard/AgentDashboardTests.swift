@@ -2148,7 +2148,7 @@ struct QueueBacklogTests {
         labels: [String] = [], stateType: String? = nil, priorityLabel: String? = nil
     ) -> QueueGraph.Node {
         .init(key: key, title: nil, url: nil, state: nil, stateType: stateType,
-              done: done, labels: labels, blockedBy: blockedBy, priority: nil,
+              done: done, labels: labels, blockedBy: blockedBy,
               priorityLabel: priorityLabel)
     }
 

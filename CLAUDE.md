@@ -1126,8 +1126,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       ACCENT fallback so an unknown-but-non-empty label still reads as "marked"; nil/empty ⇒ no
       mark. The Linear conversion lives in `example-graph.py` (`PRIORITY_LABELS = {1:"Urgent",
       2:"High"}`, emitted only for those — none/medium/low omit it; edit that map to mark
-      more/fewer, no Ghostty change). The field is plumbed alongside the long-existing raw
-      `priority` int (kept display-only). Wiring: sidecar — `types.ts` (`GraphNode.priorityLabel`),
+      more/fewer, no Ghostty change). (The raw tracker `priority` int was REMOVED end-to-end —
+      it was dead/unrendered and a tracker-specific footgun; `priorityLabel` is the only priority
+      signal now. If numeric ordering is ever wanted, add a generic provider-decided `priorityRank`,
+      not the raw int.) Wiring: sidecar — `types.ts` (`GraphNode.priorityLabel`),
       `provider.ts` (`parseGraphOutput` keeps a non-empty string; `mcp.ts` forwards `nodes`
       verbatim, no change); Swift — `MCPTools.swift` (`report_queue_graph` node schema +
       `priorityLabel`), `QueueCommandBridge.swift` (`QueueGraph.Node.priorityLabel` + parse),
