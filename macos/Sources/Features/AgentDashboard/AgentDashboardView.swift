@@ -483,6 +483,22 @@ private struct OriginSectionHeader: View {
                 .lineLimit(nil)
                 .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
+            // Relative bumps (raise the current cap) — the quick "pull in a little more"
+            // gesture. Only meaningful for a FINITE cap; hidden when unlimited.
+            if let plusOne = QueueHealthFormat.capPlus(status, 1) {
+                HStack(spacing: 6) {
+                    Button("+1") { commitCap(String(plusOne)) }
+                        .buttonStyle(.bordered)
+                        .help("Pull in one more item (raise the cap by 1)")
+                    if status.queued > 0,
+                       let plusWaiting = QueueHealthFormat.capPlus(status, status.queued) {
+                        Button("+ all waiting (\(status.queued))") { commitCap(String(plusWaiting)) }
+                            .buttonStyle(.bordered)
+                            .help("Raise the cap by the \(status.queued) waiting item\(status.queued == 1 ? "" : "s"), so they all dispatch and nothing after them")
+                    }
+                }
+            }
+            // Absolute presets.
             HStack(spacing: 6) {
                 ForEach(["1", "2", "5", "10"], id: \.self) { v in
                     Button(v) { commitCap(v) }.buttonStyle(.bordered)
@@ -609,6 +625,18 @@ enum QueueHealthFormat {
     /// user either picks ∞ or types a number). PURE, unit-tested.
     static func capDraft(_ s: QueueStatus) -> String {
         s.maxItems.map(String.init) ?? ""
+    }
+
+    /// (relative cap edits) The new ABSOLUTE cap when raising the current FINITE cap by
+    /// `delta` — backs the "+1" / "+ all waiting" buttons (delta = 1 or `queued`). The
+    /// goal is "pull in N more, then stop": at the common steady state (dispatched == cap)
+    /// `cap + delta` lets exactly `delta` more dispatch before the cap is reached again.
+    /// Returns nil for an unlimited cap (`maxItems == nil`), where a relative bump is
+    /// meaningless (everything already dispatches) — the caller hides the buttons then.
+    /// Clamped at ≥ 0 (a negative delta can never push the cap below zero). PURE, unit-tested.
+    static func capPlus(_ s: QueueStatus, _ delta: Int) -> Int? {
+        guard let cap = s.maxItems else { return nil }
+        return max(0, cap + delta)
     }
 
     /// The accent color for a phase chip.

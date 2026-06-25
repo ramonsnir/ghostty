@@ -2001,6 +2001,26 @@ struct AgentQueueHealthTests {
         #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 4, maxItems: nil)) == "")
     }
 
+    // MARK: - QueueHealthFormat.capPlus ("+1" / "+ all waiting" relative bumps)
+
+    @Test func capPlusRaisesFiniteCapByDelta() {
+        // "+1": cap 3 → 4 (at steady state 3/3 this lets exactly one more dispatch).
+        #expect(QueueHealthFormat.capPlus(status("Q", dispatched: 3, maxItems: 3), 1) == 4)
+        // "+ all waiting" (queued = 5): cap 3 → 8 (the 5 waiting can dispatch, nothing after).
+        #expect(QueueHealthFormat.capPlus(status("Q", queued: 5, dispatched: 3, maxItems: 3), 5) == 8)
+    }
+
+    @Test func capPlusNilForUnlimitedCap() {
+        // A relative bump is meaningless when unlimited (everything already dispatches) —
+        // the buttons are hidden, so the helper returns nil.
+        #expect(QueueHealthFormat.capPlus(status("Q", dispatched: 4, maxItems: nil), 1) == nil)
+    }
+
+    @Test func capPlusClampsAtZero() {
+        // A negative delta can never push the cap below zero.
+        #expect(QueueHealthFormat.capPlus(status("Q", maxItems: 1), -5) == 0)
+    }
+
     // MARK: - OPTIMISTIC command feedback (instant dashboard update before the sidecar push)
 
     @Test func parseCapOptimisticMirrorsSidecar() {
