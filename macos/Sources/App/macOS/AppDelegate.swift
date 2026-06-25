@@ -298,10 +298,13 @@ class AppDelegate: NSObject,
             let server = WebMonitorServer(
                 listen: webMonitorListen,
                 token: ghostty.config.webMonitorToken)
-            // (ramon fork / Bell Attention v2) Route the `push` effect to each tier per
-            // the config. Set BEFORE start() so the first events see the right policy.
+            // (ramon fork / Bell Attention v2) Route the `push` + `monitor` effects to
+            // each tier per the config. Set BEFORE start() so the first events/requests
+            // see the right policy.
             server.push.bellPush = ghostty.config.bellFeatures.contains(.push)
             server.push.attnPush = ghostty.config.attentionFeatures.contains(.push)
+            server.monitorBell = ghostty.config.bellFeatures.contains(.monitor)
+            server.monitorAttn = ghostty.config.attentionFeatures.contains(.monitor)
             server.start()
             self.webMonitor = server
         }

@@ -891,6 +891,16 @@ extension Ghostty {
             }
         }
 
+        /// (ramon fork / Bell Attention v2) Clear the sticky promoted `attentionNeeded`
+        /// state from outside the focus path — the web monitor's attention-clear button,
+        /// so a phone can acknowledge a promotion (drop the attention-tier border/title/
+        /// badge) without focusing locally. Independent of `resetBell` (P5: the raw bell
+        /// and the promotion clear separately). Note: this clears GUI state only; the
+        /// sidecar's own alert edge re-arms on its next clean classify.
+        func resetAttention() {
+            attentionNeeded = false
+        }
+
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
             // Decide which bell-features set applies based on true focus, and only
             // arm the visual bell (title 🔔 + border + dock badge aggregate) if that
