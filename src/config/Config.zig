@@ -3233,7 +3233,12 @@ keybind: Keybinds = .{},
 /// Example: `audio`, `no-audio`, `system`, `no-system`
 ///
 /// Available since: 1.2.0
-@"bell-features": BellFeatures = .{},
+// (ramon fork / Bell Attention v2) Default includes the fork effects that fire on a
+// raw bell today (dashboard auto-unhide, web push, web-monitor) so that with the filter
+// OFF the two-tier consumer routing reproduces today's behavior byte-for-byte. (system/
+// audio/border stay off by default, matching upstream.) When you enable the filter you'd
+// typically dial this down to e.g. `system,audio` and let `attention-features` be loud.
+@"bell-features": BellFeatures = .{ .dashboard = true, .push = true, .monitor = true },
 
 /// (Fork-only.) Bell features to enable when the ringing surface is truly in
 /// focus, i.e. it is the focused split AND its window is the key window AND
@@ -3249,7 +3254,9 @@ keybind: Keybinds = .{},
 ///
 /// This is a fork-only key and must live in `~/.config/ghostty-ramon/config`;
 /// an official Ghostty would error on the unknown key.
-@"bell-features-focused": BellFeatures = .{},
+// (ramon fork / Bell Attention v2) Default matches `bell-features` (incl. the fork
+// effects) so the in-focus default is unchanged + consistent.
+@"bell-features-focused": BellFeatures = .{ .dashboard = true, .push = true, .monitor = true },
 
 /// (ramon fork / Bell Attention v2) The ADDITIVE second tier: effects fired when a
 /// bell is PROMOTED to the sticky "attention needed" state (by the Agent Manager's
@@ -11352,7 +11359,7 @@ test "bell-features-focused: parse and default" {
         defer cfg.deinit();
         try cfg.finalize();
         try testing.expectEqual(
-            BellFeatures{ .attention = true, .title = true },
+            BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
             cfg.@"bell-features-focused",
         );
         // bell-features default is unchanged and identical.
@@ -11377,7 +11384,7 @@ test "bell-features-focused: parse and default" {
         );
         // bell-features keeps its default.
         try testing.expectEqual(
-            BellFeatures{ .attention = true, .title = true },
+            BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
             cfg.@"bell-features",
         );
     }
@@ -11402,7 +11409,7 @@ test "attention-features: parse, shared vocabulary, loud default" {
         try testing.expectEqual(cfg.@"attention-features", cfg.@"attention-features-focused");
         // bell-features default unchanged — the new flags default OFF there.
         try testing.expectEqual(
-            BellFeatures{ .attention = true, .title = true },
+            BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
             cfg.@"bell-features",
         );
     }
