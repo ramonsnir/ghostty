@@ -2167,4 +2167,42 @@ struct QueueBacklogTests {
         model.applyQueueGraph(QueueGraph(queueName: "ExampleOS", present: false, backlog: 0, nodes: []))
         #expect(model.queueGraphs["ExampleOS"] == nil)
     }
+
+    // MARK: window default sizing (fit-to-content, clamped to the display)
+
+    @Test func preferredWindowSizeGrowsWithColumnsAndRows() {
+        // A 3-node CHAIN → 3 columns (wide). Three ROOTS → 1 column, 3 rows (tall).
+        let chain = QueueBacklogGeometry.preferredWindowSize([
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["B"]),
+        ])
+        let roots = QueueBacklogGeometry.preferredWindowSize([node("A"), node("B"), node("C")])
+        #expect(chain.width > roots.width)   // more columns → wider
+        #expect(roots.height > chain.height) // more rows → taller
+    }
+
+    @Test func defaultContentSizeFloorsAtMinimum() {
+        // Empty / tiny board → at least the comfortable minimum, regardless of screen.
+        let s = QueueBacklogWindowManager.defaultContentSize(
+            nodes: [], screen: CGSize(width: 3000, height: 2000))
+        #expect(s.width >= QueueBacklogWindowManager.minContentSize.width)
+        #expect(s.height >= QueueBacklogWindowManager.minContentSize.height)
+    }
+
+    @Test func defaultContentSizeClampsToDisplay() {
+        // A big board on a small screen is clamped to (screen − margin), not the full board.
+        let many = (0..<40).map { node("N\($0)", blockedBy: $0 == 0 ? [] : ["N\($0 - 1)"]) }
+        let screen = CGSize(width: 1200, height: 800)
+        let s = QueueBacklogWindowManager.defaultContentSize(nodes: many, screen: screen)
+        #expect(s.width <= screen.width - QueueBacklogWindowManager.screenMargin)
+        #expect(s.height <= screen.height - QueueBacklogWindowManager.screenMargin)
+        // …and the unclamped preference really was larger (the clamp did something).
+        #expect(QueueBacklogGeometry.preferredWindowSize(many).width > s.width)
+    }
+
+    @Test func defaultContentSizeNoScreenIsUnclamped() {
+        // Headless/test context (screen nil): fit-to-content with no upper clamp.
+        let many = (0..<20).map { node("N\($0)", blockedBy: $0 == 0 ? [] : ["N\($0 - 1)"]) }
+        let s = QueueBacklogWindowManager.defaultContentSize(nodes: many, screen: nil)
+        #expect(s.width == QueueBacklogGeometry.preferredWindowSize(many).width)
+    }
 }
