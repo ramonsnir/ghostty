@@ -913,10 +913,34 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `QueuePaletteTests` (`templateParamsParsesTargetAndValuesCommand`, `templateProbe*`,
       `providerEnv*`, `parseValues*`, `previewState*`). **GUI relaunch to pick up (Swift change); the
       `valuesCommand` field needs no sidecar restart (the running sidecar ignores unknown param fields).**
-  - **GRID layout** (§12): all of a run's splits in ONE tab, auto-arranged up to `cols×rows`
-    filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
-    splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are
-    left + refilled lowest-slot-first (no re-flow). `concurrency` clamps to `cols×rows`.
+  - **GRID layout = BALANCED BSP, GUI-placed (§12; reworked from the old slot-geometry
+    planner).** All of a run's splits live in ONE tab, capped at `cols×rows` panes. The engine
+    no longer computes split geometry from an abstract grid: `grid.ts` is now pure OCCUPANCY
+    ACCOUNTING (`gridCap`, `lowestFreeSlot`, `splitPlan` → `firstTab` | `{balanced, anchorSlotIndex}`)
+    and `gridSlot` is just a concurrency token (caps panes, refills the lowest free hole). The
+    actual tiling is a **balanced binary-space-partition done GUI-side**: `spawn_split_command`
+    with `balanced:true` splits the **LARGEST pane in the run's tab along its longer side**
+    (`SplitTree.largestLeafSplit(within: realPixelBounds)` — wider/square → `.right`, taller →
+    `.down`). **Why the rework:** the old planner derived each split's target+direction from the
+    slot's grid neighbor, which is correct ONLY for a hole-free fill — but Ghostty's binary tree
+    RE-FLOWS when a pane closes (the sibling absorbs the parent region), so after any agent
+    finished the slot model diverged from the real geometry and a refill split a geometrically-
+    wrong pane → **stray extra columns/rows** (the reported bug). The BSP places every split from
+    the REAL tree, so it stays evenly tiled and self-heals across closures. **CRITICAL:**
+    `largestLeafSplit` MUST use real pixel `bounds` (the window content size) — `spatial()`'s
+    no-bounds fallback uses artificial 1×1 column/row units where every leaf looks square →
+    always `.right` → a single row of N columns. `concurrency` still clamps to `cols×rows`; the
+    template `grid.fill` / col-vs-row split is now IGNORED for placement (only `cols*rows` = the
+    pane cap matters). Wiring: sidecar — `grid.ts` (simplified `splitPlan`; `slotForIndex`/
+    `indexForSlot`/`Slot` removed), `runner.ts` (`dispatchOne` sends `balanced:true` + the
+    lowest-occupied UUID as the tab anchor), `mcp.ts` (`spawnSplitCommand` `balanced` arg). Swift —
+    `SplitTree.swift` (`largestLeafSplit(within:)`, pure), `MCPLayout.swift` (`newSplitCommand`
+    `balanced` path → window content size → `largestLeafSplit`), `MCPTools.swift`
+    (`spawn_split_command` `balanced` schema + dispatch; direction required only when NOT
+    balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `splitPlan`
+    firstTab/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
+    direction); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
+    biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
   - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
     `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only

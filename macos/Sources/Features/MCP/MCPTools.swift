@@ -191,12 +191,13 @@ enum MCPTools {
         [
             // (ramon fork / Agent Queue, §8.1)
             "name": "spawn_split_command",
-            "description": "Agent Queue: spawn one agent split running a command, returning the NEW surface's stable identity {id (UUID), sessionId (the pty-host session id; 0 when there is no host session)}. With firstTab:true, opens the run's first TAB (from app defaults in cwd); otherwise SPLITS the targetUUID surface in the given direction. The command is run as the new surface's first input in an interactive shell (it does NOT replace the shell); interior newlines are collapsed so exactly one trailing submit is sent. SAFETY/GENERICITY: item context MUST be passed via the 'env' map (e.g. GHOSTTY_ITEM_KEY/TITLE/URL) — which is set on the new split's environment so the launched shell inherits it — and NEVER string-spliced into 'command' (that would be shell injection). 'command' is the template launch line passed VERBATIM. 'cwd' is NOT tilde-expanded (use an absolute path).",
+            "description": "Agent Queue: spawn one agent split running a command, returning the NEW surface's stable identity {id (UUID), sessionId (the pty-host session id; 0 when there is no host session)}. With firstTab:true, opens the run's first TAB (from app defaults in cwd). Otherwise it splits within targetUUID's tab: with balanced:true (the queue's default) it ignores 'direction' and splits the LARGEST pane in the tab along its longer side (a balanced layout that self-heals when a pane closes); without balanced it splits the targetUUID surface in the explicit 'direction'. The command is run as the new surface's first input in an interactive shell (it does NOT replace the shell); interior newlines are collapsed so exactly one trailing submit is sent. SAFETY/GENERICITY: item context MUST be passed via the 'env' map (e.g. GHOSTTY_ITEM_KEY/TITLE/URL) — which is set on the new split's environment so the launched shell inherits it — and NEVER string-spliced into 'command' (that would be shell injection). 'command' is the template launch line passed VERBATIM. 'cwd' is NOT tilde-expanded (use an absolute path).",
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "targetUUID": ["type": "string", "description": "Surface UUID to split (required unless firstTab)."],
-                    "direction": ["type": "string", "enum": ["right", "down", "left", "up"], "description": "Split direction (required unless firstTab)."],
+                    "targetUUID": ["type": "string", "description": "A surface UUID identifying the tab to split into (required unless firstTab). With balanced it just anchors the tab; without balanced it is the exact pane split in 'direction'."],
+                    "direction": ["type": "string", "enum": ["right", "down", "left", "up"], "description": "Split direction (used only when balanced is false; required then)."],
+                    "balanced": ["type": "boolean", "default": false, "description": "Split the largest pane in the tab along its longer side (ignores 'direction'). The Agent Queue's default tiling."],
                     "command": ["type": "string", "description": "The launch command, run VERBATIM as the new surface's first input."],
                     "cwd": ["type": "string", "description": "Working directory (no '~' expansion)."],
                     "firstTab": ["type": "boolean", "default": false, "description": "Open the run's first tab instead of splitting a target."],
@@ -447,6 +448,7 @@ enum MCPTools {
                 return .invalidParams("missing command")
             }
             let firstTab = (arguments["firstTab"] as? Bool) ?? false
+            let balanced = (arguments["balanced"] as? Bool) ?? false
             let cwd = arguments["cwd"] as? String
             let direction = arguments["direction"] as? String
             // The item-context env: only string→string entries are kept (§13). A
@@ -462,15 +464,17 @@ enum MCPTools {
                 guard let s = arguments["targetUUID"] as? String, let u = UUID(uuidString: s) else {
                     return .invalidParams("missing or invalid targetUUID (required unless firstTab)")
                 }
-                guard MCPLayout.newDirection(direction) != nil else {
-                    return .invalidParams("missing or invalid direction (required unless firstTab)")
+                // 'direction' is required ONLY for an explicit (non-balanced) split; in
+                // balanced mode the engine picks the largest pane + direction itself.
+                if !balanced, MCPLayout.newDirection(direction) == nil {
+                    return .invalidParams("missing or invalid direction (required unless firstTab or balanced)")
                 }
                 targetUUID = u
             }
             let result: (id: String, sessionID: UInt64)? = DispatchQueue.main.sync {
                 MCPLayout.newSplitCommand(
                     targetUUID: targetUUID, direction: direction, command: command,
-                    cwd: cwd, firstTab: firstTab, env: env)
+                    cwd: cwd, firstTab: firstTab, env: env, balanced: balanced)
             }
             guard let result else { return .toolError("failed to spawn split") }
             // Casing note: this returns "sessionId" (lowercase); list_surfaces emits

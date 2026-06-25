@@ -230,6 +230,10 @@ export class McpClient {
   async spawnSplitCommand(args: {
     targetUUID?: string;
     direction?: "right" | "down" | "left" | "up";
+    /** (balanced BSP §12) Split the LARGEST pane in the target's tab along its longer
+     *  side instead of using `direction` — the queue's default tiling, which self-heals
+     *  when a pane closes. `targetUUID` then just anchors the tab. */
+    balanced?: boolean;
     command: string;
     cwd?: string;
     firstTab?: boolean;
@@ -241,6 +245,7 @@ export class McpClient {
     const toolArgs: Record<string, unknown> = { command: args.command };
     if (args.targetUUID !== undefined) toolArgs.targetUUID = args.targetUUID;
     if (args.direction !== undefined) toolArgs.direction = args.direction;
+    if (args.balanced !== undefined) toolArgs.balanced = args.balanced;
     if (args.cwd !== undefined) toolArgs.cwd = args.cwd;
     if (args.firstTab !== undefined) toolArgs.firstTab = args.firstTab;
     if (args.env !== undefined && Object.keys(args.env).length > 0) {

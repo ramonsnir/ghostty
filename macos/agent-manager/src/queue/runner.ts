@@ -89,10 +89,6 @@ import type {
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: queue: ${msg}`);
 
-/** A non-zero direction the grid planner can yield ("right"/"down"); spawnSplitCommand
- *  accepts the wider set but the planner only ever produces these two. */
-type SplitDirection = "right" | "down";
-
 /**
  * The grace window a still-PENDING (un-finalized) store record is given before
  * reconcile prunes it (§9). Covers the spawn → first `list_surfaces` lag + a crash
@@ -1217,7 +1213,10 @@ async function dispatchOne(
   const cap = gridCap(t.grid.cols, t.grid.rows);
   const slot = lowestFreeSlot(occupied, cap);
   if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
-  const sp = splitPlan(slot, occupied, t.grid.fill, t.grid.cols, t.grid.rows);
+  // The split is a BALANCED BSP (§12): the GUI splits the largest pane in the run's tab.
+  // `slot` is just the occupancy token (caps concurrency, refills holes); placement no
+  // longer derives from the slot's abstract grid position.
+  const sp = splitPlan(occupied);
 
   // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
   // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
@@ -1259,8 +1258,10 @@ async function dispatchOne(
   const commandWithItemEnv = shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
   try {
+    // Balanced BSP: the anchor UUID just identifies the run's tab; the GUI splits the
+    // largest pane in it. (firstTab opens the run's tab from app defaults.)
     const targetUUID =
-      sp.firstTab === true ? undefined : occupiedUUID(run, sp.targetSlotIndex);
+      sp.firstTab === true ? undefined : occupiedUUID(run, sp.anchorSlotIndex);
     spawned = await deps.client.spawnSplitCommand({
       command: commandWithItemEnv,
       cwd: t.workdir,
@@ -1269,7 +1270,7 @@ async function dispatchOne(
         ? { firstTab: true }
         : {
             ...(targetUUID !== undefined ? { targetUUID } : {}),
-            direction: sp.direction as SplitDirection,
+            balanced: true,
           }),
     });
   } catch (err) {

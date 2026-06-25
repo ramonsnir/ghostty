@@ -242,6 +242,32 @@ extension SplitTree {
         }
     }
 
+    /// (ramon fork / Agent Queue, balanced BSP §12) Pick the LARGEST-AREA leaf and the
+    /// direction to split it for a balanced binary layout: split along its LONGER side
+    /// (wider-or-square → `.right`, taller → `.down`), so repeated splits keep the panes
+    /// as square + evenly-sized as a binary tree allows — and a closed pane's space is
+    /// reclaimed by re-splitting whatever leaf grew largest. PURE.
+    ///
+    /// `bounds` is the REAL pixel size of the area the tree renders into — it MUST be the
+    /// actual content size, NOT the artificial column/row units `spatial()` falls back to
+    /// (those make every leaf 1×1 → always `.right` → a single row of N columns). Returns
+    /// nil for an empty tree. Ties (equal area) resolve to the first leaf in spatial order
+    /// (deterministic).
+    func largestLeafSplit(within bounds: CGSize) -> (view: ViewType, direction: NewDirection)? {
+        guard let root, bounds.width > 0, bounds.height > 0 else { return nil }
+        var best: (view: ViewType, bounds: CGRect)?
+        for slot in root.spatial(within: bounds).slots {
+            guard case .leaf(let view) = slot.node else { continue }
+            let area = slot.bounds.width * slot.bounds.height
+            if best == nil || area > (best!.bounds.width * best!.bounds.height) {
+                best = (view, slot.bounds)
+            }
+        }
+        guard let best else { return nil }
+        let direction: NewDirection = best.bounds.width >= best.bounds.height ? .right : .down
+        return (best.view, direction)
+    }
+
     /// Equalize all splits in the tree so that each split's ratio is based on the
     /// relative weight (number of leaves) of its children.
     func equalized() -> Self {
