@@ -14,7 +14,17 @@ it only annotates the tile), and bills through your existing Claude Code auth (n
 key). Its Haiku traffic can optionally be routed to a **separate account** so it never
 drains your main quota (see *Account routing* below).
 
-## Rate-limit (and other) attention bells
+## Attention bells (the promoter for Bell Attention v2)
+
+> When `agent-manager-bell-filter = true`, the summarizer is also the **classifier** that
+> powers the two-tier [**Bell Attention**](BELL-ATTENTION.md) feature: every bell wakes a
+> Haiku classify, and a *notable* bell is **promoted** to the "needs you" tier
+> (`attention-features`) while an incidental one stays the quiet raw bell (`bell-features`).
+> It is **fail-open** — only a confident "ignore" suppresses; anything uncertain promotes.
+> See **[BELL-ATTENTION.md](BELL-ATTENTION.md)** for the tiers, the effect vocabulary, the
+> per-effect routing, and the config (incl. the `no-*` dial-down gotcha). The rate-limit
+> watchdog below is one special case of the same mechanism, driven by an `alert` tag.
+
 
 The summarizer also doubles as an **attention watchdog**: when a session hits the
 Claude **usage/rate-limit prompt** — the interactive *"Stop and wait for limit to

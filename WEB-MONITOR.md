@@ -135,6 +135,11 @@ is loopback, hence identical; only your `ts.net` hostname differs:
 
 ## Notify on bell (background push notifications)
 
+> If [**Bell Attention**](BELL-ATTENTION.md) is enabled, the session list distinguishes a
+> raw bell (🔔) from a promoted "needs you" (⏳), each routed by whether `monitor` is on its
+> tier, and each split offers a **separate** clear for the two states. Whether a raw bell
+> *pushes* (vs. only a promotion) likewise follows the `push` flag's tier.
+
 Get a **push notification on your phone when any split rings a bell** — even with the
 browser tab closed and the phone locked. Use it to step away from the laptop and still get
 pinged when a long command finishes or a CLI agent wants approval. The header has a **🔔
