@@ -41,7 +41,7 @@ import {
   runProvider,
   type Exec,
 } from "./provider.js";
-import { lowestFreeSlot, splitPlan, gridCap } from "./grid.js";
+import { lowestFreeSlot, splitPlan, gridCap, MAX_QUEUE_TABS } from "./grid.js";
 import {
   ConcurrencyBudget,
   closeSequencePlan,
@@ -234,12 +234,11 @@ export interface QueueRun {
   maxItemsLive?: number | null;
   /** (live concurrency edit) A run-level OVERRIDE of the max SIMULTANEOUS agents, set by a
    *  `set_concurrency` command WHILE the run is live (the dashboard parallel control). Takes
-   *  PRECEDENCE over the template `concurrency` in `effectiveConcurrency`, and (because the
-   *  grid `cols*rows` is now just a pane cap under balanced-BSP, §12) ALSO lifts the effective
-   *  grid cap in `effectiveGridCap` so raising it past `cols*rows` actually opens more panes.
-   *  `undefined` = no live edit (use the template). Always a positive integer. Persisted in
-   *  the active-runs record so a restart re-applies it. Lowering it only stops FUTURE dispatch
-   *  (running agents are never killed). */
+   *  PRECEDENCE over the template `concurrency` in `effectiveConcurrency`. The grid `cols*rows`
+   *  is the PER-TAB pane cap; a concurrency above it OVERFLOWS to additional tabs (§12), so
+   *  this can exceed one grid. `undefined` = no live edit (use the template). A positive integer
+   *  (clamped to `capPerTab * MAX_QUEUE_TABS`). Persisted in the active-runs record so a restart
+   *  re-applies it. Lowering it only stops FUTURE dispatch (running agents are never killed). */
   concurrencyLive?: number;
 }
 
@@ -302,20 +301,16 @@ export function effectiveMaxItemsCap(run: QueueRun): number | null {
   return cap <= 0 ? null : cap;
 }
 
-/** The run's EFFECTIVE max simultaneous agents: the LIVE `set_concurrency` edit if set, else
- *  the template `concurrency`. PURE. Shared by the dispatch gate + the health report so they
- *  agree. */
+/** The run's EFFECTIVE max simultaneous agents (the TOTAL pane budget across all its tabs):
+ *  the LIVE `set_concurrency` edit if set, else the template `concurrency`. PURE. CLAMPED to
+ *  `[1, capPerTab * MAX_QUEUE_TABS]` so a fat-fingered live edit can't open hundreds of
+ *  overflow tabs. The grid `cols*rows` is the PER-TAB cap; this total may exceed it (panes
+ *  overflow to more tabs, §12). Shared by the dispatch gate + the health report so they agree. */
 export function effectiveConcurrency(run: QueueRun): number {
-  return run.concurrencyLive ?? run.template.concurrency;
-}
-
-/** The run's EFFECTIVE grid (pane) cap. PURE. Under balanced-BSP (§12) `cols*rows` is purely
- *  a pane cap, so a live concurrency raised ABOVE it must lift the pane cap too — otherwise
- *  the extra agents would have no free grid slot. So the effective cap is the LARGER of the
- *  template `cols*rows` and the effective concurrency. (Concurrency is the binding limit; this
- *  just keeps the pane budget from artificially capping it below the user's chosen parallelism.) */
-export function effectiveGridCap(run: QueueRun): number {
-  return Math.max(gridCap(run.template.grid.cols, run.template.grid.rows), effectiveConcurrency(run));
+  const raw = run.concurrencyLive ?? run.template.concurrency;
+  const capPerTab = gridCap(run.template.grid.cols, run.template.grid.rows);
+  const maxPanes = Math.max(1, capPerTab) * MAX_QUEUE_TABS;
+  return Math.max(1, Math.min(raw, maxPanes));
 }
 
 /** The injectable seams the supervisor pass needs (mirrors LoopDeps). */
@@ -1104,16 +1099,12 @@ async function dispatchCandidates(
 ): Promise<number> {
   const t = run.template;
 
-  // Remaining slots = min(concurrency room, grid room, global remaining). The active
-  // count is every assignment currently OCCUPYING a slot (EXITED kept-but-freed ones
-  // excluded, §6).
+  // Remaining slots = min(EFFECTIVE concurrency room, global remaining). The active count
+  // is every assignment currently OCCUPYING a slot (EXITED kept-but-freed ones excluded,
+  // §6). The per-tab `cols*rows` is NOT a global cap — concurrency is the total pane budget
+  // and panes overflow to additional tabs (§12), so it does not bound this.
   const activeCount = slotOccupancy(run);
-  // (live concurrency edit) Bound the sweep by the EFFECTIVE concurrency + grid cap (the
-  // `set_concurrency` override lifts both; default = template values), so raising it past
-  // `cols*rows` actually dispatches more agents (§12 — the grid is just a pane cap now).
-  const slots = remainingSlots(
-    t, activeCount, globalRemaining, effectiveConcurrency(run), effectiveGridCap(run),
-  );
+  const slots = remainingSlots(t, activeCount, globalRemaining, effectiveConcurrency(run));
   // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap
   // (null = unlimited ⇒ Infinity remaining; selectCandidates' Math.min(slots, Infinity) =
   // slots). The global `agent-queue-max-total` + grid/concurrency still bound an unlimited run.
@@ -1246,15 +1237,16 @@ async function dispatchOne(
   for (const a of run.active.values()) {
     if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
   }
-  // The pane cap is the EFFECTIVE grid cap (lifted by a live `set_concurrency` edit, §12), so
-  // a slot exists for every agent the (gated) concurrency allows.
-  const cap = effectiveGridCap(run);
+  // The total pane budget is the EFFECTIVE concurrency (across ALL the run's tabs); the
+  // lowest free slot fills the lowest tab first, then overflows (§12). A slot exists for
+  // every agent the (gated) concurrency allows.
+  const cap = effectiveConcurrency(run);
   const slot = lowestFreeSlot(occupied, cap);
-  if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
-  // The split is a BALANCED BSP (§12): the GUI splits the largest pane in the run's tab.
-  // `slot` is just the occupancy token (caps concurrency, refills holes); placement no
-  // longer derives from the slot's abstract grid position.
-  const sp = splitPlan(occupied);
+  if (slot === null) return false; // full — shouldn't happen (remainingSlots gated)
+  // Plan how to materialize this slot's pane (§12): the run's first tab, an OVERFLOW tab
+  // (slot is the first of a fresh tab), or a BALANCED split within the slot's existing tab.
+  // `slot`'s only geometry is which tab it belongs to (floor(slot / cols*rows)).
+  const sp = splitPlan(occupied, slot, gridCap(t.grid.cols, t.grid.rows));
 
   // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
   // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
@@ -1289,28 +1281,31 @@ async function dispatchOne(
   //     single-quoting (shellEnvPrefix) keeps a hostile title inert (no injection); the
   //     template `command` itself is still appended VERBATIM. Belt-and-suspenders: both
   //     set the same vars, so it works on either backend.
-  // A non-firstTab split targets the live UUID occupying the planner's target slot; we
-  // omit `targetUUID` entirely (undefined, not "") when there is no live target so the
-  // tool's first-tab fallback applies cleanly.
+  // Three spawn shapes from the §12 plan:
+  //   - firstTab           → open the run's FIRST tab (frontmost window; no run window yet).
+  //   - newTab + window-   → open an OVERFLOW tab in the run's EXISTING window, anchored on a
+  //     anchor UUID         live pane so all the run's tabs share one window (firstTab:true +
+  //                         windowAnchorUUID).
+  //   - balanced + target  → split WITHIN the slot's tab; the anchor UUID identifies the tab
+  //     UUID                and the GUI splits its largest pane. We omit a missing UUID so the
+  //                         tool's first-tab fallback applies cleanly.
   const itemEnv = buildItemEnv(item);
   const commandWithItemEnv = shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
   try {
-    // Balanced BSP: the anchor UUID just identifies the run's tab; the GUI splits the
-    // largest pane in it. (firstTab opens the run's tab from app defaults.)
-    const targetUUID =
-      sp.firstTab === true ? undefined : occupiedUUID(run, sp.anchorSlotIndex);
-    spawned = await deps.client.spawnSplitCommand({
-      command: commandWithItemEnv,
-      cwd: t.workdir,
-      env: itemEnv,
-      ...(sp.firstTab === true
-        ? { firstTab: true }
-        : {
-            ...(targetUUID !== undefined ? { targetUUID } : {}),
-            balanced: true,
-          }),
-    });
+    let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
+    const base = { command: commandWithItemEnv, cwd: t.workdir, env: itemEnv };
+    if (sp.firstTab === true) {
+      spawnArgs = { ...base, firstTab: true };
+    } else if (sp.newTab === true) {
+      // Overflow tab: open a new tab anchored on the run's window (any live pane).
+      const windowAnchorUUID = occupiedUUID(run, sp.windowAnchorSlotIndex);
+      spawnArgs = { ...base, firstTab: true, ...(windowAnchorUUID !== undefined ? { windowAnchorUUID } : {}) };
+    } else {
+      const targetUUID = occupiedUUID(run, sp.anchorSlotIndex);
+      spawnArgs = { ...base, ...(targetUUID !== undefined ? { targetUUID } : {}), balanced: true };
+    }
+    spawned = await deps.client.spawnSplitCommand(spawnArgs);
   } catch (err) {
     // Spawn failed → FAILED (§6). Free the slot so the run never deadlocks behind a
     // failed spawn; drop the pending record. The key is NOT cooled (it can retry next

@@ -93,9 +93,9 @@ shell the engine just runs.
     //   "exit": { "text": "/quit", "submit": false }  // type without pressing Enter
     "exit": { "keys": ["ctrl-d"] }
   },
-  "concurrency": 3,                          // max simultaneous agents (clamped to the grid)
+  "concurrency": 3,                          // max simultaneous agents (TOTAL across tabs; may exceed one grid — see below)
   "maxItems": 200,                           // hard ceiling on total lifetime dispatches
-  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // max simultaneous panes = cols×rows; panes auto-tile as a balanced split (the largest pane is split along its longer side) — `fill` / col-vs-row is IGNORED for placement
+  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // PANES PER TAB = cols×rows; if concurrency exceeds it, extra agents OVERFLOW to new tabs (e.g. concurrency 9 + 3×2 grid = 6 in tab 1 + 3 in tab 2). Panes auto-tile as a balanced split; `fill` / col-vs-row is IGNORED
   // NOTE: there is NO `quitWhenEmpty` — a run is removed only by an explicit Stop/Abort.
   // An empty `list` just means "nothing actionable now"; the run keeps polling. (A `quitWhenEmpty`
   // key here is silently ignored — it was removed after it abandoned live agents on a restart.)
@@ -256,9 +256,10 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   it** (e.g. bump `6 → 9` mid-run). Raising it dispatches more in parallel on the next `list`
   poll; lowering it only stops *future* dispatch — running agents are never killed. There's no
   "unlimited" (concurrency is always a finite count); a blank/garbage/non-positive entry is
-  ignored. Raising it past the template's `cols×rows` grid automatically lifts the pane cap too,
-  so the extra agents get tiles (the grid is just a pane budget under balanced tiling). Like the
-  cap, a same-scope re-`start` won't change it — this chip is the only in-place way.
+  ignored. Raising it past the template's `cols×rows` grid **overflows the extra agents into new
+  tabs** (in the run's own window) — `cols×rows` is the per-tab layout, so e.g. bumping `6 → 9`
+  with a 3×2 grid spreads 6 panes in tab 1 + 3 in tab 2. Like the cap, a same-scope re-`start`
+  won't change it — this chip is the only in-place way.
 
 ## What it guarantees
 
@@ -276,8 +277,9 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   latch is **persisted**, so a sidecar/GUI restart won't re-grab a killed-before-claim item.
   Consequence: a **crashed** agent whose item stays in the list is **not** auto-retried either —
   re-queue it with the same round-trip (the queue won't blindly re-run a crash on the same item).
-- **Concurrency** is never exceeded (per-queue `concurrency`, the `cols×rows` grid, and the
-  global `agent-queue-max-total`).
+- **Concurrency** is never exceeded (per-queue `concurrency` — the total across all the run's
+  tabs — and the global `agent-queue-max-total`; `cols×rows` is the per-tab layout, not a cap on
+  the total, since panes overflow to new tabs).
 - **Restart-proof** — a started queue, its tiles, and its in-flight items survive a sidecar
   or GUI restart with no re-dispatch and no orphaned agents. (A *host* restart loses all
   RAM-only sessions, as always.)

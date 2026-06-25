@@ -962,11 +962,19 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `QueuePaletteTests` (`templateParamsParsesTargetAndValuesCommand`, `templateProbe*`,
       `providerEnv*`, `parseValues*`, `previewState*`). **GUI relaunch to pick up (Swift change); the
       `valuesCommand` field needs no sidecar restart (the running sidecar ignores unknown param fields).**
-  - **GRID layout = BALANCED BSP, GUI-placed (§12; reworked from the old slot-geometry
-    planner).** All of a run's splits live in ONE tab, capped at `cols×rows` panes. The engine
-    no longer computes split geometry from an abstract grid: `grid.ts` is now pure OCCUPANCY
-    ACCOUNTING (`gridCap`, `lowestFreeSlot`, `splitPlan` → `firstTab` | `{balanced, anchorSlotIndex}`)
-    and `gridSlot` is just a concurrency token (caps panes, refills the lowest free hole). The
+  - **GRID layout = BALANCED BSP, GUI-placed, with MULTI-TAB OVERFLOW (§12; reworked from the
+    old slot-geometry planner — then extended from single-tab to overflow).** A run lays its
+    splits out as up to `cols×rows` panes PER TAB and OVERFLOWS to additional tabs (in the run's
+    own window) when `concurrency` exceeds one tab — so concurrency 9 with a 3×2 grid fills tab 1
+    (6) then spills 3 into tab 2, and 18 fills three tabs. The engine no longer computes split
+    geometry from an abstract grid: `grid.ts` is pure OCCUPANCY ACCOUNTING — slots are integers in
+    `[0, concurrency)`, slot `i` lives in **tab `floor(i / capPerTab)`** (`tabIndexForSlot`), and
+    `lowestFreeSlot` fills the lowest tab first (reusing a closed split's hole before opening a
+    higher slot). `splitPlan(occupied, newSlot, capPerTab)` → `firstTab` (the run's first tab) |
+    `{newTab, windowAnchorSlotIndex}` (the first pane of a fresh OVERFLOW tab — open a new tab in
+    the run's window, anchored on any live pane so all the run's tabs share ONE window) |
+    `{balanced, anchorSlotIndex}` (a split WITHIN the target slot's tab, anchored at the lowest
+    occupied slot OF THAT TAB). The
     actual tiling is a **balanced binary-space-partition done GUI-side**: `spawn_split_command`
     with `balanced:true` splits the **LARGEST pane in the run's tab along its longer side**
     (`SplitTree.largestLeafSplit(within: realPixelBounds)` — wider/square → `.right`, taller →
@@ -978,17 +986,28 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     the REAL tree, so it stays evenly tiled and self-heals across closures. **CRITICAL:**
     `largestLeafSplit` MUST use real pixel `bounds` (the window content size) — `spatial()`'s
     no-bounds fallback uses artificial 1×1 column/row units where every leaf looks square →
-    always `.right` → a single row of N columns. `concurrency` still clamps to `cols×rows`; the
-    template `grid.fill` / col-vs-row split is now IGNORED for placement (only `cols*rows` = the
-    pane cap matters). Wiring: sidecar — `grid.ts` (simplified `splitPlan`; `slotForIndex`/
-    `indexForSlot`/`Slot` removed), `runner.ts` (`dispatchOne` sends `balanced:true` + the
-    lowest-occupied UUID as the tab anchor), `mcp.ts` (`spawnSplitCommand` `balanced` arg). Swift —
+    always `.right` → a single row of N columns (it's scoped per-TAB — each tab is its own
+    `TerminalController.surfaceTree`, so the BSP correctly tiles within one tab). `cols×rows` is
+    now the PER-TAB pane cap; `concurrency` is the TOTAL across tabs and MAY exceed it (overflow),
+    clamped to `cols×rows × MAX_QUEUE_TABS` (8) so a fat-finger can't open hundreds of tabs. The
+    template `grid.fill` / col-vs-row split is IGNORED for placement (only `cols*rows` = the
+    per-tab cap matters). `remainingSlots` bounds dispatch by `min(concurrency − active, global)` —
+    the grid is NO longer a term (overflow handles >grid). Wiring: sidecar — `grid.ts`
+    (`tabIndexForSlot` + tab-aware `splitPlan` + `MAX_QUEUE_TABS`), `runner.ts` (`dispatchOne` slot
+    `[0,concurrency)` + 3-case spawn: firstTab / newTab+windowAnchorUUID / balanced+targetUUID;
+    `effectiveConcurrency` clamps to `capPerTab*MAX_QUEUE_TABS`; `effectiveGridCap` REMOVED),
+    `supervisor.ts` (`remainingSlots` drops the grid term), `templates.ts` (`clampConcurrency` →
+    `[1, cap*MAX_QUEUE_TABS]`), `mcp.ts` (`spawnSplitCommand` `windowAnchorUUID` arg). Swift —
     `SplitTree.swift` (`largestLeafSplit(within:)`, pure), `MCPLayout.swift` (`newSplitCommand`
-    `balanced` path → window content size → `largestLeafSplit`), `MCPTools.swift`
-    (`spawn_split_command` `balanced` schema + dispatch; direction required only when NOT
-    balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `splitPlan`
-    firstTab/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
-    direction); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
+    `balanced` path → window content size → `largestLeafSplit`; `windowAnchorUUID` → open the
+    overflow tab in that pane's window), `MCPTools.swift`
+    (`spawn_split_command` `balanced` + `windowAnchorUUID` schema + dispatch; direction required only when NOT
+    balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `tabIndexForSlot` +
+    `splitPlan` firstTab/newTab-overflow/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
+    direction; **concurrency>grid OVERFLOWS to a new tab** — slot 0 firstTab, slot in-tab balanced,
+    overflow slot newTab+windowAnchorUUID), `supervisor.test.ts` (`remainingSlots` concurrency-only +
+    effConcurrency override), `templates.test.ts` (concurrency may exceed one grid, clamps at
+    `cap*MAX_QUEUE_TABS`); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
     biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
   - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
@@ -1217,15 +1236,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     dashboard header gets a tap-to-edit **`⇉ N` parallel chip** (`rectangle.split.3x1` +
     presets 1/2/3/4/6/9 + a custom field; shown once the run reports `concurrency > 0`). Engine:
     a mutable `QueueRun.concurrencyLive?: number` (`undefined`=no edit; always a positive int — NO
-    "unlimited", an unbounded fan-out would spawn a pane per item). Two pure helpers consult it:
-    `effectiveConcurrency(run)` = `concurrencyLive ?? template.concurrency`, and — load-bearing —
-    `effectiveGridCap(run)` = `max(cols*rows, effectiveConcurrency)`. **Why the grid lift:** under
-    balanced-BSP (§12) `grid.cols*rows` is now purely a PANE cap, and `dispatchOne`/`remainingSlots`
-    bound dispatch by `min(concurrency, gridCap)` — so raising concurrency past `cols*rows` (example's
-    grid is 3×2=6) would do nothing unless the pane cap lifts too. So the live edit lifts BOTH (one
-    knob = "max parallel"). `remainingSlots` gained optional `effConcurrency`/`effGridCap` params
-    (default = template values, so existing callers/tests are unchanged); `dispatchCandidates` +
-    `dispatchOne` pass the effective values. Parsed by a pure `parseConcurrencyValue` (positive int
+    "unlimited", an unbounded fan-out would spawn a pane per item). `effectiveConcurrency(run)` =
+    `concurrencyLive ?? template.concurrency`, CLAMPED to `[1, capPerTab*MAX_QUEUE_TABS]`. It is the
+    run's TOTAL pane budget across ALL its tabs — concurrency above one tab's `cols×rows` OVERFLOWS
+    to additional tabs (§12 multi-tab — see the GRID layout bullet), so bumping example 6→9 with a
+    3×2 grid spreads 6 panes in tab 1 + 3 in tab 2 (NOT crammed into one tab — an earlier
+    `effectiveGridCap` single-tab-lift approach was REPLACED by real overflow). `remainingSlots`
+    bounds dispatch by `min(effectiveConcurrency − active, global)` (the grid is no longer a term);
+    `dispatchOne` allocates `lowestFreeSlot(occupied, effectiveConcurrency)` and `splitPlan` routes
+    overflow slots to new tabs. Parsed by a pure `parseConcurrencyValue` (positive int
     only; blank/garbage/zero/negative → ignored, so a fat-finger never changes parallelism). Persisted
     in the active-runs record (`concurrencyLive`) so a restart re-applies it; surfaced in the §11
     health report (`QueueStatusReport.concurrency` = effective value) so the dashboard shows + edits it.
@@ -1233,8 +1252,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `parseConcurrencyOptimistic`) before the sidecar's authoritative push. Lowering it only stops
     FUTURE dispatch (running agents are never killed); raising it re-enables dispatch on the next
     list-DUE sweep (≤`listMs`). Wiring: sidecar — `templates.ts` (`parseConcurrencyValue`),
-    `supervisor.ts` (`remainingSlots` eff params), `runner.ts` (`QueueRun.concurrencyLive` +
-    `effectiveConcurrency`/`effectiveGridCap` + `makeQueueRun` opt + `activeRunRecords` + dispatch
+    `supervisor.ts` (`remainingSlots` `effConcurrency` param), `runner.ts` (`QueueRun.concurrencyLive` +
+    `effectiveConcurrency` clamp + `makeQueueRun` opt + `activeRunRecords` + dispatch
     gate + `reportQueueStatus`), `status.ts` (`QueueStatusReport.concurrency` + inputs + builder),
     `commands.ts` (`set_concurrency` action + `concurrency` field + reducer + `applyCommands`
     change-bit), `store.ts` (`ActiveRunRecord.concurrencyLive` + tolerant parse), `wiring.ts`
@@ -1245,7 +1264,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `AgentDashboardController.swift` (`setQueueConcurrency(run:value:)`), `AgentDashboardView.swift`
     (`OriginSectionHeader` `⇉ N` chip + `concurrencyEditorPopover` + `onSetConcurrency`). Tests:
     sidecar `templates.test.ts` (`parseConcurrencyValue`), `supervisor.test.ts` (`remainingSlots` eff
-    override), `runner.test.ts` (`effectiveConcurrency`/`effectiveGridCap` + bump-dispatches-3rd),
+    override), `runner.test.ts` (`effectiveConcurrency` clamp + bump-dispatches-3rd + overflow-new-tab),
     `commands.test.ts` (set_concurrency apply/ignore-garbage/unknown-run/change-bit), `store.test.ts`
     (round-trip + tolerant parse), `mcp.test.ts` (coerce + report forward), `status.test.ts`
     (concurrency passthrough); Swift `MCPServerTests` (`queueCommandJSONObjectSetConcurrency*` +

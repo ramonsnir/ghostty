@@ -408,7 +408,8 @@ enum MCPLayout {
         cwd: String?,
         firstTab: Bool,
         env: [String: String],
-        balanced: Bool = false
+        balanced: Bool = false,
+        windowAnchorUUID: UUID? = nil
     ) -> (id: String, sessionID: UInt64)? {
         // Render the command as a single line of initial input with one trailing
         // newline = one submit. `singleLine` collapses INTERIOR newlines (so a
@@ -430,9 +431,18 @@ enum MCPLayout {
             config.initialInput = initialInput
             config.environmentVariables = env
             guard let appDelegate = NSApp.delegate as? AppDelegate else { return nil }
-            // Anchor on the frontmost terminal window if there is one (the tab joins
-            // it); a nil parent opens a new window. Mirrors `newTab`'s no-source path.
-            let parent = TerminalController.all.first?.window
+            // Pick the window the new tab joins. For an OVERFLOW tab (§12) the engine passes
+            // `windowAnchorUUID` = a live pane of the SAME run, so all the run's tabs stay in
+            // ONE window; we resolve that pane's controller window. Otherwise (the run's first
+            // tab) anchor on the frontmost terminal window if any; a nil parent opens a new
+            // window. Mirrors `newTab`'s no-source path.
+            let parent: NSWindow? = {
+                if let windowAnchorUUID,
+                   let (anchorController, _) = controllerAndView(forUUID: windowAnchorUUID) {
+                    return anchorController.window
+                }
+                return TerminalController.all.first?.window
+            }()
             guard let created = TerminalController.newTab(
                 appDelegate.ghostty, from: parent, withBaseConfig: config) else { return nil }
             // The new tab's surface tree is populated synchronously: the run's first
