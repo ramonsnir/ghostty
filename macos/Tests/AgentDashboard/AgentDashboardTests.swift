@@ -1975,6 +1975,74 @@ struct AgentDashboardOriginTests {
         model.showAllOrigins()
         #expect(model.sections.flatMap { $0.entries }.map(\.sessionID).sorted() == [1, 2])
     }
+
+    // MARK: - Collapsed sections (ramon fork / Agent Dashboard)
+
+    @Test func sectionCountsExposeUnhiddenTotalAndBells() {
+        // bellCount counts ringing unhidden tiles; totalCount = unhidden + hidden.
+        let a = entry(UUID(), session: 1, queueName: "q", bell: true)
+        let b = entry(UUID(), session: 2, queueName: "q")
+        let c = entry(UUID(), session: 3, queueName: "q", bell: true)
+        let sections = AgentDashboardModel.groupByOrigin(
+            [a, b, c], hiddenCountByOrigin: ["q": 2])
+        let q = try! #require(sections.first)
+        #expect(q.count == 3)            // unhidden
+        #expect(q.hiddenCount == 2)
+        #expect(q.totalCount == 5)       // unhidden + hidden
+        #expect(q.bellCount == 2)        // two ringing
+    }
+
+    @Test func groupByOriginInjectsHiddenOnlyOrigin() {
+        // An origin whose only agents are hidden still gets a (empty-entries)
+        // section so its header/summary is reachable.
+        let visible = entry(UUID(), session: 1, queueName: "alpha")
+        let sections = AgentDashboardModel.groupByOrigin(
+            [visible], hiddenCountByOrigin: ["alpha": 1, "beta": 3])
+        #expect(sections.map(\.id) == ["alpha", "beta"])
+        let beta = try! #require(sections.first { $0.id == "beta" })
+        #expect(beta.entries.isEmpty)
+        #expect(beta.totalCount == 3)
+        #expect(beta.count == 0)
+    }
+
+    @Test func toggleCollapsedPersistsAndReads() {
+        let collapseStore = InMemoryCollapsedSectionStore()
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(), collapsedSectionStore: collapseStore)
+        #expect(!model.isCollapsed("alpha"))
+        model.toggleCollapsed("alpha")
+        #expect(model.isCollapsed("alpha"))
+        #expect(collapseStore.load() == ["alpha"])
+        // Toggling back clears + persists.
+        model.toggleCollapsed("alpha")
+        #expect(!model.isCollapsed("alpha"))
+        #expect(collapseStore.load().isEmpty)
+    }
+
+    @Test func collapsedLoadsFromStoreAtInit() {
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            collapsedSectionStore: InMemoryCollapsedSectionStore(["beta"]))
+        #expect(model.collapsedOrigins == ["beta"])
+        #expect(model.isCollapsed("beta"))
+    }
+
+    @Test func sectionsTallyHiddenAgentsPerOrigin() {
+        // End-to-end through the model: a hidden agent's origin (from its
+        // annotation) is counted into its section's hiddenCount/totalCount.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))
+        model.applyAnnotation(a, AgentAnnotation(queueName: "q"))
+        model.applyAnnotation(b, AgentAnnotation(queueName: "q"))
+        // Hide one of q's two agents.
+        model.hide(b)
+        let q = try! #require(model.sections.first { $0.id == "q" })
+        #expect(q.count == 1)         // a is visible
+        #expect(q.hiddenCount == 1)   // b is hidden
+        #expect(q.totalCount == 2)
+    }
 }
 
 /// (ramon fork / Agent Queue, §11 health) Tests for the queue-health pieces: the

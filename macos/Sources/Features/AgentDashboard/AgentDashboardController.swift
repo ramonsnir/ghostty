@@ -203,6 +203,43 @@ final class InMemoryOriginFilterStore: OriginFilterStore {
     func save(_ excluded: Set<String>) { self.excluded = excluded }
 }
 
+/// (ramon fork / Agent Dashboard) Persistence boundary for the set of origin
+/// sections (queue names, or `(other)`) the user has COLLAPSED. A pure VIEW
+/// preference — a collapsed section hides its tiles but never touches the model's
+/// attention/auto-unhide paths (a ringing/waiting agent in a collapsed section
+/// still rings + auto-unhides; the header surfaces its bell count). Injected for
+/// testability, mirroring `OriginFilterStore`. Keyed by origin STRING (the queue
+/// name is stable across relaunch, unlike a surface UUID).
+protocol CollapsedSectionStore {
+    func load() -> Set<String>
+    func save(_ collapsed: Set<String>)
+}
+
+/// Production collapsed-section store backed by the fork bundle-id `UserDefaults`
+/// domain. Stores the collapsed origins as a string array.
+struct UserDefaultsCollapsedSectionStore: CollapsedSectionStore {
+    static let key = "agentDashboardCollapsedSections"
+    let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func load() -> Set<String> {
+        Set(defaults.stringArray(forKey: Self.key) ?? [])
+    }
+
+    func save(_ collapsed: Set<String>) {
+        defaults.set(Array(collapsed), forKey: Self.key)
+    }
+}
+
+/// In-memory `CollapsedSectionStore` for tests.
+final class InMemoryCollapsedSectionStore: CollapsedSectionStore {
+    private var collapsed: Set<String>
+    init(_ collapsed: Set<String> = []) { self.collapsed = collapsed }
+    func load() -> Set<String> { collapsed }
+    func save(_ collapsed: Set<String>) { self.collapsed = collapsed }
+}
+
 /// (ramon fork / Agent Dashboard, Layer 3) The single source of truth for the
 /// dashboard. `@MainActor`: every member touches AppKit / `SurfaceView` /
 /// `ghostty_surface_*` (which must be main-only). Detection runs off-main and
@@ -294,9 +331,21 @@ final class AgentDashboardModel: ObservableObject {
     /// relaunch, unlike a surface UUID).
     @Published private(set) var excludedOrigins: Set<String> = []
 
+    // MARK: - Collapsed sections (ramon fork / Agent Dashboard)
+
+    /// Origin sections (queue names, or `(other)`) the user has COLLAPSED.
+    /// `@Published` so the section headers + tile list re-render on toggle. A
+    /// pure VIEW preference — a collapsed section's tiles are not rendered, but
+    /// the header still shows its unhidden/total/bell summary, and the model's
+    /// attention paths are untouched (a collapsed section's ringing/waiting agent
+    /// still rings + auto-unhides). Persisted via `collapsedSectionStore`, keyed
+    /// by origin string (stable across relaunch, unlike a surface UUID).
+    @Published private(set) var collapsedOrigins: Set<String> = []
+
     private let store: HideStore
     private let orderStore: OrderStore
     private let originFilterStore: OriginFilterStore
+    private let collapsedSectionStore: CollapsedSectionStore
 
     /// (ramon fork / Agent hooks) How many background shells a `.waiting` surface
     /// has running, used to DEMOTE it (see `AgentEntry.backgroundShells`). Injected
@@ -344,15 +393,18 @@ final class AgentDashboardModel: ObservableObject {
         store: HideStore,
         agentStateStore: AgentStateStore = InMemoryAgentStateStore(),
         orderStore: OrderStore = InMemoryOrderStore(),
-        originFilterStore: OriginFilterStore = InMemoryOriginFilterStore()
+        originFilterStore: OriginFilterStore = InMemoryOriginFilterStore(),
+        collapsedSectionStore: CollapsedSectionStore = InMemoryCollapsedSectionStore()
     ) {
         self.store = store
         self.agentStore = agentStateStore
         self.orderStore = orderStore
         self.originFilterStore = originFilterStore
+        self.collapsedSectionStore = collapsedSectionStore
         self.hidden = store.load()
         self.manualOrder = orderStore.load()
         self.excludedOrigins = originFilterStore.load()
+        self.collapsedOrigins = collapsedSectionStore.load()
         let loaded = agentStateStore.load()
         let pruned = AgentDashboardModel.prune(
             loaded, now: Date(),
@@ -926,12 +978,31 @@ final class AgentDashboardModel: ObservableObject {
     struct OriginSection: Identifiable, Equatable {
         let id: String          // == origin
         let entries: [AgentEntry]
+        /// Count of this origin's HIDDEN agents (NOT in `entries`, which is the
+        /// unhidden set). Set by `groupByOrigin` from the per-origin hidden tally,
+        /// so the collapsed-section header can show "unhidden / total".
+        let hiddenCount: Int
+        /// Unhidden tile count (the agents rendered when expanded).
         var count: Int { entries.count }
+        /// Total agents in this origin = unhidden + hidden.
+        var totalCount: Int { entries.count + hiddenCount }
+        /// Number of unhidden tiles currently ringing the bell. Bells auto-unhide,
+        /// so every ringing agent is in `entries` — this is exact.
+        var bellCount: Int { entries.lazy.filter(\.bell).count }
         /// True for the catch-all `(other)` section (no queue controls on it).
         var isOther: Bool { id == AgentDashboardModel.otherOrigin }
 
+        init(id: String, entries: [AgentEntry], hiddenCount: Int = 0) {
+            self.id = id
+            self.entries = entries
+            self.hiddenCount = hiddenCount
+        }
+
         static func == (lhs: OriginSection, rhs: OriginSection) -> Bool {
-            lhs.id == rhs.id && lhs.entries.map(\.id) == rhs.entries.map(\.id)
+            lhs.id == rhs.id
+                && lhs.hiddenCount == rhs.hiddenCount
+                && lhs.entries.map(\.id) == rhs.entries.map(\.id)
+                && lhs.entries.map(\.bell) == rhs.entries.map(\.bell)
         }
     }
 
@@ -942,7 +1013,8 @@ final class AgentDashboardModel: ObservableObject {
     /// manual / recency carries into each section). Unit-tested.
     static func groupByOrigin(
         _ entries: [AgentEntry],
-        presentQueues: Set<String> = []
+        presentQueues: Set<String> = [],
+        hiddenCountByOrigin: [String: Int] = [:]
     ) -> [OriginSection] {
         var order: [String] = []           // first-seen origin order (for tie-stable grouping)
         var buckets: [String: [AgentEntry]] = [:]
@@ -958,13 +1030,21 @@ final class AgentDashboardModel: ObservableObject {
             buckets[q] = []
             order.append(q)
         }
+        // An origin whose ONLY agents are hidden still needs a section so its
+        // collapsed/expanded header (with the "0 of N" summary) is reachable.
+        for (o, n) in hiddenCountByOrigin where n > 0 && buckets[o] == nil {
+            buckets[o] = []
+            order.append(o)
+        }
         // Queue origins sorted case-insensitively, `(other)` always last.
         let origins = order.sorted { a, b in
             if a == otherOrigin { return false }
             if b == otherOrigin { return true }
             return a.localizedCaseInsensitiveCompare(b) == .orderedAscending
         }
-        return origins.map { OriginSection(id: $0, entries: buckets[$0] ?? []) }
+        return origins.map {
+            OriginSection(id: $0, entries: buckets[$0] ?? [], hiddenCount: hiddenCountByOrigin[$0] ?? 0)
+        }
     }
 
     // MARK: - Origin filter (instance API)
@@ -1004,7 +1084,45 @@ final class AgentDashboardModel: ObservableObject {
         // (§11 health) Present queues (minus any the user filtered out) get a section even
         // with no tiles — so the bar stays put while a queue is starting / all hidden.
         let present = Set(queueStatuses.keys).subtracting(excludedOrigins)
-        return AgentDashboardModel.groupByOrigin(filtered, presentQueues: present)
+        // Per-origin hidden tally (filtered the same way) feeds each section's
+        // "unhidden / total" summary + keeps a fully-hidden origin's header reachable.
+        let hiddenByOrigin = hiddenCountByOrigin().filter { !excludedOrigins.contains($0.key) }
+        return AgentDashboardModel.groupByOrigin(
+            filtered, presentQueues: present, hiddenCountByOrigin: hiddenByOrigin)
+    }
+
+    /// Count of HIDDEN live agents per origin (queue name or `(other)`). A hidden
+    /// agent is excluded from `entries`, so its origin is read from its annotation
+    /// directly (the same rule as `origin(of:)`, kept for hidden surfaces too —
+    /// annotations are pruned only on vanish). Feeds the collapsed-section summary.
+    private func hiddenCountByOrigin() -> [String: Int] {
+        var out: [String: Int] = [:]
+        for s in live where hidden.contains(s.id) && agents[s.id] != nil {
+            let o: String
+            if let q = annotations[s.id]?.queueName, !q.isEmpty { o = q }
+            else { o = AgentDashboardModel.otherOrigin }
+            out[o, default: 0] += 1
+        }
+        return out
+    }
+
+    // MARK: - Collapsed sections (ramon fork / Agent Dashboard)
+
+    /// Whether the given origin's section is collapsed in the view.
+    func isCollapsed(_ origin: String) -> Bool {
+        collapsedOrigins.contains(origin)
+    }
+
+    /// Toggle a section's collapsed state (a header gesture). Persists. Does NOT
+    /// touch the hide set or attention paths — a collapsed section's ringing/waiting
+    /// agent still rings + auto-unhides (the header surfaces its bell count).
+    func toggleCollapsed(_ origin: String) {
+        if collapsedOrigins.contains(origin) {
+            collapsedOrigins.remove(origin)
+        } else {
+            collapsedOrigins.insert(origin)
+        }
+        collapsedSectionStore.save(collapsedOrigins)
     }
 
     /// Toggle an origin's inclusion in the view. Excluded ⇄ included. Persists.
@@ -1129,7 +1247,8 @@ final class AgentDashboardController: NSWindowController {
             store: UserDefaultsHideStore(),
             agentStateStore: UserDefaultsAgentStateStore(),
             orderStore: UserDefaultsOrderStore(),
-            originFilterStore: UserDefaultsOriginFilterStore())
+            originFilterStore: UserDefaultsOriginFilterStore(),
+            collapsedSectionStore: UserDefaultsCollapsedSectionStore())
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
         let panel = AgentDashboardPanel(pinned: ghostty.config.agentDashboardPin)

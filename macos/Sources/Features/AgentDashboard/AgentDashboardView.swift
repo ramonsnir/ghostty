@@ -87,32 +87,44 @@ struct AgentDashboardView: View {
                     .moveDisabled(true)
             }
             ForEach(model.sections) { section in
+                // A lone `(other)` section (the legacy, no-queue case) shows no
+                // header — keep the classic flat look until a queue origin exists.
+                // Without a header there's no collapse affordance, so it never
+                // collapses; once there are 2+ origins, every section is labeled
+                // and collapsible.
+                let hasHeader = !(model.sections.count == 1 && section.isOther)
+                let collapsed = hasHeader && model.isCollapsed(section.id)
                 Section {
-                    ForEach(section.entries) { entry in
-                        AgentPreviewTile(
-                            entry: entry,
-                            ghostty: ghostty,
-                            previewsEnabled: ptyHostEnabled,
-                            onHide: { model.hide(entry.id) },
-                            onClose: { model.closeSurface(entry.id) }
-                        )
-                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                    }
-                    .onMove { source, destination in
-                        // Reorder ACROSS all sections: capture the global displayed
-                        // session-id order, apply the in-section move at the right
-                        // offset, then hand the full order to the model.
-                        moveWithinSection(section, source: source, destination: destination)
+                    if !collapsed {
+                        ForEach(section.entries) { entry in
+                            AgentPreviewTile(
+                                entry: entry,
+                                ghostty: ghostty,
+                                previewsEnabled: ptyHostEnabled,
+                                onHide: { model.hide(entry.id) },
+                                onClose: { model.closeSurface(entry.id) }
+                            )
+                            .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                        }
+                        .onMove { source, destination in
+                            // Reorder ACROSS all sections: capture the global displayed
+                            // session-id order, apply the in-section move at the right
+                            // offset, then hand the full order to the model.
+                            moveWithinSection(section, source: source, destination: destination)
+                        }
                     }
                 } header: {
-                    // A lone `(other)` section (the legacy, no-queue case) shows no
-                    // header — keep the classic flat look until a queue origin
-                    // exists. Once there are 2+ origins, every section is labeled.
-                    if !(model.sections.count == 1 && section.isOther) {
+                    if hasHeader {
                         OriginSectionHeader(
                             section: section,
+                            collapsed: collapsed,
+                            onToggleCollapse: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.toggleCollapsed(section.id)
+                                }
+                            },
                             status: model.queueStatuses[section.id],
                             onPause: { model.sendRunCommand(.pause, run: section.id) },
                             onResume: { model.sendRunCommand(.resume, run: section.id) },
@@ -354,6 +366,11 @@ struct AgentDashboardView: View {
 /// it — `textContent`-safe; it is untrusted queue-template / annotation data).
 private struct OriginSectionHeader: View {
     let section: AgentDashboardModel.OriginSection
+    /// Whether this section is collapsed (tiles hidden). When collapsed the header
+    /// shows a compact "unhidden / total · bells" summary in place of the tiles.
+    let collapsed: Bool
+    /// Toggle this section's collapsed state (the disclosure chevron gesture).
+    let onToggleCollapse: () -> Void
     /// (§11 health) The run's latest health snapshot, when the supervisor has reported
     /// one. nil for `(other)` and for a queue that hasn't reported yet.
     let status: QueueStatus?
@@ -388,17 +405,33 @@ private struct OriginSectionHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
+                // Disclosure chevron — collapse/expand the section's tiles.
+                Button(action: onToggleCollapse) {
+                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(collapsed ? "Expand section" : "Collapse section")
                 Text(section.id)
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text("\(section.count)")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Color.secondary.opacity(0.18))
-                    .clipShape(Capsule())
+                if collapsed {
+                    // The tiles are hidden, so surface their counts: unhidden /
+                    // total + the number of bells ringing in this section.
+                    collapsedSummary
+                } else {
+                    Text("\(section.count)")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.18))
+                        .clipShape(Capsule())
+                }
                 Spacer(minLength: 4)
                 if !section.isOther {
                     // Cheap run-control intents (§8/§11). Pause and Resume are both
@@ -496,6 +529,42 @@ private struct OriginSectionHeader: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .help("Open the backlog dependency graph (\(graph.nodes.count) items in scope)")
+    }
+
+    /// The compact collapsed-section summary: unhidden count, total count, and the
+    /// number of bells ringing — shown in the header when the section's tiles are
+    /// hidden so the counts aren't lost behind the collapse.
+    @ViewBuilder
+    private var collapsedSummary: some View {
+        HStack(spacing: 4) {
+            // "{unhidden} of {total}" when some agents are hidden; just the count
+            // (in a capsule, matching the expanded look) when none are hidden.
+            if section.hiddenCount > 0 {
+                Text("\(section.count) of \(section.totalCount)")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.18))
+                    .clipShape(Capsule())
+                    .help("\(section.count) shown · \(section.hiddenCount) hidden · \(section.totalCount) total")
+            } else {
+                Text("\(section.totalCount)")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.18))
+                    .clipShape(Capsule())
+            }
+            if section.bellCount > 0 {
+                Label("\(section.bellCount)", systemImage: "bell.fill")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .labelStyle(.titleAndIcon)
+                    .help("\(section.bellCount) agent\(section.bellCount == 1 ? "" : "s") ringing the bell")
+            }
+        }
     }
 
     @ViewBuilder
