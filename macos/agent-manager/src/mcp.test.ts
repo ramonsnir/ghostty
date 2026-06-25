@@ -251,6 +251,7 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       active: 2,
       dispatched: 2,
       maxItems: null,
+      concurrency: 6,
       next: [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }],
       running: [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }],
     }),
@@ -263,6 +264,7 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   assert.equal(args.queued, 7);
   assert.equal(args.active, 2);
   assert.equal(args.maxItems, null);
+  assert.equal(args.concurrency, 6);
   assert.deepEqual(args.next, [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }]);
   assert.deepEqual(args.running, [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }]);
 });
@@ -412,6 +414,21 @@ test("coerceQueueCommands: carries set_max_items + its string maxItems value (no
     { action: "set_max_items", run: "r2", maxItems: "unlimited" },
     { action: "set_max_items", run: "r3" },
     { action: "set_max_items", run: "r4" },
+  ]);
+});
+
+test("coerceQueueCommands: carries set_concurrency + its string concurrency value (non-strings dropped)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "set_concurrency", run: "r", concurrency: "9" },
+      { action: "set_concurrency", run: "r2", concurrency: 9 }, // non-string dropped, action kept
+      { action: "set_concurrency", run: "r3" }, // no value (kept; reducer ignores)
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "set_concurrency", run: "r", concurrency: "9" },
+    { action: "set_concurrency", run: "r2" },
+    { action: "set_concurrency", run: "r3" },
   ]);
 });
 

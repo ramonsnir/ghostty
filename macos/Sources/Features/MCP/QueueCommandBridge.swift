@@ -29,12 +29,13 @@ struct QueueCommand: Equatable, Sendable {
     enum Action: String, Equatable, Sendable {
         case start, stop, abort, pause, resume
         case setMaxItems = "set_max_items"
+        case setConcurrency = "set_concurrency"
     }
 
     let action: Action
     /// The template basename to start (start only).
     let template: String?
-    /// The active run name to pause/resume/stop/abort/setMaxItems.
+    /// The active run name to pause/resume/stop/abort/setMaxItems/setConcurrency.
     let run: String?
     /// (§8b) START-TIME parameter answers (param name → value) collected by the
     /// queue palette's prompt, passed through to the sidecar factory (start only).
@@ -44,32 +45,40 @@ struct QueueCommand: Equatable, Sendable {
     /// string the dashboard cap control collected ("10", "unlimited"/"0"/…). The
     /// sidecar parses it (blank/garbage = ignored). nil for other actions.
     let maxItems: String?
+    /// (live concurrency edit) The new max-simultaneous-agents VALUE for
+    /// `setConcurrency` — the raw string the dashboard parallel control collected
+    /// ("9", …). The sidecar parses it (blank/garbage/non-positive = ignored, NO
+    /// "unlimited" token). nil for other actions.
+    let concurrency: String?
 
     init(
         action: Action,
         template: String? = nil,
         run: String? = nil,
         params: [String: String]? = nil,
-        maxItems: String? = nil
+        maxItems: String? = nil,
+        concurrency: String? = nil
     ) {
         self.action = action
         self.template = template
         self.run = run
         self.params = params
         self.maxItems = maxItems
+        self.concurrency = concurrency
     }
 
     /// PURE: the wire dict drained by `take_queue_commands`. `action` is always
-    /// present; `template`/`run`/`maxItems` are emitted only when non-nil and
-    /// non-empty (mirrors the sidecar's tolerant `coerceQueueCommands`, which only
-    /// keeps non-empty strings); `params` is emitted only when non-nil AND non-empty
-    /// (the sidecar drops empty/non-string entries regardless). Unit-tested.
+    /// present; `template`/`run`/`maxItems`/`concurrency` are emitted only when
+    /// non-nil and non-empty (mirrors the sidecar's tolerant `coerceQueueCommands`,
+    /// which only keeps non-empty strings); `params` is emitted only when non-nil AND
+    /// non-empty (the sidecar drops empty/non-string entries regardless). Unit-tested.
     var jsonObject: [String: Any] {
         var d: [String: Any] = ["action": action.rawValue]
         if let template, !template.isEmpty { d["template"] = template }
         if let run, !run.isEmpty { d["run"] = run }
         if let params, !params.isEmpty { d["params"] = params }
         if let maxItems, !maxItems.isEmpty { d["maxItems"] = maxItems }
+        if let concurrency, !concurrency.isEmpty { d["concurrency"] = concurrency }
         return d
     }
 }
@@ -123,6 +132,10 @@ struct QueueStatus: Equatable, Sendable {
     let dispatched: Int
     /// Effective lifetime cap, or nil for unlimited.
     let maxItems: Int?
+    /// Effective max SIMULTANEOUS agents (the live `set_concurrency` edit if set, else the
+    /// template `concurrency`). 0 when unknown (legacy/missing). The header shows it +
+    /// lets the user tap-to-edit it.
+    let concurrency: Int
     /// Up to ~25 of the next actionable WAITING items (the "N waiting" dropdown). May be
     /// shorter than `queued` (capped) — the view shows "… and N more" then.
     let next: [Item]
@@ -138,7 +151,7 @@ struct QueueStatus: Equatable, Sendable {
         QueueStatus(
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: newMax,
-            next: next, running: running)
+            concurrency: concurrency, next: next, running: running)
     }
 
     /// A copy with `phase` replaced — optimistic pause/resume/stop feedback.
@@ -146,7 +159,25 @@ struct QueueStatus: Equatable, Sendable {
         QueueStatus(
             queueName: queueName, present: present, phase: newPhase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
-            next: next, running: running)
+            concurrency: concurrency, next: next, running: running)
+    }
+
+    /// A copy with `concurrency` replaced — optimistic parallel-edit feedback (the
+    /// sidecar's next authoritative push reconciles it).
+    func withConcurrency(_ newConcurrency: Int) -> QueueStatus {
+        QueueStatus(
+            queueName: queueName, present: present, phase: phase, queued: queued,
+            listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
+            concurrency: newConcurrency, next: next, running: running)
+    }
+
+    /// (pure, testable) Parse the concurrency-editor's raw string the SAME way the sidecar's
+    /// `parseConcurrencyValue` does, for the optimistic update: a positive integer, else nil
+    /// (blank / garbage / zero / negative — leave unchanged, the sidecar ignores it too).
+    static func parseConcurrencyOptimistic(_ raw: String) -> Int? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let n = Int(s), n > 0 { return n }
+        return nil
     }
 
     /// (pure, testable) Parse the cap-editor's raw string the SAME way the sidecar's
@@ -200,6 +231,7 @@ struct QueueStatusPayload {
             queueName: queueName, present: present, phase: phase,
             queued: int("queued"), listOk: listOk, active: int("active"),
             dispatched: int("dispatched"), maxItems: maxItems,
+            concurrency: int("concurrency"),
             next: items("next"), running: items("running")))
     }
 }

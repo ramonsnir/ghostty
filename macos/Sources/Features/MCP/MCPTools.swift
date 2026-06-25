@@ -253,6 +253,7 @@ enum MCPTools {
                     "active": ["type": "integer"],
                     "dispatched": ["type": "integer"],
                     "maxItems": ["type": ["integer", "null"], "description": "Lifetime cap; null/omitted = unlimited."],
+                    "concurrency": ["type": "integer", "description": "Effective max simultaneous agents (the live set_concurrency edit or the template concurrency)."],
                     "next": [
                         "type": "array",
                         "items": [

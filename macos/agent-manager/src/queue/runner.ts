@@ -232,6 +232,15 @@ export interface QueueRun {
    *  cap. Persisted in the active-runs record so a restart re-applies it. Reducing it below
    *  what is already dispatched only stops FUTURE dispatch (running agents are never killed). */
   maxItemsLive?: number | null;
+  /** (live concurrency edit) A run-level OVERRIDE of the max SIMULTANEOUS agents, set by a
+   *  `set_concurrency` command WHILE the run is live (the dashboard parallel control). Takes
+   *  PRECEDENCE over the template `concurrency` in `effectiveConcurrency`, and (because the
+   *  grid `cols*rows` is now just a pane cap under balanced-BSP, §12) ALSO lifts the effective
+   *  grid cap in `effectiveGridCap` so raising it past `cols*rows` actually opens more panes.
+   *  `undefined` = no live edit (use the template). Always a positive integer. Persisted in
+   *  the active-runs record so a restart re-applies it. Lowering it only stops FUTURE dispatch
+   *  (running agents are never killed). */
+  concurrencyLive?: number;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -248,6 +257,7 @@ export function makeQueueRun(
     draining?: boolean;
     params?: Record<string, string>;
     maxItemsLive?: number | null;
+    concurrencyLive?: number;
   } = {},
 ): QueueRun {
   const params = opts.params ?? {};
@@ -259,6 +269,7 @@ export function makeQueueRun(
     storeIO,
     params,
     maxItemsLive: opts.maxItemsLive,
+    concurrencyLive: opts.concurrencyLive,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
@@ -289,6 +300,22 @@ export function effectiveMaxItemsCap(run: QueueRun): number | null {
   const override = resolveMaxItemsOverride(run.template, run.params);
   const cap = override === undefined ? run.template.maxItems : override;
   return cap <= 0 ? null : cap;
+}
+
+/** The run's EFFECTIVE max simultaneous agents: the LIVE `set_concurrency` edit if set, else
+ *  the template `concurrency`. PURE. Shared by the dispatch gate + the health report so they
+ *  agree. */
+export function effectiveConcurrency(run: QueueRun): number {
+  return run.concurrencyLive ?? run.template.concurrency;
+}
+
+/** The run's EFFECTIVE grid (pane) cap. PURE. Under balanced-BSP (§12) `cols*rows` is purely
+ *  a pane cap, so a live concurrency raised ABOVE it must lift the pane cap too — otherwise
+ *  the extra agents would have no free grid slot. So the effective cap is the LARGER of the
+ *  template `cols*rows` and the effective concurrency. (Concurrency is the binding limit; this
+ *  just keeps the pane budget from artificially capping it below the user's chosen parallelism.) */
+export function effectiveGridCap(run: QueueRun): number {
+  return Math.max(gridCap(run.template.grid.cols, run.template.grid.rows), effectiveConcurrency(run));
 }
 
 /** The injectable seams the supervisor pass needs (mirrors LoopDeps). */
@@ -349,6 +376,9 @@ export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
     // Persist a LIVE maxItems edit so a restart re-applies it (null = unlimited; omitted
     // when never live-edited, so a restart falls back to the start-time/template cap).
     if (run.maxItemsLive !== undefined) rec.maxItemsLive = run.maxItemsLive;
+    // Persist a LIVE concurrency edit so a restart re-applies it (omitted when never edited,
+    // so a restart falls back to the template concurrency).
+    if (run.concurrencyLive !== undefined) rec.concurrencyLive = run.concurrencyLive;
     out.push(rec);
   }
   return out;
@@ -768,6 +798,7 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     listOk: run.lastListOk,
     dispatched: run.lifetimeDispatched,
     maxItemsCap: effectiveMaxItemsCap(run),
+    concurrency: effectiveConcurrency(run),
     // A generous cap for the "N waiting" dropdown (the count itself is always exact);
     // beyond this the GUI shows "… and N more".
     nextLimit: 25,
@@ -1077,7 +1108,12 @@ async function dispatchCandidates(
   // count is every assignment currently OCCUPYING a slot (EXITED kept-but-freed ones
   // excluded, §6).
   const activeCount = slotOccupancy(run);
-  const slots = remainingSlots(t, activeCount, globalRemaining);
+  // (live concurrency edit) Bound the sweep by the EFFECTIVE concurrency + grid cap (the
+  // `set_concurrency` override lifts both; default = template values), so raising it past
+  // `cols*rows` actually dispatches more agents (§12 — the grid is just a pane cap now).
+  const slots = remainingSlots(
+    t, activeCount, globalRemaining, effectiveConcurrency(run), effectiveGridCap(run),
+  );
   // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap
   // (null = unlimited ⇒ Infinity remaining; selectCandidates' Math.min(slots, Infinity) =
   // slots). The global `agent-queue-max-total` + grid/concurrency still bound an unlimited run.
@@ -1210,7 +1246,9 @@ async function dispatchOne(
   for (const a of run.active.values()) {
     if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
   }
-  const cap = gridCap(t.grid.cols, t.grid.rows);
+  // The pane cap is the EFFECTIVE grid cap (lifted by a live `set_concurrency` edit, §12), so
+  // a slot exists for every agent the (gated) concurrency allows.
+  const cap = effectiveGridCap(run);
   const slot = lowestFreeSlot(occupied, cap);
   if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
   // The split is a BALANCED BSP (§12): the GUI splits the largest pane in the run's tab.

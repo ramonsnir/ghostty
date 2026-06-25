@@ -440,6 +440,25 @@ test("serializeActiveRuns / parseActiveRuns: round-trips a live maxItems edit (n
   assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
 });
 
+test("serializeActiveRuns / parseActiveRuns: round-trips a live concurrency edit", () => {
+  const runs: ActiveRunRecord[] = [
+    { template: "example", name: "ExampleOS", paused: false, draining: false, concurrencyLive: 9 },
+  ];
+  assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
+});
+
+test("parseActiveRuns: tolerates a malformed concurrencyLive (non-positive / non-int / string / null dropped)", () => {
+  for (const v of ["0", "-2", "2.5", '"9"', "true", "null"]) {
+    const recs = parseActiveRuns(`{"version":1,"runs":[{"template":"t","name":"t","concurrencyLive":${v}}]}`);
+    assert.equal(recs.length, 1, `v=${v} keeps the record`);
+    assert.equal(recs[0].concurrencyLive, undefined, `v=${v} drops the bad concurrencyLive`);
+  }
+  assert.equal(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","concurrencyLive":9}]}')[0].concurrencyLive,
+    9,
+  );
+});
+
 test("parseActiveRuns: tolerates a malformed maxItemsLive (non-positive / non-int / string dropped)", () => {
   // A garbage maxItemsLive is DROPPED (record kept without it → falls back to the param/template cap).
   for (const v of ["0", "-2", "2.5", '"5"', "true"]) {

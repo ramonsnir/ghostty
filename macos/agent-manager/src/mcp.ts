@@ -188,6 +188,7 @@ export class McpClient {
       active: status.active,
       dispatched: status.dispatched,
       maxItems: status.maxItems,
+      concurrency: status.concurrency,
       next: status.next,      // each carries key/title?/url?
       running: status.running, // key/title?/url? per running agent
     });
@@ -420,6 +421,7 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   "pause",
   "resume",
   "set_max_items",
+  "set_concurrency",
 ]);
 
 /**
@@ -427,8 +429,8 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
  * PURE + TOLERANT — exported for unit testing. Accepts the `{commands:[...]}` envelope
  * (the wire shape). Anything else — a non-object, a missing/non-array `commands`, a
  * non-object entry, or an entry with an unrecognized `action` — yields `[]` / drops that
- * entry. Only `action`, `template`, `run`, `params`, and `maxItems` are carried (and only
- * when correctly typed).
+ * entry. Only `action`, `template`, `run`, `params`, `maxItems`, and `concurrency` are
+ * carried (and only when correctly typed).
  */
 export function coerceQueueCommands(obj: unknown): QueueCommand[] {
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return [];
@@ -453,6 +455,8 @@ export function coerceQueueCommands(obj: unknown): QueueCommand[] {
     }
     // (live maxItems edit) the raw cap value for set_max_items — a string only.
     if (typeof r.maxItems === "string" && r.maxItems.length > 0) cmd.maxItems = r.maxItems;
+    // (live concurrency edit) the raw value for set_concurrency — a string only.
+    if (typeof r.concurrency === "string" && r.concurrency.length > 0) cmd.concurrency = r.concurrency;
     out.push(cmd);
   }
   return out;

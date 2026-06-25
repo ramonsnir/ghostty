@@ -8,6 +8,7 @@ import {
   TEMPLATE_DEFAULTS,
   makeTemplateLoader,
   missingRequiredParams,
+  parseConcurrencyValue,
   parseMaxItemsValue,
   resolveMaxItemsOverride,
   resolveParamsEnv,
@@ -219,6 +220,16 @@ test("parseMaxItemsValue: unlimited tokens → null, positive int → N, blank/g
   // Blank / garbage / non-positive-int → undefined (caller decides the fallback).
   for (const v of ["", "   ", "abc", "1.5", "-3", "2x", "NaN"]) {
     assert.equal(parseMaxItemsValue(v), undefined, `"${v}" → undefined`);
+  }
+});
+
+test("parseConcurrencyValue: positive int → N, blank/garbage/zero/negative → undefined (NO unlimited)", () => {
+  assert.equal(parseConcurrencyValue("1"), 1);
+  assert.equal(parseConcurrencyValue(" 9 "), 9);
+  assert.equal(parseConcurrencyValue("12"), 12);
+  // Unlike maxItems there is NO "unlimited"/0 token — concurrency is always a finite count.
+  for (const v of ["", "   ", "0", "-3", "1.5", "abc", "unlimited", "∞", "NaN"]) {
+    assert.equal(parseConcurrencyValue(v), undefined, `"${v}" → undefined`);
   }
 });
 

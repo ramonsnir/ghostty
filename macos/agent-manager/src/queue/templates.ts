@@ -540,6 +540,22 @@ export function parseMaxItemsValue(raw: string): number | null | undefined {
 }
 
 /**
+ * Parse a raw CONCURRENCY value string (the live `set_concurrency` dashboard control). PURE.
+ * Unlike maxItems there is NO "unlimited" — concurrency is always a finite positive count of
+ * simultaneous agents (an unbounded fan-out would spawn a pane per actionable item). Returns:
+ *   - a positive integer N for an explicit numeric value.
+ *   - `undefined` for blank or garbage (incl. 0 / negatives / non-integers) — the caller
+ *     IGNORES it (keeps the current concurrency), so a fat-finger never silently changes it.
+ */
+export function parseConcurrencyValue(raw: string): number | undefined {
+  const s = raw.trim();
+  if (s === "") return undefined;
+  const n = Number(s);
+  if (Number.isInteger(n) && n > 0) return n;
+  return undefined; // blank / garbage / non-positive
+}
+
+/**
  * (§8b) Resolve the run's maxItems OVERRIDE from a "maxItems"-target param's answer. PURE.
  * Returns:
  *   - `undefined` when the template declares no maxItems param, OR the answer is blank, OR

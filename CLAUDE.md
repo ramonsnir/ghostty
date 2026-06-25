@@ -1210,8 +1210,49 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
     Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
     **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **LIVE concurrency EDIT — change a running queue's max SIMULTANEOUS agents from the dashboard,
+    no restart (the headline ask: bump example 6→9 mid-run).** Mirrors the live maxItems edit. A new
+    `set_concurrency{run,concurrency}` command re-sets a LIVE run's max parallel agents WITHOUT
+    restarting it (a re-`start` is a same-scope no-op, so this is the only in-place path). The
+    dashboard header gets a tap-to-edit **`⇉ N` parallel chip** (`rectangle.split.3x1` +
+    presets 1/2/3/4/6/9 + a custom field; shown once the run reports `concurrency > 0`). Engine:
+    a mutable `QueueRun.concurrencyLive?: number` (`undefined`=no edit; always a positive int — NO
+    "unlimited", an unbounded fan-out would spawn a pane per item). Two pure helpers consult it:
+    `effectiveConcurrency(run)` = `concurrencyLive ?? template.concurrency`, and — load-bearing —
+    `effectiveGridCap(run)` = `max(cols*rows, effectiveConcurrency)`. **Why the grid lift:** under
+    balanced-BSP (§12) `grid.cols*rows` is now purely a PANE cap, and `dispatchOne`/`remainingSlots`
+    bound dispatch by `min(concurrency, gridCap)` — so raising concurrency past `cols*rows` (example's
+    grid is 3×2=6) would do nothing unless the pane cap lifts too. So the live edit lifts BOTH (one
+    knob = "max parallel"). `remainingSlots` gained optional `effConcurrency`/`effGridCap` params
+    (default = template values, so existing callers/tests are unchanged); `dispatchCandidates` +
+    `dispatchOne` pass the effective values. Parsed by a pure `parseConcurrencyValue` (positive int
+    only; blank/garbage/zero/negative → ignored, so a fat-finger never changes parallelism). Persisted
+    in the active-runs record (`concurrencyLive`) so a restart re-applies it; surfaced in the §11
+    health report (`QueueStatusReport.concurrency` = effective value) so the dashboard shows + edits it.
+    The GUI optimistically updates the chip (`QueueStatus.withConcurrency` +
+    `parseConcurrencyOptimistic`) before the sidecar's authoritative push. Lowering it only stops
+    FUTURE dispatch (running agents are never killed); raising it re-enables dispatch on the next
+    list-DUE sweep (≤`listMs`). Wiring: sidecar — `templates.ts` (`parseConcurrencyValue`),
+    `supervisor.ts` (`remainingSlots` eff params), `runner.ts` (`QueueRun.concurrencyLive` +
+    `effectiveConcurrency`/`effectiveGridCap` + `makeQueueRun` opt + `activeRunRecords` + dispatch
+    gate + `reportQueueStatus`), `status.ts` (`QueueStatusReport.concurrency` + inputs + builder),
+    `commands.ts` (`set_concurrency` action + `concurrency` field + reducer + `applyCommands`
+    change-bit), `store.ts` (`ActiveRunRecord.concurrencyLive` + tolerant parse), `wiring.ts`
+    (rehydrate), `mcp.ts` (`coerceQueueCommands` whitelist + `reportQueueStatus` forward). Swift —
+    `QueueCommandBridge.swift` (`QueueCommand.Action.setConcurrency`="set_concurrency" + `concurrency`
+    field + `jsonObject`; `QueueStatus.concurrency` + `withConcurrency`/`parseConcurrencyOptimistic` +
+    payload parse), `MCPTools.swift` (`report_queue_status` schema `concurrency`),
+    `AgentDashboardController.swift` (`setQueueConcurrency(run:value:)`), `AgentDashboardView.swift`
+    (`OriginSectionHeader` `⇉ N` chip + `concurrencyEditorPopover` + `onSetConcurrency`). Tests:
+    sidecar `templates.test.ts` (`parseConcurrencyValue`), `supervisor.test.ts` (`remainingSlots` eff
+    override), `runner.test.ts` (`effectiveConcurrency`/`effectiveGridCap` + bump-dispatches-3rd),
+    `commands.test.ts` (set_concurrency apply/ignore-garbage/unknown-run/change-bit), `store.test.ts`
+    (round-trip + tolerant parse), `mcp.test.ts` (coerce + report forward), `status.test.ts`
+    (concurrency passthrough); Swift `MCPServerTests` (`queueCommandJSONObjectSetConcurrency*` +
+    `queueStatusPayload` concurrency), `AgentDashboardTests` (`parseConcurrencyOptimistic*` +
+    `setQueueConcurrencyOptimistically*`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
   - **INSTANT command feedback (snappiness fix for ALL queue commands).** A queue command
-    (`set_max_items`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
+    (`set_max_items`/`set_concurrency`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
     NEXT health push — i.e. after the ~5s `QUEUE_POLL_INTERVAL_MS` poll gap AND that sweep's
     provider round-trips (per-agent `status` probes + `list`), since `reportQueueStatus` is the
     LAST step of a sweep. Felt like 5–15s ("really slow"). Two-part fix: **(GUI optimistic)**

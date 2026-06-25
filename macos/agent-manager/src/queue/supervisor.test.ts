@@ -190,6 +190,16 @@ test("remainingSlots: smaller of concurrency room, grid room, global remaining",
   assert.equal(remainingSlots(tmpl(), 20, 100), 0);
 });
 
+test("remainingSlots: effConcurrency/effGridCap OVERRIDE the template (live set_concurrency)", () => {
+  // Template concurrency 6, grid 3x2=6. A live concurrency of 9 (with the lifted grid cap 9)
+  // gives room 9-2=7 instead of the template's 6-2=4.
+  const t = tmpl({ concurrency: 6, grid: { cols: 3, rows: 2, fill: "columns" } });
+  assert.equal(remainingSlots(t, 2, 100), 4, "template values: min(6,6)-2 = 4");
+  assert.equal(remainingSlots(t, 2, 100, 9, 9), 7, "lifted to 9: min(9,9)-2 = 7");
+  // The grid cap still binds if it is NOT lifted alongside concurrency.
+  assert.equal(remainingSlots(t, 2, 100, 9, 6), 4, "grid cap 6 still binds at 9 concurrency");
+});
+
 // ---------------------------------------------------------------------------
 // nextState — the §6 state machine.
 // ---------------------------------------------------------------------------

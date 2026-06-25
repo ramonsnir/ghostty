@@ -276,6 +276,57 @@ test("applyCommands: a set_max_items is a persistence-affecting change", () => {
   );
 });
 
+test("applyCommand set_concurrency: sets the live concurrency on a live run", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const res = applyCommand(reg, { action: "set_concurrency", run: "r", concurrency: "9" }, factory);
+  assert.equal(res.kind, "concurrencySet");
+  assert.equal(res.runName, "r");
+  assert.equal(reg.get("r")!.concurrencyLive, 9);
+});
+
+test("applyCommand set_concurrency: blank/garbage/zero/negative is IGNORED (no change)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  reg.get("r")!.concurrencyLive = 4; // a prior live value
+  for (const v of ["", "  ", "abc", "0", "-2", "1.5", "unlimited"]) {
+    const res = applyCommand(reg, { action: "set_concurrency", run: "r", concurrency: v }, factory);
+    assert.equal(res.kind, "noop", `"${v}" is ignored`);
+    assert.equal(reg.get("r")!.concurrencyLive, 4, `"${v}" leaves the prior value untouched`);
+  }
+});
+
+test("applyCommand set_concurrency: unknown run / missing run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  assert.equal(
+    applyCommand(reg, { action: "set_concurrency", run: "ghost", concurrency: "9" }, factory).kind,
+    "noop",
+  );
+  assert.equal(
+    applyCommand(reg, { action: "set_concurrency", concurrency: "9" }, factory).kind,
+    "noop",
+  );
+  assert.equal(reg.get("r")!.concurrencyLive, undefined, "the real run is untouched");
+});
+
+test("applyCommands: a set_concurrency is a persistence-affecting change (garbage is not)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommands(reg, [{ action: "start", template: "f" }], factory);
+  assert.equal(
+    applyCommands(reg, [{ action: "set_concurrency", run: "r", concurrency: "9" }], factory),
+    true,
+  );
+  assert.equal(
+    applyCommands(reg, [{ action: "set_concurrency", run: "r", concurrency: "junk" }], factory),
+    false,
+  );
+});
+
 test("applyCommand: pause/resume/stop/abort for an unknown run is a no-op", () => {
   const reg: RunRegistry = new Map();
   const { factory } = makeFactory({});
