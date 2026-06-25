@@ -155,14 +155,10 @@ extension Ghostty {
             guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return .init() }
             return .init(rawValue: v)
         }
-
-        var attentionFeaturesFocused: BellFeatures {
-            guard let config = self.config else { return .init() }
-            var v: CUnsignedInt = 0
-            let key = "attention-features-focused"
-            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return .init() }
-            return .init(rawValue: v)
-        }
+        // NOTE: there is intentionally NO `attentionFeaturesFocused` — the attention tier
+        // has no in-focus variant (a promotion means the user is away, and
+        // `attentionNeeded` clears on focus), so the bell tier's focused/out-of-focus
+        // split does not apply. See the `attention-features` doc in src/config/Config.zig.
 
         var bellAudioPath: ConfigPath? {
             guard let config = self.config else { return nil }

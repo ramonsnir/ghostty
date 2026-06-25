@@ -27,7 +27,10 @@ if unsure, omit it." (Model uncertainty rides the code's fail-open.)
 
 ## Config: two tiers over one shared, expanded vocabulary
 - `bell-features` / `bell-features-focused` — fires on EVERY bell, immediately.
-- `attention-features` / `attention-features-focused` — ADDED when a bell is promoted.
+- `attention-features` — ADDED when a bell is promoted. (NO `-focused` variant: a
+  promotion means the user is away, and attention clears on focus, so a focused-promoted
+  state is degenerate — the bell tier's focus split does not apply. Removed as a dead key
+  per the slice-6 review.)
 - **Additive:** promoted bell = bell-features ∪ attention-features; ignored bell =
   bell-features only. `bell-filter` off ⇒ bell-features only (today).
 
@@ -55,8 +58,11 @@ unhide+sort+tile mark), `push` (web push), `monitor` (web-monitor indicator).
 | web-monitor indicator | monitor | attention |
 | programmatic (list_surfaces.bell / .attentionNeeded) | — | TRUTHFUL (both, no flag) |
 
-Defaults: `bell-filter` OFF; `bell-features` = today's (attention,title) for back-compat;
-`attention-features` = title,border,bounce,badge,dashboard,push,monitor. Turning the
+Defaults: `bell-filter` OFF; `bell-features` = today's (attention,title) PLUS the
+always-on-pre-v2 effects dashboard,push,monitor (these were ungated/always-on before v2,
+so keeping them on the bell tier by default = "defaults reproduce today"); thus a raw bell
+by default fires bounce+badge (via the `attention` alias) + title + dashboard + push +
+monitor. `attention-features` = title,border,bounce,badge,dashboard,push,monitor. Turning the
 filter ON is when a user would dial `bell-features` down to `system,audio`.
 
 ## Separate bell vs attention state + clearing (P5 included)
@@ -86,7 +92,7 @@ aligns with fail-open.) Flag for Ramon's review of this doc.
 
 ## Implementation deltas (file-by-file)
 - **Zig:** expand BellFeatures vocabulary (bounce,badge,dashboard,push,monitor + the
-  `attention` alias); add `attention-features` + `attention-features-focused` keys;
+  `attention` alias); add the `attention-features` key (NO `-focused` variant — see above);
   parse tests.
 - **Swift:** expand the BellFeatures OptionSet; `Ghostty.Config.attentionFeatures(-Focused)`
   getters; route EACH consumer to read bell-features-tier on a raw bell vs

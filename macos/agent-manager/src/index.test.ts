@@ -680,6 +680,35 @@ test("bell-attention: attention:false ⇒ classified but NOT promoted (quiet raw
   assert.equal(fake.attentionCalls.length, 0, "not promoted");
 });
 
+// (bell-attention v2) Haiku realistically emits a STRINGIFIED boolean. A string
+// "false" is a CONFIDENT suppress; an UNRECOGNIZED string is uncertain ⇒ fail-open
+// PROMOTE. These two pin the load-bearing safety path end-to-end through runSweep.
+test("bell-attention: string \"false\" ⇒ classified but NOT promoted (confident suppress)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "launched workflow" } });
+  const strFalse: SummarizeFn = async () =>
+    '{"summary":"Workflow running","attention":"false"}';
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: strFalse, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "still classified");
+  assert.equal(fake.attentionCalls.length, 0, "string \"false\" suppresses like boolean false");
+});
+
+test("bell-attention: an UNRECOGNIZED attention string ⇒ PROMOTE (fail-open, not suppress)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const strMaybe: SummarizeFn = async () =>
+    '{"summary":"Needs you?","attention":"maybe"}';
+  const { deps } = makeDeps({ fake, summarize: strMaybe, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "uncertain value must fail-open to a promotion");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
 test("bell-attention: only a RISING edge forces — a held bell does not re-classify", async () => {
   const { surface, last } = debouncedAgent({ bell: true });
   // Pre-seed the bell as already-seen-high: no rising edge this sweep.

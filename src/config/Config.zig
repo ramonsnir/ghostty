@@ -3268,22 +3268,12 @@ keybind: Keybinds = .{},
 /// set (title, border, dock bounce+badge, dashboard, push, web-monitor) — i.e. when
 /// you enable the filter you'd typically also dial `bell-features` down to
 /// `system,audio`. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+/// NOTE: there is deliberately NO `attention-features-focused` analog to
+/// `bell-features-focused`. The attention tier has no in-focus variant by design: a
+/// promotion means "the user is away", and `attentionNeeded` is CLEARED the moment the
+/// surface gains focus (see SurfaceView.focusDidChange), so a "promoted + focused" state
+/// is degenerate/transient and a focus-specific attention set would be effectively inert.
 @"attention-features": BellFeatures = .{
-    .attention = false,
-    .title = true,
-    .border = true,
-    .bounce = true,
-    .badge = true,
-    .dashboard = true,
-    .push = true,
-    .monitor = true,
-},
-
-/// (ramon fork / Bell Attention v2) `attention-features` for when the promoted surface
-/// is truly in focus (same focus rule as `bell-features-focused`). Default matches
-/// `attention-features`; note a promoted surface usually clears its attention on focus,
-/// so this rarely applies. Fork-only.
-@"attention-features-focused": BellFeatures = .{
     .attention = false,
     .title = true,
     .border = true,
@@ -11406,7 +11396,6 @@ test "attention-features: parse, shared vocabulary, loud default" {
             },
             cfg.@"attention-features",
         );
-        try testing.expectEqual(cfg.@"attention-features", cfg.@"attention-features-focused");
         // bell-features default unchanged — the new flags default OFF there.
         try testing.expectEqual(
             BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
@@ -11436,6 +11425,30 @@ test "attention-features: parse, shared vocabulary, loud default" {
         try testing.expectEqual(true, cfg.@"attention-features".title);
         try testing.expectEqual(true, cfg.@"attention-features".border);
     }
+}
+
+test "BellFeatures: bit positions are the Zig<->Swift ABI contract" {
+    const testing = std.testing;
+    // `ghostty_config_get` hands the packed struct to Swift as a raw integer that the
+    // Swift OptionSet reinterprets by FIXED bit position (Ghostty.Config.swift:
+    // system=1<<0, audio=1<<1, attention=1<<2, title=1<<3, border=1<<4, bounce=1<<5,
+    // badge=1<<6, dashboard=1<<7, push=1<<8, monitor=1<<9). A Zig field REORDER (or a
+    // Swift bit typo) would silently route every effect to the wrong tier — the stale-ABI
+    // class of bug. Pin the Zig side here; the Swift side is asserted in GhosttyTests.
+    const B = @typeInfo(BellFeatures).@"struct".backing_integer.?;
+    const F = BellFeatures;
+    // Each case sets exactly one bit; `attention`/`title` default TRUE so they must be
+    // explicitly cleared when not under test.
+    try testing.expectEqual(@as(B, 1 << 0), @as(B, @bitCast(F{ .system = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 1), @as(B, @bitCast(F{ .audio = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 2), @as(B, @bitCast(F{ .attention = true, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 3), @as(B, @bitCast(F{ .attention = false, .title = true })));
+    try testing.expectEqual(@as(B, 1 << 4), @as(B, @bitCast(F{ .border = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 5), @as(B, @bitCast(F{ .bounce = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 6), @as(B, @bitCast(F{ .badge = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 7), @as(B, @bitCast(F{ .dashboard = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 8), @as(B, @bitCast(F{ .push = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 9), @as(B, @bitCast(F{ .monitor = true, .attention = false, .title = false })));
 }
 
 test "web-monitor: parse and default" {

@@ -11,6 +11,7 @@ import {
   ConcurrencyBudget,
   buildContext,
   coerceBool,
+  coerceAttention,
   composePrompt,
   eachJsonObject,
   extractFirstJsonObject,
@@ -584,8 +585,42 @@ test("parseSummary: parses attention boolean when present", () => {
   assert.equal(parseSummary('{"summary":"x","attention":"yes"}')?.attention, true);
 });
 
+// (bell-attention v2) The STRING "false" must parse to the boolean false — this is the
+// single most load-bearing safety value (Haiku realistically emits a stringified bool),
+// since `attention === false` is the ONLY thing that suppresses a bell promotion.
+test("parseSummary: string \"false\"/\"no\"/\"0\" => false (the only suppressor)", () => {
+  assert.equal(parseSummary('{"summary":"x","attention":"false"}')?.attention, false);
+  assert.equal(parseSummary('{"summary":"x","attention":"no"}')?.attention, false);
+  assert.equal(parseSummary('{"summary":"x","attention":"0"}')?.attention, false);
+});
+
+// FAIL-OPEN: an UNRECOGNIZED attention value must NOT suppress — it is omitted
+// (undefined) so the loop's `attention !== false` promotes. The lax coerceBool would
+// have mapped "maybe" -> false -> SUPPRESS; coerceAttention prevents that regression.
+test("parseSummary: unrecognized attention string => omitted (fail-open promote)", () => {
+  assert.equal("attention" in (parseSummary('{"summary":"x","attention":"maybe"}') ?? {}), false);
+  assert.equal("attention" in (parseSummary('{"summary":"x","attention":"idk"}') ?? {}), false);
+});
+
 test("parseSummary: absent attention => undefined (omitted)", () => {
   assert.equal("attention" in (parseSummary('{"summary":"x"}') ?? {}), false);
+});
+
+// (bell-attention v2) coerceAttention is strict three-valued: only canonical booleans
+// map; uncertainty is undefined (fail-open), NOT false (which would suppress).
+test("coerceAttention: canonical true/false; unknown => undefined", () => {
+  assert.equal(coerceAttention(true), true);
+  assert.equal(coerceAttention(false), false);
+  assert.equal(coerceAttention("true"), true);
+  assert.equal(coerceAttention("FALSE"), false);
+  assert.equal(coerceAttention("yes"), true);
+  assert.equal(coerceAttention("no"), false);
+  assert.equal(coerceAttention(1), true);
+  assert.equal(coerceAttention(0), false);
+  assert.equal(coerceAttention("maybe"), undefined);
+  assert.equal(coerceAttention(""), undefined);
+  assert.equal(coerceAttention(null), undefined);
+  assert.equal(coerceAttention({}), undefined);
 });
 
 test("bellRoseEdge: false/undefined -> true => rising edge", () => {

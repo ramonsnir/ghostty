@@ -250,4 +250,27 @@ struct ConfigTests {
         let gotoToNextSplit = try #require(config.keyboardShortcut(for: "goto_split:next"))
         #expect(gotoToNextSplit == .init("]", modifiers: [.command]))
     }
+
+    // (ramon fork / Bell Attention v2) The Swift side of the cross-language ABI contract:
+    // ghostty_config_get hands the Zig BellFeatures packed struct to Swift as a raw int
+    // that this OptionSet reinterprets by FIXED bit position. These rawValues MUST equal
+    // the Zig field order (pinned by the "BellFeatures: bit positions" test in
+    // src/config/Config.zig). A drift here silently routes every effect to the wrong tier.
+    @Test func bellFeaturesBitPositionsMatchZig() {
+        typealias F = Ghostty.Config.BellFeatures
+        #expect(F.system.rawValue == 1 << 0)
+        #expect(F.audio.rawValue == 1 << 1)
+        #expect(F.attention.rawValue == 1 << 2)
+        #expect(F.title.rawValue == 1 << 3)
+        #expect(F.border.rawValue == 1 << 4)
+        #expect(F.bounce.rawValue == 1 << 5)
+        #expect(F.badge.rawValue == 1 << 6)
+        #expect(F.dashboard.rawValue == 1 << 7)
+        #expect(F.push.rawValue == 1 << 8)
+        #expect(F.monitor.rawValue == 1 << 9)
+        // A raw int from the Zig side decodes to the right members (set semantics).
+        #expect(F(rawValue: (1 << 9) | (1 << 8)).contains(.monitor))
+        #expect(F(rawValue: (1 << 9) | (1 << 8)).contains(.push))
+        #expect(!F(rawValue: 1 << 9).contains(.dashboard))
+    }
 }
