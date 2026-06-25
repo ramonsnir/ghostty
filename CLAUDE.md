@@ -1063,6 +1063,30 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       no-graph-no-fetch); Swift `MCPServerTests` (`queueGraphPayload*`, tool count 19),
       `AgentDashboardTests` (`QueueBacklogTests`: assignLayers chain/diamond/cycle/dangling +
       columns + applyQueueGraph). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+    - **HIGH/URGENT PRIORITY MARK on backlog nodes (generic; provider-decided).** A backlog
+      node can carry an OPTIONAL generic `priorityLabel` string (e.g. "Urgent"/"High"); the
+      canvas renders any node that has one with a prominent filled badge in the title row + a
+      louder TINTED BORDER (2pt) so high-priority items pop on the DAG (running's green border
+      still wins; a `done` node keeps its dim, no loud border). STAYS GENERIC exactly like
+      `done`/`stateType`: the PROVIDER SCRIPT decides which items get a mark and what it says —
+      Ghostty NEVER interprets the tracker-specific numeric `priority` int (Linear's 1=urgent
+      differs per tracker), it only renders whatever word lands in `priorityLabel`. The badge
+      color comes from a generic English-priority vocabulary (`QueueBacklogColors.priorityColor`:
+      urgent/critical→red, high→orange, medium/med/normal→yellow, low→gray) with an
+      ACCENT fallback so an unknown-but-non-empty label still reads as "marked"; nil/empty ⇒ no
+      mark. The Linear conversion lives in `example-graph.py` (`PRIORITY_LABELS = {1:"Urgent",
+      2:"High"}`, emitted only for those — none/medium/low omit it; edit that map to mark
+      more/fewer, no Ghostty change). The field is plumbed alongside the long-existing raw
+      `priority` int (kept display-only). Wiring: sidecar — `types.ts` (`GraphNode.priorityLabel`),
+      `provider.ts` (`parseGraphOutput` keeps a non-empty string; `mcp.ts` forwards `nodes`
+      verbatim, no change); Swift — `MCPTools.swift` (`report_queue_graph` node schema +
+      `priorityLabel`), `QueueCommandBridge.swift` (`QueueGraph.Node.priorityLabel` + parse),
+      `QueueBacklogCanvas.swift` (badge + tinted border + `QueueBacklogColors.priorityColor`).
+      Config (untracked, Linear-specific): `example-graph.py`. Tests: sidecar
+      `provider.test.ts` (priorityLabel round-trip + non-empty-string rule); Swift `MCPServerTests`
+      (`queueGraphPayloadParsesFullArgs` carries it), `AgentDashboardTests`
+      (`priorityColorMarksKnownAndUnknownButNotEmpty`). **GUI relaunch + rebuilt sidecar `dist`;
+      no host/Zig change.**
   - **CLOSE-GATE fires on QUIESCENT (idle OR waiting), not idle-only (sidecar-only fix).** The
     DONE_PENDING→CLOSING gate used to require `agentState==="idle"` held `closeStableSeconds`.
     But a finished Claude Code agent reliably settles in **`waiting`** — its `Stop`→idle hook is

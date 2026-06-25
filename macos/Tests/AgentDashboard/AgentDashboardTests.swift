@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import SwiftUI
 import Testing
 @testable import Ghostty
 
@@ -2144,10 +2145,25 @@ struct AgentQueueHealthTests {
 struct QueueBacklogTests {
     private func node(
         _ key: String, done: Bool = false, blockedBy: [String] = [],
-        labels: [String] = [], stateType: String? = nil
+        labels: [String] = [], stateType: String? = nil, priorityLabel: String? = nil
     ) -> QueueGraph.Node {
         .init(key: key, title: nil, url: nil, state: nil, stateType: stateType,
-              done: done, labels: labels, blockedBy: blockedBy, priority: nil)
+              done: done, labels: labels, blockedBy: blockedBy, priority: nil,
+              priorityLabel: priorityLabel)
+    }
+
+    // MARK: priorityColor — generic priority MARK → color (nil = no mark)
+
+    @Test func priorityColorMarksKnownAndUnknownButNotEmpty() {
+        #expect(QueueBacklogColors.priorityColor(for: nil) == nil)
+        #expect(QueueBacklogColors.priorityColor(for: "") == nil)
+        #expect(QueueBacklogColors.priorityColor(for: "   ") == nil)
+        #expect(QueueBacklogColors.priorityColor(for: "Urgent") == .red)
+        #expect(QueueBacklogColors.priorityColor(for: "high") == .orange)
+        #expect(QueueBacklogColors.priorityColor(for: "Medium") == .yellow)
+        #expect(QueueBacklogColors.priorityColor(for: "low") == .gray)
+        // An unknown but non-empty label still reads as "marked" (accent, not nil).
+        #expect(QueueBacklogColors.priorityColor(for: "P0") == .accentColor)
     }
 
     // MARK: assignLayers — longest-path-from-roots over blockedBy edges

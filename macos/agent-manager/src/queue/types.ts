@@ -101,8 +101,17 @@ export interface GraphNode {
   labels: string[];
   /** Keys of items that BLOCK this one — the DAG's dependency edges. */
   blockedBy: string[];
-  /** Optional tracker priority int (0=none,1=urgent,…), display-only. */
+  /** Optional tracker priority int (0=none,1=urgent,…), display-only. RAW + tracker-
+   *  specific (Linear's 1=urgent differs from another tracker's), so the GUI does NOT
+   *  interpret it for marking — see `priorityLabel`. */
   priority?: number;
+  /** GENERIC priority MARK (e.g. "Urgent", "High"): a provider-chosen display string the
+   *  canvas renders as a prominent badge + tinted border so high-priority items stand out.
+   *  The SCRIPT decides which items get one (its own threshold) and what it says — exactly
+   *  like `done`/`stateType`, Ghostty never derives it from the tracker-specific `priority`
+   *  int. Absent ⇒ no mark. The canvas colors it from a generic English-priority vocabulary
+   *  (urgent/high/medium/low) with a neutral fallback, so an unknown label still renders. */
+  priorityLabel?: string;
 }
 
 /** (backlog graph) The board snapshot the sidecar caches + pushes via `report_queue_graph`. */

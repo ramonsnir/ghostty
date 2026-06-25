@@ -255,8 +255,12 @@ struct QueueGraph: Equatable, Sendable {
         let labels: [String]
         /// Keys that BLOCK this node — the DAG edges (may reference keys outside the set).
         let blockedBy: [String]
-        /// Optional tracker priority int (display-only).
+        /// Optional tracker priority int (display-only; RAW + tracker-specific, NOT used for
+        /// marking — see `priorityLabel`).
         let priority: Int?
+        /// GENERIC priority MARK (e.g. "Urgent", "High") the canvas renders as a prominent
+        /// badge + tinted border. Provider-decided (like `done`/`stateType`); nil → no mark.
+        let priorityLabel: String?
         var id: String { key }
     }
 
@@ -300,7 +304,8 @@ struct QueueGraphPayload {
                     state: opt("state"), stateType: opt("stateType"),
                     done: (entry["done"] as? Bool) ?? false,
                     labels: strings("labels"), blockedBy: strings("blockedBy"),
-                    priority: (entry["priority"] as? NSNumber)?.intValue))
+                    priority: (entry["priority"] as? NSNumber)?.intValue,
+                    priorityLabel: opt("priorityLabel")))
             }
         }
 

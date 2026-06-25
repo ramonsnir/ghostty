@@ -990,7 +990,8 @@ struct MCPServerTests {
             "nodes": [
                 ["key": "EX-1", "title": "do x", "url": "https://t/EX-1",
                  "state": "In Progress", "stateType": "started", "done": false,
-                 "labels": ["Design needed", "Customer"], "blockedBy": ["EX-9"], "priority": 2],
+                 "labels": ["Design needed", "Customer"], "blockedBy": ["EX-9"], "priority": 2,
+                 "priorityLabel": "High"],
                 ["key": "EX-2", "done": true],
             ],
         ])
@@ -1008,10 +1009,12 @@ struct MCPServerTests {
         #expect(n?.labels == ["Design needed", "Customer"])
         #expect(n?.blockedBy == ["EX-9"])
         #expect(n?.priority == 2)
-        // Second node: done true, missing arrays default [].
+        #expect(n?.priorityLabel == "High")
+        // Second node: done true, missing arrays default [], no priority mark.
         #expect(g?.nodes.last?.done == true)
         #expect(g?.nodes.last?.labels.isEmpty == true)
         #expect(g?.nodes.last?.blockedBy.isEmpty == true)
+        #expect(g?.nodes.last?.priorityLabel == nil)
     }
 
     @Test func queueGraphPayloadRejectsMissingNameAndDropsKeylessNodes() {
