@@ -47,6 +47,7 @@ export function parseConfig(
   numInRange("fingerprintTailLines", 1, 1000, true);
   numInRange("promptTailLines", 1, 1000, true);
   numInRange("changeRatioThreshold", 0, 1, false);
+  numInRange("rateLimitBackoffMaxMs", 0, 3_600_000, false);
 
   if (typeof o.skipHidden === "boolean") out.skipHidden = o.skipHidden;
 

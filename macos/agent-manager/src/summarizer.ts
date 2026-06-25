@@ -41,6 +41,12 @@ export interface SummarizerConfig {
   /** When true (default), the summarizer SKIPS surfaces the user has HIDDEN in the
    *  Agent Dashboard — no Haiku call for a decluttered tile. */
   skipHidden: boolean;
+  /** Cap (ms) on the adaptive RATE-LIMIT BACKOFF: when the summarizer's OWN model
+   *  calls keep failing (its account is rate-limited / returns no usable summary), the
+   *  loop backs off exponentially — `debounceMs * 2^(streak-1)` — up to this cap, and
+   *  while backed off makes at most ONE probe call per window until one SUCCEEDS (the
+   *  limit reset), then snaps back to normal. Default 600000 (10 min). */
+  rateLimitBackoffMaxMs: number;
   /** Process names that mark an agent surface even without agentState. */
   agentProcessNames: string[];
 }
@@ -53,8 +59,23 @@ export const DEFAULT_CONFIG: SummarizerConfig = {
   promptTailLines: 40,
   changeRatioThreshold: 0.2,
   skipHidden: true,
+  rateLimitBackoffMaxMs: 600000,
   agentProcessNames: ["claude", "codex"],
 };
+
+/**
+ * The adaptive rate-limit backoff delay (ms) for a given consecutive-failure
+ * `streak`: exponential `baseMs * 2^(streak-1)`, capped at `maxMs`. PURE. A streak of
+ * 0 (or less) returns 0 (normal cadence). The streak is clamped before the shift so a
+ * large streak can't overflow. With base=30s, cap=10min: 30s, 60s, 120s, 240s, 480s,
+ * 600s, 600s, … — so within a few failed sweeps the summarizer probes only ~once per
+ * 10 min until a call succeeds (the account's limit resets).
+ */
+export function backoffDelayMs(streak: number, baseMs: number, maxMs: number): number {
+  if (streak <= 0) return 0;
+  const shift = Math.min(streak - 1, 30); // guard 2^huge
+  return Math.min(maxMs, baseMs * 2 ** shift);
+}
 
 /** A point-in-time view of one surface, enriched with its viewport text. */
 export interface SurfaceSnapshot {
