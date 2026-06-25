@@ -860,18 +860,16 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
     splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are
     left + refilled lowest-slot-first (no re-flow). `concurrency` clamps to `cols×rows`.
-  - **Exit forms + quit-when-empty (template knobs):** `agent.exit` supports a TYPED exit
+  - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
     `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only
     recognizes hyphenated names (`ctrl-d`/`ctrl-c`/`enter`/…) — the engine's old `"ctrl_d"`
     default silently no-op'd (saved only by the force-close timeout) until `ctrl-d` was added to
     `MCPInput.keySpecs(forKey:)` (keycode 2 + ctrl). Claude Code swallows Ctrl-D, so use
-    `{text:"/quit"}`. `quitWhenEmpty:true` removes the run when a sweep sees a SUCCESSFUL empty
-    `list` AND `active.size===0` (even before `maxItems`); a FAILED list (`fetchListResult` ok:false)
-    is never "empty" (no false quit), and an empty list while agents still run does NOT quit (keeps
-    polling for new/unblocked items). The close sequence is sendText/sendKey-prelude → `awaitExited`
+    `{text:"/quit"}`. The close sequence is sendText/sendKey-prelude → `awaitExited`
     (bounded; force-closes anyway on timeout, so a `/quit` that leaves the launching shell alive
-    still tears down) → forceClose.
+    still tears down) → forceClose. **`quitWhenEmpty` was REMOVED** — see the hardening bullet at
+    the end of this section; a run is now removed only by an explicit stop/abort.
   - **Close path (§10) — the subtle one:** `close_surface`/`request_close` HONORS
     `confirm-close-surface` and would pop a modal for a live agent. So the supervisor sends the
     template `agent.exit` prelude (→ child exits) then calls **`force_close_surface`**, which
@@ -1028,7 +1026,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     fetches, and no `now===0` sentinel collision). `dispatchCandidates` skips the whole list
     fetch+dispatch and returns 0 when `nowMs - lastListAtMs < intervals.listMs` — the §11 health
     report (fired by `runOne` AFTER dispatch) reads the CACHED `lastListItems`/`lastListOk`, so the
-    dashboard counts stay live between polls; latch re-arm + quit-when-empty observation just wait
+    dashboard counts stay live between polls; the latch re-arm just waits
     for the next due fetch. The window is consumed on the ATTEMPT (set before the fetch), so even a
     FAILED list waits a full interval — a hard cap of one `list` call per `listMs` regardless of
     outcome. `advanceStates` gates the per-agent `status` probe on `statusDue =
@@ -1108,6 +1106,37 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     different-scope start + same-scope no-op + factory-consulted-on-restart); Swift `QueuePaletteTests`
     (`discoverUsesJSONNameForDisplayAndSort`, `templateDisplayNameFallsBackToBasename`, updated discovery
     assertions to `[QueueTemplateEntry]`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **RESTART-SURVIVAL HARDENING (the "queue vanished on restart" + "splits detached" fix).** A real
+    incident: a run with `quitWhenEmpty:true` self-removed at 19:34 while its 3 agents were still ALIVE,
+    so a later GUI restart found an empty `active-runs.json` → no queue, detached splits. Root cause
+    (confirmed by reading `reconcile`): the session-gone prune grace keys off the record's `sinceMs`,
+    which for a LONG-LIVED RUNNING record is ancient → ZERO protection against a SUCCESSFUL-but-INCOMPLETE
+    `list_surfaces` right after a (re)start (surfaces still coming up). So a transient post-restart list
+    pruned live records → `active.size→0` → `quitWhenEmpty` removed the whole run (abandoning live agents).
+    Three sidecar-only fixes:
+    - **(A) `quitWhenEmpty` REMOVED end-to-end.** The template knob + the `runOne` quit branch +
+      `QueueRun.sawEmptyListThisSweep` are gone; a run is removed ONLY by explicit stop/abort. An empty
+      `list` just means "nothing actionable now" → keep polling. A `quitWhenEmpty` key in template JSON
+      is now silently ignored (tolerant parse). Wiring: `types.ts` (field removed), `templates.ts`
+      (default + parse removed), `runner.ts` (quit branch + field removed). Tests: `runner.test.ts`
+      "an empty list + no active agents does NOT remove the run" (replaced the 3 quitWhenEmpty tests).
+    - **(B) PREMATURE-PRUNE FIX — reconcile-start grace.** `reconcile` gained an optional
+      `reconcileStartedMs` (default `-Infinity` = old behavior); a finalized record's session-gone prune
+      is now shielded for `pendingGraceMs` (30s) after the LATER of its `sinceMs` AND the run's first
+      reconcile in the current process (`run.reconcileStartedMs`, stamped once per process; a restart
+      re-stamps). So a long-lived RUNNING record survives a transient/incomplete post-restart list for a
+      full grace window. Conservative — can only DELAY a prune (hold a slot longer), never cause a
+      duplicate. Wiring: `store.ts reconcile` (param + `Math.max(sinceMs, reconcileStartedMs)` gate),
+      `runner.ts` (`QueueRun.reconcileStartedMs` stamp + pass-through). Tests: `store.test.ts`
+      (shield within grace / prune past grace / default-arg = pre-fix behavior); the latch-persists
+      restart test updated to expect the held-then-pruned sequence.
+    - **(C) PERSISTENT SIDECAR LOG (so the next incident is debuggable).** The Swift controller pipes the
+      sidecar's stdout to an UNREAD pipe and sends stderr to `nullDevice`, so the engine's run/prune/command
+      logs had NO durable trail (this incident was undiagnosable after the fact). New `src/logfile.ts`
+      tees `console.{log,info,warn,error}` to a ROTATING file `~/Library/Logs/ghostty-ramon-agent-manager.log`
+      (append, rotate at ~5MB → `.1`); best-effort (any fs error falls back to console only, never throws);
+      installed first thing in `index.ts main()`. Pure `formatLogLine`/`defaultLogPath` unit-tested
+      (`logfile.test.ts`). **Sidecar-only — rebuilt `dist` + sidecar restart; no host/Zig/GUI-Swift change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

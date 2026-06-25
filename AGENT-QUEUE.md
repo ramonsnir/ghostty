@@ -92,8 +92,9 @@ shell the engine just runs.
   "concurrency": 3,                          // max simultaneous agents (clamped to the grid)
   "maxItems": 200,                           // hard ceiling on total lifetime dispatches
   "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // auto-layout; fill columns before rows
-  "quitWhenEmpty": false,                    // true => the run quits when the queue drains
-                                             //   AND no agents are left (even before maxItems)
+  // NOTE: there is NO `quitWhenEmpty` — a run is removed only by an explicit Stop/Abort.
+  // An empty `list` just means "nothing actionable now"; the run keeps polling. (A `quitWhenEmpty`
+  // key here is silently ignored — it was removed after it abandoned live agents on a restart.)
   "intervals": { "listMs": 60000, "statusMs": 30000 },  // provider call cadence (see note below)
   "provider": {
     // LIST: print the actionable items as a JSON array. Expected to ALREADY exclude
@@ -275,6 +276,13 @@ summaries on queue tiles are the normal Agent Manager summarizer (Haiku via your
 Code auth; no API key). Your provider commands run locally with a sanitized env
 (the `mcp-token` and other `GHOSTTY_*` credentials are stripped before a provider script
 sees them).
+
+## Logs / troubleshooting
+
+The sidecar (queue engine + summarizer) tees its log to a rotating file at
+**`~/Library/Logs/ghostty-ramon-agent-manager.log`** (rotates to `.1` at ~5MB). Run
+removals, dispatch/prune decisions, and command applications are logged there — `tail -f`
+it when a queue does something surprising.
 
 ## Status / roadmap
 

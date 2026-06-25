@@ -156,6 +156,12 @@ export interface QueueRun {
   lifetimeDispatched: number;
   /** false until reconcile() has run ONCE since this run was (re)started (§9). */
   reconciledOnce: boolean;
+  /** (premature-prune fix) ms-since-epoch this run FIRST reconciled in the current
+   *  process (stamped once, on the first reconcile; a restart makes a fresh run object so
+   *  it re-stamps). Passed to `reconcile` so a finalized record's session-gone prune is
+   *  shielded for `pendingGraceMs` after a (re)start — protecting live, tracked agents from
+   *  a transient/incomplete post-restart `list_surfaces`. Non-persisted. */
+  reconcileStartedMs?: number;
   /** false until the FIRST sweep (which reconciles) has completed; dispatch is
    *  SUPPRESSED while false so re-adoption ALWAYS precedes any new dispatch — the
    *  §9 first-pass invariant that closes the restart-window double-dispatch gap. The
@@ -186,11 +192,6 @@ export interface QueueRun {
    *  ALL its live assignments THIS sweep, then is removed from the registry. NOT persisted as
    *  a flag (abort terminates the run; the active-runs store simply drops it). */
   aborting: boolean;
-  /** (§8a quit-when-empty) TRANSIENT per-sweep flag: set true when THIS sweep's dispatch
-   *  fetched a SUCCESSFUL EMPTY `list` (not a failed/skip one). The sweep loop quits the
-   *  run when this is true AND `active.size === 0`. Reset to false at the top of every
-   *  per-run sweep; never persisted. */
-  sawEmptyListThisSweep: boolean;
   /** (§11 health) The most recent `list` items seen by a dispatch sweep (null until the
    *  first list fetch) + whether that fetch SUCCEEDED. Cached purely to build the
    *  run-level health report (`report_queue_status`) each sweep without an extra provider
@@ -253,7 +254,6 @@ export function makeQueueRun(
     paused: opts.paused ?? false,
     draining: opts.draining ?? false,
     aborting: false,
-    sawEmptyListThisSweep: false,
     lastListItems: null,
     lastListOk: false,
     lastListAtMs: Number.NEGATIVE_INFINITY,
@@ -419,21 +419,14 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         registryChanged = true;
         await reportRunGone(deps, name);
         log(`run "${name}" DRAINED — no slot-occupying assignments, run removed`);
-      } else if (
-        // QUIT-WHEN-EMPTY (§8a): the template opted in AND this sweep saw a SUCCESSFUL
-        // empty `list` AND nothing is tracked (no in-flight agents, no review-held
-        // EXITED splits) → there is genuinely nothing left to do, so quit even before
-        // maxItems. A momentary empty list while agents run (active > 0) does NOT quit —
-        // the run keeps polling for new/unblocked items until BOTH queue and fleet drain.
-        run.template.quitWhenEmpty &&
-        run.sawEmptyListThisSweep &&
-        run.active.size === 0
-      ) {
-        deps.registry.delete(name);
-        registryChanged = true;
-        await reportRunGone(deps, name);
-        log(`run "${name}" QUIT — queue empty and no active agents (quitWhenEmpty)`);
       }
+      // NOTE: there is intentionally NO "quit-when-empty" auto-removal. A run is removed
+      // ONLY by an explicit stop (drain) or abort. An empty `list` just means "nothing
+      // actionable right now" — the run stays and keeps polling for new/unblocked items.
+      // (The old `quitWhenEmpty` knob was removed: it keyed on `active.size === 0`, which a
+      // transient/incomplete post-restart `list_surfaces` could falsely produce by pruning
+      // live records — silently abandoning live agents and removing the whole run. Removed
+      // so no template can re-trigger that; persistence is the safer default.)
     } catch (err) {
       errlog(`run "${name}": ${msg(err)}`);
     }
@@ -553,10 +546,6 @@ async function runOne(
 ): Promise<number> {
   const nowMs = deps.now();
   const t = run.template;
-  // Reset the per-sweep quit-when-empty observation; dispatchCandidates sets it true
-  // only if it fetches a SUCCESSFUL EMPTY list this sweep.
-  run.sawEmptyListThisSweep = false;
-
   // --- 1) RECONCILE (always first; §9) --------------------------------------------
   // Project the live surfaces carrying THIS run's annotation into LiveSurface views.
   // (parallel runs) Filter by the run's IDENTITY name (`runName`), which is what
@@ -564,7 +553,16 @@ async function runOne(
   // scoped runs of one template never adopt each other's tiles.
   const liveForRun = projectLiveSurfaces(surfaces, run.runName);
   const records = loadStore(run.storeIO);
-  const plan = reconcile(records, liveForRun, nowMs, deps.pendingGraceMs);
+  // Stamp the reconcile-start once (this process) so the prune grace shields records for
+  // pendingGraceMs after a (re)start — see reconcile()'s `reconcileStartedMs`.
+  if (run.reconcileStartedMs === undefined) run.reconcileStartedMs = nowMs;
+  const plan = reconcile(
+    records,
+    liveForRun,
+    nowMs,
+    deps.pendingGraceMs,
+    run.reconcileStartedMs,
+  );
 
   // REHYDRATE the monotonic lifetime-dispatch counter from the persisted store ONCE
   // (on the first reconcile after a (re)start), so the §7 `maxItems` cap is a TRUE
@@ -1024,7 +1022,6 @@ async function dispatchCandidates(
       env: resolveParamsEnv(t, run.params),
     });
     items = res.items;
-    run.sawEmptyListThisSweep = res.ok && res.items.length === 0;
     // (§11 health) Cache the list for the run-level status report. Only a SUCCESSFUL
     // fetch updates the cached items (a failed/skip fetch keeps the last good list so the
     // header doesn't flicker to "0 waiting" on a transient provider blip); listOk tracks

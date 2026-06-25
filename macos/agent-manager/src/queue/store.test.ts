@@ -287,6 +287,38 @@ test("reconcile: finalized record whose session vanished (PAST grace) => prune (
   assert.equal(plan.kept.length, 0);
 });
 
+test("reconcile: reconcileStartedMs SHIELDS a long-lived RUNNING record from a transient post-restart empty list (premature-prune fix)", () => {
+  // The incident: a long-lived RUNNING record has an OLD sinceMs, so the sinceMs-only
+  // grace gave it ZERO protection — a SUCCESSFUL-but-INCOMPLETE post-restart list_surfaces
+  // pruned it instantly, abandoning a live agent. With reconcileStartedMs = now, the record
+  // is shielded for graceMs after the (re)start even though its sinceMs is ancient.
+  const rec = asgn({ sessionID: 300, sinceMs: 1000 });
+  const now = 10_000_000; // sinceMs is ~10M ms in the past — way past a sinceMs-only grace
+  const plan = reconcile([rec], [], now, 30000, now); // reconcileStartedMs = now
+  assert.equal(plan.actions.length, 0, "shielded: no prune within the post-restart grace");
+  assert.equal(plan.kept.length, 1, "the live agent's record is kept, not abandoned");
+  assert.equal(plan.kept[0].key, rec.key);
+});
+
+test("reconcile: past the reconcileStartedMs grace, a genuinely-gone session IS pruned", () => {
+  const rec = asgn({ sessionID: 300, sinceMs: 1000 });
+  const started = 10_000_000;
+  // now is graceMs+1 past BOTH sinceMs and reconcileStartedMs → no longer shielded → prune.
+  const plan = reconcile([rec], [], started + 30001, 30000, started);
+  assert.equal(plan.actions.length, 1);
+  assert.equal(plan.actions[0].kind, "prune");
+  if (plan.actions[0].kind === "prune") assert.equal(plan.actions[0].reason, "session-gone");
+});
+
+test("reconcile: with NO reconcileStartedMs (default -Infinity) behavior is the pre-fix sinceMs-only grace", () => {
+  // Back-compat: the default param must reproduce the old behavior exactly — a long-lived
+  // record with an old sinceMs is pruned immediately when missing (no shield).
+  const rec = asgn({ sessionID: 300, sinceMs: 1000 });
+  const plan = reconcile([rec], [], 1000 + 30001, 30000); // 4 args (no reconcileStartedMs)
+  assert.equal(plan.actions.length, 1);
+  assert.equal(plan.actions[0].kind, "prune");
+});
+
 test("reconcile: a FRESHLY-finalized record whose surface lags list_surfaces (within grace) is KEPT (no prune, no re-dispatch)", () => {
   // The §7 one-sweep-lag guard: dispatch finalizes the record with the spawn's
   // sessionID in one sweep; the surface is only expected in list_surfaces by the NEXT

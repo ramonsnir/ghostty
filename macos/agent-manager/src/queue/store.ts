@@ -422,6 +422,17 @@ export function reconcile(
   liveSurfaces: LiveSurface[],
   nowMs: number,
   graceMs: number,
+  // (premature-prune fix) ms-since-epoch this run STARTED reconciling in the CURRENT
+  // process (stamped on the first reconcile after a (re)start; a restart re-stamps it).
+  // A finalized record's "session-gone" prune is shielded for `graceMs` after this, NOT
+  // only `graceMs` after the record's own `sinceMs`. The old `sinceMs`-only grace gave a
+  // LONG-LIVED RUNNING record (old `sinceMs`) ZERO protection against a SUCCESSFUL-but-
+  // INCOMPLETE `list_surfaces` right after a GUI restart (surfaces still coming up) — it
+  // was pruned instantly, dropping live, tracked agents (active→0) and detaching their
+  // tiles (and, with the old quitWhenEmpty, removing the whole run). This floor gives every
+  // record a fresh grace window after each (re)start. Default `-Infinity` ⇒ the floor is a
+  // no-op (identical to the pre-fix `sinceMs`-only behavior) for callers that don't pass it.
+  reconcileStartedMs: number = Number.NEGATIVE_INFINITY,
 ): ReconcilePlan {
   // Index live surfaces by sessionID (only finalized, non-zero sessions can match a
   // record). A sessionID of 0 is "unknown" and never a match key.
@@ -483,7 +494,13 @@ export function reconcile(
       // human closed the dead split — there is no spawn-lag race for it, it occupies NO
       // slot, and §6 wants its freed key promptly into COOLDOWN. So an EXITED record with
       // no live surface prunes immediately regardless of `sinceMs`.
-      if (rec.state !== "EXITED" && nowMs - rec.sinceMs <= graceMs) {
+      // Shield for graceMs after EITHER the record's own state change (`sinceMs`, the
+      // spawn-lag case) OR the run starting to reconcile in this process
+      // (`reconcileStartedMs`, the restart list-lag case) — whichever is LATER. So a
+      // long-lived RUNNING record is no longer pruned the instant it's missing from a
+      // transient/incomplete post-restart `list_surfaces`.
+      const graceFrom = Math.max(rec.sinceMs, reconcileStartedMs);
+      if (rec.state !== "EXITED" && nowMs - graceFrom <= graceMs) {
         // In-grace finalized live-agent record: KEEP it (no action) so the lagging surface
         // can still appear next sweep; it neither re-dispatches (its key stays in the
         // active set) nor is lost.

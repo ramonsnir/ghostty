@@ -40,7 +40,6 @@ export const TEMPLATE_DEFAULTS = {
   onAgentExit: "leave-and-bell" as OnAgentExit,
   closeOnComplete: true,
   closeStableSeconds: 5,
-  quitWhenEmpty: false,
 };
 
 /** The outcome of validation: a typed template, or a list of human-readable errors. */
@@ -92,10 +91,8 @@ export function validateTemplate(obj: unknown): ValidateResult {
     rec.closeOnComplete,
     TEMPLATE_DEFAULTS.closeOnComplete,
   );
-  const quitWhenEmpty = boolOrDefault(
-    rec.quitWhenEmpty,
-    TEMPLATE_DEFAULTS.quitWhenEmpty,
-  );
+  // NOTE: `quitWhenEmpty` was removed (see types.ts) — a `quitWhenEmpty` key in template
+  // JSON is now silently ignored, never parsed.
   const params = validateParams(rec.params, errors);
 
   if (
@@ -123,7 +120,6 @@ export function validateTemplate(obj: unknown): ValidateResult {
     onAgentExit,
     closeOnComplete,
     closeStableSeconds,
-    quitWhenEmpty,
     params,
   };
   return { ok: true, template, errors: [] };
