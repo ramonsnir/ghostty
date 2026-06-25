@@ -19,6 +19,8 @@ import {
   makeQueueRun,
   occupiesSlot,
   effectiveMaxItemsCap,
+  effectiveConcurrency,
+  effectiveGridCap,
   DEFAULT_PENDING_GRACE_MS,
   type QueueDeps,
   type QueueRun,
@@ -548,6 +550,53 @@ test("runQueueSweep: BUMPING the live cap re-enables dispatch past an already-re
   now += 5000;
   await runQueueSweep(deps); // now dispatches the remaining two (lifetimeDispatched 1 → 3)
   assert.equal(fake.calls.spawn.length, 3, "bumping the live cap re-enables dispatch past the reached cap");
+});
+
+// ---------------------------------------------------------------------------
+// (live concurrency edit) effectiveConcurrency / effectiveGridCap + live bump dispatch.
+// ---------------------------------------------------------------------------
+
+test("effectiveConcurrency / effectiveGridCap: a live override WINS over the template + lifts the pane cap", () => {
+  const t = tmpl({ concurrency: 6, grid: { cols: 3, rows: 2, fill: "columns" } }); // pane cap 6
+  const run = makeQueueRun(t, memStore());
+  assert.equal(effectiveConcurrency(run), 6);
+  assert.equal(effectiveGridCap(run), 6);
+  // A live edit beats the template AND lifts the effective grid (pane) cap to match.
+  run.concurrencyLive = 9;
+  assert.equal(effectiveConcurrency(run), 9);
+  assert.equal(effectiveGridCap(run), 9, "lifts the pane cap to the live concurrency");
+  // Lowering below the template grid cap still keeps the template's pane cap (max of the two).
+  run.concurrencyLive = 2;
+  assert.equal(effectiveConcurrency(run), 2);
+  assert.equal(effectiveGridCap(run), 6, "never drops the pane budget below the template grid");
+});
+
+test("runQueueSweep: BUMPING the live concurrency dispatches MORE simultaneous agents (lifts the grid cap)", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  // concurrency 2, grid 2x1 = pane cap 2 → at most 2 simultaneous agents.
+  const t = tmpl({ concurrency: 2, grid: { cols: 2, rows: 1, fill: "columns" } });
+  const run = makeQueueRun(t, memStore());
+  let now = 8_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — capped to 2 (concurrency + grid)
+  assert.equal(fake.calls.spawn.length, 2, "starts capped at concurrency 2");
+
+  // BUMP the live concurrency to 3 (lifts the effective grid/pane cap to 3 too).
+  run.concurrencyLive = 3;
+  now += 5000;
+  await runQueueSweep(deps); // the 3rd agent now dispatches
+  assert.equal(fake.calls.spawn.length, 3, "raising live concurrency dispatches the 3rd agent");
 });
 
 // ---------------------------------------------------------------------------

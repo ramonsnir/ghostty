@@ -19,22 +19,24 @@
 //   abort{run}       → set `aborting` (exit+force-close ALL its assignments this sweep, then remove).
 //   set_max_items{run,maxItems} → re-set a LIVE run's lifetime cap (the dashboard cap control)
 //                      without restarting it; persisted so a restart re-applies it.
+//   set_concurrency{run,concurrency} → re-set a LIVE run's max simultaneous agents (the dashboard
+//                      parallel control) without restarting it; persisted so a restart re-applies it.
 //
 // A command naming an UNKNOWN run (pause/resume/stop/abort with no matching active run) or a
 // start whose template fails to load is a logged NO-OP — never a throw into the loop.
 
 import type { QueueRun } from "./runner.js";
-import { parseMaxItemsValue } from "./templates.js";
+import { parseConcurrencyValue, parseMaxItemsValue } from "./templates.js";
 
 /** A drained GUI→sidecar control command (§8a). `template` is the template BASENAME
  *  (the `*.json` filename minus extension) for `start`; `run` is the active run NAME
  *  (the run's `runName` IDENTITY = `template.name` + its env-param scope, the dashboard
  *  origin) for pause/resume/stop/abort/set_max_items. */
 export interface QueueCommand {
-  action: "start" | "stop" | "abort" | "pause" | "resume" | "set_max_items";
+  action: "start" | "stop" | "abort" | "pause" | "resume" | "set_max_items" | "set_concurrency";
   /** The template basename to start (start only). */
   template?: string;
-  /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items. */
+  /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency. */
   run?: string;
   /** (§8b) START-TIME parameter answers (param name → value) collected by the GUI prompt,
    *  passed through to the factory (start only). Absent when the template declares no params. */
@@ -43,6 +45,10 @@ export interface QueueCommand {
    *  dashboard cap control collected ("10", "unlimited"/"0"/…, etc.), parsed by
    *  `parseMaxItemsValue` (blank/garbage = ignored). Absent for other actions. */
   maxItems?: string;
+  /** (live concurrency edit) The new max-simultaneous-agents VALUE for `set_concurrency` — a
+   *  raw string the dashboard parallel control collected ("9", etc.), parsed by
+   *  `parseConcurrencyValue` (blank/garbage/non-positive = ignored). Absent for other actions. */
+  concurrency?: string;
 }
 
 /** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME (+ the
@@ -74,6 +80,7 @@ export interface ApplyResult {
     | "stopping"
     | "aborting"
     | "maxItemsSet"
+    | "concurrencySet"
     | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
@@ -193,6 +200,32 @@ export function applyCommand(
       log(`run "${name}" maxItems set LIVE to ${parsed === null ? "unlimited" : parsed}`);
       return { kind: "maxItemsSet", runName: name };
     }
+    case "set_concurrency": {
+      // (live concurrency edit) Re-set a LIVE run's max simultaneous agents without restarting
+      // it. Parsed exactly like the dashboard parallel control (a positive integer; blank/
+      // garbage/non-positive is IGNORED so a bad entry never silently changes parallelism).
+      // Raising it past the template `cols*rows` also lifts the effective grid (pane) cap — see
+      // `effectiveGridCap` — so the extra agents actually get panes (§12). Lowering it only
+      // stops FUTURE dispatch; running agents are never killed.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`set_concurrency command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`set_concurrency for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      const parsed = parseConcurrencyValue(cmd.concurrency ?? "");
+      if (parsed === undefined) {
+        errlog(`set_concurrency for run "${name}" with invalid value "${cmd.concurrency ?? ""}" — ignored`);
+        return { kind: "noop" };
+      }
+      run.concurrencyLive = parsed;
+      log(`run "${name}" concurrency set LIVE to ${parsed}`);
+      return { kind: "concurrencySet", runName: name };
+    }
     default: {
       // Exhaustive guard for an unknown action (tolerant — a malformed drained command).
       errlog(`unknown queue command action "${String((cmd as { action?: unknown }).action)}" — ignored`);
@@ -219,7 +252,8 @@ export function applyCommands(
       res.kind === "paused" ||
       res.kind === "resumed" ||
       res.kind === "stopping" ||
-      res.kind === "maxItemsSet"
+      res.kind === "maxItemsSet" ||
+      res.kind === "concurrencySet"
     ) {
       changed = true;
     }

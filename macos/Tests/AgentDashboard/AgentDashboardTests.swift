@@ -1985,11 +1985,12 @@ struct AgentQueueHealthTests {
     private func status(
         _ name: String, present: Bool = true, phase: String = "running",
         queued: Int = 0, listOk: Bool = true, active: Int = 0, dispatched: Int = 0,
-        maxItems: Int? = nil, next: [QueueStatus.Item] = [], running: [QueueStatus.Item] = []
+        maxItems: Int? = nil, concurrency: Int = 0,
+        next: [QueueStatus.Item] = [], running: [QueueStatus.Item] = []
     ) -> QueueStatus {
         .init(queueName: name, present: present, phase: phase, queued: queued,
               listOk: listOk, active: active, dispatched: dispatched,
-              maxItems: maxItems, next: next, running: running)
+              maxItems: maxItems, concurrency: concurrency, next: next, running: running)
     }
 
     // MARK: - groupByOrigin present-queue injection
@@ -2099,6 +2100,33 @@ struct AgentQueueHealthTests {
         #expect(model.queueStatuses["ExampleOS"]?.maxItems == 5)
         // Unknown run: no optimistic entry conjured (just posts the command).
         model.setQueueMaxItems(run: "Ghost", value: "9")
+        #expect(model.queueStatuses["Ghost"] == nil)
+    }
+
+    @Test func parseConcurrencyOptimisticMirrorsSidecar() {
+        // positive int → the value; blank/garbage/zero/negative → nil (ignore, NO unlimited).
+        #expect(QueueStatus.parseConcurrencyOptimistic("9") == 9)
+        #expect(QueueStatus.parseConcurrencyOptimistic(" 12 ") == 12)
+        #expect(QueueStatus.parseConcurrencyOptimistic("") == nil)
+        #expect(QueueStatus.parseConcurrencyOptimistic("0") == nil)
+        #expect(QueueStatus.parseConcurrencyOptimistic("-2") == nil)
+        #expect(QueueStatus.parseConcurrencyOptimistic("abc") == nil)
+        #expect(QueueStatus.parseConcurrencyOptimistic("unlimited") == nil)
+    }
+
+    @Test func setQueueConcurrencyOptimisticallyUpdatesValue() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", concurrency: 6))
+        // A valid value shows immediately (no waiting for the sidecar's next sweep).
+        model.setQueueConcurrency(run: "ExampleOS", value: "9")
+        #expect(model.queueStatuses["ExampleOS"]?.concurrency == 9)
+        // Garbage / non-positive is NOT applied (the sidecar ignores it — don't fake a change).
+        model.setQueueConcurrency(run: "ExampleOS", value: "abc")
+        #expect(model.queueStatuses["ExampleOS"]?.concurrency == 9)
+        model.setQueueConcurrency(run: "ExampleOS", value: "0")
+        #expect(model.queueStatuses["ExampleOS"]?.concurrency == 9)
+        // Unknown run: no optimistic entry conjured (just posts the command).
+        model.setQueueConcurrency(run: "Ghost", value: "9")
         #expect(model.queueStatuses["Ghost"] == nil)
     }
 

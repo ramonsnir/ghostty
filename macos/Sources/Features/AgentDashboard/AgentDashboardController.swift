@@ -1099,6 +1099,30 @@ final class AgentDashboardModel: ObservableObject {
                     QueueCommand(action: .setMaxItems, run: run, maxItems: trimmed),
             ])
     }
+
+    /// (live concurrency edit) Post a `set_concurrency` intent for a queue RUN — re-set its
+    /// max SIMULTANEOUS agents WITHOUT restarting it. `value` is the raw user string ("9");
+    /// the sidecar parses it (blank/garbage/non-positive = ignored). Raising it past the
+    /// template `cols*rows` also lifts the pane cap sidecar-side (§12). Same FIFO path as
+    /// `sendRunCommand`.
+    func setQueueConcurrency(run: String, value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !trimmed.isEmpty else { return }
+        // OPTIMISTIC: show a VALID value instantly (the sidecar's next push reconciles). A
+        // blank/garbage/non-positive value parses to nil and is left as-is — the sidecar
+        // ignores it too, so we must not fake a change the engine won't make.
+        if let existing = queueStatuses[run],
+           let parsed = QueueStatus.parseConcurrencyOptimistic(trimmed) {
+            queueStatuses[run] = existing.withConcurrency(parsed)
+        }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .setConcurrency, run: run, concurrency: trimmed),
+            ])
+    }
 }
 
 /// (ramon fork / Agent Dashboard, Layer 3) Owns the panel, the SwiftUI host

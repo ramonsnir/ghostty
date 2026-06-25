@@ -82,6 +82,12 @@ test("maxItemsCap passes through (null = unlimited)", () => {
   assert.equal(queueStatusReport(input({ maxItemsCap: null })).maxItems, null);
 });
 
+test("concurrency passes through (present + present:false), defaulting to 0 when omitted", () => {
+  assert.equal(queueStatusReport(input({ concurrency: 9 })).concurrency, 9);
+  assert.equal(queueStatusReport(input()).concurrency, 0); // omitted → 0
+  assert.equal(queueStatusReport(input({ present: false, concurrency: 6 })).concurrency, 6);
+});
+
 test("null listItems (arm sweep) → 0 queued, no next, starting", () => {
   const r = queueStatusReport(input({ listItems: null, listOk: false, dispatchArmed: false }));
   assert.equal(r.queued, 0);

@@ -938,12 +938,27 @@ struct MCPServerTests {
         #expect(empty["maxItems"] == nil)
     }
 
+    @Test func queueCommandJSONObjectSetConcurrencyCarriesRunAndValue() {
+        // setConcurrency serializes to the snake_case action the sidecar whitelists, and
+        // carries the run name + the raw concurrency value string.
+        let d = QueueCommand(action: .setConcurrency, run: "ExampleOS", concurrency: "9").jsonObject
+        #expect(d["action"] as? String == "set_concurrency")
+        #expect(d["run"] as? String == "ExampleOS")
+        #expect(d["concurrency"] as? String == "9")
+        #expect(d["template"] == nil)
+        #expect(d["maxItems"] == nil)
+        // An empty value is omitted (the sidecar would ignore it anyway).
+        let empty = QueueCommand(action: .setConcurrency, run: "Q", concurrency: "").jsonObject
+        #expect(empty["concurrency"] == nil)
+    }
+
     // MARK: - Agent Queue: report_queue_status payload parsing (§11 health)
 
     @Test func queueStatusPayloadParsesFullArgs() {
         let p = QueueStatusPayload.fromArguments([
             "queueName": "ExampleOS", "present": true, "phase": "running",
             "queued": 7, "listOk": true, "active": 2, "dispatched": 2, "maxItems": 3,
+            "concurrency": 9,
             "next": [["key": "EX-1", "title": "Fix seed", "url": "https://linear.app/x/EX-1"],
                      ["key": "EX-2"]],
             "running": [["key": "EX-9", "title": "Running", "url": "https://linear.app/x/EX-9"]],
@@ -955,6 +970,7 @@ struct MCPServerTests {
         #expect(s?.queued == 7)
         #expect(s?.active == 2)
         #expect(s?.maxItems == 3)
+        #expect(s?.concurrency == 9)
         #expect(s?.next.count == 2)
         #expect(s?.next.first?.key == "EX-1")
         #expect(s?.next.first?.title == "Fix seed")
@@ -975,6 +991,7 @@ struct MCPServerTests {
         let s = QueueStatusPayload.fromArguments(["queueName": "Q"])?.status
         #expect(s?.present == true)
         #expect(s?.maxItems == nil)
+        #expect(s?.concurrency == 0) // absent ⇒ 0 (unknown)
         #expect(s?.next.isEmpty == true)
         #expect(s?.running.isEmpty == true)
         // present:false round-trips (the "run gone" report).

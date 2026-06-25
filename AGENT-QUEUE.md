@@ -250,6 +250,15 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   silently remove the cap.) Note a same-scope re-`start` is a no-op, so it can't change a live
   run's cap — this editor is the only in-place way; see *parallel runs* under **Start-time
   parameters** above.
+- **Change the concurrency (max parallel agents) live:** next to the cap is a **`⇉ N`** chip
+  showing the run's max *simultaneous* agents. Click it for a popover (presets `1 / 2 / 3 / 4 /
+  6 / 9` + a custom field) to raise or lower a *running* queue's concurrency **without restarting
+  it** (e.g. bump `6 → 9` mid-run). Raising it dispatches more in parallel on the next `list`
+  poll; lowering it only stops *future* dispatch — running agents are never killed. There's no
+  "unlimited" (concurrency is always a finite count); a blank/garbage/non-positive entry is
+  ignored. Raising it past the template's `cols×rows` grid automatically lifts the pane cap too,
+  so the extra agents get tiles (the grid is just a pane budget under balanced tiling). Like the
+  cap, a same-scope re-`start` won't change it — this chip is the only in-place way.
 
 ## What it guarantees
 

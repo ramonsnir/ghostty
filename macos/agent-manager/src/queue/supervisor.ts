@@ -116,14 +116,22 @@ export function selectCandidates(
  * occupying a slot (RUNNING/SPAWNED/etc — the caller decides which states count, but
  * typically every non-terminal, non-cooldown assignment). `globalRemaining` caps the
  * WHOLE fleet across runs (`agent-queue-max-total`). The result is floored at 0.
+ *
+ * `effConcurrency`/`effGridCap` OVERRIDE the template values when given (the live
+ * `set_concurrency` edit — see `effectiveConcurrency`/`effectiveGridCap` in runner.ts).
+ * Omitted ⇒ the template's own `concurrency` / `cols*rows` (the original behavior, kept
+ * so the existing tests + any non-live caller need no change).
  */
 export function remainingSlots(
   template: QueueTemplate,
   activeCount: number,
   globalRemaining: number,
+  effConcurrency?: number,
+  effGridCap?: number,
 ): number {
-  const gridCapacity = template.grid.cols * template.grid.rows;
-  const concurrencyRoom = template.concurrency - activeCount;
+  const gridCapacity = effGridCap ?? template.grid.cols * template.grid.rows;
+  const concurrency = effConcurrency ?? template.concurrency;
+  const concurrencyRoom = concurrency - activeCount;
   const gridRoom = gridCapacity - activeCount;
   return Math.max(0, Math.min(concurrencyRoom, gridRoom, globalRemaining));
 }

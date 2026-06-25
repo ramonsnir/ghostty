@@ -33,6 +33,9 @@ export interface QueueStatusReport {
   dispatched: number;
   /** Effective lifetime cap, or null for unlimited. */
   maxItems: number | null;
+  /** Effective max SIMULTANEOUS agents (the live `set_concurrency` edit if set, else the
+   *  template `concurrency`). The dashboard shows it + lets the user tap-to-edit it. */
+  concurrency: number;
   /** Up to `nextLimit` of the next actionable items (not currently active) — the
    *  "N waiting" dropdown. May be shorter than `queued` (capped); each carries its URL. */
   next: QueueItemRef[];
@@ -64,6 +67,9 @@ export interface QueueStatusInputs {
   dispatched: number;
   /** Effective lifetime cap (null = unlimited). */
   maxItemsCap: number | null;
+  /** Effective max simultaneous agents (the live `set_concurrency` edit if set, else the
+   *  template `concurrency`). Defaults to 0 when omitted (a present:false / legacy build). */
+  concurrency?: number;
   /** How many "next" items to include (default 5). */
   nextLimit?: number;
 }
@@ -87,6 +93,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       active: 0,
       dispatched: input.dispatched,
       maxItems: input.maxItemsCap,
+      concurrency: input.concurrency ?? 0,
       next: [],
       running: [],
     };
@@ -130,6 +137,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     active: input.runningItems.length,
     dispatched: input.dispatched,
     maxItems: input.maxItemsCap,
+    concurrency: input.concurrency ?? 0,
     next: deduped.slice(0, nextLimit).map(toRef),
     running: input.runningItems.map(toRef),
   };

@@ -127,6 +127,9 @@ struct AgentDashboardView: View {
                             onSetMaxItems: { value in
                                 model.setQueueMaxItems(run: section.id, value: value)
                             },
+                            onSetConcurrency: { value in
+                                model.setQueueConcurrency(run: section.id, value: value)
+                            },
                             graph: model.queueGraphs[section.id],
                             onOpenBacklog: {
                                 QueueBacklogWindowManager.shared.open(
@@ -368,6 +371,10 @@ private struct OriginSectionHeader: View {
     /// raw user string ("10"/"unlimited"/…) is posted as a `set_max_items` command; the
     /// sidecar parses it (blank/garbage = ignored).
     let onSetMaxItems: (String) -> Void
+    /// (live concurrency edit) Re-set this run's max SIMULTANEOUS agents (the dashboard
+    /// parallel control). The raw user string ("9") is posted as a `set_concurrency`
+    /// command; the sidecar parses it (blank/garbage/non-positive = ignored).
+    let onSetConcurrency: (String) -> Void
     /// (backlog graph) The run's latest whole-board snapshot, when the supervisor has pushed
     /// one (only when the template declares `provider.graph`). nil ⇒ no backlog button.
     let graph: QueueGraph?
@@ -384,6 +391,9 @@ private struct OriginSectionHeader: View {
     // (live maxItems edit) The "dispatched/cap" tap-to-edit popover + its draft field.
     @State private var showCapEditor = false
     @State private var capDraft = ""
+    // (live concurrency edit) The "⇉ N" tap-to-edit popover + its draft field.
+    @State private var showConcurrencyEditor = false
+    @State private var concurrencyDraft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -444,6 +454,26 @@ private struct OriginSectionHeader: View {
                         .help("Change the lifetime cap (maxItems) for this run")
                         .popover(isPresented: $showCapEditor, arrowEdge: .bottom) {
                             capEditorPopover(status)
+                        }
+                        // (live concurrency edit) A "⇉ N" chip = max simultaneous agents,
+                        // tap-to-edit (raise/lower the parallelism WITHOUT restarting the run).
+                        // Shown only once the report carries a concurrency (>0).
+                        if status.concurrency > 0 {
+                            Button {
+                                concurrencyDraft = String(status.concurrency)
+                                showConcurrencyEditor = true
+                            } label: {
+                                HStack(spacing: 2) {
+                                    Image(systemName: "rectangle.split.3x1")
+                                    Text("\(status.concurrency)")
+                                }
+                                .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Change max simultaneous agents (concurrency) for this run")
+                            .popover(isPresented: $showConcurrencyEditor, arrowEdge: .bottom) {
+                                concurrencyEditorPopover(status)
+                            }
                         }
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
@@ -565,6 +595,43 @@ private struct OriginSectionHeader: View {
     private func commitCap(_ value: String) {
         onSetMaxItems(value)
         showCapEditor = false
+    }
+
+    /// (live concurrency edit) The tap-to-edit parallel popover: quick presets + a custom
+    /// field. Commits the raw string (the sidecar parses + ignores garbage/non-positive),
+    /// so a fat-finger never silently changes parallelism.
+    @ViewBuilder
+    private func concurrencyEditorPopover(_ status: QueueStatus) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Max simultaneous agents").font(.caption.weight(.semibold))
+            Text("Currently \(status.concurrency) at once (\(status.active) running). Raising it lets the run dispatch more in parallel on the next poll; lowering it only stops FUTURE dispatch — running agents keep going.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach([1, 2, 3, 4, 6, 9], id: \.self) { v in
+                    Button("\(v)") { commitConcurrency(String(v)) }
+                        .buttonStyle(.bordered)
+                }
+            }
+            HStack(spacing: 6) {
+                TextField("custom", text: $concurrencyDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+                    .onSubmit { commitConcurrency(concurrencyDraft) }
+                Button("Set") { commitConcurrency(concurrencyDraft) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(QueueStatus.parseConcurrencyOptimistic(concurrencyDraft) == nil)
+            }
+        }
+        .padding(12)
+        .frame(width: 300)
+    }
+
+    private func commitConcurrency(_ value: String) {
+        onSetConcurrency(value)
+        showConcurrencyEditor = false
     }
 
     private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {
