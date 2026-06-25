@@ -8,7 +8,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runSweep, type LoopDeps, type SummarizeFn } from "./index.js";
+import {
+  runSweep,
+  parseLoopEnablement,
+  type LoopDeps,
+  type SummarizeFn,
+} from "./index.js";
 import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
@@ -714,4 +719,30 @@ test("backoff: an unparseable reply counts as a failure (engages backoff)", asyn
   await runSweep(deps);
 
   assert.equal(deps.summarizerBackoff.failureStreak, 1, "unparseable => fail => backoff");
+});
+
+// --- parseLoopEnablement: the independent summarizer/queue gating ---
+
+test("loops: summarizer ON by default (absent flag = back-compat on)", () => {
+  const e = parseLoopEnablement({});
+  assert.equal(e.summarizer, true, "absent GHOSTTY_SUMMARIZER => on");
+  assert.equal(e.queue, false, "absent GHOSTTY_AGENT_QUEUE => off");
+});
+
+test('loops: explicit "0" disables the summarizer (queue-only mode)', () => {
+  const e = parseLoopEnablement({ GHOSTTY_SUMMARIZER: "0", GHOSTTY_AGENT_QUEUE: "1" });
+  assert.equal(e.summarizer, false, '"0" => summarizer off');
+  assert.equal(e.queue, true, '"1" => queue on');
+});
+
+test('loops: explicit "1" keeps the summarizer on; queue independent', () => {
+  const e = parseLoopEnablement({ GHOSTTY_SUMMARIZER: "1" });
+  assert.equal(e.summarizer, true);
+  assert.equal(e.queue, false, "queue off unless exactly 1");
+});
+
+test("loops: queue is opt-in on exactly 1 (any other value = off)", () => {
+  assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "true" }).queue, false);
+  assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "0" }).queue, false);
+  assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "1" }).queue, true);
 });

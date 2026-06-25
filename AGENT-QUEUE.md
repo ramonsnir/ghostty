@@ -35,9 +35,13 @@ The supervisor **self-disables silently** (one info log) unless all of these hol
 
 1. **pty-host** (`pty-host = …`) — detection (`agentKind`) and the stable session ids the
    restart-resilience relies on both need it.
-2. **Agent Manager enabled + built** — see `AGENT-MANAGER.md` (this is the same sidecar):
-   `agent-manager = true`, `mcp-listen`/`mcp-token` set, `node` resolvable, and
-   `cd macos/agent-manager && npm ci && npm run build`.
+2. **The sidecar can run** — `mcp-listen`/`mcp-token` set, `node` resolvable, and the sidecar
+   built (`cd macos/agent-manager && npm ci && npm run build`). The queue and the Haiku
+   summarizer (Agent Manager) share **one sidecar**, but are **independent**: the shared
+   sidecar launches when **either** `agent-queue` **or** `agent-manager` is `true`, so you do
+   **not** need `agent-manager = true` to run a queue. Set `agent-queue = true` alone and the
+   sidecar runs the queue with the summarizer (and its Haiku billing) fully off. (See
+   `AGENT-MANAGER.md`; turning on `agent-manager` too just adds the per-tile Haiku summaries.)
 3. **Claude Code hooks installed** (the Agent-Dashboard ones) — the close-gate keys off the
    hook-driven agent state: it closes once the item is provider-`done` **and** the agent has
    been **quiescent** (`idle` *or* `waiting`) for a few seconds. *Without the hooks a queue can

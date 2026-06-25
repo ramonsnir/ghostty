@@ -8,96 +8,109 @@ import Testing
 /// MCP-URL builder. No `Process`, no AppKit, no live sidecar.
 struct AgentManagerControllerTests {
 
-    // MARK: - agentManagerShouldStart (the §8 SELF-DISABLE gate)
+    // MARK: - sidecarShouldStart (the §8 SELF-DISABLE gate, EITHER-feature)
 
-    /// The only TRUE case: everything present.
-    @Test func shouldStartWhenAllPresent() {
-        #expect(AgentManagerController.agentManagerShouldStart(
-            enabled: true,
+    /// Manager alone present ⇒ starts (the shared sidecar runs the summarizer).
+    @Test func shouldStartWhenManagerPresent() {
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: true, queueEnabled: false,
             mcpListen: "127.0.0.1:8765",
             mcpToken: "secret-token",
             nodePath: "/usr/local/bin/node") == true)
     }
 
-    /// Disabled master switch ⇒ never starts, regardless of MCP/node.
-    @Test func shouldNotStartWhenDisabled() {
-        #expect(AgentManagerController.agentManagerShouldStart(
-            enabled: false,
+    /// Queue alone present ⇒ ALSO starts (the independence requirement: the shared
+    /// sidecar launches for the queue with the summarizer off).
+    @Test func shouldStartWhenQueueOnlyPresent() {
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: false, queueEnabled: true,
+            mcpListen: "127.0.0.1:8765",
+            mcpToken: "secret-token",
+            nodePath: "/usr/local/bin/node") == true)
+    }
+
+    /// BOTH features off ⇒ never starts, regardless of MCP/node.
+    @Test func shouldNotStartWhenBothDisabled() {
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: false, queueEnabled: false,
             mcpListen: "127.0.0.1:8765",
             mcpToken: "secret-token",
             nodePath: "/usr/local/bin/node") == false)
     }
 
-    /// No MCP bind address (nil OR empty) ⇒ no transport ⇒ dormant. THE explicit
-    /// "no MCP" case the contract calls out.
+    /// No MCP bind address (nil OR empty) ⇒ no transport ⇒ dormant even with a
+    /// feature on. THE explicit "no MCP" case the contract calls out.
     @Test func shouldNotStartWithoutMCPListen() {
         for listen in [nil, ""] as [String?] {
-            #expect(AgentManagerController.agentManagerShouldStart(
-                enabled: true, mcpListen: listen, mcpToken: "tok",
-                nodePath: "/usr/local/bin/node") == false)
+            #expect(AgentManagerController.sidecarShouldStart(
+                managerEnabled: true, queueEnabled: false, mcpListen: listen,
+                mcpToken: "tok", nodePath: "/usr/local/bin/node") == false)
         }
     }
 
     /// No MCP token (nil OR empty) ⇒ sidecar can't authenticate ⇒ dormant.
     @Test func shouldNotStartWithoutMCPToken() {
-        #expect(AgentManagerController.agentManagerShouldStart(
-            enabled: true, mcpListen: "127.0.0.1:8765", mcpToken: nil,
-            nodePath: "/usr/local/bin/node") == false)
-        #expect(AgentManagerController.agentManagerShouldStart(
-            enabled: true, mcpListen: "127.0.0.1:8765", mcpToken: "",
-            nodePath: "/usr/local/bin/node") == false)
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: true, queueEnabled: false, mcpListen: "127.0.0.1:8765",
+            mcpToken: nil, nodePath: "/usr/local/bin/node") == false)
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: false, queueEnabled: true, mcpListen: "127.0.0.1:8765",
+            mcpToken: "", nodePath: "/usr/local/bin/node") == false)
     }
 
     /// No node path (nil OR empty) ⇒ nothing to launch ⇒ dormant.
     @Test func shouldNotStartWithoutNode() {
-        #expect(AgentManagerController.agentManagerShouldStart(
-            enabled: true, mcpListen: "127.0.0.1:8765", mcpToken: "tok",
-            nodePath: nil) == false)
-        #expect(AgentManagerController.agentManagerShouldStart(
-            enabled: true, mcpListen: "127.0.0.1:8765", mcpToken: "tok",
-            nodePath: "") == false)
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: true, queueEnabled: false, mcpListen: "127.0.0.1:8765",
+            mcpToken: "tok", nodePath: nil) == false)
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: false, queueEnabled: true, mcpListen: "127.0.0.1:8765",
+            mcpToken: "tok", nodePath: "") == false)
     }
 
-    /// Exhaustive truth table: only `1111` is true.
+    /// Exhaustive truth table: starts iff (manager OR queue) AND listen AND token AND node.
     @Test func shouldStartTruthTable() {
         let listen = "127.0.0.1:8765"
         let token = "tok"
         let node = "/usr/local/bin/node"
-        for e in [false, true] {
-            for l in [false, true] {
-                for t in [false, true] {
-                    for n in [false, true] {
-                        let got = AgentManagerController.agentManagerShouldStart(
-                            enabled: e,
-                            mcpListen: l ? listen : "",
-                            mcpToken: t ? token : "",
-                            nodePath: n ? node : "")
-                        #expect(got == (e && l && t && n))
+        for m in [false, true] {
+            for q in [false, true] {
+                for l in [false, true] {
+                    for t in [false, true] {
+                        for n in [false, true] {
+                            let got = AgentManagerController.sidecarShouldStart(
+                                managerEnabled: m, queueEnabled: q,
+                                mcpListen: l ? listen : "",
+                                mcpToken: t ? token : "",
+                                nodePath: n ? node : "")
+                            #expect(got == ((m || q) && l && t && n))
+                        }
                     }
                 }
             }
         }
     }
 
-    // MARK: - disabledReason (the one info line)
+    // MARK: - sidecarDisabledReason (the one info line)
 
     @Test func disabledReasonOrdersByFirstFailure() {
-        #expect(AgentManagerController.disabledReason(
-            enabled: false, mcpListen: "x:1", mcpToken: "t", nodePath: "/n")
-            == "agent-manager is off")
-        #expect(AgentManagerController.disabledReason(
-            enabled: true, mcpListen: "", mcpToken: "t", nodePath: "/n")
+        #expect(AgentManagerController.sidecarDisabledReason(
+            managerEnabled: false, queueEnabled: false, mcpListen: "x:1", mcpToken: "t", nodePath: "/n")
+            == "agent-manager and agent-queue are both off")
+        // A feature ON but MCP missing reports the transport failure, not "both off".
+        #expect(AgentManagerController.sidecarDisabledReason(
+            managerEnabled: true, queueEnabled: false, mcpListen: "", mcpToken: "t", nodePath: "/n")
             == "mcp-listen is not set")
-        #expect(AgentManagerController.disabledReason(
-            enabled: true, mcpListen: "x:1", mcpToken: "", nodePath: "/n")
+        #expect(AgentManagerController.sidecarDisabledReason(
+            managerEnabled: false, queueEnabled: true, mcpListen: "x:1", mcpToken: "", nodePath: "/n")
             == "mcp-token is not set")
-        #expect(AgentManagerController.disabledReason(
-            enabled: true, mcpListen: "x:1", mcpToken: "t", nodePath: nil)
+        #expect(AgentManagerController.sidecarDisabledReason(
+            managerEnabled: true, queueEnabled: true, mcpListen: "x:1", mcpToken: "t", nodePath: nil)
             == "node could not be resolved")
         // All present ⇒ the gate would have allowed start; the reason is "unknown"
         // (never actually surfaced in that case).
-        #expect(AgentManagerController.disabledReason(
-            enabled: true, mcpListen: "x:1", mcpToken: "t", nodePath: "/n")
+        #expect(AgentManagerController.sidecarDisabledReason(
+            managerEnabled: true, queueEnabled: false, mcpListen: "x:1", mcpToken: "t", nodePath: "/n")
             == "unknown")
     }
 
@@ -224,5 +237,26 @@ struct AgentManagerControllerTests {
             // A stale inherited dir must NOT survive — the sidecar default wins.
             #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
         }
+    }
+
+    // MARK: - applySummarizerEnv (the independent summarizer arming)
+
+    /// Enabled ⇒ sets GHOSTTY_SUMMARIZER=1 and leaves other keys untouched.
+    @Test func summarizerEnvEnabledSetsFlag() {
+        let out = AgentManagerController.applySummarizerEnv(
+            into: ["PATH": "/usr/bin"], enabled: true)
+        #expect(out["GHOSTTY_SUMMARIZER"] == "1")
+        #expect(out["PATH"] == "/usr/bin")
+    }
+
+    /// Disabled ⇒ the flag is set to an EXPLICIT "0" (overriding any stray inherited
+    /// "1"), so the queue can run with the summarizer's Haiku calls fully silent.
+    /// Explicit (not stripped) so the sidecar can distinguish "off" from a legacy
+    /// ABSENT flag (which it treats as on for back-compat).
+    @Test func summarizerEnvDisabledSetsZero() {
+        let out = AgentManagerController.applySummarizerEnv(
+            into: ["PATH": "/usr/bin", "GHOSTTY_SUMMARIZER": "1"], enabled: false)
+        #expect(out["GHOSTTY_SUMMARIZER"] == "0")
+        #expect(out["PATH"] == "/usr/bin")
     }
 }

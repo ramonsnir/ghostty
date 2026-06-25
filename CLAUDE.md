@@ -683,13 +683,36 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     falls back to the viewport tail alone and reads thin ("Idle — repo ready"); with them it
     reads rich. Prompt is tunable live via the override file (no rebuild).
   - **SELF-DISABLE (hard requirement, unit-tested).** `AgentManagerController.start()` runs
-    the §8 gate `agentManagerShouldStart(enabled, mcpListen, mcpToken, nodePath)` off-main:
-    unless `agent-manager` is on AND `mcp-listen`+`mcp-token` are set AND `node` resolves
-    (config `agent-manager-node-path`, else a login-shell `command -v node` probe — GUI apps
-    don't inherit `PATH`), it stays fully dormant with EXACTLY ONE info log; the dashboard is
-    unaffected. The sidecar is spawned/supervised via `Process` (lazy, bounded restart
-    backoff — both pure + tested), torn down on quit, run with `GHOSTTY_AGENT_MANAGER=1` so
-    its own model activity can't recurse through the agent-state hook.
+    the §8 gate `sidecarShouldStart(managerEnabled, queueEnabled, mcpListen, mcpToken, nodePath)`
+    off-main: unless **at least one feature** (`agent-manager` OR `agent-queue`) is on AND
+    `mcp-listen`+`mcp-token` are set AND `node` resolves (config `agent-manager-node-path`, else
+    a login-shell `command -v node` probe — GUI apps don't inherit `PATH`), it stays fully
+    dormant with EXACTLY ONE info log; the dashboard is unaffected. The sidecar is
+    spawned/supervised via `Process` (lazy, bounded restart backoff — both pure + tested), torn
+    down on quit, run with `GHOSTTY_AGENT_MANAGER=1` so its own model activity can't recurse
+    through the agent-state hook.
+  - **SHARED-SIDECAR / INDEPENDENT FEATURES (the agent-manager↔agent-queue untangle).** The
+    summarizer (agent-manager) and the queue supervisor (agent-queue) are TWO independent loops
+    that share ONE sidecar process. The launch gate (`sidecarShouldStart`, EITHER-feature OR)
+    starts the sidecar when either is enabled; which loops actually RUN inside it is decided
+    SEPARATELY by per-feature env flags, so each works with the other off — in particular
+    `agent-queue = true` + `agent-manager = false` runs the queue with the (Haiku-billing)
+    summarizer fully silent (the reason the untangle exists). Pure helpers
+    `AgentManagerController.applySummarizerEnv(into:enabled:)` (→ `GHOSTTY_SUMMARIZER`) and the
+    existing `applyAgentQueueEnv` (→ `GHOSTTY_AGENT_QUEUE`) arm the two; sidecar
+    `parseLoopEnablement(env)` reads them in `index.ts main()` and gates the `tick`/`queueTick`
+    loops. **BACK-COMPAT asymmetry:** `GHOSTTY_SUMMARIZER` is set EXPLICITLY both ways (`1`/`0`,
+    NOT stripped when off) and the sidecar treats an ABSENT flag as ON — because the summarizer
+    used to be unconditional, so an OLD GUI that respawns a NEW `dist` mid-upgrade keeps
+    summarizing; only this new GUI's explicit `0` (agent-manager off) disables it. The queue
+    stays opt-in (`1` only; absent ⇒ off). No new config key (reuses `agent-manager` +
+    `agent-queue`), no Zig/host change. Wiring: `AgentManagerController.swift` (`sidecarShouldStart`/
+    `sidecarDisabledReason` replacing the old `agentManagerShouldStart`/`disabledReason`,
+    `applySummarizerEnv`, `start()` OR-gate, `childEnvironment`); sidecar `index.ts`
+    (`parseLoopEnablement` + loop gating). Tests: `AgentManagerControllerTests`
+    (`shouldStartWhenQueueOnlyPresent`/`shouldNotStartWhenBothDisabled`/truth-table/
+    `summarizerEnv*`), sidecar `index.test.ts` (`loops:` group). **GUI relaunch + rebuilt sidecar
+    `dist`; no host/Zig change.**
   - **Read-only; ZERO autonomous send, ZERO host/Zig protocol change.** The only Zig change
     is two additive default-off config keys.
     Wiring: core — `src/config/Config.zig` (`agent-manager`/`agent-manager-node-path` + parse
