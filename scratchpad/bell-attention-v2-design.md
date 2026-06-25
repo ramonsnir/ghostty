@@ -188,4 +188,26 @@ rely on the sidecar promotion. Code is correct; this is a config choice, flagged
   `view.bell` arming gate left `list_surfaces.bell` blind) + 1 major (the CONFIG-MIGRATION
   item above). Blocker FIXED (event-driven `pendingBellIds` promotion); config-migration
   documented as a deferred user decision (configs are off-limits per your instruction).
-- Round 3: pending re-run after the blocker fix.
+- Round 3 (1f03913c1): FAIL/90 — 1 major (mislabeled parse semantics: `bell-features=
+  system,audio` does NOT dial down; attention+title stay on). Fixed (doc + test corrected to
+  the real additive-over-type-defaults semantics + the `no-*` dial-down).
+- Round 4 (ce18f3205): **PASS / 98** — all lenses ≥98 (correctness 98, design 98, threading
+  99, config 98, tests 98), ZERO blocker/major. The review verified the promotion path
+  end-to-end (ringBell unconditional → event bus → wait_for_event → pendingBellIds →
+  forcedBell → classify), fail-open airtightness, per-effect routing across all consumers,
+  principle #3, threading, and the cross-language BellFeatures bit-ABI. 3 polish nits, all
+  already-documented deferrals (zoom-badge attention aggregate; tile-frame raw-vs-promoted
+  visual distinction; a main-render config-read asymmetry) — cosmetic, not required.
+
+## Verification status
+- Unit: sidecar 420/420 (node --test); Zig config tests (attention-features additive +
+  BellFeatures bit-ABI); Swift ConfigTests (bit-ABI mirror) + AgentDashboardTests +
+  MCPServerTests + WebMonitorServerTests. Full Debug app BUILD SUCCEEDED; v2 markers
+  confirmed embedded in the dylib.
+- Live (prior session, core pipeline): set_attention → attentionNeeded → title 🔔 →
+  clear-on-focus; real-claude bell → sidecar edge → Haiku → set_attention → attn=true; idle
+  bell → attention=false.
+- Live (NEW event-driven path, slice-6 round-2 fix): reviewed + unit-tested (pendingBellId
+  forces a classify with bell=false); the underlying `wait_for_event` MCP tool predates v2
+  (used by the queue). A full live Debug drive of bellReactiveLoop is the one remaining
+  optional confidence step (offered to Ramon).
