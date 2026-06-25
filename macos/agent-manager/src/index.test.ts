@@ -748,3 +748,58 @@ test("bell-attention: dead-surface bell records are pruned each sweep", async ()
 
   assert.equal(deps.bellSeenBySession.has("s1"), false, "stale bell record dropped");
 });
+
+// ---------------------------------------------------------------------------
+// Bell-attention v2 FAIL-OPEN: a bell is suppressed ONLY by a clean, confident
+// attention:false. Omitted/uncertain verdict, a thrown model call, and an
+// unparseable reply all PROMOTE (a failing/hedging classifier never silences a bell).
+// ---------------------------------------------------------------------------
+
+const attnOmitted: SummarizeFn = async () => '{"summary":"working on stuff"}'; // no attention field
+
+test("bell-attention v2: omitted attention on a bell ⇒ FAIL-OPEN promote", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "ambiguous screen" } });
+  const { deps } = makeDeps({ fake, summarize: attnOmitted, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "uncertain verdict still promotes");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention v2: a THROWN model call on a bell ⇒ FAIL-OPEN promote", async () => {
+  const boom: SummarizeFn = async () => {
+    throw new Error("summarizer account out of tokens");
+  };
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps } = makeDeps({ fake, summarize: boom, last, bellFilter: true });
+
+  await runSweep(deps); // must not throw
+
+  assert.equal(fake.attentionCalls.length, 1, "a failing classifier promotes (fail-open)");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention v2: an UNPARSEABLE reply on a bell ⇒ FAIL-OPEN promote", async () => {
+  const junk: SummarizeFn = async () => "not json at all";
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps } = makeDeps({ fake, summarize: junk, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "unparseable reply promotes (fail-open)");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention v2: only a CONFIDENT attention:false suppresses", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "launched workflow in background" } });
+  const { deps } = makeDeps({ fake, summarize: attnFalse, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 0, "explicit false is the ONLY thing that suppresses");
+});

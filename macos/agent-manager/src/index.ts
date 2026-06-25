@@ -207,9 +207,12 @@ async function summarizeOne(
     const parsed = parseSummary(raw);
     if (!parsed) {
       // Spent a model call but got nothing usable — throttle the retry. No usable
-      // classify this sweep ⇒ leave the alert state untouched (see the idle note).
+      // classify this sweep ⇒ leave the SUMMARY/alert state untouched. But a bell
+      // rang and we have no confident verdict ⇒ FAIL-OPEN: promote (an unparseable
+      // reply must NEVER silence a bell).
       recordAttempt();
       errlog(`surface ${surface.id}: model reply not parseable; skipping`);
+      if (bellRang) await bellPromote(deps, surface, "unparseable classify (fail-open)");
       return;
     }
 
@@ -231,21 +234,11 @@ async function summarizeOne(
     // clear when it reports no alert (the screen changed and Haiku no longer sees
     // the live condition — this is how recovery un-rings, immune to scrolled-up text).
     await maybeSignalAlert(deps, surface, parsed.alert);
-    // (bell-attention) On a bell-triggered classify, PROMOTE the bell to the sticky
-    // "attention needed" state iff Haiku judged it worth interrupting. We only ever
-    // SET it true here; the GUI clears it on focus. set_attention is idempotent, so a
-    // re-promote is harmless. Self-isolating so a tool failure never breaks the sweep.
-    if (bellRang && parsed.attention === true) {
-      try {
-        await client.setAttention(surface.id, true, parsed.summary);
-        log(`surface ${surface.id}: bell promoted -> attention needed`);
-      } catch (err) {
-        errlog(
-          `surface ${surface.id}: set_attention failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
+    // (bell-attention v2, FAIL-OPEN) On a bell-triggered classify, PROMOTE unless Haiku
+    // confidently said ignore. `attention === false` is the ONLY suppression; `true` and
+    // an OMITTED/uncertain verdict both promote (so model hedging never silences a bell).
+    if (bellRang && parsed.attention !== false) {
+      await bellPromote(deps, surface, parsed.summary);
     }
     log(`surface ${surface.id}: "${parsed.summary}"`);
   } catch (err) {
@@ -262,6 +255,10 @@ async function summarizeOne(
         err instanceof Error ? err.message : String(err)
       }`,
     );
+    // (bell-attention v2, FAIL-OPEN) A bell rang but the read/model/annotate failed
+    // (incl. the summarizer's own account being out of tokens) ⇒ we have no confident
+    // verdict ⇒ promote. A failing classifier must never silence a bell.
+    if (bellRang) await bellPromote(deps, surface, "classify error (fail-open)");
   } finally {
     deps.budget.release();
   }
@@ -271,6 +268,28 @@ async function summarizeOne(
 function alertReason(alert: string): string {
   if (alert === ALERT_RATE_LIMITED) return "Rate limited — waiting for you";
   return `Attention: ${alert}`;
+}
+
+/**
+ * (bell-attention v2, FAIL-OPEN) Promote a belled surface to the sticky attention state.
+ * Called on a bell-edge classify in EVERY outcome EXCEPT a clean, confident Haiku
+ * `attention === false` — so a model error, timeout, out-of-tokens, unparseable reply,
+ * or an omitted/uncertain verdict all land here and PROMOTE. Only an explicit "ignore"
+ * suppresses (the user's "only an explicit filter can ignore a bell"). The GUI clears
+ * attention on focus; `set_attention` is idempotent. Self-isolating: a tool failure is
+ * logged, never thrown into the sweep.
+ */
+async function bellPromote(deps: LoopDeps, surface: Surface, reason: string): Promise<void> {
+  try {
+    await deps.client.setAttention(surface.id, true, reason);
+    log(`surface ${surface.id}: bell promoted -> attention needed (${reason})`);
+  } catch (err) {
+    errlog(
+      `surface ${surface.id}: set_attention failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 }
 
 /**
