@@ -110,7 +110,14 @@ shell the engine just runs.
     },
     // CLAIM (optional): run once after dispatch to remove the item from the source sooner.
     // Dedup does NOT depend on it — it's a latency optimization only.
-    "claim": { "command": ["linear-claim", "{key}"] }
+    "claim": { "command": ["linear-claim", "{key}"] },
+    // GRAPH (optional): print the WHOLE board — every item in scope, ALL states — for the
+    // dashboard's "N backlog" button → a dependency-graph canvas. Output:
+    //   {"nodes":[{"key","title?","url?","state?","stateType?","done","labels":[],"blockedBy":[],"priority?"}]}
+    // `done` (terminal) + `stateType` (color category: backlog/unstarted/started/completed/
+    // canceled/triage) are YOUR script's call — Ghostty maps no tracker. Fetched on the
+    // `list` cadence; absent ⇒ no backlog button. NOT part of dispatch (grooming/debug only).
+    "graph": { "command": ["linear-queue-graph"] }
   },
   "onAgentExit": "leave-and-bell",           // a crashed agent: keep the split for review + ring the bell everywhere
   "closeOnComplete": true,

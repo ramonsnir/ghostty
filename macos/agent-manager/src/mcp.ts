@@ -19,7 +19,7 @@
 // crash on a transient MCP failure — the caller logs + continues.
 
 import type { QueueCommand } from "./queue/commands.js";
-import type { QueueStatusReport } from "./queue/status.js";
+import type { QueueGraphReport, QueueStatusReport } from "./queue/status.js";
 
 /** Thrown for any MCP transport / protocol / tool failure. The loop catches it. */
 export class McpError extends Error {
@@ -186,6 +186,23 @@ export class McpClient {
       maxItems: status.maxItems,
       next: status.next,      // each carries key/title?/url?
       running: status.running, // key/title?/url? per running agent
+    });
+  }
+
+  /**
+   * (Agent Queue, backlog graph) Push the run's WHOLE-board snapshot to the GUI via the
+   * `report_queue_graph` MCP tool, so the dashboard shows the "N backlog" button + renders
+   * the dependency-graph canvas. Fired only when the optional `provider.graph` is defined
+   * and a fetch SUCCEEDS (throttled at `intervals.listMs`), plus once with `present:false`
+   * when the run is removed. Fire-and-forget from the caller's view (the runner catches
+   * errors); the wire args mirror `QueueGraphReport` 1:1.
+   */
+  async reportQueueGraph(graph: QueueGraphReport): Promise<void> {
+    await this.call("report_queue_graph", {
+      queueName: graph.queueName,
+      present: graph.present,
+      backlog: graph.backlog,
+      nodes: graph.nodes, // each: key, done, labels[], blockedBy[], + optional fields
     });
   }
 

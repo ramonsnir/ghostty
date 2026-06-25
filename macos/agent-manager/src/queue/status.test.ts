@@ -3,8 +3,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { queueStatusReport, type QueueStatusInputs } from "./status.js";
-import type { WorkItem } from "./types.js";
+import { queueStatusReport, backlogCount, type QueueStatusInputs } from "./status.js";
+import type { GraphNode, WorkItem } from "./types.js";
 
 function items(...keys: Array<string | [string, string]>): WorkItem[] {
   return keys.map((k) =>
@@ -87,4 +87,36 @@ test("null listItems (arm sweep) → 0 queued, no next, starting", () => {
   assert.equal(r.queued, 0);
   assert.deepEqual(r.next, []);
   assert.equal(r.phase, "starting");
+});
+
+// ---------------------------------------------------------------------------
+// backlogCount — the header-badge number (non-terminal, not waiting/running).
+// ---------------------------------------------------------------------------
+
+function node(over: Partial<GraphNode> & { key: string }): GraphNode {
+  return { done: false, labels: [], blockedBy: [], ...over };
+}
+
+test("backlogCount: counts non-terminal nodes not in the exclude set", () => {
+  const nodes = [node({ key: "A-1" }), node({ key: "A-2" }), node({ key: "A-3" })];
+  assert.equal(backlogCount(nodes, new Set(["A-2"])), 2);
+});
+
+test("backlogCount: terminal (done) nodes never count", () => {
+  const nodes = [node({ key: "A-1", done: true }), node({ key: "A-2" })];
+  assert.equal(backlogCount(nodes, new Set()), 1);
+});
+
+test("backlogCount: excludes both waiting (list) and running (active) keys", () => {
+  const nodes = [
+    node({ key: "W" }), // waiting
+    node({ key: "R" }), // running
+    node({ key: "B" }), // backlog
+    node({ key: "D", done: true }), // done
+  ];
+  assert.equal(backlogCount(nodes, new Set(["W", "R"])), 1);
+});
+
+test("backlogCount: empty board → 0", () => {
+  assert.equal(backlogCount([], new Set(["X"])), 0);
 });

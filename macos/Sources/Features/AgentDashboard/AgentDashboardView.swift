@@ -123,6 +123,16 @@ struct AgentDashboardView: View {
                             },
                             onSetMaxItems: { value in
                                 model.setQueueMaxItems(run: section.id, value: value)
+                            },
+                            graph: model.queueGraphs[section.id],
+                            onOpenBacklog: {
+                                QueueBacklogWindowManager.shared.open(
+                                    runName: section.id, model: model,
+                                    onJumpToKey: { key in
+                                        if let id = model.surfaceID(forQueue: section.id, key: key) {
+                                            focusHidden(id)
+                                        }
+                                    })
                             }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
@@ -355,6 +365,11 @@ private struct OriginSectionHeader: View {
     /// raw user string ("10"/"unlimited"/…) is posted as a `set_max_items` command; the
     /// sidecar parses it (blank/garbage = ignored).
     let onSetMaxItems: (String) -> Void
+    /// (backlog graph) The run's latest whole-board snapshot, when the supervisor has pushed
+    /// one (only when the template declares `provider.graph`). nil ⇒ no backlog button.
+    let graph: QueueGraph?
+    /// (backlog graph) Open the dependency-graph canvas for this run.
+    let onOpenBacklog: () -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
@@ -430,6 +445,13 @@ private struct OriginSectionHeader: View {
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
+                    // (backlog graph) The "N backlog" button → the dependency-graph canvas.
+                    // Shown whenever the run is reporting a board (provider.graph on). Lives
+                    // inside the status line because a section only exists once the run has
+                    // reported health (pushed every sweep), so `status` is always present here.
+                    if let graph {
+                        backlogButton(graph)
+                    }
                     Spacer(minLength: 0)
                 }
             }
@@ -455,6 +477,22 @@ private struct OriginSectionHeader: View {
         } message: {
             Text("Immediately force-closes all \(section.count) agent split\(section.count == 1 ? "" : "s") in this run, discarding any in-progress work.")
         }
+    }
+
+    /// (backlog graph) The "N backlog" button that opens the dependency-graph canvas. The
+    /// count is the sidecar-derived groomable remainder (non-terminal, not waiting/running).
+    @ViewBuilder
+    private func backlogButton(_ graph: QueueGraph) -> some View {
+        Button(action: onOpenBacklog) {
+            HStack(spacing: 3) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Text("\(graph.backlog) backlog")
+            }
+            .font(.caption2)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Open the backlog dependency graph (\(graph.nodes.count) items in scope)")
     }
 
     @ViewBuilder

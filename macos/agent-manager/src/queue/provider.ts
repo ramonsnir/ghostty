@@ -13,6 +13,8 @@
 // full of quotes/$/backticks/newlines can never become shell metacharacters.
 
 import type {
+  GraphNode,
+  ProviderGraphSpec,
   ProviderListSpec,
   ProviderStatusSpec,
   WorkItem,
@@ -217,6 +219,62 @@ export function parseStatusOutput(
   return { terminal: done };
 }
 
+/**
+ * Parse the `graph` provider stdout into GraphNodes. PURE + TOLERANT. Accepts either a
+ * top-level `{"nodes":[...]}` object OR a bare array of node objects. Each node needs a
+ * non-empty string `key`; nodes without one are DROPPED. `done` coerces from a boolean
+ * (default false). `labels`/`blockedBy` accept a string array (non-string entries
+ * dropped); a single string is wrapped. `state`/`stateType`/`title`/`url` are kept only
+ * when strings; `priority` only when a finite number. Unparseable / wrong-shaped stdout
+ * yields `[]` (the caller treats it as "no graph this poll" — never throws). Duplicate
+ * keys collapse to the FIRST occurrence (a flaky provider can repeat).
+ */
+export function parseGraphOutput(stdout: string): GraphNode[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  const rawNodes: unknown = Array.isArray(parsed)
+    ? parsed
+    : parsed !== null && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>).nodes
+      : undefined;
+  if (!Array.isArray(rawNodes)) return [];
+
+  const out: GraphNode[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawNodes) {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const rec = raw as Record<string, unknown>;
+    const key = asString(rec.key);
+    if (key === undefined || key.length === 0) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const node: GraphNode = {
+      key,
+      done: rec.done === true,
+      labels: asStringArray(rec.labels),
+      blockedBy: asStringArray(rec.blockedBy),
+    };
+    const title = asString(rec.title);
+    if (title !== undefined) node.title = title;
+    const url = asString(rec.url);
+    if (url !== undefined) node.url = url;
+    const state = asString(rec.state);
+    if (state !== undefined) node.state = state;
+    const stateType = asString(rec.stateType);
+    if (stateType !== undefined) node.stateType = stateType;
+    if (typeof rec.priority === "number" && Number.isFinite(rec.priority)) {
+      node.priority = rec.priority;
+    }
+    out.push(node);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // runProvider — the ONLY non-pure function (process spawn via an injected seam).
 // ---------------------------------------------------------------------------
@@ -321,6 +379,23 @@ export async function fetchListResult(
   return { ok: true, items: parseListOutput(run.result.stdout, spec) };
 }
 
+/**
+ * Run the OPTIONAL `graph` command and parse its board into GraphNodes. PURE over its
+ * injected `exec`. Like `fetchListResult`, distinguishes a SUCCESSFUL board from a
+ * FAILED/skip one: `ok` is true only when the provider exited cleanly. A FAILED graph
+ * (`{ok:false, nodes:[]}`) leaves the GUI showing the last-known board (the caller does
+ * NOT push on failure) — never an empty canvas on a transient error.
+ */
+export async function fetchGraphResult(
+  spec: ProviderGraphSpec,
+  exec: Exec,
+  opts: ExecOptions = {},
+): Promise<{ ok: boolean; nodes: GraphNode[] }> {
+  const run = await runProvider(spec.command, exec, opts);
+  if (!run.ok) return { ok: false, nodes: [] };
+  return { ok: true, nodes: parseGraphOutput(run.result.stdout) };
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers.
 // ---------------------------------------------------------------------------
@@ -328,6 +403,15 @@ export async function fetchListResult(
 /** Coerce a value to a string only when it IS a string. PURE. */
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
+}
+
+/** Coerce a value to an array of strings (drops non-string entries). A bare string is
+ *  wrapped as a one-element array; anything else yields `[]`. PURE. Used for a graph
+ *  node's `labels`/`blockedBy`. */
+function asStringArray(v: unknown): string[] {
+  if (typeof v === "string") return [v];
+  if (!Array.isArray(v)) return [];
+  return v.filter((e): e is string => typeof e === "string");
 }
 
 /** Coerce a scalar (string/number/boolean) to a string for meta. PURE. Objects /

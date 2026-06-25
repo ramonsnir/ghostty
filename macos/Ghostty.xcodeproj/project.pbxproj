@@ -131,6 +131,7 @@
 				Features/AgentDashboard/AgentDetector.swift,
 				Features/AgentDashboard/AgentPreviewTile.swift,
 				Features/AgentDashboard/AgentStateBridge.swift,
+				Features/AgentDashboard/QueueBacklogCanvas.swift,
 				Features/AgentManager/AgentManagerController.swift,
 				"Features/App Intents/CloseTerminalIntent.swift",
 				"Features/App Intents/CommandPaletteIntent.swift",

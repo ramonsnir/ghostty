@@ -281,6 +281,39 @@ enum MCPTools {
                 "additionalProperties": false,
             ],
         ],
+        [
+            // (ramon fork / Agent Queue, backlog graph)
+            "name": "report_queue_graph",
+            "description": "Agent Queue: PUSH a run's WHOLE backlog board (every state — not just actionable items) to the GUI Agent Dashboard, for the 'N backlog' header button + the dependency-graph canvas. The supervisor calls this throttled to intervals.listMs when the template declares the optional provider.graph. 'queueName' (= run/origin name) is required; 'present:false' clears the run's backlog button + canvas. 'backlog' is the header-badge count (non-terminal items not currently waiting/running). 'nodes' is the full board: each {key (required), title?, url?, state? (display name), stateType? (category for color), done (terminal flag), labels[] (e.g. 'Design needed'), blockedBy[] (keys this depends on), priority?}.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "queueName": ["type": "string"],
+                    "present": ["type": "boolean", "default": true],
+                    "backlog": ["type": "integer"],
+                    "nodes": [
+                        "type": "array",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "key": ["type": "string"],
+                                "title": ["type": "string"],
+                                "url": ["type": "string"],
+                                "state": ["type": "string"],
+                                "stateType": ["type": "string"],
+                                "done": ["type": "boolean"],
+                                "labels": ["type": "array", "items": ["type": "string"]],
+                                "blockedBy": ["type": "array", "items": ["type": "string"]],
+                                "priority": ["type": "integer"],
+                            ],
+                            "required": ["key"],
+                        ],
+                    ],
+                ],
+                "required": ["queueName"],
+                "additionalProperties": false,
+            ],
+        ],
     ]
 
     // MARK: - dispatch
@@ -461,6 +494,13 @@ enum MCPTools {
             }
             let ok = server.applyQueueStatus(payload.status)
             return ok ? .ok(["ok": true]) : .toolError("queue status not applied")
+
+        case "report_queue_graph":
+            guard let payload = QueueGraphPayload.fromArguments(arguments) else {
+                return .invalidParams("missing or empty queueName")
+            }
+            let ok = server.applyQueueGraph(payload.graph)
+            return ok ? .ok(["ok": true]) : .toolError("queue graph not applied")
 
         case "take_queue_commands":
             // dispatch() ALREADY runs on the server serial `queue` (handleRPC is a

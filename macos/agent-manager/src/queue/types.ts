@@ -56,11 +56,58 @@ export interface ProviderClaimSpec {
   command: string[];
 }
 
-/** The provider triple (§5). */
+/** The OPTIONAL `graph` provider command (backlog graph): emits the run's WHOLE scoped
+ *  board (ALL states — not just actionable, unlike `list`) as JSON for the dashboard's
+ *  backlog-graph canvas. A grooming/debug affordance, NEVER part of dispatch — the engine
+ *  only fetches it (throttled at `intervals.listMs`) to cache + push to the GUI; it never
+ *  drives a dispatch/completion decision. Absent ⇒ no backlog button (the feature is
+ *  silently off). PURE GENERICITY: like `list`/`status`, it is a command emitting JSON; the
+ *  SCRIPT decides terminality (`done`) and category (`stateType`) — Ghostty maps neither
+ *  to any tracker. */
+export interface ProviderGraphSpec {
+  command: string[];
+}
+
+/** The provider triple (§5) + the optional backlog `graph` source. */
 export interface ProviderSpec {
   list: ProviderListSpec;
   status: ProviderStatusSpec;
   claim?: ProviderClaimSpec;
+  graph?: ProviderGraphSpec;
+}
+
+/** (backlog graph) One node of the OPTIONAL `provider.graph` board — the FULL set of items
+ *  in the run's scope (every state), with labels + dependency edges, rendered as a DAG in
+ *  the dashboard's backlog canvas. GENERIC: the provider SCRIPT decides `done` (terminal,
+ *  like status `doneStates`) and the coarse `stateType` category; Ghostty maps neither to a
+ *  tracker. Edges in `blockedBy` may reference keys not present in the node set (e.g. a
+ *  blocker outside the scope) — the GUI just ignores dangling edges. */
+export interface GraphNode {
+  /** Stable item identity (matches a WorkItem.key / the status key). REQUIRED. */
+  key: string;
+  /** Display title (optional). */
+  title?: string;
+  /** Item URL for the canvas "open" affordance (optional). */
+  url?: string;
+  /** Display workflow-state name, e.g. "In Progress" (optional). */
+  state?: string;
+  /** Coarse workflow-state CATEGORY for the node color (e.g. "started"/"completed");
+   *  free-form — the GUI maps known categories to colors and anything else to neutral. */
+  stateType?: string;
+  /** Provider-declared TERMINAL flag (done/canceled/duplicate/…): excluded from the
+   *  backlog count and dimmed in the canvas. The SCRIPT decides (mirrors status doneStates). */
+  done: boolean;
+  /** Free-form labels (e.g. "Design needed", "Customer input"). */
+  labels: string[];
+  /** Keys of items that BLOCK this one — the DAG's dependency edges. */
+  blockedBy: string[];
+  /** Optional tracker priority int (0=none,1=urgent,…), display-only. */
+  priority?: number;
+}
+
+/** (backlog graph) The board snapshot the sidecar caches + pushes via `report_queue_graph`. */
+export interface QueueGraph {
+  nodes: GraphNode[];
 }
 
 /** The agent launch spec (§5). `command` is the shell command the split runs (item

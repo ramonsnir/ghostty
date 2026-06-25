@@ -2087,3 +2087,84 @@ struct AgentQueueHealthTests {
         #expect(model.queueStatuses["ExampleOS"]?.running.first?.key == "EX-1")
     }
 }
+
+// MARK: - Backlog graph (the dependency-graph canvas)
+
+@MainActor
+struct QueueBacklogTests {
+    private func node(
+        _ key: String, done: Bool = false, blockedBy: [String] = [],
+        labels: [String] = [], stateType: String? = nil
+    ) -> QueueGraph.Node {
+        .init(key: key, title: nil, url: nil, state: nil, stateType: stateType,
+              done: done, labels: labels, blockedBy: blockedBy, priority: nil)
+    }
+
+    // MARK: assignLayers — longest-path-from-roots over blockedBy edges
+
+    @Test func rootsAreLayerZero() {
+        let layers = QueueBacklogLayout.assignLayers([node("A"), node("B")])
+        #expect(layers["A"] == 0)
+        #expect(layers["B"] == 0)
+    }
+
+    @Test func chainLayersIncrement() {
+        // A ← B ← C  (B blocked by A, C blocked by B) → layers 0,1,2.
+        let layers = QueueBacklogLayout.assignLayers([
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["B"]),
+        ])
+        #expect(layers["A"] == 0)
+        #expect(layers["B"] == 1)
+        #expect(layers["C"] == 2)
+    }
+
+    @Test func diamondUsesLongestPath() {
+        // A→B, A→C, B→D, C→D : D is 1 + max(B,C) = 2.
+        let layers = QueueBacklogLayout.assignLayers([
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["A"]),
+            node("D", blockedBy: ["B", "C"]),
+        ])
+        #expect(layers["D"] == 2)
+    }
+
+    @Test func danglingEdgeIgnored() {
+        // B is blocked by X which is NOT in the set → B is treated as a root (layer 0).
+        let layers = QueueBacklogLayout.assignLayers([node("B", blockedBy: ["X"])])
+        #expect(layers["B"] == 0)
+    }
+
+    @Test func cycleIsBrokenAndTerminates() {
+        // A↔B mutual block (shouldn't happen, but must not loop forever).
+        let layers = QueueBacklogLayout.assignLayers([
+            node("A", blockedBy: ["B"]), node("B", blockedBy: ["A"]),
+        ])
+        #expect(layers["A"] != nil)
+        #expect(layers["B"] != nil)
+    }
+
+    @Test func columnsGroupByLayerInOrder() {
+        let cols = QueueBacklogLayout.columns([
+            node("A"), node("B", blockedBy: ["A"]), node("C"),
+        ])
+        #expect(cols.count == 2)
+        #expect(cols[0].map(\.key) == ["A", "C"]) // both roots, input order
+        #expect(cols[1].map(\.key) == ["B"])
+    }
+
+    @Test func columnsEmptyForNoNodes() {
+        #expect(QueueBacklogLayout.columns([]).isEmpty)
+    }
+
+    // MARK: applyQueueGraph store/clear
+
+    @Test func applyQueueGraphStoresAndClears() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueGraph(QueueGraph(
+            queueName: "ExampleOS", present: true, backlog: 2, nodes: [node("A"), node("B")]))
+        #expect(model.queueGraphs["ExampleOS"]?.backlog == 2)
+        #expect(model.queueGraphs["ExampleOS"]?.nodes.count == 2)
+        // present:false clears it.
+        model.applyQueueGraph(QueueGraph(queueName: "ExampleOS", present: false, backlog: 0, nodes: []))
+        #expect(model.queueGraphs["ExampleOS"] == nil)
+    }
+}

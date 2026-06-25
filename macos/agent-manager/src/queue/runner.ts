@@ -35,6 +35,7 @@ import {
   buildItemEnv,
   shellEnvPrefix,
   fetchListResult,
+  fetchGraphResult,
   probeStatus,
   renderArgv,
   runProvider,
@@ -71,8 +72,19 @@ import {
   runDisplayName,
   runIdentityScope,
 } from "./templates.js";
-import { queueStatusReport, type QueueStatusReport } from "./status.js";
-import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
+import {
+  queueStatusReport,
+  backlogCount,
+  type QueueStatusReport,
+  type QueueGraphReport,
+} from "./status.js";
+import type {
+  Assignment,
+  GraphNode,
+  QueueGraph,
+  QueueTemplate,
+  WorkItem,
+} from "./types.js";
 
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: queue: ${msg}`);
@@ -208,6 +220,15 @@ export interface QueueRun {
    *  after a restart the first sweep re-fetches, which is correct. */
   lastListAtMs: number;
   lastStatusAtMs: number;
+  /** (backlog graph) The most recent WHOLE-board snapshot from the optional `provider.graph`
+   *  (null until the first successful fetch), and the wall-clock ms of the last graph fetch
+   *  ATTEMPT. The graph is fetched on the SAME cadence as `list` (`intervals.listMs`), cached
+   *  here, and pushed to the GUI via `report_queue_graph` — independent of dispatch, so the
+   *  backlog view stays live even while the run is paused/draining. Not persisted (a restart
+   *  re-fetches on the first due sweep). `lastGraphAtMs` inits NEGATIVE_INFINITY so the first
+   *  sweep fetches. */
+  lastGraph: QueueGraph | null;
+  lastGraphAtMs: number;
   /** (live maxItems edit) A run-level OVERRIDE of the lifetime cap, set by a `set_max_items`
    *  command WHILE the run is live (the dashboard cap control). Takes PRECEDENCE over the
    *  start-time/template cap in `effectiveMaxItemsCap`. `undefined` = no live edit (use the
@@ -258,6 +279,8 @@ export function makeQueueRun(
     lastListOk: false,
     lastListAtMs: Number.NEGATIVE_INFINITY,
     lastStatusAtMs: Number.NEGATIVE_INFINITY,
+    lastGraph: null,
+    lastGraphAtMs: Number.NEGATIVE_INFINITY,
   };
 }
 
@@ -406,6 +429,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         deps.registry.delete(name);
         registryChanged = true;
         await reportRunGone(deps, name);
+        await reportGraphGone(deps, name);
         log(`run "${name}" ABORTED — all assignments force-closed, run removed`);
         continue;
       }
@@ -418,6 +442,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         deps.registry.delete(name);
         registryChanged = true;
         await reportRunGone(deps, name);
+        await reportGraphGone(deps, name);
         log(`run "${name}" DRAINED — no slot-occupying assignments, run removed`);
       }
       // NOTE: there is intentionally NO "quit-when-empty" auto-removal. A run is removed
@@ -647,9 +672,78 @@ async function runOne(
     dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining);
   }
 
+  // --- 4.5) REFRESH the backlog GRAPH (optional `provider.graph`), throttled to listMs.
+  // Independent of dispatch (runs even while paused/draining/disabled) so the grooming
+  // view stays live; best-effort (a failed fetch keeps the last-known board).
+  await refreshGraph(run, deps, nowMs);
+
   // --- 5) REPORT run-level health (§11), AFTER dispatch so the counts are fresh. -----
   await reportQueueStatus(run, deps);
   return dispatched;
+}
+
+/** (backlog graph) Fetch the optional `provider.graph` board on the `list` cadence, cache
+ *  it on the run, and push it to the GUI via `report_queue_graph`. No-op when the template
+ *  declares no `provider.graph`, when the client lacks the capability (test fakes), or when
+ *  not yet due. A FAILED fetch is skipped silently — the GUI keeps the last-known board (no
+ *  push), never blanking the canvas on a transient provider error. The header-badge
+ *  `backlog` count excludes everything the header already shows as waiting/running (the
+ *  actionable-list keys ∪ the active assignment keys). */
+async function refreshGraph(run: QueueRun, deps: QueueDeps, nowMs: number): Promise<void> {
+  const spec = run.template.provider.graph;
+  if (spec === undefined) return;
+  // A self-DISABLED run (no pty-host) is dormant — don't spend tracker calls on its board.
+  if (run.disabled) return;
+  if (deps.client.reportQueueGraph === undefined) return; // optional client capability
+  // Same throttle as `list` (consumed on the ATTEMPT so a failing graph waits a full
+  // interval too — a hard cap of one graph call per listMs regardless of outcome).
+  if (nowMs - run.lastGraphAtMs < run.template.intervals.listMs) return;
+  run.lastGraphAtMs = nowMs;
+
+  let res: { ok: boolean; nodes: GraphNode[] };
+  try {
+    res = await fetchGraphResult(spec, deps.exec, {
+      cwd: run.template.workdir,
+      env: resolveParamsEnv(run.template, run.params),
+    });
+  } catch (err) {
+    errlog(`provider.graph "${run.runName}": ${msg(err)}`);
+    return;
+  }
+  if (!res.ok) return; // keep last-known board on a failed fetch
+
+  run.lastGraph = { nodes: res.nodes };
+  const exclude = new Set<string>([
+    ...(run.lastListItems ?? []).map((i) => i.key),
+    ...run.active.keys(),
+  ]);
+  const report: QueueGraphReport = {
+    queueName: run.runName,
+    present: true,
+    backlog: backlogCount(res.nodes, exclude),
+    nodes: res.nodes,
+  };
+  try {
+    await deps.client.reportQueueGraph(report);
+  } catch (err) {
+    errlog(`report_queue_graph "${run.runName}": ${msg(err)}`);
+  }
+}
+
+/** (backlog graph) Tell the GUI a run's backlog board is GONE (run removed) so it clears
+ *  the "N backlog" button + canvas. Best-effort; called alongside `reportRunGone`. */
+async function reportGraphGone(deps: QueueDeps, name: string): Promise<void> {
+  if (deps.client.reportQueueGraph === undefined) return;
+  try {
+    await deps.client.reportQueueGraph({
+      queueName: name,
+      present: false,
+      backlog: 0,
+      nodes: [],
+    });
+  } catch (err) {
+    errlog(`report_queue_graph(gone) "${name}": ${msg(err)}`);
+  }
 }
 
 /** (§11 health) Build + push the run-level health report via the MCP client. Best-effort

@@ -985,6 +985,43 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       buttons). Tests: sidecar `status.test.ts` (next url + running echo) + `mcp.test.ts`
       (running forward); Swift `MCPServerTests` (parse url+running) + `AgentDashboardTests`
       (`progressText`, `applyKeepsNextAndRunningItems`). **GUI relaunch + rebuilt sidecar `dist`.**
+    - **BACKLOG DEPENDENCY GRAPH (the "N backlog" button → DAG canvas; sidecar→GUI push).**
+      The header gets an "N backlog" button that opens a resizable window rendering the run's
+      WHOLE board (every state — not just actionable) as a left→right layered dependency graph:
+      columns by blocked-by depth, arrows for "blocked by", node cards colored by workflow-state
+      category with label chips, a green ring on running items, click→jump-to-split (running) or
+      open the tracker URL. **The data needs a NEW OPTIONAL `provider.graph` command** (sibling of
+      `list`/`status`; absent ⇒ no button) — kept SEPARATE from `list` because `list` must stay
+      "actionable-only" (it drives dispatch). It is fetched on the SAME cadence as `list`
+      (`intervals.listMs`, reusing a `lastGraphAtMs` throttle), INDEPENDENT of dispatch (runs while
+      paused/draining, skipped only when `disabled`), cached on `QueueRun.lastGraph`, and PUSHED via
+      a new MCP tool **`report_queue_graph`** (`{queueName,present,backlog,nodes[]}`; `present:false`
+      on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE remainder:
+      non-terminal nodes NOT currently waiting/running (`backlogCount`, pure — exclude = the
+      actionable-list keys ∪ active assignment keys). STAYS GENERIC: the node's `done` (terminal,
+      excluded+dimmed) and `stateType` (color category) are PROVIDER-decided — Ghostty maps no
+      tracker; `QueueBacklogColors` is a cosmetic category→color map with a neutral fallback. The
+      DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
+      blocked-by cycle is broken via a `resolving` guard) and ignores edges to keys outside the
+      scope. The canvas window is one-per-run via `QueueBacklogWindowManager` (MainActor; strong
+      ref + `willClose` observer that drops both the window and itself — no leak/double-open).
+      Wiring: sidecar — `types.ts` (`ProviderGraphSpec`/`GraphNode`/`QueueGraph`), `provider.ts`
+      (`parseGraphOutput`/`fetchGraphResult`), `status.ts` (`QueueGraphReport`/`backlogCount`),
+      `templates.ts` (`validateProviderGraph`), `runner.ts` (`QueueRun.lastGraph`/`lastGraphAtMs` +
+      `refreshGraph`/`reportGraphGone`), `mcp.ts` (`reportQueueGraph`). Swift —
+      `QueueCommandBridge.swift` (`QueueGraph`/`QueueGraphPayload`/`.ghosttyQueueGraphDidChange`/
+      `applyQueueGraph`), `MCPTools.swift` (`report_queue_graph` tool — now 19 tools),
+      `AgentDashboardController.swift` (`queueGraphs` @Published + `applyQueueGraph` +
+      `subscribeQueueGraph`), `AgentDashboardView.swift` (`backlogButton` in `OriginSectionHeader`),
+      `AgentDashboard/QueueBacklogCanvas.swift` (layout + canvas + window mgr; iOS-excluded in
+      `project.pbxproj`). Config (untracked, Linear-specific): `example-graph.py` (mirrors
+      `example-list.py` scope/auth but ALL states + labels + blockedBy + done/stateType) +
+      `provider.graph` in `example.json`. Tests: sidecar `provider.test.ts` (parseGraph/fetchGraph),
+      `status.test.ts` (`backlogCount`), `templates.test.ts` (graph validate), `mcp.test.ts`
+      (`reportQueueGraph`), `runner.test.ts` (graph fetch throttled + push + present:false-on-abort +
+      no-graph-no-fetch); Swift `MCPServerTests` (`queueGraphPayload*`, tool count 19),
+      `AgentDashboardTests` (`QueueBacklogTests`: assignLayers chain/diamond/cycle/dangling +
+      columns + applyQueueGraph). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
   - **CLOSE-GATE fires on QUIESCENT (idle OR waiting), not idle-only (sidecar-only fix).** The
     DONE_PENDING→CLOSING gate used to require `agentState==="idle"` held `closeStableSeconds`.
     But a finished Claude Code agent reliably settles in **`waiting`** — its `Stop`→idle hook is

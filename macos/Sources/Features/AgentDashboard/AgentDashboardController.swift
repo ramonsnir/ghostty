@@ -276,6 +276,13 @@ final class AgentDashboardModel: ObservableObject {
     /// In-memory only (the sidecar re-reports every sweep).
     @Published private(set) var queueStatuses: [String: QueueStatus] = [:]
 
+    /// (ramon fork / Agent Queue, backlog graph) The latest whole-board snapshot per queue
+    /// NAME, pushed by the supervisor via `report_queue_graph` (only when the template
+    /// declares the optional `provider.graph`). `@Published` so the "N backlog" header
+    /// button + the dependency-graph canvas re-render. A `present:false` report removes the
+    /// entry (clears the button + canvas). In-memory only (re-pushed each list-cadence sweep).
+    @Published private(set) var queueGraphs: [String: QueueGraph] = [:]
+
     // MARK: - Origin filter (ramon fork / Agent Queue, §11)
 
     /// Origins (queue names, or `(other)`) the user has EXCLUDED from the view.
@@ -564,6 +571,17 @@ final class AgentDashboardModel: ObservableObject {
             queueStatuses[status.queueName] = status
         } else {
             queueStatuses.removeValue(forKey: status.queueName)
+        }
+    }
+
+    /// (ramon fork / Agent Queue, backlog graph) Store/clear a run's whole-board snapshot.
+    /// `present` ⇒ store (drives the "N backlog" button + canvas); `!present` ⇒ remove (the
+    /// run was torn down). `@Published`, so the header button + any open canvas re-render.
+    func applyQueueGraph(_ graph: QueueGraph) {
+        if graph.present {
+            queueGraphs[graph.queueName] = graph
+        } else {
+            queueGraphs.removeValue(forKey: graph.queueName)
         }
     }
 
@@ -1120,6 +1138,7 @@ final class AgentDashboardController: NSWindowController {
         subscribeAgentState()
         subscribeAnnotation()
         subscribeQueueStatus()
+        subscribeQueueGraph()
         rebuildControllerObservers()
     }
 
@@ -1303,6 +1322,21 @@ final class AgentDashboardController: NSWindowController {
                       let status = note.userInfo?[QueueCommandUserInfoKey.status] as? QueueStatus
                 else { return }
                 self.model.applyQueueStatus(status)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Queue, backlog graph) Observe `.ghosttyQueueGraphDidChange`
+    /// posted by the MCP `report_queue_graph` handler and hand the whole-board snapshot to
+    /// the model. Registered unconditionally (like the status subscriber).
+    private func subscribeQueueGraph() {
+        NotificationCenter.default.publisher(for: .ghosttyQueueGraphDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let graph = note.userInfo?[QueueCommandUserInfoKey.graph] as? QueueGraph
+                else { return }
+                self.model.applyQueueGraph(graph)
             }
             .store(in: &cancellables)
     }
