@@ -14,7 +14,12 @@ import {
   composePrompt,
   eachJsonObject,
   extractFirstJsonObject,
-  fingerprint,
+  changeSignals,
+  changeTail,
+  tailChangeRatio,
+  isQuiescent,
+  normalizeChangeLine,
+  lineMultiset,
   fnv1a,
   isAgentSurface,
   lastLines,
@@ -27,10 +32,28 @@ import {
   alertEdge,
   SUMMARY_MAX_LEN,
   type LastSummary,
+  type SummarizerConfig,
   type SurfaceSnapshot,
 } from "./summarizer.js";
 
 const cfg = DEFAULT_CONFIG;
+
+/** Build a LastSummary that MATCHES a snapshot's current signals + change-tail (the
+ *  "we just summarized this exact state" record), so a follow-up `shouldSummarize`
+ *  with an unchanged screen takes the unchanged path. */
+function lastFrom(
+  s: SurfaceSnapshot,
+  atMs: number,
+  summary = "old",
+  c: SummarizerConfig = cfg,
+): LastSummary {
+  return {
+    signals: changeSignals(s.surface),
+    tail: changeTail(s.viewport, c),
+    atMs,
+    summary,
+  };
+}
 
 function makeSurface(over: Partial<Surface> = {}): Surface {
   return {
@@ -106,35 +129,90 @@ test("isAgentSurface: exited agent => false", () => {
 });
 
 // ---------------------------------------------------------------------------
-// fingerprint stability
+// change detection: signals / changeTail / tailChangeRatio / normalize
 // ---------------------------------------------------------------------------
 
-test("fingerprint: identical state => identical hash", () => {
-  const a = snap({ agentState: "working", lastTool: "Edit" }, "line1\nline2\n");
-  const b = snap({ agentState: "working", lastTool: "Edit" }, "line1\nline2\n");
-  assert.equal(fingerprint(a, cfg), fingerprint(b, cfg));
+test("changeSignals: identical hook tuple => identical hash", () => {
+  const a = makeSurface({ agentState: "working", lastTool: "Edit", lastPrompt: "do" });
+  const b = makeSurface({ agentState: "working", lastTool: "Edit", lastPrompt: "do" });
+  assert.equal(changeSignals(a), changeSignals(b));
 });
 
-test("fingerprint: changed lastTool => different hash", () => {
-  const a = snap({ agentState: "working", lastTool: "Edit" }, "x");
-  const b = snap({ agentState: "working", lastTool: "Bash" }, "x");
-  assert.notEqual(fingerprint(a, cfg), fingerprint(b, cfg));
+test("changeSignals: changed lastTool => different hash", () => {
+  const a = makeSurface({ agentState: "working", lastTool: "Edit" });
+  const b = makeSurface({ agentState: "working", lastTool: "Bash" });
+  assert.notEqual(changeSignals(a), changeSignals(b));
 });
 
-test("fingerprint: changed viewport tail => different hash", () => {
-  const a = snap({ agentState: "working" }, "old output");
-  const b = snap({ agentState: "working" }, "new output");
-  assert.notEqual(fingerprint(a, cfg), fingerprint(b, cfg));
+test("changeSignals: ignores the viewport (tail handles that)", () => {
+  // Same hook tuple, different screen => signals are equal (the tail carries screen).
+  const a = makeSurface({ agentState: "working" });
+  assert.equal(changeSignals(a), changeSignals({ ...a }));
 });
 
-test("fingerprint: only the last N lines matter", () => {
+test("normalizeChangeLine: strips spinner + collapses digits/space", () => {
+  // An animated footer line normalizes to a STABLE string across ticks.
+  const a = normalizeChangeLine("⠋ Thinking… (12s · esc to interrupt)");
+  const b = normalizeChangeLine("⠙ Thinking… (47s · esc to interrupt)");
+  assert.equal(a, b);
+});
+
+test("normalizeChangeLine: real content survives", () => {
+  assert.equal(normalizeChangeLine("  Editing  src/foo.ts  "), "Editing src/foo.ts");
+});
+
+test("changeTail: only the last N lines feed change detection", () => {
   const tailN = cfg.fingerprintTailLines;
   const head = Array.from({ length: 50 }, (_, i) => `h${i}`).join("\n");
   const tail = Array.from({ length: tailN }, (_, i) => `t${i}`).join("\n");
-  const a = snap({ agentState: "working" }, `${head}\n${tail}`);
-  const b = snap({ agentState: "working" }, `DIFFERENT_HEAD\n${tail}`);
-  // Different heads beyond the window must NOT change the fingerprint.
-  assert.equal(fingerprint(a, cfg), fingerprint(b, cfg));
+  const a = changeTail(`${head}\n${tail}`, cfg);
+  const b = changeTail(`DIFFERENT_HEAD\n${tail}`, cfg);
+  assert.equal(a, b);
+});
+
+test("tailChangeRatio: identical tails => 0", () => {
+  assert.equal(tailChangeRatio("a\nb\nc", "a\nb\nc"), 0);
+});
+
+test("tailChangeRatio: two empty tails => 0", () => {
+  assert.equal(tailChangeRatio("", ""), 0);
+});
+
+test("tailChangeRatio: one differing line out of many => small ratio", () => {
+  const prev = Array.from({ length: 20 }, (_, i) => `line${i}`).join("\n");
+  const cur = prev.replace("line19", "line19-CHANGED");
+  const r = tailChangeRatio(prev, cur);
+  // 1 line replaced => 2 of 21 distinct lines differ => well under the 0.2 threshold.
+  assert.ok(r > 0 && r < 0.2, `ratio ${r}`);
+});
+
+test("tailChangeRatio: a screen of fresh output => high ratio", () => {
+  const prev = Array.from({ length: 20 }, (_, i) => `old${i}`).join("\n");
+  const cur = Array.from({ length: 20 }, (_, i) => `new${i}`).join("\n");
+  assert.ok(tailChangeRatio(prev, cur) > 0.9);
+});
+
+test("tailChangeRatio: spinner-only animation (via changeTail) => 0", () => {
+  // The whole point: an idle agent whose ONLY change is the footer spinner/timer
+  // compares EQUAL once normalized, so it never re-summarizes.
+  const base = Array.from({ length: 18 }, (_, i) => `body line ${i}`).join("\n");
+  const prev = changeTail(`${base}\n⠋ Thinking… (3s · esc to interrupt)`, cfg);
+  const cur = changeTail(`${base}\n⠙ Thinking… (41s · esc to interrupt)`, cfg);
+  assert.equal(tailChangeRatio(prev, cur), 0);
+});
+
+test("isQuiescent: waiting/idle true; working/undefined false", () => {
+  assert.equal(isQuiescent("waiting"), true);
+  assert.equal(isQuiescent("idle"), true);
+  assert.equal(isQuiescent("working"), false);
+  assert.equal(isQuiescent(undefined), false);
+});
+
+test("lineMultiset: counts non-blank lines, drops blanks", () => {
+  const m = lineMultiset("a\n\nb\na\n   ");
+  assert.equal(m.get("a"), 2);
+  assert.equal(m.get("b"), 1);
+  assert.equal(m.size, 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -146,6 +224,20 @@ test("shouldSummarize: non-agent => skip not-agent", () => {
   assert.deepEqual(d, { due: false, reason: "not-agent" });
 });
 
+test("shouldSummarize: hidden agent => skip hidden", () => {
+  // A tile the user hid in the dashboard is skipped (no Haiku call), even when first.
+  const d = shouldSummarize(snap({ agentState: "working", hidden: true }), undefined, 0, cfg);
+  assert.deepEqual(d, { due: false, reason: "hidden" });
+});
+
+test("shouldSummarize: hidden but skipHidden disabled => not skipped for hidden", () => {
+  const d = shouldSummarize(
+    snap({ agentState: "working", hidden: true }), undefined, 0,
+    { ...cfg, skipHidden: false },
+  );
+  assert.equal(d.reason, "first"); // falls through to the normal path
+});
+
 test("shouldSummarize: first time for an agent => due first", () => {
   const d = shouldSummarize(snap({ agentState: "working" }), undefined, 1_000_000, cfg);
   assert.equal(d.due, true);
@@ -154,50 +246,66 @@ test("shouldSummarize: first time for an agent => due first", () => {
 
 test("shouldSummarize: within debounce => skip debounce", () => {
   const s = snap({ agentState: "working" }, "x");
-  const last: LastSummary = { fingerprint: "deadbeef", atMs: 1000, summary: "old" };
+  const last = lastFrom(s, 1000);
   const d = shouldSummarize(s, last, 1000 + cfg.debounceMs - 1, cfg);
   assert.deepEqual(d, { due: false, reason: "debounce" });
 });
 
-test("shouldSummarize: unchanged AND idle past threshold => skip idle-unchanged", () => {
-  const s = snap({ agentState: "working", idleSeconds: cfg.idleSkipSeconds + 5 }, "x");
-  const fp = fingerprint(s, cfg);
-  const last: LastSummary = { fingerprint: fp, atMs: 0, summary: "old" };
-  const now = cfg.debounceMs + 1000; // past debounce
-  const d = shouldSummarize(s, last, now, cfg);
-  assert.deepEqual(d, { due: false, reason: "idle-unchanged" });
+test("shouldSummarize: changed hook signal past debounce => due changed-signal", () => {
+  const sLast = snap({ agentState: "working", lastTool: "Edit" }, "x");
+  const sNow = snap({ agentState: "working", lastTool: "Bash" }, "x");
+  const last = lastFrom(sLast, 0);
+  const d = shouldSummarize(sNow, last, cfg.debounceMs + 1, cfg);
+  assert.deepEqual(d, { due: true, reason: "changed-signal" });
 });
 
-test("shouldSummarize: changed fingerprint past debounce => due changed", () => {
-  const sLast = snap({ agentState: "working", lastTool: "Edit" }, "x");
-  const fpOld = fingerprint(sLast, cfg);
-  const sNow = snap({ agentState: "working", lastTool: "Bash" }, "x");
-  const last: LastSummary = { fingerprint: fpOld, atMs: 0, summary: "old" };
+test("shouldSummarize: big screen change past debounce => due changed", () => {
+  const body = Array.from({ length: 20 }, (_, i) => `old${i}`).join("\n");
+  const sLast = snap({ agentState: "working" }, body);
+  const sNow = snap(
+    { agentState: "working" },
+    Array.from({ length: 20 }, (_, i) => `new${i}`).join("\n"),
+  );
+  const last = lastFrom(sLast, 0);
   const d = shouldSummarize(sNow, last, cfg.debounceMs + 1, cfg);
   assert.deepEqual(d, { due: true, reason: "changed" });
 });
 
-test("shouldSummarize: unchanged but NOT provably idle (no idleSeconds) => due", () => {
-  // idleSeconds omitted => cannot prove idle => re-summarize once debounce passes.
+test("shouldSummarize: QUIESCENT + spinner-only churn => skip quiescent-unchanged", () => {
+  // THE headline cost fix: a waiting agent whose footer only animates is NOT
+  // re-summarized — its normalized tail is unchanged and it has nothing new to say.
+  const body = Array.from({ length: 18 }, (_, i) => `body ${i}`).join("\n");
+  const sLast = snap({ agentState: "waiting" }, `${body}\n⠋ idle (3s)`);
+  const sNow = snap({ agentState: "waiting" }, `${body}\n⠙ idle (88s)`);
+  const last = lastFrom(sLast, 0);
+  const d = shouldSummarize(sNow, last, cfg.debounceMs + 1, cfg);
+  assert.deepEqual(d, { due: false, reason: "quiescent-unchanged" });
+});
+
+test("shouldSummarize: idle agent + spinner churn => skip quiescent-unchanged", () => {
+  const sLast = snap({ agentState: "idle" }, "done\n⠋ (1s)");
+  const sNow = snap({ agentState: "idle" }, "done\n⠹ (9s)");
+  const d = shouldSummarize(sNow, lastFrom(sLast, 0), cfg.debounceMs + 1, cfg);
+  assert.deepEqual(d, { due: false, reason: "quiescent-unchanged" });
+});
+
+test("shouldSummarize: unchanged AND idle-seconds past threshold (no hook state) => idle-unchanged", () => {
+  // No agentState (not quiescent) but provably idle by idleSeconds => still skip.
+  const s = snap({ processName: "claude", idleSeconds: cfg.idleSkipSeconds + 5 }, "x");
+  const d = shouldSummarize(s, lastFrom(s, 0), cfg.debounceMs + 1000, cfg);
+  assert.deepEqual(d, { due: false, reason: "idle-unchanged" });
+});
+
+test("shouldSummarize: unchanged, non-quiescent, not provably idle => due unchanged-not-idle", () => {
+  // A working agent whose tail happens to sit unchanged this tick still re-summarizes.
   const s = snap({ agentState: "working" }, "x");
-  const fp = fingerprint(s, cfg);
-  const last: LastSummary = { fingerprint: fp, atMs: 0, summary: "old" };
-  const d = shouldSummarize(s, last, cfg.debounceMs + 1, cfg);
+  const d = shouldSummarize(s, lastFrom(s, 0), cfg.debounceMs + 1, cfg);
   assert.deepEqual(d, { due: true, reason: "unchanged-not-idle" });
 });
 
-test("shouldSummarize: unchanged + idle BELOW threshold => due", () => {
-  const s = snap({ agentState: "working", idleSeconds: cfg.idleSkipSeconds - 1 }, "x");
-  const fp = fingerprint(s, cfg);
-  const last: LastSummary = { fingerprint: fp, atMs: 0, summary: "old" };
-  const d = shouldSummarize(s, last, cfg.debounceMs + 1, cfg);
-  assert.equal(d.due, true);
-});
-
-test("shouldSummarize: debounce wins over a changed fingerprint", () => {
-  // Even with a changed fingerprint, within debounce we must skip.
+test("shouldSummarize: debounce wins over a changed screen", () => {
   const sNow = snap({ agentState: "working", lastTool: "Bash" }, "x");
-  const last: LastSummary = { fingerprint: "different", atMs: 5000, summary: "old" };
+  const last: LastSummary = { signals: "different", tail: "different", atMs: 5000, summary: "old" };
   const d = shouldSummarize(sNow, last, 5000 + cfg.debounceMs - 1, cfg);
   assert.equal(d.reason, "debounce");
   assert.equal(d.due, false);
@@ -214,6 +322,13 @@ test("preGate: non-agent => not-agent", () => {
   );
 });
 
+test("preGate: hidden agent => hidden (avoids the read_surface)", () => {
+  assert.deepEqual(
+    preGate(makeSurface({ agentState: "working", hidden: true }), undefined, 0, cfg),
+    { pass: false, reason: "hidden" },
+  );
+});
+
 test("preGate: agent, no last => candidate", () => {
   assert.deepEqual(
     preGate(makeSurface({ agentState: "working" }), undefined, 0, cfg),
@@ -222,15 +337,15 @@ test("preGate: agent, no last => candidate", () => {
 });
 
 test("preGate: within debounce => debounce", () => {
-  const last: LastSummary = { fingerprint: "x", atMs: 1000, summary: "s" };
+  const last: LastSummary = { signals: "x", tail: "x", atMs: 1000, summary: "s" };
   assert.deepEqual(
     preGate(makeSurface({ agentState: "working" }), last, 1000 + cfg.debounceMs - 1, cfg),
     { pass: false, reason: "debounce" },
   );
 });
 
-test("preGate: past debounce => candidate (defers idle/fingerprint to full gate)", () => {
-  const last: LastSummary = { fingerprint: "x", atMs: 0, summary: "s" };
+test("preGate: past debounce => candidate (defers change/idle to full gate)", () => {
+  const last: LastSummary = { signals: "x", tail: "x", atMs: 0, summary: "s" };
   assert.deepEqual(
     preGate(makeSurface({ agentState: "working", idleSeconds: 999 }), last, cfg.debounceMs + 1, cfg),
     { pass: true, reason: "candidate" },

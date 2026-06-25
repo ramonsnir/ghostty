@@ -742,6 +742,11 @@ final class AgentDashboardModel: ObservableObject {
         /// the claude-pool wrapper the foreground is `bash`; the real `claude` is a
         /// child the detector finds via its process-subtree walk).
         let agentKind: String?
+        /// (ramon fork / Agent Manager) Whether the user has HIDDEN this surface's
+        /// tile in the dashboard. Surfaced so the summarizer can skip hidden tiles
+        /// (no point spending a Haiku call on a tile you've decluttered away). The
+        /// hidden set is dashboard view-state, persisted per bundle id.
+        let hidden: Bool
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -752,13 +757,15 @@ final class AgentDashboardModel: ObservableObject {
         let ids = Set(agentStates.keys)
             .union(lastPrompt.keys).union(lastTool.keys)
             .union(annotations.keys).union(agents.keys)
+            .union(hidden)
         for id in ids {
             out[id] = HookSnapshotEntry(
                 agentState: agentStates[id]?.rawValue,
                 lastPrompt: lastPrompt[id],
                 lastTool: lastTool[id],
                 notes: annotations[id]?.summary,
-                agentKind: agents[id]?.command)
+                agentKind: agents[id]?.command,
+                hidden: hidden.contains(id))
         }
         return out
     }

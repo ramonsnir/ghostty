@@ -423,7 +423,7 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
-            notes: "Implementing fix", agentKind: "claude", sessionID: 4242)
+            notes: "Implementing fix", agentKind: "claude", hidden: false, sessionID: 4242)
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -452,6 +452,22 @@ struct MCPServerTests {
         #expect(d["agentKind"] as? String == "claude")
         // fork / Agent Queue (§8.4): sessionID is a PLAIN integer, always present.
         #expect((d["sessionID"] as? NSNumber)?.uint64Value == 4242)
+        // fork / Agent Manager: hidden is OMITTED when false (not hidden).
+        #expect(d["hidden"] == nil)
+    }
+
+    // fork / Agent Manager: a hidden tile emits `hidden:true` so the summarizer skips it.
+    @Test func surfacesJSONDataEmitsHiddenWhenTrue() {
+        let row = MCPLayout.SurfaceRow(
+            id: "ABC", title: "claude", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: "waiting", lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: true, sessionID: 7)
+        let d = MCPLayout.surfacesJSONData([row])[0]
+        #expect(d["hidden"] as? Bool == true)
     }
 
     // fork: the three optional fields are OMITTED (not null/empty) when unknown.
@@ -463,7 +479,7 @@ struct MCPServerTests {
             focused: true, bell: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
-            agentKind: nil, sessionID: 0)
+            agentKind: nil, hidden: false, sessionID: 0)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
@@ -474,6 +490,7 @@ struct MCPServerTests {
         #expect(d["lastTool"] == nil)
         #expect(d["notes"] == nil)
         #expect(d["agentKind"] == nil)
+        #expect(d["hidden"] == nil)
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)

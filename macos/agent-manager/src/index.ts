@@ -39,13 +39,14 @@ import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
 import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
 import { summarize as defaultSummarize } from "./model.js";
 import { readAccountSpec, resolveAccountDir } from "./account.js";
+import { loadConfig } from "./config.js";
 import {
-  DEFAULT_CONFIG,
   ConcurrencyBudget,
   buildContext,
   composePrompt,
   preGate,
-  fingerprint,
+  changeSignals,
+  changeTail,
   parseSummary,
   shouldSummarize,
   alertEdge,
@@ -152,12 +153,13 @@ async function summarizeOne(
   // on EVERY poll forever — an unbounded Haiku-cost leak with no backoff. We PRESERVE
   // the prior fingerprint + summary so the change-detector is not poisoned: a genuine
   // state change still re-summarizes once debounce passes, and a persistently failing
-  // surface keeps retrying (its recorded fingerprint differs from the live one) until
+  // surface keeps retrying (its recorded signals/tail differ from the live one) until
   // it succeeds — just no more than once per debounceMs. With no prior record the
-  // sentinel "" fingerprint differs from any real one, so the retry still fires.
+  // sentinel "" signals/tail differ from any real one, so the retry still fires.
   const recordAttempt = (): void => {
     deps.lastBySession.set(surface.id, {
-      fingerprint: prev?.fingerprint ?? "",
+      signals: prev?.signals ?? "",
+      tail: prev?.tail ?? "",
       atMs: deps.now(),
       summary: prev?.summary ?? "",
     });
@@ -204,7 +206,8 @@ async function summarizeOne(
     });
 
     deps.lastBySession.set(surface.id, {
-      fingerprint: fingerprint(snapshot, cfg),
+      signals: changeSignals(surface),
+      tail: changeTail(snapshot.viewport, cfg),
       atMs: deps.now(),
       summary: parsed.summary,
     });
@@ -352,13 +355,23 @@ async function main(): Promise<void> {
   const url = process.env.GHOSTTY_MCP_URL ?? "http://127.0.0.1:8765/mcp";
   const token = process.env.GHOSTTY_MCP_TOKEN;
 
-  const cfg: SummarizerConfig = { ...DEFAULT_CONFIG };
+  const home = homedir();
+  // Optional config overlay (see config.ts): debounce / fuzzy change threshold /
+  // hidden-skip / tail windows, tunable in ~/.config/ghostty-ramon/agent-manager/
+  // config.json WITHOUT a rebuild (restart the sidecar to apply). Absent ⇒ defaults.
+  const { cfg, loaded: cfgLoaded } = loadConfig(home, undefined, errlog);
+  if (cfgLoaded) {
+    log(
+      `loaded summarizer config: debounce=${cfg.debounceMs}ms ` +
+        `changeRatio=${cfg.changeRatioThreshold} skipHidden=${cfg.skipHidden} ` +
+        `idleSkip=${cfg.idleSkipSeconds}s`,
+    );
+  }
   const client = new McpClient({ url, token });
 
   // Optional summarizer ACCOUNT routing (see account.ts). Default ⇒ inherit the
   // ambient Claude Code auth (works with no claude-accounts installed). When set,
   // the summarizer's model calls bill against the configured account's CLAUDE_CONFIG_DIR.
-  const home = homedir();
   const accountSpec = readAccountSpec(home);
   const summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
   if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {

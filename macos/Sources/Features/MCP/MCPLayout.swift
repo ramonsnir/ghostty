@@ -93,6 +93,10 @@ enum MCPLayout {
         /// keys off THIS (not `processName`, which is `bash` under the claude-pool
         /// wrapper) to decide a surface is an agent worth summarizing.
         let agentKind: String?
+        /// fork / Agent Manager: whether the user HID this surface's tile in the Agent
+        /// Dashboard. Sourced from the dashboard model; false when the dashboard is
+        /// disabled / the surface is unknown. The summarizer skips hidden tiles.
+        let hidden: Bool
         /// fork / Agent Queue (§8.4): the STABLE pty-host session id
         /// (`ghostty_surface_session_id`), the supervisor's persistence/re-adoption
         /// key (§9). 0 when there is no host session (the `.exec` backend / no
@@ -165,6 +169,7 @@ enum MCPLayout {
                     lastTool: hook?.lastTool,
                     notes: hook?.notes,
                     agentKind: hook?.agentKind,
+                    hidden: hook?.hidden ?? false,
                     sessionID: sessionID))
             }
         }
@@ -192,6 +197,9 @@ enum MCPLayout {
             if let t = $0.lastTool { d["lastTool"] = t }
             if let notes = $0.notes { d["notes"] = notes }
             if let kind = $0.agentKind { d["agentKind"] = kind }
+            // fork / Agent Manager: emit `hidden` only when true (absent ⇒ not
+            // hidden), mirroring the omit-when-default style of the agent-* fields.
+            if $0.hidden { d["hidden"] = true }
             // (Agent Queue, §8.4) a PLAIN integer — emit UNCONDITIONALLY (the
             // supervisor keys persistence on it and self-disables when it is 0).
             // JSON numbers are doubles; UInt64 fits exactly within 2^53 session-id

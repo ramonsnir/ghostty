@@ -135,6 +135,42 @@ runs with no tools):
 
 e.g. "Prefer the file/feature name over the verb; flag failing tests."
 
+## Tuning cost (no rebuild)
+
+The summarizer decides *when* to call Haiku with a few gates you can tune in an optional
+JSON file (sibling of `summarizer.md`), so you can dial usage down without a rebuild —
+**restart the sidecar to apply** (kill the `node` child, or quit + relaunch the fork; the
+GUI respawns it):
+
+```
+~/.config/ghostty-ramon/agent-manager/config.json
+```
+
+```jsonc
+{
+  "debounceMs": 30000,          // min ms between calls per session (default 30000)
+  "changeRatioThreshold": 0.2,  // 0..1 — fraction of the screen tail that must differ
+                                //   to count as a real change (default 0.2; 0 = any diff)
+  "skipHidden": true,           // never summarize a tile you've hidden in the dashboard
+  "idleSkipSeconds": 45,        // unchanged + idle this long => skip (default 45)
+  "maxConcurrent": 10           // also the per-sweep batch cap
+}
+```
+
+Unknown / out-of-range keys are ignored (the default is kept), and an absent or malformed
+file just uses the defaults. What each lever buys you:
+
+- **`skipHidden`** — the cheapest win: hidden tiles cost nothing. Hide the agents you
+  aren't watching.
+- **`changeRatioThreshold`** — the screen is compared *fuzzily*: spinner glyphs and
+  elapsed-time/token counters are normalized out, and a session only re-summarizes when
+  more than this fraction of its recent lines actually change. A higher value = fewer
+  calls (and slightly staler summaries); a lower value = fresher (and more calls).
+- **`debounceMs`** — the hard floor between calls for one session. Raise it to cut the
+  rate across the board.
+- A **waiting/idle** agent whose footer is merely animating is skipped regardless — its
+  summary wouldn't change anyway.
+
 ## Verifying / troubleshooting
 
 - Console.app → filter subsystem = your bundle id, category = `agent-manager`. Expect
@@ -150,8 +186,9 @@ e.g. "Prefer the file/feature name over the verb; flag failing tests."
 
 ## Cost & privacy
 
-Each summary is one Haiku call, gated by a per-session debounce (~12s) and an
-idle-skip, with a small concurrency cap — so a wall of idle/unchanged sessions costs
-nothing. The session's recent on-screen text is sent to the model for summarization;
-disable the feature (or close the tile) for any session you don't want summarized. Use
-*Account routing* above to keep this traffic off your primary account.
+Each summary is one Haiku call, gated by a per-session debounce (~30s), a fuzzy
+change-detector (animation-proof), a hidden-tile skip, and an idle-skip, with a small
+concurrency cap — so a wall of idle/unchanged sessions costs nothing. See *Tuning cost*
+above to dial it further. The session's recent on-screen text is sent to the model for
+summarization; hide the tile (or disable the feature) for any session you don't want
+summarized. Use *Account routing* above to keep this traffic off your primary account.
