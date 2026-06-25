@@ -644,37 +644,38 @@ struct AgentDashboardModelTests {
         #expect(model.entries.first?.attention == true, "tile marked + floated")
     }
 
-    // (ramon fork / Bell Attention) With the tone-down filter ON, a RAW bell must NOT
-    // auto-unhide a hidden tile (only a promotion does). Guards the `if !bellFilter`
-    // branch in applyBells — a regression dropping it would otherwise pass green.
-    @Test func bellFilterOnRawBellDoesNotUnhide() {
+    // (ramon fork / Bell Attention v2) When `dashboard` is NOT routed to the bell tier
+    // (bellDashboard false), a RAW bell must NOT auto-unhide — but a promotion still does
+    // (attnDashboard true). Guards the per-tier `if bellDashboard`/`if attnDashboard`
+    // branches in applyBells/applyAttention.
+    @Test func dashboardNotInBellTierRawBellDoesNotUnhide() {
         let store = InMemoryHideStore()
-        let model = AgentDashboardModel(store: store, bellFilter: true)
+        let model = AgentDashboardModel(store: store, bellDashboard: false, attnDashboard: true)
         let a = UUID()
         model.rebuild(live: live([a]))
         model.applyAgents(agents([a]))
         model.hide(a)
 
-        model.applyBells([a: true])     // raw bell under the filter
-        #expect(model.hidden.contains(a), "a raw bell must not unhide under the filter")
+        model.applyBells([a: true])     // raw bell, dashboard not in the bell tier
+        #expect(model.hidden.contains(a), "a raw bell must not unhide when dashboard is off the bell tier")
 
-        // ...but a promotion still does.
+        // ...but a promotion still does (dashboard IS in the attention tier).
         model.applyAttention([a: true])
-        #expect(!model.hidden.contains(a), "a promotion unhides even under the filter")
+        #expect(!model.hidden.contains(a), "a promotion unhides via the attention tier")
     }
 
-    // (ramon fork / Bell Attention) Filter OFF: applyBells still auto-unhides (the new
-    // gate collapses to upstream behavior).
-    @Test func bellFilterOffRawBellStillUnhides() {
+    // (ramon fork / Bell Attention v2) When `dashboard` IS routed to the bell tier
+    // (the default, = upstream), applyBells auto-unhides on a raw bell.
+    @Test func dashboardInBellTierRawBellUnhides() {
         let store = InMemoryHideStore()
-        let model = AgentDashboardModel(store: store, bellFilter: false)
+        let model = AgentDashboardModel(store: store, bellDashboard: true, attnDashboard: true)
         let a = UUID()
         model.rebuild(live: live([a]))
         model.applyAgents(agents([a]))
         model.hide(a)
 
         model.applyBells([a: true])
-        #expect(!model.hidden.contains(a), "filter off ⇒ raw bell unhides as upstream")
+        #expect(!model.hidden.contains(a), "dashboard in the bell tier ⇒ raw bell unhides as upstream")
     }
 
     @Test func bellFalseKeepsHidden() {
@@ -942,28 +943,31 @@ struct AgentDashboardSortTests {
         #expect(sorted.first?.id == ring)
     }
 
-    // (ramon fork / Bell Attention) The promoted attention state floats a tile first,
-    // always (independent of the bellFilter tone-down).
+    // (ramon fork / Bell Attention v2) The promoted attention state floats a tile first
+    // whenever `dashboard` is routed to the attention tier (attnDashboard true) —
+    // independent of whether it's also on the bell tier.
     @Test func attentionFloatsFirst() {
         let promoted = UUID(); let q1 = UUID(); let q2 = UUID()
         let entries = [entry(q1, bell: false), entry(q2, bell: false),
                        entry(promoted, bell: false, attention: true)]
-        #expect(AgentDashboardModel.sorted(entries).first?.id == promoted)
-        #expect(AgentDashboardModel.sorted(entries, bellFilter: true).first?.id == promoted)
+        #expect(AgentDashboardModel.sorted(entries, bellDashboard: true, attnDashboard: true).first?.id == promoted)
+        #expect(AgentDashboardModel.sorted(entries, bellDashboard: false, attnDashboard: true).first?.id == promoted)
     }
 
-    // (ramon fork / Bell Attention) With the tone-down filter ON, a RAW bell no longer
-    // floats the tile (only a promotion does); with it OFF, a bell floats as upstream.
-    @Test func rawBellFloatGatedByFilter() {
+    // (ramon fork / Bell Attention v2) A RAW bell floats the tile only when `dashboard` is
+    // on the bell tier (bellDashboard true, = upstream); with it off the bell is inert.
+    @Test func rawBellFloatGatedByDashboardTier() {
         let ring = UUID(); let q1 = UUID(); let q2 = UUID()
         let entries = [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: true)]
-        // Filter off: bell floats first (upstream behavior).
-        #expect(AgentDashboardModel.sorted(entries, bellFilter: false).first?.id == ring)
-        // Filter on: the bell is inert, so order is the pure UUID tie-break (no float) —
-        // identical to the order with the bell cleared entirely.
-        let filtered = AgentDashboardModel.sorted(entries, bellFilter: true).map(\.id)
+        // dashboard on the bell tier: bell floats first (upstream behavior).
+        #expect(AgentDashboardModel.sorted(entries, bellDashboard: true, attnDashboard: false).first?.id == ring)
+        // dashboard off the bell tier: the bell is inert, so order is the pure UUID
+        // tie-break (no float) — identical to the order with the bell cleared entirely.
+        let filtered = AgentDashboardModel.sorted(
+            entries, bellDashboard: false, attnDashboard: false).map(\.id)
         let noBell = AgentDashboardModel.sorted(
-            [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: false)]).map(\.id)
+            [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: false)],
+            bellDashboard: false, attnDashboard: false).map(\.id)
         #expect(filtered == noBell)
     }
 

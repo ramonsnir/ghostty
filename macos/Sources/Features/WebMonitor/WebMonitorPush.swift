@@ -203,11 +203,13 @@ final class WebPushManager {
     private struct PushKey: Hashable { let id: UUID; let kind: PushKind }
     private static let debounceInterval: TimeInterval = 3
 
-    /// (ramon fork / Bell Attention) When true (mirrors `agent-manager-bell-filter`,
-    /// set by AppDelegate at startup), a RAW bell does NOT push — only a promoted
-    /// `set_attention` does (via `attentionStateObserver`). Default false ⇒ raw bells
-    /// push exactly as before.
-    var bellFilter = false
+    /// (ramon fork / Bell Attention v2) Whether the `push` effect is routed to each
+    /// tier (set by AppDelegate from bell-features.push / attention-features.push). A
+    /// RAW bell pushes iff `bellPush`; a PROMOTED attention pushes iff `attnPush`.
+    /// Defaults match the config defaults (both on) so behavior is unchanged until
+    /// configured.
+    var bellPush = true
+    var attnPush = true
 
     private var bellObserver: NSObjectProtocol?
     /// (ramon fork / Bell Attention) Observes `.ghosttyAttentionDidChange` so a
@@ -294,18 +296,19 @@ final class WebPushManager {
                 forName: Notification.Name.ghosttyBellDidRing, object: nil, queue: .main
             ) { [weak self] note in
                 guard let self, let view = note.object as? Ghostty.SurfaceView else { return }
-                // (ramon fork / Bell Attention) Under the tone-down filter, a raw bell
-                // does NOT push — the sidecar promotes the notable ones to attention.
-                if self.bellFilter { return }
+                // (ramon fork / Bell Attention v2) The raw bell pushes iff the `push`
+                // effect is routed to the bell tier (bell-features.push).
+                if !self.bellPush { return }
                 self.onBell(id: view.id, title: view.title, pwd: view.pwd)
             }
-            // (ramon fork / Bell Attention) A promoted attention state pushes (loud
-            // tier). userInfo carries surfaceID + attention + reason + title + pwd
-            // (value types, enriched by MCPServer.setAttention on its main hop).
+            // (ramon fork / Bell Attention v2) A promoted attention state pushes iff the
+            // `push` effect is routed to the attention tier (attention-features.push).
+            // userInfo carries surfaceID + attention + reason + title + pwd (value types,
+            // enriched by MCPServer.setAttention on its main hop).
             self.attentionStateObserver = NotificationCenter.default.addObserver(
                 forName: .ghosttyAttentionDidChange, object: nil, queue: .main
             ) { [weak self] note in
-                guard let self,
+                guard let self, self.attnPush,
                       let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,
                       (note.userInfo?[AgentStateUserInfoKey.attention] as? Bool) == true else { return }
                 let title = note.userInfo?[AgentStateUserInfoKey.title] as? String ?? ""

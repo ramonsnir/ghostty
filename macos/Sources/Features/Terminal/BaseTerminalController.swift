@@ -1211,12 +1211,13 @@ class BaseTerminalController: NSWindowController,
 
     private func computeTitle(title: String, bell: Bool, attention: Bool = false) -> String {
         var result = title
-        // (ramon fork / Bell Attention) The loud title 🔔 fires on the promoted
-        // attention state ALWAYS, and on a raw bell ONLY when the tone-down filter is
-        // off (so flag-off is byte-identical; flag-on drops the raw-bell 🔔 and leaves
-        // the marker to a real promotion). The raw-bell case keeps the bell-features gate.
-        let rawBellTitle = bell && !derivedConfig.bellFilter && ghostty.config.bellFeatures.contains(.title)
-        if attention || rawBellTitle {
+        // (ramon fork / Bell Attention v2) Two-tier title 🔔 over the shared `title`
+        // flag: a raw bell shows it when bell-features wants title; a promoted attention
+        // shows it when attention-features wants it. Filter off ⇒ attention never set +
+        // bell-features defaults to title ⇒ byte-identical to upstream.
+        let rawBellTitle = bell && derivedConfig.bellFeatures.contains(.title)
+        let attentionTitle = attention && derivedConfig.attentionFeatures.contains(.title)
+        if rawBellTitle || attentionTitle {
             result = "🔔 \(result)"
         }
 
@@ -1871,17 +1872,19 @@ class BaseTerminalController: NSWindowController,
         let windowStepResize: Bool
         let focusFollowsMouse: Bool
         let splitPreserveZoom: Ghostty.Config.SplitPreserveZoom
-        // (ramon fork / Bell Attention) When true, a raw bell's LOUD effects (title 🔔,
-        // dock, push, dashboard unhide/sort) are toned down; only the promoted
-        // attention state drives them. Default false ⇒ behavior identical to upstream.
-        let bellFilter: Bool
+        // (ramon fork / Bell Attention v2) Snapshots of the two feature tiers (so the
+        // title 🔔 decision doesn't read live config off-main). The window-aggregate
+        // title uses the out-of-focus sets.
+        let bellFeatures: Ghostty.Config.BellFeatures
+        let attentionFeatures: Ghostty.Config.BellFeatures
 
         init() {
             self.macosTitlebarProxyIcon = .visible
             self.windowStepResize = false
             self.focusFollowsMouse = false
             self.splitPreserveZoom = .init()
-            self.bellFilter = false
+            self.bellFeatures = []
+            self.attentionFeatures = []
         }
 
         init(_ config: Ghostty.Config) {
@@ -1889,7 +1892,8 @@ class BaseTerminalController: NSWindowController,
             self.windowStepResize = config.windowStepResize
             self.focusFollowsMouse = config.focusFollowsMouse
             self.splitPreserveZoom = config.splitPreserveZoom
-            self.bellFilter = config.agentManagerBellFilter
+            self.bellFeatures = config.bellFeatures
+            self.attentionFeatures = config.attentionFeatures
         }
     }
 }

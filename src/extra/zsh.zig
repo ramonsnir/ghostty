@@ -11,7 +11,7 @@ const equals_required = "=-:::";
 
 fn comptimeGenerateZshCompletions() []const u8 {
     comptime {
-        @setEvalBranchQuota(50000);
+        @setEvalBranchQuota(100000);
         var counter: std.Io.Writer.Discarding = .init(&.{});
         try writeZshCompletions(&counter.writer);
 

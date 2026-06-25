@@ -298,10 +298,10 @@ class AppDelegate: NSObject,
             let server = WebMonitorServer(
                 listen: webMonitorListen,
                 token: ghostty.config.webMonitorToken)
-            // (ramon fork / Bell Attention) Tell the push subsystem to drop raw-bell
-            // pushes when the tone-down filter is on (the promoted attention pushes
-            // instead). Set BEFORE start() so the first events see the right policy.
-            server.push.bellFilter = ghostty.config.agentManagerBellFilter
+            // (ramon fork / Bell Attention v2) Route the `push` effect to each tier per
+            // the config. Set BEFORE start() so the first events see the right policy.
+            server.push.bellPush = ghostty.config.bellFeatures.contains(.push)
+            server.push.attnPush = ghostty.config.attentionFeatures.contains(.push)
             server.start()
             self.webMonitor = server
         }
@@ -797,50 +797,9 @@ class AppDelegate: NSObject,
         ghosttyConfigDidChange(config: config)
     }
 
-    @objc private func ghosttyBellDidRing(_ notification: Notification) {
-        // Choose the focused vs out-of-focus bell-features set based on the
-        // ringing surface's true focus state. The notification object is the
-        // ringing surfaceView. If we can't resolve it, fall back to the
-        // out-of-focus (existing) set so we never silently drop the bell.
-        // (ramon fork / Bell Attention) Under the tone-down filter, a RAW bell does
-        // NOT make sound or bounce the dock — those loud effects move to the promoted
-        // attention state (`ghosttyAttentionDidChange`). Flag off ⇒ identical to before.
-        if ghostty.config.agentManagerBellFilter { return }
-
-        let features: Ghostty.Config.BellFeatures
-        if let surfaceView = notification.object as? Ghostty.SurfaceView {
-            features = surfaceView.bellFeaturesForCurrentFocus(ghostty.config)
-        } else {
-            features = ghostty.config.bellFeatures
-        }
-
-        if features.contains(.system) {
-            NSSound.beep()
-        }
-
-        if features.contains(.audio) {
-            if let configPath = ghostty.config.bellAudioPath,
-               let sound = NSSound(contentsOfFile: configPath.path, byReference: false) {
-                sound.volume = ghostty.config.bellAudioVolume
-                sound.play()
-            }
-        }
-
-        if features.contains(.attention) {
-            // Bounce the dock icon if we're not focused.
-            NSApp.requestUserAttention(.informationalRequest)
-        }
-    }
-
-    /// (ramon fork / Bell Attention) The loud Tier-2 dock/sound for a surface the
-    /// Agent Manager PROMOTED via `set_attention` (posted as `.ghosttyAttentionDidChange`
-    /// with `attention==true`). Mirrors the raw-bell sound/bounce but is driven by the
-    /// promoted state, so it fires whether or not the tone-down filter is on. We use the
-    /// out-of-focus `bell-features` set (a promotion means the user is away from it).
-    @objc private func ghosttyAttentionDidChange(_ notification: Notification) {
-        guard (notification.userInfo?[AgentStateUserInfoKey.attention] as? Bool) == true
-        else { return }
-        let features = ghostty.config.bellFeatures
+    /// Fire the sound/dock effects for a feature set. `bounce` OR the legacy `attention`
+    /// alias bounces the dock. (ramon fork / Bell Attention v2)
+    private func playBellEffects(_ features: Ghostty.Config.BellFeatures) {
         if features.contains(.system) { NSSound.beep() }
         if features.contains(.audio),
            let configPath = ghostty.config.bellAudioPath,
@@ -848,9 +807,33 @@ class AppDelegate: NSObject,
             sound.volume = ghostty.config.bellAudioVolume
             sound.play()
         }
-        if features.contains(.attention) {
+        if features.contains(.bounce) || features.contains(.attention) {
             NSApp.requestUserAttention(.informationalRequest)
         }
+    }
+
+    @objc private func ghosttyBellDidRing(_ notification: Notification) {
+        // (ramon fork / Bell Attention v2) The RAW-bell tier: every bell fires the
+        // `bell-features` effects (focused vs out-of-focus by the ringing surface's true
+        // focus). No tone-down gate here — bell-features IS the gate now; with the filter
+        // ON a user simply sets bell-features to e.g. system,audio and lets the promoted
+        // `attention-features` (ghosttyAttentionDidChange) carry the loud effects.
+        let features: Ghostty.Config.BellFeatures
+        if let surfaceView = notification.object as? Ghostty.SurfaceView {
+            features = surfaceView.bellFeaturesForCurrentFocus(ghostty.config)
+        } else {
+            features = ghostty.config.bellFeatures
+        }
+        playBellEffects(features)
+    }
+
+    /// (ramon fork / Bell Attention v2) The promoted ATTENTION tier's sound/dock,
+    /// driven by `attention-features` (a promotion means the user is away, so the
+    /// out-of-focus set). Posted as `.ghosttyAttentionDidChange` with attention==true.
+    @objc private func ghosttyAttentionDidChange(_ notification: Notification) {
+        guard (notification.userInfo?[AgentStateUserInfoKey.attention] as? Bool) == true
+        else { return }
+        playBellEffects(ghostty.config.attentionFeatures)
     }
 
     @objc private func terminalWindowHasBell(_ notification: Notification) {
@@ -927,16 +910,21 @@ class AppDelegate: NSObject,
     }
 
     private func setDockBadge() {
-        // (ramon fork / Bell Attention) Two-tier badge: a promoted `attentionNeeded`
-        // window ALWAYS counts (the loud Tier-2 signal, exempt from the tone-down); a
-        // raw-bell window counts only when the filter is OFF (and bell-features wants
-        // the dock attention), so flag-off is byte-identical to upstream and flag-on
-        // badges only on real promotions.
-        let bellFilter = ghostty.config.agentManagerBellFilter
-        let rawBellBadges = ghostty.config.bellFeatures.contains(.attention) && !bellFilter
+        // (ramon fork / Bell Attention v2) Two-tier badge over the shared `badge` flag
+        // (with the legacy `attention` alias): a raw-bell window counts when
+        // bell-features wants the badge; a promoted (attentionNeeded) window counts when
+        // attention-features wants it. With the filter off, attentionNeeded is never set
+        // and bell-features defaults to the badge (via `attention`), so this is
+        // byte-identical to upstream.
+        let bell = ghostty.config.bellFeatures
+        let attn = ghostty.config.attentionFeatures
+        let bellBadges = bell.contains(.badge) || bell.contains(.attention)
+        let attnBadges = attn.contains(.badge) || attn.contains(.attention)
         let count = NSApp.windows
             .compactMap { $0.windowController as? BaseTerminalController }
-            .reduce(0) { $0 + (($1.attentionNeeded || ($1.bell && rawBellBadges)) ? 1 : 0) }
+            .reduce(0) {
+                $0 + ((($1.bell && bellBadges) || ($1.attentionNeeded && attnBadges)) ? 1 : 0)
+            }
         let label = count > 0 ? (count > 99 ? "99+" : String(count)) : nil
         NSApp.dockTile.badgeLabel = label
         NSApp.dockTile.display()

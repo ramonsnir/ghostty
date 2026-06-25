@@ -227,14 +227,17 @@ final class AgentDashboardModel: ObservableObject {
 
     /// (ramon fork / Bell Attention) Latest merged "attention needed" state across all
     /// live controllers (set by the Agent Manager via set_attention). Drives the
-    /// attention-first sort + auto-unhide + tile marker, ALWAYS (independent of the
-    /// `bellFilter` tone-down — a promotion is a real "needs you").
+    /// attention-first sort + auto-unhide + tile marker, gated by the `dashboard` flag
+    /// in attention-features (`attnDashboard`).
     private(set) var attention: [UUID: Bool] = [:]
 
-    /// (ramon fork / Bell Attention) Mirrors `agent-manager-bell-filter`. When true, a
-    /// RAW bell no longer floats/auto-unhides a tile (only a promoted attention does);
-    /// the tile still shows its subtle bell dot. Default false ⇒ upstream behavior.
-    private let bellFilter: Bool
+    /// (ramon fork / Bell Attention v2) Whether the `dashboard` effect is routed to each
+    /// tier — `bellDashboard` = bell-features.dashboard (a RAW bell unhides + floats the
+    /// tile), `attnDashboard` = attention-features.dashboard (a PROMOTED attention does).
+    /// The controller passes the real config flags (both default on, so filter-off +
+    /// default config ⇒ raw bells drive the dashboard, as upstream).
+    private let bellDashboard: Bool
+    private let attnDashboard: Bool
 
     /// Latest detector results, keyed by surface UUID.
     private(set) var agents: [UUID: AgentKind] = [:]
@@ -353,9 +356,14 @@ final class AgentDashboardModel: ObservableObject {
         agentStateStore: AgentStateStore = InMemoryAgentStateStore(),
         orderStore: OrderStore = InMemoryOrderStore(),
         originFilterStore: OriginFilterStore = InMemoryOriginFilterStore(),
-        bellFilter: Bool = false
+        // Default true to match the config defaults (dashboard routed to both tiers =
+        // upstream "bell drives the dashboard" behavior); the controller passes the real
+        // config flags.
+        bellDashboard: Bool = true,
+        attnDashboard: Bool = true
     ) {
-        self.bellFilter = bellFilter
+        self.bellDashboard = bellDashboard
+        self.attnDashboard = attnDashboard
         self.store = store
         self.agentStore = agentStateStore
         self.orderStore = orderStore
@@ -443,10 +451,11 @@ final class AgentDashboardModel: ObservableObject {
     /// ringing agent. Output / rebuild never auto-unhide (variant b).
     func applyBells(_ next: [UUID: Bool]) {
         var changed = false
-        // (ramon fork / Bell Attention) Under the tone-down filter a RAW bell no longer
-        // auto-unhides — only a promoted attention does (see `applyAttention`). The
-        // tile's subtle bell dot still shows; it just won't yank a hidden tile back.
-        if !bellFilter {
+        // (ramon fork / Bell Attention v2) A RAW bell auto-unhides only when the
+        // `dashboard` effect is routed to the bell tier (bell-features.dashboard). With
+        // the filter off the default routes it there ⇒ upstream behavior; with the
+        // filter on a user drops it and the promoted attention (applyAttention) unhides.
+        if bellDashboard {
             for (id, ringing) in next where ringing {
                 if hidden.contains(id) {
                     hidden.remove(id)
@@ -459,16 +468,18 @@ final class AgentDashboardModel: ObservableObject {
         rebuildEntriesFromCurrentState()
     }
 
-    /// (ramon fork / Bell Attention) Apply a fresh merged "attention needed" map. A
-    /// surface the Agent Manager PROMOTED is never left hidden (same rule as a ringing
-    /// bell, and unconditional — a promotion is always a real "needs you"). Drives the
+    /// (ramon fork / Bell Attention v2) Apply a fresh merged "attention needed" map. A
+    /// PROMOTED surface auto-unhides when the `dashboard` effect is routed to the
+    /// attention tier (attention-features.dashboard; the default). Drives the
     /// attention-first sort + the tile marker via `rebuildEntriesFromCurrentState`.
     func applyAttention(_ next: [UUID: Bool]) {
         var changed = false
-        for (id, on) in next where on {
-            if hidden.contains(id) {
-                hidden.remove(id)
-                changed = true
+        if attnDashboard {
+            for (id, on) in next where on {
+                if hidden.contains(id) {
+                    hidden.remove(id)
+                    changed = true
+                }
             }
         }
         attention = next
@@ -831,7 +842,7 @@ final class AgentDashboardModel: ObservableObject {
             uniquingKeysWith: { first, _ in first })
         entries = AgentDashboardModel.sorted(
             built.filter { !$0.hidden }, lastSeen: lastSeen, manualRank: manualRank,
-            bellFilter: bellFilter)
+            bellDashboard: bellDashboard, attnDashboard: attnDashboard)
     }
 
     // MARK: - Sort (pure, testable)
@@ -843,11 +854,16 @@ final class AgentDashboardModel: ObservableObject {
     /// (ramon fork / Agent hooks) A `.waiting` tile with a live background shell
     /// is DEMOTED — it is waiting on its own work, not the user, so it does NOT
     /// float to the top. A bell still floats it (a bell is a real event).
-    private static func needsAttention(_ e: AgentEntry, bellFilter: Bool = false) -> Bool {
-        // (ramon fork / Bell Attention) A promoted `attention` always floats the tile.
-        // A raw bell floats it only when the tone-down filter is OFF (flag-off keeps the
-        // upstream "bell floats" behavior; flag-on leaves floating to a real promotion).
-        e.attention || (e.bell && !bellFilter) || (e.agentState == .waiting && e.backgroundShells == 0)
+    private static func needsAttention(
+        _ e: AgentEntry, bellDashboard: Bool = false, attnDashboard: Bool = false
+    ) -> Bool {
+        // (ramon fork / Bell Attention v2) A tile floats when the `dashboard` effect is
+        // routed to whichever tier is active for it: a raw bell floats iff
+        // bell-features.dashboard; a promoted attention floats iff attention-features.
+        // dashboard. (A waiting hook state still floats independently.)
+        (e.bell && bellDashboard)
+            || (e.attention && attnDashboard)
+            || (e.agentState == .waiting && e.backgroundShells == 0)
     }
 
     /// Whether the agent is idle — done with its turn and free for new work.
@@ -877,13 +893,17 @@ final class AgentDashboardModel: ObservableObject {
         _ entries: [AgentEntry],
         lastSeen: [UUID: Date] = [:],
         manualRank: [UInt64: Int] = [:],
-        bellFilter: Bool = false
+        // Default true to match the config defaults (dashboard routed to both tiers);
+        // the model passes its real flags.
+        bellDashboard: Bool = true,
+        attnDashboard: Bool = true
     ) -> [AgentEntry] {
         func rank(_ e: AgentEntry) -> Int? {
             e.sessionID == 0 ? nil : manualRank[e.sessionID]
         }
         return entries.sorted { a, b in
-            let aa = needsAttention(a, bellFilter: bellFilter), ba = needsAttention(b, bellFilter: bellFilter)
+            let aa = needsAttention(a, bellDashboard: bellDashboard, attnDashboard: attnDashboard)
+            let ba = needsAttention(b, bellDashboard: bellDashboard, attnDashboard: attnDashboard)
             if aa != ba { return aa && !ba }
             let ra = rank(a), rb = rank(b)
             // Unplaced (nil) sorts before placed (non-nil): new agents at top.
@@ -1102,7 +1122,8 @@ final class AgentDashboardController: NSWindowController {
             agentStateStore: UserDefaultsAgentStateStore(),
             orderStore: UserDefaultsOrderStore(),
             originFilterStore: UserDefaultsOriginFilterStore(),
-            bellFilter: ghostty.config.agentManagerBellFilter)
+            bellDashboard: ghostty.config.bellFeatures.contains(.dashboard),
+            attnDashboard: ghostty.config.attentionFeatures.contains(.dashboard))
         self.detector = AgentDetector(commands: Set(ghostty.config.agentDashboardCommands))
 
         let panel = AgentDashboardPanel(pinned: ghostty.config.agentDashboardPin)
