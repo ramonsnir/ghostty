@@ -148,6 +148,19 @@ const ctx =
   `reproduce today. The GUI NEVER auto-sets attentionNeeded (principle #3). The §78 crashed-sidecar ` +
   `fallback is DELIBERATELY DEFERRED (documented, flagged for the author\'s review) — do NOT raise it ` +
   `as a blocker/major.\n` +
+  `ALSO OUT OF SCOPE (deferred user decisions — do NOT raise as blocker/major): (1) the CONFIG MIGRATION ` +
+  `of the LIVE/example bell-features VALUES. The author was instructed NOT to touch the live config (and ` +
+  `example/ must stay byte-identical to it), so example/ghostty/config etc. intentionally still hold the ` +
+  `PRE-v2 values; what the CODE must guarantee is that the COMPILED DEFAULT in Config.zig reproduces today ` +
+  `(judge THAT, not the on-disk example values) — the live-config update is part of the pending config ` +
+  `discussion. Verify the compiled default + the routing code; treat the example-config values as the ` +
+  `user\'s call.\n` +
+  `PROMOTION PATH (verify THIS, not the stale assumption that it needs view.bell): a real bell posts ` +
+  `.ghosttyBellDidRing UNCONDITIONALLY (Ghostty.App.ringBell) → the MCP event bus → wait_for_event(bell). ` +
+  `The sidecar bellReactiveLoop records ev.id into pendingBellIds (the PRIMARY signal, truthful on every ` +
+  `ring even when view.bell/list_surfaces.bell is never armed in the system,audio config), drained into ` +
+  `forcedBell each sweep; the list_surfaces.bell rising-edge is only a BACKSTOP (for title/border configs). ` +
+  `So promotion does NOT depend on view.bell being armed — confirm that holds.\n` +
   `Grade strictly: 98+ = A+. Return JSON per the schema.`
 
 phase('Review')

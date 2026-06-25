@@ -127,7 +127,19 @@ aligns with fail-open.) Flag for Ramon's review of this doc.
 - **Slice 5a** (web-monitor `monitor` tier routing + P5 distinct attention + own clear) —
   DONE (662c0c863).
 - **Slice 5b** (crashed-sidecar GUI fallback, §78) — DEFERRED, see below.
-- **Slice 6** (Debug build + live verify + ≥98 review) — pending.
+- **Slice 6** (Debug build + live verify + ≥98 review) — IN PROGRESS.
+  - Review round 1 (FAIL/96): fixed a real FAIL-OPEN coerce bug (`coerceBool("maybe")`→false
+    suppressed; added strict `coerceAttention`), removed the dead `attention-features-focused`
+    key, added the cross-language BellFeatures bit-position tests.
+  - Review round 2 (FAIL/82): fixed the BLOCKER — in the recommended `bell-features=system,audio`
+    config the GUI never arms `view.bell`, so the sidecar's `list_surfaces.bell` edge detector
+    was blind and promotion was silently DEAD. Fix: the GUI posts `.ghosttyBellDidRing` on EVERY
+    ring (Ghostty.App.ringBell), so the MCP event bus + `wait_for_event(bell)` see every ring
+    regardless of the visual flag; `bellReactiveLoop` now records `ev.id` into `pendingBellIds`,
+    drained into `forcedBell` each sweep (PRIMARY signal). The `list_surfaces.bell` rising-edge
+    stays as a BACKSTOP. This avoids regressing the v1 visual-bell arming gate (which Ramon's
+    `bell-features-focused=...no-title` relies on to suppress a focused 🔔). Round-2 also found
+    the CONFIG-MIGRATION item below.
 
 ## OPEN DECISION for review — crashed-sidecar fallback (§78)
 Not implemented. The meaningful part of this fallback is the ATTENTION-TIER VISUALS
@@ -146,5 +158,29 @@ Also needs a main-readable health signal from `AgentManagerController` (currentl
 Process/backoff state is private + on a background serial queue). Deferred to your call
 since §78 was flagged "for Ramon's review of this doc."
 
+## OPEN DECISION for review — CONFIG MIGRATION (live bell-features) (found round 2)
+The COMPILED default `bell-features` reproduces today (it carries attention,title +
+dashboard,push,monitor). BUT the shared on-disk `~/.config/ghostty/config` (mirrored in
+`example/ghostty/config`) explicitly sets `bell-features = system,attention,title,border`,
+and the parser is RESET-to-listed — so on the real machine dashboard/push/monitor end up
+FALSE on the bell tier. With the filter OFF (default), the v2 consumers now gate those
+three on `bell-features` (`bellDashboard`/`bellPush`/`monitorBell`), so a raw bell would
+STOP auto-unhiding the dashboard tile, web-pushing, and lighting the web-monitor indicator
+— a regression vs today for THIS machine (the compiled default alone would not regress).
+This is INTENTIONALLY left for your config discussion: per your instruction I did NOT
+touch the live config (and `example/` must stay byte-identical to it). NOTE this regression
+is also partly your INTENDED design — your classification routes dashboard/push/monitor to
+the ATTENTION tier, i.e. a raw bell SHOULD stop doing them and only a promotion should. The
+migration when you adopt v2: either append `dashboard,push,monitor` to the `bell-features`
+line (keep them on raw bells) OR accept them as attention-tier-only (your stated intent) and
+rely on the sidecar promotion. Code is correct; this is a config choice, flagged for you.
+
 ## Review log (v2)
-- (pending — slice 6 multi-lens ≥98 review)
+- Round 1 (88a9d7331-era): FAIL/96 — 1 major (dead `attention-features-focused`) + 2 test
+  minors (string-"false" suppression untested; BellFeatures bit-ABI untested). All fixed
+  (incl. the real `coerceBool` fail-open bug the "minor" masked).
+- Round 2 (35732dc7d): FAIL/82 — 1 BLOCKER (promotion dead in `system,audio` config — the
+  `view.bell` arming gate left `list_surfaces.bell` blind) + 1 major (the CONFIG-MIGRATION
+  item above). Blocker FIXED (event-driven `pendingBellIds` promotion); config-migration
+  documented as a deferred user decision (configs are off-limits per your instruction).
+- Round 3: pending re-run after the blocker fix.

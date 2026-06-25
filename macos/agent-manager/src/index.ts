@@ -166,8 +166,18 @@ export interface LoopDeps {
   bellFilter: boolean;
   /** (bell-attention) Per-session memory of the last-seen `bell` flag, keyed by surface
    *  id, for rising-edge detection. Held on deps so a test can seed/inspect it; cleaned
-   *  up alongside lastBySession when a surface dies. */
+   *  up alongside lastBySession when a surface dies. This is the POLL BACKSTOP — it only
+   *  catches rings when `list_surfaces.bell` is armed (i.e. bell-features routes a visual
+   *  bell: title/border). The PRIMARY signal is `pendingBellIds` below. */
   bellSeenBySession: Map<string, boolean>;
+  /** (bell-attention v2 slice 6) Surface ids the bell-reactive loop saw ring via
+   *  `wait_for_event(bell)` — the GUI posts `.ghosttyBellDidRing` UNCONDITIONALLY on every
+   *  ring (Ghostty.App.ringBell), so the MCP event bus sees every bell REGARDLESS of
+   *  whether the per-surface `view.bell` visual flag was armed. This is what makes
+   *  promotion work in the feature's recommended `bell-features = system,audio` config
+   *  (where `view.bell`/`list_surfaces.bell` is never set, so the poll backstop above is
+   *  blind). Drained into `forcedBell` at the start of each sweep. */
+  pendingBellIds: Set<string>;
   /** Optional CLAUDE_CONFIG_DIR for the summarizer's model calls — routes auth/billing
    *  to a specific claude-accounts account (see account.ts). Omitted ⇒ inherit the
    *  ambient auth (the default; works with no claude-accounts installed). */
@@ -412,12 +422,20 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     if (!liveIds.has(id)) deps.alertBySession.delete(id);
   }
 
-  // (bell-attention) Rising-edge detect the `bell` flag so a newly-rung surface gets a
-  // forced classify this sweep (bellRang). Only when the feature is on — otherwise the
-  // sweep is byte-identical to before. We compute edges against the PREVIOUS seen state,
-  // then refresh the map to the current state (and prune dead surfaces).
+  // (bell-attention) Decide which surfaces get a FORCED classify this sweep (bellRang).
+  // Only when the feature is on — otherwise the sweep is byte-identical to before.
   const forcedBell = new Set<string>();
   if (deps.bellFilter) {
+    // PRIMARY: surfaces the bell-reactive loop saw ring via wait_for_event(bell). The GUI
+    // posts .ghosttyBellDidRing on EVERY ring regardless of the visual bell-features, so
+    // this is the only signal that works in the recommended `bell-features = system,audio`
+    // config (where list_surfaces.bell is never armed). Drain it (one-shot per ring).
+    for (const id of deps.pendingBellIds) forcedBell.add(id);
+    deps.pendingBellIds.clear();
+    // BACKSTOP: rising-edge of list_surfaces.bell — catches a ring the event loop missed
+    // (e.g. during an MCP reconnect) BUT only when bell-features armed the visual bell
+    // (title/border), so it can't be the primary. We compute edges against the PREVIOUS
+    // seen state, then refresh the map (and prune dead surfaces).
     for (const s of surfaces) {
       if (bellRoseEdge(deps.bellSeenBySession.get(s.id), s.bell === true)) {
         forcedBell.add(s.id);
@@ -513,6 +531,7 @@ async function main(): Promise<void> {
     alertBySession: new Map<string, string>(),
     bellFilter,
     bellSeenBySession: new Map<string, boolean>(),
+    pendingBellIds: new Set<string>(),
     summarizerConfigDir,
   };
   if (bellFilter) log("bell-attention: bell promotion ENABLED");
@@ -620,6 +639,11 @@ async function main(): Promise<void> {
       }
       if (stopped) return;
       if (ev) {
+        // Record the RINGING surface id (the truthful signal — independent of whether the
+        // GUI armed its visual bell flag), then wake an immediate classify. runSweep drains
+        // pendingBellIds into forcedBell, so this surface is classified even when
+        // list_surfaces.bell is never set (the system,audio config).
+        deps.pendingBellIds.add(ev.id);
         log(`bell event on ${ev.id} -> wake immediate classify`);
         void runSweepCoalesced();
       }

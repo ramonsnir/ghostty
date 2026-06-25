@@ -110,6 +110,7 @@ interface DepsSpec {
   alerts?: Map<string, string>;
   bellFilter?: boolean;
   bellsSeen?: Map<string, boolean>;
+  pendingBells?: Set<string>;
   budgetMax?: number;
 }
 
@@ -134,6 +135,7 @@ function makeDeps(spec: DepsSpec): {
     alertBySession: spec.alerts ?? new Map<string, string>(),
     bellFilter: spec.bellFilter ?? false,
     bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
+    pendingBellIds: spec.pendingBells ?? new Set<string>(),
   };
   return { deps, summarizeCalls };
 }
@@ -667,6 +669,30 @@ test("bell-attention: a rising bell on a debounced agent forces a classify + pro
     reason: "Needs you: approve deploy?",
   });
   assert.equal(deps.bellSeenBySession.get("s1"), true, "bell state recorded");
+});
+
+// (bell-attention v2 slice 6 — the recommended-config blocker regression test) In the
+// `bell-features = system,audio` config the GUI never arms view.bell, so list_surfaces.bell
+// is ALWAYS false and the rising-edge backstop can never fire. Promotion MUST instead come
+// from the bell-reactive loop's pendingBellIds (the wait_for_event signal, truthful on every
+// ring). Here s.bell is false but the id is pending ⇒ it must still force-classify + promote.
+test("bell-attention: a pendingBellId forces a classify even when list_surfaces.bell is false (system,audio config)", async () => {
+  const { surface, last } = debouncedAgent({ bell: false }); // never armed (sound-only)
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    last,
+    bellFilter: true,
+    pendingBells: new Set(["s1"]), // the bell-reactive loop saw it ring
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "pendingBellId forced a classify despite bell=false");
+  assert.equal(fake.attentionCalls.length, 1, "promoted");
+  assert.equal(fake.attentionCalls[0].on, true);
+  assert.equal(deps.pendingBellIds.size, 0, "pending set drained (one-shot per ring)");
 });
 
 test("bell-attention: attention:false ⇒ classified but NOT promoted (quiet raw bell stands)", async () => {
