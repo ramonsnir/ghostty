@@ -78,12 +78,15 @@ enum QueueBacklogGeometry {
     static let pad: CGFloat = 24      // padding around the board inside the scroll view
     static let headerHeight: CGFloat = 44  // the title/legend bar above the board
 
-    /// The board (ZStack) content size for a set of columns: width = columns × (card+gap),
-    /// height = tallest column × (card+gap). Floored at one card so an empty board isn't 0.
+    /// The board (ZStack) content size = the EXACT bounding box of the card grid: N cards
+    /// plus the (N−1) inter-card gaps (NO trailing gap — that spurious extra column/row gap
+    /// is what made the window scroll on a board that actually fit). Floored at one card so
+    /// an empty board isn't 0.
     static func boardSize(_ columns: [[QueueGraph.Node]]) -> CGSize {
+        let cols = columns.count
         let rows = columns.map(\.count).max() ?? 0
-        let w = CGFloat(columns.count) * (cardW + hGap)
-        let h = CGFloat(rows) * (cardH + vGap)
+        let w = cols > 0 ? CGFloat(cols) * cardW + CGFloat(cols - 1) * hGap : cardW
+        let h = rows > 0 ? CGFloat(rows) * cardH + CGFloat(rows - 1) * vGap : cardH
         return CGSize(width: max(w, cardW), height: max(h, cardH))
     }
 
@@ -211,11 +214,14 @@ struct QueueBacklogCanvas: View {
     // MARK: layout → points
 
     private func centersByKey(_ cols: [[QueueGraph.Node]]) -> [String: CGPoint] {
+        // Coordinates are RELATIVE TO THE BOARD (the ZStack sized to `boardSize`); the
+        // `.padding(pad)` around the ZStack supplies the margin, so DON'T add `pad` here
+        // (doing both double-pads and pushes the content past the viewport).
         var out: [String: CGPoint] = [:]
         for (ci, col) in cols.enumerated() {
-            let x = pad + CGFloat(ci) * (cardW + hGap) + cardW / 2
+            let x = CGFloat(ci) * (cardW + hGap) + cardW / 2
             for (ri, node) in col.enumerated() {
-                let y = pad + CGFloat(ri) * (cardH + vGap) + cardH / 2
+                let y = CGFloat(ri) * (cardH + vGap) + cardH / 2
                 out[node.key] = CGPoint(x: x, y: y)
             }
         }
@@ -356,7 +362,8 @@ private struct LegendView: View {
     private func legend(_ c: Color, _ label: String) -> some View {
         HStack(spacing: 3) {
             RoundedRectangle(cornerRadius: 2).fill(c.opacity(0.6)).frame(width: 8, height: 8)
-            Text(label)
+            // Never wrap a legend label ("in progress" → "in progre/ss"); keep it on one line.
+            Text(label).lineLimit(1).fixedSize()
         }
     }
 }
@@ -373,9 +380,12 @@ final class QueueBacklogWindowManager {
     private var observers: [String: NSObjectProtocol] = [:]
 
     /// A comfortable minimum so a tiny board (or none yet) still opens as a usable window.
-    static let minContentSize = CGSize(width: 480, height: 360)
+    /// The WIDTH floor (640) is sized to fit the header bar (title + backlog/total badges +
+    /// the 4-item legend) on ONE line — a narrower board would otherwise smush the header
+    /// AND leave a spurious horizontal scrollbar.
+    static let minContentSize = CGSize(width: 640, height: 360)
     /// Leave this much of the screen free so the title bar + edges stay reachable.
-    static let screenMargin: CGFloat = 80
+    static let screenMargin: CGFloat = 64
 
     /// PURE: the window's default CONTENT size — the board's preferred size (fit-to-content)
     /// floored at `minContentSize` and clamped to `screen` (minus a margin) so a large graph
@@ -412,6 +422,8 @@ final class QueueBacklogWindowManager {
             backing: .buffered, defer: false)
         window.title = "Backlog — \(runName)"
         window.isReleasedWhenClosed = false
+        // Don't let the user shrink it below the header's needs (keeps the header on one line).
+        window.contentMinSize = Self.minContentSize
         window.contentView = NSHostingView(rootView: root)
         window.center()
         window.makeKeyAndOrderFront(nil)
