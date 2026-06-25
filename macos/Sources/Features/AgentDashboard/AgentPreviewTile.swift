@@ -60,6 +60,12 @@ struct AgentPreviewTile: View {
     /// (request #3).
     private static let previewHeight: CGFloat = 220
 
+    /// True when this tile belongs to a queue run (carries a `queueName` annotation) —
+    /// the only case where the destructive force-Close button is offered.
+    private var isQueueOwned: Bool {
+        !(entry.annotation?.queueName ?? "").isEmpty
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -108,13 +114,18 @@ struct AgentPreviewTile: View {
                     .foregroundStyle(Self.bellAmber)
             }
             if hovering {
-                Button { confirmClose = true } label: {
-                    Image(systemName: "stop.circle")
-                        .font(.caption2)
+                // Force-close is offered ONLY for queue-owned tiles: it's the escape hatch
+                // for a wedged queue slot. On a non-queue agent it would be an unscoped
+                // "kill this terminal" sitting next to the harmless Hide — needless risk.
+                if isQueueOwned {
+                    Button { confirmClose = true } label: {
+                        Image(systemName: "stop.circle")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                    .help("Close this split (ends the agent; frees its queue slot)")
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.red)
-                .help("Close this split (ends the agent; frees its queue slot)")
                 Button(action: onHide) {
                     Image(systemName: "xmark")
                         .font(.caption2)
