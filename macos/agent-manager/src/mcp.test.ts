@@ -214,6 +214,22 @@ test("spawnSplitCommand: encodes the tool + forwards only present fields", async
   assert.deepEqual(result, { id: "new-uuid", sessionId: 17 });
 });
 
+test("moveSurfaceIntoTab: encodes move_surface_into_tab + forwards source/anchor/balanced", async () => {
+  const { method, name, args } = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({ sourceUUID: "src", targetAnchorUUID: "anchor", balanced: true }),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "move_surface_into_tab");
+  assert.equal(args.sourceUUID, "src");
+  assert.equal(args.targetAnchorUUID, "anchor");
+  assert.equal(args.balanced, true);
+  // balanced omitted when not given.
+  const noBalanced = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({ sourceUUID: "src", targetAnchorUUID: "anchor" }),
+  );
+  assert.equal("balanced" in noBalanced.args, false);
+});
+
 test("spawnSplitCommand: forwards the item env (GHOSTTY_ITEM_*) and omits an empty env", async () => {
   const withEnv = await captureCall('{"id":"u","sessionId":1}', (c) =>
     c.spawnSplitCommand({

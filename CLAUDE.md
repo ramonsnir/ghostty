@@ -1009,6 +1009,32 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     effConcurrency override), `templates.test.ts` (concurrency may exceed one grid, clamps at
     `cap*MAX_QUEUE_TABS`); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
     biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+    - **CONTINUOUS PACKING (§12) — consolidate fragmented tabs by MOVING panes.** When agents
+      finish unevenly a run fragments (e.g. tabs of 3 + 1 + 1 panes that could sit in one tab).
+      Each healthy sweep (after close, BEFORE dispatch) the engine computes ONE merge via pure
+      `packMove(occupied, capPerTab)` — the HIGHEST non-empty tab whose panes ALL fit the free
+      space of the LEFTMOST earlier tab — and physically MOVES that whole tab's panes there,
+      closing the emptied source tab. Applying one merge per sweep CONVERGES to the fewest tabs
+      WITHOUT reshuffling a balanced layout: `4+4` / `5+2` (cap 6) never move because the higher
+      tab doesn't FIT the lower tab's free space; `3+1+1` packs to one tab over two sweeps. No
+      hard-coded numbers — everything derives from `capPerTab` + occupancy. The move is a
+      FOCUS-PRESERVING cross-tab relocation reusing Ghostty's proven drag-and-drop primitive
+      (`surfaceTree.inserting` on the destination + `removeSurfaceNode` on the source), so it
+      never steals focus or raises a window; a moved pane's `gridSlot` is reassigned to the
+      target tab's range (tab membership). SAFE-DEFERS: if any source pane is not yet seated
+      (host still attaching, no `surfaceUUID`) the WHOLE merge defers to a later sweep (never a
+      half-move that re-fragments); a failed move stops the sweep (next retries). Runs only on
+      the dispatch-eligible gate (armed, not disabled/paused/draining). Wiring: sidecar —
+      `grid.ts` (`packMove` + `PackMove`), `runner.ts` (`packRun` — exported; `seatedAtSlot`;
+      called in `runOne` before `dispatchCandidates`), `mcp.ts` (`moveSurfaceIntoTab` client).
+      Swift — `BaseTerminalController.moveSurfaceIntoThisTab(source:balanced:)` (focus-preserving
+      cross-tab move), `MCPLayout.moveSurfaceIntoTab(sourceUUID:targetAnchorUUID:balanced:)`,
+      `MCPTools.swift` (`move_surface_into_tab` tool — now 20 tools). Tests: sidecar
+      `grid.test.ts` (`packMove`: 3+1+1 merge / 4+4 + 5+2 no-reshuffle / full-tab-skip / hole
+      reuse / multi-pane), `runner.test.ts` (`packRun` moves + reassigns slot / single+balanced
+      no-op / defers-when-unseated), `mcp.test.ts` (`moveSurfaceIntoTab` forwarding); Swift
+      `MCPServerTests` (`toolsListHasAllTools` now 20). **GUI relaunch + rebuilt sidecar `dist`;
+      no host/Zig change.**
   - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
     `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only

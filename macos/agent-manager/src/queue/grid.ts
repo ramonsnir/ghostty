@@ -84,3 +84,61 @@ export function splitPlan(
   }
   return { balanced: true, anchorSlotIndex: lowestInTab };
 }
+
+/**
+ * One CONTINUOUS-PACKING merge: a fragmented run (e.g. tabs holding 3 + 1 + 1 panes) wastes
+ * tabs when those panes could sit together. `packMove` finds ONE whole tab whose panes ALL
+ * fit into the free space of an EARLIER (lower-index) tab, and returns the move that merges
+ * it in — the highest such source tab into the LEFTMOST earlier tab with room. Applying it
+ * each sweep converges the layout to the fewest tabs WITHOUT reshuffling balanced cases:
+ * `4 + 4` or `5 + 2` (cap 6) don't move because the higher tab's panes don't fit the lower
+ * tab's free space, while `3 + 1 + 1` packs to a single tab over two sweeps. PURE; returns
+ * null when nothing can be merged (already minimal, or only one tab).
+ *
+ *   - `sourceSlots`  : the occupied slots of the source tab (ascending) — the panes to move.
+ *   - `targetSlots`  : the destination slots in the target tab's range (ascending, one per
+ *                      source pane) — the moved panes' NEW grid slots (tab membership).
+ *   - `targetTab`    : the target tab index (the caller resolves an anchor pane in it).
+ */
+export interface PackMove {
+  sourceSlots: number[];
+  targetSlots: number[];
+  targetTab: number;
+}
+
+export function packMove(occupiedSlots: Set<number>, capPerTab: number): PackMove | null {
+  if (capPerTab < 1 || occupiedSlots.size === 0) return null;
+  // Group occupied slots by tab index.
+  const byTab = new Map<number, number[]>();
+  for (const s of occupiedSlots) {
+    const t = tabIndexForSlot(s, capPerTab);
+    const arr = byTab.get(t);
+    if (arr) arr.push(s);
+    else byTab.set(t, [s]);
+  }
+  const tabs = [...byTab.keys()].sort((a, b) => a - b);
+  if (tabs.length < 2) return null; // one tab (or none) — nothing to merge.
+
+  // Source = highest non-empty tab down; target = the LEFTMOST earlier tab with room for the
+  // WHOLE source tab. Merging a whole tab only when it FITS is what avoids reshuffling a
+  // balanced layout (4+4 / 5+2 don't fit), while packing fragmentation (3+1+1).
+  for (let i = tabs.length - 1; i >= 1; i--) {
+    const src = tabs[i];
+    const sourceSlots = byTab.get(src)!.slice().sort((a, b) => a - b);
+    const need = sourceSlots.length;
+    for (let j = 0; j < i; j++) {
+      const tgt = tabs[j];
+      const free = capPerTab - byTab.get(tgt)!.length;
+      if (free < need) continue;
+      // The lowest `need` FREE slots in the target tab's range.
+      const base = tgt * capPerTab;
+      const targetSlots: number[] = [];
+      for (let k = 0; k < capPerTab && targetSlots.length < need; k++) {
+        const slot = base + k;
+        if (!occupiedSlots.has(slot)) targetSlots.push(slot);
+      }
+      return { sourceSlots, targetSlots, targetTab: tgt };
+    }
+  }
+  return null;
+}

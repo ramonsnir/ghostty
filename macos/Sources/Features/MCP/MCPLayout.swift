@@ -488,6 +488,19 @@ enum MCPLayout {
         return identity(of: newView)
     }
 
+    /// (Agent Queue §12 continuous packing) Move the surface `sourceUUID` INTO the tab that
+    /// holds `targetAnchorUUID`, as a balanced split, FOCUS-PRESERVING. Resolves both UUIDs to
+    /// their controllers/views and calls the destination controller's `moveSurfaceIntoThisTab`.
+    /// Returns false if either UUID is unresolved or the move fails. MUST be called on main.
+    static func moveSurfaceIntoTab(
+        sourceUUID: UUID, targetAnchorUUID: UUID, balanced: Bool
+    ) -> Bool {
+        guard let (_, source) = controllerAndView(forUUID: sourceUUID),
+              let (destController, _) = controllerAndView(forUUID: targetAnchorUUID)
+        else { return false }
+        return destController.moveSurfaceIntoThisTab(source: source, balanced: balanced)
+    }
+
     /// PURE: read a freshly-created leaf's stable identity. `sessionID` via the C
     /// API (0 with no live surface / no host session). Internal helper for
     /// `newSplitCommand` — keeps the value-types-only-across-the-hop rule honest.

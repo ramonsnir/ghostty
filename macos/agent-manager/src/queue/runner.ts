@@ -41,7 +41,7 @@ import {
   runProvider,
   type Exec,
 } from "./provider.js";
-import { lowestFreeSlot, splitPlan, gridCap, MAX_QUEUE_TABS } from "./grid.js";
+import { lowestFreeSlot, splitPlan, gridCap, MAX_QUEUE_TABS, packMove } from "./grid.js";
 import {
   ConcurrencyBudget,
   closeSequencePlan,
@@ -690,6 +690,10 @@ async function runOne(
   } else if (run.paused || run.draining) {
     // PAUSED / DRAINING (§8a): keep tracking + closing (done above), dispatch NOTHING new.
   } else {
+    // --- 3.5) CONTINUOUS PACKING (§12): consolidate fragmented tabs BEFORE dispatch, so a
+    // new dispatch fills the packed layout's low tabs rather than a stray fragment. One merge
+    // per sweep; a no-op once the layout is minimal. Best-effort (never throws into the sweep).
+    await packRun(run, deps);
     dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining);
   }
 
@@ -1385,6 +1389,79 @@ function occupiedUUID(run: QueueRun, slotIndex: number): string | undefined {
     if (a.gridSlot === slotIndex && a.surfaceUUID !== undefined) return a.surfaceUUID;
   }
   return undefined;
+}
+
+/** The SEATED assignment occupying a grid slot (has a `surfaceUUID`), or undefined. PURE. */
+function seatedAtSlot(run: QueueRun, slotIndex: number): Assignment | undefined {
+  for (const a of run.active.values()) {
+    if (a.gridSlot === slotIndex && occupiesSlot(a) && a.surfaceUUID !== undefined) return a;
+  }
+  return undefined;
+}
+
+/**
+ * CONTINUOUS PACKING (§12): consolidate a fragmented run's tabs. When agents finish unevenly,
+ * a run can end up with e.g. tabs of 3 + 1 + 1 panes that could sit in one tab. Each sweep we
+ * compute ONE merge (`packMove`) — a whole source tab whose panes fit an earlier tab's free
+ * space — and MOVE its panes there (a focus-preserving cross-tab move), closing the emptied
+ * source tab. Applying one merge per sweep converges to the fewest tabs WITHOUT reshuffling a
+ * balanced layout (4+4 / 5+2 don't fit, so they never move). Best-effort: a failed move stops
+ * this sweep (the next retries); an un-seated source pane (host still attaching) defers the
+ * whole merge. Returns the number of panes moved (0 = nothing to pack / deferred).
+ */
+export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
+  const capPerTab = gridCap(run.template.grid.cols, run.template.grid.rows);
+  // Occupied slots = every slot-occupying assignment (seated or not) so the tab grouping is
+  // accurate; the move itself only proceeds when the source panes are seated (have a UUID).
+  const occupied = new Set<number>();
+  for (const a of run.active.values()) {
+    if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
+  }
+  const plan = packMove(occupied, capPerTab);
+  if (plan === null) return 0;
+
+  // Resolve a SEATED anchor pane in the target tab (any occupied target-range slot with a
+  // UUID); without one we can't address the destination tab — defer to a later sweep.
+  let targetAnchorUUID: string | undefined;
+  for (let k = 0; k < capPerTab; k++) {
+    const uuid = occupiedUUID(run, plan.targetTab * capPerTab + k);
+    if (uuid !== undefined) { targetAnchorUUID = uuid; break; }
+  }
+  if (targetAnchorUUID === undefined) return 0;
+
+  // Resolve every source pane as a SEATED assignment up front; if ANY is un-seated (host
+  // still attaching), defer the WHOLE merge so we never half-move a tab (which would itself
+  // fragment). The slot lists are positionally paired by `packMove`.
+  const moves: Array<{ asgn: Assignment; toSlot: number }> = [];
+  for (let i = 0; i < plan.sourceSlots.length; i++) {
+    const asgn = seatedAtSlot(run, plan.sourceSlots[i]);
+    if (asgn === undefined || asgn.surfaceUUID === undefined) return 0; // defer
+    moves.push({ asgn, toSlot: plan.targetSlots[i] });
+  }
+
+  let moved = 0;
+  for (const { asgn, toSlot } of moves) {
+    if (deps.client.moveSurfaceIntoTab === undefined) break; // optional capability
+    try {
+      await deps.client.moveSurfaceIntoTab({
+        sourceUUID: asgn.surfaceUUID!,
+        targetAnchorUUID,
+        balanced: true,
+      });
+    } catch (err) {
+      errlog(`run "${run.runName}": pack move ${asgn.key} failed: ${msg(err)}`);
+      break; // stop this sweep; the next re-evaluates from the new (partial) layout.
+    }
+    // The pane now lives in the target tab → reassign its grid slot (tab membership) so the
+    // occupancy model + future dispatch/pack stay consistent.
+    asgn.gridSlot = toSlot;
+    moved += 1;
+  }
+  if (moved > 0) {
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+    log(`run "${run.runName}": packed ${moved} pane(s) into tab ${plan.targetTab} (continuous packing)`);
+  }
+  return moved;
 }
 
 // ---------------------------------------------------------------------------

@@ -209,6 +209,21 @@ enum MCPTools {
             ],
         ],
         [
+            // (ramon fork / Agent Queue, §12 continuous packing)
+            "name": "move_surface_into_tab",
+            "description": "Agent Queue: MOVE an existing surface (sourceUUID) INTO the tab that holds targetAnchorUUID, as a balanced split, FOCUS-PRESERVING (does not steal focus or raise the window — unlike a user drag). Used by the queue packer to consolidate a fragmented run's tabs (merge a whole tab's panes into an earlier tab with room); the source tab closes automatically when it empties. No-op success if the source is already in the target's tab. Reuses Ghostty's proven cross-tab/window move primitive.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "sourceUUID": ["type": "string", "description": "The surface to move."],
+                    "targetAnchorUUID": ["type": "string", "description": "Any surface in the destination tab; identifies which tab to move into."],
+                    "balanced": ["type": "boolean", "default": true, "description": "Split the largest pane in the destination tab (the queue's tiling). Currently always balanced."],
+                ],
+                "required": ["sourceUUID", "targetAnchorUUID"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
             // (ramon fork / Agent Queue, §8.2/§10)
             "name": "force_close_surface",
             "description": "Agent Queue: close a surface WITHOUT the close-confirmation prompt. Unlike close_surface (which honors confirm-close and pops a modal for a live child), this bypasses confirmation. Intended to be called only AFTER the surface's child has exited (the supervisor first sends the template exit keys), so a done-but-still-rendering agent split actually closes instead of stalling on a modal.",
@@ -487,6 +502,20 @@ enum MCPTools {
             // Casing note: this returns "sessionId" (lowercase); list_surfaces emits
             // "sessionID" (capital, MCPLayout.swift). Each matches its TS reader in mcp.ts.
             return .ok(["id": result.id, "sessionId": NSNumber(value: result.sessionID)])
+
+        case "move_surface_into_tab":
+            guard let s = arguments["sourceUUID"] as? String, let sourceUUID = UUID(uuidString: s) else {
+                return .invalidParams("missing or invalid sourceUUID")
+            }
+            guard let t = arguments["targetAnchorUUID"] as? String, let targetAnchorUUID = UUID(uuidString: t) else {
+                return .invalidParams("missing or invalid targetAnchorUUID")
+            }
+            let balanced = (arguments["balanced"] as? Bool) ?? true
+            let ok = DispatchQueue.main.sync {
+                MCPLayout.moveSurfaceIntoTab(
+                    sourceUUID: sourceUUID, targetAnchorUUID: targetAnchorUUID, balanced: balanced)
+            }
+            return ok ? .ok(["ok": true]) : .toolError("could not move surface (unresolved id or insert failed)")
 
         case "force_close_surface":
             guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }
