@@ -285,7 +285,7 @@ enum MCPTools {
         [
             // (ramon fork / Agent Queue, backlog graph)
             "name": "report_queue_graph",
-            "description": "Agent Queue: PUSH a run's WHOLE backlog board (every state — not just actionable items) to the GUI Agent Dashboard, for the 'N backlog' header button + the dependency-graph canvas. The supervisor calls this throttled to intervals.listMs when the template declares the optional provider.graph. 'queueName' (= run/origin name) is required; 'present:false' clears the run's backlog button + canvas. 'backlog' is the header-badge count (non-terminal items not currently waiting/running). 'nodes' is the full board: each {key (required), title?, url?, state? (display name), stateType? (category for color), done (terminal flag), labels[] (e.g. 'Design needed'), blockedBy[] (keys this depends on), priority?, priorityLabel? (a GENERIC priority MARK string like 'Urgent'/'High' the canvas renders as a prominent badge — the provider decides which items get one; omit for unmarked)}.",
+            "description": "Agent Queue: PUSH a run's WHOLE backlog board (every state — not just actionable items) to the GUI Agent Dashboard, for the 'N backlog' header button + the dependency-graph canvas. The supervisor calls this throttled to intervals.listMs when the template declares the optional provider.graph. 'queueName' (= run/origin name) is required; 'present:false' clears the run's backlog button + canvas. 'backlog' is the header-badge count (non-terminal items not currently waiting/running). 'nodes' is the full board: each {key (required), title?, url?, state? (display name), stateType? (category for color), done (terminal flag), labels[] (e.g. 'Design needed'), blockedBy[] (keys this depends on), priorityLabel? (a GENERIC priority MARK string like 'Urgent'/'High' the canvas renders as a prominent badge — the provider decides which items get one; omit for unmarked)}.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -305,7 +305,6 @@ enum MCPTools {
                                 "done": ["type": "boolean"],
                                 "labels": ["type": "array", "items": ["type": "string"]],
                                 "blockedBy": ["type": "array", "items": ["type": "string"]],
-                                "priority": ["type": "integer"],
                                 "priorityLabel": ["type": "string"],
                             ],
                             "required": ["key"],

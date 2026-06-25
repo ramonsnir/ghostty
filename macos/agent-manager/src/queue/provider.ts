@@ -225,8 +225,8 @@ export function parseStatusOutput(
  * non-empty string `key`; nodes without one are DROPPED. `done` coerces from a boolean
  * (default false). `labels`/`blockedBy` accept a string array (non-string entries
  * dropped); a single string is wrapped. `state`/`stateType`/`title`/`url` are kept only
- * when strings; `priority` only when a finite number; `priorityLabel` only when a
- * non-empty string (the generic priority MARK the canvas renders). Unparseable / wrong-shaped stdout
+ * when strings; `priorityLabel` only when a non-empty string (the generic priority MARK
+ * the canvas renders). Unparseable / wrong-shaped stdout
  * yields `[]` (the caller treats it as "no graph this poll" — never throws). Duplicate
  * keys collapse to the FIRST occurrence (a flaky provider can repeat).
  */
@@ -268,9 +268,6 @@ export function parseGraphOutput(stdout: string): GraphNode[] {
     if (state !== undefined) node.state = state;
     const stateType = asString(rec.stateType);
     if (stateType !== undefined) node.stateType = stateType;
-    if (typeof rec.priority === "number" && Number.isFinite(rec.priority)) {
-      node.priority = rec.priority;
-    }
     const priorityLabel = asString(rec.priorityLabel);
     if (priorityLabel !== undefined && priorityLabel.length > 0) {
       node.priorityLabel = priorityLabel;
