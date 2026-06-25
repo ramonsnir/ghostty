@@ -50,9 +50,12 @@ struct AgentDashboardView: View {
         } else {
             VStack(spacing: 0) {
                 // (ramon fork / Agent Queue, §11) Filter bar: one include/exclude
-                // toggle per known origin. Only shown when there's more than one
-                // origin to choose between (a single-origin fleet needs no filter).
-                if model.knownOrigins.count > 1 {
+                // toggle per known origin. Shown when there's more than one origin to
+                // choose between (a single-origin fleet needs no filter) OR whenever an
+                // exclusion is active — otherwise a stale exclusion (e.g. soloing a
+                // queue that later ends, leaving `(other)` excluded as the sole origin)
+                // would silently filter out every tile with NO way to reach "Show all".
+                if model.showsFilterBar {
                     originFilterBar
                 }
                 sectionedList

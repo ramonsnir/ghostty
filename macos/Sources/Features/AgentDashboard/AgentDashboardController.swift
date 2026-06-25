@@ -969,6 +969,25 @@ final class AgentDashboardModel: ObservableObject {
     /// (so the user can re-include them).
     var knownOrigins: Set<String> { AgentDashboardModel.knownOrigins(in: entries) }
 
+    /// Whether the view should render the origin filter bar. Pure + unit-tested.
+    /// Shown when there's more than one origin to choose between (a single-origin
+    /// fleet needs no filter) OR whenever an exclusion is active — the latter is the
+    /// load-bearing case: soloing a queue that later ends can leave `(other)` excluded
+    /// as the SOLE remaining origin, which would silently filter out every tile with
+    /// no way to reach "Show all". Keeping the bar visible whenever anything is
+    /// excluded guarantees the escape hatch is always reachable.
+    static func shouldShowFilterBar(
+        knownOrigins: Set<String>, excludedOrigins: Set<String>
+    ) -> Bool {
+        knownOrigins.count > 1 || !excludedOrigins.isEmpty
+    }
+
+    /// Instance accessor for `shouldShowFilterBar` over the current state.
+    var showsFilterBar: Bool {
+        AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: knownOrigins, excludedOrigins: excludedOrigins)
+    }
+
     /// The displayed, origin-filtered tiles grouped into ordered sections. The
     /// `entries` list is the global-sorted, non-hidden set (NOT origin-filtered);
     /// the origin filter is applied HERE so the model's attention logic and the
