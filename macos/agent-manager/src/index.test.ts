@@ -13,7 +13,8 @@ import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
   ConcurrencyBudget,
-  fingerprint,
+  changeSignals,
+  changeTail,
   type LastSummary,
   type SurfaceSnapshot,
 } from "./summarizer.js";
@@ -160,10 +161,13 @@ test("runSweep: unchanged + idle session is NOT summarized (gate honored, budget
     idleSeconds: DEFAULT_CONFIG.idleSkipSeconds + 10, // provably idle
   });
   const snapshot: SurfaceSnapshot = { surface, viewport };
-  const fp = fingerprint(snapshot, DEFAULT_CONFIG);
 
   const last = new Map<string, LastSummary>([
-    ["s1", { fingerprint: fp, atMs: 0, summary: "old" }],
+    ["s1", {
+      signals: changeSignals(snapshot.surface),
+      tail: changeTail(snapshot.viewport, DEFAULT_CONFIG),
+      atMs: 0, summary: "old",
+    }],
   ]);
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: viewport } });
   // now is well past debounce so only the idle-unchanged rule can apply.
@@ -191,7 +195,7 @@ test("runSweep: a CHANGED fingerprint past debounce IS summarized exactly once",
   });
   // Seed a record whose fingerprint differs from the current snapshot.
   const last = new Map<string, LastSummary>([
-    ["s1", { fingerprint: "stale0000", atMs: 0, summary: "old" }],
+    ["s1", { signals: "stale0000", tail: "stale", atMs: 0, summary: "old" }],
   ]);
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "new output" } });
   const { deps, summarizeCalls } = makeDeps({
@@ -330,8 +334,8 @@ test("runSweep: listSurfaces failure skips the sweep without throwing", async ()
 
 test("runSweep: a vanished surface's record is dropped across sweeps", async () => {
   const last = new Map<string, LastSummary>([
-    ["gone", { fingerprint: "x", atMs: 0, summary: "old" }],
-    ["s1", { fingerprint: "y", atMs: 0, summary: "old" }],
+    ["gone", { signals: "x", tail: "x", atMs: 0, summary: "old" }],
+    ["s1", { signals: "y", tail: "y", atMs: 0, summary: "old" }],
   ]);
   // Only s1 is still live; "gone" should be pruned.
   const fake = makeFakeClient({
@@ -452,13 +456,14 @@ test("bell: model flags rate_limited => rings exactly once + records the tag", a
 test("bell: a held alert under idle-skip does not re-ring (no model call, stays armed)", async () => {
   const viewport = RATE_LIMIT_SCREEN;
   const surface = makeSurface({ id: "s1", agentState: "working", idleSeconds: 999 });
-  const fp = fingerprint({ surface, viewport }, DEFAULT_CONFIG);
+  const lastSig = changeSignals(surface);
+  const lastTail = changeTail(viewport, DEFAULT_CONFIG);
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: viewport } });
   const { deps, summarizeCalls } = makeDeps({
     fake,
     summarize: rateLimitedSummary,
     now: DEFAULT_CONFIG.debounceMs + 100_000,
-    last: new Map([["s1", { fingerprint: fp, atMs: 0, summary: "Rate limited" }]]),
+    last: new Map([["s1", { signals: lastSig, tail: lastTail, atMs: 0, summary: "Rate limited" }]]),
     alerts: new Map([["s1", "rate_limited"]]),
   });
 

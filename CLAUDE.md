@@ -598,13 +598,49 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `query()` with no `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` succeeds via the pool).
   - **Deterministic loop, single-shot LLM (NOT agentic).** `src/index.ts` polls
     `list_surfaces` every 5s, applies PURE gates (`src/summarizer.ts`:
-    `isAgentSurface`/`shouldSummarize`/`fingerprint`/debounce/skip-idle/`ConcurrencyBudget`),
+    `isAgentSurface`/`shouldSummarize`/change-detection/debounce/skip-idle/`ConcurrencyBudget`),
     `read_surface`s the viewport, composes a prompt (baked base `src/prompts.ts` + the
     `~/.config/ghostty-ramon/agent-manager/summarizer.md` override, mtime-cached), makes ONE
     Haiku call (`src/model.ts`: `tools:[]`, `maxTurns:3`, NO `mcpServers` — the summary call
     touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
     dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
     Node's built-in `node --test`.
+  - **COST CONTROLS — skip-hidden + animation-proof fuzzy change + quiescent-skip +
+    config (the "Haiku burns my usage" fix).** Four levers cut the call rate; the dominant
+    sink was a quiescent (`waiting`/`idle`) agent whose ANIMATED footer (spinner / "esc to
+    interrupt" / elapsed-time counter) flipped the old exact-hash `fingerprint` every poll,
+    so it re-summarized every debounce window forever. **(1) Skip hidden tiles:** the
+    dashboard's `hidden` set is now exposed through `list_surfaces` (Swift:
+    `HookSnapshotEntry.hidden` unioned from `model.hidden` → `MCPLayout.SurfaceRow.hidden`,
+    emitted only when true; TS: `Surface.hidden`), and BOTH `preGate` (so a hidden tile skips
+    the `read_surface` entirely) and `shouldSummarize` short-circuit `{reason:"hidden"}` when
+    `cfg.skipHidden` (default true). **(2) Fuzzy change detection (replaces the binary
+    `fingerprint`):** `LastSummary` now stores `signals` (exact hash of the AUTHORITATIVE hook
+    tuple agentState|lastPrompt|lastTool — any diff = change) + `tail` (the NORMALIZED
+    change-tail kept as TEXT). `changeTail` strips spinner glyphs (Braille U+2800–28FF + dot/
+    bar spinners) and collapses digit-runs→`#` and whitespace via `normalizeChangeLine`, so an
+    animated footer normalizes to a STABLE string; `tailChangeRatio` is the Jaccard distance
+    over the NON-BLANK line MULTISETS (scroll-tolerant), and the screen counts as CHANGED only
+    when `ratio > cfg.changeRatioThreshold` (default 0.2). **(3) Quiescent-skip:** an unchanged
+    `waiting`/`idle` agent (`isQuiescent`) is skipped REGARDLESS of `idleSeconds` (its summary
+    won't change); a non-quiescent unchanged surface keeps the old idle-seconds skip / else
+    re-summarizes so a `working` agent's phase still tracks. **(4) Config overlay
+    (`src/config.ts`, no rebuild):** `~/.config/ghostty-ramon/agent-manager/config.json` (pure
+    `parseConfig` overlay on `DEFAULT_CONFIG` over an injected `readFile`, restart-to-apply,
+    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→**30000**),
+    `changeRatioThreshold`, `skipHidden`, `idleSkipSeconds`, `maxConcurrent`,
+    `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
+    `changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
+    `lineMultiset`, all pure + tested). Wiring: Swift — `AgentDashboardController.swift`
+    (`HookSnapshotEntry.hidden`), `MCPLayout.swift` (`SurfaceRow.hidden` + JSON emit); sidecar
+    — `mcp.ts` (`Surface.hidden`), `summarizer.ts` (config fields + `LastSummary` shape + the
+    new pure helpers + `shouldSummarize`/`preGate`), `config.ts` (NEW), `index.ts` (`loadConfig`
+    in `main`, record `signals`/`tail`). Tests: Swift `MCPServerTests`
+    (`surfacesJSONDataEmitsHiddenWhenTrue` + omit-when-false), `AgentDashboardTests`
+    (`hookSnapshot` hidden bit); sidecar `summarizer.test.ts` (change-detection +
+    quiescent/hidden truth table), `config.test.ts` (NEW), `index.test.ts` (record shape).
+    **GUI relaunch (for the `hidden` field) + rebuilt sidecar `dist` + sidecar restart; no
+    host/Zig change.**
   - **Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha).** Under
     the `claude-pool` wrapper the surface's foreground process is `bash` (and even bare,
     `claude` reports its versioned-binary basename e.g. `2.1.185`), so a

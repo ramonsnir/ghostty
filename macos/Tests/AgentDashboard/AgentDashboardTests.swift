@@ -1410,6 +1410,13 @@ struct AgentDashboardHookStateTests {
         #expect(snap[a]?.lastTool == "Bash")
         #expect(snap[a]?.lastPrompt == "do it")
         #expect(snap[a]?.notes == "Implementing fix")
+        #expect(snap[a]?.hidden == false)
+        // fork / Agent Manager: hiding the tile flips the snapshot's `hidden` bit
+        // (so the summarizer can skip it) without dropping its other state.
+        model.hide(a)
+        let snap2 = model.hookSnapshot()
+        #expect(snap2[a]?.hidden == true)
+        #expect(snap2[a]?.agentState == "working")
     }
 
     @Test func hookSnapshotIncludesDetectedAgentButOmitsUnknownSurface() {

@@ -58,6 +58,10 @@ export interface Surface {
   lastTool?: string;
   notes?: string;
   agentKind?: string;
+  /** (Agent Manager) Whether the user HID this surface's tile in the Agent Dashboard.
+   *  OMITTED (=== undefined) when not hidden / unknown. The summarizer skips hidden
+   *  tiles — no point spending a Haiku call on a tile you've decluttered away. */
+  hidden?: boolean;
   /** (Agent Queue) The STABLE host session id (`ghostty_surface_session_id`) — the
    *  supervisor's persistence/re-adoption key (§9). OMITTED (=== undefined) when
    *  absent so a pre-upgrade host that doesn't yet emit it still typechecks. Under
