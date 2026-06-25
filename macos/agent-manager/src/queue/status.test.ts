@@ -126,3 +126,14 @@ test("backlogCount: excludes both waiting (list) and running (active) keys", () 
 test("backlogCount: empty board → 0", () => {
   assert.equal(backlogCount([], new Set(["X"])), 0);
 });
+
+test("backlogCount: in-progress (stateType 'started') nodes are NOT counted", () => {
+  const nodes = [
+    node({ key: "TODO", stateType: "unstarted" }), // groomable → counts
+    node({ key: "WIP", stateType: "started" }), // in progress → NOT counted
+    node({ key: "WIP2", stateType: "Started" }), // case-insensitive → NOT counted
+    node({ key: "BACK", stateType: "backlog" }), // groomable → counts
+    node({ key: "NOTYPE" }), // unknown/absent stateType → counts (safe default)
+  ];
+  assert.equal(backlogCount(nodes, new Set()), 3);
+});

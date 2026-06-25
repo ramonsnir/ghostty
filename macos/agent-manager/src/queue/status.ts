@@ -162,12 +162,30 @@ export interface QueueGraphReport {
 }
 
 /**
+ * `stateType` categories (provider-supplied, generic) that mean the item is ALREADY being
+ * worked on — EXCLUDED from the backlog badge. The badge counts the *groomable/schedulable
+ * remainder* (work that could still be picked up), and an in-progress item has already been
+ * picked up (by a human or another process); it is neither schedulable now nor groomable.
+ * Generic: this keys off the same standard `stateType` vocabulary the canvas colors by
+ * (triage/backlog/unstarted/started/completed/canceled). An ABSENT/unknown stateType is NOT
+ * excluded (counted as backlog — the safe default), so a provider that doesn't classify
+ * states still gets a sensible count. Compared case-insensitively.
+ */
+const IN_PROGRESS_STATE_TYPES = new Set(["started"]);
+
+/**
  * Count the "backlog" — the groomable remainder shown on the header button: graph nodes
- * that are NOT terminal (`done`) AND NOT currently waiting/running (their key is not in
+ * that are NOT terminal (`done`), NOT already in progress (`stateType` in
+ * `IN_PROGRESS_STATE_TYPES`), AND NOT currently waiting/running (their key is not in
  * `excludeKeys`). PURE + unit-tested. `excludeKeys` is the run's actionable-list keys
  * PLUS its active assignment keys, so the count never double-counts what the header
- * already shows as "N waiting" / "M running". The full board (incl. done/canceled) is
- * still rendered in the canvas; this is only the badge number.
+ * already shows as "N waiting" / "M running". The full board (incl. done/canceled AND
+ * in-progress) is still rendered in the canvas; this is only the badge number.
+ *
+ * Excluding in-progress fixes the "2 backlog but only 1 schedulable" report: an issue
+ * someone is actively working on (In Progress) is non-terminal and not in the actionable
+ * Todo list, so it WOULD have been counted as backlog even though the queue can never
+ * dispatch it (the `list` provider only yields Todo). The DAG still shows it (blue node).
  */
 export function backlogCount(
   nodes: ReadonlyArray<GraphNode>,
@@ -177,6 +195,7 @@ export function backlogCount(
   for (const node of nodes) {
     if (node.done) continue;
     if (excludeKeys.has(node.key)) continue;
+    if (node.stateType && IN_PROGRESS_STATE_TYPES.has(node.stateType.toLowerCase())) continue;
     n += 1;
   }
   return n;
