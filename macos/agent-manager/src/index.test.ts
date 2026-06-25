@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   runSweep,
   makeCoalescedRunner,
+  parseLoopEnablement,
   type LoopDeps,
   type SummarizeFn,
 } from "./index.js";
@@ -18,7 +19,8 @@ import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
   ConcurrencyBudget,
-  fingerprint,
+  changeSignals,
+  changeTail,
   type LastSummary,
   type SurfaceSnapshot,
 } from "./summarizer.js";
@@ -112,6 +114,7 @@ interface DepsSpec {
   bellsSeen?: Map<string, boolean>;
   pendingBells?: Set<string>;
   budgetMax?: number;
+  backoff?: { failureStreak: number; nextProbeMs: number };
 }
 
 function makeDeps(spec: DepsSpec): {
@@ -136,6 +139,7 @@ function makeDeps(spec: DepsSpec): {
     bellFilter: spec.bellFilter ?? false,
     bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
     pendingBellIds: spec.pendingBells ?? new Set<string>(),
+    summarizerBackoff: spec.backoff ?? { failureStreak: 0, nextProbeMs: 0 },
   };
   return { deps, summarizeCalls };
 }
@@ -179,10 +183,13 @@ test("runSweep: unchanged + idle session is NOT summarized (gate honored, budget
     idleSeconds: DEFAULT_CONFIG.idleSkipSeconds + 10, // provably idle
   });
   const snapshot: SurfaceSnapshot = { surface, viewport };
-  const fp = fingerprint(snapshot, DEFAULT_CONFIG);
 
   const last = new Map<string, LastSummary>([
-    ["s1", { fingerprint: fp, atMs: 0, summary: "old" }],
+    ["s1", {
+      signals: changeSignals(snapshot.surface),
+      tail: changeTail(snapshot.viewport, DEFAULT_CONFIG),
+      atMs: 0, summary: "old",
+    }],
   ]);
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: viewport } });
   // now is well past debounce so only the idle-unchanged rule can apply.
@@ -210,7 +217,7 @@ test("runSweep: a CHANGED fingerprint past debounce IS summarized exactly once",
   });
   // Seed a record whose fingerprint differs from the current snapshot.
   const last = new Map<string, LastSummary>([
-    ["s1", { fingerprint: "stale0000", atMs: 0, summary: "old" }],
+    ["s1", { signals: "stale0000", tail: "stale", atMs: 0, summary: "old" }],
   ]);
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "new output" } });
   const { deps, summarizeCalls } = makeDeps({
@@ -349,8 +356,8 @@ test("runSweep: listSurfaces failure skips the sweep without throwing", async ()
 
 test("runSweep: a vanished surface's record is dropped across sweeps", async () => {
   const last = new Map<string, LastSummary>([
-    ["gone", { fingerprint: "x", atMs: 0, summary: "old" }],
-    ["s1", { fingerprint: "y", atMs: 0, summary: "old" }],
+    ["gone", { signals: "x", tail: "x", atMs: 0, summary: "old" }],
+    ["s1", { signals: "y", tail: "y", atMs: 0, summary: "old" }],
   ]);
   // Only s1 is still live; "gone" should be pruned.
   const fake = makeFakeClient({
@@ -472,13 +479,14 @@ test("bell: model flags rate_limited => rings exactly once + records the tag", a
 test("bell: a held alert under idle-skip does not re-ring (no model call, stays armed)", async () => {
   const viewport = RATE_LIMIT_SCREEN;
   const surface = makeSurface({ id: "s1", agentState: "working", idleSeconds: 999 });
-  const fp = fingerprint({ surface, viewport }, DEFAULT_CONFIG);
+  const lastSig = changeSignals(surface);
+  const lastTail = changeTail(viewport, DEFAULT_CONFIG);
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: viewport } });
   const { deps, summarizeCalls } = makeDeps({
     fake,
     summarize: rateLimitedSummary,
     now: DEFAULT_CONFIG.debounceMs + 100_000,
-    last: new Map([["s1", { fingerprint: fp, atMs: 0, summary: "Rate limited" }]]),
+    last: new Map([["s1", { signals: lastSig, tail: lastTail, atMs: 0, summary: "Rate limited" }]]),
     alerts: new Map([["s1", "rate_limited"]]),
   });
 
@@ -638,7 +646,7 @@ const attnFalse: SummarizeFn = async () =>
 function debouncedAgent(over: Partial<Surface> = {}) {
   const surface = makeSurface({ id: "s1", agentState: "working", ...over });
   const last = new Map<string, LastSummary>([
-    ["s1", { fingerprint: "fp", atMs: 1_000_000 - 1000, summary: "old" }],
+    ["s1", { signals: "sig", tail: "tail", atMs: 1_000_000 - 1000, summary: "old" }],
   ]);
   return { surface, last };
 }
@@ -919,4 +927,142 @@ test("coalesce: re-run is suppressed when isStopped() is true", async () => {
   release();
   await first;
   assert.equal(runs, 1, "no re-run after stop even though a wake arrived");
+});
+
+// ---------------------------------------------------------------------------
+// Rate-limit backoff (account-wide adaptive slowdown)
+// ---------------------------------------------------------------------------
+
+test("backoff: an all-fail sweep engages backoff (streak 1, next probe armed)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const failing: SummarizeFn = async () => {
+    throw new Error("model down");
+  };
+  const now = 1_000_000;
+  const { deps } = makeDeps({ fake, summarize: failing, now });
+
+  await runSweep(deps);
+
+  assert.equal(deps.summarizerBackoff.failureStreak, 1, "streak incremented");
+  // base debounce = 30000 => first window is 30000ms out.
+  assert.equal(deps.summarizerBackoff.nextProbeMs, now + 30000);
+});
+
+test("backoff: a success keeps the streak at 0 (normal cadence)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const { deps } = makeDeps({ fake, summarize: okSummary });
+
+  await runSweep(deps);
+
+  assert.equal(deps.summarizerBackoff.failureStreak, 0);
+  assert.equal(deps.summarizerBackoff.nextProbeMs, 0);
+});
+
+test("backoff: while cooling down, the sweep makes NO model calls", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const now = 1_000_000;
+  // Seeded: already backing off, next probe far in the future.
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    now,
+    backoff: { failureStreak: 3, nextProbeMs: now + 100_000 },
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "no model call while cooling down");
+  assert.equal(fake.readCalls.length, 0, "not even a read");
+  assert.equal(deps.summarizerBackoff.failureStreak, 3, "streak untouched");
+});
+
+test("backoff: after the window, ONE probe fires and a success resets the streak", async () => {
+  const fake = makeFakeClient({
+    surfaces: [
+      makeSurface({ id: "s1", agentState: "working" }),
+      makeSurface({ id: "s2", agentState: "working" }),
+    ],
+  });
+  const now = 1_000_000;
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: okSummary,
+    now,
+    backoff: { failureStreak: 3, nextProbeMs: now }, // window elapsed (now >= nextProbeMs)
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "exactly ONE probe call, not the whole batch");
+  assert.equal(deps.summarizerBackoff.failureStreak, 0, "recovered");
+  assert.equal(deps.summarizerBackoff.nextProbeMs, 0);
+});
+
+test("backoff: after the window, a FAILED probe extends the backoff (streak++)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [
+      makeSurface({ id: "s1", agentState: "working" }),
+      makeSurface({ id: "s2", agentState: "working" }),
+    ],
+  });
+  const failing: SummarizeFn = async () => {
+    throw new Error("still limited");
+  };
+  const now = 1_000_000;
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: failing,
+    now,
+    backoff: { failureStreak: 3, nextProbeMs: now },
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "only one probe even on failure");
+  assert.equal(deps.summarizerBackoff.failureStreak, 4, "streak extended");
+  assert.equal(deps.summarizerBackoff.nextProbeMs, now + 240000, "4th window = 30000*2^3");
+});
+
+test("backoff: an unparseable reply counts as a failure (engages backoff)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+  });
+  const junk: SummarizeFn = async () => "not json at all";
+  const { deps } = makeDeps({ fake, summarize: junk });
+
+  await runSweep(deps);
+
+  assert.equal(deps.summarizerBackoff.failureStreak, 1, "unparseable => fail => backoff");
+});
+
+// --- parseLoopEnablement: the independent summarizer/queue gating ---
+
+test("loops: summarizer ON by default (absent flag = back-compat on)", () => {
+  const e = parseLoopEnablement({});
+  assert.equal(e.summarizer, true, "absent GHOSTTY_SUMMARIZER => on");
+  assert.equal(e.queue, false, "absent GHOSTTY_AGENT_QUEUE => off");
+});
+
+test('loops: explicit "0" disables the summarizer (queue-only mode)', () => {
+  const e = parseLoopEnablement({ GHOSTTY_SUMMARIZER: "0", GHOSTTY_AGENT_QUEUE: "1" });
+  assert.equal(e.summarizer, false, '"0" => summarizer off');
+  assert.equal(e.queue, true, '"1" => queue on');
+});
+
+test('loops: explicit "1" keeps the summarizer on; queue independent', () => {
+  const e = parseLoopEnablement({ GHOSTTY_SUMMARIZER: "1" });
+  assert.equal(e.summarizer, true);
+  assert.equal(e.queue, false, "queue off unless exactly 1");
+});
+
+test("loops: queue is opt-in on exactly 1 (any other value = off)", () => {
+  assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "true" }).queue, false);
+  assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "0" }).queue, false);
+  assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "1" }).queue, true);
 });

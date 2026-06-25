@@ -4,7 +4,7 @@
 // what it's about to do (count + what's next). PURE: `queueStatusReport` derives the report
 // from primitives; runner.ts owns the I/O (caching the last list + the MCP call).
 
-import type { WorkItem } from "./types.js";
+import type { GraphNode, WorkItem } from "./types.js";
 
 /** One item reference for the dashboard header dropdowns (key + optional title + the
  *  Linear/tracker URL, so a "0 waiting"/"N running" click can link out). */
@@ -133,4 +133,43 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     next: deduped.slice(0, nextLimit).map(toRef),
     running: input.runningItems.map(toRef),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Backlog graph (the OPTIONAL `provider.graph` board) — pushed to the GUI via
+// `report_queue_graph` for the dashboard's "N backlog" button + DAG canvas.
+// ---------------------------------------------------------------------------
+
+/** The board snapshot the sidecar pushes via the `report_queue_graph` MCP tool. Mirrors
+ *  the Swift `QueueGraph` value type 1:1. `backlog` is the header-badge count (derived
+ *  once here so the GUI and the canvas agree); `nodes` is the full board for the canvas. */
+export interface QueueGraphReport {
+  queueName: string;
+  /** false ⇒ the run was removed — the GUI clears the backlog button + canvas. */
+  present: boolean;
+  /** The header-badge count: non-terminal nodes NOT currently waiting/running. */
+  backlog: number;
+  /** The full scoped board (every state) for the DAG canvas. */
+  nodes: GraphNode[];
+}
+
+/**
+ * Count the "backlog" — the groomable remainder shown on the header button: graph nodes
+ * that are NOT terminal (`done`) AND NOT currently waiting/running (their key is not in
+ * `excludeKeys`). PURE + unit-tested. `excludeKeys` is the run's actionable-list keys
+ * PLUS its active assignment keys, so the count never double-counts what the header
+ * already shows as "N waiting" / "M running". The full board (incl. done/canceled) is
+ * still rendered in the canvas; this is only the badge number.
+ */
+export function backlogCount(
+  nodes: ReadonlyArray<GraphNode>,
+  excludeKeys: ReadonlySet<string>,
+): number {
+  let n = 0;
+  for (const node of nodes) {
+    if (node.done) continue;
+    if (excludeKeys.has(node.key)) continue;
+    n += 1;
+  }
+  return n;
 }

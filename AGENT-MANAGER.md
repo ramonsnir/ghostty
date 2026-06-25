@@ -71,7 +71,10 @@ onto the tile via the MCP `set_surface_annotation` tool. The summary call uses n
 and the SDK authenticates the same way the `claude` CLI does — so there is **no API key
 in Ghostty** and usage is billed to your normal plan. (A second, independent loop in the
 same sidecar drives the [Agent Queue](AGENT-QUEUE.md) when it is configured — that is a
-deterministic, LLM-free dispatcher and is unrelated to the summarizer.)
+deterministic, LLM-free dispatcher and is unrelated to the summarizer. The two share one
+sidecar but run **independently**: the sidecar launches when **either** `agent-manager` or
+`agent-queue` is on, so you can run the queue with `agent-manager = false` and the
+summarizer — the only thing here that spends Haiku — stays completely silent.)
 
 ## Requirements
 
@@ -145,6 +148,57 @@ runs with no tools):
 
 e.g. "Prefer the file/feature name over the verb; flag failing tests."
 
+## Tuning cost (no rebuild)
+
+The summarizer decides *when* to call Haiku with a few gates you can tune in an optional
+JSON file (sibling of `summarizer.md`), so you can dial usage down without a rebuild —
+**restart the sidecar to apply** (kill the `node` child, or quit + relaunch the fork; the
+GUI respawns it):
+
+```
+~/.config/ghostty-ramon/agent-manager/config.json
+```
+
+```jsonc
+{
+  "debounceMs": 30000,            // min ms between calls per session (default 30000)
+  "changeRatioThreshold": 0.2,    // 0..1 — fraction of the screen tail that must differ
+                                  //   to count as a real change (default 0.2; 0 = any diff)
+  "skipHidden": true,             // never summarize a tile you've hidden in the dashboard
+  "idleSkipSeconds": 45,          // unchanged + idle this long => skip (default 45)
+  "maxConcurrent": 10,            // also the per-sweep batch cap
+  "rateLimitBackoffMaxMs": 600000 // cap on the auto-backoff when YOUR account is limited
+}
+```
+
+Unknown / out-of-range keys are ignored (the default is kept), and an absent or malformed
+file just uses the defaults. What each lever buys you:
+
+- **`skipHidden`** — the cheapest win: hidden tiles cost nothing. Hide the agents you
+  aren't watching.
+- **`changeRatioThreshold`** — the screen is compared *fuzzily*: spinner glyphs and
+  elapsed-time/token counters are normalized out, and a session only re-summarizes when
+  more than this fraction of its recent lines actually change. A higher value = fewer
+  calls (and slightly staler summaries); a lower value = fresher (and more calls).
+- **`debounceMs`** — the hard floor between calls for one session. Raise it to cut the
+  rate across the board.
+- A **waiting/idle** agent whose footer is merely animating is skipped regardless — its
+  summary wouldn't change anyway.
+
+### Auto-backoff when the summarizer's own account is rate-limited
+
+If the account the summarizer bills to runs out of usage, its calls fail (no usable
+summary comes back). Rather than keep hammering the limited account every debounce
+window, the loop **automatically backs off**: after a sweep where every call fails it
+waits, doubling the wait each time (`debounceMs`, then ×2, ×4, …) up to
+`rateLimitBackoffMaxMs` (default 10 min). While backed off it makes **at most one probe
+call per window**; the first call that **succeeds** (i.e. the limit reset) snaps it back
+to full cadence. So a depleted account is poked roughly once every 10 minutes instead of
+constantly, and recovery is automatic — no intervention. (You can still route the
+summarizer to a fresh account via the `account` file above to keep summaries flowing
+while the other account recovers.) Set `rateLimitBackoffMaxMs` lower if you want it to
+re-probe more often, or to `0` to effectively disable the backoff.
+
 ## Verifying / troubleshooting
 
 - Console.app → filter subsystem = your bundle id, category = `agent-manager`. Expect
@@ -160,8 +214,9 @@ e.g. "Prefer the file/feature name over the verb; flag failing tests."
 
 ## Cost & privacy
 
-Each summary is one Haiku call, gated by a per-session debounce (~12s) and an
-idle-skip, with a small concurrency cap — so a wall of idle/unchanged sessions costs
-nothing. The session's recent on-screen text is sent to the model for summarization;
-disable the feature (or close the tile) for any session you don't want summarized. Use
-*Account routing* above to keep this traffic off your primary account.
+Each summary is one Haiku call, gated by a per-session debounce (~30s), a fuzzy
+change-detector (animation-proof), a hidden-tile skip, and an idle-skip, with a small
+concurrency cap — so a wall of idle/unchanged sessions costs nothing. See *Tuning cost*
+above to dial it further. The session's recent on-screen text is sent to the model for
+summarization; hide the tile (or disable the feature) for any session you don't want
+summarized. Use *Account routing* above to keep this traffic off your primary account.

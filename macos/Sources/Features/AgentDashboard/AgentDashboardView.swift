@@ -50,9 +50,12 @@ struct AgentDashboardView: View {
         } else {
             VStack(spacing: 0) {
                 // (ramon fork / Agent Queue, §11) Filter bar: one include/exclude
-                // toggle per known origin. Only shown when there's more than one
-                // origin to choose between (a single-origin fleet needs no filter).
-                if model.knownOrigins.count > 1 {
+                // toggle per known origin. Shown when there's more than one origin to
+                // choose between (a single-origin fleet needs no filter) OR whenever an
+                // exclusion is active — otherwise a stale exclusion (e.g. soloing a
+                // queue that later ends, leaving `(other)` excluded as the sole origin)
+                // would silently filter out every tile with NO way to reach "Show all".
+                if model.showsFilterBar {
                     originFilterBar
                 }
                 sectionedList
@@ -90,7 +93,8 @@ struct AgentDashboardView: View {
                             entry: entry,
                             ghostty: ghostty,
                             previewsEnabled: ptyHostEnabled,
-                            onHide: { model.hide(entry.id) }
+                            onHide: { model.hide(entry.id) },
+                            onClose: { model.closeSurface(entry.id) }
                         )
                         .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
                         .listRowSeparator(.hidden)
@@ -122,6 +126,16 @@ struct AgentDashboardView: View {
                             },
                             onSetMaxItems: { value in
                                 model.setQueueMaxItems(run: section.id, value: value)
+                            },
+                            graph: model.queueGraphs[section.id],
+                            onOpenBacklog: {
+                                QueueBacklogWindowManager.shared.open(
+                                    runName: section.id, model: model,
+                                    onJumpToKey: { key in
+                                        if let id = model.surfaceID(forQueue: section.id, key: key) {
+                                            focusHidden(id)
+                                        }
+                                    })
                             }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
@@ -354,6 +368,11 @@ private struct OriginSectionHeader: View {
     /// raw user string ("10"/"unlimited"/…) is posted as a `set_max_items` command; the
     /// sidecar parses it (blank/garbage = ignored).
     let onSetMaxItems: (String) -> Void
+    /// (backlog graph) The run's latest whole-board snapshot, when the supervisor has pushed
+    /// one (only when the template declares `provider.graph`). nil ⇒ no backlog button.
+    let graph: QueueGraph?
+    /// (backlog graph) Open the dependency-graph canvas for this run.
+    let onOpenBacklog: () -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
@@ -429,6 +448,13 @@ private struct OriginSectionHeader: View {
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
+                    // (backlog graph) The "N backlog" button → the dependency-graph canvas,
+                    // inline at the end of the status line (after the dispatched/cap chip).
+                    // The row is full-width with a trailing Spacer, so this sits in the empty
+                    // space to the right of the counts. Shown whenever the run reports a board.
+                    if let graph {
+                        backlogButton(graph)
+                    }
                     Spacer(minLength: 0)
                 }
             }
@@ -456,6 +482,22 @@ private struct OriginSectionHeader: View {
         }
     }
 
+    /// (backlog graph) The "N backlog" button that opens the dependency-graph canvas. The
+    /// count is the sidecar-derived groomable remainder (non-terminal, not waiting/running).
+    @ViewBuilder
+    private func backlogButton(_ graph: QueueGraph) -> some View {
+        Button(action: onOpenBacklog) {
+            HStack(spacing: 3) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Text("\(graph.backlog) backlog")
+            }
+            .font(.caption2)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Open the backlog dependency graph (\(graph.nodes.count) items in scope)")
+    }
+
     @ViewBuilder
     private func phaseChip(_ phase: String) -> some View {
         let color = QueueHealthFormat.phaseColor(phase)
@@ -475,9 +517,29 @@ private struct OriginSectionHeader: View {
     private func capEditorPopover(_ status: QueueStatus) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Lifetime cap (maxItems)").font(.caption.weight(.semibold))
+            // lineLimit(nil) is explicit so an inherited limit can't collapse this to one
+            // truncated line; fixedSize(vertical) lets it grow to however many lines it needs.
             Text("Dispatched \(status.dispatched) of \(status.maxItems.map(String.init) ?? "∞"). Raising it lets the run pick up more items; lowering it only stops FUTURE dispatch — running agents keep going.")
                 .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
+            // Relative bumps (raise the current cap) — the quick "pull in a little more"
+            // gesture. Only meaningful for a FINITE cap; hidden when unlimited.
+            if let plusOne = QueueHealthFormat.capPlus(status, 1) {
+                HStack(spacing: 6) {
+                    Button("+1") { commitCap(String(plusOne)) }
+                        .buttonStyle(.bordered)
+                        .help("Pull in one more item (raise the cap by 1)")
+                    if status.queued > 0,
+                       let plusWaiting = QueueHealthFormat.capPlus(status, status.queued) {
+                        Button("+ all waiting (\(status.queued))") { commitCap(String(plusWaiting)) }
+                            .buttonStyle(.bordered)
+                            .help("Raise the cap by the \(status.queued) waiting item\(status.queued == 1 ? "" : "s"), so they all dispatch and nothing after them")
+                    }
+                }
+            }
+            // Absolute presets.
             HStack(spacing: 6) {
                 ForEach(["1", "2", "5", "10"], id: \.self) { v in
                     Button(v) { commitCap(v) }.buttonStyle(.bordered)
@@ -497,7 +559,7 @@ private struct OriginSectionHeader: View {
             }
         }
         .padding(12)
-        .frame(width: 240)
+        .frame(width: 300)
     }
 
     private func commitCap(_ value: String) {
@@ -604,6 +666,18 @@ enum QueueHealthFormat {
     /// user either picks ∞ or types a number). PURE, unit-tested.
     static func capDraft(_ s: QueueStatus) -> String {
         s.maxItems.map(String.init) ?? ""
+    }
+
+    /// (relative cap edits) The new ABSOLUTE cap when raising the current FINITE cap by
+    /// `delta` — backs the "+1" / "+ all waiting" buttons (delta = 1 or `queued`). The
+    /// goal is "pull in N more, then stop": at the common steady state (dispatched == cap)
+    /// `cap + delta` lets exactly `delta` more dispatch before the cap is reached again.
+    /// Returns nil for an unlimited cap (`maxItems == nil`), where a relative bump is
+    /// meaningless (everything already dispatches) — the caller hides the buttons then.
+    /// Clamped at ≥ 0 (a negative delta can never push the cap below zero). PURE, unit-tested.
+    static func capPlus(_ s: QueueStatus, _ delta: Int) -> Int? {
+        guard let cap = s.maxItems else { return nil }
+        return max(0, cap + delta)
     }
 
     /// The accent color for a phase chip.

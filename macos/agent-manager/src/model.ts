@@ -16,7 +16,14 @@
 // on a spawn-time failure or an error-subtype result so the loop catches + logs
 // + continues (one bad call never stops the loop).
 
-import { query } from "@anthropic-ai/claude-agent-sdk";
+// TYPE-ONLY import: fully erased at compile, so `dist/model.js` carries NO static
+// `import`/`require` of the SDK. The real `query` is loaded LAZILY (dynamic import)
+// only when `summarize()` actually runs — so the sidecar (and the Agent Queue, which
+// needs NO npm deps) loads and runs even when `node_modules` is absent, e.g. a
+// colleague's DMG that bundles only `dist/`. A summary attempt with no SDK present
+// throws → the per-surface error path skips it (the summarizer self-disables; the
+// queue is unaffected). See the COLLEAGUE/DMG note in CLAUDE.md (Agent Manager).
+import type * as ClaudeAgentSDK from "@anthropic-ai/claude-agent-sdk";
 
 /** The default summarizer model. Free-form string (no SDK enum). */
 export const SUMMARIZER_MODEL = "claude-haiku-4-5";
@@ -32,19 +39,22 @@ export interface SummarizeRequest {
 }
 
 /** The query() function signature we depend on — injectable for tests. */
-export type QueryFn = typeof query;
+export type QueryFn = typeof ClaudeAgentSDK.query;
 
 /**
  * Run a single-shot summary call and return the raw assistant text. THROWS on
- * an error-subtype result or a spawn-time failure. `queryFn` defaults to the
- * real SDK `query` but is injectable so the loop logic can be exercised without
- * spawning the CLI.
+ * an error-subtype result or a spawn-time failure. `queryFn` is injectable (tests
+ * pass a fake); when omitted, the real SDK `query` is loaded via a LAZY dynamic
+ * import — so the module loads with no `node_modules` and only a real summary call
+ * pulls the SDK in (a missing SDK throws here → the loop logs + skips).
  */
 export async function summarize(
   req: SummarizeRequest,
-  queryFn: QueryFn = query,
+  queryFn?: QueryFn,
 ): Promise<string> {
-  const q = queryFn({
+  const runQuery =
+    queryFn ?? (await import("@anthropic-ai/claude-agent-sdk")).query;
+  const q = runQuery({
     prompt: req.user,
     options: {
       // No mcpServers — the summary call needs no Ghostty tools.

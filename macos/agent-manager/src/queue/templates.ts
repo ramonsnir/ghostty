@@ -20,6 +20,7 @@ import type {
   IntervalsSpec,
   OnAgentExit,
   ProviderClaimSpec,
+  ProviderGraphSpec,
   ProviderListSpec,
   ProviderSpec,
   ProviderStatusSpec,
@@ -36,11 +37,10 @@ export const TEMPLATE_DEFAULTS = {
   concurrency: 1,
   maxItems: 100,
   grid: { cols: 3, rows: 3, fill: "columns" as GridFill },
-  intervals: { listMs: 45000, statusMs: 20000 },
+  intervals: { listMs: 60000, statusMs: 30000 },
   onAgentExit: "leave-and-bell" as OnAgentExit,
   closeOnComplete: true,
   closeStableSeconds: 5,
-  quitWhenEmpty: false,
 };
 
 /** The outcome of validation: a typed template, or a list of human-readable errors. */
@@ -92,10 +92,8 @@ export function validateTemplate(obj: unknown): ValidateResult {
     rec.closeOnComplete,
     TEMPLATE_DEFAULTS.closeOnComplete,
   );
-  const quitWhenEmpty = boolOrDefault(
-    rec.quitWhenEmpty,
-    TEMPLATE_DEFAULTS.quitWhenEmpty,
-  );
+  // NOTE: `quitWhenEmpty` was removed (see types.ts) — a `quitWhenEmpty` key in template
+  // JSON is now silently ignored, never parsed.
   const params = validateParams(rec.params, errors);
 
   if (
@@ -123,7 +121,6 @@ export function validateTemplate(obj: unknown): ValidateResult {
     onAgentExit,
     closeOnComplete,
     closeStableSeconds,
-    quitWhenEmpty,
     params,
   };
   return { ok: true, template, errors: [] };
@@ -338,10 +335,33 @@ function validateProvider(v: unknown, errors: string[]): ProviderSpec | undefine
   const list = validateProviderList(rec.list, errors);
   const status = validateProviderStatus(rec.status, errors);
   const claim = validateProviderClaim(rec.claim, errors);
+  const graph = validateProviderGraph(rec.graph, errors);
   if (list === undefined || status === undefined) return undefined;
   const provider: ProviderSpec = { list, status };
   if (claim !== undefined) provider.claim = claim;
+  if (graph !== undefined) provider.graph = graph;
   return provider;
+}
+
+/** Validate the OPTIONAL `provider.graph` (backlog board source). Absent ⇒ undefined (no
+ *  backlog button). Same shape as `claim`: `{command: string[]}`. A malformed graph is an
+ *  error (so a typo'd template fails loudly) rather than silently dropping the feature. */
+function validateProviderGraph(
+  v: unknown,
+  errors: string[],
+): ProviderGraphSpec | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || typeof v !== "object" || Array.isArray(v)) {
+    errors.push("provider.graph must be an object {command}");
+    return undefined;
+  }
+  const command = reqCommand(
+    (v as Record<string, unknown>).command,
+    "provider.graph.command",
+    errors,
+  );
+  if (command === undefined) return undefined;
+  return { command };
 }
 
 function validateProviderList(

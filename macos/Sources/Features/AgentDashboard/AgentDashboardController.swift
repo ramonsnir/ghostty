@@ -294,6 +294,13 @@ final class AgentDashboardModel: ObservableObject {
     /// In-memory only (the sidecar re-reports every sweep).
     @Published private(set) var queueStatuses: [String: QueueStatus] = [:]
 
+    /// (ramon fork / Agent Queue, backlog graph) The latest whole-board snapshot per queue
+    /// NAME, pushed by the supervisor via `report_queue_graph` (only when the template
+    /// declares the optional `provider.graph`). `@Published` so the "N backlog" header
+    /// button + the dependency-graph canvas re-render. A `present:false` report removes the
+    /// entry (clears the button + canvas). In-memory only (re-pushed each list-cadence sweep).
+    @Published private(set) var queueGraphs: [String: QueueGraph] = [:]
+
     // MARK: - Origin filter (ramon fork / Agent Queue, §11)
 
     /// Origins (queue names, or `(other)`) the user has EXCLUDED from the view.
@@ -388,6 +395,18 @@ final class AgentDashboardModel: ObservableObject {
         hidden.insert(id)
         store.save(hidden)
         rebuildEntriesFromCurrentState()
+    }
+
+    /// Force-close a surface from its tile (user gesture, escape hatch). Tears the split
+    /// down via the confirm-FREE path (`MCPLayout.forceClose`, the same one the queue's
+    /// auto-close uses) — so it works even on a live agent without popping the
+    /// confirm-close-surface modal. The caller is responsible for confirming first (the
+    /// tile shows a confirmation dialog). For a QUEUE tile this unblocks the run: once the
+    /// surface vanishes, the supervisor's next reconcile prunes the assignment and frees
+    /// the slot. The tile disappears on the next detector poll when the surface is gone.
+    /// No-op on an unresolved id. MUST be on main — the model is.
+    func closeSurface(_ id: UUID) {
+        _ = MCPLayout.forceClose(uuid: id)
     }
 
     /// Manually reveal a single hidden surface. Persists.
@@ -605,6 +624,17 @@ final class AgentDashboardModel: ObservableObject {
         }
     }
 
+    /// (ramon fork / Agent Queue, backlog graph) Store/clear a run's whole-board snapshot.
+    /// `present` ⇒ store (drives the "N backlog" button + canvas); `!present` ⇒ remove (the
+    /// run was torn down). `@Published`, so the header button + any open canvas re-render.
+    func applyQueueGraph(_ graph: QueueGraph) {
+        if graph.present {
+            queueGraphs[graph.queueName] = graph
+        } else {
+            queueGraphs.removeValue(forKey: graph.queueName)
+        }
+    }
+
     /// (§11 health) Resolve a queue item (run name + work-item key) to its live surface
     /// UUID by scanning the stored annotations — the supervisor stamps each running
     /// split's surface with `queueName`/`queueKey`, so this finds the split to "go to"
@@ -763,6 +793,11 @@ final class AgentDashboardModel: ObservableObject {
         /// the claude-pool wrapper the foreground is `bash`; the real `claude` is a
         /// child the detector finds via its process-subtree walk).
         let agentKind: String?
+        /// (ramon fork / Agent Manager) Whether the user has HIDDEN this surface's
+        /// tile in the dashboard. Surfaced so the summarizer can skip hidden tiles
+        /// (no point spending a Haiku call on a tile you've decluttered away). The
+        /// hidden set is dashboard view-state, persisted per bundle id.
+        let hidden: Bool
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -773,13 +808,15 @@ final class AgentDashboardModel: ObservableObject {
         let ids = Set(agentStates.keys)
             .union(lastPrompt.keys).union(lastTool.keys)
             .union(annotations.keys).union(agents.keys)
+            .union(hidden)
         for id in ids {
             out[id] = HookSnapshotEntry(
                 agentState: agentStates[id]?.rawValue,
                 lastPrompt: lastPrompt[id],
                 lastTool: lastTool[id],
                 notes: annotations[id]?.summary,
-                agentKind: agents[id]?.command)
+                agentKind: agents[id]?.command,
+                hidden: hidden.contains(id))
         }
         return out
     }
@@ -1005,6 +1042,25 @@ final class AgentDashboardModel: ObservableObject {
     /// (so the user can re-include them).
     var knownOrigins: Set<String> { AgentDashboardModel.knownOrigins(in: entries) }
 
+    /// Whether the view should render the origin filter bar. Pure + unit-tested.
+    /// Shown when there's more than one origin to choose between (a single-origin
+    /// fleet needs no filter) OR whenever an exclusion is active — the latter is the
+    /// load-bearing case: soloing a queue that later ends can leave `(other)` excluded
+    /// as the SOLE remaining origin, which would silently filter out every tile with
+    /// no way to reach "Show all". Keeping the bar visible whenever anything is
+    /// excluded guarantees the escape hatch is always reachable.
+    static func shouldShowFilterBar(
+        knownOrigins: Set<String>, excludedOrigins: Set<String>
+    ) -> Bool {
+        knownOrigins.count > 1 || !excludedOrigins.isEmpty
+    }
+
+    /// Instance accessor for `shouldShowFilterBar` over the current state.
+    var showsFilterBar: Bool {
+        AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: knownOrigins, excludedOrigins: excludedOrigins)
+    }
+
     /// The displayed, origin-filtered tiles grouped into ordered sections. The
     /// `entries` list is the global-sorted, non-hidden set (NOT origin-filtered);
     /// the origin filter is applied HERE so the model's attention logic and the
@@ -1067,6 +1123,17 @@ final class AgentDashboardModel: ObservableObject {
     /// state — this is a one-way control intent (single owner = the sidecar).
     func sendRunCommand(_ action: QueueCommand.Action, run: String) {
         guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        // OPTIMISTIC: reflect the phase change instantly (the sidecar's next push, ~one sweep
+        // later, reconciles). Without this the header lags a full sweep + its Linear round-trips.
+        if let existing = queueStatuses[run] {
+            switch action {
+            case .pause:  queueStatuses[run] = existing.withPhase("paused")
+            case .resume: queueStatuses[run] = existing.withPhase("running")
+            case .stop:   queueStatuses[run] = existing.withPhase("draining")
+            case .abort:  queueStatuses.removeValue(forKey: run)  // section clears immediately
+            default: break
+            }
+        }
         NotificationCenter.default.post(
             name: .ghosttyQueueCommand,
             object: nil,
@@ -1083,6 +1150,13 @@ final class AgentDashboardModel: ObservableObject {
     func setQueueMaxItems(run: String, value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !trimmed.isEmpty else { return }
+        // OPTIMISTIC: show a VALID cap instantly (the sidecar's next push reconciles, and
+        // corrects if it parsed differently). A blank/garbage value (`.none`) is left as-is —
+        // the sidecar ignores it, so we must not fake a change the engine won't make.
+        if let existing = queueStatuses[run],
+           case let .some(parsed) = QueueStatus.parseCapOptimistic(trimmed) {
+            queueStatuses[run] = existing.withMaxItems(parsed)
+        }
         NotificationCenter.default.post(
             name: .ghosttyQueueCommand,
             object: nil,
@@ -1158,6 +1232,7 @@ final class AgentDashboardController: NSWindowController {
         subscribeAgentState()
         subscribeAnnotation()
         subscribeQueueStatus()
+        subscribeQueueGraph()
         rebuildControllerObservers()
     }
 
@@ -1341,6 +1416,21 @@ final class AgentDashboardController: NSWindowController {
                       let status = note.userInfo?[QueueCommandUserInfoKey.status] as? QueueStatus
                 else { return }
                 self.model.applyQueueStatus(status)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Queue, backlog graph) Observe `.ghosttyQueueGraphDidChange`
+    /// posted by the MCP `report_queue_graph` handler and hand the whole-board snapshot to
+    /// the model. Registered unconditionally (like the status subscriber).
+    private func subscribeQueueGraph() {
+        NotificationCenter.default.publisher(for: .ghosttyQueueGraphDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self,
+                      let graph = note.userInfo?[QueueCommandUserInfoKey.graph] as? QueueGraph
+                else { return }
+                self.model.applyQueueGraph(graph)
             }
             .store(in: &cancellables)
     }

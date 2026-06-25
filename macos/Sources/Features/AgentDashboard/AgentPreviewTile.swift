@@ -13,8 +13,12 @@ struct AgentPreviewTile: View {
     /// When false (pty-host off), render a metadata-only tile (no mirror).
     let previewsEnabled: Bool
     let onHide: () -> Void
+    /// Force-close this split + free its (queue) slot — the escape hatch for a wedged
+    /// queue agent. Gated behind a confirmation (no undo: it ends the agent).
+    let onClose: () -> Void
 
     @State private var hovering = false
+    @State private var confirmClose = false
 
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
@@ -65,6 +69,12 @@ struct AgentPreviewTile: View {
     /// (request #3).
     private static let previewHeight: CGFloat = 220
 
+    /// True when this tile belongs to a queue run (carries a `queueName` annotation) —
+    /// the only case where the destructive force-Close button is offered.
+    private var isQueueOwned: Bool {
+        !(entry.annotation?.queueName ?? "").isEmpty
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -113,6 +123,18 @@ struct AgentPreviewTile: View {
                     .foregroundStyle(Self.bellAmber)
             }
             if hovering {
+                // Force-close is offered ONLY for queue-owned tiles: it's the escape hatch
+                // for a wedged queue slot. On a non-queue agent it would be an unscoped
+                // "kill this terminal" sitting next to the harmless Hide — needless risk.
+                if isQueueOwned {
+                    Button { confirmClose = true } label: {
+                        Image(systemName: "stop.circle")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                    .help("Close this split (ends the agent; frees its queue slot)")
+                }
                 Button(action: onHide) {
                     Image(systemName: "xmark")
                         .font(.caption2)
@@ -125,6 +147,16 @@ struct AgentPreviewTile: View {
         .frame(height: 22)
         .contentShape(Rectangle())
         .onTapGesture { jump() }
+        .confirmationDialog(
+            "Close “\(entry.title)”?",
+            isPresented: $confirmClose,
+            titleVisibility: .visible
+        ) {
+            Button("Close split", role: .destructive, action: onClose)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Force-closes this split and ends the agent running in it, discarding any in-progress work. If it's a queue agent, this frees its queue slot so the queue can move on.")
+        }
     }
 
     private var badge: some View {

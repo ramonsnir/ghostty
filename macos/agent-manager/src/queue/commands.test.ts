@@ -37,7 +37,6 @@ function tmpl(name: string): QueueTemplate {
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
     closeStableSeconds: 5,
-    quitWhenEmpty: false,
     params: [],
   };
 }

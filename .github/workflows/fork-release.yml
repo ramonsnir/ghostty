@@ -162,6 +162,28 @@ jobs:
           chmod +x "$APP/Contents/MacOS/ghostty-mcp"
           test -x "$APP/Contents/MacOS/ghostty-mcp"
 
+      # Bundle the agent-manager sidecar (Agent Queue + Manager) as dist/ + package.json
+      # into Contents/Resources/agent-manager (the path resolveSidecarDir() prefers). We
+      # bundle ONLY dist + package.json — NOT node_modules: it is ~271MB and ships a native
+      # `claude` binary that would break notarization. The Agent QUEUE has ZERO npm deps so
+      # it runs from dist alone; model.ts lazy-imports the SDK only when a summary actually
+      # runs, so a colleague WITHOUT node_modules gets a working queue and a self-disabled
+      # summarizer. package.json carries "type":"module" (node needs it to treat dist/*.js
+      # as ESM). RUNTIME PREREQ on the colleague's Mac: `node` on PATH (the controller's
+      # self-disable gate handles its absence). Uses the runner's system node (like the
+      # swift step above), NOT nix.
+      - name: Build + bundle agent-manager sidecar (dist only)
+        run: |
+          ( cd macos/agent-manager && npm ci && npm run build )
+          test -f macos/agent-manager/dist/index.js
+          APP="macos/build/Release/Ghostty.app"
+          DST="$APP/Contents/Resources/agent-manager"
+          rm -rf "$DST"; mkdir -p "$DST"
+          cp -R macos/agent-manager/dist "$DST/dist"
+          cp macos/agent-manager/package.json "$DST/package.json"
+          rm -rf "$DST/node_modules"   # never let node_modules into the notarized bundle
+          test -f "$DST/dist/index.js" && test -f "$DST/package.json"
+
       - name: Inject version + updater keys into Info.plist
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}

@@ -7569,3 +7569,267 @@ test "host Hello stores negotiated_minor on the Conn (process_info gate input)" 
     try clientSend(alloc, client_new, .close, protocol.Close{ .session_id = sid_new });
     std.Thread.sleep(50 * std.time.ns_per_ms);
 }
+
+// ============================================================================
+// Idle-CPU fix (Issue A): persisted RenderState + capture gate.
+// These use the bare-Session harness (no socket), so they run regardless of the
+// AF_UNIX path-length limit.
+// ============================================================================
+
+test "host idle-fix: clean ticks skip the snapshot projection; a dirty tick captures" {
+    const alloc = testing.allocator;
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    // Warmup: the first tick always captures (prev_snapshot == null AND
+    // prev_cursor_gate == null force must_capture), establishing the baselines.
+    _ = try session.renderTick();
+    try testing.expectEqual(@as(usize, 1), session.snapshots_projected);
+
+    // Idle ticks on a quiescent terminal must NOT project (the idle-CPU win): the
+    // persisted render_state short-circuits inside `update` (dirty stays .false).
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const changed = try session.renderTick();
+        try testing.expectEqual(@as(usize, 0), changed);
+    }
+    try testing.expectEqual(@as(usize, 1), session.snapshots_projected);
+    try testing.expect(session.render_state.dirty == .false);
+
+    // A real cell change makes the very next tick capture + project again.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("hello host");
+    }
+    const after = try session.renderTick();
+    try testing.expect(after > 0);
+    try testing.expectEqual(@as(usize, 2), session.snapshots_projected);
+
+    // ...and it settles back to idle (no further projection) once quiescent again.
+    _ = try session.renderTick();
+    try testing.expectEqual(@as(usize, 2), session.snapshots_projected);
+}
+
+test "host idle-fix: cursor visibility/style change on a clean grid still captures" {
+    const alloc = testing.allocator;
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    _ = try session.renderTick(); // warmup
+    const base = session.snapshots_projected;
+
+    // Idle: no projection.
+    _ = try session.renderTick();
+    try testing.expectEqual(base, session.snapshots_projected);
+
+    // DECTCEM hide (mode 25 off) dirties NO cell and is absent from ModeFrame; only the
+    // cursor-state gate catches it. Without that gate this tick would be skipped and the
+    // GUI mirror would keep a stale (visible) cursor — the efficacy MAJOR this guards.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.modes.set(.cursor_visible, false);
+    }
+    _ = try session.renderTick();
+    try testing.expectEqual(base + 1, session.snapshots_projected);
+
+    // Idle again settles (no projection).
+    _ = try session.renderTick();
+    try testing.expectEqual(base + 1, session.snapshots_projected);
+
+    // DECSCUSR visual-style change (also no cell dirty, not in ModeFrame) likewise captures.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.screens.active.cursor.cursor_style = .bar;
+    }
+    _ = try session.renderTick();
+    try testing.expectEqual(base + 2, session.snapshots_projected);
+}
+
+test "host idle-fix: a pending selection-text update is staged + broadcast on a clean tick" {
+    const alloc = testing.allocator;
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    _ = try session.renderTick(); // warmup
+    const base = session.snapshots_projected;
+
+    const Sink = struct {
+        fired: bool = false,
+        present: bool = false,
+        fn cb(ctx: *anyopaque, _: *Session, present: bool, _: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.fired = true;
+            s.present = present;
+        }
+    };
+    var sink: Sink = .{};
+    session.on_selection_text = &Sink.cb;
+    session.on_selection_text_ctx = &sink;
+
+    // Stage a selection-text update WITHOUT setting selection_dirty (the future
+    // stage-without-force-push case the hoist guards): on a CLEAN tick it must still be
+    // taken + broadcast, not stalled until the next dirty tick (concurrency MAJOR #2).
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.sel_text = try alloc.dupeZ(u8, "copied text");
+        session.sel_text_present = true;
+        session.sel_text_dirty = true;
+    }
+    _ = try session.renderTick();
+
+    try testing.expect(sink.fired);
+    try testing.expect(sink.present);
+    // Staging consumed the pending flag + buffer (no stall; no leak under testing.allocator).
+    try testing.expect(!session.sel_text_dirty);
+    try testing.expect(session.sel_text == null);
+    // And it happened on a CLEAN tick — the sel_text path does not force a projection.
+    try testing.expectEqual(base, session.snapshots_projected);
+}
+
+test "host idle-fix: active search overlay survives a one-row print without doubling highlights" {
+    const alloc = testing.allocator;
+    const session = try Session.create(alloc, .{ .cols = 40, .rows = 10 });
+    defer session.destroy();
+
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("alpha beta alpha");
+    }
+    try session.setSearch("alpha");
+
+    // Wait (bounded) for the real search thread to store matches.
+    var found = false;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            if (session.search_matches.len > 0) found = true;
+        }
+        if (found) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(found);
+
+    // Tick to project the overlay; record the matched-highlight count.
+    _ = try session.renderTick();
+    const n0 = countHighlights(session.prev_snapshot.?, Session.highlight_tag_search_match);
+    try testing.expect(n0 >= 1);
+
+    // Print one char on a DIFFERENT row (a partial cell change that does NOT touch the
+    // matched row). Without the overlay-active forced full-redraw, `update` would take the
+    // PARTIAL path (rebuild only the printed row) and the append-only updateHighlightsFlattened
+    // would DOUBLE the matched row's highlights. The dims-reset prevents that.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.carriageReturn();
+        try session.io.terminal.linefeed();
+        try session.io.terminal.printString("x");
+    }
+    _ = try session.renderTick();
+    const n1 = countHighlights(session.prev_snapshot.?, Session.highlight_tag_search_match);
+    try testing.expectEqual(n0, n1);
+}
+
+// ============================================================================
+// Dead-session reaper (Issue B).
+// ============================================================================
+
+test "host idle-fix: reapEligible truth table" {
+    const G: i64 = 1000; // grace
+    const now: i64 = 10_000;
+    const past = now - G - 1; // anchored before the grace boundary
+    // child_dead, session_alive, start_failed, teardown_requested, subs, dead_at, now, grace
+    // Live child (not child_dead): never eligible, even zero-sub past grace.
+    try testing.expect(!Server.reapEligible(false, true, false, false, 0, past, now, G));
+    // child-dead + subscribers present: not eligible (a GUI is viewing the final screen).
+    try testing.expect(!Server.reapEligible(true, true, false, false, 1, past, now, G));
+    // child-dead + zero-sub + within grace: not eligible.
+    try testing.expect(!Server.reapEligible(true, true, false, false, 0, now - 1, now, G));
+    // child-dead + zero-sub + past grace: ELIGIBLE.
+    try testing.expect(Server.reapEligible(true, true, false, false, 0, past, now, G));
+    // child-dead + zero-sub + null anchor (never stamped): not eligible.
+    try testing.expect(!Server.reapEligible(true, true, false, false, 0, null, now, G));
+    // start-failed (!session_alive && start_failed) + zero-sub + past grace: ELIGIBLE.
+    try testing.expect(Server.reapEligible(true, false, true, false, 0, past, now, G));
+    // already-destroying (!session_alive && !start_failed): never eligible.
+    try testing.expect(!Server.reapEligible(true, false, false, false, 0, past, now, G));
+    // teardown_requested set: never eligible (defensive; unreachable in practice).
+    try testing.expect(!Server.reapEligible(true, true, false, true, 0, past, now, G));
+}
+
+test "host idle-fix: reaper reclaims a child-exited detached session, never a live one" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hr.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    // Hello + Attach (spawn a real session).
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "t" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // A LIVE session (child alive, even still attached) is NEVER reaped — even at grace 0.
+    server.reapSessionsOnce(server.monoNowMs(), 0);
+    try testing.expect(server.lookupForTest(session_id) != null);
+
+    // Drive the child to exit (`exec true` replaces the shell so the pty tears down
+    // promptly), then detach so the entry reaches zero subscribers.
+    try clientSend(alloc, client, .input, protocol.Input{
+        .session_id = session_id,
+        .bytes = "exec true\n",
+    });
+    try clientSend(alloc, client, .detach, protocol.Detach{ .session_id = session_id });
+
+    // Poll the reaper (grace 0) until the child-exited, zero-subscriber entry is reclaimed
+    // (fetchRemove'd + owner thread joined). Bounded so a regression fails fast, not hangs.
+    var reaped = false;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        server.reapSessionsOnce(server.monoNowMs(), 0);
+        if (server.lookupForTest(session_id) == null) {
+            reaped = true;
+            break;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(reaped);
+}

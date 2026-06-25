@@ -117,19 +117,22 @@ final class AgentManagerController {
             // Check the CHEAP, side-effect-free conditions FIRST so the default
             // (overwhelmingly common) off-fork stays FULLY DORMANT — never spawning
             // the login-shell node probe just to discover it's disabled. The node
-            // probe runs only once enable + mcp-listen + mcp-token are all green.
-            guard self.enabled, !self.mcpListen.isEmpty, !self.mcpToken.isEmpty else {
-                self.logger.info("Agent Manager disabled: \(Self.disabledReason(enabled: self.enabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nil), privacy: .public)")
+            // probe runs only once at-least-one-feature + mcp-listen + mcp-token are
+            // all green. The sidecar is shared infra: launch it when EITHER the
+            // summarizer (agent-manager) OR the queue (agent-queue) is enabled.
+            guard self.enabled || self.agentQueueEnabled,
+                  !self.mcpListen.isEmpty, !self.mcpToken.isEmpty else {
+                self.logger.info("Agent Manager/Queue disabled: \(Self.sidecarDisabledReason(managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nil), privacy: .public)")
                 return
             }
             let nodePath = self.resolveNodePath()
-            let should = Self.agentManagerShouldStart(
-                enabled: self.enabled, mcpListen: self.mcpListen,
-                mcpToken: self.mcpToken, nodePath: nodePath)
+            let should = Self.sidecarShouldStart(
+                managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled,
+                mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nodePath)
             guard should, let nodePath else {
                 // EXACTLY ONE info-level line stating WHY we're dormant (never an
-                // error / notification — a disabled Agent Manager is a normal state).
-                self.logger.info("Agent Manager disabled: \(Self.disabledReason(enabled: self.enabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nodePath), privacy: .public)")
+                // error / notification — a disabled sidecar is a normal state).
+                self.logger.info("Agent Manager/Queue disabled: \(Self.sidecarDisabledReason(managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nodePath), privacy: .public)")
                 return
             }
             self.spawnLocked(nodePath: nodePath)
@@ -222,8 +225,11 @@ final class AgentManagerController {
     /// The env the sidecar reads (mirrors `mcp-shim`'s contract). `GHOSTTY_MCP_URL`
     /// carries the per-identity port; `GHOSTTY_AGENT_MANAGER=1` makes the agent-state
     /// hook early-exit (no hook recursion); `PATH` is extended with the node dir so
-    /// the SDK's own child spawns can find node. The queue-supervisor env (§8a/§15)
-    /// is layered in by the pure `applyAgentQueueEnv` so the wiring is unit-testable.
+    /// the SDK's own child spawns can find node. The two FEATURE loops the shared
+    /// sidecar runs are armed INDEPENDENTLY by pure, unit-testable helpers: the Haiku
+    /// SUMMARIZER via `applySummarizerEnv` (`GHOSTTY_SUMMARIZER`, gated on agent-manager)
+    /// and the QUEUE supervisor via `applyAgentQueueEnv` (§8a/§15, gated on agent-queue).
+    /// Each is set/stripped on its own enable so one feature can run with the other off.
     private func childEnvironment(nodePath: String) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["GHOSTTY_MCP_URL"] = Self.mcpURL(listen: mcpListen, offset: mcpPortOffset)
@@ -237,11 +243,30 @@ final class AgentManagerController {
             let existing = env["PATH"] ?? ""
             env["PATH"] = existing.isEmpty ? nodeDir : "\(nodeDir):\(existing)"
         }
+        env = Self.applySummarizerEnv(into: env, enabled: enabled)
         env = Self.applyAgentQueueEnv(
             into: env,
             enabled: agentQueueEnabled,
             templatesDir: agentQueueTemplatesDir,
             maxTotal: agentQueueMaxTotal)
+        return env
+    }
+
+    /// (Agent Manager) Layer the SUMMARIZER enable onto the sidecar env. PURE +
+    /// unit-tested. The Haiku tile summarizer runs in the sidecar ONLY when
+    /// `agent-manager` is enabled; the queue supervisor is armed independently
+    /// (`applyAgentQueueEnv`). So the shared sidecar can run the queue ALONE with the
+    /// (Haiku-billing) summarizer fully silent. We set the flag EXPLICITLY both ways —
+    /// `enabled` ⇒ `GHOSTTY_SUMMARIZER=1`, disabled ⇒ `GHOSTTY_SUMMARIZER=0` — rather
+    /// than stripping it (unlike `applyAgentQueueEnv`). This is deliberate for
+    /// BACK-COMPAT: the summarizer was previously UNCONDITIONAL (no env), so the
+    /// sidecar treats an ABSENT flag as ON. An OLD GUI that respawns a NEW `dist`
+    /// (transient during an upgrade) sets no flag ⇒ summarizer stays on (no
+    /// regression); only this NEW GUI, with agent-manager off, writes the explicit
+    /// `0` that turns it off. An explicit `0` also defeats a stray inherited `1`.
+    static func applySummarizerEnv(into env: [String: String], enabled: Bool) -> [String: String] {
+        var env = env
+        env["GHOSTTY_SUMMARIZER"] = enabled ? "1" : "0"
         return env
     }
 
@@ -351,14 +376,21 @@ final class AgentManagerController {
 
     // MARK: - Pure helpers (unit-tested)
 
-    /// The §8 SELF-DISABLE gate (HARD requirement, unit-tested). Agent Manager
-    /// starts ONLY when all of: the master enable is on; an MCP bind address is
-    /// configured (the sidecar's only transport); an MCP token is set (the sidecar
+    /// The §8 SELF-DISABLE gate (HARD requirement, unit-tested). The sidecar is
+    /// SHARED INFRA for two independent features — the Haiku SUMMARIZER (agent-manager)
+    /// and the QUEUE supervisor (agent-queue) — so it starts when EITHER is enabled,
+    /// not only agent-manager. All of: at least one feature is on; an MCP bind address
+    /// is configured (the sidecar's only transport); an MCP token is set (the sidecar
     /// must authenticate); AND a `node` binary resolved. Any false ⇒ stay dormant.
-    static func agentManagerShouldStart(
-        enabled: Bool, mcpListen: String?, mcpToken: String?, nodePath: String?
+    /// Which feature(s) actually RUN inside the launched sidecar is decided separately
+    /// by the per-feature env flags (`applySummarizerEnv` / `applyAgentQueueEnv`), so
+    /// the two work independently — e.g. agent-queue on + agent-manager off launches the
+    /// sidecar with the queue armed and the (Haiku-billing) summarizer fully silent.
+    static func sidecarShouldStart(
+        managerEnabled: Bool, queueEnabled: Bool,
+        mcpListen: String?, mcpToken: String?, nodePath: String?
     ) -> Bool {
-        guard enabled else { return false }
+        guard managerEnabled || queueEnabled else { return false }
         guard let listen = mcpListen, !listen.isEmpty else { return false }
         guard let token = mcpToken, !token.isEmpty else { return false }
         guard let node = nodePath, !node.isEmpty else { return false }
@@ -366,11 +398,12 @@ final class AgentManagerController {
     }
 
     /// The single human-readable reason the gate refused, for the one info line.
-    /// Order matches `agentManagerShouldStart` so the first failing condition wins.
-    static func disabledReason(
-        enabled: Bool, mcpListen: String?, mcpToken: String?, nodePath: String?
+    /// Order matches `sidecarShouldStart` so the first failing condition wins.
+    static func sidecarDisabledReason(
+        managerEnabled: Bool, queueEnabled: Bool,
+        mcpListen: String?, mcpToken: String?, nodePath: String?
     ) -> String {
-        if !enabled { return "agent-manager is off" }
+        if !managerEnabled && !queueEnabled { return "agent-manager and agent-queue are both off" }
         if (mcpListen ?? "").isEmpty { return "mcp-listen is not set" }
         if (mcpToken ?? "").isEmpty { return "mcp-token is not set" }
         if (nodePath ?? "").isEmpty { return "node could not be resolved" }

@@ -110,6 +110,38 @@ echo ">> [3/8] bundle ghostty-host"
 cp -f zig-out/bin/ghostty-host "$APP/Contents/MacOS/ghostty-host"
 chmod +x "$APP/Contents/MacOS/ghostty-host"
 
+# ---- 3a. bundle the ghostty-mcp stdio shim ---------------------------------
+# Mirror the CI workflow: build the MCP stdio shim and bundle it alongside the
+# host so it is signed + notarized as part of the app and carried by Sparkle. The
+# app's ForkSetup copies it onto PATH (~/.local/bin/ghostty-mcp) on first launch so
+# a colleague's `claude mcp add ghostty -- ghostty-mcp` works. Pure Swift/Foundation
+# SPM package (NOT in Ghostty.xcodeproj), so it builds with the system swift.
+echo ">> [3a/8] bundle ghostty-mcp shim"
+swift build -c release --package-path macos/mcp-shim
+cp -f macos/mcp-shim/.build/release/ghostty-mcp "$APP/Contents/MacOS/ghostty-mcp"
+chmod +x "$APP/Contents/MacOS/ghostty-mcp"
+test -x "$APP/Contents/MacOS/ghostty-mcp"
+
+# ---- 3b. bundle the agent-manager sidecar (Agent Queue + Manager) ----------
+# Build the TS sidecar and bundle ONLY dist/ + package.json into
+# Contents/Resources/agent-manager (the path resolveSidecarDir() prefers). We do
+# NOT bundle node_modules: it is ~271MB and ships a native `claude` binary that
+# would break notarization — and the Agent QUEUE has ZERO npm deps, so it runs from
+# dist alone (model.ts lazy-imports the SDK only when a summary actually runs, so a
+# missing SDK self-disables the summarizer without affecting the queue). package.json
+# is required so node treats dist/*.js as ESM ("type":"module"). RUNTIME PREREQ on the
+# target Mac: `node` on PATH (the controller's self-disable gate handles its absence).
+echo ">> [3b/8] bundle agent-manager sidecar (dist only; node prereq)"
+( cd macos/agent-manager && npm ci && npm run build )
+test -f macos/agent-manager/dist/index.js
+SIDECAR_DST="$APP/Contents/Resources/agent-manager"
+rm -rf "$SIDECAR_DST"
+mkdir -p "$SIDECAR_DST"
+cp -R macos/agent-manager/dist "$SIDECAR_DST/dist"
+cp macos/agent-manager/package.json "$SIDECAR_DST/package.json"
+# Belt-and-suspenders: never let node_modules sneak into the notarized bundle.
+rm -rf "$SIDECAR_DST/node_modules"
+
 # ---- 4. version + enable updates -------------------------------------------
 echo ">> [4/8] inject version"
 PLIST="$APP/Contents/Info.plist"
@@ -131,6 +163,7 @@ sign "$SPK/Versions/B/Updater.app"
 sign "$SPK"
 sign "$APP/Contents/PlugIns/DockTilePlugin.plugin"
 sign "$APP/Contents/MacOS/ghostty-host"
+sign "$APP/Contents/MacOS/ghostty-mcp"
 codesign --verbose -f -s "$IDENTITY" -o runtime --entitlements macos/Ghostty.entitlements "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 

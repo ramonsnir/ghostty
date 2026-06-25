@@ -13,6 +13,8 @@ import {
   clampEnvValue,
   fetchList,
   fetchListResult,
+  fetchGraphResult,
+  parseGraphOutput,
   parseListOutput,
   parseStatusOutput,
   probeStatus,
@@ -24,6 +26,7 @@ import {
   type ExecResult,
 } from "./provider.js";
 import type {
+  ProviderGraphSpec,
   ProviderListSpec,
   ProviderStatusSpec,
   WorkItem,
@@ -363,9 +366,9 @@ test("fetchList: a flaky list (non-zero exit) => [] (skip the tick)", async () =
   assert.deepEqual(await fetchList(spec, exec), []);
 });
 
-// fetchListResult — distinguishes a SUCCESSFUL empty list from a FAILED/skip one (the
-// quit-when-empty signal, §8a). A failed list must NEVER read as "empty".
-test("fetchListResult: a clean empty list => {ok:true, items:[]} (arms quit-when-empty)", async () => {
+// fetchListResult — distinguishes a SUCCESSFUL empty list from a FAILED/skip one (used by
+// the dispatch-latch re-arm + the §11 health cache). A failed list must NEVER read as "empty".
+test("fetchListResult: a clean empty list => {ok:true, items:[]}", async () => {
   const spec: ProviderListSpec = { command: ["list"], keyField: "k" };
   const { exec } = fakeExec({ code: 0, stdout: "[]", stderr: "" });
   assert.deepEqual(await fetchListResult(spec, exec), { ok: true, items: [] });
@@ -387,4 +390,117 @@ test("fetchListResult: success parses items with ok:true", async () => {
   const spec: ProviderListSpec = { command: ["list"], keyField: "identifier" };
   const { exec } = fakeExec({ code: 0, stdout: JSON.stringify([{ identifier: "A-1" }]), stderr: "" });
   assert.deepEqual(await fetchListResult(spec, exec), { ok: true, items: [{ key: "A-1" }] });
+});
+
+// ---------------------------------------------------------------------------
+// parseGraphOutput — the OPTIONAL backlog board (every state + labels + edges).
+// ---------------------------------------------------------------------------
+
+test("parseGraphOutput: {nodes:[…]} maps all fields", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({
+      nodes: [
+        {
+          key: "A-1",
+          title: "do x",
+          url: "https://t/A-1",
+          state: "In Progress",
+          stateType: "started",
+          done: false,
+          labels: ["Design needed", "Customer"],
+          blockedBy: ["A-9"],
+          priorityLabel: "High",
+        },
+      ],
+    }),
+  );
+  assert.deepEqual(out, [
+    {
+      key: "A-1",
+      title: "do x",
+      url: "https://t/A-1",
+      state: "In Progress",
+      stateType: "started",
+      done: false,
+      labels: ["Design needed", "Customer"],
+      blockedBy: ["A-9"],
+      priorityLabel: "High",
+    },
+  ]);
+});
+
+test("parseGraphOutput: priorityLabel kept only when a non-empty string", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({
+      nodes: [
+        { key: "A-1", priorityLabel: "Urgent" },
+        { key: "A-2", priorityLabel: "" }, // empty → dropped
+        { key: "A-3", priorityLabel: 1 }, // non-string → dropped
+        { key: "A-4" }, // absent → undefined
+      ],
+    }),
+  );
+  assert.equal(out[0].priorityLabel, "Urgent");
+  assert.equal(out[1].priorityLabel, undefined);
+  assert.equal(out[2].priorityLabel, undefined);
+  assert.equal(out[3].priorityLabel, undefined);
+});
+
+test("parseGraphOutput: accepts a BARE array too", () => {
+  const out = parseGraphOutput(JSON.stringify([{ key: "A-1", done: true }]));
+  assert.deepEqual(out, [{ key: "A-1", done: true, labels: [], blockedBy: [] }]);
+});
+
+test("parseGraphOutput: missing/blank key dropped; done defaults false; labels/blockedBy default []", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({ nodes: [{ key: "" }, { title: "no key" }, { key: "A-2" }] }),
+  );
+  assert.deepEqual(out, [{ key: "A-2", done: false, labels: [], blockedBy: [] }]);
+});
+
+test("parseGraphOutput: non-string label/edge entries are dropped; a bare string is wrapped", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({ nodes: [{ key: "A-1", labels: ["ok", 3, null], blockedBy: "A-9" }] }),
+  );
+  assert.deepEqual(out, [{ key: "A-1", done: false, labels: ["ok"], blockedBy: ["A-9"] }]);
+});
+
+test("parseGraphOutput: duplicate keys collapse to first", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({
+      nodes: [
+        { key: "A-1", state: "first" },
+        { key: "A-1", state: "dupe" },
+        { key: "A-2" },
+      ],
+    }),
+  );
+  assert.equal(out.length, 2);
+  assert.equal(out[0].state, "first");
+  assert.equal(out[1].key, "A-2");
+});
+
+test("parseGraphOutput: garbage / non-array / wrong-shape => []", () => {
+  assert.deepEqual(parseGraphOutput("not json"), []);
+  assert.deepEqual(parseGraphOutput(JSON.stringify({ nodes: "x" })), []);
+  assert.deepEqual(parseGraphOutput(JSON.stringify(42)), []);
+});
+
+test("fetchGraphResult: clean board => {ok:true, nodes}", async () => {
+  const spec: ProviderGraphSpec = { command: ["graph"] };
+  const { exec } = fakeExec({
+    code: 0,
+    stdout: JSON.stringify({ nodes: [{ key: "A-1", done: false }] }),
+    stderr: "",
+  });
+  assert.deepEqual(await fetchGraphResult(spec, exec), {
+    ok: true,
+    nodes: [{ key: "A-1", done: false, labels: [], blockedBy: [] }],
+  });
+});
+
+test("fetchGraphResult: non-zero exit => {ok:false, nodes:[]} (keep last-known board)", async () => {
+  const spec: ProviderGraphSpec = { command: ["graph"] };
+  const { exec } = fakeExec({ code: 1, stdout: "", stderr: "boom" });
+  assert.deepEqual(await fetchGraphResult(spec, exec), { ok: false, nodes: [] });
 });

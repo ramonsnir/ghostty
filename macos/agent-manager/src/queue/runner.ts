@@ -35,6 +35,7 @@ import {
   buildItemEnv,
   shellEnvPrefix,
   fetchListResult,
+  fetchGraphResult,
   probeStatus,
   renderArgv,
   runProvider,
@@ -71,15 +72,22 @@ import {
   runDisplayName,
   runIdentityScope,
 } from "./templates.js";
-import { queueStatusReport, type QueueStatusReport } from "./status.js";
-import type { Assignment, QueueTemplate, WorkItem } from "./types.js";
+import {
+  queueStatusReport,
+  backlogCount,
+  type QueueStatusReport,
+  type QueueGraphReport,
+} from "./status.js";
+import type {
+  Assignment,
+  GraphNode,
+  QueueGraph,
+  QueueTemplate,
+  WorkItem,
+} from "./types.js";
 
 const log = (msg: string): void => console.log(`agent-manager: queue: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: queue: ${msg}`);
-
-/** A non-zero direction the grid planner can yield ("right"/"down"); spawnSplitCommand
- *  accepts the wider set but the planner only ever produces these two. */
-type SplitDirection = "right" | "down";
 
 /**
  * The grace window a still-PENDING (un-finalized) store record is given before
@@ -156,6 +164,12 @@ export interface QueueRun {
   lifetimeDispatched: number;
   /** false until reconcile() has run ONCE since this run was (re)started (§9). */
   reconciledOnce: boolean;
+  /** (premature-prune fix) ms-since-epoch this run FIRST reconciled in the current
+   *  process (stamped once, on the first reconcile; a restart makes a fresh run object so
+   *  it re-stamps). Passed to `reconcile` so a finalized record's session-gone prune is
+   *  shielded for `pendingGraceMs` after a (re)start — protecting live, tracked agents from
+   *  a transient/incomplete post-restart `list_surfaces`. Non-persisted. */
+  reconcileStartedMs?: number;
   /** false until the FIRST sweep (which reconciles) has completed; dispatch is
    *  SUPPRESSED while false so re-adoption ALWAYS precedes any new dispatch — the
    *  §9 first-pass invariant that closes the restart-window double-dispatch gap. The
@@ -186,17 +200,31 @@ export interface QueueRun {
    *  ALL its live assignments THIS sweep, then is removed from the registry. NOT persisted as
    *  a flag (abort terminates the run; the active-runs store simply drops it). */
   aborting: boolean;
-  /** (§8a quit-when-empty) TRANSIENT per-sweep flag: set true when THIS sweep's dispatch
-   *  fetched a SUCCESSFUL EMPTY `list` (not a failed/skip one). The sweep loop quits the
-   *  run when this is true AND `active.size === 0`. Reset to false at the top of every
-   *  per-run sweep; never persisted. */
-  sawEmptyListThisSweep: boolean;
   /** (§11 health) The most recent `list` items seen by a dispatch sweep (null until the
    *  first list fetch) + whether that fetch SUCCEEDED. Cached purely to build the
    *  run-level health report (`report_queue_status`) each sweep without an extra provider
    *  call — the dashboard's "N waiting / next: …" reads from this. Not persisted. */
   lastListItems: WorkItem[] | null;
   lastListOk: boolean;
+  /** (interval throttling) Wall-clock ms of the LAST provider `list` fetch and the LAST
+   *  per-agent `status` probe round. The 5s sweep is the BASE cadence (reconcile / close /
+   *  command-drain / health report run every sweep), but the PROVIDER calls are throttled to
+   *  `template.intervals.listMs` / `.statusMs` — a `list` fetch happens only when
+   *  `nowMs - lastListAtMs >= intervals.listMs`, and the per-agent `status` probes only when
+   *  `nowMs - lastStatusAtMs >= intervals.statusMs`. Init `NEGATIVE_INFINITY` so the first
+   *  sweep always fetches (and to avoid a `nowMs===0` sentinel collision). Not persisted —
+   *  after a restart the first sweep re-fetches, which is correct. */
+  lastListAtMs: number;
+  lastStatusAtMs: number;
+  /** (backlog graph) The most recent WHOLE-board snapshot from the optional `provider.graph`
+   *  (null until the first successful fetch), and the wall-clock ms of the last graph fetch
+   *  ATTEMPT. The graph is fetched on the SAME cadence as `list` (`intervals.listMs`), cached
+   *  here, and pushed to the GUI via `report_queue_graph` — independent of dispatch, so the
+   *  backlog view stays live even while the run is paused/draining. Not persisted (a restart
+   *  re-fetches on the first due sweep). `lastGraphAtMs` inits NEGATIVE_INFINITY so the first
+   *  sweep fetches. */
+  lastGraph: QueueGraph | null;
+  lastGraphAtMs: number;
   /** (live maxItems edit) A run-level OVERRIDE of the lifetime cap, set by a `set_max_items`
    *  command WHILE the run is live (the dashboard cap control). Takes PRECEDENCE over the
    *  start-time/template cap in `effectiveMaxItemsCap`. `undefined` = no live edit (use the
@@ -243,9 +271,12 @@ export function makeQueueRun(
     paused: opts.paused ?? false,
     draining: opts.draining ?? false,
     aborting: false,
-    sawEmptyListThisSweep: false,
     lastListItems: null,
     lastListOk: false,
+    lastListAtMs: Number.NEGATIVE_INFINITY,
+    lastStatusAtMs: Number.NEGATIVE_INFINITY,
+    lastGraph: null,
+    lastGraphAtMs: Number.NEGATIVE_INFINITY,
   };
 }
 
@@ -351,7 +382,18 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
   }
   if (commands.length > 0) {
     const changed = applyCommands(deps.registry, commands, deps.factory);
-    if (changed) persistActiveRunSet(deps);
+    if (changed) {
+      persistActiveRunSet(deps);
+      // SNAPPY FEEDBACK: push each run's health snapshot IMMEDIATELY after a command applies,
+      // BEFORE this sweep's provider round-trips (the per-agent `status` probes + the `list`
+      // fetch). Otherwise a pause/resume/stop/set_max_items only reflects in the dashboard at
+      // the END of the sweep (after those Linear calls) — the visible "really slow" lag. The
+      // normal end-of-sweep report still runs and refreshes the live counts. Skip ABORTING
+      // runs (the sweep removes them + reports `present:false` below — no point flashing them).
+      for (const run of deps.registry.values()) {
+        if (!run.aborting) await reportQueueStatus(run, deps);
+      }
+    }
   }
 
   // No runs in the registry (none started / all drained-or-aborted-away) ⇒ nothing to
@@ -383,6 +425,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         deps.registry.delete(name);
         registryChanged = true;
         await reportRunGone(deps, name);
+        await reportGraphGone(deps, name);
         log(`run "${name}" ABORTED — all assignments force-closed, run removed`);
         continue;
       }
@@ -395,22 +438,16 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         deps.registry.delete(name);
         registryChanged = true;
         await reportRunGone(deps, name);
+        await reportGraphGone(deps, name);
         log(`run "${name}" DRAINED — no slot-occupying assignments, run removed`);
-      } else if (
-        // QUIT-WHEN-EMPTY (§8a): the template opted in AND this sweep saw a SUCCESSFUL
-        // empty `list` AND nothing is tracked (no in-flight agents, no review-held
-        // EXITED splits) → there is genuinely nothing left to do, so quit even before
-        // maxItems. A momentary empty list while agents run (active > 0) does NOT quit —
-        // the run keeps polling for new/unblocked items until BOTH queue and fleet drain.
-        run.template.quitWhenEmpty &&
-        run.sawEmptyListThisSweep &&
-        run.active.size === 0
-      ) {
-        deps.registry.delete(name);
-        registryChanged = true;
-        await reportRunGone(deps, name);
-        log(`run "${name}" QUIT — queue empty and no active agents (quitWhenEmpty)`);
       }
+      // NOTE: there is intentionally NO "quit-when-empty" auto-removal. A run is removed
+      // ONLY by an explicit stop (drain) or abort. An empty `list` just means "nothing
+      // actionable right now" — the run stays and keeps polling for new/unblocked items.
+      // (The old `quitWhenEmpty` knob was removed: it keyed on `active.size === 0`, which a
+      // transient/incomplete post-restart `list_surfaces` could falsely produce by pruning
+      // live records — silently abandoning live agents and removing the whole run. Removed
+      // so no template can re-trigger that; persistence is the safer default.)
     } catch (err) {
       errlog(`run "${name}": ${msg(err)}`);
     }
@@ -530,10 +567,6 @@ async function runOne(
 ): Promise<number> {
   const nowMs = deps.now();
   const t = run.template;
-  // Reset the per-sweep quit-when-empty observation; dispatchCandidates sets it true
-  // only if it fetches a SUCCESSFUL EMPTY list this sweep.
-  run.sawEmptyListThisSweep = false;
-
   // --- 1) RECONCILE (always first; §9) --------------------------------------------
   // Project the live surfaces carrying THIS run's annotation into LiveSurface views.
   // (parallel runs) Filter by the run's IDENTITY name (`runName`), which is what
@@ -541,7 +574,16 @@ async function runOne(
   // scoped runs of one template never adopt each other's tiles.
   const liveForRun = projectLiveSurfaces(surfaces, run.runName);
   const records = loadStore(run.storeIO);
-  const plan = reconcile(records, liveForRun, nowMs, deps.pendingGraceMs);
+  // Stamp the reconcile-start once (this process) so the prune grace shields records for
+  // pendingGraceMs after a (re)start — see reconcile()'s `reconcileStartedMs`.
+  if (run.reconcileStartedMs === undefined) run.reconcileStartedMs = nowMs;
+  const plan = reconcile(
+    records,
+    liveForRun,
+    nowMs,
+    deps.pendingGraceMs,
+    run.reconcileStartedMs,
+  );
 
   // REHYDRATE the monotonic lifetime-dispatch counter from the persisted store ONCE
   // (on the first reconcile after a (re)start), so the §7 `maxItems` cap is a TRUE
@@ -626,9 +668,78 @@ async function runOne(
     dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining);
   }
 
+  // --- 4.5) REFRESH the backlog GRAPH (optional `provider.graph`), throttled to listMs.
+  // Independent of dispatch (runs even while paused/draining/disabled) so the grooming
+  // view stays live; best-effort (a failed fetch keeps the last-known board).
+  await refreshGraph(run, deps, nowMs);
+
   // --- 5) REPORT run-level health (§11), AFTER dispatch so the counts are fresh. -----
   await reportQueueStatus(run, deps);
   return dispatched;
+}
+
+/** (backlog graph) Fetch the optional `provider.graph` board on the `list` cadence, cache
+ *  it on the run, and push it to the GUI via `report_queue_graph`. No-op when the template
+ *  declares no `provider.graph`, when the client lacks the capability (test fakes), or when
+ *  not yet due. A FAILED fetch is skipped silently — the GUI keeps the last-known board (no
+ *  push), never blanking the canvas on a transient provider error. The header-badge
+ *  `backlog` count excludes everything the header already shows as waiting/running (the
+ *  actionable-list keys ∪ the active assignment keys). */
+async function refreshGraph(run: QueueRun, deps: QueueDeps, nowMs: number): Promise<void> {
+  const spec = run.template.provider.graph;
+  if (spec === undefined) return;
+  // A self-DISABLED run (no pty-host) is dormant — don't spend tracker calls on its board.
+  if (run.disabled) return;
+  if (deps.client.reportQueueGraph === undefined) return; // optional client capability
+  // Same throttle as `list` (consumed on the ATTEMPT so a failing graph waits a full
+  // interval too — a hard cap of one graph call per listMs regardless of outcome).
+  if (nowMs - run.lastGraphAtMs < run.template.intervals.listMs) return;
+  run.lastGraphAtMs = nowMs;
+
+  let res: { ok: boolean; nodes: GraphNode[] };
+  try {
+    res = await fetchGraphResult(spec, deps.exec, {
+      cwd: run.template.workdir,
+      env: resolveParamsEnv(run.template, run.params),
+    });
+  } catch (err) {
+    errlog(`provider.graph "${run.runName}": ${msg(err)}`);
+    return;
+  }
+  if (!res.ok) return; // keep last-known board on a failed fetch
+
+  run.lastGraph = { nodes: res.nodes };
+  const exclude = new Set<string>([
+    ...(run.lastListItems ?? []).map((i) => i.key),
+    ...run.active.keys(),
+  ]);
+  const report: QueueGraphReport = {
+    queueName: run.runName,
+    present: true,
+    backlog: backlogCount(res.nodes, exclude),
+    nodes: res.nodes,
+  };
+  try {
+    await deps.client.reportQueueGraph(report);
+  } catch (err) {
+    errlog(`report_queue_graph "${run.runName}": ${msg(err)}`);
+  }
+}
+
+/** (backlog graph) Tell the GUI a run's backlog board is GONE (run removed) so it clears
+ *  the "N backlog" button + canvas. Best-effort; called alongside `reportRunGone`. */
+async function reportGraphGone(deps: QueueDeps, name: string): Promise<void> {
+  if (deps.client.reportQueueGraph === undefined) return;
+  try {
+    await deps.client.reportQueueGraph({
+      queueName: name,
+      present: false,
+      backlog: 0,
+      nodes: [],
+    });
+  } catch (err) {
+    errlog(`report_queue_graph(gone) "${name}": ${msg(err)}`);
+  }
 }
 
 /** (§11 health) Build + push the run-level health report via the MCP client. Best-effort
@@ -761,6 +872,16 @@ async function advanceStates(
   nowMs: number,
 ): Promise<void> {
   let changed = false;
+  // (interval throttling) Probe provider `status` at most once per `intervals.statusMs`,
+  // not every 5s sweep. The idle-anchor fold (cheap, from the hook-driven agentState) and
+  // the close-gate still run EVERY sweep; only the provider round-trip is throttled. When a
+  // probe is NOT due, `statusTerminal` stays undefined for every agent → nextState makes no
+  // status-driven completion this sweep (it resumes on the next due sweep). Decided once for
+  // the whole batch so all agents share one round; the window is consumed (`lastStatusAtMs`
+  // advanced) ONLY if a probe actually fired, so a due sweep with no live SPAWNED/RUNNING
+  // agent doesn't burn the interval (the next sweep with an agent probes immediately).
+  const statusDue = nowMs - run.lastStatusAtMs >= run.template.intervals.statusMs;
+  let probed = false;
   for (const a of [...run.active.values()]) {
     // Terminal/transitional states are owned by the close loop / cooldown logic.
     if (
@@ -786,12 +907,13 @@ async function advanceStates(
     // Probe provider status ONLY for states that can complete (SPAWNED/RUNNING) and
     // only when the surface is still live (no point probing a gone surface).
     let statusTerminal: boolean | undefined = undefined;
-    if (surfaceLive && (a.state === "SPAWNED" || a.state === "RUNNING")) {
+    if (statusDue && surfaceLive && (a.state === "SPAWNED" || a.state === "RUNNING")) {
       const probe = await probeStatus(run.template.provider.status, a.key, deps.exec, {
         cwd: run.template.workdir,
         env: resolveParamsEnv(run.template, run.params),
       });
       statusTerminal = probe.terminal;
+      probed = true;
     }
 
     const ctx: NextStateContext = {
@@ -830,6 +952,9 @@ async function advanceStates(
       }
     }
   }
+  // Consume the status-probe window only when a probe actually fired this sweep (see the
+  // `statusDue`/`probed` note above).
+  if (probed) run.lastStatusAtMs = nowMs;
   if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
 }
 
@@ -965,6 +1090,18 @@ async function dispatchCandidates(
   // (e.g. at its maxItems cap). The dispatch gate is applied AFTER the fetch instead (a
   // capped run that fetched `[]` shows "0 waiting · N running · N/N", not "reading the queue…").
 
+  // (interval throttling) Throttle the provider `list` fetch to `intervals.listMs` instead
+  // of hitting it every 5s sweep. When a fetch is NOT due, dispatch nothing THIS sweep and
+  // return — the §11 health report (fired by runOne after this returns) reads the CACHED
+  // `lastListItems`/`lastListOk` from the previous fetch, so the dashboard counts stay live;
+  // the latch re-arm + quit-when-empty observation simply wait for the next due fetch.
+  // `lastListAtMs` inits NEGATIVE_INFINITY so the first dispatch sweep always fetches. The
+  // window is consumed on the ATTEMPT (set before the fetch), so even a FAILED list waits a
+  // full interval before retrying — a hard cap of one provider `list` call per `listMs`,
+  // regardless of outcome (the point: stop hammering the provider every 5s).
+  if (nowMs - run.lastListAtMs < t.intervals.listMs) return 0;
+  run.lastListAtMs = nowMs;
+
   // Fetch the provider list (skip the tick on any failure — never throws). Use the
   // ok-distinguishing variant so quit-when-empty can tell a SUCCESSFUL empty list from a
   // failed/skip one (§8a): only a clean, parsed, empty list arms the quit.
@@ -975,7 +1112,6 @@ async function dispatchCandidates(
       env: resolveParamsEnv(t, run.params),
     });
     items = res.items;
-    run.sawEmptyListThisSweep = res.ok && res.items.length === 0;
     // (§11 health) Cache the list for the run-level status report. Only a SUCCESSFUL
     // fetch updates the cached items (a failed/skip fetch keeps the last good list so the
     // header doesn't flicker to "0 waiting" on a transient provider blip); listOk tracks
@@ -1077,7 +1213,10 @@ async function dispatchOne(
   const cap = gridCap(t.grid.cols, t.grid.rows);
   const slot = lowestFreeSlot(occupied, cap);
   if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
-  const sp = splitPlan(slot, occupied, t.grid.fill, t.grid.cols, t.grid.rows);
+  // The split is a BALANCED BSP (§12): the GUI splits the largest pane in the run's tab.
+  // `slot` is just the occupancy token (caps concurrency, refills holes); placement no
+  // longer derives from the slot's abstract grid position.
+  const sp = splitPlan(occupied);
 
   // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
   // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
@@ -1119,8 +1258,10 @@ async function dispatchOne(
   const commandWithItemEnv = shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
   try {
+    // Balanced BSP: the anchor UUID just identifies the run's tab; the GUI splits the
+    // largest pane in it. (firstTab opens the run's tab from app defaults.)
     const targetUUID =
-      sp.firstTab === true ? undefined : occupiedUUID(run, sp.targetSlotIndex);
+      sp.firstTab === true ? undefined : occupiedUUID(run, sp.anchorSlotIndex);
     spawned = await deps.client.spawnSplitCommand({
       command: commandWithItemEnv,
       cwd: t.workdir,
@@ -1129,7 +1270,7 @@ async function dispatchOne(
         ? { firstTab: true }
         : {
             ...(targetUUID !== undefined ? { targetUUID } : {}),
-            direction: sp.direction as SplitDirection,
+            balanced: true,
           }),
     });
   } catch (err) {

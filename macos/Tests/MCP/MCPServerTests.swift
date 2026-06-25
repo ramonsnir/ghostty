@@ -349,14 +349,14 @@ struct MCPServerTests {
             "list_surfaces", "read_surface", "get_layout", "send_text", "send_key",
             "scroll", "wait_for_event", "watch_for_pattern", "focus_surface",
             "new_tab", "close_surface", "perform_action", "set_surface_annotation",
-            // Agent Queue (§8): the supervisor's "hands".
-            "spawn_split_command", "force_close_surface", "signal_attention",
-            "take_queue_commands", "report_queue_status",
             // Bell Attention: promote a bell to the sticky attention state.
             "set_attention",
+            // Agent Queue (§8): the supervisor's "hands".
+            "spawn_split_command", "force_close_surface", "signal_attention",
+            "take_queue_commands", "report_queue_status", "report_queue_graph",
         ]
         #expect(names == expected)
-        #expect(tools.count == 19)
+        #expect(tools.count == 20)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -425,7 +425,7 @@ struct MCPServerTests {
             focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
-            notes: "Implementing fix", agentKind: "claude", sessionID: 4242)
+            notes: "Implementing fix", agentKind: "claude", hidden: false, sessionID: 4242)
         let out = MCPLayout.surfacesJSONData([row])
         #expect(out.count == 1)
         let d = out[0]
@@ -455,6 +455,22 @@ struct MCPServerTests {
         #expect(d["agentKind"] as? String == "claude")
         // fork / Agent Queue (§8.4): sessionID is a PLAIN integer, always present.
         #expect((d["sessionID"] as? NSNumber)?.uint64Value == 4242)
+        // fork / Agent Manager: hidden is OMITTED when false (not hidden).
+        #expect(d["hidden"] == nil)
+    }
+
+    // fork / Agent Manager: a hidden tile emits `hidden:true` so the summarizer skips it.
+    @Test func surfacesJSONDataEmitsHiddenWhenTrue() {
+        let row = MCPLayout.SurfaceRow(
+            id: "ABC", title: "claude", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: "waiting", lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: true, sessionID: 7)
+        let d = MCPLayout.surfacesJSONData([row])[0]
+        #expect(d["hidden"] as? Bool == true)
     }
 
     // fork: the three optional fields are OMITTED (not null/empty) when unknown.
@@ -466,7 +482,7 @@ struct MCPServerTests {
             focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
-            agentKind: nil, sessionID: 0)
+            agentKind: nil, hidden: false, sessionID: 0)
         let d = MCPLayout.surfacesJSONData([row])[0]
         #expect(d["processName"] == nil)
         #expect(d["command"] == nil)
@@ -477,6 +493,7 @@ struct MCPServerTests {
         #expect(d["lastTool"] == nil)
         #expect(d["notes"] == nil)
         #expect(d["agentKind"] == nil)
+        #expect(d["hidden"] == nil)
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)
@@ -982,6 +999,62 @@ struct MCPServerTests {
         #expect(s?.running.isEmpty == true)
         // present:false round-trips (the "run gone" report).
         let gone = QueueStatusPayload.fromArguments(["queueName": "Q", "present": false])?.status
+        #expect(gone?.present == false)
+    }
+
+    // MARK: - Agent Queue: report_queue_graph payload parsing (backlog graph)
+
+    @Test func queueGraphPayloadParsesFullArgs() {
+        let p = QueueGraphPayload.fromArguments([
+            "queueName": "ExampleOS", "present": true, "backlog": 7,
+            "nodes": [
+                ["key": "EX-1", "title": "do x", "url": "https://t/EX-1",
+                 "state": "In Progress", "stateType": "started", "done": false,
+                 "labels": ["Design needed", "Customer"], "blockedBy": ["EX-9"],
+                 "priorityLabel": "High"],
+                ["key": "EX-2", "done": true],
+            ],
+        ])
+        let g = p?.graph
+        #expect(g?.queueName == "ExampleOS")
+        #expect(g?.present == true)
+        #expect(g?.backlog == 7)
+        #expect(g?.nodes.count == 2)
+        let n = g?.nodes.first
+        #expect(n?.key == "EX-1")
+        #expect(n?.title == "do x")
+        #expect(n?.state == "In Progress")
+        #expect(n?.stateType == "started")
+        #expect(n?.done == false)
+        #expect(n?.labels == ["Design needed", "Customer"])
+        #expect(n?.blockedBy == ["EX-9"])
+        #expect(n?.priorityLabel == "High")
+        // Second node: done true, missing arrays default [], no priority mark.
+        #expect(g?.nodes.last?.done == true)
+        #expect(g?.nodes.last?.labels.isEmpty == true)
+        #expect(g?.nodes.last?.blockedBy.isEmpty == true)
+        #expect(g?.nodes.last?.priorityLabel == nil)
+    }
+
+    @Test func queueGraphPayloadRejectsMissingNameAndDropsKeylessNodes() {
+        #expect(QueueGraphPayload.fromArguments(["backlog": 3]) == nil)
+        #expect(QueueGraphPayload.fromArguments(["queueName": "  "]) == nil)
+        // A node with no/blank key is dropped (mirrors the sidecar parse).
+        let g = QueueGraphPayload.fromArguments([
+            "queueName": "Q", "nodes": [["key": ""], ["title": "no key"], ["key": "A-2"]],
+        ])?.graph
+        #expect(g?.nodes.count == 1)
+        #expect(g?.nodes.first?.key == "A-2")
+    }
+
+    @Test func queueGraphPayloadDefaultsAndGone() {
+        // present defaults true; backlog absent ⇒ 0; nodes absent ⇒ [].
+        let g = QueueGraphPayload.fromArguments(["queueName": "Q"])?.graph
+        #expect(g?.present == true)
+        #expect(g?.backlog == 0)
+        #expect(g?.nodes.isEmpty == true)
+        // present:false round-trips (the "run gone" graph report).
+        let gone = QueueGraphPayload.fromArguments(["queueName": "Q", "present": false])?.graph
         #expect(gone?.present == false)
     }
 

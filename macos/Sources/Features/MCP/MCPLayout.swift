@@ -97,6 +97,10 @@ enum MCPLayout {
         /// keys off THIS (not `processName`, which is `bash` under the claude-pool
         /// wrapper) to decide a surface is an agent worth summarizing.
         let agentKind: String?
+        /// fork / Agent Manager: whether the user HID this surface's tile in the Agent
+        /// Dashboard. Sourced from the dashboard model; false when the dashboard is
+        /// disabled / the surface is unknown. The summarizer skips hidden tiles.
+        let hidden: Bool
         /// fork / Agent Queue (§8.4): the STABLE pty-host session id
         /// (`ghostty_surface_session_id`), the supervisor's persistence/re-adoption
         /// key (§9). 0 when there is no host session (the `.exec` backend / no
@@ -170,6 +174,7 @@ enum MCPLayout {
                     lastTool: hook?.lastTool,
                     notes: hook?.notes,
                     agentKind: hook?.agentKind,
+                    hidden: hook?.hidden ?? false,
                     sessionID: sessionID))
             }
         }
@@ -198,6 +203,9 @@ enum MCPLayout {
             if let t = $0.lastTool { d["lastTool"] = t }
             if let notes = $0.notes { d["notes"] = notes }
             if let kind = $0.agentKind { d["agentKind"] = kind }
+            // fork / Agent Manager: emit `hidden` only when true (absent ⇒ not
+            // hidden), mirroring the omit-when-default style of the agent-* fields.
+            if $0.hidden { d["hidden"] = true }
             // (Agent Queue, §8.4) a PLAIN integer — emit UNCONDITIONALLY (the
             // supervisor keys persistence on it and self-disables when it is 0).
             // JSON numbers are doubles; UInt64 fits exactly within 2^53 session-id
@@ -405,7 +413,8 @@ enum MCPLayout {
         command: String,
         cwd: String?,
         firstTab: Bool,
-        env: [String: String]
+        env: [String: String],
+        balanced: Bool = false
     ) -> (id: String, sessionID: UInt64)? {
         // Render the command as a single line of initial input with one trailing
         // newline = one submit. `singleLine` collapses INTERIOR newlines (so a
@@ -438,10 +447,33 @@ enum MCPLayout {
             return identity(of: view)
         }
 
-        // Split path: resolve the target + the NewDirection, split it.
+        // Split path: resolve the controller via the anchor `targetUUID`.
         guard let targetUUID,
-              let (controller, target) = controllerAndView(forUUID: targetUUID),
-              let newDir = newDirection(direction) else { return nil }
+              let (controller, anchor) = controllerAndView(forUUID: targetUUID)
+        else { return nil }
+
+        // Pick the pane to split + the direction. In BALANCED mode (the Agent Queue, §12)
+        // we ignore the caller's direction and split the LARGEST leaf in the anchor's tab
+        // tree along its longer side — a binary-space-partition that stays evenly tiled and
+        // self-heals when a pane closes (no stale grid-slot geometry). Otherwise we split
+        // the anchor in the explicit direction (the old behavior, still used by callers that
+        // know exactly where they want the split).
+        let target: Ghostty.SurfaceView
+        let newDir: SplitTree<Ghostty.SurfaceView>.NewDirection
+        if balanced {
+            // Real pixel content size so "largest" + aspect are honest (NOT artificial
+            // column/row units). Fall back to a wide default so the first split goes right.
+            let bounds = controller.window?.contentView?.bounds.size
+                ?? CGSize(width: 1600, height: 1000)
+            guard let pick = controller.surfaceTree.largestLeafSplit(within: bounds) else { return nil }
+            target = pick.view
+            newDir = pick.direction
+        } else {
+            guard let dir = newDirection(direction) else { return nil }
+            target = anchor
+            newDir = dir
+        }
+
         revealIfZoomedAway(controller, target)
         var config = Ghostty.SurfaceConfiguration()
         if let cwd { config.workingDirectory = cwd }

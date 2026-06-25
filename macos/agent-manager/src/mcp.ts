@@ -19,7 +19,7 @@
 // crash on a transient MCP failure — the caller logs + continues.
 
 import type { QueueCommand } from "./queue/commands.js";
-import type { QueueStatusReport } from "./queue/status.js";
+import type { QueueGraphReport, QueueStatusReport } from "./queue/status.js";
 
 /** Thrown for any MCP transport / protocol / tool failure. The loop catches it. */
 export class McpError extends Error {
@@ -58,6 +58,10 @@ export interface Surface {
   lastTool?: string;
   notes?: string;
   agentKind?: string;
+  /** (Agent Manager) Whether the user HID this surface's tile in the Agent Dashboard.
+   *  OMITTED (=== undefined) when not hidden / unknown. The summarizer skips hidden
+   *  tiles — no point spending a Haiku call on a tile you've decluttered away. */
+  hidden?: boolean;
   /** (Agent Queue) The STABLE host session id (`ghostty_surface_session_id`) — the
    *  supervisor's persistence/re-adoption key (§9). OMITTED (=== undefined) when
    *  absent so a pre-upgrade host that doesn't yet emit it still typechecks. Under
@@ -190,6 +194,23 @@ export class McpClient {
   }
 
   /**
+   * (Agent Queue, backlog graph) Push the run's WHOLE-board snapshot to the GUI via the
+   * `report_queue_graph` MCP tool, so the dashboard shows the "N backlog" button + renders
+   * the dependency-graph canvas. Fired only when the optional `provider.graph` is defined
+   * and a fetch SUCCEEDS (throttled at `intervals.listMs`), plus once with `present:false`
+   * when the run is removed. Fire-and-forget from the caller's view (the runner catches
+   * errors); the wire args mirror `QueueGraphReport` 1:1.
+   */
+  async reportQueueGraph(graph: QueueGraphReport): Promise<void> {
+    await this.call("report_queue_graph", {
+      queueName: graph.queueName,
+      present: graph.present,
+      backlog: graph.backlog,
+      nodes: graph.nodes, // each: key, done, labels[], blockedBy[], + optional fields
+    });
+  }
+
+  /**
    * (Agent Queue, §8.1) spawn_split_command — split a TARGET surface in a given
    * direction (or open the run's first tab when `firstTab`) running `command`, and
    * return the new leaf's stable identity `{id (UUID), sessionId}`. The macOS-layer
@@ -209,6 +230,10 @@ export class McpClient {
   async spawnSplitCommand(args: {
     targetUUID?: string;
     direction?: "right" | "down" | "left" | "up";
+    /** (balanced BSP §12) Split the LARGEST pane in the target's tab along its longer
+     *  side instead of using `direction` — the queue's default tiling, which self-heals
+     *  when a pane closes. `targetUUID` then just anchors the tab. */
+    balanced?: boolean;
     command: string;
     cwd?: string;
     firstTab?: boolean;
@@ -220,6 +245,7 @@ export class McpClient {
     const toolArgs: Record<string, unknown> = { command: args.command };
     if (args.targetUUID !== undefined) toolArgs.targetUUID = args.targetUUID;
     if (args.direction !== undefined) toolArgs.direction = args.direction;
+    if (args.balanced !== undefined) toolArgs.balanced = args.balanced;
     if (args.cwd !== undefined) toolArgs.cwd = args.cwd;
     if (args.firstTab !== undefined) toolArgs.firstTab = args.firstTab;
     if (args.env !== undefined && Object.keys(args.env).length > 0) {

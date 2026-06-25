@@ -12,12 +12,23 @@
 //      LLM-free dispatch/track/close loop on its OWN timer (decoupled so the slow
 //      summarizer can never starve it). Armed only when a queue is configured.
 //
+// The two loops are INDEPENDENT (see parseLoopEnablement): the shared sidecar runs
+// whichever the controller arms, so the queue can run with the summarizer OFF (no
+// Haiku billing) and vice-versa. The controller launches the sidecar when EITHER
+// feature is enabled.
+//
 // The summarizer's Haiku calls bill against the ambient Claude Code auth by
 // default; an optional account spec (account.ts) routes them to a separate account.
 //
 // Config (env, set by the Swift AgentManagerController; mirrors macos/mcp-shim):
 //   GHOSTTY_MCP_URL      MCP server URL (default http://127.0.0.1:8765/mcp)
 //   GHOSTTY_MCP_TOKEN    shared secret, sent as the X-Ghostty-Token header (opt.)
+//   GHOSTTY_SUMMARIZER   "1"/ABSENT ⇒ run the summarizer; "0" ⇒ don't (gated on the
+//                        `agent-manager` key). Absent means ON for back-compat (the
+//                        summarizer used to be unconditional), so an old GUI that
+//                        respawns a new dist keeps summarizing.
+//   GHOSTTY_AGENT_QUEUE  "1" ⇒ arm the queue supervisor (gated on `agent-queue`);
+//                        absent ⇒ off. INDEPENDENT of GHOSTTY_SUMMARIZER.
 //   GHOSTTY_AGENT_MANAGER=1  set by the controller (and inherited by the `claude`
 //                            subprocess the SDK spawns) so the agent-state hook
 //                            early-exits and the summarizer's own model activity
@@ -33,18 +44,21 @@
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 
+import { installFileLogger } from "./logfile.js";
 import { McpClient, McpError, type Surface } from "./mcp.js";
 import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
 import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
 import { summarize as defaultSummarize } from "./model.js";
 import { readAccountSpec, resolveAccountDir } from "./account.js";
+import { loadConfig } from "./config.js";
 import {
-  DEFAULT_CONFIG,
   ConcurrencyBudget,
   buildContext,
   composePrompt,
   preGate,
-  fingerprint,
+  changeSignals,
+  changeTail,
+  backoffDelayMs,
   parseSummary,
   shouldSummarize,
   isAgentSurface,
@@ -134,6 +148,24 @@ function parsePositiveInt(v: string | undefined, def: number): number {
   return Number.isInteger(n) && n > 0 ? n : def;
 }
 
+/** Which INDEPENDENT loops the shared sidecar should run, from its env. PURE.
+ *  The Swift controller (AgentManagerController) sets GHOSTTY_SUMMARIZER per the
+ *  `agent-manager` key and GHOSTTY_AGENT_QUEUE per `agent-queue`; either alone (or
+ *  both) can run.
+ *  - summarizer: ON unless explicitly "0". An ABSENT flag is ON for BACK-COMPAT —
+ *    the summarizer used to be unconditional, so an old GUI that respawns this (new)
+ *    dist without the flag keeps summarizing; only a new GUI with agent-manager off
+ *    writes the explicit "0".
+ *  - queue: opt-in, ON only on exactly "1" (absent ⇒ off, unchanged). */
+export function parseLoopEnablement(
+  env: Record<string, string | undefined>,
+): { summarizer: boolean; queue: boolean } {
+  return {
+    summarizer: env.GHOSTTY_SUMMARIZER !== "0",
+    queue: env.GHOSTTY_AGENT_QUEUE === "1",
+  };
+}
+
 /** The single-shot model call seam (defaults to the real SDK-backed summarize).
  *  Injectable so the loop can be exercised without spawning the CLI. `configDir`
  *  (optional) routes the spawned `claude`'s auth/billing to a specific account. */
@@ -178,6 +210,13 @@ export interface LoopDeps {
    *  (where `view.bell`/`list_surfaces.bell` is never set, so the poll backstop above is
    *  blind). Drained into `forcedBell` at the start of each sweep. */
   pendingBellIds: Set<string>;
+  /** Adaptive RATE-LIMIT BACKOFF state (account-WIDE, not per-session). When the
+   *  summarizer's own model calls keep failing — its account is rate-limited / returns
+   *  no usable summary — `failureStreak` rises and `nextProbeMs` pushes the next probe
+   *  out (exponential, capped by `cfg.rateLimitBackoffMaxMs`). While backed off the
+   *  sweep makes at most ONE probe call per window; the first SUCCESS resets the streak
+   *  to 0 and normal cadence resumes. Held on deps so a test can seed/inspect it. */
+  summarizerBackoff: { failureStreak: number; nextProbeMs: number };
   /** Optional CLAUDE_CONFIG_DIR for the summarizer's model calls — routes auth/billing
    *  to a specific claude-accounts account (see account.ts). Omitted ⇒ inherit the
    *  ambient auth (the default; works with no claude-accounts installed). */
@@ -200,11 +239,17 @@ export interface LoopDeps {
  * the sweep — so the gate and the recorded fingerprint share the SAME basis
  * (the freshly-read viewport tail), keeping idle-skip honest.
  */
+/** The outcome of one summarizeOne attempt, for the rate-limit backoff aggregator:
+ *  "ok" = a model call SUCCEEDED + parsed (the account works); "fail" = a call was
+ *  made but threw / returned no usable summary (rate-limited or junk); "skip" = no
+ *  model call happened (the full gate said not-due). */
+type SummarizeResult = "ok" | "fail" | "skip";
+
 async function summarizeOne(
   surface: Surface,
   deps: LoopDeps,
   opts: { bellRang?: boolean } = {},
-): Promise<void> {
+): Promise<SummarizeResult> {
   const { client, overrides, cfg } = deps;
   const bellRang = opts.bellRang === true;
   const prev = deps.lastBySession.get(surface.id);
@@ -216,12 +261,13 @@ async function summarizeOne(
   // on EVERY poll forever — an unbounded Haiku-cost leak with no backoff. We PRESERVE
   // the prior fingerprint + summary so the change-detector is not poisoned: a genuine
   // state change still re-summarizes once debounce passes, and a persistently failing
-  // surface keeps retrying (its recorded fingerprint differs from the live one) until
+  // surface keeps retrying (its recorded signals/tail differ from the live one) until
   // it succeeds — just no more than once per debounceMs. With no prior record the
-  // sentinel "" fingerprint differs from any real one, so the retry still fires.
+  // sentinel "" signals/tail differ from any real one, so the retry still fires.
   const recordAttempt = (): void => {
     deps.lastBySession.set(surface.id, {
-      fingerprint: prev?.fingerprint ?? "",
+      signals: prev?.signals ?? "",
+      tail: prev?.tail ?? "",
       atMs: deps.now(),
       summary: prev?.summary ?? "",
     });
@@ -241,7 +287,7 @@ async function summarizeOne(
     // EXCEPTION: a bell-triggered classify (bellRang) always proceeds, even when the
     // gate would skip — a bell is an event worth one classify so Haiku can decide
     // whether to promote it to the "attention needed" state.
-    if (!decision.due && !bellRang) return; // unchanged/idle on the real viewport — skip
+    if (!decision.due && !bellRang) return "skip"; // unchanged/idle — skip (no model call)
 
     // Prefer the loop's own record for continuity; fall back to the round-tripped
     // `notes` (our last summary echoed by list_surfaces). `||` so the "" sentinel
@@ -264,7 +310,7 @@ async function summarizeOne(
       recordAttempt();
       errlog(`surface ${surface.id}: model reply not parseable; skipping`);
       if (bellRang) await bellPromote(deps, surface, "unparseable classify (fail-open)");
-      return;
+      return "fail";
     }
 
     await client.setAnnotation(surface.id, {
@@ -274,7 +320,8 @@ async function summarizeOne(
     });
 
     deps.lastBySession.set(surface.id, {
-      fingerprint: fingerprint(snapshot, cfg),
+      signals: changeSignals(surface),
+      tail: changeTail(snapshot.viewport, cfg),
       atMs: deps.now(),
       summary: parsed.summary,
     });
@@ -292,6 +339,7 @@ async function summarizeOne(
       await bellPromote(deps, surface, parsed.summary);
     }
     log(`surface ${surface.id}: "${parsed.summary}"`);
+    return "ok";
   } catch (err) {
     // A read/model/annotate failure — throttle the retry so a persistently failing
     // surface costs at most one attempt per debounceMs, not one per poll. No fresh
@@ -310,6 +358,7 @@ async function summarizeOne(
     // (incl. the summarizer's own account being out of tokens) ⇒ we have no confident
     // verdict ⇒ promote. A failing classifier must never silence a bell.
     if (bellRang) await bellPromote(deps, surface, "classify error (fail-open)");
+    return "fail";
   } finally {
     deps.budget.release();
   }
@@ -448,33 +497,67 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     }
   }
 
-  const fired: Array<Promise<void>> = [];
+  // Cheap pre-gate from row fields only (no read_surface yet): drop non-agent / hidden /
+  // debounced surfaces. A bell rising edge FORCES a classify past the DEBOUNCE gate — but
+  // NEVER past the not-agent/hidden gate (a bell on a non-agent shell is not promoted) — so
+  // a forced surface is ALSO a candidate when the pre-gate's SOLE objection is debounce.
+  const candidates = surfaces.filter((s) => {
+    const pre = preGate(s, deps.lastBySession.get(s.id), deps.now(), deps.cfg);
+    return pre.pass || (forcedBell.has(s.id) && pre.reason === "debounce");
+  });
 
-  // SUMMARIZER pass.
-  for (const surface of surfaces) {
+  // RATE-LIMIT BACKOFF (account-wide): while the summarizer's own calls keep failing,
+  // slow WAY down and make at most ONE probe call per window until one succeeds (the
+  // limit reset). `failureStreak === 0` is the normal path.
+  const bo = deps.summarizerBackoff;
+  if (bo.failureStreak > 0) {
+    if (deps.now() < bo.nextProbeMs) return; // still cooling down — no model calls
+    // PROBE: try candidates sequentially until ONE makes a real model call (not a
+    // gate-skip). A forced (belled) surface still carries bellRang so it FAIL-OPEN
+    // promotes even while the account is backed off.
+    let probed: SummarizeResult | null = null;
+    for (const surface of candidates) {
+      if (!deps.budget.tryAcquire()) break;
+      const r = await summarizeOne(surface, deps, { bellRang: forcedBell.has(surface.id) });
+      if (r !== "skip") { probed = r; break; }
+    }
+    if (probed === "ok") {
+      log(`rate-limit backoff cleared after ${bo.failureStreak} failure(s); resuming`);
+      bo.failureStreak = 0;
+      bo.nextProbeMs = 0;
+    } else if (probed === "fail") {
+      bo.failureStreak += 1;
+      const delay = backoffDelayMs(bo.failureStreak, deps.cfg.debounceMs, deps.cfg.rateLimitBackoffMaxMs);
+      bo.nextProbeMs = deps.now() + delay;
+      log(`rate-limit backoff: probe failed (streak ${bo.failureStreak}); next probe in ${Math.round(delay / 1000)}s`);
+    }
+    // probed === null ⇒ no real call this sweep (all gate-skipped); leave the backoff
+    // untouched and retry on the next sweep.
+    return;
+  }
+
+  // NORMAL path: fire due surfaces concurrently (bounded by the budget = per-sweep batch
+  // cap). A forced surface carries bellRang so Haiku can promote it.
+  const fired: Array<Promise<SummarizeResult>> = [];
+  for (const surface of candidates) {
     const forced = forcedBell.has(surface.id);
-    // Cheap pre-gate from row fields only (no read_surface yet): skip non-agent
-    // + debounced surfaces. The viewport-aware fingerprint/idle decision happens
-    // inside summarizeOne after the read, so the gate and the recorded
-    // fingerprint share the same basis.
-    const pre = preGate(surface, deps.lastBySession.get(surface.id), deps.now(), deps.cfg);
-    // A bell rising edge FORCES a classify past the debounce gate — but NEVER past the
-    // not-agent gate (a bell on a non-agent shell is not promoted). So we let a forced
-    // surface through ONLY when the pre-gate's sole objection is debounce.
-    if (!pre.pass && !(forced && pre.reason === "debounce")) continue;
-    // NOTE: because the loop is self-paced + non-overlapping (a sweep fully
-    // settles before the next setTimeout), `cfg.maxConcurrent` doubles as a
-    // per-sweep BATCH cap: at most maxConcurrent tiles are summarized per
-    // POLL_INTERVAL_MS sweep, so with N>maxConcurrent due tiles a full refresh
-    // takes ceil(N/maxConcurrent) sweeps. This is fine for Phase 1 (it also
-    // rate-limits a many-tile setup); it is not the cross-overlap global cap the
-    // design's wording might imply, but is functionally equivalent given no
-    // overlap.
     if (!deps.budget.tryAcquire()) break; // budget exhausted this sweep
     fired.push(summarizeOne(surface, deps, { bellRang: forced }));
   }
 
-  await Promise.all(fired);
+  const results = await Promise.all(fired);
+  // ENTER backoff iff this sweep made calls and EVERY one failed (a success anywhere
+  // means the account is healthy ⇒ stay normal). A success resets; otherwise arm the
+  // first backoff window so the next sweep probes instead of firing the whole batch.
+  if (results.includes("ok")) {
+    bo.failureStreak = 0;
+    bo.nextProbeMs = 0;
+  } else if (results.includes("fail")) {
+    bo.failureStreak += 1;
+    const delay = backoffDelayMs(bo.failureStreak, deps.cfg.debounceMs, deps.cfg.rateLimitBackoffMaxMs);
+    bo.nextProbeMs = deps.now() + delay;
+    log(`rate-limit backoff engaged: ${results.filter((r) => r === "fail").length} call(s) failed; next probe in ${Math.round(delay / 1000)}s`);
+  }
   // NOTE: the AGENT QUEUE SUPERVISOR is NOT run here. It is a deterministic,
   // latency-sensitive loop that must NOT be gated behind the (slow, LLM-bound)
   // summarizer pass above — with many agents, `Promise.all(fired)` can take tens of
@@ -496,24 +579,48 @@ export async function runQueueSweepSafe(deps: LoopDeps): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Tee console output to a durable rotating file FIRST, so every log below (incl. the
+  // queue engine's run/prune/command lines) is diagnosable after the fact — the Swift
+  // controller pipes stdout to an unread pipe and discards stderr, so without this there
+  // is no trail (see logfile.ts).
+  installFileLogger();
   const url = process.env.GHOSTTY_MCP_URL ?? "http://127.0.0.1:8765/mcp";
   const token = process.env.GHOSTTY_MCP_TOKEN;
 
-  const cfg: SummarizerConfig = { ...DEFAULT_CONFIG };
+  // Which INDEPENDENT loops to run. The controller launches the sidecar when EITHER
+  // feature is on, then arms each loop via its own env flag (see parseLoopEnablement).
+  const { summarizer: summarizerEnabled, queue: queueEnabled } =
+    parseLoopEnablement(process.env);
+
+  const home = homedir();
+  // Optional config overlay (see config.ts): debounce / fuzzy change threshold /
+  // hidden-skip / tail windows, tunable in ~/.config/ghostty-ramon/agent-manager/
+  // config.json WITHOUT a rebuild (restart the sidecar to apply). Absent ⇒ defaults.
+  const { cfg, loaded: cfgLoaded } = loadConfig(home, undefined, errlog);
+  if (cfgLoaded) {
+    log(
+      `loaded summarizer config: debounce=${cfg.debounceMs}ms ` +
+        `changeRatio=${cfg.changeRatioThreshold} skipHidden=${cfg.skipHidden} ` +
+        `idleSkip=${cfg.idleSkipSeconds}s`,
+    );
+  }
   const client = new McpClient({ url, token });
 
   // Optional summarizer ACCOUNT routing (see account.ts). Default ⇒ inherit the
   // ambient Claude Code auth (works with no claude-accounts installed). When set,
   // the summarizer's model calls bill against the configured account's CLAUDE_CONFIG_DIR.
-  const home = homedir();
-  const accountSpec = readAccountSpec(home);
-  const summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
-  if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
-    errlog(
-      `summarizer account "${accountSpec.trim()}" did not resolve to a directory; using default auth`,
-    );
-  } else if (summarizerConfigDir) {
-    log(`summarizer billing routed to CLAUDE_CONFIG_DIR=${summarizerConfigDir}`);
+  // Only relevant to the summarizer, so skip it entirely in queue-only mode.
+  let summarizerConfigDir: string | undefined;
+  if (summarizerEnabled) {
+    const accountSpec = readAccountSpec(home);
+    summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
+    if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
+      errlog(
+        `summarizer account "${accountSpec.trim()}" did not resolve to a directory; using default auth`,
+      );
+    } else if (summarizerConfigDir) {
+      log(`summarizer billing routed to CLAUDE_CONFIG_DIR=${summarizerConfigDir}`);
+    }
   }
 
   // (bell-attention) The GUI sets GHOSTTY_BELL_FILTER=1 from `agent-manager-bell-filter`
@@ -532,16 +639,16 @@ async function main(): Promise<void> {
     bellFilter,
     bellSeenBySession: new Map<string, boolean>(),
     pendingBellIds: new Set<string>(),
+    summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     summarizerConfigDir,
   };
   if (bellFilter) log("bell-attention: bell promotion ENABLED");
 
-  // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on AND at
-  // least one valid template loads from the templates dir. The Swift controller sets
-  // GHOSTTY_AGENT_QUEUE=1 (master enable) + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
-  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys; absent ⇒ the queue stays
-  // a no-op and the summarizer behavior is byte-identical.
-  if (process.env.GHOSTTY_AGENT_QUEUE === "1") {
+  // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on (the Swift
+  // controller sets GHOSTTY_AGENT_QUEUE=1 + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
+  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys). Absent ⇒ the queue stays
+  // a no-op; this is INDEPENDENT of the summarizer (either can run alone).
+  if (queueEnabled) {
     const templatesDir = process.env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR ?? defaultTemplatesDir();
     const stateDir = defaultStateDir();
     const maxTotal = parsePositiveInt(process.env.GHOSTTY_AGENT_QUEUE_MAX_TOTAL, 8);
@@ -581,7 +688,18 @@ async function main(): Promise<void> {
     );
   }
 
-  log(`summarizer started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
+  log(
+    `sidecar started; MCP=${url} summarizer=${summarizerEnabled} ` +
+      `queue=${deps.queue !== undefined} (poll ${POLL_INTERVAL_MS}ms)`,
+  );
+
+  // The controller's gate guarantees at least one loop is armed, but guard anyway:
+  // with nothing to run, return so the process exits cleanly (no timers pending)
+  // rather than idle forever holding the MCP connection.
+  if (!summarizerEnabled && deps.queue === undefined) {
+    errlog("neither summarizer nor queue is enabled; nothing to do — exiting");
+    return;
+  }
 
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
@@ -665,15 +783,20 @@ async function main(): Promise<void> {
 
   // Start the INDEPENDENT queue loop FIRST, so it is never delayed (or blocked
   // forever) by the slow — or occasionally hanging — first summarizer sweep in
-  // `tick`. Both loops then run concurrently on the event loop.
+  // `tick`. Each loop runs only when its feature is armed; whichever are on run
+  // concurrently on the event loop, and their pending timers keep the process alive.
   if (deps.queue !== undefined) void queueTick();
-  // (bell-attention v2 slice 4) Arm the bell-reactive loop only when bell promotion is on
-  // (it needs the attention tier to promote into) AND we have the waitForEvent capability.
-  if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
-    log("bell-attention: event-driven classify ENABLED (wait_for_event)");
-    void bellReactiveLoop();
+  if (summarizerEnabled) {
+    // (bell-attention v2 slice 4) Arm the bell-reactive loop only when bell promotion is on
+    // (it needs the attention tier to promote into) AND we have the waitForEvent capability.
+    // Nested under summarizerEnabled: promotion rides the summarizer's classify, so the
+    // queue-only mode (agent-manager off) never spins it.
+    if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
+      log("bell-attention: event-driven classify ENABLED (wait_for_event)");
+      void bellReactiveLoop();
+    }
+    await tick();
   }
-  await tick();
 }
 
 // Only start the poll loop when this module is the program ENTRY POINT (i.e.

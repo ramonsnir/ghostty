@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import SwiftUI
 import Testing
 @testable import Ghostty
 
@@ -1490,6 +1491,13 @@ struct AgentDashboardHookStateTests {
         #expect(snap[a]?.lastTool == "Bash")
         #expect(snap[a]?.lastPrompt == "do it")
         #expect(snap[a]?.notes == "Implementing fix")
+        #expect(snap[a]?.hidden == false)
+        // fork / Agent Manager: hiding the tile flips the snapshot's `hidden` bit
+        // (so the summarizer can skip it) without dropping its other state.
+        model.hide(a)
+        let snap2 = model.hookSnapshot()
+        #expect(snap2[a]?.hidden == true)
+        #expect(snap2[a]?.agentState == "working")
     }
 
     @Test func hookSnapshotIncludesDetectedAgentButOmitsUnknownSurface() {
@@ -2004,6 +2012,49 @@ struct AgentDashboardOriginTests {
         // sections drops the excluded beta tile.
         #expect(model.sections.flatMap { $0.entries }.map(\.sessionID) == [1])
     }
+
+    @Test func filterBarVisibilityKeepsShowAllReachable() {
+        // Pure helper: the bar shows with 2+ origins (so the user can switch) AND
+        // whenever ANY exclusion is active — even with a single remaining origin.
+        // No origins, nothing excluded → no bar.
+        #expect(!AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: [], excludedOrigins: []))
+        // Single origin, nothing excluded → no bar (a single-origin fleet needs none).
+        #expect(!AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["(other)"], excludedOrigins: []))
+        // Two origins → bar (switch between them).
+        #expect(AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["alpha", "(other)"], excludedOrigins: []))
+        // THE TRAP: a stale exclusion left `(other)` excluded as the sole origin. The
+        // old `knownOrigins.count > 1` gate hid the bar → no reachable "Show all" →
+        // every tile silently filtered. The bar MUST stay visible here.
+        #expect(AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["(other)"], excludedOrigins: ["(other)"]))
+        // Even a stale exclusion of an origin no longer present keeps the bar (so the
+        // user can clear it via "Show all").
+        #expect(AgentDashboardModel.shouldShowFilterBar(
+            knownOrigins: ["(other)"], excludedOrigins: ["gone-queue"]))
+    }
+
+    @Test func staleOtherExclusionDoesNotTrapTheView() {
+        // End-to-end: a queue was soloed, then ended; only non-queue `(other)` agents
+        // remain but `(other)` is still excluded. The bar must show (escape hatch),
+        // and "Show all" must restore the tiles.
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            originFilterStore: InMemoryOriginFilterStore(["(other)"]))
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([(a, 1), (b, 2)]))
+        model.applyAgents(agents([a, b]))  // no annotations → both `(other)`
+        // Single remaining origin, but it's excluded → the trap state.
+        #expect(model.knownOrigins == ["(other)"])
+        #expect(model.sections.flatMap { $0.entries }.isEmpty)  // everything filtered out
+        // The fix: the bar stays visible so "Show all" is reachable.
+        #expect(model.showsFilterBar)
+        // Recovering via "Show all" brings the tiles back.
+        model.showAllOrigins()
+        #expect(model.sections.flatMap { $0.entries }.map(\.sessionID).sorted() == [1, 2])
+    }
 }
 
 /// (ramon fork / Agent Queue, §11 health) Tests for the queue-health pieces: the
@@ -2081,6 +2132,70 @@ struct AgentQueueHealthTests {
         #expect(QueueHealthFormat.capDraft(status("Q", dispatched: 4, maxItems: nil)) == "")
     }
 
+    // MARK: - QueueHealthFormat.capPlus ("+1" / "+ all waiting" relative bumps)
+
+    @Test func capPlusRaisesFiniteCapByDelta() {
+        // "+1": cap 3 → 4 (at steady state 3/3 this lets exactly one more dispatch).
+        #expect(QueueHealthFormat.capPlus(status("Q", dispatched: 3, maxItems: 3), 1) == 4)
+        // "+ all waiting" (queued = 5): cap 3 → 8 (the 5 waiting can dispatch, nothing after).
+        #expect(QueueHealthFormat.capPlus(status("Q", queued: 5, dispatched: 3, maxItems: 3), 5) == 8)
+    }
+
+    @Test func capPlusNilForUnlimitedCap() {
+        // A relative bump is meaningless when unlimited (everything already dispatches) —
+        // the buttons are hidden, so the helper returns nil.
+        #expect(QueueHealthFormat.capPlus(status("Q", dispatched: 4, maxItems: nil), 1) == nil)
+    }
+
+    @Test func capPlusClampsAtZero() {
+        // A negative delta can never push the cap below zero.
+        #expect(QueueHealthFormat.capPlus(status("Q", maxItems: 1), -5) == 0)
+    }
+
+    // MARK: - OPTIMISTIC command feedback (instant dashboard update before the sidecar push)
+
+    @Test func parseCapOptimisticMirrorsSidecar() {
+        // number → cap; unlimited tokens → .some(nil); blank/garbage/negative → .none (ignore).
+        if case .some(.some(10)) = QueueStatus.parseCapOptimistic("10") {} else { Issue.record("10 → cap 10") }
+        if case .some(nil) = QueueStatus.parseCapOptimistic("unlimited") {} else { Issue.record("unlimited → nil") }
+        if case .some(nil) = QueueStatus.parseCapOptimistic("0") {} else { Issue.record("0 → nil") }
+        if case .none = QueueStatus.parseCapOptimistic("") {} else { Issue.record("blank → ignore") }
+        if case .none = QueueStatus.parseCapOptimistic("abc") {} else { Issue.record("garbage → ignore") }
+        if case .none = QueueStatus.parseCapOptimistic("-3") {} else { Issue.record("negative → ignore") }
+    }
+
+    @Test func setQueueMaxItemsOptimisticallyUpdatesCap() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", dispatched: 3, maxItems: 3))
+        // A numeric cap shows immediately (no waiting for the sidecar's next sweep).
+        model.setQueueMaxItems(run: "ExampleOS", value: "7")
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == 7)
+        // "unlimited" → nil (∞).
+        model.setQueueMaxItems(run: "ExampleOS", value: "unlimited")
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == nil)
+        // Garbage is NOT applied (the sidecar ignores it — don't fake a change).
+        model.applyQueueStatus(status("ExampleOS", dispatched: 3, maxItems: 5))
+        model.setQueueMaxItems(run: "ExampleOS", value: "abc")
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == 5)
+        // Unknown run: no optimistic entry conjured (just posts the command).
+        model.setQueueMaxItems(run: "Ghost", value: "9")
+        #expect(model.queueStatuses["Ghost"] == nil)
+    }
+
+    @Test func sendRunCommandOptimisticallyUpdatesPhase() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", phase: "running"))
+        model.sendRunCommand(.pause, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"]?.phase == "paused")
+        model.sendRunCommand(.resume, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"]?.phase == "running")
+        model.sendRunCommand(.stop, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"]?.phase == "draining")
+        // Abort clears the section immediately.
+        model.sendRunCommand(.abort, run: "ExampleOS")
+        #expect(model.queueStatuses["ExampleOS"] == nil)
+    }
+
     // MARK: - applyQueueStatus carries next/running items (for the dropdowns)
 
     @Test func surfaceIDResolvesByQueueNameAndKey() {
@@ -2101,5 +2216,139 @@ struct AgentQueueHealthTests {
             running: [QueueStatus.Item(key: "EX-1", title: "Run", url: "https://linear.app/x/EX-1")]))
         #expect(model.queueStatuses["ExampleOS"]?.next.first?.url == "https://linear.app/x/EX-2")
         #expect(model.queueStatuses["ExampleOS"]?.running.first?.key == "EX-1")
+    }
+}
+
+// MARK: - Backlog graph (the dependency-graph canvas)
+
+@MainActor
+struct QueueBacklogTests {
+    private func node(
+        _ key: String, done: Bool = false, blockedBy: [String] = [],
+        labels: [String] = [], stateType: String? = nil, priorityLabel: String? = nil
+    ) -> QueueGraph.Node {
+        .init(key: key, title: nil, url: nil, state: nil, stateType: stateType,
+              done: done, labels: labels, blockedBy: blockedBy,
+              priorityLabel: priorityLabel)
+    }
+
+    // MARK: priorityColor — generic priority MARK → color (nil = no mark)
+
+    @Test func priorityColorMarksKnownAndUnknownButNotEmpty() {
+        #expect(QueueBacklogColors.priorityColor(for: nil) == nil)
+        #expect(QueueBacklogColors.priorityColor(for: "") == nil)
+        #expect(QueueBacklogColors.priorityColor(for: "   ") == nil)
+        #expect(QueueBacklogColors.priorityColor(for: "Urgent") == .red)
+        #expect(QueueBacklogColors.priorityColor(for: "high") == .orange)
+        #expect(QueueBacklogColors.priorityColor(for: "Medium") == .yellow)
+        #expect(QueueBacklogColors.priorityColor(for: "low") == .gray)
+        // An unknown but non-empty label still reads as "marked" (accent, not nil).
+        #expect(QueueBacklogColors.priorityColor(for: "P0") == .accentColor)
+    }
+
+    // MARK: assignLayers — longest-path-from-roots over blockedBy edges
+
+    @Test func rootsAreLayerZero() {
+        let layers = QueueBacklogLayout.assignLayers([node("A"), node("B")])
+        #expect(layers["A"] == 0)
+        #expect(layers["B"] == 0)
+    }
+
+    @Test func chainLayersIncrement() {
+        // A ← B ← C  (B blocked by A, C blocked by B) → layers 0,1,2.
+        let layers = QueueBacklogLayout.assignLayers([
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["B"]),
+        ])
+        #expect(layers["A"] == 0)
+        #expect(layers["B"] == 1)
+        #expect(layers["C"] == 2)
+    }
+
+    @Test func diamondUsesLongestPath() {
+        // A→B, A→C, B→D, C→D : D is 1 + max(B,C) = 2.
+        let layers = QueueBacklogLayout.assignLayers([
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["A"]),
+            node("D", blockedBy: ["B", "C"]),
+        ])
+        #expect(layers["D"] == 2)
+    }
+
+    @Test func danglingEdgeIgnored() {
+        // B is blocked by X which is NOT in the set → B is treated as a root (layer 0).
+        let layers = QueueBacklogLayout.assignLayers([node("B", blockedBy: ["X"])])
+        #expect(layers["B"] == 0)
+    }
+
+    @Test func cycleIsBrokenAndTerminates() {
+        // A↔B mutual block (shouldn't happen, but must not loop forever).
+        let layers = QueueBacklogLayout.assignLayers([
+            node("A", blockedBy: ["B"]), node("B", blockedBy: ["A"]),
+        ])
+        #expect(layers["A"] != nil)
+        #expect(layers["B"] != nil)
+    }
+
+    @Test func columnsGroupByLayerInOrder() {
+        let cols = QueueBacklogLayout.columns([
+            node("A"), node("B", blockedBy: ["A"]), node("C"),
+        ])
+        #expect(cols.count == 2)
+        #expect(cols[0].map(\.key) == ["A", "C"]) // both roots, input order
+        #expect(cols[1].map(\.key) == ["B"])
+    }
+
+    @Test func columnsEmptyForNoNodes() {
+        #expect(QueueBacklogLayout.columns([]).isEmpty)
+    }
+
+    // MARK: applyQueueGraph store/clear
+
+    @Test func applyQueueGraphStoresAndClears() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueGraph(QueueGraph(
+            queueName: "ExampleOS", present: true, backlog: 2, nodes: [node("A"), node("B")]))
+        #expect(model.queueGraphs["ExampleOS"]?.backlog == 2)
+        #expect(model.queueGraphs["ExampleOS"]?.nodes.count == 2)
+        // present:false clears it.
+        model.applyQueueGraph(QueueGraph(queueName: "ExampleOS", present: false, backlog: 0, nodes: []))
+        #expect(model.queueGraphs["ExampleOS"] == nil)
+    }
+
+    // MARK: window default sizing (fit-to-content, clamped to the display)
+
+    @Test func preferredWindowSizeGrowsWithColumnsAndRows() {
+        // A 3-node CHAIN → 3 columns (wide). Three ROOTS → 1 column, 3 rows (tall).
+        let chain = QueueBacklogGeometry.preferredWindowSize([
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["B"]),
+        ])
+        let roots = QueueBacklogGeometry.preferredWindowSize([node("A"), node("B"), node("C")])
+        #expect(chain.width > roots.width)   // more columns → wider
+        #expect(roots.height > chain.height) // more rows → taller
+    }
+
+    @Test func defaultContentSizeFloorsAtMinimum() {
+        // Empty / tiny board → at least the comfortable minimum, regardless of screen.
+        let s = QueueBacklogWindowManager.defaultContentSize(
+            nodes: [], screen: CGSize(width: 3000, height: 2000))
+        #expect(s.width >= QueueBacklogWindowManager.minContentSize.width)
+        #expect(s.height >= QueueBacklogWindowManager.minContentSize.height)
+    }
+
+    @Test func defaultContentSizeClampsToDisplay() {
+        // A big board on a small screen is clamped to (screen − margin), not the full board.
+        let many = (0..<40).map { node("N\($0)", blockedBy: $0 == 0 ? [] : ["N\($0 - 1)"]) }
+        let screen = CGSize(width: 1200, height: 800)
+        let s = QueueBacklogWindowManager.defaultContentSize(nodes: many, screen: screen)
+        #expect(s.width <= screen.width - QueueBacklogWindowManager.screenMargin)
+        #expect(s.height <= screen.height - QueueBacklogWindowManager.screenMargin)
+        // …and the unclamped preference really was larger (the clamp did something).
+        #expect(QueueBacklogGeometry.preferredWindowSize(many).width > s.width)
+    }
+
+    @Test func defaultContentSizeNoScreenIsUnclamped() {
+        // Headless/test context (screen nil): fit-to-content with no upper clamp.
+        let many = (0..<20).map { node("N\($0)", blockedBy: $0 == 0 ? [] : ["N\($0 - 1)"]) }
+        let s = QueueBacklogWindowManager.defaultContentSize(nodes: many, screen: nil)
+        #expect(s.width == QueueBacklogGeometry.preferredWindowSize(many).width)
     }
 }

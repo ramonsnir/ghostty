@@ -56,11 +56,63 @@ export interface ProviderClaimSpec {
   command: string[];
 }
 
-/** The provider triple (§5). */
+/** The OPTIONAL `graph` provider command (backlog graph): emits the run's WHOLE scoped
+ *  board (ALL states — not just actionable, unlike `list`) as JSON for the dashboard's
+ *  backlog-graph canvas. A grooming/debug affordance, NEVER part of dispatch — the engine
+ *  only fetches it (throttled at `intervals.listMs`) to cache + push to the GUI; it never
+ *  drives a dispatch/completion decision. Absent ⇒ no backlog button (the feature is
+ *  silently off). PURE GENERICITY: like `list`/`status`, it is a command emitting JSON; the
+ *  SCRIPT decides terminality (`done`) and category (`stateType`) — Ghostty maps neither
+ *  to any tracker. */
+export interface ProviderGraphSpec {
+  command: string[];
+}
+
+/** The provider triple (§5) + the optional backlog `graph` source. */
 export interface ProviderSpec {
   list: ProviderListSpec;
   status: ProviderStatusSpec;
   claim?: ProviderClaimSpec;
+  graph?: ProviderGraphSpec;
+}
+
+/** (backlog graph) One node of the OPTIONAL `provider.graph` board — the FULL set of items
+ *  in the run's scope (every state), with labels + dependency edges, rendered as a DAG in
+ *  the dashboard's backlog canvas. GENERIC: the provider SCRIPT decides `done` (terminal,
+ *  like status `doneStates`) and the coarse `stateType` category; Ghostty maps neither to a
+ *  tracker. Edges in `blockedBy` may reference keys not present in the node set (e.g. a
+ *  blocker outside the scope) — the GUI just ignores dangling edges. */
+export interface GraphNode {
+  /** Stable item identity (matches a WorkItem.key / the status key). REQUIRED. */
+  key: string;
+  /** Display title (optional). */
+  title?: string;
+  /** Item URL for the canvas "open" affordance (optional). */
+  url?: string;
+  /** Display workflow-state name, e.g. "In Progress" (optional). */
+  state?: string;
+  /** Coarse workflow-state CATEGORY for the node color (e.g. "started"/"completed");
+   *  free-form — the GUI maps known categories to colors and anything else to neutral. */
+  stateType?: string;
+  /** Provider-declared TERMINAL flag (done/canceled/duplicate/…): excluded from the
+   *  backlog count and dimmed in the canvas. The SCRIPT decides (mirrors status doneStates). */
+  done: boolean;
+  /** Free-form labels (e.g. "Design needed", "Customer input"). */
+  labels: string[];
+  /** Keys of items that BLOCK this one — the DAG's dependency edges. */
+  blockedBy: string[];
+  /** GENERIC priority MARK (e.g. "Urgent", "High"): a provider-chosen display string the
+   *  canvas renders as a prominent badge + tinted border so high-priority items stand out.
+   *  The SCRIPT decides which items get one (its own threshold) and what it says — exactly
+   *  like `done`/`stateType`, Ghostty never derives it from the tracker-specific `priority`
+   *  int. Absent ⇒ no mark. The canvas colors it from a generic English-priority vocabulary
+   *  (urgent/high/medium/low) with a neutral fallback, so an unknown label still renders. */
+  priorityLabel?: string;
+}
+
+/** (backlog graph) The board snapshot the sidecar caches + pushes via `report_queue_graph`. */
+export interface QueueGraph {
+  nodes: GraphNode[];
 }
 
 /** The agent launch spec (§5). `command` is the shell command the split runs (item
@@ -156,14 +208,12 @@ export interface QueueTemplate {
   closeOnComplete: boolean;
   /** agentState==idle, unchanged this long, before the close sequence fires (§10). */
   closeStableSeconds: number;
-  /** When true, the RUN quits (removes itself from the registry) as soon as a sweep
-   *  observes a SUCCESSFUL EMPTY `list` AND it has no active assignments — i.e. there
-   *  is nothing left to do, even before `maxItems` is reached. A flaky/failed `list`
-   *  (which is treated as "skip", not "empty") never triggers it, and a momentary
-   *  empty list while agents are still running does NOT quit (active > 0) — the run
-   *  keeps polling for new/unblocked items until BOTH the queue and the fleet are
-   *  empty. Default false (poll forever). */
-  quitWhenEmpty: boolean;
+  // NOTE: there is intentionally NO `quitWhenEmpty`. A run is removed only by an explicit
+  // stop/abort; an empty `list` just means "nothing actionable now" and the run keeps
+  // polling. The old knob keyed on `active.size === 0`, which a transient/incomplete
+  // post-restart `list_surfaces` could falsely produce (by pruning live records) → it would
+  // silently abandon live agents + remove the whole run. Removed; any `quitWhenEmpty` in a
+  // template JSON is now simply ignored.
 }
 
 // ---------------------------------------------------------------------------

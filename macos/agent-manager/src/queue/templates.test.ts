@@ -47,6 +47,34 @@ function goodTemplateObj(): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// provider.graph (backlog board) — optional; same shape as claim.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: provider.graph is optional (absent => undefined)", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.provider.graph, undefined);
+});
+
+test("validateTemplate: a valid provider.graph {command} is parsed", () => {
+  const obj = goodTemplateObj();
+  (obj.provider as Record<string, unknown>).graph = { command: ["python3", "graph.py"] };
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.deepEqual(r.template.provider.graph, { command: ["python3", "graph.py"] });
+});
+
+test("validateTemplate: a malformed provider.graph is rejected (not silently dropped)", () => {
+  for (const graph of [{}, { command: [] }, { command: "x" }, 5, []]) {
+    const obj = goodTemplateObj();
+    (obj.provider as Record<string, unknown>).graph = graph;
+    assert.equal(validateTemplate(obj).ok, false, JSON.stringify(graph));
+  }
+});
+
+// ---------------------------------------------------------------------------
 // §8b start-time params: validateTemplate(params) + resolveParamsEnv + missingRequiredParams.
 // ---------------------------------------------------------------------------
 
@@ -242,6 +270,9 @@ test("validateTemplate: minimal good template fills defaults", () => {
   assert.equal(t.maxItems, TEMPLATE_DEFAULTS.maxItems);
   assert.deepEqual(t.grid, TEMPLATE_DEFAULTS.grid);
   assert.deepEqual(t.intervals, TEMPLATE_DEFAULTS.intervals);
+  // The aligned default: list every 60s, status every 30s (honored by the runner's
+  // interval throttling, not just stored). Pinned so an accidental edit is caught.
+  assert.deepEqual(TEMPLATE_DEFAULTS.intervals, { listMs: 60000, statusMs: 30000 });
   assert.equal(t.onAgentExit, "leave-and-bell");
   assert.equal(t.closeOnComplete, true);
   assert.equal(t.closeStableSeconds, TEMPLATE_DEFAULTS.closeStableSeconds);

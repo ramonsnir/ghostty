@@ -25,7 +25,7 @@ import {
 } from "./runner.js";
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
-import type { QueueStatusReport } from "./status.js";
+import type { QueueStatusReport, QueueGraphReport } from "./status.js";
 import { loadStore, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
@@ -44,7 +44,12 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     concurrency: 9,
     maxItems: 200,
     grid: { cols: 3, rows: 3, fill: "columns" },
-    intervals: { listMs: 45000, statusMs: 20000 },
+    // Throttle DISABLED in the shared fixture (0 = every sweep fetches list+status, the
+    // pre-throttle behavior) so the dispatch/state-machine tests below — which advance the
+    // clock by only ~5s between sweeps — keep exercising every-sweep provider calls. The
+    // interval THROTTLING itself is covered by the dedicated tests at the end of the file,
+    // which build templates with realistic intervals.
+    intervals: { listMs: 0, statusMs: 0 },
     provider: {
       list: { command: ["list"], keyField: "id", titleField: "title", urlField: "url" },
       status: { command: ["status", "{key}"], doneStates: ["done"] },
@@ -52,7 +57,6 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
     closeStableSeconds: 5,
-    quitWhenEmpty: false,
     params: [],
     ...over,
   };
@@ -75,6 +79,8 @@ interface QueueFakeSpec {
   surfaces: Surface[];
   /** list provider output (JSON). */
   listJson?: string;
+  /** graph provider output (JSON) — only used when the template declares provider.graph. */
+  graphJson?: string;
   /** key -> status JSON (defaults to {"state":"working"} = not terminal). */
   statusByKey?: Record<string, string>;
   /** new spawns: a queue of {id,sessionId} returned in order by spawnSplitCommand. */
@@ -93,8 +99,10 @@ interface QueueFake {
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
     list: number;
+    graph: number;
     status: string[];
     reports: QueueStatusReport[];
+    graphReports: QueueGraphReport[];
   };
 }
 
@@ -106,8 +114,10 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     signal: [],
     sendKey: [],
     list: 0,
+    graph: 0,
     status: [],
     reports: [],
+    graphReports: [],
   };
   let spawnIdx = 0;
   const spawns = spec.spawns ?? [];
@@ -147,6 +157,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     async reportQueueStatus(status: QueueStatusReport): Promise<void> {
       calls.reports.push(status);
     },
+    async reportQueueGraph(graph: QueueGraphReport): Promise<void> {
+      calls.graphReports.push(graph);
+    },
   } as unknown as McpClient;
 
   // The provider exec: the FIRST arg element decides list vs status (matches the tmpl
@@ -161,6 +174,10 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
       calls.status.push(key);
       const out = spec.statusByKey?.[key] ?? '{"state":"working"}';
       return { code: 0, stdout: out, stderr: "" };
+    }
+    if (argv[0] === "graph") {
+      calls.graph += 1;
+      return { code: 0, stdout: spec.graphJson ?? '{"nodes":[]}', stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -259,6 +276,7 @@ function makeLoopDeps(client: McpClient): LoopDeps {
     bellFilter: false,
     bellSeenBySession: new Map(),
     pendingBellIds: new Set(),
+    summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     // queue intentionally OMITTED → the queue pass is a no-op.
   };
 }
@@ -996,7 +1014,7 @@ test("runQueueSweep: a crashed (EXITED) split's key is COOLED then LATCHED — N
   assert.ok(run.dispatched.has("K-1"), "latch still held");
 
   // K-1 LEAVES the actionable list (e.g. moved off the queried state) for a sweep → the
-  // latch RE-ARMS (clears). quitWhenEmpty is false in tmpl() so the empty list won't quit.
+  // latch RE-ARMS (clears). An empty list never removes the run (no auto-quit).
   spec.listJson = "[]";
   now += 5000;
   await runQueueSweep(deps);
@@ -1092,12 +1110,17 @@ test("runQueueSweep: the dispatched latch PERSISTS across a sidecar restart (a k
   // --- SIDECAR RESTART: a brand-new run over the SAME persisted store ---
   const run2 = makeQueueRun(tmpl(), store);
   deps = makeQueueDeps(fake, [run2], () => now);
-  now += 200_000; // past grace so the killed record is pruned, isolating the latch
-  await runQueueSweep(deps); // first post-restart sweep reconciles + rehydrates the latch (dispatch suppressed)
+  // First post-restart sweep: reconcile stamps reconcileStartedMs (now), rehydrates the
+  // latch, and SHIELDS the killed record for graceMs after restart (the premature-prune
+  // fix: a transient/incomplete post-restart list_surfaces must not be mistaken for a kill).
+  await runQueueSweep(deps);
   assert.ok(run2.dispatched.has("K-1"), "latch rehydrated from the store on restart");
-  assert.equal(run2.active.has("K-1"), false, "killed record pruned — only the rehydrated latch remains");
-  now += 5000;
-  await runQueueSweep(deps); // now dispatch-armed; K-1 still listed → latch suppresses
+  assert.equal(run2.active.has("K-1"), true, "killed record HELD within the post-restart grace (not pruned yet)");
+  // Advance PAST the reconcile-start grace → the genuinely-gone record is now pruned,
+  // isolating the latch as the sole re-dispatch suppressor.
+  now += 200_000;
+  await runQueueSweep(deps); // dispatch-armed; reconcile prunes K-1; K-1 still listed → latch suppresses
+  assert.equal(run2.active.has("K-1"), false, "killed record pruned once past the restart grace — only the latch remains");
   assert.equal(fake.calls.spawn.length, 1, "NOT re-dispatched after restart (the latch persisted)");
 });
 
@@ -1320,11 +1343,13 @@ test("runQueueSweep: a dispatch after an orphan adoption splits into the adopted
   await runQueueSweep(deps); // armed → dispatch NEW-1 alongside the adopted pane
   assert.equal(fake.calls.spawn.length, 1, "the new item dispatched");
   // The dispatch must SPLIT INTO the adopted pane's tab — NOT open a new tab. The
-  // adopted pane got a real grid slot (slot 0) on reconcile, so the refill targets it.
+  // adopted pane got a real grid slot (slot 0) on reconcile, so it anchors the tab; the
+  // split is BALANCED (the GUI picks the largest pane + direction), not a fixed direction.
   const spawnArgs = fake.calls.spawn[0];
   assert.notEqual(spawnArgs.firstTab, true, "refill must NOT open a new tab (firstTab absent)");
-  assert.equal(spawnArgs.direction, "right", "the refill splits beside the adopted pane");
-  assert.equal(spawnArgs.targetUUID, "orphan-1", "the split targets the adopted pane");
+  assert.equal(spawnArgs.balanced, true, "the refill is a balanced BSP split");
+  assert.equal(spawnArgs.direction, undefined, "balanced mode sends no explicit direction");
+  assert.equal(spawnArgs.targetUUID, "orphan-1", "the split anchors on the adopted pane's tab");
   // The adopted pane is still tracked (NOT clobbered/closed by the refill).
   assert.equal(run.active.has("ORPH-1"), true, "adopted pane survives the refill dispatch");
   assert.equal(run.active.has("NEW-1"), true, "new item tracked");
@@ -1883,74 +1908,267 @@ test("runQueueSweep: a sweep with no commands behaves exactly like the static-ru
 });
 
 // ---------------------------------------------------------------------------
-// (14) quitWhenEmpty (§8a): the run QUITS when a sweep sees a SUCCESSFUL empty list
-//      AND nothing is active — but NOT while agents are still running, and NOT on a
-//      flaky/failed list.
+// (14) NO auto-quit on an empty list (quitWhenEmpty REMOVED). A run is removed only by
+//      an explicit stop/abort; an empty `list` just means "nothing actionable now" and
+//      the run KEEPS polling. (The old quitWhenEmpty keyed on active.size===0, which a
+//      transient/incomplete post-restart list_surfaces could falsely produce → abandon
+//      live agents + remove the run. Removed; this pins the persist-forever behavior.)
 // ---------------------------------------------------------------------------
 
-test("runQueueSweep: quitWhenEmpty run with an empty list + no active agents removes itself", () => {
-  // arm (suppressed), then a sweep that fetches a clean empty list with nothing active
-  // → the run quits (removed from the registry) even though maxItems is not reached.
+test("runQueueSweep: an empty list + no active agents does NOT remove the run", () => {
   return (async () => {
     const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
-    const run = makeQueueRun(tmpl({ quitWhenEmpty: true }), memStore());
+    const run = makeQueueRun(tmpl(), memStore());
     let now = 1_000_000;
     const deps = makeQueueDeps(fake, [run], () => now);
 
     await runQueueSweep(deps); // arm (dispatch suppressed; no list fetch yet)
-    assert.equal(deps.registry.size, 1, "still armed after the first sweep");
     now += 5000;
-    await runQueueSweep(deps); // armed → fetch empty list → quit
-    assert.equal(deps.registry.size, 0, "quit on empty list + no active");
-    assert.equal(fake.calls.spawn.length, 0, "nothing was ever dispatched");
+    await runQueueSweep(deps); // empty list, nothing active
+    assert.equal(deps.registry.size, 1, "run persists on an empty list (no auto-quit)");
+    assert.equal(fake.calls.spawn.length, 0, "nothing dispatched (empty list)");
+    now += 5000;
+    await runQueueSweep(deps); // and again — still there, still polling
+    assert.equal(deps.registry.size, 1, "still present after another empty sweep");
   })();
 });
 
-test("runQueueSweep: quitWhenEmpty does NOT quit while an agent is still running (empty list, active>0)", () => {
-  return (async () => {
-    // A mutable spec so we can empty the list AFTER an item is dispatched (the agent
-    // 'claimed' it → it left the filter), while the agent keeps running.
-    const spec = {
-      surfaces: [] as Surface[],
-      listJson: '[{"id":"Q-1","title":"t"}]',
-      spawns: [{ id: "spawned-1", sessionId: 4242 }],
-    };
-    const fake = makeQueueFake(spec);
-    const run = makeQueueRun(tmpl({ quitWhenEmpty: true }), memStore());
-    let now = 2_000_000;
-    const deps = makeQueueDeps(fake, [run], () => now);
+// ---------------------------------------------------------------------------
+// (interval throttling) Provider `list`/`status` calls are throttled to
+// intervals.listMs / intervals.statusMs — the 5s sweep stays the base cadence for
+// reconcile/close/commands/health, but the provider is NOT hit every sweep.
+// ---------------------------------------------------------------------------
 
-    await runQueueSweep(deps); // arm
-    now += 5000;
-    await runQueueSweep(deps); // dispatch Q-1 → SPAWNED (active = 1)
-    assert.equal(fake.calls.spawn.length, 1);
-    assert.equal(run.active.size, 1, "Q-1 tracked");
+test("runQueueSweep: list fetch is THROTTLED to intervals.listMs", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const t = tmpl({ intervals: { listMs: 30000, statusMs: 0 } });
+  const run = makeQueueRun(t, memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
 
-    // The agent claimed its item, so the source list is now empty — but the agent is
-    // still running. The run must KEEP polling, not quit.
-    spec.listJson = "[]";
-    spec.surfaces = [queueSurface({ id: "spawned-1", queueKey: "Q-1", queueName: "backlog" })];
-    now += 5000;
-    await runQueueSweep(deps);
-    assert.equal(deps.registry.size, 1, "must NOT quit while the agent is still active");
-    assert.ok(run.active.has("Q-1"), "the running agent is still tracked");
-  })();
+  await runQueueSweep(deps); // arm — dispatch suppressed, no list fetch at all
+  assert.equal(fake.calls.list, 0, "arm sweep does not fetch the list");
+
+  now += 5000;
+  await runQueueSweep(deps); // first dispatch sweep — lastListAtMs is -Inf → fetches
+  assert.equal(fake.calls.list, 1, "first dispatch sweep fetches");
+
+  now += 5000; // +5s since the fetch < 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 1, "within listMs: no re-fetch");
+
+  now += 10000; // +15s since the fetch < 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 1, "still within listMs: no re-fetch");
+
+  now += 20000; // +35s since the fetch ≥ 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 2, "after listMs elapses: re-fetch");
 });
 
-test("runQueueSweep: quitWhenEmpty does NOT quit on a FLAKY (non-zero) list", () => {
-  return (async () => {
-    // A list provider that always fails → fetchListResult ok:false → NOT 'empty' → never quits.
-    const fake = makeQueueFake({ surfaces: [] });
-    fake.exec = async (argv: string[]) => {
-      if (argv[0] === "list") return { code: 1, stdout: "", stderr: "boom" };
-      return { code: 0, stdout: '{"state":"working"}', stderr: "" };
-    };
-    const run = makeQueueRun(tmpl({ quitWhenEmpty: true }), memStore());
-    let now = 3_000_000;
-    const deps = makeQueueDeps(fake, [run], () => now);
-    await runQueueSweep(deps); // arm
-    now += 5000;
-    await runQueueSweep(deps); // list FAILS → not empty → must NOT quit
-    assert.equal(deps.registry.size, 1, "a failed list never reads as empty (no quit)");
-  })();
+test("runQueueSweep: a throttled (skipped) list sweep STILL reports health from the cache", async () => {
+  // The dashboard counts must stay live between list polls — reportQueueStatus reads the
+  // cached lastListItems, so a throttled sweep still pushes the same waiting count.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"}]',
+    spawns: [{ id: "s-a", sessionId: 1 }, { id: "s-b", sessionId: 2 }],
+  });
+  // Cap dispatch to 0 net effect on health by using a big concurrency but tracking the
+  // "waiting" count: list has 2 items, both dispatched on the fetch sweep, so 0 waiting after.
+  const t = tmpl({ intervals: { listMs: 30000, statusMs: 0 }, concurrency: 1 });
+  const run = makeQueueRun(t, memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // fetch: dispatch A (concurrency 1), B waiting
+  const afterFetch = fake.calls.reports.at(-1)!;
+  assert.equal(fake.calls.list, 1);
+  assert.equal(afterFetch.queued, 1, "B waiting after the fetch sweep");
+
+  now += 5000; // throttled sweep (no fetch)
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.list, 1, "throttled: no second fetch");
+  const afterThrottle = fake.calls.reports.at(-1)!;
+  assert.equal(afterThrottle.queued, 1, "throttled sweep still reports the cached waiting count");
+});
+
+test("runQueueSweep: status probe is THROTTLED to intervals.statusMs", async () => {
+  let surfaces: Surface[] = [];
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1"}]',
+    spawns: [{ id: "spawned-1", sessionId: 900 }],
+    statusByKey: { "K-1": '{"state":"working"}' }, // never terminal → stays RUNNING, keeps being probed
+  });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+  // list throttling OFF (0) so it doesn't interfere; status throttled to 30s.
+  const t = tmpl({ intervals: { listMs: 0, statusMs: 30000 } });
+  const run = makeQueueRun(t, memStore());
+  let now = 2_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → SPAWNED (advanceStates ran before dispatch, active empty)
+  assert.equal(fake.calls.status.length, 0, "no probe the sweep it was spawned (not yet live)");
+
+  // The spawned surface now appears live + working.
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+
+  now += 5000;
+  await runQueueSweep(deps); // advanceStates: statusDue (-Inf) → probe #1, SPAWNED→RUNNING
+  assert.equal(fake.calls.status.length, 1, "first status probe fires once the agent is live");
+
+  now += 5000; // +5s since the probe < 30s
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.status.length, 1, "within statusMs: no re-probe");
+
+  now += 30000; // ≥ 30s since the probe
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.status.length, 2, "after statusMs elapses: re-probe");
+});
+
+test("advanceStates: a due status sweep with NO live agent does not burn the interval", async () => {
+  // The window is consumed only when a probe actually fires. A SPAWNED assignment whose
+  // surface isn't live yet must NOT consume the status window — the next sweep (surface live)
+  // probes immediately rather than waiting a full interval.
+  let surfaces: Surface[] = [];
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1"}]',
+    spawns: [{ id: "spawned-1", sessionId: 900 }],
+    statusByKey: { "K-1": '{"state":"working"}' },
+  });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+  const t = tmpl({ intervals: { listMs: 0, statusMs: 30000 } });
+  const run = makeQueueRun(t, memStore());
+  let now = 5_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → SPAWNED; surface NOT live yet → no probe
+  assert.equal(fake.calls.status.length, 0);
+
+  // Surface still not live this sweep (host attach lag): SPAWNED but no live surface.
+  now += 5000;
+  await runQueueSweep(deps); // due, but no live agent → no probe, window NOT consumed
+  assert.equal(fake.calls.status.length, 0, "no probe when the agent isn't live");
+
+  // Surface finally appears — even though only 5s passed since the (no-op) due sweep, the
+  // probe fires NOW because the window was never consumed.
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.status.length, 1, "probes immediately once the agent is live (window not pre-burned)");
+});
+
+// ---------------------------------------------------------------------------
+// (backlog graph) provider.graph fetch + report_queue_graph push (throttled, present:false).
+// ---------------------------------------------------------------------------
+
+// A template that opts into the optional backlog board.
+function graphTmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
+  return tmpl({
+    provider: {
+      list: { command: ["list"], keyField: "id", titleField: "title", urlField: "url" },
+      status: { command: ["status", "{key}"], doneStates: ["done"] },
+      graph: { command: ["graph"] },
+    },
+    ...over,
+  });
+}
+
+test("runQueueSweep: with provider.graph, a sweep fetches the board + pushes report_queue_graph with the backlog count", async () => {
+  // Board: W is waiting/dispatched (in the list), B1/B2 are backlog, D is terminal.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"W"}]',
+    spawns: [{ id: "s-w", sessionId: 1 }],
+    graphJson: JSON.stringify({
+      nodes: [
+        { key: "W", state: "Todo", done: false, blockedBy: [] },
+        { key: "B1", state: "Backlog", done: false, blockedBy: ["W"] },
+        { key: "B2", state: "Backlog", done: false, labels: ["Design needed"], blockedBy: [] },
+        { key: "D", state: "Done", done: true, blockedBy: [] },
+      ],
+    }),
+  });
+  const run = makeQueueRun(graphTmpl(), memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (graph fetches here: lastGraphAtMs is -Inf)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch W
+
+  assert.ok(fake.calls.graph >= 1, "the graph command was fetched");
+  const last = fake.calls.graphReports.at(-1)!;
+  assert.equal(last.present, true);
+  assert.equal(last.queueName, "backlog");
+  assert.equal(last.nodes.length, 4, "the full board (incl. done) is pushed");
+  // backlog = non-terminal not waiting/running: B1, B2 (W excluded as active/listed, D done).
+  assert.equal(last.backlog, 2);
+  // Edges + labels survive to the report (for the canvas).
+  assert.deepEqual(last.nodes.find((n) => n.key === "B1")?.blockedBy, ["W"]);
+  assert.deepEqual(last.nodes.find((n) => n.key === "B2")?.labels, ["Design needed"]);
+});
+
+test("runQueueSweep: provider.graph fetch is THROTTLED to intervals.listMs", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]", graphJson: '{"nodes":[]}' });
+  const run = makeQueueRun(graphTmpl({ intervals: { listMs: 30000, statusMs: 0 } }), memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm — graph fetches (lastGraphAtMs -Inf)
+  assert.equal(fake.calls.graph, 1, "first sweep fetches the graph");
+
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.graph, 1, "within listMs: no graph re-fetch");
+
+  now += 30000; // ≥ listMs since the first fetch
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.graph, 2, "after listMs: graph re-fetches");
+});
+
+test("runQueueSweep: NO provider.graph => never fetches a graph nor pushes report_queue_graph", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const run = makeQueueRun(tmpl(), memStore()); // base tmpl has no provider.graph
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.graph, 0);
+  assert.equal(fake.calls.graphReports.length, 0);
+});
+
+test("runQueueSweep: aborting a run with provider.graph pushes report_queue_graph present:false", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]", graphJson: '{"nodes":[]}' });
+  const run = makeQueueRun(graphTmpl({ name: "backlog" }), memStore());
+  const registry = registryOf([run]);
+  let now = 1_000_000;
+  const deps: QueueDeps = {
+    client: fake.client, exec: fake.exec, budget: new QueueBudget(8), now: () => now,
+    registry, factory: noFactory, takeCommands: async () => [],
+    maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+  };
+  await runQueueSweep(deps); // arm
+  run.aborting = true;
+  now += 5000;
+  await runQueueSweep(deps); // abort → run removed
+  assert.equal(registry.has("backlog"), false);
+  const gone = fake.calls.graphReports.at(-1)!;
+  assert.equal(gone.present, false, "graph section cleared on abort");
+  assert.deepEqual(gone.nodes, []);
 });

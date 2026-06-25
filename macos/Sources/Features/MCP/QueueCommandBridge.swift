@@ -129,6 +129,39 @@ struct QueueStatus: Equatable, Sendable {
     /// The currently-RUNNING items (one per slot-occupying agent) — the "M running"
     /// dropdown. `running.count == active`.
     let running: [Item]
+
+    // MARK: - Optimistic edits (instant dashboard feedback before the sidecar confirms)
+
+    /// A copy with `maxItems` replaced (nil = unlimited). Used to reflect a cap edit
+    /// IMMEDIATELY in the header; the sidecar's next authoritative push reconciles it.
+    func withMaxItems(_ newMax: Int?) -> QueueStatus {
+        QueueStatus(
+            queueName: queueName, present: present, phase: phase, queued: queued,
+            listOk: listOk, active: active, dispatched: dispatched, maxItems: newMax,
+            next: next, running: running)
+    }
+
+    /// A copy with `phase` replaced — optimistic pause/resume/stop feedback.
+    func withPhase(_ newPhase: String) -> QueueStatus {
+        QueueStatus(
+            queueName: queueName, present: present, phase: newPhase, queued: queued,
+            listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
+            next: next, running: running)
+    }
+
+    /// (pure, testable) Parse the cap-editor's raw string the SAME way the sidecar's
+    /// `parseMaxItemsValue` does, for the optimistic update. Returns a DOUBLE optional so
+    /// "leave unchanged" is distinct from "set to unlimited":
+    ///   `.none`            → blank / garbage → caller should NOT optimistically change
+    ///   `.some(nil)`       → unlimited (`0`/`unlimited`/`none`/`inf`/`∞`) → set maxItems = nil
+    ///   `.some(.some(n))`  → a positive-integer cap
+    static func parseCapOptimistic(_ raw: String) -> Int?? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if s.isEmpty { return .none }
+        if ["0", "unlimited", "none", "inf", "infinity", "∞"].contains(s) { return .some(nil) }
+        if let n = Int(s), n > 0 { return .some(n) }
+        return .none
+    }
 }
 
 /// PURE, unit-tested parser of the `report_queue_status` tool arguments → `QueueStatus`.
@@ -193,6 +226,112 @@ extension MCPServer {
             NotificationCenter.default.post(
                 name: .ghosttyQueueStatusDidChange, object: nil,
                 userInfo: [QueueCommandUserInfoKey.status: status])
+        }
+        return true
+    }
+}
+
+// MARK: - Backlog GRAPH — sidecar → GUI whole-board push (the "N backlog" button + canvas)
+
+/// (ramon fork / Agent Queue, backlog graph) The run's WHOLE-board snapshot the sidecar
+/// pushes (throttled to `intervals.listMs`) via the `report_queue_graph` MCP tool, for the
+/// dashboard's "N backlog" header button + the dependency-graph canvas. Mirrors the TS
+/// `QueueGraphReport` (macos/agent-manager/src/queue/status.ts). PURE value type, safe
+/// across the main hop. Only present when the template declares the optional `provider.graph`.
+struct QueueGraph: Equatable, Sendable {
+    /// One node of the board — the FULL set of items in the run's scope (every state).
+    /// `Identifiable` (by key) for the SwiftUI canvas.
+    struct Node: Equatable, Sendable, Identifiable {
+        let key: String
+        let title: String?
+        let url: String?
+        /// Display workflow-state name, e.g. "In Progress".
+        let state: String?
+        /// Coarse category for the node COLOR (e.g. "started"/"completed"); nil → neutral.
+        let stateType: String?
+        /// Provider-declared TERMINAL flag — excluded from `backlog`, dimmed in the canvas.
+        let done: Bool
+        /// Free-form labels (e.g. "Design needed").
+        let labels: [String]
+        /// Keys that BLOCK this node — the DAG edges (may reference keys outside the set).
+        let blockedBy: [String]
+        /// GENERIC priority MARK (e.g. "Urgent", "High") the canvas renders as a prominent
+        /// badge + tinted border. Provider-decided (like `done`/`stateType`); nil → no mark.
+        let priorityLabel: String?
+        var id: String { key }
+    }
+
+    /// The run NAME (= dashboard origin) this board is for.
+    let queueName: String
+    /// false ⇒ the run was removed — the dashboard clears the backlog button + canvas.
+    let present: Bool
+    /// The header-badge count: non-terminal nodes NOT currently waiting/running.
+    let backlog: Int
+    /// The full scoped board (every state) for the canvas.
+    let nodes: [Node]
+}
+
+/// PURE, unit-tested parser of the `report_queue_graph` tool arguments → `QueueGraph`.
+/// `queueName` is REQUIRED (non-empty); `present`/`backlog`/`nodes` default sanely. A node
+/// needs a non-empty `key`; `done` defaults false; `labels`/`blockedBy` default []. Nodes
+/// without a usable key are dropped (mirrors the sidecar's `parseGraphOutput`).
+struct QueueGraphPayload {
+    let graph: QueueGraph
+
+    static func fromArguments(_ arguments: [String: Any]) -> QueueGraphPayload? {
+        guard let queueName = (arguments["queueName"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !queueName.isEmpty
+        else { return nil }
+
+        let present = (arguments["present"] as? Bool) ?? true
+        let backlog = (arguments["backlog"] as? NSNumber)?.intValue ?? 0
+
+        var nodes: [QueueGraph.Node] = []
+        if let raw = arguments["nodes"] as? [[String: Any]] {
+            for entry in raw {
+                guard let key = (entry["key"] as? String), !key.isEmpty else { continue }
+                let strings: (String) -> [String] = { k in
+                    (entry[k] as? [Any])?.compactMap { $0 as? String } ?? []
+                }
+                let opt: (String) -> String? = { k in
+                    (entry[k] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                }
+                nodes.append(QueueGraph.Node(
+                    key: key, title: opt("title"), url: opt("url"),
+                    state: opt("state"), stateType: opt("stateType"),
+                    done: (entry["done"] as? Bool) ?? false,
+                    labels: strings("labels"), blockedBy: strings("blockedBy"),
+                    priorityLabel: opt("priorityLabel")))
+            }
+        }
+
+        return QueueGraphPayload(graph: QueueGraph(
+            queueName: queueName, present: present, backlog: backlog, nodes: nodes))
+    }
+}
+
+extension Notification.Name {
+    /// (ramon fork / Agent Queue, backlog graph) Posted on MAIN by `MCPServer.applyQueueGraph`
+    /// when the sidecar pushes a run's whole-board snapshot. `AgentDashboardController`
+    /// observes it (stores the graph per run; drops it when `present == false`).
+    /// userInfo: [QueueCommandUserInfoKey.graph: QueueGraph]
+    static let ghosttyQueueGraphDidChange =
+        Notification.Name("com.mitchellh.ghostty.ghosttyQueueGraphDidChange")
+}
+
+extension QueueCommandUserInfoKey {
+    static let graph = "graph"  // QueueGraph
+}
+
+extension MCPServer {
+    /// Handle a `report_queue_graph` tool call: post `.ghosttyQueueGraphDidChange` on MAIN so
+    /// the dashboard can store/render the backlog board. Run-level (no surface to resolve), so
+    /// it never fails — always returns true.
+    func applyQueueGraph(_ graph: QueueGraph) -> Bool {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .ghosttyQueueGraphDidChange, object: nil,
+                userInfo: [QueueCommandUserInfoKey.graph: graph])
         }
         return true
     }

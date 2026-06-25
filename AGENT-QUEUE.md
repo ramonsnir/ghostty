@@ -35,9 +35,13 @@ The supervisor **self-disables silently** (one info log) unless all of these hol
 
 1. **pty-host** (`pty-host = …`) — detection (`agentKind`) and the stable session ids the
    restart-resilience relies on both need it.
-2. **Agent Manager enabled + built** — see `AGENT-MANAGER.md` (this is the same sidecar):
-   `agent-manager = true`, `mcp-listen`/`mcp-token` set, `node` resolvable, and
-   `cd macos/agent-manager && npm ci && npm run build`.
+2. **The sidecar can run** — `mcp-listen`/`mcp-token` set, `node` resolvable, and the sidecar
+   built (`cd macos/agent-manager && npm ci && npm run build`). The queue and the Haiku
+   summarizer (Agent Manager) share **one sidecar**, but are **independent**: the shared
+   sidecar launches when **either** `agent-queue` **or** `agent-manager` is `true`, so you do
+   **not** need `agent-manager = true` to run a queue. Set `agent-queue = true` alone and the
+   sidecar runs the queue with the summarizer (and its Haiku billing) fully off. (See
+   `AGENT-MANAGER.md`; turning on `agent-manager` too just adds the per-tile Haiku summaries.)
 3. **Claude Code hooks installed** (the Agent-Dashboard ones) — the close-gate keys off the
    hook-driven agent state: it closes once the item is provider-`done` **and** the agent has
    been **quiescent** (`idle` *or* `waiting`) for a few seconds. *Without the hooks a queue can
@@ -91,10 +95,11 @@ shell the engine just runs.
   },
   "concurrency": 3,                          // max simultaneous agents (clamped to the grid)
   "maxItems": 200,                           // hard ceiling on total lifetime dispatches
-  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // auto-layout; fill columns before rows
-  "quitWhenEmpty": false,                    // true => the run quits when the queue drains
-                                             //   AND no agents are left (even before maxItems)
-  "intervals": { "listMs": 45000, "statusMs": 20000 },
+  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // max simultaneous panes = cols×rows; panes auto-tile as a balanced split (the largest pane is split along its longer side) — `fill` / col-vs-row is IGNORED for placement
+  // NOTE: there is NO `quitWhenEmpty` — a run is removed only by an explicit Stop/Abort.
+  // An empty `list` just means "nothing actionable now"; the run keeps polling. (A `quitWhenEmpty`
+  // key here is silently ignored — it was removed after it abandoned live agents on a restart.)
+  "intervals": { "listMs": 60000, "statusMs": 30000 },  // provider call cadence (see note below)
   "provider": {
     // LIST: print the actionable items as a JSON array. Expected to ALREADY exclude
     // blocked / claimed / done items (the queue has no dependency graph by design).
@@ -109,7 +114,14 @@ shell the engine just runs.
     },
     // CLAIM (optional): run once after dispatch to remove the item from the source sooner.
     // Dedup does NOT depend on it — it's a latency optimization only.
-    "claim": { "command": ["linear-claim", "{key}"] }
+    "claim": { "command": ["linear-claim", "{key}"] },
+    // GRAPH (optional): print the WHOLE board — every item in scope, ALL states — for the
+    // dashboard's "N backlog" button → a dependency-graph canvas. Output:
+    //   {"nodes":[{"key","title?","url?","state?","stateType?","done","labels":[],"blockedBy":[],"priority?"}]}
+    // `done` (terminal) + `stateType` (color category: backlog/unstarted/started/completed/
+    // canceled/triage) are YOUR script's call — Ghostty maps no tracker. Fetched on the
+    // `list` cadence; absent ⇒ no backlog button. NOT part of dispatch (grooming/debug only).
+    "graph": { "command": ["linear-queue-graph"] }
   },
   "onAgentExit": "leave-and-bell",           // a crashed agent: keep the split for review + ring the bell everywhere
   "closeOnComplete": true,
@@ -190,6 +202,19 @@ Provider contract (the genericity boundary):
 - Item fields reach the **provider** as argv elements (`{key}`) and the **agent** as
   `GHOSTTY_ITEM_*` env vars — they are never string-spliced into a shell line.
 
+**`intervals` — how often the provider is actually called.** The supervisor runs a ~5s
+internal sweep (reconcile / close finished splits / apply dashboard commands / refresh the
+health bar all happen every sweep), but it does **not** run your `list`/`status` commands every
+sweep — those are throttled to `intervals.listMs` / `intervals.statusMs`. So with the defaults
+(`listMs: 60000`, `statusMs: 30000`) your tracker is queried for new work at most once a minute
+and each running item's completion is checked at most every 30s. Lower them if you want the
+queue to notice newly-unblocked items / completed items faster (at the cost of more API calls);
+raise them to be gentler on a rate-limited provider. Two consequences worth knowing: a
+**completed** item's split closes within ~`statusMs` of it actually finishing, and bumping a
+running queue's **maxItems** (or resuming it) re-enables dispatch but the *new* agent spawns on
+the next `list` poll (≤`listMs`) — the dashboard cap/phase updates instantly, only the spawn
+waits for the poll.
+
 There's a no-Linear demo (a fake `list`/`status` that drains as you `touch` marker files)
 to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 
@@ -262,6 +287,13 @@ summaries on queue tiles are the normal Agent Manager summarizer (Haiku via your
 Code auth; no API key). Your provider commands run locally with a sanitized env
 (the `mcp-token` and other `GHOSTTY_*` credentials are stripped before a provider script
 sees them).
+
+## Logs / troubleshooting
+
+The sidecar (queue engine + summarizer) tees its log to a rotating file at
+**`~/Library/Logs/ghostty-ramon-agent-manager.log`** (rotates to `.1` at ~5MB). Run
+removals, dispatch/prune decisions, and command applications are logged there — `tail -f`
+it when a queue does something surprising.
 
 ## Status / roadmap
 

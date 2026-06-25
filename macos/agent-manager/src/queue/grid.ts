@@ -1,67 +1,27 @@
-// (ramon fork / Agent Queue Supervisor) Grid layout (§12) — PURE + deterministic.
+// (ramon fork / Agent Queue Supervisor) Grid accounting (§12) — PURE + deterministic.
 //
-// A queue run keeps all its splits in ONE tab, auto-arranged into a grid of up to
-// cols×rows, filled per `fill`. Ghostty's split tree is strictly BINARY (no true
-// grid geometry), so the supervisor tracks a `gridSlot` per assignment and computes
-// each spawn's split TARGET + DIRECTION from the slot index. Holes (from a closed
-// split) are left empty and the next dispatch fills the LOWEST free slot — the
-// surviving panes never re-flow.
+// A queue run keeps all its splits in ONE tab. The engine tracks a `gridSlot` per
+// assignment PURELY for OCCUPANCY ACCOUNTING (cap the live panes at cols*rows; refill
+// the lowest free slot when one closes). It does NOT compute geometry: the actual tiling
+// is a BALANCED binary-space-partition done GUI-side (`spawn_split_command` with
+// `balanced:true` splits the LARGEST pane in the tab along its longer side). That is
+// correct across closures because Ghostty's binary tree RE-FLOWS when a pane closes (the
+// sibling absorbs the parent region) — an abstract grid-neighbor split would land in the
+// wrong place and produce stray columns/rows, so we let the GUI place each split from the
+// real tree instead.
 //
-// All functions are pure (no I/O, no clock) so the layout planner is fully
-// unit-testable. NOTHING here is queue-content aware.
+// All functions are pure (no I/O, no clock) and unit-tested. NOTHING here is content-aware.
 
-import type { GridFill } from "./types.js";
-
-/** A grid cell coordinate. */
-export interface Slot {
-  col: number;
-  row: number;
-}
-
-/**
- * Map a slot INDEX to its (col,row) for a given fill (§12). PURE.
- *   - fill "columns" (row-major): fill a row of columns before the next row, so
- *       row = floor(i/cols), col = i % cols.
- *   - fill "rows" (column-major): fill a column of rows before the next column, so
- *       col = floor(i/rows), row = i % rows.
- */
-export function slotForIndex(
-  i: number,
-  cols: number,
-  rows: number,
-  fill: GridFill,
-): Slot {
-  if (fill === "columns") {
-    return { row: Math.floor(i / cols), col: i % cols };
-  }
-  return { col: Math.floor(i / rows), row: i % rows };
-}
-
-/**
- * The inverse of `slotForIndex`: map a (col,row) back to its slot index for a given
- * fill. PURE. (Used by the split planner to find the index of a neighbor slot.)
- */
-export function indexForSlot(
-  slot: Slot,
-  cols: number,
-  rows: number,
-  fill: GridFill,
-): number {
-  if (fill === "columns") {
-    return slot.row * cols + slot.col;
-  }
-  return slot.col * rows + slot.row;
-}
-
-/** The grid capacity = cols*rows. PURE. */
+/** The grid capacity = cols*rows (the max simultaneous panes a run may hold). PURE. */
 export function gridCap(cols: number, rows: number): number {
   return cols * rows;
 }
 
 /**
  * The lowest free slot index in [0, cap), or null when the grid is full. PURE.
- * "Lowest free" honors the hole policy (§12): a closed split's slot is reused
- * before opening a higher one, with no re-flow.
+ * "Lowest free" reuses a closed split's slot before opening a higher one. The index is
+ * an OCCUPANCY TOKEN only (caps concurrency); it carries no geometric meaning under the
+ * balanced-BSP tiling.
  */
 export function lowestFreeSlot(occupied: Set<number>, cap: number): number | null {
   for (let i = 0; i < cap; i++) {
@@ -71,104 +31,28 @@ export function lowestFreeSlot(occupied: Set<number>, cap: number): number | nul
 }
 
 /**
- * The result of planning HOW to materialize a new slot in the binary split tree:
- *   - `{firstTab:true}` — the run has no splits yet; open its tab (the first leaf).
- *   - `{targetSlotIndex, direction}` — split the EXISTING surface at
- *     `targetSlotIndex` in `direction` to create the new leaf.
+ * How to materialize a new pane in the run's tab (§12):
+ *   - `{firstTab:true}` — the run has no live panes yet; open its tab (the first leaf).
+ *   - `{balanced:true, anchorSlotIndex}` — split WITHIN the tab that holds the pane at
+ *     `anchorSlotIndex`. The GUI picks the largest pane + direction (balanced BSP); the
+ *     anchor only identifies which tab. `anchorSlotIndex` is the lowest occupied slot (any
+ *     live pane of the run would do — they share one tab).
  */
 export type SplitPlan =
   | { firstTab: true }
-  | { firstTab?: false; targetSlotIndex: number; direction: "right" | "down" };
+  | { firstTab?: false; balanced: true; anchorSlotIndex: number };
 
 /**
- * Plan the binary split that materializes `newSlotIndex` (§12). PURE.
- *
- * Given the set of ALREADY-occupied slot indices (the live panes) and the grid
- * geometry, decide what to split and in which direction so the new leaf lands in
- * the right grid position:
- *   - no occupied slots             → open the run's first tab (`firstTab`).
- *   - new slot starts a NEW COLUMN  (its row is 0 / it has no neighbor above in its
- *     column) → split the slot ONE COLUMN TO THE LEFT in the same row RIGHT.
- *   - new slot is BELOW an existing one in its column → split the slot directly
- *     ABOVE it DOWN.
- *
- * The chosen target is required to be currently occupied (it's the pane we split);
- * for the no-hole fill orders the natural left/above neighbor is always present, so
- * this yields the clean grid the spec describes. If the strictly-preferred neighbor
- * is somehow absent (an unusual hole pattern), we fall back to the nearest occupied
- * neighbor (left-in-row, else above-in-column, else the lowest occupied slot) so the
- * planner is total and never returns a target that isn't a live pane.
+ * Plan how to materialize the next pane from the currently-occupied slots. PURE.
+ * Empty ⇒ open the run's first tab; otherwise a balanced split anchored at the lowest
+ * occupied slot (the GUI chooses the actual pane + direction from the real split tree).
  */
-export function splitPlan(
-  newSlotIndex: number,
-  occupiedSlots: Set<number>,
-  fill: GridFill,
-  cols: number,
-  rows: number,
-): SplitPlan {
+export function splitPlan(occupiedSlots: Set<number>): SplitPlan {
   if (occupiedSlots.size === 0) return { firstTab: true };
-
-  const here = slotForIndex(newSlotIndex, cols, rows, fill);
-
-  // A slot in row 0 cannot be "below" anything → it starts a new column: split the
-  // pane immediately to its left (same row) RIGHT. Otherwise prefer splitting the
-  // pane directly above it DOWN.
-  if (here.row === 0) {
-    const left = idxIfOccupied(
-      { col: here.col - 1, row: 0 },
-      occupiedSlots,
-      cols,
-      rows,
-      fill,
-    );
-    if (left !== null) return { targetSlotIndex: left, direction: "right" };
-    // Fallback: nothing to the left (hole) — split the lowest occupied pane right.
-    return { targetSlotIndex: lowestOccupied(occupiedSlots), direction: "right" };
-  }
-
-  const above = idxIfOccupied(
-    { col: here.col, row: here.row - 1 },
-    occupiedSlots,
-    cols,
-    rows,
-    fill,
-  );
-  if (above !== null) return { targetSlotIndex: above, direction: "down" };
-
-  // The pane directly above is a hole. Prefer a left neighbor (split right), else
-  // fall back to the lowest occupied pane split down.
-  const left = idxIfOccupied(
-    { col: here.col - 1, row: here.row },
-    occupiedSlots,
-    cols,
-    rows,
-    fill,
-  );
-  if (left !== null) return { targetSlotIndex: left, direction: "right" };
-  return { targetSlotIndex: lowestOccupied(occupiedSlots), direction: "down" };
+  return { balanced: true, anchorSlotIndex: lowestOccupied(occupiedSlots) };
 }
 
-// ---------------------------------------------------------------------------
-// Pure helpers.
-// ---------------------------------------------------------------------------
-
-/** The slot index for a (col,row) if it is in-bounds AND currently occupied, else
- *  null. PURE. */
-function idxIfOccupied(
-  slot: Slot,
-  occupied: Set<number>,
-  cols: number,
-  rows: number,
-  fill: GridFill,
-): number | null {
-  if (slot.col < 0 || slot.row < 0 || slot.col >= cols || slot.row >= rows) {
-    return null;
-  }
-  const idx = indexForSlot(slot, cols, rows, fill);
-  return occupied.has(idx) ? idx : null;
-}
-
-/** The lowest occupied slot index (the set is guaranteed non-empty by callers). */
+/** The lowest occupied slot index (callers guarantee the set is non-empty). PURE. */
 function lowestOccupied(occupied: Set<number>): number {
   let min = Number.POSITIVE_INFINITY;
   for (const i of occupied) if (i < min) min = i;

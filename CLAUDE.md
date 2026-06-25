@@ -685,13 +685,75 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `query()` with no `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` succeeds via the pool).
   - **Deterministic loop, single-shot LLM (NOT agentic).** `src/index.ts` polls
     `list_surfaces` every 5s, applies PURE gates (`src/summarizer.ts`:
-    `isAgentSurface`/`shouldSummarize`/`fingerprint`/debounce/skip-idle/`ConcurrencyBudget`),
+    `isAgentSurface`/`shouldSummarize`/change-detection/debounce/skip-idle/`ConcurrencyBudget`),
     `read_surface`s the viewport, composes a prompt (baked base `src/prompts.ts` + the
     `~/.config/ghostty-ramon/agent-manager/summarizer.md` override, mtime-cached), makes ONE
     Haiku call (`src/model.ts`: `tools:[]`, `maxTurns:3`, NO `mcpServers` — the summary call
     touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
     dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
     Node's built-in `node --test`.
+  - **COST CONTROLS — skip-hidden + animation-proof fuzzy change + quiescent-skip +
+    config (the "Haiku burns my usage" fix).** Four levers cut the call rate; the dominant
+    sink was a quiescent (`waiting`/`idle`) agent whose ANIMATED footer (spinner / "esc to
+    interrupt" / elapsed-time counter) flipped the old exact-hash `fingerprint` every poll,
+    so it re-summarized every debounce window forever. **(1) Skip hidden tiles:** the
+    dashboard's `hidden` set is now exposed through `list_surfaces` (Swift:
+    `HookSnapshotEntry.hidden` unioned from `model.hidden` → `MCPLayout.SurfaceRow.hidden`,
+    emitted only when true; TS: `Surface.hidden`), and BOTH `preGate` (so a hidden tile skips
+    the `read_surface` entirely) and `shouldSummarize` short-circuit `{reason:"hidden"}` when
+    `cfg.skipHidden` (default true). **(2) Fuzzy change detection (replaces the binary
+    `fingerprint`):** `LastSummary` now stores `signals` (exact hash of the AUTHORITATIVE hook
+    tuple agentState|lastPrompt|lastTool — any diff = change) + `tail` (the NORMALIZED
+    change-tail kept as TEXT). `changeTail` strips spinner glyphs (Braille U+2800–28FF + dot/
+    bar spinners) and collapses digit-runs→`#` and whitespace via `normalizeChangeLine`, so an
+    animated footer normalizes to a STABLE string; `tailChangeRatio` is the Jaccard distance
+    over the NON-BLANK line MULTISETS (scroll-tolerant), and the screen counts as CHANGED only
+    when `ratio > cfg.changeRatioThreshold` (default 0.2). **(3) Quiescent-skip:** an unchanged
+    `waiting`/`idle` agent (`isQuiescent`) is skipped REGARDLESS of `idleSeconds` (its summary
+    won't change); a non-quiescent unchanged surface keeps the old idle-seconds skip / else
+    re-summarizes so a `working` agent's phase still tracks. **(4) Config overlay
+    (`src/config.ts`, no rebuild):** `~/.config/ghostty-ramon/agent-manager/config.json` (pure
+    `parseConfig` overlay on `DEFAULT_CONFIG` over an injected `readFile`, restart-to-apply,
+    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→**30000**),
+    `changeRatioThreshold`, `skipHidden`, `idleSkipSeconds`, `maxConcurrent`,
+    `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
+    `changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
+    `lineMultiset`, all pure + tested). Wiring: Swift — `AgentDashboardController.swift`
+    (`HookSnapshotEntry.hidden`), `MCPLayout.swift` (`SurfaceRow.hidden` + JSON emit); sidecar
+    — `mcp.ts` (`Surface.hidden`), `summarizer.ts` (config fields + `LastSummary` shape + the
+    new pure helpers + `shouldSummarize`/`preGate`), `config.ts` (NEW), `index.ts` (`loadConfig`
+    in `main`, record `signals`/`tail`). Tests: Swift `MCPServerTests`
+    (`surfacesJSONDataEmitsHiddenWhenTrue` + omit-when-false), `AgentDashboardTests`
+    (`hookSnapshot` hidden bit); sidecar `summarizer.test.ts` (change-detection +
+    quiescent/hidden truth table), `config.test.ts` (NEW), `index.test.ts` (record shape).
+    **GUI relaunch (for the `hidden` field) + rebuilt sidecar `dist` + sidecar restart; no
+    host/Zig change.**
+  - **RATE-LIMIT AUTO-BACKOFF (sidecar-only) — when the summarizer's OWN account is
+    rate-limited, slow way down until one call succeeds (the limit resets).** When the
+    summarizer bills to a depleted account, its `summarize()` calls fail (throw) or return
+    an unusable/unparseable reply — and without this it would keep firing one call per
+    surface per `debounceMs`, hammering the limited account. An ACCOUNT-WIDE adaptive
+    backoff (`LoopDeps.summarizerBackoff = {failureStreak, nextProbeMs}`, pure
+    `backoffDelayMs(streak, base, max) = min(max, base·2^(streak-1))`, default cap
+    `cfg.rateLimitBackoffMaxMs` 600000) governs `runSweep`: `summarizeOne` now returns
+    `"ok"|"fail"|"skip"` ("ok" = a model call parsed = account healthy; "fail" = threw OR
+    unparseable; "skip" = gate not-due, no call). NORMAL sweep fires the due batch
+    concurrently and aggregates — ANY "ok" resets the streak to 0; else if any "fail",
+    streak++ and arm `nextProbeMs`. BACKED-OFF sweep (streak>0): if `now < nextProbeMs`
+    return with ZERO calls; once the window elapses, probe candidates SEQUENTIALLY until
+    ONE makes a real call (not a gate-skip, so a leading quiescent tile can't waste the
+    probe) — "ok" clears the backoff + logs "resuming", "fail" extends it. So a depleted
+    account is poked ~once per 10 min (one probe), and the first success snaps back to full
+    cadence — fully automatic. Unparseable counts as "fail" deliberately (a rate-limit
+    message often renders as un-parseable text, not an exception, so "until one SUCCEEDS"
+    means "until one returns a real summary"). Wiring: sidecar ONLY — `summarizer.ts`
+    (`rateLimitBackoffMaxMs` cfg + `backoffDelayMs`), `config.ts` (parse the key), `index.ts`
+    (`summarizerBackoff` on `LoopDeps` + `SummarizeResult` return + `runSweep`
+    gate/probe/aggregate + `main` init). Tests: `summarizer.test.ts` (`backoffDelayMs`),
+    `config.test.ts` (parse), `index.test.ts` (`backoff:` group — engage-on-all-fail,
+    success-keeps-0, cooldown-no-calls, one-probe-recovers, failed-probe-extends,
+    unparseable-is-fail). **Rebuilt sidecar `dist` + sidecar restart only; no GUI/host/Zig
+    change.**
   - **Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha).** Under
     the `claude-pool` wrapper the surface's foreground process is `bash` (and even bare,
     `claude` reports its versioned-binary basename e.g. `2.1.185`), so a
@@ -708,13 +770,36 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     falls back to the viewport tail alone and reads thin ("Idle — repo ready"); with them it
     reads rich. Prompt is tunable live via the override file (no rebuild).
   - **SELF-DISABLE (hard requirement, unit-tested).** `AgentManagerController.start()` runs
-    the §8 gate `agentManagerShouldStart(enabled, mcpListen, mcpToken, nodePath)` off-main:
-    unless `agent-manager` is on AND `mcp-listen`+`mcp-token` are set AND `node` resolves
-    (config `agent-manager-node-path`, else a login-shell `command -v node` probe — GUI apps
-    don't inherit `PATH`), it stays fully dormant with EXACTLY ONE info log; the dashboard is
-    unaffected. The sidecar is spawned/supervised via `Process` (lazy, bounded restart
-    backoff — both pure + tested), torn down on quit, run with `GHOSTTY_AGENT_MANAGER=1` so
-    its own model activity can't recurse through the agent-state hook.
+    the §8 gate `sidecarShouldStart(managerEnabled, queueEnabled, mcpListen, mcpToken, nodePath)`
+    off-main: unless **at least one feature** (`agent-manager` OR `agent-queue`) is on AND
+    `mcp-listen`+`mcp-token` are set AND `node` resolves (config `agent-manager-node-path`, else
+    a login-shell `command -v node` probe — GUI apps don't inherit `PATH`), it stays fully
+    dormant with EXACTLY ONE info log; the dashboard is unaffected. The sidecar is
+    spawned/supervised via `Process` (lazy, bounded restart backoff — both pure + tested), torn
+    down on quit, run with `GHOSTTY_AGENT_MANAGER=1` so its own model activity can't recurse
+    through the agent-state hook.
+  - **SHARED-SIDECAR / INDEPENDENT FEATURES (the agent-manager↔agent-queue untangle).** The
+    summarizer (agent-manager) and the queue supervisor (agent-queue) are TWO independent loops
+    that share ONE sidecar process. The launch gate (`sidecarShouldStart`, EITHER-feature OR)
+    starts the sidecar when either is enabled; which loops actually RUN inside it is decided
+    SEPARATELY by per-feature env flags, so each works with the other off — in particular
+    `agent-queue = true` + `agent-manager = false` runs the queue with the (Haiku-billing)
+    summarizer fully silent (the reason the untangle exists). Pure helpers
+    `AgentManagerController.applySummarizerEnv(into:enabled:)` (→ `GHOSTTY_SUMMARIZER`) and the
+    existing `applyAgentQueueEnv` (→ `GHOSTTY_AGENT_QUEUE`) arm the two; sidecar
+    `parseLoopEnablement(env)` reads them in `index.ts main()` and gates the `tick`/`queueTick`
+    loops. **BACK-COMPAT asymmetry:** `GHOSTTY_SUMMARIZER` is set EXPLICITLY both ways (`1`/`0`,
+    NOT stripped when off) and the sidecar treats an ABSENT flag as ON — because the summarizer
+    used to be unconditional, so an OLD GUI that respawns a NEW `dist` mid-upgrade keeps
+    summarizing; only this new GUI's explicit `0` (agent-manager off) disables it. The queue
+    stays opt-in (`1` only; absent ⇒ off). No new config key (reuses `agent-manager` +
+    `agent-queue`), no Zig/host change. Wiring: `AgentManagerController.swift` (`sidecarShouldStart`/
+    `sidecarDisabledReason` replacing the old `agentManagerShouldStart`/`disabledReason`,
+    `applySummarizerEnv`, `start()` OR-gate, `childEnvironment`); sidecar `index.ts`
+    (`parseLoopEnablement` + loop gating). Tests: `AgentManagerControllerTests`
+    (`shouldStartWhenQueueOnlyPresent`/`shouldNotStartWhenBothDisabled`/truth-table/
+    `summarizerEnv*`), sidecar `index.test.ts` (`loops:` group). **GUI relaunch + rebuilt sidecar
+    `dist`; no host/Zig change.**
   - **Read-only; ZERO autonomous send, ZERO host/Zig protocol change.** The only Zig change
     is two additive default-off config keys.
     Wiring: core — `src/config/Config.zig` (`agent-manager`/`agent-manager-node-path` + parse
@@ -731,9 +816,30 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     backoff + URL), `macos/Tests/MCP/MCPAnnotationTests.swift`, the `agentKind`
     `surfacesJSONData` cases in `macos/Tests/MCP/MCPServerTests.swift`, the `agent-manager`
     Zig config test, and the sidecar's `node --test` suite (`npm test` in `macos/agent-manager`).
-    **GUI relaunch only** to enable (no host restart); the sidecar must be built
-    (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
-    the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
+    **GUI relaunch only** to enable (no host restart). For Ramon's dev tree the sidecar runs
+    from `macos/agent-manager/dist` via the `#filePath` fallback in `resolveSidecarDir()` (build
+    it with `npm ci && npm run build`).
+    **COLLEAGUE / DMG distribution — the sidecar IS bundled (dist-only), so the QUEUE works.**
+    Both release paths (`dist/macos/release-local.sh` step 3b + `.github/workflows/fork-release.yml`)
+    build the sidecar and copy **`dist/` + `package.json` ONLY** into
+    `Contents/Resources/agent-manager` — the path `resolveSidecarDir()` prefers over the dev
+    `#filePath`. **`node_modules` is deliberately NOT bundled** (~271MB and it ships a native
+    `claude` binary that would break notarization), so the bundle is pure-JS data — notarization-
+    safe, no extra signing (the app seal covers `Resources/`). Three things make this work:
+    (1) the Agent **Queue** engine has ZERO npm deps (Node built-ins + global `fetch`); (2)
+    `model.ts` imports the SDK as a **TYPE-ONLY import + a LAZY `await import()`** inside
+    `summarize()`, so `dist/index.js` loads with no `node_modules` and only a real summary call
+    pulls the SDK (a missing SDK throws → the summarizer self-disables per-surface, queue
+    unaffected); (3) `package.json` is bundled so node treats `dist/*.js` as ESM (`"type":"module"`).
+    **RUNTIME PREREQ: `node` on PATH** — the controller's §8 self-disable gate probes a login-shell
+    `command -v node` and stays dormant (one log line, no crash) if absent, so a colleague without
+    node just doesn't get the features. **So for a colleague: the Agent QUEUE works** (given node +
+    the usual opt-in: `agent-queue`/`agent-manager` on, `mcp-listen`/`mcp-token` set, the agent-state
+    hooks installed, a template) — **but the Haiku tile SUMMARIZER stays dev-only** (it needs the
+    un-bundled `node_modules`; without it, the SDK import throws and the summarizer self-disables
+    while the queue runs fine). Verified the dist-only bundle boots with no `node_modules`. Wiring:
+    `model.ts` (type-only + lazy import), `dist/macos/release-local.sh` (step 3b),
+    `.github/workflows/fork-release.yml` ("Build + bundle agent-manager sidecar").
   - **Account routing (optional) — bill the summarizer to a SEPARATE account.** By default the
     summarizer inherits the ambient Claude Code auth (works with NO multi-account setup); set a
     spec in `~/.config/ghostty-ramon/agent-manager/account` (sibling of `summarizer.md`) OR the
@@ -946,22 +1052,44 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `QueuePaletteTests` (`templateParamsParsesTargetAndValuesCommand`, `templateProbe*`,
       `providerEnv*`, `parseValues*`, `previewState*`). **GUI relaunch to pick up (Swift change); the
       `valuesCommand` field needs no sidecar restart (the running sidecar ignores unknown param fields).**
-  - **GRID layout** (§12): all of a run's splits in ONE tab, auto-arranged up to `cols×rows`
-    filling `columns`-or-`rows` first (template; default 3×3 columns-first), built from binary
-    splits via a pure `grid.ts splitPlan` (target+direction); holes from closed splits are
-    left + refilled lowest-slot-first (no re-flow). `concurrency` clamps to `cols×rows`.
-  - **Exit forms + quit-when-empty (template knobs):** `agent.exit` supports a TYPED exit
+  - **GRID layout = BALANCED BSP, GUI-placed (§12; reworked from the old slot-geometry
+    planner).** All of a run's splits live in ONE tab, capped at `cols×rows` panes. The engine
+    no longer computes split geometry from an abstract grid: `grid.ts` is now pure OCCUPANCY
+    ACCOUNTING (`gridCap`, `lowestFreeSlot`, `splitPlan` → `firstTab` | `{balanced, anchorSlotIndex}`)
+    and `gridSlot` is just a concurrency token (caps panes, refills the lowest free hole). The
+    actual tiling is a **balanced binary-space-partition done GUI-side**: `spawn_split_command`
+    with `balanced:true` splits the **LARGEST pane in the run's tab along its longer side**
+    (`SplitTree.largestLeafSplit(within: realPixelBounds)` — wider/square → `.right`, taller →
+    `.down`). **Why the rework:** the old planner derived each split's target+direction from the
+    slot's grid neighbor, which is correct ONLY for a hole-free fill — but Ghostty's binary tree
+    RE-FLOWS when a pane closes (the sibling absorbs the parent region), so after any agent
+    finished the slot model diverged from the real geometry and a refill split a geometrically-
+    wrong pane → **stray extra columns/rows** (the reported bug). The BSP places every split from
+    the REAL tree, so it stays evenly tiled and self-heals across closures. **CRITICAL:**
+    `largestLeafSplit` MUST use real pixel `bounds` (the window content size) — `spatial()`'s
+    no-bounds fallback uses artificial 1×1 column/row units where every leaf looks square →
+    always `.right` → a single row of N columns. `concurrency` still clamps to `cols×rows`; the
+    template `grid.fill` / col-vs-row split is now IGNORED for placement (only `cols*rows` = the
+    pane cap matters). Wiring: sidecar — `grid.ts` (simplified `splitPlan`; `slotForIndex`/
+    `indexForSlot`/`Slot` removed), `runner.ts` (`dispatchOne` sends `balanced:true` + the
+    lowest-occupied UUID as the tab anchor), `mcp.ts` (`spawnSplitCommand` `balanced` arg). Swift —
+    `SplitTree.swift` (`largestLeafSplit(within:)`, pure), `MCPLayout.swift` (`newSplitCommand`
+    `balanced` path → window content size → `largestLeafSplit`), `MCPTools.swift`
+    (`spawn_split_command` `balanced` schema + dispatch; direction required only when NOT
+    balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `splitPlan`
+    firstTab/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
+    direction); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
+    biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
     `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only
     recognizes hyphenated names (`ctrl-d`/`ctrl-c`/`enter`/…) — the engine's old `"ctrl_d"`
     default silently no-op'd (saved only by the force-close timeout) until `ctrl-d` was added to
     `MCPInput.keySpecs(forKey:)` (keycode 2 + ctrl). Claude Code swallows Ctrl-D, so use
-    `{text:"/quit"}`. `quitWhenEmpty:true` removes the run when a sweep sees a SUCCESSFUL empty
-    `list` AND `active.size===0` (even before `maxItems`); a FAILED list (`fetchListResult` ok:false)
-    is never "empty" (no false quit), and an empty list while agents still run does NOT quit (keeps
-    polling for new/unblocked items). The close sequence is sendText/sendKey-prelude → `awaitExited`
+    `{text:"/quit"}`. The close sequence is sendText/sendKey-prelude → `awaitExited`
     (bounded; force-closes anyway on timeout, so a `/quit` that leaves the launching shell alive
-    still tears down) → forceClose.
+    still tears down) → forceClose. **`quitWhenEmpty` was REMOVED** — see the hardening bullet at
+    the end of this section; a run is now removed only by an explicit stop/abort.
   - **Close path (§10) — the subtle one:** `close_surface`/`request_close` HONORS
     `confirm-close-surface` and would pop a modal for a live agent. So the supervisor sends the
     template `agent.exit` prelude (→ child exits) then calls **`force_close_surface`**, which
@@ -994,6 +1122,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `MCPServerTests`/`MCPAnnotationTests`/`AgentDashboardTests`/`QueuePaletteTests`, Zig
     `agent-queue` config + `start_agent_queue` binding. **GUI relaunch + rebuilt sidecar
     `dist` to enable; no host restart.**
+  - **Per-tile CLOSE button (GUI-only, queue tiles only) — the wedged-slot escape hatch.** On
+    hover each tile shows the existing **Hide ✕** (view-only declutter; the split keeps
+    running) and, ONLY on a **queue-owned** tile (one carrying a `queueName` annotation), a red
+    **⏹ `stop.circle`** that **force-closes** the split: it ends the agent + frees the queue
+    slot (the surface vanishing makes the next sweep reconcile + prune the record). It routes
+    through the confirm-FREE `MCPLayout.forceClose` (same path the queue's own auto-close uses),
+    so it works on a live agent without the `confirm-close-surface` modal — gated behind a
+    confirmation dialog (no undo). It's the manual remedy when auto-close is wedged (e.g. a
+    stuck-`working` hook). Queue-only by design: on a non-queue `(other)` agent a force-close is
+    an unscoped "kill this terminal" next to the harmless Hide. Wiring:
+    `AgentPreviewTile.swift` (`isQueueOwned` = `entry.annotation?.queueName` non-empty + the
+    `onClose` button + `confirmationDialog`), `AgentDashboardController.swift`
+    (`AgentDashboardModel.closeSurface(_:)` → `MCPLayout.forceClose`), `AgentDashboardView.swift`
+    (`onClose:` wiring). Tests: `AgentDashboardTests` (`capDraft*` neighborhood; the button +
+    gating are SwiftUI, not unit-tested). **GUI-only, GUI relaunch to pick up; no sidecar/host/Zig change.**
   - **QUEUE HEALTH bar (§11, sidecar→GUI push).** The dashboard shows each running queue's
     health in its section header — even BEFORE any split spawns and even when every tile is
     hidden/filtered (the "scary blank at start" + "all hidden" fixes). The supervisor PUSHES
@@ -1041,6 +1184,76 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       buttons). Tests: sidecar `status.test.ts` (next url + running echo) + `mcp.test.ts`
       (running forward); Swift `MCPServerTests` (parse url+running) + `AgentDashboardTests`
       (`progressText`, `applyKeepsNextAndRunningItems`). **GUI relaunch + rebuilt sidecar `dist`.**
+    - **BACKLOG DEPENDENCY GRAPH (the "N backlog" button → DAG canvas; sidecar→GUI push).**
+      The header gets an "N backlog" button that opens a resizable window rendering the run's
+      WHOLE board (every state — not just actionable) as a left→right layered dependency graph:
+      columns by blocked-by depth, arrows for "blocked by", node cards colored by workflow-state
+      category with label chips, a green ring on running items, click→jump-to-split (running) or
+      open the tracker URL. **The data needs a NEW OPTIONAL `provider.graph` command** (sibling of
+      `list`/`status`; absent ⇒ no button) — kept SEPARATE from `list` because `list` must stay
+      "actionable-only" (it drives dispatch). It is fetched on the SAME cadence as `list`
+      (`intervals.listMs`, reusing a `lastGraphAtMs` throttle), INDEPENDENT of dispatch (runs while
+      paused/draining, skipped only when `disabled`), cached on `QueueRun.lastGraph`, and PUSHED via
+      a new MCP tool **`report_queue_graph`** (`{queueName,present,backlog,nodes[]}`; `present:false`
+      on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE remainder:
+      non-terminal nodes NOT currently waiting/running (`backlogCount`, pure — exclude = the
+      actionable-list keys ∪ active assignment keys). STAYS GENERIC: the node's `done` (terminal,
+      excluded+dimmed) and `stateType` (color category) are PROVIDER-decided — Ghostty maps no
+      tracker; `QueueBacklogColors` is a cosmetic category→color map with a neutral fallback. The
+      DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
+      blocked-by cycle is broken via a `resolving` guard) and ignores edges to keys outside the
+      scope. The canvas window is one-per-run via `QueueBacklogWindowManager` (MainActor; strong
+      ref + `willClose` observer that drops both the window and itself — no leak/double-open). Its
+      DEFAULT size is fit-to-content (the whole board, no scrolling) floored at a minimum and
+      CLAMPED to the display: shared geometry `QueueBacklogGeometry` (the card/gap constants the
+      view also uses) computes `preferredWindowSize(nodes)`, and `QueueBacklogWindowManager.defaultContentSize(nodes:screen:)`
+      floors it at `minContentSize` (480×360) + clamps to `screen − screenMargin` (both pure +
+      unit-tested).
+      Wiring: sidecar — `types.ts` (`ProviderGraphSpec`/`GraphNode`/`QueueGraph`), `provider.ts`
+      (`parseGraphOutput`/`fetchGraphResult`), `status.ts` (`QueueGraphReport`/`backlogCount`),
+      `templates.ts` (`validateProviderGraph`), `runner.ts` (`QueueRun.lastGraph`/`lastGraphAtMs` +
+      `refreshGraph`/`reportGraphGone`), `mcp.ts` (`reportQueueGraph`). Swift —
+      `QueueCommandBridge.swift` (`QueueGraph`/`QueueGraphPayload`/`.ghosttyQueueGraphDidChange`/
+      `applyQueueGraph`), `MCPTools.swift` (`report_queue_graph` tool — now 19 tools),
+      `AgentDashboardController.swift` (`queueGraphs` @Published + `applyQueueGraph` +
+      `subscribeQueueGraph`), `AgentDashboardView.swift` (`backlogButton` in `OriginSectionHeader`),
+      `AgentDashboard/QueueBacklogCanvas.swift` (layout + canvas + window mgr; iOS-excluded in
+      `project.pbxproj`). Config (untracked, Linear-specific): `example-graph.py` (mirrors
+      `example-list.py` scope/auth but emits the FUTURE board — every NON-TERMINAL issue
+      (completed/canceled/duplicate EXCLUDED) + labels + blockedBy + stateType, and DROPS
+      "blocked by" edges to done blockers so a task gated only by finished work reads as a
+      ready root) + `provider.graph` in `example.json`. Tests: sidecar `provider.test.ts` (parseGraph/fetchGraph),
+      `status.test.ts` (`backlogCount`), `templates.test.ts` (graph validate), `mcp.test.ts`
+      (`reportQueueGraph`), `runner.test.ts` (graph fetch throttled + push + present:false-on-abort +
+      no-graph-no-fetch); Swift `MCPServerTests` (`queueGraphPayload*`, tool count 19),
+      `AgentDashboardTests` (`QueueBacklogTests`: assignLayers chain/diamond/cycle/dangling +
+      columns + applyQueueGraph). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+    - **HIGH/URGENT PRIORITY MARK on backlog nodes (generic; provider-decided).** A backlog
+      node can carry an OPTIONAL generic `priorityLabel` string (e.g. "Urgent"/"High"); the
+      canvas renders any node that has one with a prominent filled badge in the title row + a
+      louder TINTED BORDER (2pt) so high-priority items pop on the DAG (running's green border
+      still wins; a `done` node keeps its dim, no loud border). STAYS GENERIC exactly like
+      `done`/`stateType`: the PROVIDER SCRIPT decides which items get a mark and what it says —
+      Ghostty NEVER interprets the tracker-specific numeric `priority` int (Linear's 1=urgent
+      differs per tracker), it only renders whatever word lands in `priorityLabel`. The badge
+      color comes from a generic English-priority vocabulary (`QueueBacklogColors.priorityColor`:
+      urgent/critical→red, high→orange, medium/med/normal→yellow, low→gray) with an
+      ACCENT fallback so an unknown-but-non-empty label still reads as "marked"; nil/empty ⇒ no
+      mark. The Linear conversion lives in `example-graph.py` (`PRIORITY_LABELS = {1:"Urgent",
+      2:"High"}`, emitted only for those — none/medium/low omit it; edit that map to mark
+      more/fewer, no Ghostty change). (The raw tracker `priority` int was REMOVED end-to-end —
+      it was dead/unrendered and a tracker-specific footgun; `priorityLabel` is the only priority
+      signal now. If numeric ordering is ever wanted, add a generic provider-decided `priorityRank`,
+      not the raw int.) Wiring: sidecar — `types.ts` (`GraphNode.priorityLabel`),
+      `provider.ts` (`parseGraphOutput` keeps a non-empty string; `mcp.ts` forwards `nodes`
+      verbatim, no change); Swift — `MCPTools.swift` (`report_queue_graph` node schema +
+      `priorityLabel`), `QueueCommandBridge.swift` (`QueueGraph.Node.priorityLabel` + parse),
+      `QueueBacklogCanvas.swift` (badge + tinted border + `QueueBacklogColors.priorityColor`).
+      Config (untracked, Linear-specific): `example-graph.py`. Tests: sidecar
+      `provider.test.ts` (priorityLabel round-trip + non-empty-string rule); Swift `MCPServerTests`
+      (`queueGraphPayloadParsesFullArgs` carries it), `AgentDashboardTests`
+      (`priorityColorMarksKnownAndUnknownButNotEmpty`). **GUI relaunch + rebuilt sidecar `dist`;
+      no host/Zig change.**
   - **CLOSE-GATE fires on QUIESCENT (idle OR waiting), not idle-only (sidecar-only fix).** The
     DONE_PENDING→CLOSING gate used to require `agentState==="idle"` held `closeStableSeconds`.
     But a finished Claude Code agent reliably settles in **`waiting`** — its `Stop`→idle hook is
@@ -1087,6 +1300,59 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
     Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
     **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **INSTANT command feedback (snappiness fix for ALL queue commands).** A queue command
+    (`set_max_items`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
+    NEXT health push — i.e. after the ~5s `QUEUE_POLL_INTERVAL_MS` poll gap AND that sweep's
+    provider round-trips (per-agent `status` probes + `list`), since `reportQueueStatus` is the
+    LAST step of a sweep. Felt like 5–15s ("really slow"). Two-part fix: **(GUI optimistic)**
+    `AgentDashboardModel.setQueueMaxItems`/`sendRunCommand` update the local `queueStatuses`
+    entry IMMEDIATELY before posting — cap via `QueueStatus.parseCapOptimistic` (mirrors the
+    sidecar's `parseMaxItemsValue`; `.none`=blank/garbage→leave as-is so we never fake a change
+    the engine ignores) + `withMaxItems`; phase via `withPhase` (pause→paused/resume→running/
+    stop→draining); abort removes the section. The sidecar's next authoritative push reconciles
+    (and corrects a mis-parsed value). **(Sidecar fast confirm)** `runQueueSweep` pushes
+    `reportQueueStatus` for every (non-aborting) run IMMEDIATELY after `applyCommands` changes
+    the registry — BEFORE the sweep's `status`/`list` round-trips — so the authoritative number
+    lands within the drain, not at sweep end. Wiring: `QueueCommandBridge.swift`
+    (`QueueStatus.withMaxItems`/`withPhase`/`parseCapOptimistic`),
+    `AgentDashboardController.swift` (optimistic mutation in both posters), `runner.ts`
+    (post-`applyCommands` immediate report loop). Tests: `AgentDashboardTests`
+    (`parseCapOptimisticMirrorsSidecar`, `setQueueMaxItemsOptimisticallyUpdatesCap`,
+    `sendRunCommandOptimisticallyUpdatesPhase`); the sidecar suite still green. **GUI relaunch +
+    rebuilt sidecar `dist`; no host/Zig change.**
+  - **PROVIDER-CALL THROTTLING — honor `intervals.listMs`/`statusMs` (the real "5s too
+    frequent" fix).** The supervisor sweep stays at the 5s `QUEUE_POLL_INTERVAL_MS` base cadence
+    (reconcile / close / command-drain / §11 health report run EVERY sweep), but the PROVIDER
+    calls are now throttled to the template's `intervals` instead of firing every sweep — so a
+    tracker like Linear is hit at most once per `listMs` (`list`) and once per `statusMs`
+    (`status`), not every 5s. Previously both knobs were DEAD (`runner.ts` called `fetchListResult`
+    + `probeStatus` every sweep, ignoring `intervals`). Engine: two new non-persisted
+    `QueueRun.lastListAtMs`/`lastStatusAtMs` (init `NEGATIVE_INFINITY` ⇒ the first sweep always
+    fetches, and no `now===0` sentinel collision). `dispatchCandidates` skips the whole list
+    fetch+dispatch and returns 0 when `nowMs - lastListAtMs < intervals.listMs` — the §11 health
+    report (fired by `runOne` AFTER dispatch) reads the CACHED `lastListItems`/`lastListOk`, so the
+    dashboard counts stay live between polls; the latch re-arm just waits
+    for the next due fetch. The window is consumed on the ATTEMPT (set before the fetch), so even a
+    FAILED list waits a full interval — a hard cap of one `list` call per `listMs` regardless of
+    outcome. `advanceStates` gates the per-agent `status` probe on `statusDue =
+    nowMs - lastStatusAtMs >= statusMs` (decided once for the whole batch so all agents share one
+    round); when not due, `statusTerminal` stays undefined so no status-driven completion happens
+    that sweep (idle-anchor fold + close-gate still run every sweep — completion is delayed at
+    most `statusMs`, never lost). The status window is consumed ONLY if a probe actually fired
+    (`probed` flag), so a due sweep with no live SPAWNED/RUNNING agent (host-attach lag) doesn't
+    burn the interval — the next sweep with a live agent probes immediately. BEHAVIOR NOTE: a
+    `set_max_items` bump / `resume` re-enables dispatch, but the NEW dispatch lands on the next
+    list-DUE sweep (≤`listMs`), not the next 5s sweep — the dashboard cap/phase still updates
+    INSTANTLY (the optimistic + fast-confirm path above); only the actual spawn waits for the
+    poll. **Default ALIGNED to `{listMs:60000, statusMs:30000}`** (was 45000/20000) and the user's
+    near-identical 60/30 override was REMOVED from `example.json` so config == default. Wiring:
+    `runner.ts` (`QueueRun.lastListAtMs`/`lastStatusAtMs` + `makeQueueRun` init + list gate in
+    `dispatchCandidates` + status gate in `advanceStates`), `templates.ts`
+    (`TEMPLATE_DEFAULTS.intervals` → 60000/30000). Tests: `runner.test.ts` (list throttled +
+    throttled-sweep-still-reports-from-cache + status throttled + due-sweep-no-agent-doesn't-burn;
+    the shared `tmpl()` fixture sets `intervals:{0,0}` = throttle-off so the existing every-sweep
+    dispatch/state tests are preserved), `templates.test.ts` (default pinned to 60000/30000).
+    **Sidecar-only — rebuilt `dist` + sidecar respawn (GUI relaunch); no host/Zig/GUI-Swift change.**
   - **PER-SCOPE RUN IDENTITY — one template, parallel runs per project/milestone (palette shows the
     template `name`).** Three coupled changes so a generic template (e.g. Example) is re-usable in
     parallel for different env-param scopes:
@@ -1145,6 +1411,37 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     different-scope start + same-scope no-op + factory-consulted-on-restart); Swift `QueuePaletteTests`
     (`discoverUsesJSONNameForDisplayAndSort`, `templateDisplayNameFallsBackToBasename`, updated discovery
     assertions to `[QueueTemplateEntry]`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **RESTART-SURVIVAL HARDENING (the "queue vanished on restart" + "splits detached" fix).** A real
+    incident: a run with `quitWhenEmpty:true` self-removed at 19:34 while its 3 agents were still ALIVE,
+    so a later GUI restart found an empty `active-runs.json` → no queue, detached splits. Root cause
+    (confirmed by reading `reconcile`): the session-gone prune grace keys off the record's `sinceMs`,
+    which for a LONG-LIVED RUNNING record is ancient → ZERO protection against a SUCCESSFUL-but-INCOMPLETE
+    `list_surfaces` right after a (re)start (surfaces still coming up). So a transient post-restart list
+    pruned live records → `active.size→0` → `quitWhenEmpty` removed the whole run (abandoning live agents).
+    Three sidecar-only fixes:
+    - **(A) `quitWhenEmpty` REMOVED end-to-end.** The template knob + the `runOne` quit branch +
+      `QueueRun.sawEmptyListThisSweep` are gone; a run is removed ONLY by explicit stop/abort. An empty
+      `list` just means "nothing actionable now" → keep polling. A `quitWhenEmpty` key in template JSON
+      is now silently ignored (tolerant parse). Wiring: `types.ts` (field removed), `templates.ts`
+      (default + parse removed), `runner.ts` (quit branch + field removed). Tests: `runner.test.ts`
+      "an empty list + no active agents does NOT remove the run" (replaced the 3 quitWhenEmpty tests).
+    - **(B) PREMATURE-PRUNE FIX — reconcile-start grace.** `reconcile` gained an optional
+      `reconcileStartedMs` (default `-Infinity` = old behavior); a finalized record's session-gone prune
+      is now shielded for `pendingGraceMs` (30s) after the LATER of its `sinceMs` AND the run's first
+      reconcile in the current process (`run.reconcileStartedMs`, stamped once per process; a restart
+      re-stamps). So a long-lived RUNNING record survives a transient/incomplete post-restart list for a
+      full grace window. Conservative — can only DELAY a prune (hold a slot longer), never cause a
+      duplicate. Wiring: `store.ts reconcile` (param + `Math.max(sinceMs, reconcileStartedMs)` gate),
+      `runner.ts` (`QueueRun.reconcileStartedMs` stamp + pass-through). Tests: `store.test.ts`
+      (shield within grace / prune past grace / default-arg = pre-fix behavior); the latch-persists
+      restart test updated to expect the held-then-pruned sequence.
+    - **(C) PERSISTENT SIDECAR LOG (so the next incident is debuggable).** The Swift controller pipes the
+      sidecar's stdout to an UNREAD pipe and sends stderr to `nullDevice`, so the engine's run/prune/command
+      logs had NO durable trail (this incident was undiagnosable after the fact). New `src/logfile.ts`
+      tees `console.{log,info,warn,error}` to a ROTATING file `~/Library/Logs/ghostty-ramon-agent-manager.log`
+      (append, rotate at ~5MB → `.1`); best-effort (any fs error falls back to console only, never throws);
+      installed first thing in `index.ts main()`. Pure `formatLogLine`/`defaultLogPath` unit-tested
+      (`logfile.test.ts`). **Sidecar-only — rebuilt `dist` + sidecar restart; no host/Zig/GUI-Swift change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
@@ -1272,9 +1569,12 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   the host (ends live sessions, RAM-only) exactly like Ramon's manual reload.
 
 - **The `ghostty-mcp` shim is bundled + installed-to-PATH for colleagues too** — same
-  pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. CI
-  `swift build -c release`s the shim and copies+signs it into `Contents/MacOS/ghostty-mcp`
-  (alongside the host, inside the notarized bundle, carried by Sparkle). On first launch
+  pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. **BOTH
+  release paths** `swift build -c release`s the shim and copies+signs it into
+  `Contents/MacOS/ghostty-mcp` (alongside the host, inside the notarized bundle, carried by
+  Sparkle): `dist/macos/release-local.sh` step 3a (the PRIMARY local path — it was MISSING
+  this until 2026-06-24, so locally-cut DMGs shipped no shim) and the CI workflow
+  (`.github/workflows/fork-release.yml`, the manual-only fallback). On first launch
   `ForkSetup.installShimIfNeeded` copies it onto PATH at `~/.local/bin/ghostty-mcp`
   (version-aware via `kInstalledShimVersion`; reinstalls on a Sparkle bump or a manual
   delete). **Safety is symmetric with the host:** `planShimInstall` only acts when a shim
@@ -1284,7 +1584,8 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   xattr doesn't propagate to the loose copy. A colleague then registers with
   `claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"` (token auto-read from `local`);
   the committed `.mcp.json` (bare `ghostty-mcp`) serves repo-clone developers, not DMG users.
-  Wiring: `.github/workflows/fork-release.yml` (build+bundle+sign steps),
+  Wiring: `dist/macos/release-local.sh` (step 3a build+bundle + the `sign` line) and
+  `.github/workflows/fork-release.yml` (build+bundle+sign steps),
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`ShimPlan`/`planShimInstall`/
   `installShimIfNeeded`); tests in `macos/Tests/ForkSetup/ForkSetupTests.swift` (`shim*`).
 

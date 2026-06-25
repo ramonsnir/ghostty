@@ -209,12 +209,13 @@ enum MCPTools {
         [
             // (ramon fork / Agent Queue, §8.1)
             "name": "spawn_split_command",
-            "description": "Agent Queue: spawn one agent split running a command, returning the NEW surface's stable identity {id (UUID), sessionId (the pty-host session id; 0 when there is no host session)}. With firstTab:true, opens the run's first TAB (from app defaults in cwd); otherwise SPLITS the targetUUID surface in the given direction. The command is run as the new surface's first input in an interactive shell (it does NOT replace the shell); interior newlines are collapsed so exactly one trailing submit is sent. SAFETY/GENERICITY: item context MUST be passed via the 'env' map (e.g. GHOSTTY_ITEM_KEY/TITLE/URL) — which is set on the new split's environment so the launched shell inherits it — and NEVER string-spliced into 'command' (that would be shell injection). 'command' is the template launch line passed VERBATIM. 'cwd' is NOT tilde-expanded (use an absolute path).",
+            "description": "Agent Queue: spawn one agent split running a command, returning the NEW surface's stable identity {id (UUID), sessionId (the pty-host session id; 0 when there is no host session)}. With firstTab:true, opens the run's first TAB (from app defaults in cwd). Otherwise it splits within targetUUID's tab: with balanced:true (the queue's default) it ignores 'direction' and splits the LARGEST pane in the tab along its longer side (a balanced layout that self-heals when a pane closes); without balanced it splits the targetUUID surface in the explicit 'direction'. The command is run as the new surface's first input in an interactive shell (it does NOT replace the shell); interior newlines are collapsed so exactly one trailing submit is sent. SAFETY/GENERICITY: item context MUST be passed via the 'env' map (e.g. GHOSTTY_ITEM_KEY/TITLE/URL) — which is set on the new split's environment so the launched shell inherits it — and NEVER string-spliced into 'command' (that would be shell injection). 'command' is the template launch line passed VERBATIM. 'cwd' is NOT tilde-expanded (use an absolute path).",
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "targetUUID": ["type": "string", "description": "Surface UUID to split (required unless firstTab)."],
-                    "direction": ["type": "string", "enum": ["right", "down", "left", "up"], "description": "Split direction (required unless firstTab)."],
+                    "targetUUID": ["type": "string", "description": "A surface UUID identifying the tab to split into (required unless firstTab). With balanced it just anchors the tab; without balanced it is the exact pane split in 'direction'."],
+                    "direction": ["type": "string", "enum": ["right", "down", "left", "up"], "description": "Split direction (used only when balanced is false; required then)."],
+                    "balanced": ["type": "boolean", "default": false, "description": "Split the largest pane in the tab along its longer side (ignores 'direction'). The Agent Queue's default tiling."],
                     "command": ["type": "string", "description": "The launch command, run VERBATIM as the new surface's first input."],
                     "cwd": ["type": "string", "description": "Working directory (no '~' expansion)."],
                     "firstTab": ["type": "boolean", "default": false, "description": "Open the run's first tab instead of splitting a target."],
@@ -290,6 +291,39 @@ enum MCPTools {
                                 "key": ["type": "string"],
                                 "title": ["type": "string"],
                                 "url": ["type": "string"],
+                            ],
+                            "required": ["key"],
+                        ],
+                    ],
+                ],
+                "required": ["queueName"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / Agent Queue, backlog graph)
+            "name": "report_queue_graph",
+            "description": "Agent Queue: PUSH a run's WHOLE backlog board (every state — not just actionable items) to the GUI Agent Dashboard, for the 'N backlog' header button + the dependency-graph canvas. The supervisor calls this throttled to intervals.listMs when the template declares the optional provider.graph. 'queueName' (= run/origin name) is required; 'present:false' clears the run's backlog button + canvas. 'backlog' is the header-badge count (non-terminal items not currently waiting/running). 'nodes' is the full board: each {key (required), title?, url?, state? (display name), stateType? (category for color), done (terminal flag), labels[] (e.g. 'Design needed'), blockedBy[] (keys this depends on), priorityLabel? (a GENERIC priority MARK string like 'Urgent'/'High' the canvas renders as a prominent badge — the provider decides which items get one; omit for unmarked)}.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "queueName": ["type": "string"],
+                    "present": ["type": "boolean", "default": true],
+                    "backlog": ["type": "integer"],
+                    "nodes": [
+                        "type": "array",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "key": ["type": "string"],
+                                "title": ["type": "string"],
+                                "url": ["type": "string"],
+                                "state": ["type": "string"],
+                                "stateType": ["type": "string"],
+                                "done": ["type": "boolean"],
+                                "labels": ["type": "array", "items": ["type": "string"]],
+                                "blockedBy": ["type": "array", "items": ["type": "string"]],
+                                "priorityLabel": ["type": "string"],
                             ],
                             "required": ["key"],
                         ],
@@ -439,6 +473,7 @@ enum MCPTools {
                 return .invalidParams("missing command")
             }
             let firstTab = (arguments["firstTab"] as? Bool) ?? false
+            let balanced = (arguments["balanced"] as? Bool) ?? false
             let cwd = arguments["cwd"] as? String
             let direction = arguments["direction"] as? String
             // The item-context env: only string→string entries are kept (§13). A
@@ -454,15 +489,17 @@ enum MCPTools {
                 guard let s = arguments["targetUUID"] as? String, let u = UUID(uuidString: s) else {
                     return .invalidParams("missing or invalid targetUUID (required unless firstTab)")
                 }
-                guard MCPLayout.newDirection(direction) != nil else {
-                    return .invalidParams("missing or invalid direction (required unless firstTab)")
+                // 'direction' is required ONLY for an explicit (non-balanced) split; in
+                // balanced mode the engine picks the largest pane + direction itself.
+                if !balanced, MCPLayout.newDirection(direction) == nil {
+                    return .invalidParams("missing or invalid direction (required unless firstTab or balanced)")
                 }
                 targetUUID = u
             }
             let result: (id: String, sessionID: UInt64)? = DispatchQueue.main.sync {
                 MCPLayout.newSplitCommand(
                     targetUUID: targetUUID, direction: direction, command: command,
-                    cwd: cwd, firstTab: firstTab, env: env)
+                    cwd: cwd, firstTab: firstTab, env: env, balanced: balanced)
             }
             guard let result else { return .toolError("failed to spawn split") }
             // Casing note: this returns "sessionId" (lowercase); list_surfaces emits
@@ -486,6 +523,13 @@ enum MCPTools {
             }
             let ok = server.applyQueueStatus(payload.status)
             return ok ? .ok(["ok": true]) : .toolError("queue status not applied")
+
+        case "report_queue_graph":
+            guard let payload = QueueGraphPayload.fromArguments(arguments) else {
+                return .invalidParams("missing or empty queueName")
+            }
+            let ok = server.applyQueueGraph(payload.graph)
+            return ok ? .ok(["ok": true]) : .toolError("queue graph not applied")
 
         case "take_queue_commands":
             // dispatch() ALREADY runs on the server serial `queue` (handleRPC is a
