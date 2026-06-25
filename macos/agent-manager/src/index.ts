@@ -12,12 +12,23 @@
 //      LLM-free dispatch/track/close loop on its OWN timer (decoupled so the slow
 //      summarizer can never starve it). Armed only when a queue is configured.
 //
+// The two loops are INDEPENDENT (see parseLoopEnablement): the shared sidecar runs
+// whichever the controller arms, so the queue can run with the summarizer OFF (no
+// Haiku billing) and vice-versa. The controller launches the sidecar when EITHER
+// feature is enabled.
+//
 // The summarizer's Haiku calls bill against the ambient Claude Code auth by
 // default; an optional account spec (account.ts) routes them to a separate account.
 //
 // Config (env, set by the Swift AgentManagerController; mirrors macos/mcp-shim):
 //   GHOSTTY_MCP_URL      MCP server URL (default http://127.0.0.1:8765/mcp)
 //   GHOSTTY_MCP_TOKEN    shared secret, sent as the X-Ghostty-Token header (opt.)
+//   GHOSTTY_SUMMARIZER   "1"/ABSENT ⇒ run the summarizer; "0" ⇒ don't (gated on the
+//                        `agent-manager` key). Absent means ON for back-compat (the
+//                        summarizer used to be unconditional), so an old GUI that
+//                        respawns a new dist keeps summarizing.
+//   GHOSTTY_AGENT_QUEUE  "1" ⇒ arm the queue supervisor (gated on `agent-queue`);
+//                        absent ⇒ off. INDEPENDENT of GHOSTTY_SUMMARIZER.
 //   GHOSTTY_AGENT_MANAGER=1  set by the controller (and inherited by the `claude`
 //                            subprocess the SDK spawns) so the agent-state hook
 //                            early-exits and the summarizer's own model activity
@@ -92,6 +103,24 @@ function parsePositiveInt(v: string | undefined, def: number): number {
   if (v === undefined) return def;
   const n = Number.parseInt(v.trim(), 10);
   return Number.isInteger(n) && n > 0 ? n : def;
+}
+
+/** Which INDEPENDENT loops the shared sidecar should run, from its env. PURE.
+ *  The Swift controller (AgentManagerController) sets GHOSTTY_SUMMARIZER per the
+ *  `agent-manager` key and GHOSTTY_AGENT_QUEUE per `agent-queue`; either alone (or
+ *  both) can run.
+ *  - summarizer: ON unless explicitly "0". An ABSENT flag is ON for BACK-COMPAT —
+ *    the summarizer used to be unconditional, so an old GUI that respawns this (new)
+ *    dist without the flag keeps summarizing; only a new GUI with agent-manager off
+ *    writes the explicit "0".
+ *  - queue: opt-in, ON only on exactly "1" (absent ⇒ off, unchanged). */
+export function parseLoopEnablement(
+  env: Record<string, string | undefined>,
+): { summarizer: boolean; queue: boolean } {
+  return {
+    summarizer: env.GHOSTTY_SUMMARIZER !== "0",
+    queue: env.GHOSTTY_AGENT_QUEUE === "1",
+  };
 }
 
 /** The single-shot model call seam (defaults to the real SDK-backed summarize).
@@ -409,6 +438,11 @@ async function main(): Promise<void> {
   const url = process.env.GHOSTTY_MCP_URL ?? "http://127.0.0.1:8765/mcp";
   const token = process.env.GHOSTTY_MCP_TOKEN;
 
+  // Which INDEPENDENT loops to run. The controller launches the sidecar when EITHER
+  // feature is on, then arms each loop via its own env flag (see parseLoopEnablement).
+  const { summarizer: summarizerEnabled, queue: queueEnabled } =
+    parseLoopEnablement(process.env);
+
   const home = homedir();
   // Optional config overlay (see config.ts): debounce / fuzzy change threshold /
   // hidden-skip / tail windows, tunable in ~/.config/ghostty-ramon/agent-manager/
@@ -426,14 +460,18 @@ async function main(): Promise<void> {
   // Optional summarizer ACCOUNT routing (see account.ts). Default ⇒ inherit the
   // ambient Claude Code auth (works with no claude-accounts installed). When set,
   // the summarizer's model calls bill against the configured account's CLAUDE_CONFIG_DIR.
-  const accountSpec = readAccountSpec(home);
-  const summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
-  if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
-    errlog(
-      `summarizer account "${accountSpec.trim()}" did not resolve to a directory; using default auth`,
-    );
-  } else if (summarizerConfigDir) {
-    log(`summarizer billing routed to CLAUDE_CONFIG_DIR=${summarizerConfigDir}`);
+  // Only relevant to the summarizer, so skip it entirely in queue-only mode.
+  let summarizerConfigDir: string | undefined;
+  if (summarizerEnabled) {
+    const accountSpec = readAccountSpec(home);
+    summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
+    if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
+      errlog(
+        `summarizer account "${accountSpec.trim()}" did not resolve to a directory; using default auth`,
+      );
+    } else if (summarizerConfigDir) {
+      log(`summarizer billing routed to CLAUDE_CONFIG_DIR=${summarizerConfigDir}`);
+    }
   }
 
   const deps: LoopDeps = {
@@ -449,12 +487,11 @@ async function main(): Promise<void> {
     summarizerConfigDir,
   };
 
-  // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on AND at
-  // least one valid template loads from the templates dir. The Swift controller sets
-  // GHOSTTY_AGENT_QUEUE=1 (master enable) + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
-  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys; absent ⇒ the queue stays
-  // a no-op and the summarizer behavior is byte-identical.
-  if (process.env.GHOSTTY_AGENT_QUEUE === "1") {
+  // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on (the Swift
+  // controller sets GHOSTTY_AGENT_QUEUE=1 + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
+  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys). Absent ⇒ the queue stays
+  // a no-op; this is INDEPENDENT of the summarizer (either can run alone).
+  if (queueEnabled) {
     const templatesDir = process.env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR ?? defaultTemplatesDir();
     const stateDir = defaultStateDir();
     const maxTotal = parsePositiveInt(process.env.GHOSTTY_AGENT_QUEUE_MAX_TOTAL, 8);
@@ -494,7 +531,18 @@ async function main(): Promise<void> {
     );
   }
 
-  log(`summarizer started; MCP=${url} (poll ${POLL_INTERVAL_MS}ms)`);
+  log(
+    `sidecar started; MCP=${url} summarizer=${summarizerEnabled} ` +
+      `queue=${deps.queue !== undefined} (poll ${POLL_INTERVAL_MS}ms)`,
+  );
+
+  // The controller's gate guarantees at least one loop is armed, but guard anyway:
+  // with nothing to run, return so the process exits cleanly (no timers pending)
+  // rather than idle forever holding the MCP connection.
+  if (!summarizerEnabled && deps.queue === undefined) {
+    errlog("neither summarizer nor queue is enabled; nothing to do — exiting");
+    return;
+  }
 
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
@@ -539,9 +587,10 @@ async function main(): Promise<void> {
 
   // Start the INDEPENDENT queue loop FIRST, so it is never delayed (or blocked
   // forever) by the slow — or occasionally hanging — first summarizer sweep in
-  // `tick`. Both loops then run concurrently on the event loop.
+  // `tick`. Each loop runs only when its feature is armed; whichever are on run
+  // concurrently on the event loop, and their pending timers keep the process alive.
   if (deps.queue !== undefined) void queueTick();
-  await tick();
+  if (summarizerEnabled) await tick();
 }
 
 // Only start the poll loop when this module is the program ENTRY POINT (i.e.

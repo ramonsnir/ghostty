@@ -61,7 +61,10 @@ onto the tile via the MCP `set_surface_annotation` tool. The summary call uses n
 and the SDK authenticates the same way the `claude` CLI does — so there is **no API key
 in Ghostty** and usage is billed to your normal plan. (A second, independent loop in the
 same sidecar drives the [Agent Queue](AGENT-QUEUE.md) when it is configured — that is a
-deterministic, LLM-free dispatcher and is unrelated to the summarizer.)
+deterministic, LLM-free dispatcher and is unrelated to the summarizer. The two share one
+sidecar but run **independently**: the sidecar launches when **either** `agent-manager` or
+`agent-queue` is on, so you can run the queue with `agent-manager = false` and the
+summarizer — the only thing here that spends Haiku — stays completely silent.)
 
 ## Requirements
 

@@ -884,9 +884,10 @@ extension Ghostty {
             return split.isEmpty ? agentDashboardCommandsDefault : split
         }
 
-        // (ramon fork / Agent Manager) Master enable for the Agent Manager
-        // sidecar. Default false. Gated further at runtime by
-        // agentManagerShouldStart(...) (requires mcp-listen + mcp-token + node).
+        // (ramon fork / Agent Manager) Master enable for the Haiku SUMMARIZER.
+        // Default false. The shared sidecar launches when this OR agent-queue is on
+        // (sidecarShouldStart(...), requires mcp-listen + mcp-token + node); this flag
+        // independently gates whether the summarizer loop runs inside it.
         var agentManagerEnabled: Bool {
             guard let config = self.config else { return false }
             var v = false
