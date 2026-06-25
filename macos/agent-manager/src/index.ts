@@ -190,11 +190,19 @@ export interface LoopDeps {
    *  after the alert clears (the screen changes). Held on deps so a test can
    *  seed/inspect it; cleaned up alongside lastBySession when a surface dies. */
   alertBySession: Map<string, string>;
-  /** (bell-attention) Whether the two-tier bell pass is active (mirrors the GUI's
+  /** Whether the CONTINUOUS summarizer pass runs (mirrors `agent-manager` /
+   *  GHOSTTY_SUMMARIZER). When false, `runSweep` does NOT summarize the periodic due
+   *  agents — only the cheap, INDEPENDENT per-bell FORCED pass below still runs (so
+   *  bell-promotion works with agent-manager OFF, e.g. queue-only or bell-only mode). The
+   *  expensive continuous Haiku polling is what `agent-manager` gates; bell promotion is
+   *  per-bell + fail-open and is gated separately by `bellFilter`. */
+  summarizerEnabled: boolean;
+  /** (bell-attention) Whether the per-bell promotion pass is active (mirrors the GUI's
    *  `agent-manager-bell-filter` config, delivered via GHOSTTY_BELL_FILTER=1). When
    *  false the sweep does NO bell-edge work and behaves byte-identically to before;
-   *  when true, a `bell` rising-edge force-classifies that surface (bellRang) so Haiku
-   *  can PROMOTE it to the "attention needed" state via set_attention. */
+   *  when true, a `bell` rising-edge / `pendingBellIds` force-classifies that surface
+   *  (bellRang) so Haiku can PROMOTE it via set_attention. INDEPENDENT of
+   *  `summarizerEnabled` — a bell still promotes when the continuous summarizer is off. */
   bellFilter: boolean;
   /** (bell-attention) Per-session memory of the last-seen `bell` flag, keyed by surface
    *  id, for rising-edge detection. Held on deps so a test can seed/inspect it; cleaned
@@ -497,14 +505,38 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     }
   }
 
-  // Cheap pre-gate from row fields only (no read_surface yet): drop non-agent / hidden /
-  // debounced surfaces. A bell rising edge FORCES a classify past the DEBOUNCE gate — but
-  // NEVER past the not-agent/hidden gate (a bell on a non-agent shell is not promoted) — so
-  // a forced surface is ALSO a candidate when the pre-gate's SOLE objection is debounce.
-  const candidates = surfaces.filter((s) => {
-    const pre = preGate(s, deps.lastBySession.get(s.id), deps.now(), deps.cfg);
-    return pre.pass || (forcedBell.has(s.id) && pre.reason === "debounce");
-  });
+  // (bell-attention) FORCED (bell) pass — ALWAYS runs when a surface rang, INDEPENDENT of
+  // the continuous summarizer (`summarizerEnabled`) and EXEMPT from the rate-limit backoff
+  // cooldown below. Rationale (the headline of this design): the continuous summarizer's
+  // per-poll Haiku calls are EXPENSIVE so they are gated by `agent-manager`; a per-bell
+  // classify is RARE, urgent, and FAIL-OPEN (a failed/errored classify PROMOTES), so it
+  // must always get its one classify — even with agent-manager OFF (queue-only / bell-only)
+  // or while the account is backed off. A bell forces past the DEBOUNCE gate but NEVER past
+  // the not-agent/hidden gate. These run sequentially (forced surfaces are few) and are NOT
+  // fed into the backoff aggregator (which governs the CONTINUOUS poll cadence only).
+  if (forcedBell.size > 0) {
+    for (const surface of surfaces) {
+      if (!forcedBell.has(surface.id)) continue;
+      const pre = preGate(surface, deps.lastBySession.get(surface.id), deps.now(), deps.cfg);
+      if (!(pre.pass || pre.reason === "debounce")) continue; // not-agent/hidden: never promote
+      if (!deps.budget.tryAcquire()) break;
+      await summarizeOne(surface, deps, { bellRang: true });
+    }
+  }
+
+  // CONTINUOUS summarizer pass — ONLY when agent-manager is enabled. With it OFF (queue-only
+  // or bell-only mode) the expensive per-poll Haiku calls never happen; only the cheap
+  // per-bell pass above ran. This is the load-bearing decoupling: agent-manager gates the
+  // continuous cost, bell-filter gates the cheap promotion, independently.
+  if (!deps.summarizerEnabled) return;
+
+  // Cheap pre-gate: the due (changed / non-debounced) NON-forced agents. Forced surfaces
+  // were handled above, so EXCLUDE them here (no double-classify).
+  const candidates = surfaces.filter(
+    (s) =>
+      !forcedBell.has(s.id) &&
+      preGate(s, deps.lastBySession.get(s.id), deps.now(), deps.cfg).pass,
+  );
 
   // RATE-LIMIT BACKOFF (account-wide): while the summarizer's own calls keep failing,
   // slow WAY down and make at most ONE probe call per window until one succeeds (the
@@ -512,13 +544,11 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
   const bo = deps.summarizerBackoff;
   if (bo.failureStreak > 0) {
     if (deps.now() < bo.nextProbeMs) return; // still cooling down — no model calls
-    // PROBE: try candidates sequentially until ONE makes a real model call (not a
-    // gate-skip). A forced (belled) surface still carries bellRang so it FAIL-OPEN
-    // promotes even while the account is backed off.
+    // PROBE: try candidates sequentially until ONE makes a real model call (not a gate-skip).
     let probed: SummarizeResult | null = null;
     for (const surface of candidates) {
       if (!deps.budget.tryAcquire()) break;
-      const r = await summarizeOne(surface, deps, { bellRang: forcedBell.has(surface.id) });
+      const r = await summarizeOne(surface, deps);
       if (r !== "skip") { probed = r; break; }
     }
     if (probed === "ok") {
@@ -536,13 +566,12 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     return;
   }
 
-  // NORMAL path: fire due surfaces concurrently (bounded by the budget = per-sweep batch
-  // cap). A forced surface carries bellRang so Haiku can promote it.
+  // NORMAL path: fire due (non-forced) surfaces concurrently (bounded by the budget =
+  // per-sweep batch cap).
   const fired: Array<Promise<SummarizeResult>> = [];
   for (const surface of candidates) {
-    const forced = forcedBell.has(surface.id);
     if (!deps.budget.tryAcquire()) break; // budget exhausted this sweep
-    fired.push(summarizeOne(surface, deps, { bellRang: forced }));
+    fired.push(summarizeOne(surface, deps));
   }
 
   const results = await Promise.all(fired);
@@ -606,12 +635,18 @@ async function main(): Promise<void> {
   }
   const client = new McpClient({ url, token });
 
-  // Optional summarizer ACCOUNT routing (see account.ts). Default ⇒ inherit the
-  // ambient Claude Code auth (works with no claude-accounts installed). When set,
-  // the summarizer's model calls bill against the configured account's CLAUDE_CONFIG_DIR.
-  // Only relevant to the summarizer, so skip it entirely in queue-only mode.
+  // (bell-attention) The GUI sets GHOSTTY_BELL_FILTER=1 from `agent-manager-bell-filter`
+  // when the per-bell promotion feature is on. INDEPENDENT of the summarizer — a bell still
+  // promotes (cheap, per-bell, fail-open) when the continuous summarizer is off.
+  const bellFilter = process.env.GHOSTTY_BELL_FILTER === "1";
+
+  // Optional ACCOUNT routing (see account.ts). Default ⇒ inherit the ambient Claude Code
+  // auth (works with no claude-accounts installed). When set, the model calls bill against
+  // the configured account's CLAUDE_CONFIG_DIR. Relevant to ANY Haiku classify — the
+  // continuous summarizer AND the per-bell promotion — so it is resolved when EITHER is on
+  // (skip it only in pure queue-only mode, which makes no Haiku calls).
   let summarizerConfigDir: string | undefined;
-  if (summarizerEnabled) {
+  if (summarizerEnabled || bellFilter) {
     const accountSpec = readAccountSpec(home);
     summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
     if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
@@ -623,10 +658,6 @@ async function main(): Promise<void> {
     }
   }
 
-  // (bell-attention) The GUI sets GHOSTTY_BELL_FILTER=1 from `agent-manager-bell-filter`
-  // when the two-tier bell feature is on. Absent ⇒ no bell-edge work (byte-identical).
-  const bellFilter = process.env.GHOSTTY_BELL_FILTER === "1";
-
   const deps: LoopDeps = {
     client,
     overrides: makeOverrideLoader(),
@@ -636,6 +667,7 @@ async function main(): Promise<void> {
     summarize: defaultSummarize,
     lastBySession: new Map<string, LastSummary>(),
     alertBySession: new Map<string, string>(),
+    summarizerEnabled,
     bellFilter,
     bellSeenBySession: new Map<string, boolean>(),
     pendingBellIds: new Set<string>(),
@@ -690,14 +722,14 @@ async function main(): Promise<void> {
 
   log(
     `sidecar started; MCP=${url} summarizer=${summarizerEnabled} ` +
-      `queue=${deps.queue !== undefined} (poll ${POLL_INTERVAL_MS}ms)`,
+      `queue=${deps.queue !== undefined} bellFilter=${bellFilter} (poll ${POLL_INTERVAL_MS}ms)`,
   );
 
-  // The controller's gate guarantees at least one loop is armed, but guard anyway:
-  // with nothing to run, return so the process exits cleanly (no timers pending)
-  // rather than idle forever holding the MCP connection.
-  if (!summarizerEnabled && deps.queue === undefined) {
-    errlog("neither summarizer nor queue is enabled; nothing to do — exiting");
+  // The controller's gate guarantees at least one of the THREE loops is armed, but guard
+  // anyway: with nothing to run (no summarizer, no queue, AND no bell promotion) return so
+  // the process exits cleanly rather than idle forever holding the MCP connection.
+  if (!summarizerEnabled && deps.queue === undefined && !bellFilter) {
+    errlog("neither summarizer, queue, nor bell-filter is enabled; nothing to do — exiting");
     return;
   }
 
@@ -786,17 +818,19 @@ async function main(): Promise<void> {
   // `tick`. Each loop runs only when its feature is armed; whichever are on run
   // concurrently on the event loop, and their pending timers keep the process alive.
   if (deps.queue !== undefined) void queueTick();
-  if (summarizerEnabled) {
-    // (bell-attention v2 slice 4) Arm the bell-reactive loop only when bell promotion is on
-    // (it needs the attention tier to promote into) AND we have the waitForEvent capability.
-    // Nested under summarizerEnabled: promotion rides the summarizer's classify, so the
-    // queue-only mode (agent-manager off) never spins it.
-    if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
-      log("bell-attention: event-driven classify ENABLED (wait_for_event)");
-      void bellReactiveLoop();
-    }
-    await tick();
+  // (bell-attention) The bell-reactive loop is INDEPENDENT of the continuous summarizer:
+  // it runs whenever bell promotion is on (+ the waitForEvent capability exists), so a bell
+  // still promotes (cheap, per-bell, fail-open) even with agent-manager OFF (queue-only or
+  // bell-only mode). The classify it wakes runs ONLY the forced surface — `runSweep` gates
+  // the expensive continuous pass on `summarizerEnabled`.
+  if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
+    log("bell-attention: event-driven classify ENABLED (wait_for_event)");
+    void bellReactiveLoop();
   }
+  // The 5s CONTINUOUS summarizer poll runs ONLY when agent-manager is enabled (the expensive
+  // path). `await` it so main() stays alive on the summarizer's timer; when it's off, the
+  // queue and/or bell-reactive loops keep the process alive via their own pending work.
+  if (summarizerEnabled) await tick();
 }
 
 // Only start the poll loop when this module is the program ENTRY POINT (i.e.

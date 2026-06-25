@@ -29,10 +29,20 @@ struct AgentManagerControllerTests {
             nodePath: "/usr/local/bin/node") == true)
     }
 
-    /// BOTH features off ⇒ never starts, regardless of MCP/node.
-    @Test func shouldNotStartWhenBothDisabled() {
+    /// (bell-attention) Bell-filter alone ⇒ ALSO starts — per-bell promotion is cheap
+    /// (per-bell, fail-open) so it runs the sidecar on its own with the summarizer off.
+    @Test func shouldStartWhenBellFilterOnly() {
         #expect(AgentManagerController.sidecarShouldStart(
-            managerEnabled: false, queueEnabled: false,
+            managerEnabled: false, queueEnabled: false, bellFilterEnabled: true,
+            mcpListen: "127.0.0.1:8765",
+            mcpToken: "secret-token",
+            nodePath: "/usr/local/bin/node") == true)
+    }
+
+    /// ALL THREE features off ⇒ never starts, regardless of MCP/node.
+    @Test func shouldNotStartWhenAllDisabled() {
+        #expect(AgentManagerController.sidecarShouldStart(
+            managerEnabled: false, queueEnabled: false, bellFilterEnabled: false,
             mcpListen: "127.0.0.1:8765",
             mcpToken: "secret-token",
             nodePath: "/usr/local/bin/node") == false)
@@ -96,7 +106,13 @@ struct AgentManagerControllerTests {
     @Test func disabledReasonOrdersByFirstFailure() {
         #expect(AgentManagerController.sidecarDisabledReason(
             managerEnabled: false, queueEnabled: false, mcpListen: "x:1", mcpToken: "t", nodePath: "/n")
-            == "agent-manager and agent-queue are both off")
+            == "agent-manager, agent-queue, and agent-manager-bell-filter are all off")
+        // Bell-filter alone flips the "all off" reason to a transport/node check (it's a
+        // valid launch trigger), proving the gate now considers it.
+        #expect(AgentManagerController.sidecarDisabledReason(
+            managerEnabled: false, queueEnabled: false, bellFilterEnabled: true,
+            mcpListen: "", mcpToken: "t", nodePath: "/n")
+            == "mcp-listen is not set")
         // A feature ON but MCP missing reports the transport failure, not "both off".
         #expect(AgentManagerController.sidecarDisabledReason(
             managerEnabled: true, queueEnabled: false, mcpListen: "", mcpToken: "t", nodePath: "/n")

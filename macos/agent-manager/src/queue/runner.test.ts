@@ -273,6 +273,7 @@ function makeLoopDeps(client: McpClient): LoopDeps {
     summarize: okSummary,
     lastBySession: new Map(),
     alertBySession: new Map(),
+    summarizerEnabled: true,
     bellFilter: false,
     bellSeenBySession: new Map(),
     pendingBellIds: new Set(),

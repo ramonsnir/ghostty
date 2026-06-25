@@ -110,6 +110,9 @@ interface DepsSpec {
   now?: number;
   last?: Map<string, LastSummary>;
   alerts?: Map<string, string>;
+  /** Defaults TRUE (the continuous summarizer is on) so existing summarizer tests are
+   *  unchanged; set false to exercise queue-only / bell-only mode. */
+  summarizerEnabled?: boolean;
   bellFilter?: boolean;
   bellsSeen?: Map<string, boolean>;
   pendingBells?: Set<string>;
@@ -136,6 +139,7 @@ function makeDeps(spec: DepsSpec): {
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
     alertBySession: spec.alerts ?? new Map<string, string>(),
+    summarizerEnabled: spec.summarizerEnabled ?? true,
     bellFilter: spec.bellFilter ?? false,
     bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
     pendingBellIds: spec.pendingBells ?? new Set<string>(),
@@ -701,6 +705,52 @@ test("bell-attention: a pendingBellId forces a classify even when list_surfaces.
   assert.equal(fake.attentionCalls.length, 1, "promoted");
   assert.equal(fake.attentionCalls[0].on, true);
   assert.equal(deps.pendingBellIds.size, 0, "pending set drained (one-shot per ring)");
+});
+
+// (bell-attention) The DECOUPLING: agent-manager (the expensive continuous summarizer) is
+// OFF, but bell-filter is ON (queue-only / bell-only mode). A bell must STILL promote (cheap,
+// per-bell, fail-open), while the due NON-belled agents must NOT be polled (the costly pass
+// is gated off). This is the combination the "agent-manager optional" change requires.
+test("bell-attention: summarizer OFF + bell-filter ON ⇒ a bell promotes but due agents are NOT polled", async () => {
+  const belled = makeSurface({ id: "s1", agentState: "working", bell: false }); // sound-only ring
+  const due = makeSurface({ id: "s2", agentState: "working", bell: false }); // changed/due, no bell
+  const fake = makeFakeClient({
+    surfaces: [belled, due],
+    screens: { s1: "permission prompt", s2: "fresh output" },
+  });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    summarizerEnabled: false, // agent-manager OFF (the expensive poll is gated)
+    bellFilter: true, // per-bell promotion ON
+    pendingBells: new Set(["s1"]), // the bell-reactive loop saw s1 ring
+  });
+
+  await runSweep(deps);
+
+  assert.deepEqual(fake.readCalls, ["s1"], "ONLY the belled surface is read — no continuous poll");
+  assert.equal(summarizeCalls.length, 1, "exactly one classify (the bell), not the due agent s2");
+  assert.equal(fake.attentionCalls.length, 1, "the bell still promotes with the summarizer off");
+  assert.equal(fake.attentionCalls[0].id, "s1");
+});
+
+// Complement: summarizer OFF + bell-filter ON + NO bell ⇒ a fully no-op sweep.
+test("bell-attention: summarizer OFF + bell-filter ON + no bell ⇒ no model calls at all", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "fresh output" },
+  });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    summarizerEnabled: false,
+    bellFilter: true,
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "no bell + summarizer off ⇒ nothing summarized");
+  assert.equal(fake.readCalls.length, 0, "not even a read");
 });
 
 test("bell-attention: attention:false ⇒ classified but NOT promoted (quiet raw bell stands)", async () => {

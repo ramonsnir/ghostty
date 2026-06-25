@@ -125,14 +125,23 @@ a promoted "needs you" as ⏳, each routed by whether `monitor` is on its tier. 
 
 ## Requirements
 
-1. **Agent Manager running** (`agent-manager = true`) — it is the promoter. See
-   [AGENT-MANAGER.md](AGENT-MANAGER.md) for its own requirements (pty-host, MCP, the
-   Claude hooks, and — strongly recommended — routing its Haiku to a **separate account**
-   so the rate-limit watchdog survives the very limit it watches for).
-2. `agent-manager-bell-filter = true`.
+1. `agent-manager-bell-filter = true` — the master switch.
+2. The **Agent Manager sidecar must be able to run**: `mcp-listen` + `mcp-token` set and
+   `node` on PATH (see [AGENT-MANAGER.md](AGENT-MANAGER.md)). **You do NOT need the continuous
+   summarizer** (`agent-manager`) on — the sidecar launches for bell-filter alone, and a bell
+   classify is a cheap *per-bell* Haiku call, decoupled from the expensive continuous polling
+   that `agent-manager` gates. (So bell-promotion works in every combination: agent-manager
+   on or off, agent-queue on or off.)
 3. Your chosen `bell-features` / `attention-features` routing (remember the `no-` gotcha).
+4. *Recommended:* route the sidecar's Haiku to a **separate account** (AGENT-MANAGER.md →
+   Account routing) so a bell classify survives the very rate-limit it might be reporting.
 
 With the filter **off**, none of this engages and a bell behaves exactly as it does today.
+
+> **Cost note.** The continuous summarizer (`agent-manager`) makes Haiku calls on a timer
+> for every agent tile — that's the expensive part, so it's separately toggleable. Bell
+> promotion only classifies *on a bell* (rare), so it's cheap enough to leave on even with
+> the summarizer off.
 
 ## Known limitation (deliberately not built)
 

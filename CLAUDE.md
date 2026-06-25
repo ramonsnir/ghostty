@@ -78,6 +78,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     badge,dashboard,push,monitor`. **`attention` is a BACK-COMPAT alias** the dock consumers
     treat as `bounce`+`badge`. **`agent-manager-bell-filter` (bool, default false)** is the
     master switch (delivered to the sidecar as `GHOSTTY_BELL_FILTER=1`).
+  - **DECOUPLED from the continuous summarizer (works in ALL agent-manager combinations).**
+    Since ramon-fork made `agent-manager` (the EXPENSIVE per-poll summarizer) optional, bell
+    promotion — a CHEAP per-bell, fail-open classify — must work independently. So: (1) the
+    Swift `sidecarShouldStart` gate launches the sidecar when agent-manager OR agent-queue OR
+    `bell-filter` is on (`bellFilterEnabled` added, default false); (2) `LoopDeps.summarizerEnabled`
+    (from GHOSTTY_SUMMARIZER) gates ONLY the continuous pass — `runSweep` ALWAYS runs the FORCED
+    (bell) pass (sequential, fail-open, EXEMPT from the rate-limit backoff cooldown) but runs the
+    continuous due-agent pass + backoff ONLY when `summarizerEnabled`; (3) `main()` arms
+    `bellReactiveLoop` whenever `bellFilter` (NOT nested under summarizer), and `await tick()` (the
+    5s poll) only when `summarizerEnabled`; the process-exit guard requires all THREE off. So
+    bell-only mode (summarizer off, bell-filter on): a bell classifies ONLY the rung surface
+    (one cheap call), the due agents are never polled. Account-routing is resolved when
+    `summarizerEnabled || bellFilter` (a bell classify also bills the routed account). Tests:
+    sidecar `summarizer OFF + bell-filter ON ⇒ a bell promotes but due agents are NOT polled`
+    (+ the no-bell no-op), Swift `shouldStartWhenBellFilterOnly`.
   - **PARSE IS ADDITIVE over the TYPE field defaults, NOT reset-to-listed (load-bearing
     gotcha).** `parsePackedStruct` does `var result: T = .{}` — so `BellFeatures{}` starts
     `attention`+`title` TRUE, the rest FALSE, then the listed flags are OR'd on (or cleared
