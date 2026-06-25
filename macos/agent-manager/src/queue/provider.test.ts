@@ -363,9 +363,9 @@ test("fetchList: a flaky list (non-zero exit) => [] (skip the tick)", async () =
   assert.deepEqual(await fetchList(spec, exec), []);
 });
 
-// fetchListResult — distinguishes a SUCCESSFUL empty list from a FAILED/skip one (the
-// quit-when-empty signal, §8a). A failed list must NEVER read as "empty".
-test("fetchListResult: a clean empty list => {ok:true, items:[]} (arms quit-when-empty)", async () => {
+// fetchListResult — distinguishes a SUCCESSFUL empty list from a FAILED/skip one (used by
+// the dispatch-latch re-arm + the §11 health cache). A failed list must NEVER read as "empty".
+test("fetchListResult: a clean empty list => {ok:true, items:[]}", async () => {
   const spec: ProviderListSpec = { command: ["list"], keyField: "k" };
   const { exec } = fakeExec({ code: 0, stdout: "[]", stderr: "" });
   assert.deepEqual(await fetchListResult(spec, exec), { ok: true, items: [] });

@@ -33,6 +33,7 @@
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 
+import { installFileLogger } from "./logfile.js";
 import { McpClient, McpError, type Surface } from "./mcp.js";
 import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
 import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
@@ -343,6 +344,11 @@ export async function runQueueSweepSafe(deps: LoopDeps): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Tee console output to a durable rotating file FIRST, so every log below (incl. the
+  // queue engine's run/prune/command lines) is diagnosable after the fact — the Swift
+  // controller pipes stdout to an unread pipe and discards stderr, so without this there
+  // is no trail (see logfile.ts).
+  installFileLogger();
   const url = process.env.GHOSTTY_MCP_URL ?? "http://127.0.0.1:8765/mcp";
   const token = process.env.GHOSTTY_MCP_TOKEN;
 

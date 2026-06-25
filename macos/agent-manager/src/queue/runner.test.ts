@@ -57,7 +57,6 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
     closeStableSeconds: 5,
-    quitWhenEmpty: false,
     params: [],
     ...over,
   };
@@ -992,7 +991,7 @@ test("runQueueSweep: a crashed (EXITED) split's key is COOLED then LATCHED — N
   assert.ok(run.dispatched.has("K-1"), "latch still held");
 
   // K-1 LEAVES the actionable list (e.g. moved off the queried state) for a sweep → the
-  // latch RE-ARMS (clears). quitWhenEmpty is false in tmpl() so the empty list won't quit.
+  // latch RE-ARMS (clears). An empty list never removes the run (no auto-quit).
   spec.listJson = "[]";
   now += 5000;
   await runQueueSweep(deps);
@@ -1088,12 +1087,17 @@ test("runQueueSweep: the dispatched latch PERSISTS across a sidecar restart (a k
   // --- SIDECAR RESTART: a brand-new run over the SAME persisted store ---
   const run2 = makeQueueRun(tmpl(), store);
   deps = makeQueueDeps(fake, [run2], () => now);
-  now += 200_000; // past grace so the killed record is pruned, isolating the latch
-  await runQueueSweep(deps); // first post-restart sweep reconciles + rehydrates the latch (dispatch suppressed)
+  // First post-restart sweep: reconcile stamps reconcileStartedMs (now), rehydrates the
+  // latch, and SHIELDS the killed record for graceMs after restart (the premature-prune
+  // fix: a transient/incomplete post-restart list_surfaces must not be mistaken for a kill).
+  await runQueueSweep(deps);
   assert.ok(run2.dispatched.has("K-1"), "latch rehydrated from the store on restart");
-  assert.equal(run2.active.has("K-1"), false, "killed record pruned — only the rehydrated latch remains");
-  now += 5000;
-  await runQueueSweep(deps); // now dispatch-armed; K-1 still listed → latch suppresses
+  assert.equal(run2.active.has("K-1"), true, "killed record HELD within the post-restart grace (not pruned yet)");
+  // Advance PAST the reconcile-start grace → the genuinely-gone record is now pruned,
+  // isolating the latch as the sole re-dispatch suppressor.
+  now += 200_000;
+  await runQueueSweep(deps); // dispatch-armed; reconcile prunes K-1; K-1 still listed → latch suppresses
+  assert.equal(run2.active.has("K-1"), false, "killed record pruned once past the restart grace — only the latch remains");
   assert.equal(fake.calls.spawn.length, 1, "NOT re-dispatched after restart (the latch persisted)");
 });
 
@@ -1879,75 +1883,28 @@ test("runQueueSweep: a sweep with no commands behaves exactly like the static-ru
 });
 
 // ---------------------------------------------------------------------------
-// (14) quitWhenEmpty (§8a): the run QUITS when a sweep sees a SUCCESSFUL empty list
-//      AND nothing is active — but NOT while agents are still running, and NOT on a
-//      flaky/failed list.
+// (14) NO auto-quit on an empty list (quitWhenEmpty REMOVED). A run is removed only by
+//      an explicit stop/abort; an empty `list` just means "nothing actionable now" and
+//      the run KEEPS polling. (The old quitWhenEmpty keyed on active.size===0, which a
+//      transient/incomplete post-restart list_surfaces could falsely produce → abandon
+//      live agents + remove the run. Removed; this pins the persist-forever behavior.)
 // ---------------------------------------------------------------------------
 
-test("runQueueSweep: quitWhenEmpty run with an empty list + no active agents removes itself", () => {
-  // arm (suppressed), then a sweep that fetches a clean empty list with nothing active
-  // → the run quits (removed from the registry) even though maxItems is not reached.
+test("runQueueSweep: an empty list + no active agents does NOT remove the run", () => {
   return (async () => {
     const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
-    const run = makeQueueRun(tmpl({ quitWhenEmpty: true }), memStore());
+    const run = makeQueueRun(tmpl(), memStore());
     let now = 1_000_000;
     const deps = makeQueueDeps(fake, [run], () => now);
 
     await runQueueSweep(deps); // arm (dispatch suppressed; no list fetch yet)
-    assert.equal(deps.registry.size, 1, "still armed after the first sweep");
     now += 5000;
-    await runQueueSweep(deps); // armed → fetch empty list → quit
-    assert.equal(deps.registry.size, 0, "quit on empty list + no active");
-    assert.equal(fake.calls.spawn.length, 0, "nothing was ever dispatched");
-  })();
-});
-
-test("runQueueSweep: quitWhenEmpty does NOT quit while an agent is still running (empty list, active>0)", () => {
-  return (async () => {
-    // A mutable spec so we can empty the list AFTER an item is dispatched (the agent
-    // 'claimed' it → it left the filter), while the agent keeps running.
-    const spec = {
-      surfaces: [] as Surface[],
-      listJson: '[{"id":"Q-1","title":"t"}]',
-      spawns: [{ id: "spawned-1", sessionId: 4242 }],
-    };
-    const fake = makeQueueFake(spec);
-    const run = makeQueueRun(tmpl({ quitWhenEmpty: true }), memStore());
-    let now = 2_000_000;
-    const deps = makeQueueDeps(fake, [run], () => now);
-
-    await runQueueSweep(deps); // arm
+    await runQueueSweep(deps); // empty list, nothing active
+    assert.equal(deps.registry.size, 1, "run persists on an empty list (no auto-quit)");
+    assert.equal(fake.calls.spawn.length, 0, "nothing dispatched (empty list)");
     now += 5000;
-    await runQueueSweep(deps); // dispatch Q-1 → SPAWNED (active = 1)
-    assert.equal(fake.calls.spawn.length, 1);
-    assert.equal(run.active.size, 1, "Q-1 tracked");
-
-    // The agent claimed its item, so the source list is now empty — but the agent is
-    // still running. The run must KEEP polling, not quit.
-    spec.listJson = "[]";
-    spec.surfaces = [queueSurface({ id: "spawned-1", queueKey: "Q-1", queueName: "backlog" })];
-    now += 5000;
-    await runQueueSweep(deps);
-    assert.equal(deps.registry.size, 1, "must NOT quit while the agent is still active");
-    assert.ok(run.active.has("Q-1"), "the running agent is still tracked");
-  })();
-});
-
-test("runQueueSweep: quitWhenEmpty does NOT quit on a FLAKY (non-zero) list", () => {
-  return (async () => {
-    // A list provider that always fails → fetchListResult ok:false → NOT 'empty' → never quits.
-    const fake = makeQueueFake({ surfaces: [] });
-    fake.exec = async (argv: string[]) => {
-      if (argv[0] === "list") return { code: 1, stdout: "", stderr: "boom" };
-      return { code: 0, stdout: '{"state":"working"}', stderr: "" };
-    };
-    const run = makeQueueRun(tmpl({ quitWhenEmpty: true }), memStore());
-    let now = 3_000_000;
-    const deps = makeQueueDeps(fake, [run], () => now);
-    await runQueueSweep(deps); // arm
-    now += 5000;
-    await runQueueSweep(deps); // list FAILS → not empty → must NOT quit
-    assert.equal(deps.registry.size, 1, "a failed list never reads as empty (no quit)");
+    await runQueueSweep(deps); // and again — still there, still polling
+    assert.equal(deps.registry.size, 1, "still present after another empty sweep");
   })();
 });
 

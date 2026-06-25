@@ -39,7 +39,6 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
     closeStableSeconds: 5,
-    quitWhenEmpty: false,
     params: [],
     ...over,
   };

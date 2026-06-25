@@ -156,14 +156,12 @@ export interface QueueTemplate {
   closeOnComplete: boolean;
   /** agentState==idle, unchanged this long, before the close sequence fires (§10). */
   closeStableSeconds: number;
-  /** When true, the RUN quits (removes itself from the registry) as soon as a sweep
-   *  observes a SUCCESSFUL EMPTY `list` AND it has no active assignments — i.e. there
-   *  is nothing left to do, even before `maxItems` is reached. A flaky/failed `list`
-   *  (which is treated as "skip", not "empty") never triggers it, and a momentary
-   *  empty list while agents are still running does NOT quit (active > 0) — the run
-   *  keeps polling for new/unblocked items until BOTH the queue and the fleet are
-   *  empty. Default false (poll forever). */
-  quitWhenEmpty: boolean;
+  // NOTE: there is intentionally NO `quitWhenEmpty`. A run is removed only by an explicit
+  // stop/abort; an empty `list` just means "nothing actionable now" and the run keeps
+  // polling. The old knob keyed on `active.size === 0`, which a transient/incomplete
+  // post-restart `list_surfaces` could falsely produce (by pruning live records) → it would
+  // silently abandon live agents + remove the whole run. Removed; any `quitWhenEmpty` in a
+  // template JSON is now simply ignored.
 }
 
 // ---------------------------------------------------------------------------
