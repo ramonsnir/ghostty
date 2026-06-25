@@ -267,6 +267,26 @@ export class McpClient {
   }
 
   /**
+   * (Agent Queue, §12 continuous packing) move_surface_into_tab — MOVE an existing surface
+   * (`sourceUUID`) into the TAB that holds `targetAnchorUUID`, as a balanced split, FOCUS-
+   * PRESERVING. Used by the packer to consolidate a fragmented run's tabs (merge a whole tab
+   * into an earlier one with room); the source tab closes when it empties. Throws McpError on
+   * failure (the packer logs + retries next sweep). Reuses Ghostty's proven cross-tab/window
+   * move primitive GUI-side.
+   */
+  async moveSurfaceIntoTab(args: {
+    sourceUUID: string;
+    targetAnchorUUID: string;
+    balanced?: boolean;
+  }): Promise<void> {
+    await this.call("move_surface_into_tab", {
+      sourceUUID: args.sourceUUID,
+      targetAnchorUUID: args.targetAnchorUUID,
+      ...(args.balanced !== undefined ? { balanced: args.balanced } : {}),
+    });
+  }
+
+  /**
    * (Agent Queue, §10) send_key — send a SINGLE real key event to a surface via the
    * existing MCP `send_key` tool (the supervisor's only key send; it never sends
    * free-form input). Used by the close sequence to deliver the template `agent.exit`

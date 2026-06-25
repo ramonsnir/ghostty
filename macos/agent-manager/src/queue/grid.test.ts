@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { gridCap, lowestFreeSlot, splitPlan, tabIndexForSlot } from "./grid.js";
+import { gridCap, lowestFreeSlot, splitPlan, tabIndexForSlot, packMove } from "./grid.js";
 
 // ---------------------------------------------------------------------------
 // gridCap / lowestFreeSlot — occupancy accounting (caps concurrency, refills holes).
@@ -82,5 +82,58 @@ test("splitPlan: a SUBSEQUENT slot of an overflow tab => balanced within that ta
   assert.deepEqual(splitPlan(new Set([0, 1, 2, 3, 4, 5, 6]), 7, 6), {
     balanced: true,
     anchorSlotIndex: 6,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// packMove — continuous packing: merge a whole tab into an earlier tab with room,
+// without reshuffling balanced layouts. capPerTab 6 throughout.
+// ---------------------------------------------------------------------------
+
+test("packMove: nothing to merge for 0 or 1 tab", () => {
+  assert.equal(packMove(new Set(), 6), null);
+  assert.equal(packMove(new Set([0, 1, 2]), 6), null); // one tab
+});
+
+test("packMove: 3 + 1 + 1 merges the HIGHEST tab into the leftmost tab with room", () => {
+  // tab0={0,1,2} (3), tab1={6} (1), tab2={12} (1). Highest src = tab2; leftmost target with
+  // room = tab0 (free 3 ≥ 1). Move slot 12 → the lowest free slot of tab0's range = 3.
+  assert.deepEqual(packMove(new Set([0, 1, 2, 6, 12]), 6), {
+    sourceSlots: [12],
+    targetSlots: [3],
+    targetTab: 0,
+  });
+});
+
+test("packMove: a whole multi-pane tab merges when it fits (and picks the lowest free slots)", () => {
+  // tab0={0,1} (2, free 4), tab1={6,7,8} (3). src=tab1 fits tab0 → move 6,7,8 → 2,3,4.
+  assert.deepEqual(packMove(new Set([0, 1, 6, 7, 8]), 6), {
+    sourceSlots: [6, 7, 8],
+    targetSlots: [2, 3, 4],
+    targetTab: 0,
+  });
+});
+
+test("packMove: does NOT reshuffle balanced layouts (4+4, 5+2) — the higher tab doesn't fit", () => {
+  // 4+4: tab0 free 2 < 4. 5+2: tab0 free 1 < 2. Neither merges.
+  assert.equal(packMove(new Set([0, 1, 2, 3, 6, 7, 8, 9]), 6), null);
+  assert.equal(packMove(new Set([0, 1, 2, 3, 4, 6, 7]), 6), null);
+});
+
+test("packMove: skips a FULL earlier tab and merges into the next one with room (6+1+1)", () => {
+  // tab0 full (0-5); tab1={6} (1); tab2={12} (1). src=tab2: tab0 free 0 (skip) → tab1 free 5 → move 12 → 7.
+  assert.deepEqual(packMove(new Set([0, 1, 2, 3, 4, 5, 6, 12]), 6), {
+    sourceSlots: [12],
+    targetSlots: [7],
+    targetTab: 1,
+  });
+});
+
+test("packMove: a hole in the target tab is reused as the destination slot", () => {
+  // tab0={0,2} (slot 1 is a hole), tab1={6}. src=tab1 → tab0 free includes 1 → move 6 → 1.
+  assert.deepEqual(packMove(new Set([0, 2, 6]), 6), {
+    sourceSlots: [6],
+    targetSlots: [1],
+    targetTab: 0,
   });
 });

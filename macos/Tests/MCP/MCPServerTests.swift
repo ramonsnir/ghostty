@@ -352,9 +352,10 @@ struct MCPServerTests {
             // Agent Queue (§8): the supervisor's "hands".
             "spawn_split_command", "force_close_surface", "signal_attention",
             "take_queue_commands", "report_queue_status", "report_queue_graph",
+            "move_surface_into_tab",
         ]
         #expect(names == expected)
-        #expect(tools.count == 19)
+        #expect(tools.count == 20)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")

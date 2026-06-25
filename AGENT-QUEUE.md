@@ -280,6 +280,13 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 - **Concurrency** is never exceeded (per-queue `concurrency` — the total across all the run's
   tabs — and the global `agent-queue-max-total`; `cols×rows` is the per-tab layout, not a cap on
   the total, since panes overflow to new tabs).
+- **Tabs stay packed** — as agents finish unevenly and tabs fragment (e.g. 3 + 1 + 1 panes
+  spread across three tabs), the queue **continuously consolidates**: when a whole tab's panes
+  fit into an earlier tab's free space, it moves them there and closes the emptied tab (over a
+  few sweeps), so you don't accumulate near-empty tabs. It does this WITHOUT reshuffling a
+  balanced layout — e.g. `4 + 4` or `5 + 2` (with a 6-pane grid) are left alone because the
+  bigger tab doesn't fit. The move is focus-preserving (it never yanks your focus or raises a
+  window).
 - **Restart-proof** — a started queue, its tiles, and its in-flight items survive a sidecar
   or GUI restart with no re-dispatch and no orphaned agents. (A *host* restart loses all
   RAM-only sessions, as always.)
