@@ -448,16 +448,13 @@ private struct OriginSectionHeader: View {
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
                     }
-                    Spacer(minLength: 0)
-                }
-            }
-            // (backlog graph) The "N backlog" button → the dependency-graph canvas, on its
-            // OWN full-width row so the narrow sidebar can never squeeze it out of the
-            // crowded status line (phase + waiting + running + cap). Shown whenever the run
-            // is reporting a board (provider.graph on).
-            if let graph {
-                HStack(spacing: 6) {
-                    backlogButton(graph)
+                    // (backlog graph) The "N backlog" button → the dependency-graph canvas,
+                    // inline at the end of the status line (after the dispatched/cap chip).
+                    // The row is full-width with a trailing Spacer, so this sits in the empty
+                    // space to the right of the counts. Shown whenever the run reports a board.
+                    if let graph {
+                        backlogButton(graph)
+                    }
                     Spacer(minLength: 0)
                 }
             }
