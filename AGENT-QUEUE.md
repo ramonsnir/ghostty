@@ -91,7 +91,7 @@ shell the engine just runs.
   },
   "concurrency": 3,                          // max simultaneous agents (clamped to the grid)
   "maxItems": 200,                           // hard ceiling on total lifetime dispatches
-  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // auto-layout; fill columns before rows
+  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // max simultaneous panes = cols×rows; panes auto-tile as a balanced split (the largest pane is split along its longer side) — `fill` / col-vs-row is IGNORED for placement
   // NOTE: there is NO `quitWhenEmpty` — a run is removed only by an explicit Stop/Abort.
   // An empty `list` just means "nothing actionable now"; the run keeps polling. (A `quitWhenEmpty`
   // key here is silently ignored — it was removed after it abandoned live agents on a restart.)

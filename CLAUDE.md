@@ -1106,8 +1106,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `subscribeQueueGraph`), `AgentDashboardView.swift` (`backlogButton` in `OriginSectionHeader`),
       `AgentDashboard/QueueBacklogCanvas.swift` (layout + canvas + window mgr; iOS-excluded in
       `project.pbxproj`). Config (untracked, Linear-specific): `example-graph.py` (mirrors
-      `example-list.py` scope/auth but ALL states + labels + blockedBy + done/stateType) +
-      `provider.graph` in `example.json`. Tests: sidecar `provider.test.ts` (parseGraph/fetchGraph),
+      `example-list.py` scope/auth but emits the FUTURE board — every NON-TERMINAL issue
+      (completed/canceled/duplicate EXCLUDED) + labels + blockedBy + stateType, and DROPS
+      "blocked by" edges to done blockers so a task gated only by finished work reads as a
+      ready root) + `provider.graph` in `example.json`. Tests: sidecar `provider.test.ts` (parseGraph/fetchGraph),
       `status.test.ts` (`backlogCount`), `templates.test.ts` (graph validate), `mcp.test.ts`
       (`reportQueueGraph`), `runner.test.ts` (graph fetch throttled + push + present:false-on-abort +
       no-graph-no-fetch); Swift `MCPServerTests` (`queueGraphPayload*`, tool count 19),
