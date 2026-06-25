@@ -3251,6 +3251,42 @@ keybind: Keybinds = .{},
 /// an official Ghostty would error on the unknown key.
 @"bell-features-focused": BellFeatures = .{},
 
+/// (ramon fork / Bell Attention v2) The ADDITIVE second tier: effects fired when a
+/// bell is PROMOTED to the sticky "attention needed" state (by the Agent Manager's
+/// fail-open classifier — see `agent-manager-bell-filter`). Same `BellFeatures` value
+/// format and shared vocabulary as `bell-features`, so any effect is routable to
+/// either tier. Semantics: every bell fires `bell-features`; a promoted bell ALSO
+/// fires `attention-features`; a confidently-ignored bell fires only `bell-features`.
+/// Only meaningful when `agent-manager-bell-filter = true`. The default is the "loud"
+/// set (title, border, dock bounce+badge, dashboard, push, web-monitor) — i.e. when
+/// you enable the filter you'd typically also dial `bell-features` down to
+/// `system,audio`. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+@"attention-features": BellFeatures = .{
+    .attention = false,
+    .title = true,
+    .border = true,
+    .bounce = true,
+    .badge = true,
+    .dashboard = true,
+    .push = true,
+    .monitor = true,
+},
+
+/// (ramon fork / Bell Attention v2) `attention-features` for when the promoted surface
+/// is truly in focus (same focus rule as `bell-features-focused`). Default matches
+/// `attention-features`; note a promoted surface usually clears its attention on focus,
+/// so this rarely applies. Fork-only.
+@"attention-features-focused": BellFeatures = .{
+    .attention = false,
+    .title = true,
+    .border = true,
+    .bounce = true,
+    .badge = true,
+    .dashboard = true,
+    .push = true,
+    .monitor = true,
+},
+
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
 /// from a phone (e.g. over Tailscale). Empty/null (the default) DISABLES the
@@ -9430,6 +9466,16 @@ pub const BellFeatures = packed struct {
     attention: bool = true,
     title: bool = true,
     border: bool = false,
+    // (ramon fork / Bell Attention v2) Finer-grained + fork-only effect flags, shared
+    // by `bell-features` and `attention-features` so any effect is routable to either
+    // tier. `attention` stays a BACK-COMPAT alias the consumers treat as (bounce AND
+    // badge). All default false so `bell-features` keeps its historical default
+    // (attention+title); `attention-features` sets its own explicit (loud) default.
+    bounce: bool = false, // dock bounce (requestUserAttention)
+    badge: bool = false, // dock tile badge count
+    dashboard: bool = false, // Agent Dashboard unhide + sort + tile mark
+    push: bool = false, // web push to the phone
+    monitor: bool = false, // web-monitor indicator
 };
 
 /// See mouse-shift-capture
@@ -11334,6 +11380,54 @@ test "bell-features-focused: parse and default" {
             BellFeatures{ .attention = true, .title = true },
             cfg.@"bell-features",
         );
+    }
+}
+
+test "attention-features: parse, shared vocabulary, loud default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default is the loud set; bell-features default is UNCHANGED (back-compat).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(
+            BellFeatures{
+                .attention = false, .title = true, .border = true,
+                .bounce = true, .badge = true, .dashboard = true, .push = true, .monitor = true,
+            },
+            cfg.@"attention-features",
+        );
+        try testing.expectEqual(cfg.@"attention-features", cfg.@"attention-features-focused");
+        // bell-features default unchanged — the new flags default OFF there.
+        try testing.expectEqual(
+            BellFeatures{ .attention = true, .title = true },
+            cfg.@"bell-features",
+        );
+    }
+
+    // The expanded vocabulary parses on BOTH keys (e.g. route push to the bell tier,
+    // drop dashboard from attention).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            // Providing a value RESETS the set to the listed flags (zero + OR), so this
+            // routes `push` to the bell tier and re-defines the attention tier as exactly
+            // title+border (dropping dashboard/push from the loud default).
+            "--bell-features=push",
+            "--attention-features=title,border",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        // push is now routable to the BELL tier (the new shared-vocabulary flag parses).
+        try testing.expectEqual(true, cfg.@"bell-features".push);
+        // ...and the attention tier is exactly what was listed (vocabulary parses both ways).
+        try testing.expectEqual(false, cfg.@"attention-features".dashboard);
+        try testing.expectEqual(false, cfg.@"attention-features".push);
+        try testing.expectEqual(true, cfg.@"attention-features".title);
+        try testing.expectEqual(true, cfg.@"attention-features".border);
     }
 }
 
