@@ -18,6 +18,7 @@ import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
   ConcurrencyBudget,
+  backoffDelayMs,
   changeSignals,
   changeTail,
   type LastSummary,
@@ -626,8 +627,8 @@ test("backoff: an all-fail sweep engages backoff (streak 1, next probe armed)", 
   await runSweep(deps);
 
   assert.equal(deps.summarizerBackoff.failureStreak, 1, "streak incremented");
-  // base debounce = 30000 => first window is 30000ms out.
-  assert.equal(deps.summarizerBackoff.nextProbeMs, now + 30000);
+  // base = cfg.debounceMs => first window is one debounce out.
+  assert.equal(deps.summarizerBackoff.nextProbeMs, now + DEFAULT_CONFIG.debounceMs);
 });
 
 test("backoff: a success keeps the streak at 0 (normal cadence)", async () => {
@@ -706,7 +707,11 @@ test("backoff: after the window, a FAILED probe extends the backoff (streak++)",
 
   assert.equal(summarizeCalls.length, 1, "only one probe even on failure");
   assert.equal(deps.summarizerBackoff.failureStreak, 4, "streak extended");
-  assert.equal(deps.summarizerBackoff.nextProbeMs, now + 240000, "4th window = 30000*2^3");
+  assert.equal(
+    deps.summarizerBackoff.nextProbeMs,
+    now + backoffDelayMs(4, DEFAULT_CONFIG.debounceMs, DEFAULT_CONFIG.rateLimitBackoffMaxMs),
+    "4th window = base*2^3 (capped)",
+  );
 });
 
 test("backoff: an unparseable reply counts as a failure (engages backoff)", async () => {

@@ -36,6 +36,11 @@ that tag and clears when Haiku reports no alert — so:
 - **Recovery un-rings correctly** — as soon as Haiku reclassifies the live screen, the
   bell re-arms. Stale text scrolled up in history never (re-)fires it, because the
   decision isn't a substring match.
+- **Hidden tiles are still covered.** A tile you've hidden in the dashboard (the
+  long-running, stepped-away agents this is *for*) is summarized on a slower cadence
+  (`hiddenDebounceMs`, default 10 min) rather than skipped — so a hidden agent's
+  rate-limit prompt still rings, within that window. (`skipHidden: true` opts out and
+  silences hidden tiles entirely — see *Tuning cost*.)
 
 Why no regex backstop: a regex matches the text *anywhere* in the viewport and can't
 tell a live prompt from one scrolled up in history — so it would both miss recovery and
@@ -151,10 +156,11 @@ GUI respawns it):
 
 ```jsonc
 {
-  "debounceMs": 30000,            // min ms between calls per session (default 30000)
+  "debounceMs": 120000,           // min ms between calls per session (default 120000 = 2 min)
+  "hiddenDebounceMs": 600000,     // min ms between calls for a HIDDEN tile (default 600000 = 10 min)
   "changeRatioThreshold": 0.2,    // 0..1 — fraction of the screen tail that must differ
                                   //   to count as a real change (default 0.2; 0 = any diff)
-  "skipHidden": true,             // never summarize a tile you've hidden in the dashboard
+  "skipHidden": false,            // true = NEVER summarize a hidden tile (default false: see below)
   "idleSkipSeconds": 45,          // unchanged + idle this long => skip (default 45)
   "maxConcurrent": 10,            // also the per-sweep batch cap
   "rateLimitBackoffMaxMs": 600000 // cap on the auto-backoff when YOUR account is limited
@@ -164,14 +170,19 @@ GUI respawns it):
 Unknown / out-of-range keys are ignored (the default is kept), and an absent or malformed
 file just uses the defaults. What each lever buys you:
 
-- **`skipHidden`** — the cheapest win: hidden tiles cost nothing. Hide the agents you
-  aren't watching.
+- **`hiddenDebounceMs` / `skipHidden`** — by default a tile you've **hidden** in the
+  dashboard is still summarized, just **rarely** (every `hiddenDebounceMs`, default 10 min)
+  rather than every `debounceMs`. This keeps the **rate-limit watchdog alive on hidden
+  agents** — the long-running, stepped-away ones it exists for — at a fraction of the cost.
+  Set **`skipHidden: true`** to opt back into the old behavior (a hidden tile costs nothing
+  and is never summarized — but its rate-limit prompt then never rings). Raise
+  `hiddenDebounceMs` to make hidden tiles even cheaper.
 - **`changeRatioThreshold`** — the screen is compared *fuzzily*: spinner glyphs and
   elapsed-time/token counters are normalized out, and a session only re-summarizes when
   more than this fraction of its recent lines actually change. A higher value = fewer
   calls (and slightly staler summaries); a lower value = fresher (and more calls).
-- **`debounceMs`** — the hard floor between calls for one session. Raise it to cut the
-  rate across the board.
+- **`debounceMs`** — the hard floor between calls for one (visible) session. Raise it to cut
+  the rate across the board.
 - A **waiting/idle** agent whose footer is merely animating is skipped regardless — its
   summary wouldn't change anyway.
 
@@ -204,9 +215,9 @@ re-probe more often, or to `0` to effectively disable the backoff.
 
 ## Cost & privacy
 
-Each summary is one Haiku call, gated by a per-session debounce (~30s), a fuzzy
-change-detector (animation-proof), a hidden-tile skip, and an idle-skip, with a small
-concurrency cap — so a wall of idle/unchanged sessions costs nothing. See *Tuning cost*
+Each summary is one Haiku call, gated by a per-session debounce (~2 min; ~10 min for a
+hidden tile), a fuzzy change-detector (animation-proof), and an idle-skip, with a small
+concurrency cap — so a wall of idle/unchanged sessions costs nearly nothing. See *Tuning cost*
 above to dial it further. The session's recent on-screen text is sent to the model for
 summarization; hide the tile (or disable the feature) for any session you don't want
 summarized. Use *Account routing* above to keep this traffic off your primary account.

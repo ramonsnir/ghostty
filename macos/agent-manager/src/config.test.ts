@@ -41,6 +41,14 @@ test("parseConfig: overlays rateLimitBackoffMaxMs in range, rejects out-of-range
   );
 });
 
+test("parseConfig: overlays hiddenDebounceMs in range, rejects out-of-range", () => {
+  assert.equal(parseConfig({ hiddenDebounceMs: 900000 }).hiddenDebounceMs, 900000);
+  assert.equal(
+    parseConfig({ hiddenDebounceMs: 99_999_999 }).hiddenDebounceMs,
+    DEFAULT_CONFIG.hiddenDebounceMs,
+  );
+});
+
 test("parseConfig: rejects out-of-range / wrong-type values (keeps base)", () => {
   const c = parseConfig({
     changeRatioThreshold: 5, // > 1 → ignored
