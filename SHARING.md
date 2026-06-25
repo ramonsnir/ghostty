@@ -95,6 +95,19 @@ No token in that command — the shim reads `mcp-token` from `~/.config/ghostty-
 Restart Claude Code afterward. (If `~/.local/bin` is on your `PATH`, `claude mcp add
 ghostty -- ghostty-mcp` works too.) See **MCP-SERVER.md** for the tool list.
 
+### Optional: Agent Dashboard / Queue (needs `node`)
+
+The Agent Dashboard (live tiles of your CLI-agent splits) and the Agent **Queue** (a
+supervisor that launches one agent per work item) are bundled in the app. To turn them on:
+set `agent-dashboard = true` (and, for the queue, `agent-queue = true` + `agent-manager =
+true`) in `~/.config/ghostty-ramon/config`, set `mcp-listen`/`mcp-token` in `local` (above),
+and **have `node` on your `PATH`** — the queue/manager sidecar runs under node, and silently
+stays off (one log line, no error) if node is missing. The queue also wants the Claude Code
+agent-state hooks installed (see **AGENT-DASHBOARD.md**) so it can auto-close finished agents,
+and a queue **template** describing your tracker (see **AGENT-QUEUE.md**). Note: the one-line
+Haiku tile *summaries* (the "Agent Manager") need extra node packages that are NOT shipped in
+the DMG, so they stay off for colleagues — the **queue itself works without them**.
+
 ## Uninstall
 
 ```sh

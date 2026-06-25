@@ -110,6 +110,26 @@ echo ">> [3/8] bundle ghostty-host"
 cp -f zig-out/bin/ghostty-host "$APP/Contents/MacOS/ghostty-host"
 chmod +x "$APP/Contents/MacOS/ghostty-host"
 
+# ---- 3b. bundle the agent-manager sidecar (Agent Queue + Manager) ----------
+# Build the TS sidecar and bundle ONLY dist/ + package.json into
+# Contents/Resources/agent-manager (the path resolveSidecarDir() prefers). We do
+# NOT bundle node_modules: it is ~271MB and ships a native `claude` binary that
+# would break notarization — and the Agent QUEUE has ZERO npm deps, so it runs from
+# dist alone (model.ts lazy-imports the SDK only when a summary actually runs, so a
+# missing SDK self-disables the summarizer without affecting the queue). package.json
+# is required so node treats dist/*.js as ESM ("type":"module"). RUNTIME PREREQ on the
+# target Mac: `node` on PATH (the controller's self-disable gate handles its absence).
+echo ">> [3b/8] bundle agent-manager sidecar (dist only; node prereq)"
+( cd macos/agent-manager && npm ci && npm run build )
+test -f macos/agent-manager/dist/index.js
+SIDECAR_DST="$APP/Contents/Resources/agent-manager"
+rm -rf "$SIDECAR_DST"
+mkdir -p "$SIDECAR_DST"
+cp -R macos/agent-manager/dist "$SIDECAR_DST/dist"
+cp macos/agent-manager/package.json "$SIDECAR_DST/package.json"
+# Belt-and-suspenders: never let node_modules sneak into the notarized bundle.
+rm -rf "$SIDECAR_DST/node_modules"
+
 # ---- 4. version + enable updates -------------------------------------------
 echo ">> [4/8] inject version"
 PLIST="$APP/Contents/Info.plist"
