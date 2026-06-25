@@ -1300,9 +1300,12 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   the host (ends live sessions, RAM-only) exactly like Ramon's manual reload.
 
 - **The `ghostty-mcp` shim is bundled + installed-to-PATH for colleagues too** — same
-  pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. CI
-  `swift build -c release`s the shim and copies+signs it into `Contents/MacOS/ghostty-mcp`
-  (alongside the host, inside the notarized bundle, carried by Sparkle). On first launch
+  pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. **BOTH
+  release paths** `swift build -c release`s the shim and copies+signs it into
+  `Contents/MacOS/ghostty-mcp` (alongside the host, inside the notarized bundle, carried by
+  Sparkle): `dist/macos/release-local.sh` step 3a (the PRIMARY local path — it was MISSING
+  this until 2026-06-24, so locally-cut DMGs shipped no shim) and the CI workflow
+  (`.github/workflows/fork-release.yml`, the manual-only fallback). On first launch
   `ForkSetup.installShimIfNeeded` copies it onto PATH at `~/.local/bin/ghostty-mcp`
   (version-aware via `kInstalledShimVersion`; reinstalls on a Sparkle bump or a manual
   delete). **Safety is symmetric with the host:** `planShimInstall` only acts when a shim
@@ -1312,7 +1315,8 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   xattr doesn't propagate to the loose copy. A colleague then registers with
   `claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"` (token auto-read from `local`);
   the committed `.mcp.json` (bare `ghostty-mcp`) serves repo-clone developers, not DMG users.
-  Wiring: `.github/workflows/fork-release.yml` (build+bundle+sign steps),
+  Wiring: `dist/macos/release-local.sh` (step 3a build+bundle + the `sign` line) and
+  `.github/workflows/fork-release.yml` (build+bundle+sign steps),
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`ShimPlan`/`planShimInstall`/
   `installShimIfNeeded`); tests in `macos/Tests/ForkSetup/ForkSetupTests.swift` (`shim*`).
 

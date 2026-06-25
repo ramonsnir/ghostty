@@ -110,6 +110,18 @@ echo ">> [3/8] bundle ghostty-host"
 cp -f zig-out/bin/ghostty-host "$APP/Contents/MacOS/ghostty-host"
 chmod +x "$APP/Contents/MacOS/ghostty-host"
 
+# ---- 3a. bundle the ghostty-mcp stdio shim ---------------------------------
+# Mirror the CI workflow: build the MCP stdio shim and bundle it alongside the
+# host so it is signed + notarized as part of the app and carried by Sparkle. The
+# app's ForkSetup copies it onto PATH (~/.local/bin/ghostty-mcp) on first launch so
+# a colleague's `claude mcp add ghostty -- ghostty-mcp` works. Pure Swift/Foundation
+# SPM package (NOT in Ghostty.xcodeproj), so it builds with the system swift.
+echo ">> [3a/8] bundle ghostty-mcp shim"
+swift build -c release --package-path macos/mcp-shim
+cp -f macos/mcp-shim/.build/release/ghostty-mcp "$APP/Contents/MacOS/ghostty-mcp"
+chmod +x "$APP/Contents/MacOS/ghostty-mcp"
+test -x "$APP/Contents/MacOS/ghostty-mcp"
+
 # ---- 3b. bundle the agent-manager sidecar (Agent Queue + Manager) ----------
 # Build the TS sidecar and bundle ONLY dist/ + package.json into
 # Contents/Resources/agent-manager (the path resolveSidecarDir() prefers). We do
@@ -151,6 +163,7 @@ sign "$SPK/Versions/B/Updater.app"
 sign "$SPK"
 sign "$APP/Contents/PlugIns/DockTilePlugin.plugin"
 sign "$APP/Contents/MacOS/ghostty-host"
+sign "$APP/Contents/MacOS/ghostty-mcp"
 codesign --verbose -f -s "$IDENTITY" -o runtime --entitlements macos/Ghostty.entitlements "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
