@@ -290,6 +290,14 @@ private struct NodeCard: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 Text(node.key).font(.caption.weight(.bold)).lineLimit(1)
+                // High/Urgent (or any provider-marked) item: a prominent filled badge.
+                if let label = node.priorityLabel, let pc = priorityColor {
+                    Text(label.uppercased())
+                        .font(.system(size: 8, weight: .bold)).lineLimit(1)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(pc).foregroundStyle(.white)
+                        .clipShape(Capsule())
+                }
                 if running {
                     Image(systemName: "play.circle.fill").font(.caption2).foregroundStyle(.green)
                 } else if waiting {
@@ -318,19 +326,32 @@ private struct NodeCard: View {
         .background(stateColor.opacity(node.done ? 0.07 : 0.16))
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(borderColor, lineWidth: running ? 2 : 1))
+                .strokeBorder(borderColor, lineWidth: running || isMarked ? 2 : 1))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(node.done ? 0.55 : 1.0)
-        .help(node.state.map { "\(node.key) — \($0)" } ?? node.key)
+        .help(helpText)
     }
+
+    /// A non-done item carrying a priority mark gets a louder, tinted border (running wins).
+    private var isMarked: Bool { !node.done && priorityColor != nil }
 
     private var borderColor: Color {
         if running { return .green }
+        if isMarked, let pc = priorityColor { return pc }
         return stateColor.opacity(0.6)
     }
 
+    /// The GENERIC priority-mark color, or nil when the node carries no mark.
+    private var priorityColor: Color? { QueueBacklogColors.priorityColor(for: node.priorityLabel) }
+
     /// Map the coarse workflow-state category to a color; unknown / nil → neutral.
     private var stateColor: Color { QueueBacklogColors.color(forStateType: node.stateType) }
+
+    private var helpText: String {
+        var s = node.state.map { "\(node.key) — \($0)" } ?? node.key
+        if let label = node.priorityLabel { s += " · \(label) priority" }
+        return s
+    }
 }
 
 /// Pure category→color map (shared so a test could assert it stays total).
@@ -344,6 +365,22 @@ enum QueueBacklogColors {
         case "backlog": return .secondary
         case "triage": return .purple
         default: return .secondary
+        }
+    }
+
+    /// Map a GENERIC priority MARK label (provider-chosen, e.g. "Urgent"/"High") to a color,
+    /// or nil when there is no mark (so the canvas draws no badge/border tint). GENERIC: this
+    /// keys off universal English-priority WORDS (not a tracker's numeric `priority`), and any
+    /// non-empty-but-unknown label still gets a noticeable accent so it reads as "marked".
+    static func priorityColor(for label: String?) -> Color? {
+        guard let label = label?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !label.isEmpty else { return nil }
+        switch label.lowercased() {
+        case "urgent", "critical": return .red
+        case "high": return .orange
+        case "medium", "med", "normal": return .yellow
+        case "low": return .gray
+        default: return .accentColor
         }
     }
 }

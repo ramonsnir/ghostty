@@ -410,6 +410,7 @@ test("parseGraphOutput: {nodes:[…]} maps all fields", () => {
           labels: ["Design needed", "Customer"],
           blockedBy: ["A-9"],
           priority: 2,
+          priorityLabel: "High",
         },
       ],
     }),
@@ -425,8 +426,26 @@ test("parseGraphOutput: {nodes:[…]} maps all fields", () => {
       labels: ["Design needed", "Customer"],
       blockedBy: ["A-9"],
       priority: 2,
+      priorityLabel: "High",
     },
   ]);
+});
+
+test("parseGraphOutput: priorityLabel kept only when a non-empty string", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({
+      nodes: [
+        { key: "A-1", priorityLabel: "Urgent" },
+        { key: "A-2", priorityLabel: "" }, // empty → dropped
+        { key: "A-3", priorityLabel: 1 }, // non-string → dropped
+        { key: "A-4" }, // absent → undefined
+      ],
+    }),
+  );
+  assert.equal(out[0].priorityLabel, "Urgent");
+  assert.equal(out[1].priorityLabel, undefined);
+  assert.equal(out[2].priorityLabel, undefined);
+  assert.equal(out[3].priorityLabel, undefined);
 });
 
 test("parseGraphOutput: accepts a BARE array too", () => {
