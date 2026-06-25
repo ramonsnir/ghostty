@@ -111,29 +111,26 @@ export function selectCandidates(
 }
 
 /**
- * The remaining dispatch SLOTS = the smaller of remaining concurrency and remaining
- * grid capacity (§7/§12). PURE. `activeCount` is the number of assignments currently
+ * The remaining dispatch SLOTS = the smaller of remaining concurrency and the global
+ * fleet remaining (§7/§12). PURE. `activeCount` is the number of assignments currently
  * occupying a slot (RUNNING/SPAWNED/etc — the caller decides which states count, but
  * typically every non-terminal, non-cooldown assignment). `globalRemaining` caps the
  * WHOLE fleet across runs (`agent-queue-max-total`). The result is floored at 0.
  *
- * `effConcurrency`/`effGridCap` OVERRIDE the template values when given (the live
- * `set_concurrency` edit — see `effectiveConcurrency`/`effectiveGridCap` in runner.ts).
- * Omitted ⇒ the template's own `concurrency` / `cols*rows` (the original behavior, kept
- * so the existing tests + any non-live caller need no change).
+ * `concurrency` is the run's TOTAL pane budget across ALL its tabs — it is NOT bounded by
+ * one tab's `cols*rows` (panes overflow to additional tabs, §12), so the grid is no longer a
+ * term here. `effConcurrency` OVERRIDES the template's `concurrency` when given (the live
+ * `set_concurrency` edit — see `effectiveConcurrency` in runner.ts); omitted ⇒ the template's
+ * own `concurrency`.
  */
 export function remainingSlots(
   template: QueueTemplate,
   activeCount: number,
   globalRemaining: number,
   effConcurrency?: number,
-  effGridCap?: number,
 ): number {
-  const gridCapacity = effGridCap ?? template.grid.cols * template.grid.rows;
   const concurrency = effConcurrency ?? template.concurrency;
-  const concurrencyRoom = concurrency - activeCount;
-  const gridRoom = gridCapacity - activeCount;
-  return Math.max(0, Math.min(concurrencyRoom, gridRoom, globalRemaining));
+  return Math.max(0, Math.min(concurrency - activeCount, globalRemaining));
 }
 
 // ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { gridCap, lowestFreeSlot, splitPlan } from "./grid.js";
+import { gridCap, lowestFreeSlot, splitPlan, tabIndexForSlot } from "./grid.js";
 
 // ---------------------------------------------------------------------------
 // gridCap / lowestFreeSlot — occupancy accounting (caps concurrency, refills holes).
@@ -35,20 +35,52 @@ test("lowestFreeSlot: full grid => null", () => {
 });
 
 // ---------------------------------------------------------------------------
-// splitPlan — firstTab when empty; otherwise a balanced split anchored at the
-// lowest occupied slot (the GUI picks the actual pane + direction).
+// tabIndexForSlot — which tab a slot lands in (floor(slot / capPerTab)).
+// ---------------------------------------------------------------------------
+
+test("tabIndexForSlot: slots partition into tabs of capPerTab", () => {
+  // capPerTab 6 (e.g. 3x2): slots 0-5 → tab 0, 6-11 → tab 1, 12-17 → tab 2.
+  assert.equal(tabIndexForSlot(0, 6), 0);
+  assert.equal(tabIndexForSlot(5, 6), 0);
+  assert.equal(tabIndexForSlot(6, 6), 1);
+  assert.equal(tabIndexForSlot(11, 6), 1);
+  assert.equal(tabIndexForSlot(12, 6), 2);
+});
+
+// ---------------------------------------------------------------------------
+// splitPlan — firstTab when empty; an OVERFLOW tab when the target tab is empty;
+// otherwise a balanced split anchored at the lowest occupied slot OF THE SAME TAB.
 // ---------------------------------------------------------------------------
 
 test("splitPlan: no occupied slots => open the first tab", () => {
-  assert.deepEqual(splitPlan(new Set()), { firstTab: true });
+  assert.deepEqual(splitPlan(new Set(), 0, 6), { firstTab: true });
 });
 
-test("splitPlan: with panes => balanced split anchored at the lowest occupied slot", () => {
-  assert.deepEqual(splitPlan(new Set([0])), { balanced: true, anchorSlotIndex: 0 });
-  assert.deepEqual(splitPlan(new Set([0, 1, 2])), { balanced: true, anchorSlotIndex: 0 });
+test("splitPlan: a slot within an already-populated tab => balanced split anchored in THAT tab", () => {
+  // capPerTab 6; tab 0 has panes; the new slot 1 is also tab 0 → balanced anchored at the
+  // lowest occupied slot of tab 0.
+  assert.deepEqual(splitPlan(new Set([0]), 1, 6), { balanced: true, anchorSlotIndex: 0 });
+  assert.deepEqual(splitPlan(new Set([0, 1, 2]), 3, 6), { balanced: true, anchorSlotIndex: 0 });
 });
 
-test("splitPlan: anchor is the LOWEST occupied slot even with a low hole", () => {
-  // Slot 0 is a hole (closed); the lowest LIVE pane is slot 1 → that's the anchor.
-  assert.deepEqual(splitPlan(new Set([1, 2, 4])), { balanced: true, anchorSlotIndex: 1 });
+test("splitPlan: anchor is the lowest occupied slot OF THE SAME TAB (a low hole is skipped)", () => {
+  // Slot 0 is a hole; lowest live pane in tab 0 is slot 1 → anchor 1.
+  assert.deepEqual(splitPlan(new Set([1, 2, 4]), 0, 6), { balanced: true, anchorSlotIndex: 1 });
+});
+
+test("splitPlan: the first slot of a fresh OVERFLOW tab => newTab anchored on the run's window", () => {
+  // capPerTab 6; tab 0 full (0-5); slot 6 is the first of tab 1 (empty) → open a new tab,
+  // window-anchored on any live pane (the lowest occupied = 0).
+  assert.deepEqual(splitPlan(new Set([0, 1, 2, 3, 4, 5]), 6, 6), {
+    newTab: true,
+    windowAnchorSlotIndex: 0,
+  });
+});
+
+test("splitPlan: a SUBSEQUENT slot of an overflow tab => balanced within that tab", () => {
+  // tab 1 already has slot 6; slot 7 is also tab 1 → balanced anchored at 6 (not a new tab).
+  assert.deepEqual(splitPlan(new Set([0, 1, 2, 3, 4, 5, 6]), 7, 6), {
+    balanced: true,
+    anchorSlotIndex: 6,
+  });
 });

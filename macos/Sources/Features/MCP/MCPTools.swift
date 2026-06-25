@@ -200,7 +200,8 @@ enum MCPTools {
                     "balanced": ["type": "boolean", "default": false, "description": "Split the largest pane in the tab along its longer side (ignores 'direction'). The Agent Queue's default tiling."],
                     "command": ["type": "string", "description": "The launch command, run VERBATIM as the new surface's first input."],
                     "cwd": ["type": "string", "description": "Working directory (no '~' expansion)."],
-                    "firstTab": ["type": "boolean", "default": false, "description": "Open the run's first tab instead of splitting a target."],
+                    "firstTab": ["type": "boolean", "default": false, "description": "Open a new tab instead of splitting a target. The run's first tab uses the frontmost window; an OVERFLOW tab passes windowAnchorUUID to join the run's existing window."],
+                    "windowAnchorUUID": ["type": "string", "description": "With firstTab:true, the UUID of a live pane of the SAME run so the new (overflow) tab joins that pane's window — keeping all of a run's tabs in one window. Omit for the run's first tab."],
                     "env": ["type": "object", "description": "Item-context env vars (GHOSTTY_ITEM_*) set on the launched shell. NEVER splice these into 'command'.", "additionalProperties": ["type": "string"]],
                 ],
                 "required": ["command"],
@@ -472,10 +473,15 @@ enum MCPTools {
                 }
                 targetUUID = u
             }
+            // (multi-tab overflow §12) For an overflow tab the engine passes a window-anchor
+            // UUID so the new tab joins the run's existing window. Invalid/absent ⇒ nil
+            // (frontmost window — the run's first tab).
+            let windowAnchorUUID = (arguments["windowAnchorUUID"] as? String).flatMap { UUID(uuidString: $0) }
             let result: (id: String, sessionID: UInt64)? = DispatchQueue.main.sync {
                 MCPLayout.newSplitCommand(
                     targetUUID: targetUUID, direction: direction, command: command,
-                    cwd: cwd, firstTab: firstTab, env: env, balanced: balanced)
+                    cwd: cwd, firstTab: firstTab, env: env, balanced: balanced,
+                    windowAnchorUUID: windowAnchorUUID)
             }
             guard let result else { return .toolError("failed to spawn split") }
             // Casing note: this returns "sessionId" (lowercase); list_surfaces emits

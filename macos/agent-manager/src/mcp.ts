@@ -238,6 +238,10 @@ export class McpClient {
     command: string;
     cwd?: string;
     firstTab?: boolean;
+    /** (multi-tab overflow §12) When opening an OVERFLOW tab (`firstTab:true`), the UUID of a
+     *  live pane of the SAME run so the new tab joins that pane's window — keeping all of a
+     *  run's tabs in ONE window. Omitted for the run's very first tab (frontmost window). */
+    windowAnchorUUID?: string;
     /** The item-context env (GHOSTTY_ITEM_*) for the launched agent (§13). Forwarded
      *  to the tool as `env`; the Swift handler sets it on the new split's
      *  environmentVariables. Omitted from the wire payload when empty/undefined. */
@@ -249,6 +253,7 @@ export class McpClient {
     if (args.balanced !== undefined) toolArgs.balanced = args.balanced;
     if (args.cwd !== undefined) toolArgs.cwd = args.cwd;
     if (args.firstTab !== undefined) toolArgs.firstTab = args.firstTab;
+    if (args.windowAnchorUUID !== undefined) toolArgs.windowAnchorUUID = args.windowAnchorUUID;
     if (args.env !== undefined && Object.keys(args.env).length > 0) {
       toolArgs.env = args.env;
     }

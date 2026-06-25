@@ -20,7 +20,6 @@ import {
   occupiesSlot,
   effectiveMaxItemsCap,
   effectiveConcurrency,
-  effectiveGridCap,
   DEFAULT_PENDING_GRACE_MS,
   type QueueDeps,
   type QueueRun,
@@ -553,25 +552,27 @@ test("runQueueSweep: BUMPING the live cap re-enables dispatch past an already-re
 });
 
 // ---------------------------------------------------------------------------
-// (live concurrency edit) effectiveConcurrency / effectiveGridCap + live bump dispatch.
+// (live concurrency edit + multi-tab overflow §12) effectiveConcurrency clamp,
+// live bump dispatch, and overflow tabs.
 // ---------------------------------------------------------------------------
 
-test("effectiveConcurrency / effectiveGridCap: a live override WINS over the template + lifts the pane cap", () => {
-  const t = tmpl({ concurrency: 6, grid: { cols: 3, rows: 2, fill: "columns" } }); // pane cap 6
+test("effectiveConcurrency: a live override WINS over the template, clamped to capPerTab*MAX_QUEUE_TABS", () => {
+  const t = tmpl({ concurrency: 6, grid: { cols: 3, rows: 2, fill: "columns" } }); // capPerTab 6
   const run = makeQueueRun(t, memStore());
   assert.equal(effectiveConcurrency(run), 6);
-  assert.equal(effectiveGridCap(run), 6);
-  // A live edit beats the template AND lifts the effective grid (pane) cap to match.
+  // A live edit beats the template — and MAY exceed one grid (panes overflow to more tabs).
   run.concurrencyLive = 9;
   assert.equal(effectiveConcurrency(run), 9);
-  assert.equal(effectiveGridCap(run), 9, "lifts the pane cap to the live concurrency");
-  // Lowering below the template grid cap still keeps the template's pane cap (max of the two).
-  run.concurrencyLive = 2;
-  assert.equal(effectiveConcurrency(run), 2);
-  assert.equal(effectiveGridCap(run), 6, "never drops the pane budget below the template grid");
+  // Clamped at the multi-tab ceiling capPerTab*MAX_QUEUE_TABS = 6*8 = 48 (a fat-finger can't
+  // open hundreds of tabs).
+  run.concurrencyLive = 1000;
+  assert.equal(effectiveConcurrency(run), 48);
+  // Floored at 1.
+  run.concurrencyLive = 1;
+  assert.equal(effectiveConcurrency(run), 1);
 });
 
-test("runQueueSweep: BUMPING the live concurrency dispatches MORE simultaneous agents (lifts the grid cap)", async () => {
+test("runQueueSweep: BUMPING the live concurrency dispatches MORE simultaneous agents", async () => {
   const fake = makeQueueFake({
     surfaces: [],
     listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
@@ -581,7 +582,7 @@ test("runQueueSweep: BUMPING the live concurrency dispatches MORE simultaneous a
       { id: "s-c", sessionId: 3 },
     ],
   });
-  // concurrency 2, grid 2x1 = pane cap 2 → at most 2 simultaneous agents.
+  // concurrency 2 → at most 2 simultaneous agents.
   const t = tmpl({ concurrency: 2, grid: { cols: 2, rows: 1, fill: "columns" } });
   const run = makeQueueRun(t, memStore());
   let now = 8_000_000;
@@ -589,14 +590,48 @@ test("runQueueSweep: BUMPING the live concurrency dispatches MORE simultaneous a
 
   await runQueueSweep(deps); // arm (suppressed)
   now += 5000;
-  await runQueueSweep(deps); // dispatch — capped to 2 (concurrency + grid)
+  await runQueueSweep(deps); // dispatch — capped to 2 (concurrency)
   assert.equal(fake.calls.spawn.length, 2, "starts capped at concurrency 2");
 
-  // BUMP the live concurrency to 3 (lifts the effective grid/pane cap to 3 too).
+  // BUMP the live concurrency to 3.
   run.concurrencyLive = 3;
   now += 5000;
   await runQueueSweep(deps); // the 3rd agent now dispatches
   assert.equal(fake.calls.spawn.length, 3, "raising live concurrency dispatches the 3rd agent");
+});
+
+test("runQueueSweep: concurrency ABOVE the per-tab grid OVERFLOWS to a new tab (§12)", async () => {
+  // grid 2x1 = 2 panes per tab; concurrency 3 → tab 1 holds slots 0,1; slot 2 overflows to a
+  // NEW tab anchored on the run's window.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  const t = tmpl({ concurrency: 3, grid: { cols: 2, rows: 1, fill: "columns" } });
+  const run = makeQueueRun(t, memStore());
+  let now = 9_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch all 3
+  const spawns = fake.calls.spawn;
+  assert.equal(spawns.length, 3, "all 3 dispatched across 2 tabs");
+  // Slot 0 → the run's FIRST tab (firstTab, no window anchor).
+  assert.equal(spawns[0].firstTab, true);
+  assert.equal(spawns[0].windowAnchorUUID, undefined);
+  // Slot 1 → balanced split WITHIN tab 1 (same tab, has a pane) — not a new tab.
+  assert.equal(spawns[1].balanced, true);
+  assert.notEqual(spawns[1].targetUUID, undefined);
+  assert.equal(spawns[1].firstTab, undefined);
+  // Slot 2 → OVERFLOW: a NEW tab (firstTab:true) anchored on the run's window.
+  assert.equal(spawns[2].firstTab, true);
+  assert.notEqual(spawns[2].windowAnchorUUID, undefined);
 });
 
 // ---------------------------------------------------------------------------
