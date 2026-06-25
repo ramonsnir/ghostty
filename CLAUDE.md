@@ -644,21 +644,30 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     backoff + URL), `macos/Tests/MCP/MCPAnnotationTests.swift`, the `agentKind`
     `surfacesJSONData` cases in `macos/Tests/MCP/MCPServerTests.swift`, the `agent-manager`
     Zig config test, and the sidecar's `node --test` suite (`npm test` in `macos/agent-manager`).
-    **GUI relaunch only** to enable (no host restart); the sidecar must be built
-    (`npm ci && npm run build` in `macos/agent-manager`) — not bundled into the app yet, so
-    the dev-path `#filePath` resolution points at the repo's `macos/agent-manager/dist`.
-    **⚠️ COLLEAGUE / DMG LIMITATION (NOT bundled).** `resolveSidecarDir()` prefers a bundled
-    `Contents/Resources/agent-manager` but the release (`fork-release.yml`) does **NOT** bundle
-    the sidecar (unlike the host + `ghostty-mcp` shim, which ARE), so on a colleague's DMG install
-    the `#filePath` dev fallback is a build-machine path that doesn't exist → **the Agent Manager +
-    Agent Queue self-disable** (the sidecar `Process` never spawns; the controller's backoff gives
-    up). It fails CLOSED (one log line, no crash) and everything compiled into the app — the Agent
-    Dashboard previews + hook-driven chips + the per-tile Close button, the Web Monitor, the MCP
-    server, splits/host — still works. Also requires `node` on PATH (the §8 self-disable gate). So
-    these two features are effectively **Ramon-dev-only** today; shipping them to colleagues needs
-    a CI step to build + bundle + sign `macos/agent-manager/{dist,node_modules}` into
-    `Contents/Resources/agent-manager` (the resolver already prefers it) plus a node story — a
-    deliberate follow-up, not done.
+    **GUI relaunch only** to enable (no host restart). For Ramon's dev tree the sidecar runs
+    from `macos/agent-manager/dist` via the `#filePath` fallback in `resolveSidecarDir()` (build
+    it with `npm ci && npm run build`).
+    **COLLEAGUE / DMG distribution — the sidecar IS bundled (dist-only), so the QUEUE works.**
+    Both release paths (`dist/macos/release-local.sh` step 3b + `.github/workflows/fork-release.yml`)
+    build the sidecar and copy **`dist/` + `package.json` ONLY** into
+    `Contents/Resources/agent-manager` — the path `resolveSidecarDir()` prefers over the dev
+    `#filePath`. **`node_modules` is deliberately NOT bundled** (~271MB and it ships a native
+    `claude` binary that would break notarization), so the bundle is pure-JS data — notarization-
+    safe, no extra signing (the app seal covers `Resources/`). Three things make this work:
+    (1) the Agent **Queue** engine has ZERO npm deps (Node built-ins + global `fetch`); (2)
+    `model.ts` imports the SDK as a **TYPE-ONLY import + a LAZY `await import()`** inside
+    `summarize()`, so `dist/index.js` loads with no `node_modules` and only a real summary call
+    pulls the SDK (a missing SDK throws → the summarizer self-disables per-surface, queue
+    unaffected); (3) `package.json` is bundled so node treats `dist/*.js` as ESM (`"type":"module"`).
+    **RUNTIME PREREQ: `node` on PATH** — the controller's §8 self-disable gate probes a login-shell
+    `command -v node` and stays dormant (one log line, no crash) if absent, so a colleague without
+    node just doesn't get the features. **So for a colleague: the Agent QUEUE works** (given node +
+    the usual opt-in: `agent-queue`/`agent-manager` on, `mcp-listen`/`mcp-token` set, the agent-state
+    hooks installed, a template) — **but the Haiku tile SUMMARIZER stays dev-only** (it needs the
+    un-bundled `node_modules`; without it, the SDK import throws and the summarizer self-disables
+    while the queue runs fine). Verified the dist-only bundle boots with no `node_modules`. Wiring:
+    `model.ts` (type-only + lazy import), `dist/macos/release-local.sh` (step 3b),
+    `.github/workflows/fork-release.yml` ("Build + bundle agent-manager sidecar").
   - **Account routing (optional) — bill the summarizer to a SEPARATE account.** By default the
     summarizer inherits the ambient Claude Code auth (works with NO multi-account setup); set a
     spec in `~/.config/ghostty-ramon/agent-manager/account` (sibling of `summarizer.md`) OR the
