@@ -1,6 +1,6 @@
 export const meta = {
   name: 'bell-attention-review',
-  description: 'Multi-lens A+/>=98 review of the bell-attention feature diff (read-only, blocking gate)',
+  description: 'Multi-lens A+/>=98 review of the bell-attention v2 diff (read-only, blocking gate)',
   phases: [
     { title: 'Review', detail: 'parallel lenses over the diff, each graded >=98' },
     { title: 'Verify', detail: 'adversarially verify each non-trivial finding' },
@@ -8,61 +8,94 @@ export const meta = {
   ],
 }
 
-// The lenses. Each reviews the SAME diff through a distinct lens and returns a
-// strict score + findings. `args` carries { base, head, worktree } so each agent
-// can read the diff itself.
+// Each lens reviews the SAME v2 diff through a distinct lens and returns a strict
+// score + findings. `args` carries { base, head, worktree, testStatus }.
 const LENSES = [
   {
     key: 'correctness',
     prompt:
-      'CORRECTNESS lens. Hunt for real bugs in the logic: the sidecar bell-edge ' +
-      'detection (bellRoseEdge, the rising-edge map update + dead-id prune), the ' +
-      'force-classify-past-debounce path (bellRang in summarizeOne + the runSweep ' +
-      'gate that allows forced surfaces through ONLY on a debounce objection, never ' +
-      'not-agent), the attention promotion (only on bellRang AND parsed.attention===true; ' +
-      'idempotent set_attention; failures swallowed), the Swift set_attention tool ' +
-      '(pre-hop id/on validation, main-hop resolve, .ghosttyAttentionDidChange post), ' +
-      'the SurfaceView observer (filtered by surfaceID since posted object:nil) + ' +
-      'clear-on-focus, and the config/env plumbing (agent-manager-bell-filter -> ' +
-      'GHOSTTY_BELL_FILTER). Check the invariants hold: signal_attention (rate-limit) ' +
-      'stays exempt from any tone-down; bellFilter OFF is byte-identical; nothing rings ' +
-      'or promotes without a successful Haiku classify.',
+      'CORRECTNESS lens. Hunt for real bugs in the v2 logic. SIDECAR (macos/agent-manager): ' +
+      'the FAIL-OPEN bell decision in summarizeOne/bellPromote — on a bell-edge classify, ' +
+      'PROMOTE (set_attention(true)) unless we got a clean parsed attention===false; the ' +
+      'unparseable / thrown / omitted / uncertain paths ALL promote; only a confident false ' +
+      'suppresses. The event-driven path: parseWaitForEvent (fired {id,type} | null, never ' +
+      'throws), makeCoalescedRunner (non-overlap: a wake mid-run coalesces to exactly one ' +
+      're-run, suppressed when stopped), bellReactiveLoop (long-poll wait_for_event(bell) -> ' +
+      'wake an immediate coalesced sweep; the sweep does the promote; never exits on error). ' +
+      'SWIFT consumers — verify the TWO-TIER routing rule is applied CONSISTENTLY: a RAW bell ' +
+      'fires bell-features effects; a PROMOTED attentionNeeded adds attention-features effects; ' +
+      'each effect is gated by its own flag in the right tier. Check: AppDelegate playBellEffects ' +
+      '(system->beep, audio->sound, bounce||attention->requestUserAttention) on bell-features for ' +
+      'ghosttyBellDidRing and attention-features for ghosttyAttentionDidChange; setDockBadge two-tier ' +
+      '((bell && bell.badge|attention) || (attentionNeeded && attn.badge|attention)); ' +
+      'BaseTerminalController.computeTitle ((bell && bell.title) || (attention && attn.title)); ' +
+      'SurfaceView BellBorderOverlay ((bell && bell.border) || (attentionNeeded && attn.border)) + ' +
+      'the zoom-badge gate; AgentDashboardModel (applyBells unhide iff bellDashboard, applyAttention ' +
+      'iff attnDashboard, needsAttention/sorted per-tier); WebMonitorPush (bellPush/attnPush gates); ' +
+      'WebMonitorServer.surfacesJSONData attnIndicator = (bell && monitorBell) || (attentionNeeded && ' +
+      'monitorAttn) + the /attention clear route -> resetAttention. INVARIANTS: the `attention` flag ' +
+      'is a back-compat alias for bounce+badge consistently; filter-OFF + default config is ' +
+      'byte-identical to upstream (bell-features default carries the rich set, attentionNeeded never ' +
+      'set without the sidecar); the GUI NEVER auto-sets attentionNeeded (principle #3 — only the ' +
+      'sidecar set_attention does); bell and attentionNeeded clear INDEPENDENTLY (focus clears both; ' +
+      'resetBell only bell; resetAttention only attention).',
   },
   {
     key: 'design',
     prompt:
-      'DESIGN/ARCHITECTURE lens. Judge adherence to the two-tier ADDITIVE model in ' +
-      'scratchpad/bell-attention-design.md: the raw bell must always fire immediately ' +
-      '(no deferral / hold-and-wait anywhere), Haiku only ever PROMOTES (fail-safe: ' +
-      'sidecar down => still the raw bell), and the design must reuse existing patterns ' +
-      '(mirrors applyAnnotation / the alert path / the queue env plumbing). Flag any ' +
-      'creeping deferral, any new long-poll/drain tool that was supposed to be avoided ' +
-      '(only set_attention should be new), and whether the deferred rendering boundary ' +
-      'is cleanly separated (no half-built visual that pre-empts the bell-features debate).',
+      'DESIGN/ARCHITECTURE lens. Judge adherence to scratchpad/bell-attention-v2-design.md: ' +
+      '(1) FAIL-OPEN — a bell is suppressed ONLY by a live sidecar with a confident Haiku ignore; ' +
+      'every other state (disabled/out-of-tokens/timeout/crash/unparseable/uncertain) stays loud. ' +
+      '(2) FULLY CONFIGURABLE — per-effect routing is config (bell-features vs attention-features ' +
+      'over one shared vocabulary), NOT hardcoded; Ramon\'s classification is just the DEFAULT. ' +
+      '(3) The GUI NEVER auto-sets attention. Verify the v1 `bellFilter` consumer BRANCH was fully ' +
+      'removed in favor of the two-tier config (no leftover bellFilter gate in a consumer). Verify ' +
+      'the event-driven wake reuses the EXISTING sweep (no duplicated classify/edge bookkeeping) and ' +
+      'only adds the wait_for_event capability (no new server tool). Verify the web monitor stayed ' +
+      'scoped (no new foundation built on it). Confirm the deferred §78 crashed-sidecar fallback is a ' +
+      'CLEAN omission (documented, default config does not need it) — do NOT raise §78 as a blocker.',
   },
   {
     key: 'threading',
     prompt:
-      'CONCURRENCY/THREADING lens. The MCP server runs on a dedicated serial queue; ' +
-      'handlers hop to main via DispatchQueue.main.sync/async and must return ONLY ' +
-      'value types across the hop (never a SurfaceView). Verify setAttention follows ' +
-      'this (sync to check existence, async to post; no SurfaceView escaping). Verify ' +
-      'the SurfaceView NotificationCenter observer is safe (main-thread @objc, id filter, ' +
-      'no retain cycle / removed on deinit like the bell observer). Verify the sidecar ' +
-      'bell pass cannot deadlock or double-fire (the per-sweep non-overlap + budget). ' +
-      'Flag any main.sync that could deadlock if called from main.',
+      'CONCURRENCY/THREADING lens. The MCP/web-monitor servers run on dedicated serial queues; ' +
+      'handlers hop to main and return ONLY value types (never a SurfaceView across the hop). ' +
+      'Verify MCPServer.setAttention + WebMonitorServer.clearAttention/clearBell follow this ' +
+      '(respondFromMain, capture title/pwd as values, no SurfaceView escaping). Verify the SurfaceView ' +
+      'NotificationCenter observers (bell + ghosttyAttentionDidChange) are main-thread, surfaceID-' +
+      'filtered, and torn down (no retain cycle). SIDECAR: makeCoalescedRunner is single-threaded JS ' +
+      'but verify the running/again flags can\'t drop a wake or double-run; bellReactiveLoop holds ONE ' +
+      'long-lived parked connection (within the conn cap) and the per-call fetch timeout exceeds the ' +
+      'park window so it never aborts a live wait. Flag any main.sync that could deadlock from main. ' +
+      'WebMonitorServer.monitorBell/monitorAttn are written once before start() and read on the main ' +
+      'hop — confirm no torn read.',
+  },
+  {
+    key: 'config',
+    prompt:
+      'CONFIG / BACK-COMPAT lens. The BellFeatures type is shared by both tiers. Verify the Zig ' +
+      'packed-struct bit order (src/config/Config.zig: system/audio/attention/title/border/bounce/' +
+      'badge/dashboard/push/monitor) EXACTLY matches the Swift OptionSet rawValues (Ghostty.Config.swift ' +
+      '1<<0..1<<9) — a mismatch silently corrupts every flag read. Verify the new keys attention-features ' +
+      '/ attention-features-focused parse, default correctly, and that bell-features / bell-features-' +
+      'focused DEFAULTS reproduce TODAY (attention,title + the always-on dashboard/push/monitor) so an ' +
+      'unconfigured fork behaves exactly as before. Verify the flag parser RESET-to-listed semantics ' +
+      '(a provided value zeroes then ORs). Confirm all new keys are FORK-ONLY (an official Ghostty ' +
+      'sharing ~/.config/ghostty/config must not see them) and documented as such. Check the shell-' +
+      'completion comptime quota bump is correct (not masking a real overflow).',
   },
   {
     key: 'tests',
     prompt:
-      'TEST-COVERAGE lens. The sidecar suite (374 tests) and the Swift MCP dispatch ' +
-      'guards are the safety net. Assess whether the LOAD-BEARING behaviors are tested: ' +
-      'bellRoseEdge (rise/held/clear), parseSummary.attention, the runSweep bell ' +
-      'force-through (bellFilter on/off, rising-edge-only, non-agent never, attention ' +
-      'true/false promote/not, failure swallowed, dead-id prune, attention-only-on-bell), ' +
-      'and the Swift set_attention pre-hop guards + tool-count. Name the SPECIFIC missing ' +
-      'tests (if any) that a reviewer would require for A+ — but do NOT credit tests that ' +
-      'cannot exist yet (the rendering is deferred).',
+      'TEST-COVERAGE lens. The sidecar suite (414 node --test) + the Swift suites are the safety net. ' +
+      'Assess whether the LOAD-BEARING v2 behaviors are tested: the fail-open decision (omitted/thrown/' +
+      'unparseable promote; only confident false suppresses), parseWaitForEvent (fired/timeout/malformed/' +
+      'partial), makeCoalescedRunner (serial, coalesce-one, stop-suppresses), the Zig attention-features ' +
+      'parse + bell-features default, the Swift two-tier sort (AgentDashboardTests dashboardInBellTier / ' +
+      'dashboardNotInBellTier / attentionFloatsFirst / rawBellFloatGatedByDashboardTier), and the web-' +
+      'monitor attnIndicator routing + /attention route decode. Name SPECIFIC missing tests a reviewer ' +
+      'would require for A+. Untestable-by-design (do NOT require): the exact SwiftUI visual pixels, the ' +
+      'live bellReactiveLoop wiring in main() (only its pure parts are testable).',
   },
 ]
 
@@ -101,17 +134,24 @@ const VERDICT_SCHEMA = {
 }
 
 const ctx =
-  `Review the bell-attention feature on a git worktree.\n` +
+  `Review the bell-attention v2 feature on a git worktree.\n` +
   `Worktree: ${args.worktree}\n` +
   `Diff to review: \`git -C ${args.worktree} diff ${args.base}...${args.head}\` (also read the ` +
-  `full files for context, and scratchpad/bell-attention-design.md for the intended design).\n` +
+  `full files for context, and scratchpad/bell-attention-v2-design.md for the intended design + ` +
+  `the build status / the §78 OPEN DECISION at the bottom).\n` +
   `Test status handed in: ${args.testStatus}\n` +
-  `IMPORTANT: the quiet/loud RENDERING is DELIBERATELY deferred (the bell-features debate) — ` +
-  `do NOT raise its absence as a blocker/major; only review what is implemented.\n` +
+  `SCOPE: v2 is a fully-configurable, fail-open, TWO-TIER redesign. A RAW bell always fires the ` +
+  `bell-features effects immediately; a sidecar PROMOTION (set_attention, fail-open: promote unless ` +
+  `a confident Haiku ignore) ADDS the attention-features effects. Each effect (system,audio,bounce,` +
+  `badge,title,border,dashboard,push,monitor; `+'`attention`'+` = bounce+badge alias) is routed to a ` +
+  `tier by config. The v1 single `+'`bellFilter`'+` consumer gate was REPLACED by this. DEFAULTS ` +
+  `reproduce today. The GUI NEVER auto-sets attentionNeeded (principle #3). The §78 crashed-sidecar ` +
+  `fallback is DELIBERATELY DEFERRED (documented, flagged for the author\'s review) — do NOT raise it ` +
+  `as a blocker/major.\n` +
   `Grade strictly: 98+ = A+. Return JSON per the schema.`
 
 phase('Review')
-// Pipeline: each lens reviews, then its non-trivial findings are adversarially
+// Pipeline: each lens reviews, then its blocker/major findings are adversarially
 // verified as soon as that lens returns (no barrier between review and verify).
 const reviewed = await pipeline(
   LENSES,
