@@ -351,10 +351,10 @@ struct MCPServerTests {
             "new_tab", "close_surface", "perform_action", "set_surface_annotation",
             // Agent Queue (§8): the supervisor's "hands".
             "spawn_split_command", "force_close_surface", "signal_attention",
-            "take_queue_commands", "report_queue_status",
+            "take_queue_commands", "report_queue_status", "report_queue_graph",
         ]
         #expect(names == expected)
-        #expect(tools.count == 18)
+        #expect(tools.count == 19)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -962,6 +962,60 @@ struct MCPServerTests {
         #expect(s?.running.isEmpty == true)
         // present:false round-trips (the "run gone" report).
         let gone = QueueStatusPayload.fromArguments(["queueName": "Q", "present": false])?.status
+        #expect(gone?.present == false)
+    }
+
+    // MARK: - Agent Queue: report_queue_graph payload parsing (backlog graph)
+
+    @Test func queueGraphPayloadParsesFullArgs() {
+        let p = QueueGraphPayload.fromArguments([
+            "queueName": "ExampleOS", "present": true, "backlog": 7,
+            "nodes": [
+                ["key": "EX-1", "title": "do x", "url": "https://t/EX-1",
+                 "state": "In Progress", "stateType": "started", "done": false,
+                 "labels": ["Design needed", "Customer"], "blockedBy": ["EX-9"], "priority": 2],
+                ["key": "EX-2", "done": true],
+            ],
+        ])
+        let g = p?.graph
+        #expect(g?.queueName == "ExampleOS")
+        #expect(g?.present == true)
+        #expect(g?.backlog == 7)
+        #expect(g?.nodes.count == 2)
+        let n = g?.nodes.first
+        #expect(n?.key == "EX-1")
+        #expect(n?.title == "do x")
+        #expect(n?.state == "In Progress")
+        #expect(n?.stateType == "started")
+        #expect(n?.done == false)
+        #expect(n?.labels == ["Design needed", "Customer"])
+        #expect(n?.blockedBy == ["EX-9"])
+        #expect(n?.priority == 2)
+        // Second node: done true, missing arrays default [].
+        #expect(g?.nodes.last?.done == true)
+        #expect(g?.nodes.last?.labels.isEmpty == true)
+        #expect(g?.nodes.last?.blockedBy.isEmpty == true)
+    }
+
+    @Test func queueGraphPayloadRejectsMissingNameAndDropsKeylessNodes() {
+        #expect(QueueGraphPayload.fromArguments(["backlog": 3]) == nil)
+        #expect(QueueGraphPayload.fromArguments(["queueName": "  "]) == nil)
+        // A node with no/blank key is dropped (mirrors the sidecar parse).
+        let g = QueueGraphPayload.fromArguments([
+            "queueName": "Q", "nodes": [["key": ""], ["title": "no key"], ["key": "A-2"]],
+        ])?.graph
+        #expect(g?.nodes.count == 1)
+        #expect(g?.nodes.first?.key == "A-2")
+    }
+
+    @Test func queueGraphPayloadDefaultsAndGone() {
+        // present defaults true; backlog absent ⇒ 0; nodes absent ⇒ [].
+        let g = QueueGraphPayload.fromArguments(["queueName": "Q"])?.graph
+        #expect(g?.present == true)
+        #expect(g?.backlog == 0)
+        #expect(g?.nodes.isEmpty == true)
+        // present:false round-trips (the "run gone" graph report).
+        let gone = QueueGraphPayload.fromArguments(["queueName": "Q", "present": false])?.graph
         #expect(gone?.present == false)
     }
 

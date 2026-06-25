@@ -25,7 +25,7 @@ import {
 } from "./runner.js";
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
-import type { QueueStatusReport } from "./status.js";
+import type { QueueStatusReport, QueueGraphReport } from "./status.js";
 import { loadStore, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
@@ -79,6 +79,8 @@ interface QueueFakeSpec {
   surfaces: Surface[];
   /** list provider output (JSON). */
   listJson?: string;
+  /** graph provider output (JSON) — only used when the template declares provider.graph. */
+  graphJson?: string;
   /** key -> status JSON (defaults to {"state":"working"} = not terminal). */
   statusByKey?: Record<string, string>;
   /** new spawns: a queue of {id,sessionId} returned in order by spawnSplitCommand. */
@@ -97,8 +99,10 @@ interface QueueFake {
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
     list: number;
+    graph: number;
     status: string[];
     reports: QueueStatusReport[];
+    graphReports: QueueGraphReport[];
   };
 }
 
@@ -110,8 +114,10 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     signal: [],
     sendKey: [],
     list: 0,
+    graph: 0,
     status: [],
     reports: [],
+    graphReports: [],
   };
   let spawnIdx = 0;
   const spawns = spec.spawns ?? [];
@@ -145,6 +151,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     async reportQueueStatus(status: QueueStatusReport): Promise<void> {
       calls.reports.push(status);
     },
+    async reportQueueGraph(graph: QueueGraphReport): Promise<void> {
+      calls.graphReports.push(graph);
+    },
   } as unknown as McpClient;
 
   // The provider exec: the FIRST arg element decides list vs status (matches the tmpl
@@ -159,6 +168,10 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
       calls.status.push(key);
       const out = spec.statusByKey?.[key] ?? '{"state":"working"}';
       return { code: 0, stdout: out, stderr: "" };
+    }
+    if (argv[0] === "graph") {
+      calls.graph += 1;
+      return { code: 0, stdout: spec.graphJson ?? '{"nodes":[]}', stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -2045,4 +2058,105 @@ test("advanceStates: a due status sweep with NO live agent does not burn the int
   now += 5000;
   await runQueueSweep(deps);
   assert.equal(fake.calls.status.length, 1, "probes immediately once the agent is live (window not pre-burned)");
+});
+
+// ---------------------------------------------------------------------------
+// (backlog graph) provider.graph fetch + report_queue_graph push (throttled, present:false).
+// ---------------------------------------------------------------------------
+
+// A template that opts into the optional backlog board.
+function graphTmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
+  return tmpl({
+    provider: {
+      list: { command: ["list"], keyField: "id", titleField: "title", urlField: "url" },
+      status: { command: ["status", "{key}"], doneStates: ["done"] },
+      graph: { command: ["graph"] },
+    },
+    ...over,
+  });
+}
+
+test("runQueueSweep: with provider.graph, a sweep fetches the board + pushes report_queue_graph with the backlog count", async () => {
+  // Board: W is waiting/dispatched (in the list), B1/B2 are backlog, D is terminal.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"W"}]',
+    spawns: [{ id: "s-w", sessionId: 1 }],
+    graphJson: JSON.stringify({
+      nodes: [
+        { key: "W", state: "Todo", done: false, blockedBy: [] },
+        { key: "B1", state: "Backlog", done: false, blockedBy: ["W"] },
+        { key: "B2", state: "Backlog", done: false, labels: ["Design needed"], blockedBy: [] },
+        { key: "D", state: "Done", done: true, blockedBy: [] },
+      ],
+    }),
+  });
+  const run = makeQueueRun(graphTmpl(), memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (graph fetches here: lastGraphAtMs is -Inf)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch W
+
+  assert.ok(fake.calls.graph >= 1, "the graph command was fetched");
+  const last = fake.calls.graphReports.at(-1)!;
+  assert.equal(last.present, true);
+  assert.equal(last.queueName, "backlog");
+  assert.equal(last.nodes.length, 4, "the full board (incl. done) is pushed");
+  // backlog = non-terminal not waiting/running: B1, B2 (W excluded as active/listed, D done).
+  assert.equal(last.backlog, 2);
+  // Edges + labels survive to the report (for the canvas).
+  assert.deepEqual(last.nodes.find((n) => n.key === "B1")?.blockedBy, ["W"]);
+  assert.deepEqual(last.nodes.find((n) => n.key === "B2")?.labels, ["Design needed"]);
+});
+
+test("runQueueSweep: provider.graph fetch is THROTTLED to intervals.listMs", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]", graphJson: '{"nodes":[]}' });
+  const run = makeQueueRun(graphTmpl({ intervals: { listMs: 30000, statusMs: 0 } }), memStore());
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm — graph fetches (lastGraphAtMs -Inf)
+  assert.equal(fake.calls.graph, 1, "first sweep fetches the graph");
+
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.graph, 1, "within listMs: no graph re-fetch");
+
+  now += 30000; // ≥ listMs since the first fetch
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.graph, 2, "after listMs: graph re-fetches");
+});
+
+test("runQueueSweep: NO provider.graph => never fetches a graph nor pushes report_queue_graph", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const run = makeQueueRun(tmpl(), memStore()); // base tmpl has no provider.graph
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.graph, 0);
+  assert.equal(fake.calls.graphReports.length, 0);
+});
+
+test("runQueueSweep: aborting a run with provider.graph pushes report_queue_graph present:false", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]", graphJson: '{"nodes":[]}' });
+  const run = makeQueueRun(graphTmpl({ name: "backlog" }), memStore());
+  const registry = registryOf([run]);
+  let now = 1_000_000;
+  const deps: QueueDeps = {
+    client: fake.client, exec: fake.exec, budget: new QueueBudget(8), now: () => now,
+    registry, factory: noFactory, takeCommands: async () => [],
+    maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+  };
+  await runQueueSweep(deps); // arm
+  run.aborting = true;
+  now += 5000;
+  await runQueueSweep(deps); // abort → run removed
+  assert.equal(registry.has("backlog"), false);
+  const gone = fake.calls.graphReports.at(-1)!;
+  assert.equal(gone.present, false, "graph section cleared on abort");
+  assert.deepEqual(gone.nodes, []);
 });

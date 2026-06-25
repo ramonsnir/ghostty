@@ -267,6 +267,30 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   assert.deepEqual(args.running, [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }]);
 });
 
+test("reportQueueGraph: encodes report_queue_graph + forwards backlog + nodes", async () => {
+  const nodes = [
+    { key: "EX-1", done: false, labels: ["Design needed"], blockedBy: ["EX-9"], state: "Backlog" },
+  ];
+  const { method, name, args } = await captureCall('{"ok":true}', (c) =>
+    c.reportQueueGraph({ queueName: "ExampleOS", present: true, backlog: 7, nodes }),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "report_queue_graph");
+  assert.equal(args.queueName, "ExampleOS");
+  assert.equal(args.present, true);
+  assert.equal(args.backlog, 7);
+  assert.deepEqual(args.nodes, nodes);
+});
+
+test("reportQueueGraph: present:false (run gone) forwards empty nodes", async () => {
+  const { name, args } = await captureCall('{"ok":true}', (c) =>
+    c.reportQueueGraph({ queueName: "ExampleOS", present: false, backlog: 0, nodes: [] }),
+  );
+  assert.equal(name, "report_queue_graph");
+  assert.equal(args.present, false);
+  assert.deepEqual(args.nodes, []);
+});
+
 test("sendKey: encodes the send_key tool with id + key", async () => {
   const { method, name, args } = await captureCall('{"ok":true}', (c) =>
     c.sendKey("s9", "ctrl_d"),
