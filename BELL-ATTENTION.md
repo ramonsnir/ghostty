@@ -75,6 +75,20 @@ gap, a *fully crashed* sidecar, is the deferred fallback noted at the end.) The 
 watchdog in [Agent Manager](AGENT-MANAGER.md) is this same mechanism with a dedicated
 `alert` tag.
 
+**What the classifier is told to treat as incidental (`attention: false`).** The decisive
+question in the summarizer prompt (`prompts.ts`) is *"is the user being asked to ACT right
+now?"* — judged from the live bottom of the screen. Explicitly incidental → `false`: a
+background task just started; **a long-running workflow / review / pipeline / test / build
+the user kicked off that is still progressing or just finished a stage, where they are
+merely awaiting its completion** (the agent may even report `waiting` — it is waiting on its
+own sub-tasks, not on the human); a sub-step finished; a routine notification. Loud only
+when the screen *actually* awaits the user (a question / approval / choice / error, or a
+workflow that has **stopped** and now needs them). This is the prompt-side complement to the
+focus guards: the orchestration case (a supervisor "waiting" on its sub-agents) is one a
+structural `agentState` gate can't tell from human-waiting, but the classifier can read it
+off the screen. Naming the case lets the model emit a *confident* `false` instead of
+omitting (which fails open to loud).
+
 **The GUI never promotes on its own.** `attentionNeeded` is set *only* by the sidecar (via
 the MCP `set_attention` tool); the GUI just renders the two states. A promotion clears when
 you focus the surface (you've seen it) or when the sidecar reports recovery.
