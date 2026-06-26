@@ -151,12 +151,15 @@ const Diagnostic = extern struct {
 // MCP "knowledge" tools. These do NOT need a *Config; they read the generated
 // `help_strings` (the same doc text `+explain-config` uses) plus the static Key
 // enum. The fork marker that identifies a fork-only key is the leading
-// "(ramon fork)" on its doc comment (see src/config/Config.zig). All returned
-// `[*:0]const u8` pointers are STATIC (help_strings literals / @tagName), so the
-// caller must NOT free them.
+// "(ramon fork" on its doc comment — this matches both the bare "(ramon fork)"
+// and the scoped "(ramon fork / Agent Manager)" / "(ramon fork / Bell Attention)"
+// forms (see src/config/Config.zig). All returned `[*:0]const u8` pointers are
+// STATIC (help_strings literals / @tagName), so the caller must NOT free them.
 
-/// The fork marker prefix on a fork-only config key's doc comment.
-const fork_marker = "(ramon fork)";
+/// The fork marker prefix on a fork-only config key's doc comment. Matches both
+/// "(ramon fork)" and the scoped "(ramon fork / …)" variants (do NOT include the
+/// closing paren, or scoped keys like agent-manager/agent-queue are missed).
+const fork_marker = "(ramon fork";
 
 /// Sync with ghostty_config_key_doc_s.
 const KeyDoc = extern struct {
@@ -386,11 +389,22 @@ test "ghostty_config_describe_key: known upstream key" {
 
 test "ghostty_config_describe_key: fork-only key is flagged" {
     const testing = std.testing;
-    const key = "agent-dashboard";
-    const out = ghostty_config_describe_key(key, key.len);
-    try testing.expect(out.known);
-    try testing.expect(out.fork_only);
-    try testing.expect(std.mem.startsWith(u8, std.mem.span(out.doc), fork_marker));
+    // Cover all three doc-marker shapes: bare "(ramon fork)", the scoped
+    // "(ramon fork / …)" form (agent-queue), and a key that used to start with a
+    // different marker but is now normalized (bell-features-focused). All must be
+    // classified fork-only — a regression here means list_config_keys(forkOnly)
+    // silently drops fork keys.
+    for ([_][]const u8{ "agent-dashboard", "agent-queue", "bell-features-focused" }) |key| {
+        const out = ghostty_config_describe_key(key.ptr, key.len);
+        try testing.expect(out.known);
+        try testing.expect(out.fork_only);
+        try testing.expect(std.mem.startsWith(u8, std.mem.span(out.doc), fork_marker));
+    }
+    // Sanity: an upstream key is NOT fork-only.
+    const up = "font-size";
+    const upout = ghostty_config_describe_key(up.ptr, up.len);
+    try testing.expect(upout.known);
+    try testing.expect(!upout.fork_only);
 }
 
 test "ghostty_config_describe_key: unknown key" {

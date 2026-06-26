@@ -414,7 +414,9 @@ human scrolling the command palette.
   `ghostty_config_describe_key(name,len)` → `ghostty_config_key_doc_s`,
   `ghostty_config_key_count()`, `ghostty_config_key_at(idx)` → `ghostty_config_key_info_s`.
   Returned `const char*`s are STATIC (do not free). **Fork-only-key detection is the doc's
-  leading `(ramon fork)` marker**, so any new fork key is auto-classified.
+  leading `(ramon fork` prefix** (matches both `(ramon fork)` and the scoped
+  `(ramon fork / Agent Manager)` / `(ramon fork / Bell Attention)` forms), so any new
+  fork key is auto-classified.
 
 Wiring: `src/config/CApi.zig` (the 3 exports + `keyDoc`), `include/ghostty.h`
 (`ghostty_config_key_doc_s`/`_info_s` + prototypes), `macos/Sources/Features/MCP/MCPKnowledge.swift`

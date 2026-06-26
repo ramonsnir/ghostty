@@ -3248,7 +3248,7 @@ keybind: Keybinds = .{},
 // and let `attention-features` carry the loud effects on a promotion.
 @"bell-features": BellFeatures = .{ .dashboard = true, .push = true, .monitor = true },
 
-/// (Fork-only.) Bell features to enable when the ringing surface is truly in
+/// (ramon fork) Bell features to enable when the ringing surface is truly in
 /// focus, i.e. it is the focused split AND its window is the key window AND
 /// the macOS app is frontmost/active. When the ringing surface is NOT in
 /// focus by that definition, `bell-features` is used instead. This lets the

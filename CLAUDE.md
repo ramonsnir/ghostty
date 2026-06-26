@@ -250,8 +250,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `Key` enum): `ghostty_config_describe_key(name,len)` → `ghostty_config_key_doc_s`,
   `ghostty_config_key_count()`, `ghostty_config_key_at(idx)` → `ghostty_config_key_info_s`
   (all returned `[*:0]const u8` are STATIC — do not free). **Fork-only-key detection is the
-  doc's leading `(ramon fork)` marker** (`fork_marker` in `CApi.zig`), so any new fork key
-  whose doc starts with that marker is auto-classified. Live config reads hop to main and
+  doc's leading `(ramon fork` prefix** (`fork_marker` in `CApi.zig`; matches the bare
+  `(ramon fork)` AND scoped `(ramon fork / …)` forms — NOT including the closing paren,
+  else scoped keys like agent-manager/agent-queue are missed), so any new fork key whose
+  doc starts with that prefix is auto-classified. Live config reads hop to main and
   return ONLY value types (the WebMonitor/MCP threading rule); the C-API path works headless.
   Wiring: core — `src/config/CApi.zig` (the 3 exports + `keyDoc` + `KeyDoc`/`KeyInfo` extern
   structs), `include/ghostty.h` (`ghostty_config_key_doc_s`/`_info_s` + the 3 prototypes);
