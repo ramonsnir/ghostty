@@ -349,13 +349,15 @@ struct MCPServerTests {
             "list_surfaces", "read_surface", "get_layout", "send_text", "send_key",
             "scroll", "wait_for_event", "watch_for_pattern", "focus_surface",
             "new_tab", "close_surface", "perform_action", "set_surface_annotation",
+            // Bell Attention: promote a bell to the sticky attention state.
+            "set_attention",
             // Agent Queue (§8): the supervisor's "hands".
             "spawn_split_command", "force_close_surface", "signal_attention",
             "take_queue_commands", "report_queue_status", "report_queue_graph",
             "move_surface_into_tab",
         ]
         #expect(names == expected)
-        #expect(tools.count == 20)
+        #expect(tools.count == 21)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -421,7 +423,7 @@ struct MCPServerTests {
             id: "ABC", title: "vim", pwd: "/tmp",
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
-            focused: true, bell: false, exited: false, atPrompt: true,
+            focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: "bash", command: "bash claude-pool", idleSeconds: 0.0,
             agentState: "working", lastPrompt: "do it", lastTool: "Bash",
             notes: "Implementing fix", agentKind: "claude", hidden: false, sessionID: 4242)
@@ -438,6 +440,7 @@ struct MCPServerTests {
         #expect(d["splitCount"] as? Int == 3)
         #expect(d["focused"] as? Bool == true)
         #expect(d["bell"] as? Bool == false)
+        #expect(d["attentionNeeded"] as? Bool == false)
         #expect(d["exited"] as? Bool == false)
         #expect(d["atPrompt"] as? Bool == true)
         #expect(d["processName"] as? String == "bash")
@@ -463,7 +466,7 @@ struct MCPServerTests {
             id: "ABC", title: "claude", pwd: "/tmp",
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 0, splitCount: 1,
-            focused: false, bell: false, exited: false, atPrompt: true,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: "waiting", lastPrompt: nil, lastTool: nil, notes: nil,
             agentKind: "claude", hidden: true, sessionID: 7)
@@ -477,7 +480,7 @@ struct MCPServerTests {
             id: "ABC", title: "vim", pwd: "/tmp",
             window: 0, tab: 1, tabTitle: "T",
             splitIndex: 2, splitCount: 3,
-            focused: true, bell: false, exited: false, atPrompt: true,
+            focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
             processName: nil, command: nil, idleSeconds: nil,
             agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
             agentKind: nil, hidden: false, sessionID: 0)
@@ -527,6 +530,23 @@ struct MCPServerTests {
         switch MCPTools.dispatch(name: "send_key", arguments: ["key": "enter"], server: server) {
         case .invalidParams: break
         default: Issue.record("expected .invalidParams")
+        }
+    }
+
+    // (ramon fork / Bell Attention) set_attention pre-hop guards.
+    @Test func dispatchSetAttentionMissingIdInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "set_attention", arguments: ["on": true], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for missing id")
+        }
+    }
+
+    @Test func dispatchSetAttentionMissingOnInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "set_attention", arguments: ["id": UUID().uuidString], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for missing on")
         }
     }
 

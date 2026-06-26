@@ -606,10 +606,10 @@ struct WebMonitorServerTests {
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "id-1", title: "Title One", pwd: "/home/x",
                   window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 0, splitCount: 2,
-                  bell: false, isAgent: false, hidden: false),
+                  bell: false, attentionNeeded: false, isAgent: false, hidden: false),
             .init(id: "id-2", title: "", pwd: "",
                   window: 0, tab: 0, tabTitle: "Tab A", splitIndex: 1, splitCount: 2,
-                  bell: true, isAgent: false, hidden: false),
+                  bell: true, attentionNeeded: false, isAgent: false, hidden: false),
         ], agentDashboard: true)
         let arr = try surfacesArray(d)
         #expect(arr?.count == 2)
@@ -621,13 +621,54 @@ struct WebMonitorServerTests {
         #expect(arr?[1]["bell"] as? Bool == true)
     }
 
+    // (Bell Attention v2) Each row carries the raw bell + attentionNeeded (truthful)
+    // and a monitor-tier-routed `attnIndicator` = (bell && monitorBell) ||
+    // (attentionNeeded && monitorAttn). Default flags (both true) ⇒ bell || attention.
+    @Test func surfacesJSONCarriesAttentionAndIndicatorDefault() throws {
+        let d = WebMonitorServer.surfacesJSONData([
+            .init(id: "bell", title: "b", pwd: "", window: 0, tab: 0, tabTitle: "",
+                  splitIndex: 0, splitCount: 1, bell: true, attentionNeeded: false,
+                  isAgent: false, hidden: false),
+            .init(id: "attn", title: "a", pwd: "", window: 0, tab: 0, tabTitle: "",
+                  splitIndex: 0, splitCount: 1, bell: false, attentionNeeded: true,
+                  isAgent: false, hidden: false),
+            .init(id: "none", title: "n", pwd: "", window: 0, tab: 0, tabTitle: "",
+                  splitIndex: 0, splitCount: 1, bell: false, attentionNeeded: false,
+                  isAgent: false, hidden: false),
+        ], agentDashboard: false)
+        let arr = try surfacesArray(d)
+        #expect(arr?[0]["attentionNeeded"] as? Bool == false)
+        #expect(arr?[0]["attnIndicator"] as? Bool == true)   // raw bell
+        #expect(arr?[1]["attentionNeeded"] as? Bool == true)
+        #expect(arr?[1]["attnIndicator"] as? Bool == true)   // promotion
+        #expect(arr?[2]["attnIndicator"] as? Bool == false)  // neither
+    }
+
+    // monitor OFF the bell tier: a raw bell no longer lights the indicator, but a
+    // promotion (monitorAttn on) still does.
+    @Test func surfacesJSONIndicatorRoutedByMonitorFlags() throws {
+        let rows: [WebMonitorServer.SurfaceRow] = [
+            .init(id: "bell", title: "b", pwd: "", window: 0, tab: 0, tabTitle: "",
+                  splitIndex: 0, splitCount: 1, bell: true, attentionNeeded: false,
+                  isAgent: false, hidden: false),
+            .init(id: "attn", title: "a", pwd: "", window: 0, tab: 0, tabTitle: "",
+                  splitIndex: 0, splitCount: 1, bell: false, attentionNeeded: true,
+                  isAgent: false, hidden: false),
+        ]
+        let d = WebMonitorServer.surfacesJSONData(
+            rows, agentDashboard: false, monitorBell: false, monitorAttn: true)
+        let arr = try surfacesArray(d)
+        #expect(arr?[0]["attnIndicator"] as? Bool == false)  // raw bell suppressed
+        #expect(arr?[1]["attnIndicator"] as? Bool == true)   // promotion still shows
+    }
+
     @Test func surfacesJSONCarriesLayout() throws {
         // The grouping fields (window/tab/tabTitle/splitIndex/splitCount) let the
         // phone list show how panes are organized on the Mac.
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "a", title: "A", pwd: "", window: 1, tab: 2,
                   tabTitle: "Editor", splitIndex: 0, splitCount: 3,
-                  bell: false, isAgent: false, hidden: false),
+                  bell: false, attentionNeeded: false, isAgent: false, hidden: false),
         ], agentDashboard: false)
         let arr = try surfacesArray(d)
         #expect(arr?[0]["window"] as? Int == 1)
@@ -645,7 +686,7 @@ struct WebMonitorServerTests {
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "id-1", title: hostileTitle, pwd: hostilePwd,
                   window: 0, tab: 0, tabTitle: "", splitIndex: 0, splitCount: 1,
-                  bell: false, isAgent: false, hidden: false),
+                  bell: false, attentionNeeded: false, isAgent: false, hidden: false),
         ], agentDashboard: false)
         let arr = try surfacesArray(d)
         #expect(arr?.count == 1)
@@ -670,13 +711,13 @@ struct WebMonitorServerTests {
         let d = WebMonitorServer.surfacesJSONData([
             .init(id: "agent-shown", title: "claude", pwd: "", window: 0, tab: 0,
                   tabTitle: "", splitIndex: 0, splitCount: 1,
-                  bell: false, isAgent: true, hidden: false),
+                  bell: false, attentionNeeded: false, isAgent: true, hidden: false),
             .init(id: "agent-hidden", title: "codex", pwd: "", window: 0, tab: 0,
                   tabTitle: "", splitIndex: 0, splitCount: 1,
-                  bell: false, isAgent: true, hidden: true),
+                  bell: false, attentionNeeded: false, isAgent: true, hidden: true),
             .init(id: "plain", title: "zsh", pwd: "", window: 0, tab: 0,
                   tabTitle: "", splitIndex: 0, splitCount: 1,
-                  bell: false, isAgent: false, hidden: false),
+                  bell: false, attentionNeeded: false, isAgent: false, hidden: false),
         ], agentDashboard: true)
         let arr = try surfacesArray(d)
         #expect(arr?.count == 3)
@@ -862,6 +903,17 @@ struct WebMonitorServerTests {
     @Test func decideRouteClearBellGetMethodNotAllowed() {
         let id = UUID()
         #expect(decide("GET", "/api/surface/\(id.uuidString)/bell") == .methodNotAllowed)
+    }
+
+    // (Bell Attention v2) The attention-clear route mirrors the bell-clear route.
+    @Test func decideRouteClearAttentionPost() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/attention") == .clearAttention(uuid: id))
+    }
+
+    @Test func decideRouteClearAttentionGetMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/attention") == .methodNotAllowed)
     }
 
     @Test func scrollDeltaYDecode() {

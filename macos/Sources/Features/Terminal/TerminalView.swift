@@ -73,11 +73,16 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
         return URL(fileURLWithPath: surfacePwd)
     }
 
-    /// (ramon fork) Gate for the hidden-split bell badge. Gated on the SAME static
-    /// `bellFeatures.contains(.border)` that mounts BellBorderOverlay, so the badge
-    /// (under zoom) and the amber bell border (on un-zoom) are a symmetric handoff.
+    /// (ramon fork) Gate for the hidden-split bell badge. Gated on the SAME `border`
+    /// routing that mounts BellBorderOverlay, so the badge (under zoom) and the amber
+    /// bell border (on un-zoom) are a symmetric handoff. (ramon fork / Bell Attention v2)
+    /// `border` defaults to the ATTENTION tier, so the gate is the OR of both tiers —
+    /// otherwise the badge would vanish when `border` is only on attention-features. The
+    /// driving `zoomedHiddenBell` aggregate is still bell-only; a promoted-attention-aware
+    /// aggregate is a follow-up.
     private var showHiddenBellBadge: Bool {
         ghostty.config.bellFeatures.contains(.border)
+            || ghostty.config.attentionFeatures.contains(.border)
     }
 
     var body: some View {

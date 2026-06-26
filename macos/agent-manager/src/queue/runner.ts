@@ -1468,12 +1468,15 @@ export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
 // Small effect wrappers (kept thin so the orchestration above stays readable).
 // ---------------------------------------------------------------------------
 
-/** Ring the bell / raise attention for a surface; best-effort. */
+/** Raise attention for a surface (leave-and-bell); best-effort. Routed through
+ *  set_attention (the always-loud Tier-2 state) rather than signal_attention so a
+ *  crashed-agent review prompt stays loud even under the `agent-manager-bell-filter`
+ *  tone-down (review fix / slice 5). */
 async function signal(deps: QueueDeps, uuid: string, reason: string): Promise<void> {
   try {
-    await deps.client.signalAttention(uuid, reason);
+    await deps.client.setAttention(uuid, true, reason);
   } catch (err) {
-    errlog(`signal_attention ${uuid}: ${msg(err)}`);
+    errlog(`set_attention ${uuid}: ${msg(err)}`);
   }
 }
 

@@ -146,6 +146,20 @@ extension Ghostty {
             return .init(rawValue: v)
         }
 
+        // (ramon fork / Bell Attention v2) The additive attention tier's feature sets.
+        // Same BellFeatures type/vocabulary as bell-features; read the same way.
+        var attentionFeatures: BellFeatures {
+            guard let config = self.config else { return .init() }
+            var v: CUnsignedInt = 0
+            let key = "attention-features"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return .init() }
+            return .init(rawValue: v)
+        }
+        // NOTE: there is intentionally NO `attentionFeaturesFocused` — the attention tier
+        // has no in-focus variant (a promotion means the user is away, and
+        // `attentionNeeded` clears on focus), so the bell tier's focused/out-of-focus
+        // split does not apply. See the `attention-features` doc in src/config/Config.zig.
+
         var bellAudioPath: ConfigPath? {
             guard let config = self.config else { return nil }
             var v = ghostty_config_path_s()
@@ -896,6 +910,18 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Bell Attention) Opt-in two-tier bell handling. When true AND
+        // the Agent Manager is running, the sidecar promotes only notable bells to the
+        // sticky "attention needed" state. Default false. The GUI forwards this to the
+        // sidecar as GHOSTTY_BELL_FILTER=1.
+        var agentManagerBellFilter: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-manager-bell-filter"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
         // nil/empty when unset (the controller falls back to a login-shell probe).
         var agentManagerNodePath: String? {
@@ -1025,6 +1051,14 @@ extension Ghostty.Config {
         static let attention = BellFeatures(rawValue: 1 << 2)
         static let title = BellFeatures(rawValue: 1 << 3)
         static let border = BellFeatures(rawValue: 1 << 4)
+        // (ramon fork / Bell Attention v2) bits 5–9 mirror the Zig BellFeatures packed
+        // struct field order (bounce, badge, dashboard, push, monitor). `attention`
+        // (bit 2) stays a back-compat alias the dock consumers OR with bounce/badge.
+        static let bounce = BellFeatures(rawValue: 1 << 5)
+        static let badge = BellFeatures(rawValue: 1 << 6)
+        static let dashboard = BellFeatures(rawValue: 1 << 7)
+        static let push = BellFeatures(rawValue: 1 << 8)
+        static let monitor = BellFeatures(rawValue: 1 << 9)
     }
 
     struct SplitPreserveZoom: OptionSet {

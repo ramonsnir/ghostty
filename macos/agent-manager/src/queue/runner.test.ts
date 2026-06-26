@@ -149,6 +149,12 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     async signalAttention(id: string, reason?: string): Promise<void> {
       calls.signal.push({ id, reason });
     },
+    // (review fix / slice 5) leave-and-bell now routes through set_attention; record it
+    // on the SAME `calls.signal` array so the existing leave-and-bell assertions
+    // (signal fired / not fired) keep verifying the attention raise.
+    async setAttention(id: string, _on: boolean, reason?: string): Promise<void> {
+      calls.signal.push({ id, reason });
+    },
     async sendKey(id: string, key: string): Promise<void> {
       calls.sendKey.push({ id, key });
     },
@@ -274,6 +280,10 @@ function makeLoopDeps(client: McpClient): LoopDeps {
     summarize: okSummary,
     lastBySession: new Map(),
     alertBySession: new Map(),
+    summarizerEnabled: true,
+    bellFilter: false,
+    bellSeenBySession: new Map(),
+    pendingBellIds: new Set(),
     summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     // queue intentionally OMITTED → the queue pass is a no-op.
   };

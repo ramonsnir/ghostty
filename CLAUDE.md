@@ -67,14 +67,116 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 `macos/Tests/Splits/SplitTreeTests.swift`; `RepeatableString cval*` +
 `Binding toggle_project_selector` + `Binding goto_last_surface` (Zig).
 
+- **Bell Attention v2 — two-tier, fail-open "bell vs needs-you"** (fork-only, OFF by
+  default). **See `BELL-ATTENTION.md` for the user-facing config/usage.** The load-bearing
+  facts for an agent touching this code:
+  - **Two tiers over ONE shared `BellFeatures` vocabulary.** `bell-features` fires on EVERY
+    bell (immediately); `attention-features` (fork-only key) is ADDED when a bell is
+    PROMOTED. Promoted bell = `bell-features ∪ attention-features`; ignored bell =
+    `bell-features` only; filter OFF ⇒ `bell-features` only (today). The expanded vocabulary
+    (`BellFeatures` packed struct, bits 0–9): `system,audio,attention,title,border,bounce,
+    badge,dashboard,push,monitor`. **`attention` is a BACK-COMPAT alias** the dock consumers
+    treat as `bounce`+`badge`. **`agent-manager-bell-filter` (bool, default false)** is the
+    master switch (delivered to the sidecar as `GHOSTTY_BELL_FILTER=1`).
+  - **DECOUPLED from the continuous summarizer (works in ALL agent-manager combinations).**
+    Since ramon-fork made `agent-manager` (the EXPENSIVE per-poll summarizer) optional, bell
+    promotion — a CHEAP per-bell, fail-open classify — must work independently. So: (1) the
+    Swift `sidecarShouldStart` gate launches the sidecar when agent-manager OR agent-queue OR
+    `bell-filter` is on (`bellFilterEnabled` added, default false); (2) `LoopDeps.summarizerEnabled`
+    (from GHOSTTY_SUMMARIZER) gates ONLY the continuous pass — `runSweep` ALWAYS runs the FORCED
+    (bell) pass (sequential, fail-open, EXEMPT from the rate-limit backoff cooldown) but runs the
+    continuous due-agent pass + backoff ONLY when `summarizerEnabled`; (3) `main()` arms
+    `bellReactiveLoop` whenever `bellFilter` (NOT nested under summarizer), and `await tick()` (the
+    5s poll) only when `summarizerEnabled`; the process-exit guard requires all THREE off. So
+    bell-only mode (summarizer off, bell-filter on): a bell classifies ONLY the rung surface
+    (one cheap call), the due agents are never polled. Account-routing is resolved when
+    `summarizerEnabled || bellFilter` (a bell classify also bills the routed account). Tests:
+    sidecar `summarizer OFF + bell-filter ON ⇒ a bell promotes but due agents are NOT polled`
+    (+ the no-bell no-op), Swift `shouldStartWhenBellFilterOnly`.
+  - **PARSE IS ADDITIVE over the TYPE field defaults, NOT reset-to-listed (load-bearing
+    gotcha).** `parsePackedStruct` does `var result: T = .{}` — so `BellFeatures{}` starts
+    `attention`+`title` TRUE, the rest FALSE, then the listed flags are OR'd on (or cleared
+    with a `no-` prefix). So `bell-features = system,audio` does NOT dial the bell tier down
+    — `attention`(bounce+badge) and `title`(🔔) STAY ON; the real dial-down needs explicit
+    `no-attention,no-title,…`. (An earlier note here wrongly said "reset to listed"; a
+    `bell-features=system,audio` Config.zig test now asserts `attention`/`title` stay true,
+    plus a `no-*` case.) DEFAULTS reproduce today: `bell-features` field default adds
+    `dashboard,push,monitor=true` (which were ungated/always-on pre-v2) atop the type
+    defaults `attention,title`; `attention-features` default is the loud set.
+  - **FAIL-OPEN decision (sidecar).** On a bell, the Agent Manager classifies and PROMOTES
+    (`set_attention(true)`) unless it got a CONFIDENT parsed `attention === false`. A strict
+    three-valued `coerceAttention` (summarizer.ts) maps only canonical true/false; an
+    unrecognized value (e.g. `"maybe"`) ⇒ `undefined` ⇒ `attention !== false` ⇒ PROMOTE
+    (using the lax `coerceBool` here was a real fail-open BUG — `"maybe"`→false→suppress).
+    Thrown / unparseable / omitted all promote. Only a confident `false` suppresses.
+  - **PROMOTION DOES NOT DEPEND ON `view.bell` (the recommended-config blocker, fixed).**
+    `Ghostty.App.ringBell` posts `.ghosttyBellDidRing` UNCONDITIONALLY on every ring → the
+    MCP event bus records a `.bell` event → the sidecar's `bellReactiveLoop` long-polls
+    `wait_for_event(bell)` and records `ev.id` into `LoopDeps.pendingBellIds`, drained into
+    `forcedBell` each sweep as the PRIMARY trigger. The `list_surfaces.bell` rising-edge
+    (`bellRoseEdge`) is only a BACKSTOP. This is load-bearing because in the RECOMMENDED
+    `bell-features = system,audio,no-…` config the GUI never arms `view.bell` (its arming
+    gate still requires `.title`/`.border` — UNCHANGED, so it can't regress the focused-
+    suppression that `bell-features-focused = …no-title` relies on), so `list_surfaces.bell`
+    stays false and the backstop alone would never promote. Event-driven ⇒ promotion lands
+    in ~1–2s; `makeCoalescedRunner` keeps the bell-reactive wake from overlapping the 5s
+    summarizer sweep. `bellReactiveLoop` never exits on error (fail-open: backoff + re-park).
+  - **Per-tier consumer routing (the v1 single `bellFilter` consumer gate is GONE).** Every
+    consumer renders `(bell && bell-features.<flag>) || (attentionNeeded && attention-features
+    .<flag>)`: AppDelegate `playBellEffects` (system→beep, audio→sound, bounce|attention→
+    requestUserAttention) on bell-features for `ghosttyBellDidRing` / attention-features for
+    `ghosttyAttentionDidChange`, + two-tier `setDockBadge` (badge|attention) + web-push policy
+    (`server.push.bellPush`/`attnPush`); BaseTerminalController `computeTitle` (title) +
+    `DerivedConfig` snapshots both sets; SurfaceView `BellBorderOverlay` + TerminalView
+    `showHiddenBellBadge` (border, gated on EITHER tier); AgentDashboardModel
+    `bellDashboard`/`attnDashboard` (applyBells unhide iff bellDashboard, applyAttention iff
+    attnDashboard, `needsAttention`/`sorted` float per tier); WebMonitorServer `attnIndicator`
+    + `monitorBell`/`monitorAttn`.
+  - **GUI NEVER auto-sets `attentionNeeded` (principle #3).** It is set ONLY by the sidecar
+    via the MCP `set_attention` tool → `.ghosttyAttentionDidChange` (filtered by surfaceID;
+    SurfaceView `attentionNeeded` @Published). It CLEARS independently of the raw `bell`: on
+    focus (`focusDidChange` clears both), `resetBell()` clears only `bell` (web-monitor bell
+    button), `resetAttention()` clears only attention (web-monitor `/attention` button, P5).
+    `list_surfaces` carries BOTH `bell` + `attentionNeeded` truthfully (no flag — principle F).
+  - **Cross-language `BellFeatures` bit-ABI** (Zig packed struct ⇄ Swift OptionSet rawValue):
+    `ghostty_config_get` hands the struct to Swift as a raw int reinterpreted by FIXED bit
+    position. Pinned BOTH ways — a Zig `@bitCast` test (`system`=bit0 … `monitor`=bit9) +
+    `ConfigTests.bellFeaturesBitPositionsMatchZig`. A field reorder / bit typo would silently
+    misroute every effect; it now fails a test.
+  - **Web monitor (P5):** `/api/surfaces` rows carry `bell`, `attentionNeeded`, and a
+    monitor-tier-routed `attnIndicator = (bell && monitorBell) || (attentionNeeded &&
+    monitorAttn)`; the page shows 🔔 (raw) vs ⏳ (promoted) distinctly, each with its own
+    clear button (`POST /api/surface/{uuid}/{bell,attention}`).
+  - **DEFERRED (the one open design decision, NOT built): §78 crashed-sidecar GUI fallback**
+    — when the filter is on + the sidecar is fully DOWN, attention-tier visuals don't fire
+    (sound stays bell-tier, so a bell is never silent). Needs either a principle-#3 exception
+    or per-consumer health wiring; flagged in `scratchpad/bell-attention-v2-design.md`.
+  - **History/billing/account-routing** of the promoter live in the Agent Manager — see the
+    Agent Manager bullet's "Attention bell on rate-limit" (the rate-limit watchdog is this
+    same mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
+  - Wiring: core — `src/config/Config.zig` (`BellFeatures` vocabulary + `attention-features`
+    + `agent-manager-bell-filter` + parse/bit-ABI tests); macOS — `Ghostty.Config.swift`
+    (`attentionFeatures` getter + the OptionSet flags), `AppDelegate.swift`,
+    `BaseTerminalController.swift`, `Surface View/{SurfaceView,SurfaceView_AppKit}.swift`,
+    `Terminal/TerminalView.swift`, `AgentDashboard/AgentDashboardController.swift`,
+    `WebMonitor/{WebMonitorServer,WebMonitorPush}.swift`, `MCP/{MCPAnnotation,MCPLayout}.swift`
+    (`set_attention` + `attentionNeeded` row); sidecar — `macos/agent-manager/src/{index,
+    summarizer,mcp,prompts}.ts` (`coerceAttention`, `pendingBellIds`/`bellReactiveLoop`,
+    `makeCoalescedRunner`, `waitForEvent`/`parseWaitForEvent`). Tests: sidecar `node --test`
+    (fail-open + `parseWaitForEvent` + coalesce + event-driven promote), Swift
+    `ConfigTests`/`WebMonitorServerTests`/`AgentDashboardTests`, Zig `attention-features` +
+    `BellFeatures bit positions`. **GUI relaunch + rebuilt sidecar `dist`; no host change.**
+
 - `bell-features-focused: BellFeatures` (fork-only config key) — a second bell-feature
   set governing the bell when the ringing surface is **truly in focus**: focused split
   / first responder AND `window.isKeyWindow` AND `NSApp.isActive` (a surface on another
   Space, in a backgrounded app, or a non-focused split counts as OUT OF FOCUS). When in
   focus, this set is used; otherwise the existing `bell-features` (unchanged, the
-  OUT-OF-FOCUS set) is used. Same value format and same `BellFeatures` type
-  (`system,audio,attention,title,border`); defaults are IDENTICAL to `bell-features`
-  (`attention`+`title`), so behavior is unchanged until set. For "sound only when
+  OUT-OF-FOCUS set) is used. This is the **focused variant of tier 1** in the Bell
+  Attention v2 model above (the ATTENTION tier has NO focused variant — a promotion clears
+  on focus). Same value format and same (now v2-expanded) `BellFeatures` type
+  (`system,audio,attention,title,border,bounce,badge,dashboard,push,monitor`); defaults are
+  IDENTICAL to `bell-features`, so behavior is unchanged until set. For "sound only when
   focused" set `bell-features-focused = audio,no-attention,no-title` (or `system,...`).
   The focus decision is made at RING time (not render) in a shared SurfaceView helper
   `bellFeaturesForCurrentFocus(_:)` / `bellIsFocused`, reused by both AppDelegate's bell
@@ -776,7 +878,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     CLAUDE_CONFIG_DIR}` (spread so HOME/PATH/OAuth survive — only the config dir is re-pointed).
     SIDECAR-only: edit the file + restart the sidecar (the GUI respawns it; no app relaunch).
   - **Attention bell on rate-limit (fork-only, sidecar-only, ZERO Swift/Zig/host change).**
-    The summarizer doubles as an attention watchdog: when a session hits the Claude
+    NOTE: this rate-limit watchdog is now ONE case of the general **Bell Attention v2**
+    two-tier promotion mechanism (see that bullet near the top + `BELL-ATTENTION.md`) — the
+    same fail-open classify + `set_attention`, here driven by a dedicated `alert` tag rather
+    than a bell edge. The summarizer doubles as an attention watchdog: when a session hits the Claude
     usage/rate-limit BLOCKING prompt ("Stop and wait for limit to reset / Ask your admin
     for more usage" — which halts the agent WITHOUT ringing a terminal bell), the sidecar
     rings the bell via the EXISTING MCP `signalAttention` tool (`client.signalAttention`,
@@ -1462,7 +1567,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

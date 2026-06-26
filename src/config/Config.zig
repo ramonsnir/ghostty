@@ -2955,6 +2955,17 @@ keybind: Keybinds = .{},
 // macOS apprt reads this via the `agentManagerNodePath` Swift getter.
 @"agent-manager-node-path": ?[:0]const u8 = null,
 
+/// (ramon fork / Bell Attention) Opt-in two-tier bell handling. When true AND the
+/// Agent Manager is running, a raw terminal bell renders QUIET (a low-key indicator,
+/// no dock bounce / sound / push / dashboard auto-unhide), and the Agent Manager
+/// sidecar PROMOTES only the bells Haiku judges worth interrupting you for into a
+/// louder "attention needed" state (strong tab marker, dashboard sort+highlight,
+/// push). Purely additive — the raw bell always fires immediately, so nothing is ever
+/// lost; the sidecar only ever turns the volume UP. Default false ⇒ bells behave
+/// exactly as today. Fork-only — keep it in `~/.config/ghostty-ramon/config` (an
+/// official Ghostty sharing `~/.config/ghostty/config` would error on it).
+@"agent-manager-bell-filter": bool = false,
+
 /// (ramon fork / Agent Queue Supervisor) Master enable for the Agent Queue
 /// Supervisor — the deterministic supervisor "pass 3" the Agent Manager
 /// sidecar runs (no LLM in the control path) that starts, tracks, and tears
@@ -3222,7 +3233,20 @@ keybind: Keybinds = .{},
 /// Example: `audio`, `no-audio`, `system`, `no-system`
 ///
 /// Available since: 1.2.0
-@"bell-features": BellFeatures = .{},
+// (ramon fork / Bell Attention v2) Default includes the fork effects that fire on a
+// raw bell today (dashboard auto-unhide, web push, web-monitor) so that with the filter
+// OFF the two-tier consumer routing reproduces today's behavior byte-for-byte. (system/
+// audio/border stay off by default, matching upstream.)
+//
+// IMPORTANT — parsing is ADDITIVE over the TYPE field defaults, NOT reset-to-listed.
+// `parsePackedStruct` starts from `BellFeatures{}` (so `attention` and `title` are TRUE,
+// the other flags FALSE) and then turns the listed flags on (or off with a `no-` prefix).
+// So providing `bell-features = system,audio` does NOT silence the loud effects — it
+// leaves `attention` (the dock bounce+badge alias) and `title` (the 🔔) ON. To actually
+// dial the bell tier down when enabling the filter you MUST negate them explicitly, e.g.
+// `bell-features = system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor`,
+// and let `attention-features` carry the loud effects on a promotion.
+@"bell-features": BellFeatures = .{ .dashboard = true, .push = true, .monitor = true },
 
 /// (Fork-only.) Bell features to enable when the ringing surface is truly in
 /// focus, i.e. it is the focused split AND its window is the key window AND
@@ -3238,7 +3262,37 @@ keybind: Keybinds = .{},
 ///
 /// This is a fork-only key and must live in `~/.config/ghostty-ramon/config`;
 /// an official Ghostty would error on the unknown key.
-@"bell-features-focused": BellFeatures = .{},
+// (ramon fork / Bell Attention v2) Default matches `bell-features` (incl. the fork
+// effects) so the in-focus default is unchanged + consistent.
+@"bell-features-focused": BellFeatures = .{ .dashboard = true, .push = true, .monitor = true },
+
+/// (ramon fork / Bell Attention v2) The ADDITIVE second tier: effects fired when a
+/// bell is PROMOTED to the sticky "attention needed" state (by the Agent Manager's
+/// fail-open classifier — see `agent-manager-bell-filter`). Same `BellFeatures` value
+/// format and shared vocabulary as `bell-features`, so any effect is routable to
+/// either tier. Semantics: every bell fires `bell-features`; a promoted bell ALSO
+/// fires `attention-features`; a confidently-ignored bell fires only `bell-features`.
+/// Only meaningful when `agent-manager-bell-filter = true`. The default is the "loud"
+/// set (title, border, dock bounce+badge, dashboard, push, web-monitor) — i.e. when
+/// you enable the filter you'd typically also dial `bell-features` down (remember the
+/// parse is additive over the type defaults, so the dial-down needs explicit negation:
+/// `bell-features = system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor`).
+/// Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+/// NOTE: there is deliberately NO `attention-features-focused` analog to
+/// `bell-features-focused`. The attention tier has no in-focus variant by design: a
+/// promotion means "the user is away", and `attentionNeeded` is CLEARED the moment the
+/// surface gains focus (see SurfaceView.focusDidChange), so a "promoted + focused" state
+/// is degenerate/transient and a focus-specific attention set would be effectively inert.
+@"attention-features": BellFeatures = .{
+    .attention = false,
+    .title = true,
+    .border = true,
+    .bounce = true,
+    .badge = true,
+    .dashboard = true,
+    .push = true,
+    .monitor = true,
+},
 
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
@@ -9419,6 +9473,16 @@ pub const BellFeatures = packed struct {
     attention: bool = true,
     title: bool = true,
     border: bool = false,
+    // (ramon fork / Bell Attention v2) Finer-grained + fork-only effect flags, shared
+    // by `bell-features` and `attention-features` so any effect is routable to either
+    // tier. `attention` stays a BACK-COMPAT alias the consumers treat as (bounce AND
+    // badge). All default false so `bell-features` keeps its historical default
+    // (attention+title); `attention-features` sets its own explicit (loud) default.
+    bounce: bool = false, // dock bounce (requestUserAttention)
+    badge: bool = false, // dock tile badge count
+    dashboard: bool = false, // Agent Dashboard unhide + sort + tile mark
+    push: bool = false, // web push to the phone
+    monitor: bool = false, // web-monitor indicator
 };
 
 /// See mouse-shift-capture
@@ -11295,7 +11359,7 @@ test "bell-features-focused: parse and default" {
         defer cfg.deinit();
         try cfg.finalize();
         try testing.expectEqual(
-            BellFeatures{ .attention = true, .title = true },
+            BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
             cfg.@"bell-features-focused",
         );
         // bell-features default is unchanged and identical.
@@ -11320,10 +11384,118 @@ test "bell-features-focused: parse and default" {
         );
         // bell-features keeps its default.
         try testing.expectEqual(
-            BellFeatures{ .attention = true, .title = true },
+            BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
             cfg.@"bell-features",
         );
     }
+}
+
+test "attention-features: parse, shared vocabulary, loud default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default is the loud set; bell-features default is UNCHANGED (back-compat).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(
+            BellFeatures{
+                .attention = false, .title = true, .border = true,
+                .bounce = true, .badge = true, .dashboard = true, .push = true, .monitor = true,
+            },
+            cfg.@"attention-features",
+        );
+        // bell-features default unchanged — the new flags default OFF there.
+        try testing.expectEqual(
+            BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
+            cfg.@"bell-features",
+        );
+    }
+
+    // The expanded vocabulary parses on BOTH keys (e.g. route push to the bell tier,
+    // drop dashboard from attention).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            // Parsing is ADDITIVE over the TYPE field defaults (parsePackedStruct starts
+            // from `BellFeatures{}` = attention+title TRUE, the rest FALSE), NOT
+            // reset-to-listed. So this routes `push` onto the bell tier (a new shared-
+            // vocabulary flag) and re-defines the attention tier starting from the TYPE
+            // defaults + title,border (so dashboard/push are FALSE — they're false in the
+            // TYPE default and not listed — while attention/title ride the type default).
+            "--bell-features=push",
+            "--attention-features=title,border",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        // push is now routable to the BELL tier (the new shared-vocabulary flag parses).
+        try testing.expectEqual(true, cfg.@"bell-features".push);
+        // The new flags default FALSE in the TYPE, so an un-listed one is off.
+        try testing.expectEqual(false, cfg.@"attention-features".dashboard);
+        try testing.expectEqual(false, cfg.@"attention-features".push);
+        try testing.expectEqual(true, cfg.@"attention-features".title);
+        try testing.expectEqual(true, cfg.@"attention-features".border);
+    }
+
+    // ADDITIVE-over-defaults, NOT reset: a value that doesn't list `attention`/`title`
+    // leaves them ON (they're TRUE in the BellFeatures TYPE default), so the documented
+    // "dial down to system,audio" does NOT silence the loud bell — you MUST negate them.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--bell-features=system,audio"} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"bell-features".system);
+        try testing.expectEqual(true, cfg.@"bell-features".audio);
+        // The load-bearing assertion the old test was missing: attention+title stay ON.
+        try testing.expectEqual(true, cfg.@"bell-features".attention);
+        try testing.expectEqual(true, cfg.@"bell-features".title);
+    }
+
+    // The REAL dial-down requires explicit negation.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--bell-features=system,audio,no-attention,no-title,no-dashboard,no-push,no-monitor",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"bell-features".system);
+        try testing.expectEqual(true, cfg.@"bell-features".audio);
+        try testing.expectEqual(false, cfg.@"bell-features".attention);
+        try testing.expectEqual(false, cfg.@"bell-features".title);
+        try testing.expectEqual(false, cfg.@"bell-features".dashboard);
+        try testing.expectEqual(false, cfg.@"bell-features".push);
+        try testing.expectEqual(false, cfg.@"bell-features".monitor);
+    }
+}
+
+test "BellFeatures: bit positions are the Zig<->Swift ABI contract" {
+    const testing = std.testing;
+    // `ghostty_config_get` hands the packed struct to Swift as a raw integer that the
+    // Swift OptionSet reinterprets by FIXED bit position (Ghostty.Config.swift:
+    // system=1<<0, audio=1<<1, attention=1<<2, title=1<<3, border=1<<4, bounce=1<<5,
+    // badge=1<<6, dashboard=1<<7, push=1<<8, monitor=1<<9). A Zig field REORDER (or a
+    // Swift bit typo) would silently route every effect to the wrong tier — the stale-ABI
+    // class of bug. Pin the Zig side here; the Swift side is asserted in GhosttyTests.
+    const B = @typeInfo(BellFeatures).@"struct".backing_integer.?;
+    const F = BellFeatures;
+    // Each case sets exactly one bit; `attention`/`title` default TRUE so they must be
+    // explicitly cleared when not under test.
+    try testing.expectEqual(@as(B, 1 << 0), @as(B, @bitCast(F{ .system = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 1), @as(B, @bitCast(F{ .audio = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 2), @as(B, @bitCast(F{ .attention = true, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 3), @as(B, @bitCast(F{ .attention = false, .title = true })));
+    try testing.expectEqual(@as(B, 1 << 4), @as(B, @bitCast(F{ .border = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 5), @as(B, @bitCast(F{ .bounce = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 6), @as(B, @bitCast(F{ .badge = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 7), @as(B, @bitCast(F{ .dashboard = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 8), @as(B, @bitCast(F{ .push = true, .attention = false, .title = false })));
+    try testing.expectEqual(@as(B, 1 << 9), @as(B, @bitCast(F{ .monitor = true, .attention = false, .title = false })));
 }
 
 test "web-monitor: parse and default" {
@@ -11388,6 +11560,7 @@ test "agent-manager: parse and default" {
         try cfg.finalize();
         try testing.expectEqual(false, cfg.@"agent-manager");
         try testing.expect(cfg.@"agent-manager-node-path" == null);
+        try testing.expectEqual(false, cfg.@"agent-manager-bell-filter");
     }
 
     {
@@ -11396,11 +11569,13 @@ test "agent-manager: parse and default" {
         var it: TestIterator = .{ .data = &.{
             "--agent-manager=true",
             "--agent-manager-node-path=/usr/local/bin/node",
+            "--agent-manager-bell-filter=true",
         } };
         try cfg.loadIter(alloc, &it);
         try cfg.finalize();
         try testing.expectEqual(true, cfg.@"agent-manager");
         try testing.expectEqualStrings("/usr/local/bin/node", cfg.@"agent-manager-node-path".?);
+        try testing.expectEqual(true, cfg.@"agent-manager-bell-filter");
     }
 }
 

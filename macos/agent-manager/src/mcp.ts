@@ -330,6 +330,19 @@ export class McpClient {
   }
 
   /**
+   * (bell-attention) set_attention — set/clear the sticky "attention needed" STATE on
+   * a surface (the loud Tier-2 treatment: strong tab marker, dashboard sort+highlight,
+   * push). Distinct from `signal_attention` (a one-shot bell ring): this is a persistent
+   * state the GUI clears on focus. The bell-attention pass calls it with `on:true` when
+   * Haiku promotes a bell. `reason` is an optional human note. Throws McpError on failure.
+   */
+  async setAttention(id: string, on: boolean, reason?: string): Promise<void> {
+    const args: Record<string, unknown> = { id, on };
+    if (reason !== undefined) args.reason = reason;
+    await this.call("set_attention", args);
+  }
+
+  /**
    * (Agent Queue, §8a) take_queue_commands — DRAIN + clear the GUI's in-memory FIFO of
    * GUI→sidecar control commands. Returns the drained commands (a `{commands:[...]}`
    * envelope on the wire). TOLERANT: a malformed payload, a non-array `commands`, or any
@@ -346,6 +359,29 @@ export class McpClient {
   }
 
   /**
+   * (bell-attention v2 slice 4) wait_for_event long-poll. Parks server-side until a
+   * matching event fires or `timeoutMs` elapses, returning the fired `{id,type}` or
+   * `null` on timeout. The HTTP request timeout is set ABOVE the park timeout so the
+   * fetch never aborts a still-parked wait (a spurious abort would look like a miss).
+   * `types` defaults to bell-only; an empty `ids` matches any surface.
+   */
+  async waitForEvent(spec: {
+    ids?: string[];
+    types?: string[];
+    timeoutMs: number;
+  }): Promise<{ id: string; type: string } | null> {
+    const payload = await this.call(
+      "wait_for_event",
+      {
+        filter: { ids: spec.ids ?? [], types: spec.types ?? ["bell"] },
+        timeoutMs: spec.timeoutMs,
+      },
+      spec.timeoutMs + 10000,
+    );
+    return parseWaitForEvent(payload);
+  }
+
+  /**
    * Low-level tools/call. Returns the RAW `result.content[0].text` STRING on
    * success; the caller JSON.parses tool payloads. Throws McpError on a
    * non-200, a protocol-level error, a tool-level error (isError), or a
@@ -354,6 +390,7 @@ export class McpClient {
   private async call(
     name: string,
     args: Record<string, unknown>,
+    timeoutMs?: number,
   ): Promise<string> {
     const id = this.nextId++;
     const body = JSON.stringify({
@@ -364,7 +401,9 @@ export class McpClient {
     });
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    // A long-poll (wait_for_event) parks server-side up to its own timeout, so the
+    // caller can pass a larger request timeout; default to the client's timeout.
+    const timer = setTimeout(() => controller.abort(), timeoutMs ?? this.timeoutMs);
     let res: Response;
     try {
       res = await fetch(this.url, {
@@ -436,6 +475,30 @@ export function parseToolJson(text: string): unknown {
   } catch {
     throw new McpError("tool result was not valid JSON");
   }
+}
+
+/**
+ * (bell-attention v2 slice 4) Parse a `wait_for_event` tool payload. The wire shape is
+ * `{"event":{"id","type",...}}` on a fired event and `{"event":null}` on timeout. PURE
+ * + TOLERANT — exported for unit testing. Returns `{id,type}` only when both are strings;
+ * anything else (timeout, malformed, missing fields) yields `null` (treated as "no event"
+ * by the caller, which simply re-parks — never a throw).
+ */
+export function parseWaitForEvent(
+  text: string,
+): { id: string; type: string } | null {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (obj === null || typeof obj !== "object") return null;
+  const ev = (obj as { event?: unknown }).event;
+  if (ev === null || typeof ev !== "object") return null;
+  const { id, type } = ev as { id?: unknown; type?: unknown };
+  if (typeof id !== "string" || typeof type !== "string") return null;
+  return { id, type };
 }
 
 /** The recognized control-command actions (§8a). */

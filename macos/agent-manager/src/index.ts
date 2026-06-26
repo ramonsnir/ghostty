@@ -61,7 +61,9 @@ import {
   backoffDelayMs,
   parseSummary,
   shouldSummarize,
+  isAgentSurface,
   alertEdge,
+  bellRoseEdge,
   ALERT_RATE_LIMITED,
   type LastSummary,
   type SummarizerConfig,
@@ -93,6 +95,47 @@ const POLL_INTERVAL_MS = 5000;
 /** Poll interval for the INDEPENDENT Agent Queue supervisor loop (decoupled from the
  *  slow LLM passes — see `runQueueSweepSafe` / `queueTick`). */
 const QUEUE_POLL_INTERVAL_MS = 5000;
+
+/** (bell-attention v2 slice 4) The bell-reactive long-poll park window. Below the MCP
+ *  tool's 120s ceiling and the connection caps; on timeout the loop simply re-parks. */
+const BELL_WAIT_MS = 60000;
+/** Backoff before re-parking after a failed `wait_for_event` (MCP down / restarting), so
+ *  a wedged server doesn't spin the loop. */
+const BELL_WAIT_RETRY_MS = 3000;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * (bell-attention v2 slice 4) Wrap an async run so concurrent callers COALESCE instead
+ * of overlapping: while one run is in flight, additional calls set a re-run flag and
+ * return immediately; when the run finishes it loops once more iff a wake arrived (and we
+ * are not stopped). This lets the 5s summarizer timer AND the bell-reactive long-poll both
+ * request a sweep without ever running two sweeps at once (the design's non-overlap
+ * invariant). PURE over its injected `run`/`isStopped` — unit-tested.
+ */
+export function makeCoalescedRunner(
+  run: () => Promise<void>,
+  isStopped: () => boolean = () => false,
+): () => Promise<void> {
+  let running = false;
+  let again = false;
+  return async (): Promise<void> => {
+    if (running) {
+      again = true;
+      return;
+    }
+    running = true;
+    try {
+      do {
+        again = false;
+        await run();
+      } while (again && !isStopped());
+    } finally {
+      running = false;
+    }
+  };
+}
 
 const log = (msg: string): void => console.log(`agent-manager: ${msg}`);
 const errlog = (msg: string): void => console.error(`agent-manager: ${msg}`);
@@ -147,6 +190,34 @@ export interface LoopDeps {
    *  after the alert clears (the screen changes). Held on deps so a test can
    *  seed/inspect it; cleaned up alongside lastBySession when a surface dies. */
   alertBySession: Map<string, string>;
+  /** Whether the CONTINUOUS summarizer pass runs (mirrors `agent-manager` /
+   *  GHOSTTY_SUMMARIZER). When false, `runSweep` does NOT summarize the periodic due
+   *  agents — only the cheap, INDEPENDENT per-bell FORCED pass below still runs (so
+   *  bell-promotion works with agent-manager OFF, e.g. queue-only or bell-only mode). The
+   *  expensive continuous Haiku polling is what `agent-manager` gates; bell promotion is
+   *  per-bell + fail-open and is gated separately by `bellFilter`. */
+  summarizerEnabled: boolean;
+  /** (bell-attention) Whether the per-bell promotion pass is active (mirrors the GUI's
+   *  `agent-manager-bell-filter` config, delivered via GHOSTTY_BELL_FILTER=1). When
+   *  false the sweep does NO bell-edge work and behaves byte-identically to before;
+   *  when true, a `bell` rising-edge / `pendingBellIds` force-classifies that surface
+   *  (bellRang) so Haiku can PROMOTE it via set_attention. INDEPENDENT of
+   *  `summarizerEnabled` — a bell still promotes when the continuous summarizer is off. */
+  bellFilter: boolean;
+  /** (bell-attention) Per-session memory of the last-seen `bell` flag, keyed by surface
+   *  id, for rising-edge detection. Held on deps so a test can seed/inspect it; cleaned
+   *  up alongside lastBySession when a surface dies. This is the POLL BACKSTOP — it only
+   *  catches rings when `list_surfaces.bell` is armed (i.e. bell-features routes a visual
+   *  bell: title/border). The PRIMARY signal is `pendingBellIds` below. */
+  bellSeenBySession: Map<string, boolean>;
+  /** (bell-attention v2 slice 6) Surface ids the bell-reactive loop saw ring via
+   *  `wait_for_event(bell)` — the GUI posts `.ghosttyBellDidRing` UNCONDITIONALLY on every
+   *  ring (Ghostty.App.ringBell), so the MCP event bus sees every bell REGARDLESS of
+   *  whether the per-surface `view.bell` visual flag was armed. This is what makes
+   *  promotion work in the feature's recommended `bell-features = system,audio` config
+   *  (where `view.bell`/`list_surfaces.bell` is never set, so the poll backstop above is
+   *  blind). Drained into `forcedBell` at the start of each sweep. */
+  pendingBellIds: Set<string>;
   /** Adaptive RATE-LIMIT BACKOFF state (account-WIDE, not per-session). When the
    *  summarizer's own model calls keep failing — its account is rate-limited / returns
    *  no usable summary — `failureStreak` rises and `nextProbeMs` pushes the next probe
@@ -185,8 +256,10 @@ type SummarizeResult = "ok" | "fail" | "skip";
 async function summarizeOne(
   surface: Surface,
   deps: LoopDeps,
+  opts: { bellRang?: boolean } = {},
 ): Promise<SummarizeResult> {
   const { client, overrides, cfg } = deps;
+  const bellRang = opts.bellRang === true;
   const prev = deps.lastBySession.get(surface.id);
 
   // Record a spent ATTEMPT: advance the per-session debounce clock (atMs) so a
@@ -219,13 +292,16 @@ async function summarizeOne(
     // The attention alert is the MODEL's verdict (below), so an idle-skip — where no
     // model call runs — deliberately LEAVES the alert state untouched: a held alert
     // stays armed (no re-ring), and nothing rings or clears without a fresh classify.
-    if (!decision.due) return "skip"; // unchanged/idle on the real viewport — skip
+    // EXCEPTION: a bell-triggered classify (bellRang) always proceeds, even when the
+    // gate would skip — a bell is an event worth one classify so Haiku can decide
+    // whether to promote it to the "attention needed" state.
+    if (!decision.due && !bellRang) return "skip"; // unchanged/idle — skip (no model call)
 
     // Prefer the loop's own record for continuity; fall back to the round-tripped
     // `notes` (our last summary echoed by list_surfaces). `||` so the "" sentinel
     // from a prior failed attempt falls back to notes rather than an empty string.
     const prevSummary = prev?.summary || surface.notes;
-    const ctx = buildContext(snapshot, prevSummary, cfg);
+    const ctx = buildContext(snapshot, prevSummary, cfg, bellRang);
     const { system, user } = composePrompt(
       SUMMARIZER_BASE_PROMPT,
       overrides.load(),
@@ -236,9 +312,12 @@ async function summarizeOne(
     const parsed = parseSummary(raw);
     if (!parsed) {
       // Spent a model call but got nothing usable — throttle the retry. No usable
-      // classify this sweep ⇒ leave the alert state untouched (see the idle note).
+      // classify this sweep ⇒ leave the SUMMARY/alert state untouched. But a bell
+      // rang and we have no confident verdict ⇒ FAIL-OPEN: promote (an unparseable
+      // reply must NEVER silence a bell).
       recordAttempt();
       errlog(`surface ${surface.id}: model reply not parseable; skipping`);
+      if (bellRang) await bellPromote(deps, surface, "unparseable classify (fail-open)");
       return "fail";
     }
 
@@ -254,10 +333,19 @@ async function summarizeOne(
       atMs: deps.now(),
       summary: parsed.summary,
     });
+    if (bellRang) {
+      log(`surface ${surface.id}: bellRang classify -> attention=${parsed.attention} alert=${parsed.alert}`);
+    }
     // The model is the SOLE judge of the attention alert: ring on a rising edge,
     // clear when it reports no alert (the screen changed and Haiku no longer sees
     // the live condition — this is how recovery un-rings, immune to scrolled-up text).
     await maybeSignalAlert(deps, surface, parsed.alert);
+    // (bell-attention v2, FAIL-OPEN) On a bell-triggered classify, PROMOTE unless Haiku
+    // confidently said ignore. `attention === false` is the ONLY suppression; `true` and
+    // an OMITTED/uncertain verdict both promote (so model hedging never silences a bell).
+    if (bellRang && parsed.attention !== false) {
+      await bellPromote(deps, surface, parsed.summary);
+    }
     log(`surface ${surface.id}: "${parsed.summary}"`);
     return "ok";
   } catch (err) {
@@ -274,6 +362,10 @@ async function summarizeOne(
         err instanceof Error ? err.message : String(err)
       }`,
     );
+    // (bell-attention v2, FAIL-OPEN) A bell rang but the read/model/annotate failed
+    // (incl. the summarizer's own account being out of tokens) ⇒ we have no confident
+    // verdict ⇒ promote. A failing classifier must never silence a bell.
+    if (bellRang) await bellPromote(deps, surface, "classify error (fail-open)");
     return "fail";
   } finally {
     deps.budget.release();
@@ -287,13 +379,42 @@ function alertReason(alert: string): string {
 }
 
 /**
- * Edge-triggered attention bell for one surface. Compares `alert` (the alert tag
- * for THIS read, or undefined) against the last-seen tag and, on a rising/changed
- * edge, calls signal_attention (which fans out to the tab bell, dashboard, web
- * monitor, and push). Records the new tag so a held alert never re-rings; clears
- * the record when the alert goes away so the next occurrence rings again. Catches
- * its OWN errors (a failed ring rolls back the record so a later sweep retries),
- * so it never escapes into summarizeOne's flow.
+ * (bell-attention v2, FAIL-OPEN) Promote a belled surface to the sticky attention state.
+ * Called on a bell-edge classify in EVERY outcome EXCEPT a clean, confident Haiku
+ * `attention === false` — so a model error, timeout, out-of-tokens, unparseable reply,
+ * or an omitted/uncertain verdict all land here and PROMOTE. Only an explicit "ignore"
+ * suppresses (the user's "only an explicit filter can ignore a bell"). The GUI clears
+ * attention on focus; `set_attention` is idempotent. Self-isolating: a tool failure is
+ * logged, never thrown into the sweep.
+ */
+async function bellPromote(deps: LoopDeps, surface: Surface, reason: string): Promise<void> {
+  try {
+    await deps.client.setAttention(surface.id, true, reason);
+    log(`surface ${surface.id}: bell promoted -> attention needed (${reason})`);
+  } catch (err) {
+    errlog(
+      `surface ${surface.id}: set_attention failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+/**
+ * Edge-triggered "needs you" promotion for one surface. Compares `alert` (the tag for
+ * THIS read, or undefined) against the last-seen tag and, on a rising/changed edge,
+ * sets the surface's STICKY attention state via `set_attention` (the always-loud
+ * Tier-2 signal — title marker, dock, push, dashboard float — that is EXEMPT from the
+ * `agent-manager-bell-filter` tone-down, so a rate-limit halt stays loud even with the
+ * filter on). On the clearing edge it sets attention OFF so a recovered surface
+ * un-promotes (it also clears on focus GUI-side). Records the tag so a held alert
+ * never re-fires; rolls back on failure so a later sweep retries. Catches its OWN
+ * errors so it never escapes into summarizeOne's flow.
+ *
+ * NOTE (review fix / slice 5): this used to call `signal_attention` (a one-shot
+ * `.ghosttyBellDidRing`), which the tone-down filter SILENCED — defeating the whole
+ * point of the watchdog when the filter was on. Routing through `set_attention`
+ * (the sticky attention tier) is the unification the design called for.
  */
 async function maybeSignalAlert(
   deps: LoopDeps,
@@ -302,22 +423,32 @@ async function maybeSignalAlert(
 ): Promise<void> {
   const edge = alertEdge(deps.alertBySession.get(surface.id), alert);
   if (edge === "ring") {
-    // Record FIRST so a slow signal_attention can't double-fire from an overlapping
+    // Record FIRST so a slow set_attention can't double-fire from an overlapping
     // sweep; roll back below if the call fails so the edge is retried.
     deps.alertBySession.set(surface.id, alert as string);
     try {
-      await deps.client.signalAttention(surface.id, alertReason(alert as string));
-      log(`surface ${surface.id}: alert "${alert}" -> rang attention`);
+      await deps.client.setAttention(surface.id, true, alertReason(alert as string));
+      log(`surface ${surface.id}: alert "${alert}" -> promoted (attention)`);
     } catch (err) {
       deps.alertBySession.delete(surface.id);
       errlog(
-        `surface ${surface.id}: signal_attention failed: ${
+        `surface ${surface.id}: set_attention failed: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
   } else if (edge === "clear") {
     deps.alertBySession.delete(surface.id);
+    // Best-effort un-promote on recovery (also cleared on focus GUI-side).
+    try {
+      await deps.client.setAttention(surface.id, false);
+    } catch (err) {
+      errlog(
+        `surface ${surface.id}: set_attention(off) failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 }
 
@@ -348,12 +479,63 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     if (!liveIds.has(id)) deps.alertBySession.delete(id);
   }
 
-  // Cheap pre-gate from row fields only (no read_surface yet): drop non-agent /
-  // hidden / debounced surfaces. The viewport-aware change/idle decision happens
-  // inside summarizeOne after the read, so the gate and the recorded tail share the
-  // same basis.
+  // (bell-attention) Decide which surfaces get a FORCED classify this sweep (bellRang).
+  // Only when the feature is on — otherwise the sweep is byte-identical to before.
+  const forcedBell = new Set<string>();
+  if (deps.bellFilter) {
+    // PRIMARY: surfaces the bell-reactive loop saw ring via wait_for_event(bell). The GUI
+    // posts .ghosttyBellDidRing on EVERY ring regardless of the visual bell-features, so
+    // this is the only signal that works in the recommended `bell-features = system,audio`
+    // config (where list_surfaces.bell is never armed). Drain it (one-shot per ring).
+    for (const id of deps.pendingBellIds) forcedBell.add(id);
+    deps.pendingBellIds.clear();
+    // BACKSTOP: rising-edge of list_surfaces.bell — catches a ring the event loop missed
+    // (e.g. during an MCP reconnect) BUT only when bell-features armed the visual bell
+    // (title/border), so it can't be the primary. We compute edges against the PREVIOUS
+    // seen state, then refresh the map (and prune dead surfaces).
+    for (const s of surfaces) {
+      if (bellRoseEdge(deps.bellSeenBySession.get(s.id), s.bell === true)) {
+        forcedBell.add(s.id);
+        log(`surface ${s.id}: bell rising edge -> force classify (agent=${isAgentSurface(s, deps.cfg)})`);
+      }
+      deps.bellSeenBySession.set(s.id, s.bell === true);
+    }
+    for (const id of [...deps.bellSeenBySession.keys()]) {
+      if (!liveIds.has(id)) deps.bellSeenBySession.delete(id);
+    }
+  }
+
+  // (bell-attention) FORCED (bell) pass — ALWAYS runs when a surface rang, INDEPENDENT of
+  // the continuous summarizer (`summarizerEnabled`) and EXEMPT from the rate-limit backoff
+  // cooldown below. Rationale (the headline of this design): the continuous summarizer's
+  // per-poll Haiku calls are EXPENSIVE so they are gated by `agent-manager`; a per-bell
+  // classify is RARE, urgent, and FAIL-OPEN (a failed/errored classify PROMOTES), so it
+  // must always get its one classify — even with agent-manager OFF (queue-only / bell-only)
+  // or while the account is backed off. A bell forces past the DEBOUNCE gate but NEVER past
+  // the not-agent/hidden gate. These run sequentially (forced surfaces are few) and are NOT
+  // fed into the backoff aggregator (which governs the CONTINUOUS poll cadence only).
+  if (forcedBell.size > 0) {
+    for (const surface of surfaces) {
+      if (!forcedBell.has(surface.id)) continue;
+      const pre = preGate(surface, deps.lastBySession.get(surface.id), deps.now(), deps.cfg);
+      if (!(pre.pass || pre.reason === "debounce")) continue; // not-agent/hidden: never promote
+      if (!deps.budget.tryAcquire()) break;
+      await summarizeOne(surface, deps, { bellRang: true });
+    }
+  }
+
+  // CONTINUOUS summarizer pass — ONLY when agent-manager is enabled. With it OFF (queue-only
+  // or bell-only mode) the expensive per-poll Haiku calls never happen; only the cheap
+  // per-bell pass above ran. This is the load-bearing decoupling: agent-manager gates the
+  // continuous cost, bell-filter gates the cheap promotion, independently.
+  if (!deps.summarizerEnabled) return;
+
+  // Cheap pre-gate: the due (changed / non-debounced) NON-forced agents. Forced surfaces
+  // were handled above, so EXCLUDE them here (no double-classify).
   const candidates = surfaces.filter(
-    (s) => preGate(s, deps.lastBySession.get(s.id), deps.now(), deps.cfg).pass,
+    (s) =>
+      !forcedBell.has(s.id) &&
+      preGate(s, deps.lastBySession.get(s.id), deps.now(), deps.cfg).pass,
   );
 
   // RATE-LIMIT BACKOFF (account-wide): while the summarizer's own calls keep failing,
@@ -362,9 +544,7 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
   const bo = deps.summarizerBackoff;
   if (bo.failureStreak > 0) {
     if (deps.now() < bo.nextProbeMs) return; // still cooling down — no model calls
-    // PROBE: try candidates sequentially until ONE makes a real model call (not a
-    // gate-skip), so a leading quiescent tile can't waste the probe without testing
-    // the account. The first real result decides recovery vs. continued backoff.
+    // PROBE: try candidates sequentially until ONE makes a real model call (not a gate-skip).
     let probed: SummarizeResult | null = null;
     for (const surface of candidates) {
       if (!deps.budget.tryAcquire()) break;
@@ -386,10 +566,8 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     return;
   }
 
-  // NORMAL path: fire due surfaces concurrently (bounded by the budget = per-sweep
-  // batch cap). NOTE: because the loop is self-paced + non-overlapping (a sweep fully
-  // settles before the next setTimeout), `cfg.maxConcurrent` doubles as a per-sweep
-  // BATCH cap: at most maxConcurrent tiles are summarized per POLL_INTERVAL_MS sweep.
+  // NORMAL path: fire due (non-forced) surfaces concurrently (bounded by the budget =
+  // per-sweep batch cap).
   const fired: Array<Promise<SummarizeResult>> = [];
   for (const surface of candidates) {
     if (!deps.budget.tryAcquire()) break; // budget exhausted this sweep
@@ -457,12 +635,18 @@ async function main(): Promise<void> {
   }
   const client = new McpClient({ url, token });
 
-  // Optional summarizer ACCOUNT routing (see account.ts). Default ⇒ inherit the
-  // ambient Claude Code auth (works with no claude-accounts installed). When set,
-  // the summarizer's model calls bill against the configured account's CLAUDE_CONFIG_DIR.
-  // Only relevant to the summarizer, so skip it entirely in queue-only mode.
+  // (bell-attention) The GUI sets GHOSTTY_BELL_FILTER=1 from `agent-manager-bell-filter`
+  // when the per-bell promotion feature is on. INDEPENDENT of the summarizer — a bell still
+  // promotes (cheap, per-bell, fail-open) when the continuous summarizer is off.
+  const bellFilter = process.env.GHOSTTY_BELL_FILTER === "1";
+
+  // Optional ACCOUNT routing (see account.ts). Default ⇒ inherit the ambient Claude Code
+  // auth (works with no claude-accounts installed). When set, the model calls bill against
+  // the configured account's CLAUDE_CONFIG_DIR. Relevant to ANY Haiku classify — the
+  // continuous summarizer AND the per-bell promotion — so it is resolved when EITHER is on
+  // (skip it only in pure queue-only mode, which makes no Haiku calls).
   let summarizerConfigDir: string | undefined;
-  if (summarizerEnabled) {
+  if (summarizerEnabled || bellFilter) {
     const accountSpec = readAccountSpec(home);
     summarizerConfigDir = resolveAccountDir(accountSpec, home) ?? undefined;
     if (accountSpec && accountSpec.trim() && summarizerConfigDir === undefined) {
@@ -483,9 +667,14 @@ async function main(): Promise<void> {
     summarize: defaultSummarize,
     lastBySession: new Map<string, LastSummary>(),
     alertBySession: new Map<string, string>(),
+    summarizerEnabled,
+    bellFilter,
+    bellSeenBySession: new Map<string, boolean>(),
+    pendingBellIds: new Set<string>(),
     summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     summarizerConfigDir,
   };
+  if (bellFilter) log("bell-attention: bell promotion ENABLED");
 
   // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on (the Swift
   // controller sets GHOSTTY_AGENT_QUEUE=1 + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
@@ -533,14 +722,14 @@ async function main(): Promise<void> {
 
   log(
     `sidecar started; MCP=${url} summarizer=${summarizerEnabled} ` +
-      `queue=${deps.queue !== undefined} (poll ${POLL_INTERVAL_MS}ms)`,
+      `queue=${deps.queue !== undefined} bellFilter=${bellFilter} (poll ${POLL_INTERVAL_MS}ms)`,
   );
 
-  // The controller's gate guarantees at least one loop is armed, but guard anyway:
-  // with nothing to run, return so the process exits cleanly (no timers pending)
-  // rather than idle forever holding the MCP connection.
-  if (!summarizerEnabled && deps.queue === undefined) {
-    errlog("neither summarizer nor queue is enabled; nothing to do — exiting");
+  // The controller's gate guarantees at least one of the THREE loops is armed, but guard
+  // anyway: with nothing to run (no summarizer, no queue, AND no bell promotion) return so
+  // the process exits cleanly rather than idle forever holding the MCP connection.
+  if (!summarizerEnabled && deps.queue === undefined && !bellFilter) {
+    errlog("neither summarizer, queue, nor bell-filter is enabled; nothing to do — exiting");
     return;
   }
 
@@ -558,11 +747,12 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  // Self-pacing loop: run a sweep, then schedule the next POLL_INTERVAL_MS after
-  // it settles (no overlap). setTimeout (not setInterval) avoids piling sweeps
-  // when a sweep runs long.
-  const tick = async (): Promise<void> => {
-    if (stopped) return;
+  // (bell-attention v2 slice 4) Both the 5s timer and the bell-reactive long-poll run
+  // sweeps through this COALESCED runner, so a bell event can wake an immediate classify
+  // without ever overlapping the periodic sweep (which would race the shared bell-edge /
+  // alert bookkeeping in `deps`). The sweep itself does all the work; the reactive loop
+  // only wakes it.
+  const runSweepCoalesced = makeCoalescedRunner(async () => {
     try {
       await runSweep(deps);
     } catch (err) {
@@ -570,7 +760,45 @@ async function main(): Promise<void> {
       // loop can never die from an unexpected throw.
       errlog(`sweep error: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }, () => stopped);
+
+  // Self-pacing loop: run a sweep, then schedule the next POLL_INTERVAL_MS after
+  // it settles (no overlap). setTimeout (not setInterval) avoids piling sweeps
+  // when a sweep runs long.
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    await runSweepCoalesced();
     if (!stopped) timer = setTimeout(() => void tick(), POLL_INTERVAL_MS);
+  };
+
+  // (bell-attention v2 slice 4) BELL-REACTIVE loop: long-poll wait_for_event(bell) and
+  // wake an immediate classify so a promotion lands in ~1-2s instead of up to
+  // POLL_INTERVAL_MS (sound-only until then). The 5s `tick` stays as the backstop (it
+  // also drives summaries + catches any missed event). Only armed when bell promotion is
+  // enabled (`bellFilter`); without it there is no attention tier to promote into. The
+  // loop NEVER exits on error (fail-open: a recovered MCP re-arms after a short backoff).
+  const bellReactiveLoop = async (): Promise<void> => {
+    while (!stopped) {
+      let ev: { id: string; type: string } | null;
+      try {
+        ev = await deps.client.waitForEvent({ types: ["bell"], timeoutMs: BELL_WAIT_MS });
+      } catch (err) {
+        errlog(`bell wait failed: ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(BELL_WAIT_RETRY_MS);
+        continue;
+      }
+      if (stopped) return;
+      if (ev) {
+        // Record the RINGING surface id (the truthful signal — independent of whether the
+        // GUI armed its visual bell flag), then wake an immediate classify. runSweep drains
+        // pendingBellIds into forcedBell, so this surface is classified even when
+        // list_surfaces.bell is never set (the system,audio config).
+        deps.pendingBellIds.add(ev.id);
+        log(`bell event on ${ev.id} -> wake immediate classify`);
+        void runSweepCoalesced();
+      }
+      // ev === null ⇒ park timeout; just loop and re-park.
+    }
   };
 
   // INDEPENDENT queue loop (ramon fork / Agent Queue): the deterministic supervisor
@@ -590,6 +818,18 @@ async function main(): Promise<void> {
   // `tick`. Each loop runs only when its feature is armed; whichever are on run
   // concurrently on the event loop, and their pending timers keep the process alive.
   if (deps.queue !== undefined) void queueTick();
+  // (bell-attention) The bell-reactive loop is INDEPENDENT of the continuous summarizer:
+  // it runs whenever bell promotion is on (+ the waitForEvent capability exists), so a bell
+  // still promotes (cheap, per-bell, fail-open) even with agent-manager OFF (queue-only or
+  // bell-only mode). The classify it wakes runs ONLY the forced surface — `runSweep` gates
+  // the expensive continuous pass on `summarizerEnabled`.
+  if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
+    log("bell-attention: event-driven classify ENABLED (wait_for_event)");
+    void bellReactiveLoop();
+  }
+  // The 5s CONTINUOUS summarizer poll runs ONLY when agent-manager is enabled (the expensive
+  // path). `await` it so main() stays alive on the summarizer's timer; when it's off, the
+  // queue and/or bell-reactive loops keep the process alive via their own pending work.
   if (summarizerEnabled) await tick();
 }
 

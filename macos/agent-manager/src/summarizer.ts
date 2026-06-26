@@ -121,6 +121,10 @@ export interface SummaryContext {
   previousSummary?: string;
   idleSeconds?: number;
   viewportTail: string;
+  /** True when this classify was triggered by a terminal bell rising on the
+   *  surface (the bell-attention path). When set, the model is asked to also
+   *  return `attention` — whether the bell warrants pulling the user in now. */
+  bellRang?: boolean;
 }
 
 /** The parsed, validated model output. */
@@ -133,6 +137,11 @@ export interface ParsedSummary {
    *  edge-triggers signal_attention on it. Lower-cased + trimmed; omitted when
    *  the model emits no usable tag. */
   alert?: string;
+  /** (bell-attention v2) The model's bell-promotion verdict, meaningful only when the
+   *  classify was triggered by a bell. true ⇒ promote (add the attention tier); false ⇒
+   *  a confident "incidental, leave it the quiet raw bell" — the ONLY thing that
+   *  suppresses. Omitted/undefined ⇒ fail-open promote (the loop tests `!== false`). */
+  attention?: boolean;
 }
 
 /** The alert tag for the Claude usage/rate-limit blocking prompt. Used by both
@@ -320,11 +329,13 @@ export function preGate(
   return { pass: true, reason: "candidate" };
 }
 
-/** Build the SummaryContext fed to the model from a snapshot + its prior summary. */
+/** Build the SummaryContext fed to the model from a snapshot + its prior summary.
+ *  `bellRang` marks a bell-triggered classify so the model also returns `attention`. */
 export function buildContext(
   s: SurfaceSnapshot,
   previousSummary: string | undefined,
   cfg: SummarizerConfig,
+  bellRang?: boolean,
 ): SummaryContext {
   return {
     title: s.surface.title,
@@ -335,6 +346,7 @@ export function buildContext(
     previousSummary,
     idleSeconds: s.surface.idleSeconds,
     viewportTail: lastLines(s.viewport, cfg.promptTailLines),
+    bellRang: bellRang || undefined,
   };
 }
 
@@ -356,6 +368,11 @@ export function serializeContext(ctx: SummaryContext): string {
   }
   if (ctx.previousSummary) {
     lines.push(`Your previous summary: ${ctx.previousSummary}`);
+  }
+  if (ctx.bellRang) {
+    lines.push(
+      "A terminal bell just rang on this surface. Also return `attention` (see the contract).",
+    );
   }
   lines.push("");
   lines.push("Recent terminal output (most recent last):");
@@ -421,6 +438,14 @@ export function parseSummary(modelText: string): ParsedSummary | null {
       const alert = rec.alert.trim().toLowerCase();
       if (alert.length > 0) result.alert = alert;
     }
+    if ("attention" in rec) {
+      // FAIL-OPEN: only a CONFIDENT, canonical boolean sets `attention`. An
+      // unrecognized value (e.g. "maybe") leaves it UNDEFINED so the loop's
+      // `attention !== false` promotes — uncertainty must never suppress (using the
+      // lax coerceBool here would coerce "maybe" -> false -> SUPPRESS, a fail-open bug).
+      const a = coerceAttention(rec.attention);
+      if (a !== undefined) result.attention = a;
+    }
     return result;
   }
   return null;
@@ -452,6 +477,14 @@ export function alertEdge(
 ): "ring" | "clear" | "none" {
   if (current) return current === prev ? "none" : "ring";
   return prev ? "clear" : "none";
+}
+
+/** (bell-attention) Rising-edge detector for the per-surface `bell` flag: true ONLY
+ *  on a false/undefined → true transition (a NEW ring), so a held bell doesn't
+ *  re-force a classify every sweep. PURE. The POLL-backstop counterpart to the
+ *  event-driven `pendingBellIds`. */
+export function bellRoseEdge(prev: boolean | undefined, current: boolean): boolean {
+  return current === true && prev !== true;
 }
 
 /** A simple concurrency budget: a counter capped at maxConcurrent. Not pure
@@ -539,6 +572,26 @@ export function coerceBool(v: unknown): boolean {
     return s === "true" || s === "yes" || s === "1";
   }
   return false;
+}
+
+/**
+ * (bell-attention v2) STRICT three-valued coercion for the `attention` verdict, used
+ * ONLY for the fail-open promotion decision. Unlike `coerceBool`, an UNRECOGNIZED value
+ * yields `undefined` (not `false`) so the loop's `attention !== false` PROMOTES on
+ * uncertainty — fail-open. Only canonical booleans map: true/"true"/"yes"/"1"/nonzero ⇒
+ * true; false/"false"/"no"/"0"/0 ⇒ false; everything else (e.g. "maybe", null, object) ⇒
+ * undefined. PURE.
+ */
+export function coerceAttention(v: unknown): boolean | undefined {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true" || s === "yes" || s === "1") return true;
+    if (s === "false" || s === "no" || s === "0") return false;
+    return undefined; // uncertain ⇒ fail-open (promote)
+  }
+  return undefined;
 }
 
 /** Strip leading/trailing markdown code fences (```json ... ``` or ``` ... ```). */

@@ -628,6 +628,57 @@ struct AgentDashboardModelTests {
         #expect(model.entries.map(\.id).contains(a))
     }
 
+    // (ramon fork / Bell Attention) A surface the Agent Manager PROMOTES via
+    // set_attention must never stay hidden, and the promotion floats + marks the tile.
+    @Test func attentionAutoUnhidesAndMarks() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        model.hide(a)
+        #expect(model.hidden.contains(a))
+
+        model.applyAttention([a: true])
+        #expect(!model.hidden.contains(a), "a promoted tile must be unhidden")
+        #expect(!store.load().contains(a), "hide store updated")
+        #expect(model.entries.first?.attention == true, "tile marked + floated")
+    }
+
+    // (ramon fork / Bell Attention v2) When `dashboard` is NOT routed to the bell tier
+    // (bellDashboard false), a RAW bell must NOT auto-unhide — but a promotion still does
+    // (attnDashboard true). Guards the per-tier `if bellDashboard`/`if attnDashboard`
+    // branches in applyBells/applyAttention.
+    @Test func dashboardNotInBellTierRawBellDoesNotUnhide() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store, bellDashboard: false, attnDashboard: true)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        model.hide(a)
+
+        model.applyBells([a: true])     // raw bell, dashboard not in the bell tier
+        #expect(model.hidden.contains(a), "a raw bell must not unhide when dashboard is off the bell tier")
+
+        // ...but a promotion still does (dashboard IS in the attention tier).
+        model.applyAttention([a: true])
+        #expect(!model.hidden.contains(a), "a promotion unhides via the attention tier")
+    }
+
+    // (ramon fork / Bell Attention v2) When `dashboard` IS routed to the bell tier
+    // (the default, = upstream), applyBells auto-unhides on a raw bell.
+    @Test func dashboardInBellTierRawBellUnhides() {
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store, bellDashboard: true, attnDashboard: true)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        model.hide(a)
+
+        model.applyBells([a: true])
+        #expect(!model.hidden.contains(a), "dashboard in the bell tier ⇒ raw bell unhides as upstream")
+    }
+
     @Test func bellFalseKeepsHidden() {
         // Negative complement of the auto-unhide path (LOCKED #1 / spec §4.2):
         // a hidden agent that is NOT ringing must STAY hidden through applyBells.
@@ -875,9 +926,9 @@ struct AgentDashboardConfigTests {
 
 @MainActor
 struct AgentDashboardSortTests {
-    private func entry(_ id: UUID, bell: Bool) -> AgentEntry {
+    private func entry(_ id: UUID, bell: Bool, attention: Bool = false) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: 0,
+              bell: bell, attention: attention, hidden: false, sessionID: 0,
               agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
               annotation: nil,
               backgroundShells: 0)
@@ -891,6 +942,34 @@ struct AgentDashboardSortTests {
         let entries = [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: true)]
         let sorted = AgentDashboardModel.sorted(entries)
         #expect(sorted.first?.id == ring)
+    }
+
+    // (ramon fork / Bell Attention v2) The promoted attention state floats a tile first
+    // whenever `dashboard` is routed to the attention tier (attnDashboard true) —
+    // independent of whether it's also on the bell tier.
+    @Test func attentionFloatsFirst() {
+        let promoted = UUID(); let q1 = UUID(); let q2 = UUID()
+        let entries = [entry(q1, bell: false), entry(q2, bell: false),
+                       entry(promoted, bell: false, attention: true)]
+        #expect(AgentDashboardModel.sorted(entries, bellDashboard: true, attnDashboard: true).first?.id == promoted)
+        #expect(AgentDashboardModel.sorted(entries, bellDashboard: false, attnDashboard: true).first?.id == promoted)
+    }
+
+    // (ramon fork / Bell Attention v2) A RAW bell floats the tile only when `dashboard` is
+    // on the bell tier (bellDashboard true, = upstream); with it off the bell is inert.
+    @Test func rawBellFloatGatedByDashboardTier() {
+        let ring = UUID(); let q1 = UUID(); let q2 = UUID()
+        let entries = [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: true)]
+        // dashboard on the bell tier: bell floats first (upstream behavior).
+        #expect(AgentDashboardModel.sorted(entries, bellDashboard: true, attnDashboard: false).first?.id == ring)
+        // dashboard off the bell tier: the bell is inert, so order is the pure UUID
+        // tie-break (no float) — identical to the order with the bell cleared entirely.
+        let filtered = AgentDashboardModel.sorted(
+            entries, bellDashboard: false, attnDashboard: false).map(\.id)
+        let noBell = AgentDashboardModel.sorted(
+            [entry(q1, bell: false), entry(q2, bell: false), entry(ring, bell: false)],
+            bellDashboard: false, attnDashboard: false).map(\.id)
+        #expect(filtered == noBell)
     }
 
     @Test func uuidTieBreakStable() {
@@ -928,9 +1007,10 @@ struct AgentDashboardSortTests {
 
     // MARK: - Manual order (ramon fork / Agent Dashboard)
 
-    private func entry(_ id: UUID, session: UInt64, bell: Bool = false, waiting: Bool = false) -> AgentEntry {
+    private func entry(_ id: UUID, session: UInt64, bell: Bool = false, waiting: Bool = false,
+                       attention: Bool = false) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: session,
+              bell: bell, attention: attention, hidden: false, sessionID: session,
               agentState: waiting ? .waiting : nil,
               lastTool: nil, lastPrompt: nil, hookBacked: false,
               annotation: nil,
@@ -1445,7 +1525,7 @@ struct AgentDashboardWaitingSortTests {
         _ id: UUID, bell: Bool, state: AgentState?, backgroundShells: Int = 0
     ) -> AgentEntry {
         .init(id: id, realView: nil, title: "t", pwd: "/x", agent: nil,
-              bell: bell, hidden: false, sessionID: 0,
+              bell: bell, attention: false, hidden: false, sessionID: 0,
               agentState: state, lastTool: nil, lastPrompt: nil, hookBacked: state != nil,
               annotation: nil,
               backgroundShells: backgroundShells)
@@ -1535,11 +1615,11 @@ struct AgentDashboardWaitingSortTests {
         let idle = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
         let entries = [
             AgentEntry(id: working, realView: nil, title: "t", pwd: "/x", agent: nil,
-                       bell: false, hidden: false, sessionID: 10, agentState: .working,
+                       bell: false, attention: false, hidden: false, sessionID: 10, agentState: .working,
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
                        backgroundShells: 0),
             AgentEntry(id: idle, realView: nil, title: "t", pwd: "/x", agent: nil,
-                       bell: false, hidden: false, sessionID: 20, agentState: .idle,
+                       bell: false, attention: false, hidden: false, sessionID: 20, agentState: .idle,
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
                        backgroundShells: 0),
         ]
@@ -1776,7 +1856,7 @@ struct AgentDashboardOriginTests {
             ? AgentAnnotation(queueKey: queueKey, queueName: queueName, queueUrl: queueUrl)
             : nil
         return .init(id: id, realView: nil, title: "t", pwd: "/x", agent: AgentKind("claude"),
-                     bell: bell, hidden: false, sessionID: session,
+                     bell: bell, attention: false, hidden: false, sessionID: session,
                      agentState: waiting ? .waiting : nil,
                      lastTool: nil, lastPrompt: nil, hookBacked: false,
                      annotation: ann,
@@ -2075,7 +2155,7 @@ struct AgentQueueHealthTests {
         // A present queue that already has tiles isn't duplicated; `(other)` is never
         // injected as a queue even if (defensively) passed in.
         let e = AgentEntry(id: UUID(), realView: nil, title: "t", pwd: "/x", agent: nil,
-                           bell: false, hidden: false, sessionID: 1,
+                           bell: false, attention: false, hidden: false, sessionID: 1,
                            agentState: nil, lastTool: nil, lastPrompt: nil, hookBacked: false,
                            annotation: AgentAnnotation(queueName: "ExampleOS"),
                            backgroundShells: 0)

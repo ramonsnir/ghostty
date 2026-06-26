@@ -62,7 +62,7 @@ pub const compiler =
 /// Generates the syntax file at comptime.
 fn comptimeGenSyntax() []const u8 {
     comptime {
-        @setEvalBranchQuota(50000);
+        @setEvalBranchQuota(100000);
         var counter: std.Io.Writer.Discarding = .init(&.{});
         try writeSyntax(&counter.writer);
 

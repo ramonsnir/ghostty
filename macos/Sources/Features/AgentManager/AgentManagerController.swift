@@ -46,6 +46,10 @@ final class AgentManagerController {
     /// probe (`PATH` is not inherited by a GUI app — see §8 GOTCHA).
     private let configuredNodePath: String?
 
+    /// (ramon fork / Bell Attention) When true the controller arms the sidecar's
+    /// bell-promotion pass via `GHOSTTY_BELL_FILTER=1` (else it stays a no-op and the
+    /// sidecar does no bell-edge work). Captured on main at init.
+    private let bellFilterEnabled: Bool
     /// (Agent Queue Supervisor §8a/§15) Master enable for the sidecar's queue
     /// supervisor "pass 3". Captured on main at init. When true the controller
     /// arms the sidecar via `GHOSTTY_AGENT_QUEUE=1` (else pass 3 stays a no-op).
@@ -92,6 +96,7 @@ final class AgentManagerController {
         self.mcpListen = ghostty.config.mcpListen
         self.mcpToken = ghostty.config.mcpToken
         self.configuredNodePath = ghostty.config.agentManagerNodePath
+        self.bellFilterEnabled = ghostty.config.agentManagerBellFilter
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
         self.agentQueueTemplatesDir = ghostty.config.agentQueueTemplatesDir
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
@@ -114,20 +119,22 @@ final class AgentManagerController {
             // the login-shell node probe just to discover it's disabled. The node
             // probe runs only once at-least-one-feature + mcp-listen + mcp-token are
             // all green. The sidecar is shared infra: launch it when EITHER the
-            // summarizer (agent-manager) OR the queue (agent-queue) is enabled.
-            guard self.enabled || self.agentQueueEnabled,
+            // summarizer (agent-manager) OR the queue (agent-queue) OR per-bell promotion
+            // (agent-manager-bell-filter) is enabled.
+            guard self.enabled || self.agentQueueEnabled || self.bellFilterEnabled,
                   !self.mcpListen.isEmpty, !self.mcpToken.isEmpty else {
-                self.logger.info("Agent Manager/Queue disabled: \(Self.sidecarDisabledReason(managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nil), privacy: .public)")
+                self.logger.info("Agent Manager/Queue disabled: \(Self.sidecarDisabledReason(managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled, bellFilterEnabled: self.bellFilterEnabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nil), privacy: .public)")
                 return
             }
             let nodePath = self.resolveNodePath()
             let should = Self.sidecarShouldStart(
                 managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled,
+                bellFilterEnabled: self.bellFilterEnabled,
                 mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nodePath)
             guard should, let nodePath else {
                 // EXACTLY ONE info-level line stating WHY we're dormant (never an
                 // error / notification — a disabled sidecar is a normal state).
-                self.logger.info("Agent Manager/Queue disabled: \(Self.sidecarDisabledReason(managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nodePath), privacy: .public)")
+                self.logger.info("Agent Manager/Queue disabled: \(Self.sidecarDisabledReason(managerEnabled: self.enabled, queueEnabled: self.agentQueueEnabled, bellFilterEnabled: self.bellFilterEnabled, mcpListen: self.mcpListen, mcpToken: self.mcpToken, nodePath: nodePath), privacy: .public)")
                 return
             }
             self.spawnLocked(nodePath: nodePath)
@@ -230,6 +237,9 @@ final class AgentManagerController {
         env["GHOSTTY_MCP_URL"] = Self.mcpURL(listen: mcpListen, offset: mcpPortOffset)
         env["GHOSTTY_MCP_TOKEN"] = mcpToken
         env["GHOSTTY_AGENT_MANAGER"] = "1"
+        // (ramon fork / Bell Attention) Arm the sidecar's bell-promotion pass when
+        // the feature is on; absent ⇒ the sidecar does no bell-edge work.
+        if bellFilterEnabled { env["GHOSTTY_BELL_FILTER"] = "1" }
         let nodeDir = (nodePath as NSString).deletingLastPathComponent
         if !nodeDir.isEmpty {
             let existing = env["PATH"] ?? ""
@@ -379,10 +389,14 @@ final class AgentManagerController {
     /// the two work independently — e.g. agent-queue on + agent-manager off launches the
     /// sidecar with the queue armed and the (Haiku-billing) summarizer fully silent.
     static func sidecarShouldStart(
-        managerEnabled: Bool, queueEnabled: Bool,
+        managerEnabled: Bool, queueEnabled: Bool, bellFilterEnabled: Bool = false,
         mcpListen: String?, mcpToken: String?, nodePath: String?
     ) -> Bool {
-        guard managerEnabled || queueEnabled else { return false }
+        // Launch when ANY of the three independent sidecar loops is armed: the summarizer
+        // (agent-manager), the queue (agent-queue), OR per-bell promotion (agent-manager-
+        // bell-filter). Bell promotion is cheap (per-bell, fail-open) so it can run on its
+        // own with the expensive summarizer off.
+        guard managerEnabled || queueEnabled || bellFilterEnabled else { return false }
         guard let listen = mcpListen, !listen.isEmpty else { return false }
         guard let token = mcpToken, !token.isEmpty else { return false }
         guard let node = nodePath, !node.isEmpty else { return false }
@@ -392,10 +406,12 @@ final class AgentManagerController {
     /// The single human-readable reason the gate refused, for the one info line.
     /// Order matches `sidecarShouldStart` so the first failing condition wins.
     static func sidecarDisabledReason(
-        managerEnabled: Bool, queueEnabled: Bool,
+        managerEnabled: Bool, queueEnabled: Bool, bellFilterEnabled: Bool = false,
         mcpListen: String?, mcpToken: String?, nodePath: String?
     ) -> String {
-        if !managerEnabled && !queueEnabled { return "agent-manager and agent-queue are both off" }
+        if !managerEnabled && !queueEnabled && !bellFilterEnabled {
+            return "agent-manager, agent-queue, and agent-manager-bell-filter are all off"
+        }
         if (mcpListen ?? "").isEmpty { return "mcp-listen is not set" }
         if (mcpToken ?? "").isEmpty { return "mcp-token is not set" }
         if (nodePath ?? "").isEmpty { return "node could not be resolved" }

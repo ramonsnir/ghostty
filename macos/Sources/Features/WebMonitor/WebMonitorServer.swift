@@ -70,6 +70,14 @@ final class WebMonitorServer {
     /// tied to the server (`start()`/`stop()` below).
     let push = WebPushManager()
 
+    /// (ramon fork / Bell Attention v2) The `monitor` effect's routing per tier, set by
+    /// AppDelegate at start from bell-features.monitor / attention-features.monitor.
+    /// Drives the per-row `attnIndicator` in the surfaces JSON. Default true (both tiers)
+    /// ⇒ the page flag reproduces today's bell indicator + surfaces promotions. Read on
+    /// the main hop in `surfacesJSON`; written once before `start()`.
+    var monitorBell = true
+    var monitorAttn = true
+
     private var listener: NWListener?
     private var connectionRefs: [ObjectIdentifier: NWConnection] = [:]
     /// Per-connection idle/read watchdog timers (slowloris defense; also bounds
@@ -527,6 +535,7 @@ final class WebMonitorServer {
         case input(uuid: UUID)                   // POST /api/surface/{uuid}/input
         case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
         case clearBell(uuid: UUID)               // POST /api/surface/{uuid}/bell (acknowledge bell)
+        case clearAttention(uuid: UUID)          // POST /api/surface/{uuid}/attention (acknowledge promotion)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
         case serviceWorker                       // GET /sw.js (bootstrap; Web Push SW)
         case pushConfig                          // GET /api/push/config (VAPID pubkey + enabled)
@@ -652,6 +661,9 @@ final class WebMonitorServer {
             case "bell":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .clearBell(uuid: uuid)
+            case "attention":
+                guard method == "POST" else { return .methodNotAllowed }
+                return .clearAttention(uuid: uuid)
             default:
                 return .notFound
             }
@@ -815,6 +827,18 @@ final class WebMonitorServer {
             respondFromMain(on: conn) {
                 guard let view = self.surface(forUUID: uuid) else { return .status(404, "Not Found") }
                 view.resetBell()
+                return .json(Data(#"{"ok":true}"#.utf8))
+            }
+
+        case .clearAttention(let uuid):
+            clearAuthFailures(peer)
+            // (ramon fork / Bell Attention v2) Acknowledge a PROMOTION from the phone
+            // WITHOUT focusing the surface — drop the attention-tier border/title/badge
+            // independently of the raw bell (P5). The sidecar re-arms on its next clean
+            // classify, so a still-live condition can promote again.
+            respondFromMain(on: conn) {
+                guard let view = self.surface(forUUID: uuid) else { return .status(404, "Not Found") }
+                view.resetAttention()
                 return .json(Data(#"{"ok":true}"#.utf8))
             }
 
@@ -1329,6 +1353,11 @@ final class WebMonitorServer {
         /// True when this surface has an active (unacknowledged) bell, so the
         /// phone can flag it and offer to clear it (POST .../bell).
         let bell: Bool
+        /// (ramon fork / Bell Attention v2) True when this surface has the sticky
+        /// promoted "attention needed" state (set by the Agent Manager via set_attention).
+        /// Surfaced DISTINCTLY from `bell` (P5) so the phone shows both and can clear the
+        /// attention independently (POST .../attention).
+        let attentionNeeded: Bool
         /// (ramon fork) True iff the Agent Dashboard's detector matched this surface
         /// as a CLI agent. Only meaningful when the dashboard is running (see the
         /// top-level `agentDashboard` flag); false otherwise. Drives the page's
@@ -1387,11 +1416,14 @@ final class WebMonitorServer {
                     id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
                     window: win, tab: tabIdx, tabTitle: tabTitle,
                     splitIndex: splitIdx, splitCount: leaves.count, bell: view.bell,
+                    attentionNeeded: view.attentionNeeded,
                     isAgent: filter?.agents.contains(view.id) ?? false,
                     hidden: filter?.hidden.contains(view.id) ?? false))
             }
         }
-        return Self.surfacesJSONData(rows, agentDashboard: dashboardRunning)
+        return Self.surfacesJSONData(
+            rows, agentDashboard: dashboardRunning,
+            monitorBell: monitorBell, monitorAttn: monitorAttn)
     }
 
     /// Pure JSON shaping for the surfaces list (testable; no AppKit). Returns an
@@ -1399,13 +1431,26 @@ final class WebMonitorServer {
     /// page whether the Agent Dashboard is running (and thus whether the agent/hidden
     /// filters are usable); `surfaces` is the per-row array. Each row's `isAgent` /
     /// `hidden` are only meaningful when `agentDashboard` is true.
-    static func surfacesJSONData(_ rows: [SurfaceRow], agentDashboard: Bool) -> Data {
+    ///
+    /// (ramon fork / Bell Attention v2) Each row also carries the raw `bell` +
+    /// `attentionNeeded` (truthful — principle F) and a `attnIndicator` boolean: the
+    /// monitor-tier-routed "show an alert flag" = (bell && monitorBell) ||
+    /// (attentionNeeded && monitorAttn), where monitorBell/monitorAttn are the `monitor`
+    /// flag of bell-features / attention-features. Default config (both true) ⇒
+    /// `bell || attentionNeeded` (reproduces today + surfaces promotions). The page
+    /// renders the flag off `attnIndicator` so the `monitor` effect is config-routable.
+    static func surfacesJSONData(
+        _ rows: [SurfaceRow], agentDashboard: Bool,
+        monitorBell: Bool = true, monitorAttn: Bool = true
+    ) -> Data {
         let arr: [[String: Any]] = rows.map {
             [
                 "id": $0.id, "title": $0.title, "pwd": $0.pwd,
                 "window": $0.window, "tab": $0.tab, "tabTitle": $0.tabTitle,
                 "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
-                "bell": $0.bell, "isAgent": $0.isAgent, "hidden": $0.hidden,
+                "bell": $0.bell, "attentionNeeded": $0.attentionNeeded,
+                "attnIndicator": ($0.bell && monitorBell) || ($0.attentionNeeded && monitorAttn),
+                "isAgent": $0.isAgent, "hidden": $0.hidden,
             ]
         }
         let obj: [String: Any] = ["agentDashboard": agentDashboard, "surfaces": arr]
@@ -1817,6 +1862,8 @@ final class WebMonitorServer {
       .row .bellflag { margin-left: 8px; font-size: 13px; vertical-align: middle; }
       #clearbell { background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
       #clearbell:active { background: #6a5320; }
+      #clearattn { background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
+      #clearattn:active { background: #6a5320; }
       .row .p { color: #b6bccb; font-size: 12px; margin-top: 4px; word-break: break-all; }
       .empty { padding: 12px; color: #b6bccb; }
       #viewer { display: none; padding: 8px; }
@@ -1919,6 +1966,10 @@ final class WebMonitorServer {
              hidden again once the clear is processed (visible confirmation). -->
         <button id="clearbell" style="display:none"
                 title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
+        <!-- (Bell Attention v2) Shown only while this split has a PROMOTED attention
+             state; clears it independently of the raw bell (P5). -->
+        <button id="clearattn" style="display:none"
+                title="Acknowledge/clear the &quot;needs you&quot; state for this split (it can re-promote later)">&#9203; Clear</button>
       </div>
       <!-- Arrows + remote-control scroll on ONE row to save vertical space.
            Scroll is forwarded to the host as mouse-wheel input, so a TUI (Claude
@@ -1975,6 +2026,7 @@ final class WebMonitorServer {
       var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
       var clearBellBtn = document.getElementById("clearbell");
+      var clearAttnBtn = document.getElementById("clearattn");
       var modeEl = document.getElementById("mode");
       // The whole poll-fallback control bar (View/Refresh); hidden while the live
       // xterm stream is active so it costs no vertical space in the common case.
@@ -2174,9 +2226,14 @@ final class WebMonitorServer {
               d.className = "row";
               var t = document.createElement("div"); t.className = "t";
               t.textContent = row.title || "(untitled)";
-              if (row.bell) {
+              // (Bell Attention v2) The alert flag follows the monitor-tier-routed
+              // `attnIndicator`. A PROMOTED attention shows an hourglass (distinct from a
+              // raw bell, P5); a raw bell shows the bell. Default config ⇒ either shows.
+              if (row.attnIndicator) {
                 var bf = document.createElement("span"); bf.className = "bellflag";
-                bf.textContent = "\\uD83D\\uDD14";  // 🔔 — an unacknowledged bell rang here
+                bf.textContent = row.attentionNeeded
+                  ? "\\u23F3"            // ⏳ — promoted "needs you"
+                  : "\\uD83D\\uDD14";    // 🔔 — an unacknowledged bell rang here
                 t.appendChild(bf);
               }
               if ((row.splitCount || 1) > 1) {
@@ -2374,6 +2431,7 @@ final class WebMonitorServer {
         curEl.textContent = "";
         jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
         setClearBellVisible(false);
+        setClearAttnVisible(false);
       }
 
       // The Clear-bell button is only meaningful when this split has an active
@@ -2383,9 +2441,16 @@ final class WebMonitorServer {
         clearBellBtn.style.display = on ? "inline-block" : "none";
       }
 
+      // (Bell Attention v2) The Clear-attention button mirrors Clear-bell for the
+      // PROMOTED state (P5: cleared independently of the raw bell).
+      function setClearAttnVisible(on) {
+        clearAttnBtn.style.display = on ? "inline-block" : "none";
+      }
+
       // While viewing a split the detail view doesn't poll the session list, so
-      // refresh the Clear-bell button against the live bell state — both to
-      // reveal it if a bell rings mid-view and to drop it once a clear lands.
+      // refresh the Clear-bell/Clear-attention buttons against the live state —
+      // both to reveal one if a bell rings / a promotion lands mid-view and to
+      // drop it once a clear lands.
       function refreshBellButton() {
         if (!current) return;
         var want = current;
@@ -2396,7 +2461,7 @@ final class WebMonitorServer {
             var rows = data.surfaces || [];
             var hit = null;
             for (var i = 0; i < rows.length; i++) { if (rows[i].id === want) { hit = rows[i]; break; } }
-            if (hit) setClearBellVisible(!!hit.bell);
+            if (hit) { setClearBellVisible(!!hit.bell); setClearAttnVisible(!!hit.attentionNeeded); }
           })
           .catch(function () {});
       }
@@ -2404,6 +2469,7 @@ final class WebMonitorServer {
       function showSurface(id, title, bell) {
         current = id;
         setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
+        setClearAttnVisible(false);   // refresh corrects from live state
         refreshBellButton();
         listEl.style.display = "none";
         filterBar.style.display = "none";
@@ -2449,6 +2515,20 @@ final class WebMonitorServer {
             else { setBanner("Clear bell failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
           })
           .catch(function () { setBanner("Clear bell failed \\u2014 not delivered.", false, true); });
+      };
+
+      // (Bell Attention v2) Acknowledge/clear the PROMOTED "needs you" state for the
+      // viewed split WITHOUT focusing it — drops the attention-tier border/title/badge
+      // independently of the raw bell (the sidecar can re-promote later).
+      clearAttnBtn.onclick = function () {
+        if (!current) { noActiveSession(); return; }
+        fetch(url("/api/surface/" + current + "/attention"), { method: "POST", headers: headers() })
+          .then(function (r) {
+            if (r && r.ok) { setClearAttnVisible(false); setBanner("Attention cleared.", true); setTimeout(clearBannerIfNotError, 1200); }
+            else if (r && r.status === 404) { sessionClosedTeardown(); }
+            else { setBanner("Clear attention failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
+          })
+          .catch(function () { setBanner("Clear attention failed \\u2014 not delivered.", false, true); });
       };
 
       // View preferences persist across page loads (localStorage; best-effort).

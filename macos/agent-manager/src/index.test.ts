@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   runSweep,
+  makeCoalescedRunner,
   parseLoopEnablement,
   type LoopDeps,
   type SummarizeFn,
@@ -58,6 +59,8 @@ interface FakeClientSpec {
   readThrows?: Set<string>;
   /** ids that should throw from signalAttention. */
   signalThrows?: Set<string>;
+  /** ids that should throw from setAttention. */
+  attentionThrows?: Set<string>;
   /** when true, listSurfaces throws. */
   listThrows?: boolean;
 }
@@ -67,14 +70,16 @@ interface FakeClient {
   setCalls: Array<{ id: string; ann: Annotation }>;
   readCalls: string[];
   signalCalls: Array<{ id: string; reason?: string }>;
+  attentionCalls: Array<{ id: string; on: boolean; reason?: string }>;
 }
 
-/** Build a structurally-typed fake McpClient (cast to the class — runSweep only
- *  ever calls listSurfaces/readSurface/setAnnotation/signalAttention). */
+/** Build a structurally-typed fake McpClient (cast to the class — runSweep only ever
+ *  calls listSurfaces/readSurface/setAnnotation/signalAttention/setAttention). */
 function makeFakeClient(spec: FakeClientSpec): FakeClient {
   const setCalls: Array<{ id: string; ann: Annotation }> = [];
   const readCalls: string[] = [];
   const signalCalls: Array<{ id: string; reason?: string }> = [];
+  const attentionCalls: Array<{ id: string; on: boolean; reason?: string }> = [];
   const client = {
     async listSurfaces(): Promise<Surface[]> {
       if (spec.listThrows) throw new Error("list boom");
@@ -92,8 +97,12 @@ function makeFakeClient(spec: FakeClientSpec): FakeClient {
       if (spec.signalThrows?.has(id)) throw new Error(`signal boom ${id}`);
       signalCalls.push({ id, reason });
     },
+    async setAttention(id: string, on: boolean, reason?: string): Promise<void> {
+      if (spec.attentionThrows?.has(id)) throw new Error(`attention boom ${id}`);
+      attentionCalls.push({ id, on, reason });
+    },
   } as unknown as McpClient;
-  return { client, setCalls, readCalls, signalCalls };
+  return { client, setCalls, readCalls, signalCalls, attentionCalls };
 }
 
 interface DepsSpec {
@@ -102,6 +111,12 @@ interface DepsSpec {
   now?: number;
   last?: Map<string, LastSummary>;
   alerts?: Map<string, string>;
+  /** Defaults TRUE (the continuous summarizer is on) so existing summarizer tests are
+   *  unchanged; set false to exercise queue-only / bell-only mode. */
+  summarizerEnabled?: boolean;
+  bellFilter?: boolean;
+  bellsSeen?: Map<string, boolean>;
+  pendingBells?: Set<string>;
   budgetMax?: number;
   backoff?: { failureStreak: number; nextProbeMs: number };
 }
@@ -125,6 +140,10 @@ function makeDeps(spec: DepsSpec): {
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
     alertBySession: spec.alerts ?? new Map<string, string>(),
+    summarizerEnabled: spec.summarizerEnabled ?? true,
+    bellFilter: spec.bellFilter ?? false,
+    bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
+    pendingBellIds: spec.pendingBells ?? new Set<string>(),
     summarizerBackoff: spec.backoff ?? { failureStreak: 0, nextProbeMs: 0 },
   };
   return { deps, summarizeCalls };
@@ -455,9 +474,10 @@ test("bell: model flags rate_limited => rings exactly once + records the tag", a
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 1, "rang attention exactly once");
-  assert.equal(fake.signalCalls[0].id, "s1");
-  assert.match(fake.signalCalls[0].reason ?? "", /rate limited/i);
+  assert.equal(fake.attentionCalls.length, 1, "promoted attention exactly once");
+  assert.equal(fake.attentionCalls[0].id, "s1");
+  assert.equal(fake.attentionCalls[0].on, true);
+  assert.match(fake.attentionCalls[0].reason ?? "", /rate limited/i);
   assert.equal(deps.alertBySession.get("s1"), "rate_limited");
 });
 
@@ -478,7 +498,7 @@ test("bell: a held alert under idle-skip does not re-ring (no model call, stays 
   await runSweep(deps);
 
   assert.equal(summarizeCalls.length, 0, "idle-skip: no model call");
-  assert.equal(fake.signalCalls.length, 0, "held alert must not re-ring");
+  assert.equal(fake.attentionCalls.length, 0, "held alert must not re-promote");
   assert.equal(deps.alertBySession.get("s1"), "rate_limited", "alert left armed");
 });
 
@@ -497,7 +517,9 @@ test("bell: recovery — model reports NO alert => clears the armed tag, no ring
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 0, "no ring when the model reports no alert");
+  // The clearing edge un-promotes (set_attention off) and re-arms the tag.
+  assert.equal(fake.attentionCalls.filter((c) => c.on).length, 0, "no promotion on recovery");
+  assert.ok(fake.attentionCalls.some((c) => c.id === "s1" && c.on === false), "un-promoted");
   assert.equal(deps.alertBySession.has("s1"), false, "armed tag cleared / re-armed");
 });
 
@@ -511,7 +533,7 @@ test("bell: scrolled-up text alone never rings — only the model's verdict does
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 0, "viewport text is inert without a model alert");
+  assert.equal(fake.attentionCalls.length, 0, "viewport text is inert without a model alert");
   assert.equal(deps.alertBySession.has("s1"), false);
 });
 
@@ -534,7 +556,7 @@ test("bell: a failed model call leaves the alert state UNTOUCHED (held stays arm
   // No fresh classify => no ring and no clear. (The honest cost of pure-Haiku: a
   // FIRST detection can't happen while the summarizer's own calls fail — mitigated
   // by routing the summarizer to a separate account.)
-  assert.equal(fake.signalCalls.length, 0, "no ring on model failure");
+  assert.equal(fake.attentionCalls.length, 0, "no promotion on model failure");
   assert.equal(deps.alertBySession.get("s1"), "rate_limited", "held alert untouched");
 });
 
@@ -547,7 +569,8 @@ test("bell: model alert rings regardless of the on-screen text", async () => {
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 1, "the model's verdict alone drives the bell");
+  assert.equal(fake.attentionCalls.length, 1, "the model's verdict alone drives the promotion");
+  assert.equal(fake.attentionCalls[0].on, true);
   assert.equal(deps.alertBySession.get("s1"), "rate_limited");
 });
 
@@ -566,21 +589,22 @@ test("bell: a changed alert tag re-rings", async () => {
 
   await runSweep(deps);
 
-  assert.equal(fake.signalCalls.length, 1, "a different tag is a fresh edge");
+  assert.equal(fake.attentionCalls.length, 1, "a different tag is a fresh edge");
+  assert.equal(fake.attentionCalls[0].on, true);
   assert.equal(deps.alertBySession.get("s1"), "needs_input");
 });
 
-test("bell: a failed signal_attention rolls back so a later sweep retries", async () => {
+test("bell: a failed set_attention rolls back so a later sweep retries", async () => {
   const fake = makeFakeClient({
     surfaces: [makeSurface({ id: "s1", agentState: "working" })],
     screens: { s1: RATE_LIMIT_SCREEN },
-    signalThrows: new Set(["s1"]),
+    attentionThrows: new Set(["s1"]),
   });
   const { deps } = makeDeps({ fake, summarize: rateLimitedSummary });
 
   await runSweep(deps);
 
-  assert.equal(deps.alertBySession.has("s1"), false, "rolled back after a failed ring");
+  assert.equal(deps.alertBySession.has("s1"), false, "rolled back after a failed promotion");
 });
 
 test("bell: a non-agent surface is never read, classified, or rung", async () => {
@@ -594,7 +618,7 @@ test("bell: a non-agent surface is never read, classified, or rung", async () =>
 
   assert.equal(fake.readCalls.length, 0, "non-agent is pre-gated out (no read)");
   assert.equal(summarizeCalls.length, 0, "and never classified");
-  assert.equal(fake.signalCalls.length, 0, "and never rung");
+  assert.equal(fake.attentionCalls.length, 0, "and never promoted");
 });
 
 test("bell: dead-surface alert records are pruned each sweep", async () => {
@@ -608,6 +632,352 @@ test("bell: dead-surface alert records are pruned each sweep", async () => {
   await runSweep(deps);
 
   assert.equal(deps.alertBySession.has("s1"), false, "stale alert record dropped");
+});
+
+// ---------------------------------------------------------------------------
+// Bell-attention (ramon fork): a bell rising-edge forces a classify, and Haiku's
+// `attention` verdict PROMOTES the bell to the sticky "attention needed" state via
+// set_attention. Only when bellFilter is on; only on a rising edge; never for a
+// non-agent; and `attention` is acted on ONLY for a bell-triggered classify.
+// ---------------------------------------------------------------------------
+
+const attnTrue: SummarizeFn = async () =>
+  '{"summary":"Needs you: approve deploy?","attention":true}';
+const attnFalse: SummarizeFn = async () =>
+  '{"summary":"Workflow running in the background","attention":false}';
+
+// A debounced agent surface: preGate/shouldSummarize would normally SKIP it, so any
+// classify that happens is attributable to the bell force-through.
+function debouncedAgent(over: Partial<Surface> = {}) {
+  const surface = makeSurface({ id: "s1", agentState: "working", ...over });
+  const last = new Map<string, LastSummary>([
+    ["s1", { signals: "sig", tail: "tail", atMs: 1_000_000 - 1000, summary: "old" }],
+  ]);
+  return { surface, last };
+}
+
+test("bell-attention: bellFilter OFF ⇒ a bell never forces a classify (byte-identical)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, last, bellFilter: false });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "debounced surface stays skipped");
+  assert.equal(fake.attentionCalls.length, 0);
+});
+
+test("bell-attention: a rising bell on a debounced agent forces a classify + promotes when attention:true", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "bell forced a classify past debounce");
+  assert.equal(fake.attentionCalls.length, 1, "promoted to attention needed");
+  assert.deepEqual(fake.attentionCalls[0], {
+    id: "s1",
+    on: true,
+    reason: "Needs you: approve deploy?",
+  });
+  assert.equal(deps.bellSeenBySession.get("s1"), true, "bell state recorded");
+});
+
+// (bell-attention v2 slice 6 — the recommended-config blocker regression test) In the
+// `bell-features = system,audio` config the GUI never arms view.bell, so list_surfaces.bell
+// is ALWAYS false and the rising-edge backstop can never fire. Promotion MUST instead come
+// from the bell-reactive loop's pendingBellIds (the wait_for_event signal, truthful on every
+// ring). Here s.bell is false but the id is pending ⇒ it must still force-classify + promote.
+test("bell-attention: a pendingBellId forces a classify even when list_surfaces.bell is false (system,audio config)", async () => {
+  const { surface, last } = debouncedAgent({ bell: false }); // never armed (sound-only)
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    last,
+    bellFilter: true,
+    pendingBells: new Set(["s1"]), // the bell-reactive loop saw it ring
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "pendingBellId forced a classify despite bell=false");
+  assert.equal(fake.attentionCalls.length, 1, "promoted");
+  assert.equal(fake.attentionCalls[0].on, true);
+  assert.equal(deps.pendingBellIds.size, 0, "pending set drained (one-shot per ring)");
+});
+
+// (bell-attention) The DECOUPLING: agent-manager (the expensive continuous summarizer) is
+// OFF, but bell-filter is ON (queue-only / bell-only mode). A bell must STILL promote (cheap,
+// per-bell, fail-open), while the due NON-belled agents must NOT be polled (the costly pass
+// is gated off). This is the combination the "agent-manager optional" change requires.
+test("bell-attention: summarizer OFF + bell-filter ON ⇒ a bell promotes but due agents are NOT polled", async () => {
+  const belled = makeSurface({ id: "s1", agentState: "working", bell: false }); // sound-only ring
+  const due = makeSurface({ id: "s2", agentState: "working", bell: false }); // changed/due, no bell
+  const fake = makeFakeClient({
+    surfaces: [belled, due],
+    screens: { s1: "permission prompt", s2: "fresh output" },
+  });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    summarizerEnabled: false, // agent-manager OFF (the expensive poll is gated)
+    bellFilter: true, // per-bell promotion ON
+    pendingBells: new Set(["s1"]), // the bell-reactive loop saw s1 ring
+  });
+
+  await runSweep(deps);
+
+  assert.deepEqual(fake.readCalls, ["s1"], "ONLY the belled surface is read — no continuous poll");
+  assert.equal(summarizeCalls.length, 1, "exactly one classify (the bell), not the due agent s2");
+  assert.equal(fake.attentionCalls.length, 1, "the bell still promotes with the summarizer off");
+  assert.equal(fake.attentionCalls[0].id, "s1");
+});
+
+// Complement: summarizer OFF + bell-filter ON + NO bell ⇒ a fully no-op sweep.
+test("bell-attention: summarizer OFF + bell-filter ON + no bell ⇒ no model calls at all", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "fresh output" },
+  });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    summarizerEnabled: false,
+    bellFilter: true,
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "no bell + summarizer off ⇒ nothing summarized");
+  assert.equal(fake.readCalls.length, 0, "not even a read");
+});
+
+test("bell-attention: attention:false ⇒ classified but NOT promoted (quiet raw bell stands)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "launched workflow" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnFalse, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "still classified");
+  assert.equal(fake.attentionCalls.length, 0, "not promoted");
+});
+
+// (bell-attention v2) Haiku realistically emits a STRINGIFIED boolean. A string
+// "false" is a CONFIDENT suppress; an UNRECOGNIZED string is uncertain ⇒ fail-open
+// PROMOTE. These two pin the load-bearing safety path end-to-end through runSweep.
+test("bell-attention: string \"false\" ⇒ classified but NOT promoted (confident suppress)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "launched workflow" } });
+  const strFalse: SummarizeFn = async () =>
+    '{"summary":"Workflow running","attention":"false"}';
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: strFalse, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "still classified");
+  assert.equal(fake.attentionCalls.length, 0, "string \"false\" suppresses like boolean false");
+});
+
+test("bell-attention: an UNRECOGNIZED attention string ⇒ PROMOTE (fail-open, not suppress)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const strMaybe: SummarizeFn = async () =>
+    '{"summary":"Needs you?","attention":"maybe"}';
+  const { deps } = makeDeps({ fake, summarize: strMaybe, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "uncertain value must fail-open to a promotion");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention: only a RISING edge forces — a held bell does not re-classify", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  // Pre-seed the bell as already-seen-high: no rising edge this sweep.
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    last,
+    bellFilter: true,
+    bellsSeen: new Map([["s1", true]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 0, "held bell does not force a classify");
+  assert.equal(fake.attentionCalls.length, 0);
+});
+
+test("bell-attention: a bell on a NON-agent surface is never read/classified/promoted", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", processName: "vim", bell: true })],
+    screens: { s1: "x" },
+  });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.readCalls.length, 0, "non-agent not read");
+  assert.equal(summarizeCalls.length, 0);
+  assert.equal(fake.attentionCalls.length, 0);
+});
+
+test("bell-attention: `attention` is acted on ONLY for a bell-triggered classify", async () => {
+  // A normally-due (changed) agent surface with NO bell: even if the model returns
+  // attention:true, the loop must NOT promote (bellRang is false).
+  const surface = makeSurface({ id: "s1", agentState: "working", bell: false });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "fresh output" } });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: attnTrue, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "summarized as usual");
+  assert.equal(fake.attentionCalls.length, 0, "no promotion without a bell");
+});
+
+test("bell-attention: a failed set_attention is swallowed (annotation still written)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({
+    surfaces: [surface],
+    screens: { s1: "permission prompt" },
+    attentionThrows: new Set(["s1"]),
+  });
+  const { deps } = makeDeps({ fake, summarize: attnTrue, last, bellFilter: true });
+
+  await runSweep(deps); // must not throw
+
+  assert.equal(fake.setCalls.length, 1, "annotation still written despite the promote failure");
+  assert.equal(deps.budget.active, 0, "budget released");
+});
+
+test("bell-attention: dead-surface bell records are pruned each sweep", async () => {
+  const fake = makeFakeClient({ surfaces: [] }); // s1 gone
+  const { deps } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    bellFilter: true,
+    bellsSeen: new Map([["s1", true]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(deps.bellSeenBySession.has("s1"), false, "stale bell record dropped");
+});
+
+// ---------------------------------------------------------------------------
+// Bell-attention v2 FAIL-OPEN: a bell is suppressed ONLY by a clean, confident
+// attention:false. Omitted/uncertain verdict, a thrown model call, and an
+// unparseable reply all PROMOTE (a failing/hedging classifier never silences a bell).
+// ---------------------------------------------------------------------------
+
+const attnOmitted: SummarizeFn = async () => '{"summary":"working on stuff"}'; // no attention field
+
+test("bell-attention v2: omitted attention on a bell ⇒ FAIL-OPEN promote", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "ambiguous screen" } });
+  const { deps } = makeDeps({ fake, summarize: attnOmitted, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "uncertain verdict still promotes");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention v2: a THROWN model call on a bell ⇒ FAIL-OPEN promote", async () => {
+  const boom: SummarizeFn = async () => {
+    throw new Error("summarizer account out of tokens");
+  };
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps } = makeDeps({ fake, summarize: boom, last, bellFilter: true });
+
+  await runSweep(deps); // must not throw
+
+  assert.equal(fake.attentionCalls.length, 1, "a failing classifier promotes (fail-open)");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention v2: an UNPARSEABLE reply on a bell ⇒ FAIL-OPEN promote", async () => {
+  const junk: SummarizeFn = async () => "not json at all";
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "x" } });
+  const { deps } = makeDeps({ fake, summarize: junk, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "unparseable reply promotes (fail-open)");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention v2: only a CONFIDENT attention:false suppresses", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "launched workflow in background" } });
+  const { deps } = makeDeps({ fake, summarize: attnFalse, last, bellFilter: true });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 0, "explicit false is the ONLY thing that suppresses");
+});
+
+// (bell-attention v2 slice 4) makeCoalescedRunner — concurrent callers coalesce
+// into non-overlapping runs, with a single re-run when a wake arrives mid-flight.
+test("coalesce: serial calls run once each (no coalescing when idle)", async () => {
+  let runs = 0;
+  const run = makeCoalescedRunner(async () => {
+    runs++;
+  });
+  await run();
+  await run();
+  assert.equal(runs, 2);
+});
+
+test("coalesce: a wake DURING a run triggers exactly one re-run", async () => {
+  let runs = 0;
+  let release!: () => void;
+  let gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const run = makeCoalescedRunner(async () => {
+    runs++;
+    await gate; // park the first run so we can fire concurrent calls
+  });
+  const first = run(); // starts running, parked on gate
+  // Two more calls arrive while running: they must coalesce to ONE re-run.
+  const second = run();
+  const third = run();
+  // Re-arm the gate so the coalesced re-run can also complete promptly.
+  const firstGate = gate;
+  gate = Promise.resolve();
+  release(); // let the first run finish; firstGate resolves
+  void firstGate;
+  await Promise.all([first, second, third]);
+  assert.equal(runs, 2, "first run + exactly one coalesced re-run");
+});
+
+test("coalesce: re-run is suppressed when isStopped() is true", async () => {
+  let runs = 0;
+  let stopped = false;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const run = makeCoalescedRunner(
+    async () => {
+      runs++;
+      await gate;
+    },
+    () => stopped,
+  );
+  const first = run();
+  void run(); // wake while running
+  stopped = true; // but we are stopping
+  release();
+  await first;
+  assert.equal(runs, 1, "no re-run after stop even though a wake arrived");
 });
 
 // ---------------------------------------------------------------------------
