@@ -824,6 +824,16 @@ class AppDelegate: NSObject,
         let features: Ghostty.Config.BellFeatures
         if let surfaceView = notification.object as? Ghostty.SurfaceView {
             features = surfaceView.bellFeaturesForCurrentFocus(ghostty.config)
+            // (ramon fork) Diagnostics: record every ring with its focus state. A focused
+            // ring is NOT classified/promoted (see Bell Attention v2 focus guards), so
+            // `focused: true` here explains a later absence of an `attention` event.
+            if ghostty.config.bellDiagnostics {
+                BellDiagnostics.record("ring", [
+                    "surface": surfaceView.id.uuidString,
+                    "title": surfaceView.title,
+                    "focused": surfaceView.bellIsFocused,
+                ])
+            }
         } else {
             features = ghostty.config.bellFeatures
         }

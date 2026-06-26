@@ -98,12 +98,49 @@ surface (focused split + key window + active app — the same `bellIsFocused` ru
    most bell promotions at the source; guard 2 also covers the watchdog (which bypasses the
    bell event entirely) and the race where focus lands mid-classify.
 
+## Diagnostics (`bell-diagnostics`) — "why did it fire / why didn't it?"
+
+Set `bell-diagnostics = true` and **both** the GUI and the sidecar append a structured
+JSONL trace of the whole lifecycle to **`~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl`**.
+Off by default; turn it on while investigating, then turn it back off (the file grows
+append-only). A GUI relaunch is needed to pick up the change (it also forwards the flag to
+the sidecar as `GHOSTTY_BELL_DIAG=1`).
+
+One JSON object per line, `{ts, src, ev, …}` (`src` is `"gui"` or `"sidecar"`):
+
+| `ev` | `src` | fields | what it tells you |
+|---|---|---|---|
+| `ring` | gui | `surface, title, focused` | a bell rang. `focused:true` ⇒ it was NOT classified/promoted (focus guard) |
+| `classify` | sidecar | `surface, verdict, decision, reason` | what Haiku decided for a bell. `verdict`∈`true/false/omitted/unparseable/error`; `decision`∈`promote/ignore` |
+| `alert` | sidecar | `surface, tag, edge, decision` | the rate-limit watchdog. `edge:ring` (e.g. `tag:rate_limited`) / `edge:clear` |
+| `attention` | gui | `surface, title, on, focused, applied, reason` | a `set_attention` landed. `applied:false` ⇒ suppressed because you were focused |
+| `clear` | gui | `surface, title, cause, hadBell, hadAttention` | focusing the surface dismissed a pending bell/attention |
+
+**Answering the usual questions** (`jq` over the file):
+- *Why did it just fire?* — the latest `attention` with `on:true, applied:true`; its `reason`
+  is the sidecar's verdict, and the preceding `classify`/`alert` for the same `surface` shows
+  whether it was a real bell promotion or the rate-limit watchdog.
+- *Why DIDN'T it fire an hour ago?* — find the `ring` at that time; then either there's a
+  `classify` with `decision:ignore` (Haiku said incidental), or the `ring` was `focused:true`
+  (focus guard, never classified), or there's no `classify` at all (sidecar down/slow).
+- *Average delay* — per `surface`, the gap from a `ring` to its following `attention`
+  (`applied:true`) is the user-perceived ring→visuals delay.
+
+```sh
+# last 20 events, human-ish:
+tail -20 ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl | jq -c '{ts,src,ev,surface,reason,verdict,decision,focused,applied}'
+# average ring→attention delay (seconds), naive pairing per surface:
+jq -rs '... ' ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl   # (or just ask Claude to analyze the file)
+```
+
+(You can also just hand the file to Claude and ask in plain English.)
+
 ## Config
 
 All keys are **fork-only** — keep them in `~/.config/ghostty-ramon/config` (an official
 Ghostty sharing `~/.config/ghostty/config` would error on them). `bell-features` itself is
-upstream; `bell-features-focused`, `attention-features`, and `agent-manager-bell-filter`
-are the fork additions.
+upstream; `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, and
+`bell-diagnostics` are the fork additions.
 
 ```ini
 # Master switch: let the Agent Manager classify bells and promote the notable ones.
@@ -290,6 +327,24 @@ Not unit-tested: `bellIsFocused` depends on live `NSApp`/window state (like
 `bellFeaturesForCurrentFocus` itself, also untested) — verified by build + the existing
 MCP/WebMonitor/Config suites staying green.
 
+### Diagnostics trace (`bell-diagnostics`)
+
+`bell-diagnostics` (Zig bool, default false) makes the GUI + sidecar append a shared JSONL
+lifecycle trace to `~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl`. GUI side: a pure-
+Foundation `BellDiagnostics` appender (no AppKit types, so no Xcode target exclusion; O_APPEND
+fd on a background queue so GUI + sidecar lines interleave atomically). Three GUI events:
+`ring` (AppDelegate `ghosttyBellDidRing`, with `bellIsFocused`), `attention` (SurfaceView
+`ghosttyAttentionDidChange`, with `reason` + `applied = !(on && bellIsFocused)`), `clear`
+(SurfaceView `focusDidChange`, read prior `bell`/`attentionNeeded` BEFORE clearing). Each call
+site gates on `config.bellDiagnostics` so a disabled feature does zero work — there is NO
+global enabled flag (avoids config-reload state). Sidecar side: `diag.ts` (`recordDiag`, gated
+by `GHOSTTY_BELL_DIAG=1`, forwarded by `AgentManagerController.childEnvironment` when
+`bellDiagnostics`), emitting `classify` (verdict/decision at each bell-classify outcome:
+clean true/false/omitted, unparseable, error) + `alert` edges in `maybeSignalAlert`. Delay is
+measured GUI-side (`ring`→`attention`), so the sidecar carries NO ring-timestamp threading.
+Pure line builders (`BellDiagnostics.line`, `formatDiagLine`) are unit-tested; the fs append is
+best-effort and untested by design.
+
 ### Cross-language `BellFeatures` bit-ABI (Zig packed struct ⇄ Swift OptionSet rawValue)
 
 `ghostty_config_get` hands the struct to Swift as a raw int reinterpreted by FIXED bit
@@ -319,14 +374,20 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
 ### Wiring
 
 - **core** — `src/config/Config.zig` (`BellFeatures` vocabulary + `attention-features` +
-  `agent-manager-bell-filter` + parse/bit-ABI tests).
+  `agent-manager-bell-filter` + `bell-diagnostics` + parse/bit-ABI tests).
 - **macOS** — `Ghostty.Config.swift` (`attentionFeatures` getter + the OptionSet flags),
   `AppDelegate.swift`, `BaseTerminalController.swift`, `Surface
   View/{SurfaceView,SurfaceView_AppKit}.swift`, `Terminal/TerminalView.swift`,
   `AgentDashboard/AgentDashboardController.swift`, `WebMonitor/{WebMonitorServer,WebMonitorPush}.swift`,
   `MCP/{MCPAnnotation,MCPLayout}.swift` (`set_attention` + `attentionNeeded` row),
   `MCP/MCPEventBus.swift` (focus guard 1 — skip `.bell` for a focused surface) +
-  `Surface View/SurfaceView_AppKit.swift` `ghosttyAttentionDidChange` (focus guard 2).
+  `Surface View/SurfaceView_AppKit.swift` `ghosttyAttentionDidChange` (focus guard 2),
+  `Features/BellDiagnostics/BellDiagnostics.swift` (new, pure-Foundation JSONL appender) +
+  the `ring`/`attention`/`clear` call sites (`AppDelegate.swift`, `SurfaceView_AppKit.swift`)
+  + `AgentManager/AgentManagerController.swift` (`GHOSTTY_BELL_DIAG` env).
+- **sidecar (diagnostics)** — `macos/agent-manager/src/diag.ts` (`recordDiag`/`formatDiagLine`)
+  + `index.ts` (`classify`/`alert` records). Tests: `diag.test.ts`,
+  `macos/Tests/BellDiagnostics/BellDiagnosticsTests.swift`.
 - **sidecar** — `macos/agent-manager/src/{index,summarizer,mcp,prompts}.ts` (`coerceAttention`,
   `pendingBellIds`/`bellReactiveLoop`, `makeCoalescedRunner`, `waitForEvent`/`parseWaitForEvent`).
 

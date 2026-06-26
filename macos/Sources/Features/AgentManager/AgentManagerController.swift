@@ -50,6 +50,10 @@ final class AgentManagerController {
     /// bell-promotion pass via `GHOSTTY_BELL_FILTER=1` (else it stays a no-op and the
     /// sidecar does no bell-edge work). Captured on main at init.
     private let bellFilterEnabled: Bool
+    /// (ramon fork / Bell Attention v2) When true, forward `GHOSTTY_BELL_DIAG=1` so the
+    /// sidecar appends its per-bell classify verdict + alert edges to the shared
+    /// bell-diagnostics JSONL. Captured on main at init.
+    private let bellDiagnostics: Bool
     /// (Agent Queue Supervisor §8a/§15) Master enable for the sidecar's queue
     /// supervisor "pass 3". Captured on main at init. When true the controller
     /// arms the sidecar via `GHOSTTY_AGENT_QUEUE=1` (else pass 3 stays a no-op).
@@ -97,6 +101,7 @@ final class AgentManagerController {
         self.mcpToken = ghostty.config.mcpToken
         self.configuredNodePath = ghostty.config.agentManagerNodePath
         self.bellFilterEnabled = ghostty.config.agentManagerBellFilter
+        self.bellDiagnostics = ghostty.config.bellDiagnostics
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
         self.agentQueueTemplatesDir = ghostty.config.agentQueueTemplatesDir
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
@@ -240,6 +245,7 @@ final class AgentManagerController {
         // (ramon fork / Bell Attention) Arm the sidecar's bell-promotion pass when
         // the feature is on; absent ⇒ the sidecar does no bell-edge work.
         if bellFilterEnabled { env["GHOSTTY_BELL_FILTER"] = "1" }
+        if bellDiagnostics { env["GHOSTTY_BELL_DIAG"] = "1" }
         let nodeDir = (nodePath as NSString).deletingLastPathComponent
         if !nodeDir.isEmpty {
             let existing = env["PATH"] ?? ""

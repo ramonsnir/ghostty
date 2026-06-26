@@ -506,6 +506,23 @@ extension Ghostty {
                 // On macOS 13+ we can store our continuous clock...
                 focusInstant = ContinuousClock.now
 
+                // (ramon fork) Diagnostics: record a focus-clear when it actually
+                // dismisses a pending bell/attention — this is "it stopped because I
+                // looked at it". Read the prior state BEFORE clearing below.
+                let hadBell = bell
+                let hadAttention = attentionNeeded
+                if hadBell || hadAttention,
+                   let cfg = Ghostty.App.appState(fromView: self)?.config,
+                   cfg.bellDiagnostics {
+                    BellDiagnostics.record("clear", [
+                        "surface": self.id.uuidString,
+                        "title": self.title,
+                        "cause": "focus",
+                        "hadBell": hadBell,
+                        "hadAttention": hadAttention,
+                    ])
+                }
+
                 // We unset our bell state if we gained focus
                 bell = false
 
@@ -921,6 +938,19 @@ extension Ghostty {
                   let uuid = info[AgentStateUserInfoKey.surfaceID] as? UUID,
                   uuid == self.id else { return }
             let on = (info[AgentStateUserInfoKey.attention] as? Bool) ?? false
+            // (ramon fork) Diagnostics: record every set_attention with the sidecar's
+            // reason and whether focus is about to SUPPRESS it (the guard below) — this is
+            // the "why did it fire / why was it suppressed" record.
+            if let cfg = Ghostty.App.appState(fromView: self)?.config, cfg.bellDiagnostics {
+                BellDiagnostics.record("attention", [
+                    "surface": self.id.uuidString,
+                    "title": self.title,
+                    "on": on,
+                    "focused": bellIsFocused,
+                    "applied": !(on && bellIsFocused),
+                    "reason": (info[AgentStateUserInfoKey.reason] as? String) ?? "",
+                ])
+            }
             // (ramon fork / Bell Attention v2) Never RAISE the sticky attention state on
             // a surface the user is actively looking at — we don't need to be summoned to
             // a split we're already focused on. This is the mechanism-agnostic backstop

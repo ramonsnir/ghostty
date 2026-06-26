@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 
 import { installFileLogger } from "./logfile.js";
+import { recordDiag } from "./diag.js";
 import { McpClient, McpError, type Surface } from "./mcp.js";
 import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
 import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
@@ -317,7 +318,15 @@ async function summarizeOne(
       // reply must NEVER silence a bell).
       recordAttempt();
       errlog(`surface ${surface.id}: model reply not parseable; skipping`);
-      if (bellRang) await bellPromote(deps, surface, "unparseable classify (fail-open)");
+      if (bellRang) {
+        recordDiag("classify", {
+          surface: surface.id,
+          verdict: "unparseable",
+          decision: "promote",
+          reason: "unparseable classify (fail-open)",
+        });
+        await bellPromote(deps, surface, "unparseable classify (fail-open)");
+      }
       return "fail";
     }
 
@@ -343,8 +352,21 @@ async function summarizeOne(
     // (bell-attention v2, FAIL-OPEN) On a bell-triggered classify, PROMOTE unless Haiku
     // confidently said ignore. `attention === false` is the ONLY suppression; `true` and
     // an OMITTED/uncertain verdict both promote (so model hedging never silences a bell).
-    if (bellRang && parsed.attention !== false) {
-      await bellPromote(deps, surface, parsed.summary);
+    if (bellRang) {
+      const verdict =
+        parsed.attention === true
+          ? "true"
+          : parsed.attention === false
+            ? "false"
+            : "omitted";
+      const decision = parsed.attention !== false ? "promote" : "ignore";
+      recordDiag("classify", {
+        surface: surface.id,
+        verdict,
+        decision,
+        reason: parsed.summary,
+      });
+      if (parsed.attention !== false) await bellPromote(deps, surface, parsed.summary);
     }
     log(`surface ${surface.id}: "${parsed.summary}"`);
     return "ok";
@@ -365,7 +387,15 @@ async function summarizeOne(
     // (bell-attention v2, FAIL-OPEN) A bell rang but the read/model/annotate failed
     // (incl. the summarizer's own account being out of tokens) ⇒ we have no confident
     // verdict ⇒ promote. A failing classifier must never silence a bell.
-    if (bellRang) await bellPromote(deps, surface, "classify error (fail-open)");
+    if (bellRang) {
+      recordDiag("classify", {
+        surface: surface.id,
+        verdict: "error",
+        decision: "promote",
+        reason: "classify error (fail-open)",
+      });
+      await bellPromote(deps, surface, "classify error (fail-open)");
+    }
     return "fail";
   } finally {
     deps.budget.release();
@@ -426,6 +456,12 @@ async function maybeSignalAlert(
     // Record FIRST so a slow set_attention can't double-fire from an overlapping
     // sweep; roll back below if the call fails so the edge is retried.
     deps.alertBySession.set(surface.id, alert as string);
+    recordDiag("alert", {
+      surface: surface.id,
+      tag: alert as string,
+      edge: "ring",
+      decision: "promote",
+    });
     try {
       await deps.client.setAttention(surface.id, true, alertReason(alert as string));
       log(`surface ${surface.id}: alert "${alert}" -> promoted (attention)`);
@@ -439,6 +475,7 @@ async function maybeSignalAlert(
     }
   } else if (edge === "clear") {
     deps.alertBySession.delete(surface.id);
+    recordDiag("alert", { surface: surface.id, edge: "clear", decision: "unpromote" });
     // Best-effort un-promote on recovery (also cleared on focus GUI-side).
     try {
       await deps.client.setAttention(surface.id, false);

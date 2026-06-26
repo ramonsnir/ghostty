@@ -922,6 +922,19 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Bell Attention v2) Diagnostics: append a structured JSONL trace
+        // of the bell → attention lifecycle to
+        // ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl. Default false. The GUI
+        // records ring/attention/clear events directly and forwards this to the sidecar
+        // as GHOSTTY_BELL_DIAG=1 so it also records its classify verdict + alert edges.
+        var bellDiagnostics: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "bell-diagnostics"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
         // nil/empty when unset (the controller falls back to a login-shell probe).
         var agentManagerNodePath: String? {

@@ -3294,6 +3294,19 @@ keybind: Keybinds = .{},
     .monitor = true,
 },
 
+/// (ramon fork / Bell Attention v2) Diagnostics: when true, the GUI and the Agent
+/// Manager sidecar append a structured JSONL trace of the bell → attention lifecycle
+/// to `~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl` — every bell ring (with
+/// focus state), every `set_attention` (with the sidecar's reason + whether it was
+/// applied or suppressed by focus), every focus-clear, and the sidecar's per-bell
+/// classify verdict/decision + rate-limit alert edges. This is the data behind "why
+/// did the bell just fire", "why DIDN'T it fire an hour ago", and average ring→attention
+/// delay. Off by default; flip it on temporarily when investigating, then turn it back
+/// off (the file grows append-only). A GUI relaunch is needed to pick up a change (and
+/// to forward the flag to the sidecar as `GHOSTTY_BELL_DIAG=1`). Fork-only — keep it in
+/// `~/.config/ghostty-ramon/config`.
+@"bell-diagnostics": bool = false,
+
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
 /// from a phone (e.g. over Tailscale). Empty/null (the default) DISABLES the
@@ -11387,6 +11400,27 @@ test "bell-features-focused: parse and default" {
             BellFeatures{ .attention = true, .title = true, .dashboard = true, .push = true, .monitor = true },
             cfg.@"bell-features",
         );
+    }
+}
+
+test "bell-diagnostics: default off and parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(false, cfg.@"bell-diagnostics");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--bell-diagnostics=true"} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"bell-diagnostics");
     }
 }
 
