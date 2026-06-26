@@ -255,3 +255,136 @@ initial command, `send_key`, and `wait_for_event` parking/timeout). Merged on `r
 | macOS config getters | `macos/Sources/Ghostty/Ghostty.Config.swift` (`mcpListen` / `mcpToken`) |
 | Start on launch | `macos/Sources/App/macOS/AppDelegate.swift` |
 | Full architecture / wiring notes | **`CLAUDE.md`** ("MCP server" entry) |
+
+---
+
+## Implementation notes (for agents touching the code)
+
+The load-bearing dev-internals for an agent working on this code.
+
+### Built on existing abstractions; zero host changes
+
+Read/respond go through the libghostty C API on the GUI surface
+(`ghostty_surface_read_text` viewport, `ghostty_surface_key` real key events,
+`ghostty_surface_text`, `ghostty_surface_mouse_scroll`); watch is a Swift event bus over
+existing GUI state (`ghosttyBellDidRing`, `process_exited`, a `needsConfirmQuit`
+transition); layout calls the existing `TerminalController`/`SplitTree` handlers. The host
+(`ghostty-host`) has **no MCP awareness** — the only Zig change is two additive,
+default-null config keys it ignores. So enabling/changing MCP needs a **GUI relaunch only,
+never a host restart**.
+
+### Copies the web monitor, never depends on it
+
+Standalone module that **COPIES the web monitor, never depends on it** (per the
+web-monitor scope rule in CLAUDE.md): the serial-queue + main-hop threading model, the
+`keySpecs` NATIVE-keycode input mapping (Return=36, Esc=53, …; the `GHOSTTY_KEY_*` enum
+value silently no-ops — see the web-monitor `fix7` notes), the `decideRoute`/`RequestParser`
+shape, and the token/Host-header/backoff defenses are all re-homed in
+`macos/Sources/Features/MCP/`, not imported from `WebMonitor`.
+
+### Config + per-identity port offset
+
+**Config (fork-only, default null/off):** `mcp-listen` (`addr:port`, empty = disabled;
+purely a BIND address) + `mcp-token`. **Unlike `web-monitor-token`, the MCP token should
+ALWAYS be set** — it is a SHELL-EXECUTION credential (the tools spawn tabs + run commands),
+so the recommended bind is **localhost** (`127.0.0.1:8765`) with a token, NOT an open
+tailnet bind. Empty token ⇒ runs OPEN + logs a warning. Keep both in
+`~/.config/ghostty-ramon/config`.
+
+**Per-identity port offset (automatic, code not config):** the three fork identities share
+one config file (hence one `mcp-listen` port) and would fight over it side-by-side, so
+`MCPServer.init` shifts the port by a per-bundle-id offset — Release `+0` (keeps the
+configured port), ReleaseLocal `+1`, Debug `+2` (so `:8765` ⇒ 8765 / 8766 / 8767). Pure
+overflow-safe helpers `portOffset(forBundleID:)` / `applyPortOffset(_:offset:)` in
+`MCPServer.swift`, unit-tested (`MCPServerTests`). The stdio shim defaults to Release
+(`8765`); use `GHOSTTY_MCP_URL` to hit a dev build.
+
+### Transport
+
+In-GUI HTTP JSON-RPC 2.0 on its own `NWListener` (`POST /mcp`: `initialize` / `tools/list`
+/ `tools/call`) + a standalone stdio shim (`macos/mcp-shim`, `ghostty-mcp`, a dumb
+stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`, built with `swift build`) so
+`claude mcp add ghostty -- ghostty-mcp` works. The shim's default URL is
+`http://127.0.0.1:8765/mcp`; `GHOSTTY_MCP_URL`/`GHOSTTY_MCP_TOKEN` override.
+
+### Durable registration (the "works on a new laptop" story)
+
+A committed **`.mcp.json`** at the repo root registers the server project-scoped as
+`ghostty -- ghostty-mcp` (bare PATH name, **no secret, no clone-specific path**), so any
+Claude Code session opened in the repo auto-gets the 12 tools after a one-time approval +
+restart. Two pieces make a secret-less, path-less registration work: (1) the shim is
+installed on PATH at **`~/.local/bin/ghostty-mcp`** (release build, alongside
+`ghostty-host`; new-machine: `cd macos/mcp-shim && swift build -c release && cp
+.build/release/ghostty-mcp ~/.local/bin/`); (2) the shim **falls back to reading
+`mcp-token` from `~/.config/ghostty-ramon/local`** when `GHOSTTY_MCP_TOKEN` is unset
+(`tokenFromLocalConfig()` in `main.swift` — same canonical secret store the agent-state
+hook reads), so the committed JSON needs no token. Dev identities still reachable via
+`GHOSTTY_MCP_URL=…:8766/:8767`. Wiring: `.mcp.json` (repo root),
+`macos/mcp-shim/Sources/ghostty-mcp/main.swift` (`tokenFromLocalConfig`); see "Connecting
+an agent" above.
+
+### The 12 tools
+
+`list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`, `scroll`,
+`wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`, `close_surface`,
+`perform_action` (the keybind-action grammar string). All address a surface by **stable
+UUID**; `wait_for_event`/`watch_for_pattern` are long-poll (idle-watchdog-exempt, bounded
+by a clamped `timeoutMs` 1000–120000).
+
+`list_surfaces` rows carry `id, title, pwd, window/tab/split position, focused, bell,
+exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /
+`command` (foreground process + full cmdline) and `idleSeconds` (seconds since the screen
+last changed).
+
+### Host-gated `processName` / `command` / `idleSeconds`
+
+**`processName`/`command` are HOST-GATED**: under `.client` the GUI mirror can't read the
+foreground process (the PTY is in the host), so the host resolves them (libproc/sysctl in
+`src/os/proc_info.zig`) and PUSHES an additive `process_info` frame (protocol minor 3,
+gated on the conn's negotiated minor in `Server.zig`) — they stay absent until the **host
+is restarted** to a minor-3 build, even after a GUI upgrade.
+
+**`idleSeconds` is GUI-only** (stamped in `Client.zig` on each applied `grid_frame`; ships
+at the next GUI relaunch, no host restart) and is a coarse heuristic (a TUI that repaints
+on a timer never idles; null on backends without a host frame stream).
+
+### Two deliberate v1 limits (documented honestly, don't "fix" by guessing)
+
+(a) **`read_surface` is VIEWPORT-ONLY** — under `pty-host` the GUI mirror is viewport-sized
+(real scrollback is on the host), so there is no honest scrollback read; the `mode` param
+was REMOVED rather than lie. Reach scrolled-off output via `scroll` + re-read.
+
+(b) **`prompt`/`atPrompt` rides the coarse `needsConfirmQuit` bit, NOT OSC 133** — gated by
+`confirm-close-surface` (`false` ⇒ never fires; `always` ⇒ inverted); prefer
+`watch_for_pattern` for "agent waiting on me". A real OSC-133 bit needs host plumbing (out
+of scope).
+
+Relative layout verbs focus the target first (anchor-parameterizing `SplitTree` is a
+follow-up).
+
+### Wiring
+
+`src/config/Config.zig` (`mcp-listen`/`mcp-token` + parse test);
+`macos/Sources/Features/MCP/{MCPServer,MCPRPC,MCPTools,MCPInput,MCPLayout,MCPEventBus}.swift`;
+`Ghostty.Config.swift` (`mcpListen`/`mcpToken`); `AppDelegate.swift` (start on launch);
+`project.pbxproj` (iOS exclusion); `macos/mcp-shim/*`.
+
+The `processName`/`command`/`idleSeconds` feature adds:
+- **HOST** — `src/os/proc_info.zig` (pid→name+cmdline resolver, pure `parseProcArgs2`), the
+  `process_info` frame + `Conn.negotiated_minor` gate
+  (`src/host/{protocol,Server,Session}.zig`, minor bumped to 3).
+- **CORE/lib** — `src/termio/Client.zig` (cache + `last_activity_ms` stamp on `grid_frame`
+  only + accessors), `src/Surface.zig`
+  (`foregroundProcessName`/`foregroundCommand`/`idleMillis` getters; `.exec` resolves
+  locally via `proc_info`), `src/apprt/embedded.zig` + `include/ghostty.h`
+  (`ghostty_surface_process_name`/`_command`/`_idle_ms` exports).
+- **macOS** — `Surface View/SurfaceView_AppKit.swift` (the three computed vars),
+  `MCPLayout.swift` (`SurfaceRow` fields + JSON), `MCPTools.swift` (schema doc).
+
+### Tests
+
+`macos/Tests/MCP/MCPServerTests.swift` + the `mcp` Zig config test
+(`zig build test -Dtest-filter=mcp`); the `process_info` frame round-trip/bounds + minor-3
+tests in `src/host/test.zig` and the `proc_info parseProcArgs2` tests in
+`src/os/proc_info.zig` (`zig build test -Dtest-filter=host` / `-Dtest-filter=proc_info`),
+plus the `process_info`/`idleMillis` Client tests in `src/termio/Client.zig`.

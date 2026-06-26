@@ -231,3 +231,296 @@ concurrency cap — so a wall of idle/unchanged sessions costs nearly nothing. S
 above to dial it further. The session's recent on-screen text is sent to the model for
 summarization; hide the tile (or disable the feature) for any session you don't want
 summarized. Use *Account routing* above to keep this traffic off your primary account.
+
+## Implementation notes (for agents touching the code)
+
+These are the load-bearing dev-internals for an agent working on this feature. (The
+sections above are user-facing config/usage; this is the architecture, the gotchas, and
+the wiring/test ledger.)
+
+### Architecture: warm TS Agent SDK sidecar (brain) + MCP server (hands)
+
+A warm **TypeScript Agent SDK sidecar is the brain; the MCP server is its hands.**
+`claude -p` was rejected (cold-boots the CLI per call). Instead a persistent TS program
+(`macos/agent-manager/`, `@anthropic-ai/claude-agent-sdk`, NOT in `Ghostty.xcodeproj`,
+built with `npm ci && npm run build`) keeps warm and drives Ghostty's existing **MCP
+server** as a tool provider. **Billing rides Claude Code's own auth** (subscription/pool
+creds the SDK reads on disk) — **NO Anthropic API key in Ghostty** (verified: a bare
+`query()` with no `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` succeeds via the pool).
+
+### Deterministic loop, single-shot LLM (NOT agentic)
+
+`src/index.ts` polls `list_surfaces` every 5s, applies PURE gates (`src/summarizer.ts`:
+`isAgentSurface`/`shouldSummarize`/change-detection/debounce/skip-idle/`ConcurrencyBudget`),
+`read_surface`s the viewport, composes a prompt (baked base `src/prompts.ts` + the
+`~/.config/ghostty-ramon/agent-manager/summarizer.md` override, mtime-cached), makes ONE
+Haiku call (`src/model.ts`: `tools:[]`, `maxTurns:3`, NO `mcpServers` — the summary call
+touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
+dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
+Node's built-in `node --test`.
+
+### Cost controls — hidden-throttle + animation-proof fuzzy change + quiescent-skip + config
+
+The "Haiku burns my usage" fix. Four levers cut the call rate; the dominant sink was a
+quiescent (`waiting`/`idle`) agent whose ANIMATED footer (spinner / "esc to interrupt" /
+elapsed-time counter) flipped the old exact-hash `fingerprint` every poll, so it
+re-summarized every debounce window forever.
+
+**(1) Throttle (not skip) hidden tiles — so the rate-limit watchdog survives hiding:**
+the dashboard's `hidden` set is exposed through `list_surfaces` (Swift:
+`HookSnapshotEntry.hidden` unioned from `model.hidden` → `MCPLayout.SurfaceRow.hidden`,
+emitted only when true; TS: `Surface.hidden`). A hidden tile is summarized on a MUCH
+LARGER per-session debounce (`hiddenDebounceMs`, default 600000 = 10 min) via the pure
+`effectiveDebounceMs(surface, cfg)` = `surface.hidden ? max(debounceMs, hiddenDebounceMs)
+: debounceMs`, consulted by the debounce clause of BOTH `preGate` and `shouldSummarize`.
+**`skipHidden` defaults FALSE** — it's the explicit opt-out for zero-cost behavior (when
+true, both gates still short-circuit `{reason:"hidden"}` and skip the `read_surface`
+entirely). **Why the flip:** the rate-limit attention bell (below) has Haiku as its SOLE
+classifier, so a fully-skipped hidden tile NEVER rings — and hidden tiles are exactly the
+long-running, stepped-away agents the watchdog is for. Throttling instead of skipping
+keeps the watchdog alive on them within `hiddenDebounceMs` at a fraction of the
+visible-tile cost.
+
+**(2) Fuzzy change detection (replaces the binary `fingerprint`):** `LastSummary` now
+stores `signals` (exact hash of the AUTHORITATIVE hook tuple
+agentState|lastPrompt|lastTool — any diff = change) + `tail` (the NORMALIZED change-tail
+kept as TEXT). `changeTail` strips spinner glyphs (Braille U+2800–28FF + dot/bar
+spinners) and collapses digit-runs→`#` and whitespace via `normalizeChangeLine`, so an
+animated footer normalizes to a STABLE string; `tailChangeRatio` is the Jaccard distance
+over the NON-BLANK line MULTISETS (scroll-tolerant), and the screen counts as CHANGED only
+when `ratio > cfg.changeRatioThreshold` (default 0.2).
+
+**(3) Quiescent-skip:** an unchanged `waiting`/`idle` agent (`isQuiescent`) is skipped
+REGARDLESS of `idleSeconds` (its summary won't change); a non-quiescent unchanged surface
+keeps the old idle-seconds skip / else re-summarizes so a `working` agent's phase still
+tracks.
+
+**(4) Config overlay (`src/config.ts`, no rebuild):**
+`~/.config/ghostty-ramon/agent-manager/config.json` (pure `parseConfig` overlay on
+`DEFAULT_CONFIG` over an injected `readFile`, restart-to-apply, malformed/unknown keys
+ignored) tunes `debounceMs` (default **120000** = 2 min), `hiddenDebounceMs` (default
+**600000** = 10 min), `changeRatioThreshold`, `skipHidden` (default **false**),
+`idleSkipSeconds`, `maxConcurrent`, `agentProcessNames`.
+
+The change-detection pure helpers are
+`changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
+`lineMultiset` (all tested). Wiring: Swift — `AgentDashboardController.swift`
+(`HookSnapshotEntry.hidden`), `MCPLayout.swift` (`SurfaceRow.hidden` + JSON emit); sidecar
+— `mcp.ts` (`Surface.hidden`), `summarizer.ts` (config fields + `LastSummary` shape + the
+new pure helpers + `shouldSummarize`/`preGate`), `config.ts` (NEW), `index.ts`
+(`loadConfig` in `main`, record `signals`/`tail`). Tests: Swift `MCPServerTests`
+(`surfacesJSONDataEmitsHiddenWhenTrue` + omit-when-false), `AgentDashboardTests`
+(`hookSnapshot` hidden bit); sidecar `summarizer.test.ts` (change-detection +
+quiescent/hidden truth table + `effectiveDebounceMs` + hidden-throttle/skip cases),
+`config.test.ts` (NEW + `hiddenDebounceMs` parse), `index.test.ts` (record shape; backoff
+windows now reference `cfg.debounceMs`). **GUI relaunch (for the `hidden` field) + rebuilt
+sidecar `dist` + sidecar restart; no host/Zig change.**
+
+### Rate-limit auto-backoff (sidecar-only)
+
+When the summarizer's OWN account is rate-limited, slow way down until one call succeeds
+(the limit resets). When the summarizer bills to a depleted account, its `summarize()`
+calls fail (throw) or return an unusable/unparseable reply — and without this it would
+keep firing one call per surface per `debounceMs`, hammering the limited account. An
+ACCOUNT-WIDE adaptive backoff (`LoopDeps.summarizerBackoff = {failureStreak,
+nextProbeMs}`, pure `backoffDelayMs(streak, base, max) = min(max, base·2^(streak-1))`,
+default cap `cfg.rateLimitBackoffMaxMs` 600000) governs `runSweep`: `summarizeOne` now
+returns `"ok"|"fail"|"skip"` ("ok" = a model call parsed = account healthy; "fail" = threw
+OR unparseable; "skip" = gate not-due, no call). NORMAL sweep fires the due batch
+concurrently and aggregates — ANY "ok" resets the streak to 0; else if any "fail",
+streak++ and arm `nextProbeMs`. BACKED-OFF sweep (streak>0): if `now < nextProbeMs` return
+with ZERO calls; once the window elapses, probe candidates SEQUENTIALLY until ONE makes a
+real call (not a gate-skip, so a leading quiescent tile can't waste the probe) — "ok"
+clears the backoff + logs "resuming", "fail" extends it. So a depleted account is poked
+~once per 10 min (one probe), and the first success snaps back to full cadence — fully
+automatic. Unparseable counts as "fail" deliberately (a rate-limit message often renders
+as un-parseable text, not an exception, so "until one SUCCEEDS" means "until one returns a
+real summary"). Wiring: sidecar ONLY — `summarizer.ts` (`rateLimitBackoffMaxMs` cfg +
+`backoffDelayMs`), `config.ts` (parse the key), `index.ts` (`summarizerBackoff` on
+`LoopDeps` + `SummarizeResult` return + `runSweep` gate/probe/aggregate + `main` init).
+Tests: `summarizer.test.ts` (`backoffDelayMs`), `config.test.ts` (parse), `index.test.ts`
+(`backoff:` group — engage-on-all-fail, success-keeps-0, cooldown-no-calls,
+one-probe-recovers, failed-probe-extends, unparseable-is-fail). **Rebuilt sidecar `dist` +
+sidecar restart only; no GUI/host/Zig change.**
+
+### Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha)
+
+Under the `claude-pool` wrapper the surface's foreground process is `bash` (and even bare,
+`claude` reports its versioned-binary basename e.g. `2.1.185`), so a `processName ∈
+{claude,codex}` check NEVER matches a real agent. The Agent Dashboard already detects
+agents via a foreground-pid **subtree walk**; Phase 0 exposes that result as
+`list_surfaces.agentKind` (`AgentDashboardModel.agents` → `HookSnapshotEntry.agentKind` →
+`MCPLayout.SurfaceRow.agentKind` → JSON → `Surface.agentKind`), and `isAgentSurface` keys
+off it (then `agentState`, then `processName`). This also keeps the summarizer's notion of
+"agent" identical to the dashboard's tiles.
+
+### Rich summaries need the Claude hooks
+
+The strongest inputs — the user's `lastPrompt` and `agentState` (working/waiting) — arrive
+via the same Agent-Dashboard `/agent-state` hooks (so they only populate on the build the
+hooks POST to, i.e. the **installed Release** on the default MCP port, NOT a dev `+1/+2`
+port). Without them the summarizer falls back to the viewport tail alone and reads thin
+("Idle — repo ready"); with them it reads rich. Prompt is tunable live via the override
+file (no rebuild).
+
+### SELF-DISABLE (hard requirement, unit-tested)
+
+`AgentManagerController.start()` runs the §8 gate `sidecarShouldStart(managerEnabled,
+queueEnabled, mcpListen, mcpToken, nodePath)` off-main: unless **at least one feature**
+(`agent-manager` OR `agent-queue`) is on AND `mcp-listen`+`mcp-token` are set AND `node`
+resolves (config `agent-manager-node-path`, else a login-shell `command -v node` probe —
+GUI apps don't inherit `PATH`), it stays fully dormant with EXACTLY ONE info log; the
+dashboard is unaffected. The sidecar is spawned/supervised via `Process` (lazy, bounded
+restart backoff — both pure + tested), torn down on quit, run with
+`GHOSTTY_AGENT_MANAGER=1` so its own model activity can't recurse through the agent-state
+hook.
+
+### Shared-sidecar / independent features (the agent-manager↔agent-queue untangle)
+
+The summarizer (agent-manager) and the queue supervisor (agent-queue) are TWO independent
+loops that share ONE sidecar process. The launch gate (`sidecarShouldStart`,
+EITHER-feature OR) starts the sidecar when either is enabled; which loops actually RUN
+inside it is decided SEPARATELY by per-feature env flags, so each works with the other off
+— in particular `agent-queue = true` + `agent-manager = false` runs the queue with the
+(Haiku-billing) summarizer fully silent (the reason the untangle exists). Pure helpers
+`AgentManagerController.applySummarizerEnv(into:enabled:)` (→ `GHOSTTY_SUMMARIZER`) and the
+existing `applyAgentQueueEnv` (→ `GHOSTTY_AGENT_QUEUE`) arm the two; sidecar
+`parseLoopEnablement(env)` reads them in `index.ts main()` and gates the `tick`/`queueTick`
+loops.
+
+**BACK-COMPAT asymmetry:** `GHOSTTY_SUMMARIZER` is set EXPLICITLY both ways (`1`/`0`, NOT
+stripped when off) and the sidecar treats an ABSENT flag as ON — because the summarizer
+used to be unconditional, so an OLD GUI that respawns a NEW `dist` mid-upgrade keeps
+summarizing; only this new GUI's explicit `0` (agent-manager off) disables it. The queue
+stays opt-in (`1` only; absent ⇒ off). No new config key (reuses `agent-manager` +
+`agent-queue`), no Zig/host change. Wiring: `AgentManagerController.swift`
+(`sidecarShouldStart`/`sidecarDisabledReason` replacing the old
+`agentManagerShouldStart`/`disabledReason`, `applySummarizerEnv`, `start()` OR-gate,
+`childEnvironment`); sidecar `index.ts` (`parseLoopEnablement` + loop gating). Tests:
+`AgentManagerControllerTests`
+(`shouldStartWhenQueueOnlyPresent`/`shouldNotStartWhenBothDisabled`/truth-table/
+`summarizerEnv*`), sidecar `index.test.ts` (`loops:` group). **GUI relaunch + rebuilt
+sidecar `dist`; no host/Zig change.**
+
+### Read-only; ZERO autonomous send, ZERO host/Zig protocol change — wiring + tests
+
+The only Zig change is two additive default-off config keys. Wiring: core —
+`src/config/Config.zig` (`agent-manager`/`agent-manager-node-path` + parse test); macOS —
+`macos/Sources/Features/AgentManager/AgentManagerController.swift`,
+`macos/Sources/Features/MCP/MCPAnnotation.swift` (`set_surface_annotation` tool + pure
+`AgentAnnotationPayload.fromArguments` + main-hop handler posting
+`.ghosttyAgentAnnotationDidChange`), `MCPLayout.swift`/`MCPTools.swift` (`agentKind` +
+`list_surfaces` enrichment), `AgentDashboardController.swift` (`HookSnapshotEntry.agentKind`
++ `annotations` store + observer) + `AgentPreviewTile.swift` (renders the summary),
+`Ghostty.Config.swift` (`agentManagerEnabled`/`agentManagerNodePath`), `AppDelegate.swift`
+(off-main start), `project.pbxproj` (iOS exclusion); sidecar — `macos/agent-manager/*`.
+Tests: `macos/Tests/AgentManager/AgentManagerControllerTests.swift` (self-disable truth
+table + backoff + URL), `macos/Tests/MCP/MCPAnnotationTests.swift`, the `agentKind`
+`surfacesJSONData` cases in `macos/Tests/MCP/MCPServerTests.swift`, the `agent-manager` Zig
+config test, and the sidecar's `node --test` suite (`npm test` in `macos/agent-manager`).
+**GUI relaunch only** to enable (no host restart). For Ramon's dev tree the sidecar runs
+from `macos/agent-manager/dist` via the `#filePath` fallback in `resolveSidecarDir()`
+(build it with `npm ci && npm run build`).
+
+Note on the annotation contract: `AgentAnnotation` / the `set_surface_annotation` tool
+carry ONLY `summary`/`phase`/`needsUser` + the Agent Queue tags
+(`queueKey`/`queueName`/`queueUrl`); the partial-MERGE behavior stays because the Queue
+uses it. The only autonomous send path is the `send_text`/`send_key` MCP tools (used by
+the Queue's exit prelude). **Do NOT rebuild a reply-suggestion feature** — a previous
+Approve/Edit/Dismiss-on-`waiting`-tiles pass was removed end-to-end as
+low-value/quota-draining.
+
+### COLLEAGUE / DMG distribution — the sidecar IS bundled (dist-only), so the QUEUE works
+
+Both release paths (`dist/macos/release-local.sh` step 3b +
+`.github/workflows/fork-release.yml`) build the sidecar and copy **`dist/` + `package.json`
+ONLY** into `Contents/Resources/agent-manager` — the path `resolveSidecarDir()` prefers
+over the dev `#filePath`. **`node_modules` is deliberately NOT bundled** (~271MB and it
+ships a native `claude` binary that would break notarization), so the bundle is pure-JS
+data — notarization-safe, no extra signing (the app seal covers `Resources/`). Three things
+make this work: (1) the Agent **Queue** engine has ZERO npm deps (Node built-ins + global
+`fetch`); (2) `model.ts` imports the SDK as a **TYPE-ONLY import + a LAZY `await import()`**
+inside `summarize()`, so `dist/index.js` loads with no `node_modules` and only a real
+summary call pulls the SDK (a missing SDK throws → the summarizer self-disables
+per-surface, queue unaffected); (3) `package.json` is bundled so node treats `dist/*.js` as
+ESM (`"type":"module"`).
+
+**RUNTIME PREREQ: `node` on PATH** — the controller's §8 self-disable gate probes a
+login-shell `command -v node` and stays dormant (one log line, no crash) if absent, so a
+colleague without node just doesn't get the features. **So for a colleague: the Agent QUEUE
+works** (given node + the usual opt-in: `agent-queue`/`agent-manager` on,
+`mcp-listen`/`mcp-token` set, the agent-state hooks installed, a template) — **but the
+Haiku tile SUMMARIZER stays dev-only** (it needs the un-bundled `node_modules`; without it,
+the SDK import throws and the summarizer self-disables while the queue runs fine). Verified
+the dist-only bundle boots with no `node_modules`. Wiring: `model.ts` (type-only + lazy
+import), `dist/macos/release-local.sh` (step 3b), `.github/workflows/fork-release.yml`
+("Build + bundle agent-manager sidecar").
+
+### Account routing (optional) — dev internals
+
+By default the summarizer inherits the ambient Claude Code auth (works with NO
+multi-account setup); set a spec in `~/.config/ghostty-ramon/agent-manager/account`
+(sibling of `summarizer.md`) OR the `GHOSTTY_AGENT_MANAGER_ACCOUNT` env (env wins) to route
+its Haiku calls to a specific account. The spec is a bare account NAME →
+`~/.claude-accounts/<name>` (the `claude-accounts` convention) or an absolute/`~` PATH used
+directly as `CLAUDE_CONFIG_DIR`; a spec that doesn't resolve to a real dir is ignored (warn
++ inherit, so a stale name never breaks anyone). The resolver (`src/account.ts`:
+`readAccountSpec`/`resolveAccountDir`, PURE over an injected fs seam + `account.test.ts`)
+feeds `LoopDeps.summarizerConfigDir`, which `summarizeOne` threads into the model call;
+`model.ts summarize()` then passes `env:{...process.env, CLAUDE_CONFIG_DIR}` (spread so
+HOME/PATH/OAuth survive — only the config dir is re-pointed). SIDECAR-only: edit the file +
+restart the sidecar (the GUI respawns it; no app relaunch).
+
+### Attention bell on rate-limit (fork-only, sidecar-only, ZERO Swift/Zig/host change)
+
+The summarizer doubles as an attention watchdog: when a session hits the Claude
+usage/rate-limit BLOCKING prompt ("Stop and wait for limit to reset / Ask your admin for
+more usage" — which halts the agent WITHOUT ringing a terminal bell), the sidecar rings the
+bell via the EXISTING MCP `signalAttention` tool (`client.signalAttention`, already used by
+the Queue's leave-and-bell) — fanning out to the 🔔 tab title, dashboard aggregate, web
+monitor, and push, all off the one `.ghosttyBellDidRing` post. **No new MCP tool / no Swift
+/ no host work** — the bell path already existed; this just triggers it.
+
+**HAIKU IS THE SOLE CLASSIFIER — NO regex/text match (deliberate, see below).** An
+extensible `alert?: string` field was added to the Haiku STRUCTURED OUTPUT contract
+(`src/prompts.ts`, parsed in `parseSummary` → `ParsedSummary.alert`, lower-cased/trimmed);
+the prompt tells Haiku to judge the CURRENT/LIVE state at the BOTTOM of the screen and set
+`"rate_limited"` only while the agent is actually halted on that prompt right now — NOT when
+the same text merely sits scrolled-up in history.
+
+**Why no deterministic regex backstop (deliberate — do NOT add one):** a regex matches the
+text ANYWHERE in the viewport, so it (a) can't detect RECOVERY (the prompt scrolls up but
+stays in view → would never clear) and (b) on the idle-skip/model-fail paths would re-scan
+and FALSELY RE-RING after Haiku had already cleared it. Only a whole-screen classifier can
+tell "live prompt" from "scrolled-up history". The alert state therefore changes ONLY when
+a Haiku call SUCCEEDS + parses: `maybeSignalAlert(parsed.alert)` runs on the due path only;
+idle-skip / parse-fail / model-throw branches LEAVE the alert state untouched (a held alert
+stays armed, nothing rings or clears without a fresh classify).
+
+EDGE-TRIGGERED via a per-surface `alertBySession: Map<id,tag>` on `LoopDeps` (pure
+`alertEdge(prev,current)` → ring/clear/none): rings ONCE on a rising/changed edge, clears
+when Haiku reports no alert (this is how recovery un-rings, immune to scrolled-up text),
+re-arms after; cleaned up alongside `lastBySession` for dead surfaces; a failed
+`signalAttention` rolls the record back so a later sweep retries.
+
+**HONEST COST of pure-Haiku:** if the summarizer's OWN account is the rate-limited one, its
+calls fail and the FIRST detection can't fire (a held alert still stays armed; only the
+initial ring is at risk) — mitigate by routing the summarizer to a SEPARATE account (the
+existing Account-routing feature; the recommended watchdog setup). Detection still lands on
+the change-edge: the prompt appearing changes the screen → `shouldSummarize` returns
+`changed` (beats idle-skip) → Haiku runs → rings; latency ≈ debounce + a sweep (~5–15s).
+
+NOTE: this rate-limit watchdog is now ONE case of the general **Bell Attention v2** two-tier
+promotion mechanism (see `BELL-ATTENTION.md`) — the same fail-open classify +
+`set_attention`, here driven by a dedicated `alert` tag rather than a bell edge.
+
+Wiring: sidecar ONLY — `prompts.ts` (contract + `alert` rule), `summarizer.ts`
+(`ParsedSummary.alert` + `parseSummary` parse + `ALERT_RATE_LIMITED` + pure `alertEdge`),
+`index.ts` (`LoopDeps.alertBySession` + `maybeSignalAlert` edge handler on the success
+branch only + `alertReason` + dead-id prune + main init). Tests: `summarizer.test.ts`
+(`alertEdge` + `parseSummary` alert parsing) + `index.test.ts` (`bell:` group — ring-once,
+held-no-rering-under-idle-skip, recovery-clears, scrolled-up-text-inert,
+model-failure-leaves-untouched, model-alert-rings-regardless-of-text, changed-tag-rerings,
+failed-ring rollback, non-agent never rung, dead-id prune). **Rebuilt sidecar `dist` + a
+sidecar restart (kill the node child or relaunch the GUI) is enough; no host/Zig change, no
+GUI relaunch needed for the GUI itself.**

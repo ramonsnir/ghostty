@@ -266,3 +266,229 @@ Committed on `ramon-fork` (not pushed).
 | macOS config getters | `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen` / `webMonitorToken` / `ptyHost`) |
 | Start on launch / stop on quit | `macos/Sources/App/macOS/AppDelegate.swift` |
 | Full architecture / wiring notes | **`CLAUDE.md`** ("Web monitor" entry) |
+
+---
+
+## Implementation notes (for agents touching the code)
+
+The deep dev-internals below were relocated from `CLAUDE.md`. They are the load-bearing
+facts for an agent working on the web-monitor code — preserved verbatim/near-verbatim,
+including every gotcha.
+
+### Scope — phone workflows ONLY
+
+> **SCOPE — phone workflows ONLY.** The web monitor is the phone-usage feature
+> (list/render/input/scroll from a handset over Tailscale) and nothing else. Do
+> **not** build new features on top of it — it is not maintained as a highly-stable
+> foundation. Other work (e.g. an MCP server / agent control) may *reuse its
+> architecture and copy code* (the host-protocol client, `keySpecs` input mapping,
+> `decideRoute`/`RequestParser` patterns, the serial-queue + main-hop threading
+> model), but should stand on its own and build directly on Ghostty + the host's
+> existing abstractions — there is already enough tooling there. Keep the web
+> monitor's surface frozen to what phone usage needs.
+
+The server lives INSIDE the app — one binary, one rebuild/restart, NO second process. A
+SINGLE `NWListener` (dedicated serial queue) serves the page, the JSON API, the vendored
+`xterm.js` assets, the raw stream, and input/scroll on ONE port.
+
+### Config (dev nuance)
+
+**Config (fork-only, default null/off so an official Ghostty sharing `~/.config/ghostty/config`
+never trips):** `web-monitor-listen` (`addr:port`; empty = disabled; purely a BIND address,
+NOT an IP allowlist — see the bind caveat) and `web-monitor-token` (OPTIONAL). **Token is
+optional:** empty ⇒ the server runs OPEN (`start()` logs a warning; `decideRoute` skips the
+token gate + backoff entirely — access control is the TAILNET/Tailscale ACL alone) — this
+is the user's deliberate choice for a private tailnet. If SET, it is fully enforced
+(constant-time compare; `?token=` only on the bootstrap `GET /` + asset routes, which can't
+send a header; `/api/*` requires the `X-Ghostty-Token` header) and is a SHELL-EXECUTION
+credential (rotate if leaked). `tokenAcceptable` (≥16 chars) is a soft warning, not a
+refusal.
+
+### Color/scrollback architecture (the core of v2)
+
+Under the fork's `pty-host` `.client` backend the GUI's screen mirror is VIEWPORT-ONLY and
+colorless, so the live view comes from the HOST. `src/termio/Termio.zig` gained a nullable
+`output_observer` (null for `.exec` ⇒ byte-identical GUI behavior; set by the host
+`Session`). The host `Session` keeps a bounded 256KB per-session RAW RING BUFFER
+(replay-on-connect) and broadcasts new bytes; two ADDITIVE, version-negotiated (minor 0→1),
+crash-safe frames carry it: `subscribe_raw` (client→host) + `raw_output` (host→client) in
+`src/host/protocol.zig`, routed by `src/host/Server.zig` raw subscribers. A Swift
+host-protocol client — `WebMonitorHostClient` (POSIX `AF_UNIX`) — connects to the `pty-host`
+socket, does the `Hello` handshake, `subscribe_raw`s a session, and decodes the `raw_output`
+stream. `GET /api/surface/{uuid}/stream` pipes those bytes to the browser as a long-lived
+`application/octet-stream` with the host grid in `X-Ghostty-Cols`/`X-Ghostty-Rows` headers
+(from `ghostty_surface_size`); the page `term.resize()`s `xterm.js` to that grid so
+cursor-addressed TUIs render aligned. **Without `pty-host`** (or if the stream can't start →
+501) the page falls back to the plain-text snapshot poll.
+
+### Font
+
+The page + the `xterm.js` terminal render in **JetBrains Mono Nerd Font** (the GUI's own
+default font), vendored as woff2 (Regular + Bold, from `src/font/res/`, TTF→woff2
+~2.2MB→~900KB each) at `vendor/JetBrainsMonoNerdFont-{Regular,Bold}.woff2` and served via two
+`assetRoutes` (`/jetbrains-mono-{regular,bold}.woff2`, `font/woff2`, bootstrap/`?token=` like
+xterm.css). The phone has no such system font, so shipping it is REQUIRED. The `@font-face`
+is injected **client-side** (page asset-loader IIFE) — NOT in the static `<style>` — so the
+woff2 `src` URLs carry `?token=` via `url()` exactly like the xterm assets;
+`font-display:swap` + an eager `document.fonts.load()` nudge, and the existing
+resize-to-host-grid re-measures xterm metrics so a slightly-late font swap self-corrects.
+Font is a faithful match to Ghostty, not config-driven (changing `font-family` in ghostty
+config won't follow); regenerate the woff2 if you want a different face. NOT exempt from the
+iOS-target exclusion set in `project.pbxproj` (listed alongside xterm.{js,css}). GUI-only —
+relaunch, no host restart.
+
+### HTTP API (routes + status codes)
+
+`GET /` (page); `GET /xterm.js`, `GET /xterm.css` (vendored assets, `?token=` accepted like
+the bootstrap); `GET /api/surfaces` (`{agentDashboard:Bool,
+surfaces:[{id,title,pwd,…,isAgent,hidden}]}` — the response is an OBJECT, not a bare array;
+see the agent-filters note below); `GET /api/surface/{uuid}/stream` (raw-byte xterm source;
+needs `pty-host`); `GET /api/surface/{uuid}/screen?mode=viewport|scrollback` (plain-text
+fallback, reuses `cachedVisibleContents`/`cachedScreenContents`); `POST
+/api/surface/{uuid}/input`; `POST /api/surface/{uuid}/scroll` (`{"dy":±ticks}`).
+
+Status codes: Unknown id/path → 404, wrong method → 405, bad/negative/oversized
+Content-Length → 400, chunked → 411, oversized → 413, bad Host → 403, throttled (token mode)
+→ 429.
+
+### Agent filters (fork-only, GUI-only) — list-only "Agents only" / "Hide hidden"
+
+The page's session list has two checkboxes that MIRROR the Agent Dashboard: keep only
+detected CLI-agent splits, and/or drop splits hidden in the dashboard. Both DEFAULT ON (so
+the phone opens showing only your non-hidden agents) and persist per device in `localStorage`
+(`ghostty_filter_agents`/`ghostty_filter_visible`). Filtering is PAGE-SIDE in `loadList`; the
+server just enriches each `/api/surfaces` row with `isAgent`/`hidden` and adds the top-level
+`agentDashboard` flag (whether the dashboard controller exists). The signal comes from
+`AgentDashboardController.webMonitorFilterState()` (`model.liveAgentIDs` + `model.hidden`,
+value types, read on the existing main hop in `surfacesJSON()` via `MainActor.assumeIsolated`
+like `MCPLayout.surfaceRows`). When the dashboard ISN'T running (`agentDashboard:false`) the
+checkboxes are DISABLED + greyed with a note and no filtering is applied — "filters can be
+disabled" by design. The detector pauses while the dashboard panel is hidden/occluded, so
+`isAgent` reflects last-known detection then (acceptable). ZERO host/Zig change; GUI relaunch
+to pick up. Wiring: `AgentDashboardController.webMonitorFilterState()`,
+`WebMonitorServer.swift` (`SurfaceRow.isAgent`/`.hidden`, `surfacesJSON()` read,
+`surfacesJSONData(_:agentDashboard:)` now returns the OBJECT envelope, page filter bar +
+`applyFilterAvailability` + `loadList`/`refreshBellButton` parse `data.surfaces`). Tests:
+`WebMonitorServerTests` (`surfacesJSONCarriesAgentDashboardFlag`,
+`surfacesJSONCarriesAgentAndHiddenFlags`, `htmlPageHasAgentFilters`, updated `surfacesJSON*`).
+
+### Input = REAL key/wheel events, NOT paste (critical)
+
+`ghostty_surface_text` routes through `completeClipboardPaste` (clipboard path) — pasted `\n`
+is a literal newline (never submits), control bytes aren't real keys, and newline pastes trip
+Mac paste-protection. So input is sent via `ghostty_surface_key`: a pure testable `KeySpec`
+mapping (`keySpecs(forKey:)` / `keySpecs(forText:)`) → press+release. **`KeySpec.keycode`
+MUST be the NATIVE macOS virtual keycode** (Return=36, Esc=53, Tab=48, Backspace=51,
+C=8+ctrl, U=32+ctrl, arrows 123–126) — the core resolves the physical key via
+`input.keycodes` `entry.native == keycode`, so the `GHOSTTY_KEY_*` enum value is WRONG and
+silently no-ops. Printable text rides the `text` field (keycode 0); `\n`/`\r` → a real
+Return. Scroll = `ghostty_surface_mouse_scroll` (non-precision wheel, `scroll_mods=0`; the
+host routes it per the app's mode: SGR wheel / alternate-scroll arrows / scrollback). Page
+input model: **Send (and Return-in-field) TYPE the text only — they do NOT submit**; the
+**Enter quick-key submits**; quick-keys are
+enter/y/n/esc/tab/backspace/ctrl-u(Clear)/ctrl-c, digits 1–4, arrows, and Scroll ↑/↓.
+**Press-and-hold auto-repeat** (`addRepeat`: 350ms delay → 90ms repeat; `touch-action:none` +
+preventDefault) on scroll/arrows/backspace only; the rest are single-fire.
+
+### Security defense-in-depth
+
+Independent of the token: `hostHeaderAllowed` (DNS-rebinding guard), a decaying+capped
+per-peer failed-token backoff (only applies when a token is set), and per-connection bounds
+(~10s idle watchdog + ~15s absolute deadline armed once in `handle()` + 32-connection cap) —
+the long-lived `/stream` connection is EXEMPT from the watchdogs. The page renders untrusted
+list/snapshot text via `textContent` (never `innerHTML`); the live view is `xterm.js` parsing
+the byte stream.
+
+### Threading (correctness-critical)
+
+The listener + all connections run on a DEDICATED background SERIAL queue (never
+`DispatchQueue.main`), which makes the `DispatchQueue.main.sync` hops deadlock-safe; `stop()`
+tears down with `queue.async` (a `queue.sync` from main would invert against a handler's
+`main.sync`). Every handler touching AppKit / `TerminalController.all` / `SurfaceView` /
+`ghostty_surface_*` hops to main and returns ONLY value types — never a
+`ghostty_surface_t`/`SurfaceView` across the hop. `WebMonitorHostClient` runs its socket read
+loop on its OWN background thread; `onBytes` writes straight to the (thread-safe)
+`NWConnection`. **Routing is a PURE function** `decideRoute(...) -> RouteDecision` (no
+AppKit/socket/mutation); it + `hostHeaderAllowed`, `keySpecs`, `scrollDeltaY`, `parseListen`,
+`RequestParser`, `surfacesJSONData`, `HTTPResponse`, and the host-client framing helpers are
+`internal` + unit-tested.
+
+### Push notifications on bell (Notify toggle, fork-only, GUI-only)
+
+A background **Web Push** so a bell pushes to a subscribed phone with the tab CLOSED / phone
+LOCKED — the "I stepped away" feature. The page header has a **🔔 Notify** toggle = a single
+SERVER-SIDE arm/mute flag (mute at the laptop, arm when away). Full Web Push, ZERO new deps:
+a self-generated **VAPID** P-256 keypair (RFC 8292 ES256 JWT) — **NO Firebase/Google
+project**; Chrome returns an `fcm.googleapis.com` endpoint we POST to directly with **RFC
+8291 `aes128gcm`** payload encryption (ephemeral ECDH + HKDF-SHA256 + AES-128-GCM), ALL via
+**CryptoKit**. `WebPushCrypto` (encrypt + JWT + base64url) is PURE and unit-tested against the
+**RFC 8291 §5 worked example** (byte-for-byte) + a VAPID sign/verify round-trip.
+`WebPushManager` persists the keypair + device subscriptions + the enable flag in
+**UserDefaults** (per-bundle-id; default MUTED), observes `.ghosttyBellDidRing` like
+`MCPEventBus`, and fans each bell out via `URLSession` (debounced ~3s/surface; 404/410 ⇒ drop
+the dead subscription).
+
+**HARD REQUIREMENT: a SECURE CONTEXT** — service workers only register over HTTPS, so the
+plain-HTTP-over-Tailscale-IP setup CANNOT push. The chosen TLS path is **`tailscale serve`**
+in front: bind the monitor to a **loopback INTERNAL port** (`web-monitor-listen =
+127.0.0.1:18787`) and `tailscale serve --bg --https=<external> 127.0.0.1:<internal>` proxies
+`https://<machine>.<tailnet>.ts.net:<external>` → loopback.
+
+**The external HTTPS port and the internal bind port MUST DIFFER** — the monitor binds the
+port on ALL interfaces (`*:<internal>`, host part ignored), so serving HTTPS on that same
+port makes `tailscaled` grab the tailnet IP's `:<port>` first and the monitor's wildcard bind
+then fails with `EADDRINUSE` (never starts → proxy 502s). Convention: external `8787`,
+internal `18787` (the `1`-prefixed twin).
+
+**Per-identity offset** (`WebMonitorServer.portOffset`, mirrors `MCPServer`) shifts the shared
+loopback port so the three builds coexist: Release `+0` (18787), ReleaseLocal `+1` (18788),
+Debug `+2` (18789); `tailscale serve` maps each external (8787/8788/8789) to its identity's
+loopback port. Pure helpers `portOffset(forBundleID:)` / `applyPortOffset(_:offset:)` are
+unit-tested (`WebMonitorServerTests`).
+
+`tailscale serve` only proxies to `127.0.0.1` but it does NOT rewrite `Host` to the loopback
+backend; it forwards the ORIGINAL tailnet `Host: <machine>.<tailnet>.ts.net:<external port>`
+(also in `X-Forwarded-Host`, with `X-Forwarded-Proto: https` + Tailscale identity headers).
+So `hostHeaderAllowed` explicitly **accepts any `*.ts.net` host on any port** (verified
+against the real forwarded request); reaching that endpoint already requires tailnet
+membership, and a browser cannot forge a `*.ts.net` Host against the loopback bind, so
+DNS-rebinding protection for the loopback/configured-host paths is unaffected. The token still
+gates — **NO Zig changes were needed; this is entirely Swift + page-side.** Routes (all on the
+same listener): `GET /sw.js` (the service worker — a BOOTSTRAP path, `?token=` accepted, since
+`serviceWorker.register()` can't set the header), `GET /api/push/config` (`{vapidPublicKey,
+enabled, subscriptions}`), `POST /api/push/{subscribe,unsubscribe,enabled}` (header-token like
+every `/api/*`). The page's Notify button is disabled with a "needs HTTPS" note when
+`!window.isSecureContext`. The body parsers (`pushSubscription`/`pushEndpoint`/`pushEnabledFlag`
+`fromBody:`) + the route decisions are `internal` + unit-tested.
+
+### Liveness/errors
+
+Via `UNUserNotificationCenter` + log (Console.app subsystem = bundle id, category =
+`web-monitor`). No live config-reload (relaunch to change listen/token). Zero new SPM deps
+(Foundation + Network + AppKit; `xterm.js` is a vendored static asset, bundled via the
+synchronized Sources group + iOS exclusion). **DEPLOY caveat:** the host raw-tee is a HOST
+change — rebuilding/restarting `ghostty-host` LOSES all live sessions (RAM-only); the
+GUI/page parts are GUI-only (a relaunch reattaches).
+
+### Wiring
+
+- `src/config/Config.zig` (`web-monitor-listen` + `web-monitor-token` + `pty-host` — the
+  last is now `?[:0]const u8` so `ghostty_config_get` can return it as a C string for the
+  `ptyHost` getter)
+- `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen`/`webMonitorToken`/`ptyHost`)
+- `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` (server + xterm page + routes +
+  Notify toggle + `/sw.js` + `/api/push/*`)
+- `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`)
+- `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift` (host-protocol client)
+- `macos/Sources/Features/WebMonitor/vendor/xterm.{js,css}`
+- `src/host/{Session,Server,protocol}.zig` + `src/termio/Termio.zig` (raw-tee + ring + frames
+  + observer)
+- `macos/Sources/App/macOS/AppDelegate.swift` (start/stop)
+- `macos/Ghostty.xcodeproj/project.pbxproj` (iOS exclusion of the new macOS-only files)
+
+### Tests
+
+- `macos/Tests/WebMonitor/WebMonitorServerTests.swift` (auto-discovered by the `GhosttyTests`
+  filesystem-synchronized group)
+- host frame/ring/integration tests in `src/host/test.zig` (`zig build test
+  -Dtest-filter=host`)

@@ -319,4 +319,683 @@ v1 = start / track / close (no autonomous replies). Not yet: priority/dependency
 beyond the source `list`, cross-machine coordination, Codex auto-close. Design notes + the
 review ledger:
 `scratchpad/agent-queue-design.md` (local).
-```
+
+## Implementation notes (for agents touching the code)
+
+The load-bearing facts for an agent working on the Agent Queue Supervisor code. The local
+design + review ledger is `scratchpad/agent-queue-design.md` (paths in the iteration worktree).
+
+### Generic by design + the provider contract (injection seam)
+
+- **GENERIC by design — the #1 requirement.** Ghostty/sidecar link NO tracker (Linear/
+  GitHub/Jira) code. The queue source is a **command-based provider** the template
+  defines: `list` (prints actionable items as JSON; expected to already exclude
+  blocked/claimed/done — NO dependency graph in v1), `status {key}` (prints
+  `{"state":…}`; terminal iff in `doneStates`), optional `claim`. Item fields reach the
+  PROVIDER as argv elements (`{key}`) and the AGENT as **`GHOSTTY_ITEM_*` env vars** —
+  NEVER string-spliced into a shell line (the one injection seam, closed). Completion is
+  **status-only** (idleness alone never completes — no false positives).
+
+### Engine architecture
+
+- **Engine = a deterministic, independent loop in the existing TS sidecar** (`macos/agent-manager/`,
+  `src/queue/{types,provider,grid,templates,store,supervisor,runner,wiring,commands}.ts`) —
+  NO LLM in the control path (the summarizer pass is orthogonal, still runs on the tiles on
+  its own timer). It has its OWN `ConcurrencyBudget` (the starvation lesson — a slow LLM pass
+  must never deny it a slot). Pure core (selectCandidates/nextState/grid/reconcile/applyCommand)
+  is `node --test`-tested.
+
+### Hard deps + self-disable
+
+- **HARD DEPS, self-disables silently otherwise (§2):** pty-host (detection `agentKind` +
+  STABLE session ids for persistence — `sessionID==0` without it) AND the Claude
+  agent-state hooks (the close-gate keys off hook-driven `agentState==idle` held
+  `closeStableSeconds`; `idleSeconds` is deliberately NOT a fallback — a repainting TUI
+  never idles by it). Hooks post to the INSTALLED RELEASE port, so real queues run there,
+  not a dev `+1/+2` build. **Codex can dispatch/preview but CANNOT auto-close in v1** (no
+  hooks) — documented limitation.
+
+### No-duplicates guarantee
+
+- **No-duplicates guarantee, robust WITHOUT `claim`** (§7/§9): synchronous pre-`await`
+  active-set insert (within-tick), durable sidecar store keyed by `sessionID` +
+  reconcile-each-sweep (cross-tick/restart), cooldown (re-dispatch of a just-finished key).
+  `claim` is a latency optimization only. **Resilience is first-class:** a started queue +
+  its in-flight items survive a sidecar OR GUI restart with NO re-dispatch and NO orphaning
+  — the **first sweep is dispatch-suppressed until reconcile runs**, crash-safe dispatch
+  ordering (pending record → spawn → annotate → finalize), orphan adoption, finalized-record
+  prune is grace-gated against a one-sweep `list_surfaces` lag. (These three — the lag grace,
+  orphan grid-slot reclamation, and the `sessionID:0` self-disable — were the adversarial-
+  review blockers; all fixed + regression-tested.)
+
+### DISPATCH LATCH (§7.1)
+
+- **DISPATCH LATCH (§7.1) — block re-dispatch ENTIRELY until the item leaves the list and
+  returns.** The ~2-min `cooldown` is NOT enough on its own: the dispatch→claim gap is
+  HUMAN-GATED (the agent waits for the user's go-ahead before `/todo claim`, which is what
+  moves the item off the queried state), so a split KILLED in that window leaves the item
+  STILL in the `list` — and the cooldown would expire and re-grab it (and a restart drops the
+  cooldown map → re-grab immediately). So every dispatched key joins a PERSISTED `dispatched`
+  latch (`QueueRun.dispatched`, in the per-run store file); `selectCandidates` suppresses any
+  latched key OUTRIGHT (not time-cooled). The latch is RE-ARMED (cleared) only when a
+  SUCCESSFUL `list` no longer reports the key (it left the actionable set — claimed / blocked /
+  labeled / moved off the queried state); a FAILED list never re-arms (no false re-enable on a
+  transient provider error). So re-dispatch requires a real **status round-trip** (leave the
+  list, return) — the user's explicit "block it off unless it literally changes status and back
+  to Todo." Consequence: a crashed (EXITED) agent whose item stays listed is
+  NOT auto-retried — it needs the round-trip too (a crashed agent is not
+  blindly re-run on the same item). Latched at dispatch intent (rolled back only if the spawn
+  itself fails), persisted on every store write, rehydrated on the first reconcile (so the
+  suppression survives a sidecar/GUI restart), and cleared on `abort` (a deliberate re-start is
+  fresh). Wiring: `store.ts` (`StoreFile.dispatched` + `serializeStore`/`parseDispatched`/
+  `loadDispatched` + `persistStore` 4th arg), `supervisor.ts` (`selectCandidates` `dispatched`
+  param), `runner.ts` (`QueueRun.dispatched` + latch add/rollback in `dispatchOne` + re-arm in
+  `dispatchCandidates` + rehydrate on first reconcile). Tests: `store.test.ts`
+  (serialize/parse/persist round-trips + tolerance), `supervisor.test.ts` (`selectCandidates`
+  latch skip + re-arm), `runner.test.ts` (kill-before-claim NOT re-dispatched w/o a round-trip,
+  crashed-EXITED cooled-then-latched, latch persists across restart).
+
+### On-demand command channel + `take_queue_commands` (§8a)
+
+- **ON-DEMAND lifecycle via a GUI→sidecar COMMAND CHANNEL** (§8a) — the sidecar is the MCP
+  CLIENT so the GUI can't push; commands are DRAINED. `MCPServer` holds a thread-safe FIFO
+  (enqueued on its serial queue via a `.ghosttyQueueCommand` observer the palette/dashboard
+  post to; `QueueCommandBridge.swift`/`MCPQueueCommands.swift`), drained by the new MCP tool
+  **`take_queue_commands`**. The sidecar applies start/pause/stop(drain)/abort/resume
+  (`commands.ts applyCommand`), persists the active-run SET (`active-runs.json`) + rehydrates
+  it on restart. **A template merely on disk does NOT auto-run** (replaced Phase-1
+  `loadRuns(all)`) — only a started/persisted run.
+
+### START-TIME PARAMS + maxItems override (§8b)
+
+- **START-TIME PARAMS (§8b) — prompt for project/milestone/maxItems/etc. at start, don't hard-code.**
+  A template can declare `params: [{name, target?, env?, label?, default?, required?}]`; on start the
+  QueuePalette PROMPTS for each (a form, pre-filled with `default`), and each answer is delivered
+  per its `target`. **`target` (default `"env"`)** picks the delivery: an `"env"` param is
+  injected into the PROVIDER command env under `param.env` (the `list`/`status`/`claim` calls
+  read it) — so ONE generic template is re-pointed at a different scope per run with no file
+  edits; a **`"maxItems"`** param instead sets the RUN's lifetime dispatch cap (overriding the
+  template `maxItems`), so the user picks 1/2/unlimited at start (the headline ask — "run it
+  careful with maxItems=1, or unlimited"). STAYS GENERIC: the TEMPLATE names the env var / opts
+  into the maxItems prompt; Ghostty never hard-codes "Linear". An env param scopes "what to work
+  on" and is delivered ONLY to the provider, NOT the agent (the agent gets per-item
+  `GHOSTTY_ITEM_*`); a maxItems param reaches NEITHER (it tunes the engine). Env resolution is
+  `answer ?? default ?? omit` (`resolveParamsEnv`, pure); a REQUIRED param with no answer+no
+  default REJECTS the start (`missingRequiredParams`, enforced in the factory + the GUI Start
+  button is disabled). The maxItems override (`resolveMaxItemsOverride`, pure): blank/garbage →
+  `undefined` (use the template `maxItems`, a safe finite); `"0"`/`"unlimited"`/`"none"`/`"inf"`/`"∞"`
+  → unlimited (no lifetime cap — `maxItemsRemaining` is Infinity in `dispatchCandidates`, the
+  global `agent-queue-max-total`+grid+concurrency still bound it); a positive integer → that cap.
+  Validation: `target` must be `"env"`|`"maxItems"`; an env param needs a valid `env`; AT MOST ONE
+  maxItems param (a 2nd is rejected). Params persist in the active-runs record (`params` map) so a
+  restart re-applies the same scope AND maxItems. A template with no params starts directly (prior
+  behavior). **The Swift palette is UNCHANGED** — its `templateParams` parser reads name/label/
+  default/required and is `env`/`target`-agnostic, so the maxItems param prompts like any other
+  with no GUI code change. Wiring: sidecar ONLY — `types.ts` (`QueueParam.target`/`QueueParamTarget`,
+  `env` now optional), `templates.ts` (`validateParams` target + `resolveParamsEnv` skips non-env +
+  new `resolveMaxItemsOverride`), `runner.ts` (`dispatchCandidates` applies the override). The
+  env-param plumbing (`runner.ts` `QueueRun.params`, `commands.ts`, `store.ts`, `mcp.ts`,
+  `wiring.ts`, `QueueCommandBridge.swift`, `QueuePalette.swift`) is unchanged — the maxItems answer
+  just rides the existing `params` map. Tests: sidecar `templates.test.ts` (target validate +
+  `resolveParamsEnv` skip + `resolveMaxItemsOverride` cases), `runner.test.ts` (override CAPS a
+  sweep below list size + `"0"` unlimited dispatches PAST the template cap), plus the existing
+  `commands.test.ts`/`store.test.ts`/`mcp.test.ts` and Swift `QueuePaletteTests`. **A rebuilt
+  sidecar `dist` is enough (the GUI respawns it); no GUI relaunch / host / Zig change.**
+
+### Start-form live preview + value suggestions (§8b UX)
+
+- **START-FORM LIVE PREVIEW + VALUE SUGGESTIONS (§8b UX, GUI-only, no sidecar/host/Zig change).**
+  The start-form is no longer blind free-text — two GUI-SIDE probes run the template's
+  provider commands directly (via `Process`, off-main, debounced ~0.35s, generation-guarded so
+  stale results are discarded) as fields change:
+  - **Live `list` PREVIEW** — once all REQUIRED fields are filled, the form runs
+    `provider.list.command` with the CURRENT values as provider env and shows a success signal:
+    "N items would be queued" + a sample of titles, or "no matching items" (amber), or the
+    provider's last stderr line (red). Catches typos immediately (wrong project → empty/error).
+    Gated on `canStart` so it doesn't spam "missing scope" errors while you're still typing.
+  - **Per-param VALUE SUGGESTIONS** — a param may declare an OPTIONAL `valuesCommand` (argv) that
+    prints a JSON array of suggested values (bare strings OR `{value,label?}`). The form runs it
+    with the current values as env and shows a small menu next to the field; picking one fills it
+    (no typing exact names). Because the env carries the OTHER fields, a DEPENDENT provider works:
+    milestones' `valuesCommand` reads `$LINEAR_PROJECT` and re-runs when the project field changes
+    (empty list when no project chosen). Every `valuesCommand` re-runs on each debounced change
+    (simple + handles dependencies; a failed probe keeps the prior list rather than blanking).
+  - **The probe is the GUI running the provider, NOT the sidecar** — the sidecar is the MCP client
+    and can't be queried by the GUI, so the form execs the argv itself via `/usr/bin/env <argv>`
+    (so a bare `python3`/`node` resolves on PATH) in the template `workdir`, inheriting the GUI env
+    + the form's provider env. The env build mirrors the sidecar's `resolveParamsEnv`
+    (`QueueProviderProbe.providerEnv`: env-target non-blank only; maxItems/blank skipped).
+  - **Schema:** `QueueParam.valuesCommand?: string[]` (TS type + `validateParams` validates it as an
+    optional argv even though only the GUI runs it; `env` stays optional). Wiring: sidecar —
+    `types.ts`/`templates.ts` (`valuesCommand` field + validation); Swift — `QueuePalette.swift`
+    (`QueueParamSpec` gains `env`/`isMaxItems`/`valuesCommand`; new `QueueTemplateProbe` +
+    `templateProbe()`; `QueueParamProber` @MainActor debounced probe model; `QueueProviderProbe`
+    pure `providerEnv`/`parseValues`/`previewState` + the blocking `run`; `QueueParamFormView` adds
+    the suggestion menus + preview footer). Linear value scripts live in the untracked config
+    (`example-projects.py` = all projects; `example-milestones.py` = milestones for `$LINEAR_PROJECT`,
+    `[]` when none). Tests: sidecar `templates.test.ts` (valuesCommand validate); Swift
+    `QueuePaletteTests` (`templateParamsParsesTargetAndValuesCommand`, `templateProbe*`,
+    `providerEnv*`, `parseValues*`, `previewState*`). **GUI relaunch to pick up (Swift change); the
+    `valuesCommand` field needs no sidecar restart (the running sidecar ignores unknown param fields).**
+
+### GRID layout — balanced BSP + multi-tab overflow (§12)
+
+- **GRID layout = BALANCED BSP, GUI-placed, with MULTI-TAB OVERFLOW (§12; reworked from the
+  old slot-geometry planner — then extended from single-tab to overflow).** A run lays its
+  splits out as up to `cols×rows` panes PER TAB and OVERFLOWS to additional tabs (in the run's
+  own window) when `concurrency` exceeds one tab — so concurrency 9 with a 3×2 grid fills tab 1
+  (6) then spills 3 into tab 2, and 18 fills three tabs. The engine no longer computes split
+  geometry from an abstract grid: `grid.ts` is pure OCCUPANCY ACCOUNTING — slots are integers in
+  `[0, concurrency)`, slot `i` lives in **tab `floor(i / capPerTab)`** (`tabIndexForSlot`), and
+  `lowestFreeSlot` fills the lowest tab first (reusing a closed split's hole before opening a
+  higher slot). `splitPlan(occupied, newSlot, capPerTab)` → `firstTab` (the run's first tab) |
+  `{newTab, windowAnchorSlotIndex}` (the first pane of a fresh OVERFLOW tab — open a new tab in
+  the run's window, anchored on any live pane so all the run's tabs share ONE window) |
+  `{balanced, anchorSlotIndex}` (a split WITHIN the target slot's tab, anchored at the lowest
+  occupied slot OF THAT TAB). The
+  actual tiling is a **balanced binary-space-partition done GUI-side**: `spawn_split_command`
+  with `balanced:true` splits the **LARGEST pane in the run's tab along its longer side**
+  (`SplitTree.largestLeafSplit(within: realPixelBounds)` — wider/square → `.right`, taller →
+  `.down`). **Why BSP, not slot-neighbor planning:** Ghostty's binary tree
+  RE-FLOWS when a pane closes (the sibling absorbs the parent region), so a slot→grid-neighbor
+  planner diverges from real geometry after any agent finishes and a refill splits a
+  geometrically-wrong pane → **stray extra columns/rows**. The BSP places every split from
+  the REAL tree, so it stays evenly tiled and self-heals across closures. **CRITICAL:**
+  `largestLeafSplit` MUST use real pixel `bounds` (the window content size) — `spatial()`'s
+  no-bounds fallback uses artificial 1×1 column/row units where every leaf looks square →
+  always `.right` → a single row of N columns (it's scoped per-TAB — each tab is its own
+  `TerminalController.surfaceTree`, so the BSP correctly tiles within one tab). `cols×rows` is
+  now the PER-TAB pane cap; `concurrency` is the TOTAL across tabs and MAY exceed it (overflow),
+  clamped to `cols×rows × MAX_QUEUE_TABS` (8) so a fat-finger can't open hundreds of tabs. The
+  template `grid.fill` / col-vs-row split is IGNORED for placement (only `cols*rows` = the
+  per-tab cap matters). `remainingSlots` bounds dispatch by `min(concurrency − active, global)` —
+  the grid is NO longer a term (overflow handles >grid). Wiring: sidecar — `grid.ts`
+  (`tabIndexForSlot` + tab-aware `splitPlan` + `MAX_QUEUE_TABS`), `runner.ts` (`dispatchOne` slot
+  `[0,concurrency)` + 3-case spawn: firstTab / newTab+windowAnchorUUID / balanced+targetUUID;
+  `effectiveConcurrency` clamps to `capPerTab*MAX_QUEUE_TABS`),
+  `supervisor.ts` (`remainingSlots` drops the grid term), `templates.ts` (`clampConcurrency` →
+  `[1, cap*MAX_QUEUE_TABS]`), `mcp.ts` (`spawnSplitCommand` `windowAnchorUUID` arg). Swift —
+  `SplitTree.swift` (`largestLeafSplit(within:)`, pure), `MCPLayout.swift` (`newSplitCommand`
+  `balanced` path → window content size → `largestLeafSplit`; `windowAnchorUUID` → open the
+  overflow tab in that pane's window), `MCPTools.swift`
+  (`spawn_split_command` `balanced` + `windowAnchorUUID` schema + dispatch; direction required only when NOT
+  balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `tabIndexForSlot` +
+  `splitPlan` firstTab/newTab-overflow/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
+  direction; **concurrency>grid OVERFLOWS to a new tab** — slot 0 firstTab, slot in-tab balanced,
+  overflow slot newTab+windowAnchorUUID), `supervisor.test.ts` (`remainingSlots` concurrency-only +
+  effConcurrency override), `templates.test.ts` (concurrency may exceed one grid, clamps at
+  `cap*MAX_QUEUE_TABS`); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
+  biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+### Continuous packing — `packMove` (§12)
+
+- **CONTINUOUS PACKING (§12) — consolidate fragmented tabs by MOVING panes.** When agents
+  finish unevenly a run fragments (e.g. tabs of 3 + 1 + 1 panes that could sit in one tab).
+  Each healthy sweep (after close, BEFORE dispatch) the engine computes ONE merge via pure
+  `packMove(occupied, capPerTab)` — the HIGHEST non-empty tab whose panes ALL fit the free
+  space of the LEFTMOST earlier tab — and physically MOVES that whole tab's panes there,
+  closing the emptied source tab. Applying one merge per sweep CONVERGES to the fewest tabs
+  WITHOUT reshuffling a balanced layout: `4+4` / `5+2` (cap 6) never move because the higher
+  tab doesn't FIT the lower tab's free space; `3+1+1` packs to one tab over two sweeps. No
+  hard-coded numbers — everything derives from `capPerTab` + occupancy. The move is a
+  FOCUS-PRESERVING cross-tab relocation reusing Ghostty's proven drag-and-drop primitive
+  (`surfaceTree.inserting` on the destination + `removeSurfaceNode` on the source), so it
+  never steals focus or raises a window; a moved pane's `gridSlot` is reassigned to the
+  target tab's range (tab membership). SAFE-DEFERS: if any source pane is not yet seated
+  (host still attaching, no `surfaceUUID`) the WHOLE merge defers to a later sweep (never a
+  half-move that re-fragments); a failed move stops the sweep (next retries). Runs only on
+  the dispatch-eligible gate (armed, not disabled/paused/draining). Wiring: sidecar —
+  `grid.ts` (`packMove` + `PackMove`), `runner.ts` (`packRun` — exported; `seatedAtSlot`;
+  called in `runOne` before `dispatchCandidates`), `mcp.ts` (`moveSurfaceIntoTab` client).
+  Swift — `BaseTerminalController.moveSurfaceIntoThisTab(source:balanced:)` (focus-preserving
+  cross-tab move), `MCPLayout.moveSurfaceIntoTab(sourceUUID:targetAnchorUUID:balanced:)`,
+  `MCPTools.swift` (`move_surface_into_tab` tool — now 20 tools). Tests: sidecar
+  `grid.test.ts` (`packMove`: 3+1+1 merge / 4+4 + 5+2 no-reshuffle / full-tab-skip / hole
+  reuse / multi-pane), `runner.test.ts` (`packRun` moves + reassigns slot / single+balanced
+  no-op / defers-when-unseated), `mcp.test.ts` (`moveSurfaceIntoTab` forwarding); Swift
+  `MCPServerTests` (`toolsListHasAllTools` now 20). **GUI relaunch + rebuilt sidecar `dist`;
+  no host/Zig change.**
+
+### Exit forms (template knob)
+
+- **Exit forms (template knob):** `agent.exit` supports a TYPED exit
+  command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
+  `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only
+  recognizes hyphenated names (`ctrl-d`/`ctrl-c`/`enter`/…) — a non-hyphenated `"ctrl_d"`
+  silently no-ops. Claude Code swallows Ctrl-D, so use
+  `{text:"/quit"}`. The close sequence is sendText/sendKey-prelude → `awaitExited`
+  (bounded; force-closes anyway on timeout, so a `/quit` that leaves the launching shell alive
+  still tears down) → forceClose. **There is no `quitWhenEmpty`** — a run is removed only by an
+  explicit stop/abort.
+
+### Close path — `force_close_surface` (§10)
+
+- **Close path (§10) — the subtle one:** `close_surface`/`request_close` HONORS
+  `confirm-close-surface` and would pop a modal for a live agent. So the supervisor sends the
+  template `agent.exit` prelude (→ child exits) then calls **`force_close_surface`**, which
+  routes a LAST/ONLY-pane (tree-root) close to the confirm-FREE
+  `closeTabImmediately()`/`closeWindowImmediately()` (NOT `closeTab`/`closeWindow`, which
+  re-check `needsConfirmQuit`) — `TerminalController.closeSurface` override. `onAgentExit:
+  leave-and-bell` keeps a crashed split for review + rings the bell everywhere via
+  **`signal_attention`** (posts `.ghosttyBellDidRing` with the SurfaceView as `object`, so
+  the dashboard aggregate + web monitor + push all fire), and FREES the slot (no deadlock).
+
+### New MCP tools (the engine's "hands")
+
+- **New MCP tools (Swift, the engine's "hands"):** `spawn_split_command` (opens the run's
+  first tab or splits a target surface running a command, returns `{id, sessionId}` —
+  `MCPLayout.newSplitCommand` reads the new leaf's UUID + `ghostty_surface_session_id` back
+  as VALUE types on the main hop), `force_close_surface`, `signal_attention`,
+  `take_queue_commands`, plus `sessionID` added to `list_surfaces` rows and queue annotation
+  fields (`queueKey`/`queueName`/`queueUrl`, partial-merge like summary/suggestion). No host/
+  Zig protocol change — only 3 additive default-off config keys (`agent-queue`,
+  `agent-queue-templates-dir`, `agent-queue-max-total`) + the `start_agent_queue` action.
+
+### Dashboard — grouping / filtering / controls (§11)
+
+- **Dashboard** (§11): tiles **grouped by origin** (queue name, or `(other)` for non-queue
+  agents), per-tile origin **marker**, a top **filter bar** (include/exclude origins,
+  persisted; VIEW-only — an excluded ringing/waiting agent still alerts), per-queue
+  Pause/Stop/Abort header buttons (post `.ghosttyQueueCommand`). Start via the
+  `start_agent_queue` action (+ `:template-name`) → `QueuePalette` (mirrors `ProjectPalette`)
+  → posts a `start` command. Wiring: sidecar `src/queue/*`; Swift
+  `macos/Sources/Features/MCP/{MCPLayout,MCPTools,MCPServer,MCPAnnotation,MCPQueueCommands,
+  QueueCommandBridge}.swift`, `AgentDashboard/{AgentDashboardController,View,PreviewTile,
+  AgentStateBridge}.swift`, `Command Palette/QueuePalette.swift`, `Terminal/
+  {TerminalController,BaseTerminalController,TerminalView}.swift`, `Ghostty/{Ghostty.App,
+  Ghostty.Config}.swift`; core `src/config/Config.zig` + `src/input/{Binding,command}.zig` +
+  `src/apprt/action.zig` + `src/Surface.zig`. Tests: sidecar `node --test` (337+), Swift
+  `MCPServerTests`/`MCPAnnotationTests`/`AgentDashboardTests`/`QueuePaletteTests`, Zig
+  `agent-queue` config + `start_agent_queue` binding. **GUI relaunch + rebuilt sidecar
+  `dist` to enable; no host restart.**
+
+### Per-tile CLOSE button (wedged-slot escape hatch)
+
+- **Per-tile CLOSE button (GUI-only, queue tiles only) — the wedged-slot escape hatch.** On
+  hover each tile shows the existing **Hide ✕** (view-only declutter; the split keeps
+  running) and, ONLY on a **queue-owned** tile (one carrying a `queueName` annotation), a red
+  **⏹ `stop.circle`** that **force-closes** the split: it ends the agent + frees the queue
+  slot (the surface vanishing makes the next sweep reconcile + prune the record). It routes
+  through the confirm-FREE `MCPLayout.forceClose` (same path the queue's own auto-close uses),
+  so it works on a live agent without the `confirm-close-surface` modal — gated behind a
+  confirmation dialog (no undo). It's the manual remedy when auto-close is wedged (e.g. a
+  stuck-`working` hook). Queue-only by design: on a non-queue `(other)` agent a force-close is
+  an unscoped "kill this terminal" next to the harmless Hide. Wiring:
+  `AgentPreviewTile.swift` (`isQueueOwned` = `entry.annotation?.queueName` non-empty + the
+  `onClose` button + `confirmationDialog`), `AgentDashboardController.swift`
+  (`AgentDashboardModel.closeSurface(_:)` → `MCPLayout.forceClose`), `AgentDashboardView.swift`
+  (`onClose:` wiring). Tests: `AgentDashboardTests` (`capDraft*` neighborhood; the button +
+  gating are SwiftUI, not unit-tested). **GUI-only, GUI relaunch to pick up; no sidecar/host/Zig change.**
+
+### QUEUE HEALTH bar (§11)
+
+- **QUEUE HEALTH bar (§11, sidecar→GUI push).** The dashboard shows each running queue's
+  health in its section header — even BEFORE any split spawns and even when every tile is
+  hidden/filtered (the "scary blank at start" + "all hidden" fixes). The supervisor PUSHES
+  a run-level snapshot EVERY 5s sweep (incl. the dispatch-suppressed arm sweep) via a new
+  MCP tool **`report_queue_status`**: `{queueName, present, phase, queued, listOk, active,
+  dispatched, maxItems|null, next:[{key,title?}]}`. The header renders a phase chip
+  (starting/running/paused/draining/disabled) + `QueueHealthFormat.healthText` ("N waiting ·
+  M running · dispatched/cap", ∞ = unlimited — so a reached `maxItems` like `1/1` is
+  obvious) + "next: KEY,KEY,…". **`present:false`** (reported on drain/abort/quit removal)
+  clears the section. The "show with no tiles" behavior: `AgentDashboardModel.groupByOrigin`
+  gained a `presentQueues` param that injects an EMPTY section for any present queue with no
+  (visible) entries, and `sections` passes the (filter-minus) `queueStatuses` keys; the
+  `content` body now falls through to the sectioned list (not the "no agents" placeholder)
+  whenever `queueStatuses` is non-empty. **The ~170s "only one item, then a delay" the user
+  saw was NOT serialization** — the engine dispatches up to min(concurrency, grid, maxTotal,
+  maxItemsRemaining) per 5s sweep; the gap was the 2nd item only becoming actionable in the
+  `list` later. Health-bar visibility makes that observable. Sidecar wiring: `status.ts`
+  (pure `queueStatusReport` + `QueueStatusReport`), `runner.ts` (`lastListItems`/`lastListOk`
+  cache + `effectiveMaxItemsCap` + `reportQueueStatus`/`reportRunGone` each sweep, single
+  funnel for the dispatch-decision returns so the report ALWAYS fires), `mcp.ts`
+  (`reportQueueStatus`). Swift: `QueueCommandBridge.swift` (`QueueStatus` +
+  `QueueStatusPayload.fromArguments` + `.ghosttyQueueStatusDidChange` +
+  `MCPServer.applyQueueStatus`), `MCPTools.swift` (schema + dispatch), `MCPServer`
+  (handler), `AgentDashboardController.swift` (`queueStatuses` @Published + `applyQueueStatus`
+  + `subscribeQueueStatus` + `groupByOrigin(presentQueues:)` + `sections`),
+  `AgentDashboardView.swift` (`OriginSectionHeader` status line + `QueueHealthFormat` +
+  the `content` fall-through). Tests: sidecar `status.test.ts` + `mcp.test.ts`
+  (`reportQueueStatus`) + `runner.test.ts` (a sweep reports starting→counts); Swift
+  `MCPServerTests` (`queueStatusPayload*`, `toolsListHasAllTools` now 18) +
+  `AgentDashboardTests` (`AgentQueueHealthTests`: apply/clear, empty-section grouping,
+  `healthText`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+#### Clickable count DROPDOWNS
+
+- **Clickable count DROPDOWNS (mirrors the hidden-agents popover).** The "N waiting" and
+  "M running" counts in the header are buttons that open a popover listing those items
+  with **Linear links** (key badge · title · `Link` for http(s) urls; "… and N more" when
+  the waiting list is capped). This required the report to carry per-item DETAIL, not just
+  counts: `QueueStatusReport.next` items gained `url`, and a new `running: QueueItemRef[]`
+  (key/title/url per slot-occupying agent) was added — `runner.ts reportQueueStatus` builds
+  `runningItems` from the active assignments (title/url captured at dispatch) and sends
+  `nextLimit:25`; the pure builder's `active` is now `runningItems.length`. Swift mirrors it:
+  `QueueStatus.Item` (was `NextItem`, +`url`, `Identifiable`) + `running: [Item]`, parsed by a
+  shared `items(_:)` helper in `QueueStatusPayload`; `report_queue_status` schema gains `url`
+  on next + a `running` array; `OriginSectionHeader` renders `countButton`→`itemsPopover`
+  (Linear `Link` via `itemLink`, http(s)-gated like `queueURLLink`) and `QueueHealthFormat`
+  swapped `healthText`→`progressText` (just the "dispatched/cap" suffix; the counts are now
+  buttons). Tests: sidecar `status.test.ts` (next url + running echo) + `mcp.test.ts`
+  (running forward); Swift `MCPServerTests` (parse url+running) + `AgentDashboardTests`
+  (`progressText`, `applyKeepsNextAndRunningItems`). **GUI relaunch + rebuilt sidecar `dist`.**
+
+#### BACKLOG DEPENDENCY GRAPH
+
+- **BACKLOG DEPENDENCY GRAPH (the "N backlog" button → DAG canvas; sidecar→GUI push).**
+  The header gets an "N backlog" button that opens a resizable window rendering the run's
+  WHOLE board (every state — not just actionable) as a left→right layered dependency graph:
+  columns by blocked-by depth, arrows for "blocked by", node cards colored by workflow-state
+  category with label chips, a green ring on running items, click→jump-to-split (running) or
+  open the tracker URL. **The data needs a NEW OPTIONAL `provider.graph` command** (sibling of
+  `list`/`status`; absent ⇒ no button) — kept SEPARATE from `list` because `list` must stay
+  "actionable-only" (it drives dispatch). It is fetched on the SAME cadence as `list`
+  (`intervals.listMs`, reusing a `lastGraphAtMs` throttle), INDEPENDENT of dispatch (runs while
+  paused/draining, skipped only when `disabled`), cached on `QueueRun.lastGraph`, and PUSHED via
+  a new MCP tool **`report_queue_graph`** (`{queueName,present,backlog,nodes[]}`; `present:false`
+  on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE/SCHEDULABLE
+  remainder: non-terminal nodes that are NOT currently waiting/running AND NOT already
+  in-progress (`backlogCount`, pure — exclude = the actionable-list keys ∪ active assignment
+  keys, plus any node whose `stateType` is in `IN_PROGRESS_STATE_TYPES` = {`started`}). The
+  in-progress exclusion fixes the "2 backlog but only 1 schedulable" report: an In-Progress
+  issue is non-terminal and not in the actionable Todo `list`, so it WOULD have been counted as
+  backlog even though the queue can never dispatch it (the `list` provider only yields Todo).
+  It is still RENDERED in the DAG (blue node) — only the badge number drops it; an absent/unknown
+  `stateType` still counts (safe default). STAYS GENERIC: the node's `done` (terminal,
+  excluded+dimmed) and `stateType` (color category) are PROVIDER-decided — Ghostty maps no
+  tracker; `QueueBacklogColors` is a cosmetic category→color map with a neutral fallback. The
+  DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
+  blocked-by cycle is broken via a `resolving` guard) and ignores edges to keys outside the
+  scope. The canvas window is one-per-run via `QueueBacklogWindowManager` (MainActor; strong
+  ref + `willClose` observer that drops both the window and itself — no leak/double-open). Its
+  DEFAULT size is fit-to-content (the whole board, no scrolling) floored at a minimum and
+  CLAMPED to the display: shared geometry `QueueBacklogGeometry` (the card/gap constants the
+  view also uses) computes `preferredWindowSize(nodes)`, and `QueueBacklogWindowManager.defaultContentSize(nodes:screen:)`
+  floors it at `minContentSize` (480×360) + clamps to `screen − screenMargin` (both pure +
+  unit-tested).
+  Wiring: sidecar — `types.ts` (`ProviderGraphSpec`/`GraphNode`/`QueueGraph`), `provider.ts`
+  (`parseGraphOutput`/`fetchGraphResult`), `status.ts` (`QueueGraphReport`/`backlogCount`),
+  `templates.ts` (`validateProviderGraph`), `runner.ts` (`QueueRun.lastGraph`/`lastGraphAtMs` +
+  `refreshGraph`/`reportGraphGone`), `mcp.ts` (`reportQueueGraph`). Swift —
+  `QueueCommandBridge.swift` (`QueueGraph`/`QueueGraphPayload`/`.ghosttyQueueGraphDidChange`/
+  `applyQueueGraph`), `MCPTools.swift` (`report_queue_graph` tool — now 19 tools),
+  `AgentDashboardController.swift` (`queueGraphs` @Published + `applyQueueGraph` +
+  `subscribeQueueGraph`), `AgentDashboardView.swift` (`backlogButton` in `OriginSectionHeader`),
+  `AgentDashboard/QueueBacklogCanvas.swift` (layout + canvas + window mgr; iOS-excluded in
+  `project.pbxproj`). Config (untracked, Linear-specific): `example-graph.py` (mirrors
+  `example-list.py` scope/auth but emits the FUTURE board — every NON-TERMINAL issue
+  (completed/canceled/duplicate EXCLUDED) + labels + blockedBy + stateType, and DROPS
+  "blocked by" edges to done blockers so a task gated only by finished work reads as a
+  ready root) + `provider.graph` in `example.json`. Tests: sidecar `provider.test.ts` (parseGraph/fetchGraph),
+  `status.test.ts` (`backlogCount`), `templates.test.ts` (graph validate), `mcp.test.ts`
+  (`reportQueueGraph`), `runner.test.ts` (graph fetch throttled + push + present:false-on-abort +
+  no-graph-no-fetch); Swift `MCPServerTests` (`queueGraphPayload*`, tool count 19),
+  `AgentDashboardTests` (`QueueBacklogTests`: assignLayers chain/diamond/cycle/dangling +
+  columns + applyQueueGraph). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+#### HIGH/URGENT PRIORITY MARK on backlog nodes
+
+- **HIGH/URGENT PRIORITY MARK on backlog nodes (generic; provider-decided).** A backlog
+  node can carry an OPTIONAL generic `priorityLabel` string (e.g. "Urgent"/"High"); the
+  canvas renders any node that has one with a prominent filled badge in the title row + a
+  louder TINTED BORDER (2pt) so high-priority items pop on the DAG (running's green border
+  still wins; a `done` node keeps its dim, no loud border). STAYS GENERIC exactly like
+  `done`/`stateType`: the PROVIDER SCRIPT decides which items get a mark and what it says —
+  Ghostty NEVER interprets the tracker-specific numeric `priority` int (Linear's 1=urgent
+  differs per tracker), it only renders whatever word lands in `priorityLabel`. The badge
+  color comes from a generic English-priority vocabulary (`QueueBacklogColors.priorityColor`:
+  urgent/critical→red, high→orange, medium/med/normal→yellow, low→gray) with an
+  ACCENT fallback so an unknown-but-non-empty label still reads as "marked"; nil/empty ⇒ no
+  mark. The Linear conversion lives in `example-graph.py` (`PRIORITY_LABELS = {1:"Urgent",
+  2:"High"}`, emitted only for those — none/medium/low omit it; edit that map to mark
+  more/fewer, no Ghostty change). (Do NOT use the raw tracker `priority` int — it's a
+  tracker-specific footgun; `priorityLabel` is the only priority signal. If numeric ordering
+  is ever wanted, add a generic provider-decided `priorityRank`, not the raw int.) Wiring:
+  sidecar — `types.ts` (`GraphNode.priorityLabel`),
+  `provider.ts` (`parseGraphOutput` keeps a non-empty string; `mcp.ts` forwards `nodes`
+  verbatim, no change); Swift — `MCPTools.swift` (`report_queue_graph` node schema +
+  `priorityLabel`), `QueueCommandBridge.swift` (`QueueGraph.Node.priorityLabel` + parse),
+  `QueueBacklogCanvas.swift` (badge + tinted border + `QueueBacklogColors.priorityColor`).
+  Config (untracked, Linear-specific): `example-graph.py`. Tests: sidecar
+  `provider.test.ts` (priorityLabel round-trip + non-empty-string rule); Swift `MCPServerTests`
+  (`queueGraphPayloadParsesFullArgs` carries it), `AgentDashboardTests`
+  (`priorityColorMarksKnownAndUnknownButNotEmpty`). **GUI relaunch + rebuilt sidecar `dist`;
+  no host/Zig change.**
+
+### Close-gate fires on QUIESCENT (idle OR waiting)
+
+- **CLOSE-GATE fires on QUIESCENT (idle OR waiting), not idle-only (sidecar-only fix).** The
+  DONE_PENDING→CLOSING gate used to require `agentState==="idle"` held `closeStableSeconds`.
+  But a finished Claude Code agent reliably settles in **`waiting`** — its `Stop`→idle hook is
+  immediately overwritten by a `Notification` "waiting for input" nudge — so an idle-ONLY gate
+  NEVER fired and the completed split was never auto-closed (real stuck case: EX-1446 sat
+  DONE_PENDING with status=Done, agentState=waiting, forever). Fix: a pure `isQuiescent(agentState)`
+  = `idle || waiting`; `supervisor.ts` `nextState` gates on `isQuiescent`, and `foldIdleAnchor`
+  anchors the hold on EITHER state AND **keeps the anchor across an idle↔waiting transition**
+  (only `working`/`undefined` resets it) — so the `Stop`→`Notification` flip keeps the close clock
+  running instead of resetting it. Status-only completion is unchanged (idleness alone still never
+  completes); this only governs WHEN a provider-DONE item's split tears down. Tests:
+  `supervisor.test.ts` (close-on-waiting-held, foldIdleAnchor anchors-on-waiting + keeps-anchor-
+  across-transition). **Sidecar-only — rebuilt `dist` + sidecar restart; no GUI/host/Zig change.**
+
+### LIVE maxItems EDIT (§8b)
+
+- **LIVE maxItems EDIT — change a running queue's cap from the dashboard, no restart (§8b).**
+  A new `set_max_items{run,maxItems}` command re-sets a LIVE run's lifetime dispatch cap WITHOUT
+  restarting it (the headline ask: bump 3→10 mid-run). The dashboard header's "dispatched/cap"
+  suffix is now **tap-to-edit** → a popover with preset buttons (1/2/5/10/∞) + a custom field; the
+  raw string is posted (the sidecar parses it, so a fat-finger never silently removes the cap).
+  Bumping the cap above `lifetimeDispatched` re-enables dispatch on the next sweep (`maxItemsRemaining`
+  recomputes); LOWERING it only stops FUTURE dispatch — running agents are never killed. **NOTE the
+  run-identity semantics** (UPDATED by the per-scope-identity change — see the "PER-SCOPE RUN
+  IDENTITY" bullet below): after the `queue-parallel` merge a run is keyed by **template basename +
+  resolved scope** (`identityScope` = the resolved provider env, e.g. project/milestone — see
+  `commands.ts applyCommand`). A re-`start` with the SAME basename AND SAME scope is an idempotent
+  NO-OP that ignores the second start's maxItems — so you can't rescope or re-cap a live run by
+  re-starting it; `set_max_items` is the in-place cap edit. A DIFFERENT scope of the same template is
+  a DISTINCT run that proceeds in PARALLEL (own tab + state file), so two milestones run at once from
+  ONE template — you do NOT need two template files.
+  Engine: a new
+  mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
+  consults FIRST (over the start-time param + template cap); persisted in the active-runs record
+  (`maxItemsLive`) so a restart re-applies it. A shared pure `parseMaxItemsValue` (null=unlimited,
+  N=cap, undefined=blank/garbage→ignored) backs both this and the start-time `resolveMaxItemsOverride`.
+  Wiring: sidecar — `templates.ts` (`parseMaxItemsValue` + `resolveMaxItemsOverride` reuse), `runner.ts`
+  (`QueueRun.maxItemsLive` + `effectiveMaxItemsCap` + `makeQueueRun` opt + `activeRunRecords`),
+  `commands.ts` (`set_max_items` action + `maxItems` field + reducer case + `applyCommands` change-bit),
+  `store.ts` (`ActiveRunRecord.maxItemsLive` + tolerant parse), `wiring.ts` (rehydrate), `mcp.ts`
+  (`coerceQueueCommands` whitelists + carries `maxItems`). Swift — `QueueCommandBridge.swift`
+  (`QueueCommand.Action.setMaxItems`="set_max_items" + `maxItems` field + `jsonObject`),
+  `AgentDashboardController.swift` (`setQueueMaxItems(run:value:)`), `AgentDashboardView.swift`
+  (`OriginSectionHeader` cap button + `capEditorPopover` + `QueueHealthFormat.capDraft`). Tests:
+  sidecar `templates.test.ts` (`parseMaxItemsValue`), `commands.test.ts` (set_max_items apply/unlimited/
+  ignore-garbage/unknown-run/change-bit), `runner.test.ts` (`effectiveMaxItemsCap` live override + bump-
+  re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
+  Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
+  **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+### LIVE concurrency EDIT
+
+- **LIVE concurrency EDIT — change a running queue's max SIMULTANEOUS agents from the dashboard,
+  no restart (the headline ask: bump example 6→9 mid-run).** Mirrors the live maxItems edit. A new
+  `set_concurrency{run,concurrency}` command re-sets a LIVE run's max parallel agents WITHOUT
+  restarting it (a re-`start` is a same-scope no-op, so this is the only in-place path). The
+  dashboard header gets a tap-to-edit **`⇉ N` parallel chip** (`rectangle.split.3x1` +
+  presets 1/2/3/4/6/9 + a custom field; shown once the run reports `concurrency > 0`). Engine:
+  a mutable `QueueRun.concurrencyLive?: number` (`undefined`=no edit; always a positive int — NO
+  "unlimited", an unbounded fan-out would spawn a pane per item). `effectiveConcurrency(run)` =
+  `concurrencyLive ?? template.concurrency`, CLAMPED to `[1, capPerTab*MAX_QUEUE_TABS]`. It is the
+  run's TOTAL pane budget across ALL its tabs — concurrency above one tab's `cols×rows` OVERFLOWS
+  to additional tabs (§12 multi-tab — see the GRID layout bullet), so bumping example 6→9 with a
+  3×2 grid spreads 6 panes in tab 1 + 3 in tab 2 (NOT crammed into one tab). `remainingSlots`
+  bounds dispatch by `min(effectiveConcurrency − active, global)` (the grid is no longer a term);
+  `dispatchOne` allocates `lowestFreeSlot(occupied, effectiveConcurrency)` and `splitPlan` routes
+  overflow slots to new tabs. Parsed by a pure `parseConcurrencyValue` (positive int
+  only; blank/garbage/zero/negative → ignored, so a fat-finger never changes parallelism). Persisted
+  in the active-runs record (`concurrencyLive`) so a restart re-applies it; surfaced in the §11
+  health report (`QueueStatusReport.concurrency` = effective value) so the dashboard shows + edits it.
+  The GUI optimistically updates the chip (`QueueStatus.withConcurrency` +
+  `parseConcurrencyOptimistic`) before the sidecar's authoritative push. Lowering it only stops
+  FUTURE dispatch (running agents are never killed); raising it re-enables dispatch on the next
+  list-DUE sweep (≤`listMs`). Wiring: sidecar — `templates.ts` (`parseConcurrencyValue`),
+  `supervisor.ts` (`remainingSlots` `effConcurrency` param), `runner.ts` (`QueueRun.concurrencyLive` +
+  `effectiveConcurrency` clamp + `makeQueueRun` opt + `activeRunRecords` + dispatch
+  gate + `reportQueueStatus`), `status.ts` (`QueueStatusReport.concurrency` + inputs + builder),
+  `commands.ts` (`set_concurrency` action + `concurrency` field + reducer + `applyCommands`
+  change-bit), `store.ts` (`ActiveRunRecord.concurrencyLive` + tolerant parse), `wiring.ts`
+  (rehydrate), `mcp.ts` (`coerceQueueCommands` whitelist + `reportQueueStatus` forward). Swift —
+  `QueueCommandBridge.swift` (`QueueCommand.Action.setConcurrency`="set_concurrency" + `concurrency`
+  field + `jsonObject`; `QueueStatus.concurrency` + `withConcurrency`/`parseConcurrencyOptimistic` +
+  payload parse), `MCPTools.swift` (`report_queue_status` schema `concurrency`),
+  `AgentDashboardController.swift` (`setQueueConcurrency(run:value:)`), `AgentDashboardView.swift`
+  (`OriginSectionHeader` `⇉ N` chip + `concurrencyEditorPopover` + `onSetConcurrency`). Tests:
+  sidecar `templates.test.ts` (`parseConcurrencyValue`), `supervisor.test.ts` (`remainingSlots` eff
+  override), `runner.test.ts` (`effectiveConcurrency` clamp + bump-dispatches-3rd + overflow-new-tab),
+  `commands.test.ts` (set_concurrency apply/ignore-garbage/unknown-run/change-bit), `store.test.ts`
+  (round-trip + tolerant parse), `mcp.test.ts` (coerce + report forward), `status.test.ts`
+  (concurrency passthrough); Swift `MCPServerTests` (`queueCommandJSONObjectSetConcurrency*` +
+  `queueStatusPayload` concurrency), `AgentDashboardTests` (`parseConcurrencyOptimistic*` +
+  `setQueueConcurrencyOptimistically*`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+### Instant command feedback
+
+- **INSTANT command feedback (snappiness fix for ALL queue commands).** A queue command
+  (`set_max_items`/`set_concurrency`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
+  NEXT health push — i.e. after the ~5s `QUEUE_POLL_INTERVAL_MS` poll gap AND that sweep's
+  provider round-trips (per-agent `status` probes + `list`), since `reportQueueStatus` is the
+  LAST step of a sweep. Felt like 5–15s ("really slow"). Two-part fix: **(GUI optimistic)**
+  `AgentDashboardModel.setQueueMaxItems`/`sendRunCommand` update the local `queueStatuses`
+  entry IMMEDIATELY before posting — cap via `QueueStatus.parseCapOptimistic` (mirrors the
+  sidecar's `parseMaxItemsValue`; `.none`=blank/garbage→leave as-is so we never fake a change
+  the engine ignores) + `withMaxItems`; phase via `withPhase` (pause→paused/resume→running/
+  stop→draining); abort removes the section. The sidecar's next authoritative push reconciles
+  (and corrects a mis-parsed value). **(Sidecar fast confirm)** `runQueueSweep` pushes
+  `reportQueueStatus` for every (non-aborting) run IMMEDIATELY after `applyCommands` changes
+  the registry — BEFORE the sweep's `status`/`list` round-trips — so the authoritative number
+  lands within the drain, not at sweep end. Wiring: `QueueCommandBridge.swift`
+  (`QueueStatus.withMaxItems`/`withPhase`/`parseCapOptimistic`),
+  `AgentDashboardController.swift` (optimistic mutation in both posters), `runner.ts`
+  (post-`applyCommands` immediate report loop). Tests: `AgentDashboardTests`
+  (`parseCapOptimisticMirrorsSidecar`, `setQueueMaxItemsOptimisticallyUpdatesCap`,
+  `sendRunCommandOptimisticallyUpdatesPhase`); the sidecar suite still green. **GUI relaunch +
+  rebuilt sidecar `dist`; no host/Zig change.**
+
+### Provider-call throttling — honor `intervals.listMs`/`statusMs`
+
+- **PROVIDER-CALL THROTTLING — honor `intervals.listMs`/`statusMs` (the real "5s too
+  frequent" fix).** The supervisor sweep stays at the 5s `QUEUE_POLL_INTERVAL_MS` base cadence
+  (reconcile / close / command-drain / §11 health report run EVERY sweep), but the PROVIDER
+  calls are now throttled to the template's `intervals` instead of firing every sweep — so a
+  tracker like Linear is hit at most once per `listMs` (`list`) and once per `statusMs`
+  (`status`), not every 5s. Previously both knobs were DEAD (`runner.ts` called `fetchListResult`
+  + `probeStatus` every sweep, ignoring `intervals`). Engine: two new non-persisted
+  `QueueRun.lastListAtMs`/`lastStatusAtMs` (init `NEGATIVE_INFINITY` ⇒ the first sweep always
+  fetches, and no `now===0` sentinel collision). `dispatchCandidates` skips the whole list
+  fetch+dispatch and returns 0 when `nowMs - lastListAtMs < intervals.listMs` — the §11 health
+  report (fired by `runOne` AFTER dispatch) reads the CACHED `lastListItems`/`lastListOk`, so the
+  dashboard counts stay live between polls; the latch re-arm just waits
+  for the next due fetch. The window is consumed on the ATTEMPT (set before the fetch), so even a
+  FAILED list waits a full interval — a hard cap of one `list` call per `listMs` regardless of
+  outcome. `advanceStates` gates the per-agent `status` probe on `statusDue =
+  nowMs - lastStatusAtMs >= statusMs` (decided once for the whole batch so all agents share one
+  round); when not due, `statusTerminal` stays undefined so no status-driven completion happens
+  that sweep (idle-anchor fold + close-gate still run every sweep — completion is delayed at
+  most `statusMs`, never lost). The status window is consumed ONLY if a probe actually fired
+  (`probed` flag), so a due sweep with no live SPAWNED/RUNNING agent (host-attach lag) doesn't
+  burn the interval — the next sweep with a live agent probes immediately. BEHAVIOR NOTE: a
+  `set_max_items` bump / `resume` re-enables dispatch, but the NEW dispatch lands on the next
+  list-DUE sweep (≤`listMs`), not the next 5s sweep — the dashboard cap/phase still updates
+  INSTANTLY (the optimistic + fast-confirm path above); only the actual spawn waits for the
+  poll. **Default is `{listMs:60000, statusMs:30000}`.** Wiring:
+  `runner.ts` (`QueueRun.lastListAtMs`/`lastStatusAtMs` + `makeQueueRun` init + list gate in
+  `dispatchCandidates` + status gate in `advanceStates`), `templates.ts`
+  (`TEMPLATE_DEFAULTS.intervals` → 60000/30000). Tests: `runner.test.ts` (list throttled +
+  throttled-sweep-still-reports-from-cache + status throttled + due-sweep-no-agent-doesn't-burn;
+  the shared `tmpl()` fixture sets `intervals:{0,0}` = throttle-off so the existing every-sweep
+  dispatch/state tests are preserved), `templates.test.ts` (default pinned to 60000/30000).
+  **Sidecar-only — rebuilt `dist` + sidecar respawn (GUI relaunch); no host/Zig/GUI-Swift change.**
+
+### PER-SCOPE RUN IDENTITY
+
+- **PER-SCOPE RUN IDENTITY — one template, parallel runs per project/milestone (palette shows the
+  template `name`).** Three coupled changes so a generic template (e.g. Example) is re-usable in
+  parallel for different env-param scopes:
+  - **(1) Palette shows the template `name`, not the filename.** The "Start Agent Queue…" picker lists
+    each template by its JSON `name` (e.g. "ExampleOS"), not the file basename ("example"), sorted by
+    display name. The START command + `templateParams`/`templateProbe` still key off the BASENAME (the
+    sidecar loads templates by it). `QueuePalette.discoverTemplates` now returns `[QueueTemplateEntry]`
+    (`basename` + `displayName`, read via the new `templateDisplayName`, basename fallback); the option
+    title + the param-form title use `displayName`; `QueueParamPrompt` gained `displayName`.
+  - **(2) A run's live IDENTITY is `runName` = `template.name` + its non-empty ENV-param VALUES,
+    " · "-joined** (e.g. "ExampleOS · Acme · v2.0"; maxItems params excluded — engine tuning, not
+    scope). `runName` REPLACES `template.name` everywhere the run identity flows: the annotation
+    `queueName` (dispatchOne + restampAnnotation), the §11 health report, the `activeRunRecords` name,
+    and the reconcile `projectLiveSurfaces` filter — so two scoped runs of one template are shown
+    (separate dashboard sections) AND controlled (pause/stop/abort/set_max_items target the `runName`)
+    independently. Pure helper `runDisplayName(template, values)` in `templates.ts`.
+  - **(3) Dedup is now per-SCOPE, so different scopes run IN PARALLEL (separate tabs).** `applyCommand`
+    builds the candidate run, then dedups on (basename + `identityScope`) where `identityScope` =
+    `runIdentityScope(template, values)` = the resolved provider env (sorted `name=value`, pure). Same
+    (template + scope) = idempotent no-op (unchanged); DIFFERENT scope = a second run, keyed in the
+    registry by its `runName`. The per-run STATE FILE gets a scope-hash suffix (`<basename>.<slug>.state.json`
+    via `scopeSlug(runIdentityScope(...))`) so parallel runs of one template don't collide on disk;
+    rehydration recomputes the same path. **Separate tabs are automatic** — each run starts with an empty
+    `occupied` set, so its first dispatch's `splitPlan` returns `firstTab` → a new tab per run.
+  - **(3a) State-file MIGRATION across the rename (bug fix).** The scope-suffix renamed the per-run
+    state file (`example.state.json` → `example.<slug>.state.json`), so a run that was IN FLIGHT across
+    the upgrade rehydrated under the NEW path, found no file, and **reset `lifetimeDispatched` to 0** (it
+    also lost the live maxItems edit + re-adopted its agents as orphans). Fix: `rehydrateActiveRuns`
+    RENAMES a surviving bare `<basename>.state.json` to the scoped path on first rehydrate (pure decision
+    `shouldMigrateLegacyState(scoped, legacy, scopedExists, legacyExists)` — migrate only when the scoped
+    file is absent, the legacy exists, and the paths differ; best-effort rename). Done ONLY on the
+    rehydrate path (a run that WAS active) — a FRESH `start` must NOT adopt a stale bare file. Normal
+    restarts (no rename) already persisted the count via the stable scoped path; this only covers the
+    one-time upgrade boundary. Wiring: `wiring.ts` (`shouldMigrateLegacyState` + the rename in
+    `rehydrateActiveRuns`); test: `wiring.test.ts` (`shouldMigrateLegacyState`).
+  - **(3b) REHYDRATION must key the registry by `runName`, NOT `template.name` (bug fix).** The
+    `start` path (`applyCommand`) keys the registry by `run.runName`, but `index.ts` populated a
+    RESTORED run (from `active-runs.json` on restart) with `registry.set(run.template.name, run)` —
+    so after a restart a scoped run was keyed by the bare `"ExampleOS"` while the dashboard / health
+    report target its `runName` (`"ExampleOS · Acme Foods · Visual Prototype"`). Every control
+    command (`set_max_items`, pause, stop, abort) then `registry.get(cmd.run)`→undefined → silent
+    "unknown run" no-op (the "changing maxItems does nothing after restart" bug), and two parallel
+    scoped runs of one template would COLLIDE on the bare name. Fix: a shared
+    `registerRehydratedRuns(registry, runs)` in `commands.ts` keys by `run.runName` — the SAME key
+    `start` uses — and `index.ts` calls it instead of the inline loop. So a restored run behaves
+    identically to a freshly started one. Wiring: `commands.ts` (`registerRehydratedRuns`),
+    `index.ts` (call it). Tests: `commands.test.ts` (keyed-by-runName + `set_max_items` resolves
+    after rehydrate + two parallel scoped runs coexist).
+  `makeQueueRun` computes `runName`/`identityScope` from (template + params); a `runName` collision from a
+  DIFFERENT identity is rejected (no clobber). Wiring: sidecar — `templates.ts` (`runDisplayName`/
+  `runIdentityScope`/`scopeSlug`), `runner.ts` (`QueueRun.runName`/`.identityScope` + identity usages),
+  `commands.ts` (scope-aware dedup + key-by-`runName`), `wiring.ts` (`runStatePath` scope-suffixed state
+  file, factory + rehydrate). macOS — `QueuePalette.swift` (`QueueTemplateEntry` + `templateDisplayName` +
+  `discoverTemplates` return type + `QueueParamPrompt.displayName` + option/form titles). Tests: sidecar
+  `templates.test.ts` (`runDisplayName`/`runIdentityScope`/`scopeSlug`), `commands.test.ts` (parallel
+  different-scope start + same-scope no-op + factory-consulted-on-restart); Swift `QueuePaletteTests`
+  (`discoverUsesJSONNameForDisplayAndSort`, `templateDisplayNameFallsBackToBasename`, updated discovery
+  assertions to `[QueueTemplateEntry]`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+### Restart-survival hardening
+
+- **RESTART-SURVIVAL HARDENING.** A started run + its in-flight items survive a sidecar/GUI restart
+  without the queue vanishing or its splits detaching. (Removing `quitWhenEmpty` — above — is part of
+  this: a transient SUCCESSFUL-but-INCOMPLETE post-restart `list_surfaces` must not self-remove a live
+  run.) Two further sidecar-only safeguards:
+  - **(A) PREMATURE-PRUNE FIX — reconcile-start grace.** `reconcile` takes an optional
+    `reconcileStartedMs` (default `-Infinity` = no grace); a finalized record's session-gone prune
+    is shielded for `pendingGraceMs` (30s) after the LATER of its `sinceMs` AND the run's first
+    reconcile in the current process (`run.reconcileStartedMs`, stamped once per process; a restart
+    re-stamps). So a long-lived RUNNING record survives a transient/incomplete post-restart list for a
+    full grace window. Conservative — can only DELAY a prune (hold a slot longer), never cause a
+    duplicate. Wiring: `store.ts reconcile` (param + `Math.max(sinceMs, reconcileStartedMs)` gate),
+    `runner.ts` (`QueueRun.reconcileStartedMs` stamp + pass-through). Tests: `store.test.ts`
+    (shield within grace / prune past grace / default-arg = no-grace behavior); the latch-persists
+    restart test expects the held-then-pruned sequence.
+  - **(B) PERSISTENT SIDECAR LOG.** The Swift controller pipes the sidecar's stdout to an UNREAD pipe
+    and sends stderr to `nullDevice`, so the engine's run/prune/command logs have no other durable
+    trail. `src/logfile.ts` tees `console.{log,info,warn,error}` to a ROTATING file
+    `~/Library/Logs/ghostty-ramon-agent-manager.log` (append, rotate at ~5MB → `.1`); best-effort
+    (any fs error falls back to console only, never throws); installed first thing in `index.ts main()`.
+    Pure `formatLogLine`/`defaultLogPath` unit-tested (`logfile.test.ts`). **Sidecar-only — rebuilt
+    `dist` + sidecar restart; no host/Zig/GUI-Swift change.**
