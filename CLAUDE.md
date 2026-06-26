@@ -121,8 +121,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `{ts, src:"gui"|"sidecar", ev, …}`: GUI `ring` (every bell + `focused`), `attention` (every
   `set_attention` + `reason` + `applied`=not-suppressed-by-focus), `clear` (focus dismissed a
   pending bell/attn); sidecar `classify` (per-bell `verdict`∈true/false/omitted/unparseable/error
-  + `decision`∈promote/ignore) and `alert` edges (rate-limit watchdog). Delay is measured GUI-side
-  (`ring`→`attention`), so the sidecar needs no ring-timestamp threading. GUI side is a pure-
+  + `decision`∈promote/ignore + `durationMs`=Haiku-call time + `error`/`errorKind` on errors),
+  `alert` edges (rate-limit WATCHDOG — fake bell from a prompt on the agent's screen), and
+  `backoff` edges (the CLASSIFIER's OWN account throttled ⇒ bells fail-open into fake promotions
+  until clear). Two "fake bell" sources are thus both visible. Delay = GUI-side `ring`→`attention`
+  (user-perceived) + the `classify` `durationMs` (model portion); no sidecar ring-timestamp
+  threading. GUI side is a pure-
   Foundation `BellDiagnostics` appender (O_APPEND, no AppKit ⇒ no pbxproj exclusion) gated per
   call site on `config.bellDiagnostics` (no global state); sidecar side is `diag.ts` gated by
   `GHOSTTY_BELL_DIAG=1` (forwarded by `AgentManagerController` when the config is on). Append-only

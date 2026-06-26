@@ -111,8 +111,9 @@ One JSON object per line, `{ts, src, ev, …}` (`src` is `"gui"` or `"sidecar"`)
 | `ev` | `src` | fields | what it tells you |
 |---|---|---|---|
 | `ring` | gui | `surface, title, focused` | a bell rang. `focused:true` ⇒ it was NOT classified/promoted (focus guard) |
-| `classify` | sidecar | `surface, verdict, decision, reason` | what Haiku decided for a bell. `verdict`∈`true/false/omitted/unparseable/error`; `decision`∈`promote/ignore` |
-| `alert` | sidecar | `surface, tag, edge, decision` | the rate-limit watchdog. `edge:ring` (e.g. `tag:rate_limited`) / `edge:clear` |
+| `classify` | sidecar | `surface, verdict, decision, reason, durationMs` (+ `error, errorKind` on errors) | what Haiku decided for a bell. `verdict`∈`true/false/omitted/unparseable/error`; `decision`∈`promote/ignore`. **`durationMs` = the Haiku call's wall-clock time** (the model portion of the delay). On `verdict:error` the real `error` message shows whether it was a fail-open *caused by the classifier's own rate-limit* |
+| `alert` | sidecar | `surface, tag, edge, decision` | the rate-limit **watchdog** (a "fake" bell synthesized from a rate-limit prompt on the agent's screen). `edge:ring` (e.g. `tag:rate_limited`) / `edge:clear` |
+| `backoff` | sidecar | `edge, streak, failed, nextProbeInS` / `afterFailures` | the **classifier's OWN account** is rate-limited. `edge:engage` ⇒ from here every bell fail-opens into a "fake" promotion (`verdict:error`) until `edge:clear`. `probe_fail` extends it |
 | `attention` | gui | `surface, title, on, focused, applied, reason` | a `set_attention` landed. `applied:false` ⇒ suppressed because you were focused |
 | `clear` | gui | `surface, title, cause, hadBell, hadAttention` | focusing the surface dismissed a pending bell/attention |
 
@@ -123,8 +124,16 @@ One JSON object per line, `{ts, src, ev, …}` (`src` is `"gui"` or `"sidecar"`)
 - *Why DIDN'T it fire an hour ago?* — find the `ring` at that time; then either there's a
   `classify` with `decision:ignore` (Haiku said incidental), or the `ring` was `focused:true`
   (focus guard, never classified), or there's no `classify` at all (sidecar down/slow).
-- *Average delay* — per `surface`, the gap from a `ring` to its following `attention`
-  (`applied:true`) is the user-perceived ring→visuals delay.
+- *Average delay* — two numbers: the per-surface gap from a `ring` to its following
+  `attention` (`applied:true`) is the **user-perceived** ring→visuals delay; the `classify`
+  event's `durationMs` is the **Haiku-call** portion of it (the rest is poll/queue latency).
+- *"Fake" bells from rate limits* — two distinct cases, both visible: (a) the **watchdog**
+  synthesizing attention from a rate-limit prompt on the *agent's* screen ⇒ an `alert` event
+  with `tag:rate_limited`; (b) a promotion that fired only because the **classifier's own
+  account** was throttled ⇒ a `classify` with `verdict:error` whose `error` names the rate
+  limit, almost always inside a `backoff edge:engage`…`edge:clear` window. If you're seeing
+  spurious bells, scan for `backoff edge:engage` — everything promoted in that window is a
+  fail-open artifact, not a real "needs you".
 
 ```sh
 # last 20 events, human-ish:
@@ -340,10 +349,15 @@ site gates on `config.bellDiagnostics` so a disabled feature does zero work — 
 global enabled flag (avoids config-reload state). Sidecar side: `diag.ts` (`recordDiag`, gated
 by `GHOSTTY_BELL_DIAG=1`, forwarded by `AgentManagerController.childEnvironment` when
 `bellDiagnostics`), emitting `classify` (verdict/decision at each bell-classify outcome:
-clean true/false/omitted, unparseable, error) + `alert` edges in `maybeSignalAlert`. Delay is
-measured GUI-side (`ring`→`attention`), so the sidecar carries NO ring-timestamp threading.
-Pure line builders (`BellDiagnostics.line`, `formatDiagLine`) are unit-tested; the fs append is
-best-effort and untested by design.
+clean true/false/omitted, unparseable, error) + `alert` edges in `maybeSignalAlert` +
+`backoff` edges (engage/clear/probe_fail) in `runSweep`'s rate-limit aggregator. The
+user-perceived delay is measured GUI-side (`ring`→`attention`, so NO ring-timestamp
+threading); the `classify` event ALSO carries `durationMs` (timed around the `summarize()`
+call via `modelStartedAt`/`durMs()`, valid in the catch too so a failed call's time is
+captured) and, on `verdict:error`, the real `error`+`errorKind` so a fail-open caused by the
+classifier's OWN rate-limit is distinguishable from a confident promotion — corroborated by the
+`backoff edge:engage`…`clear` window around it. Pure line builders (`BellDiagnostics.line`,
+`formatDiagLine`) are unit-tested; the fs append is best-effort and untested by design.
 
 ### Cross-language `BellFeatures` bit-ABI (Zig packed struct ⇄ Swift OptionSet rawValue)
 

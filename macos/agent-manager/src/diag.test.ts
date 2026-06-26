@@ -27,6 +27,28 @@ test("formatDiagLine: caller cannot override the reserved fields", () => {
   assert.equal(obj.tag, "rate_limited");
 });
 
+test("formatDiagLine: a classify line carries durationMs (the Haiku call time)", () => {
+  const obj = JSON.parse(
+    formatDiagLine(
+      "classify",
+      { surface: "S1", verdict: "true", decision: "promote", reason: "needs you", durationMs: 842 },
+      "T",
+    ),
+  );
+  assert.equal(obj.ev, "classify");
+  assert.equal(obj.durationMs, 842);
+  assert.equal(obj.verdict, "true");
+});
+
+test("formatDiagLine: a backoff engage line (classifier's own account throttled)", () => {
+  const obj = JSON.parse(
+    formatDiagLine("backoff", { edge: "engage", streak: 1, failed: 3, nextProbeInS: 120 }, "T"),
+  );
+  assert.equal(obj.ev, "backoff");
+  assert.equal(obj.edge, "engage");
+  assert.equal(obj.nextProbeInS, 120);
+});
+
 test("diagPath: under ~/Library/Logs with the shared filename", () => {
   assert.match(diagPath(), /Library\/Logs\/ghostty-ramon-bell-diagnostics\.jsonl$/);
 });

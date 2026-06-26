@@ -282,6 +282,14 @@ async function summarizeOne(
     });
   };
 
+  // (diagnostics) Wall-clock duration of the Haiku classify call itself, so the trace
+  // can decompose total ring->attention delay into model time vs. poll/queue latency.
+  // Set right before `summarize()`; in the catch it measures a FAILED call's time (e.g.
+  // how long a rate-limited call hung before erroring). Null if we erred before the call.
+  let modelStartedAt: number | null = null;
+  const durMs = (): number | null =>
+    modelStartedAt != null ? deps.now() - modelStartedAt : null;
+
   try {
     const screen = await client.readSurface(surface.id);
     const snapshot: SurfaceSnapshot = { surface, viewport: screen.text };
@@ -309,6 +317,7 @@ async function summarizeOne(
       ctx,
     );
 
+    modelStartedAt = deps.now();
     const raw = await deps.summarize({ system, user, configDir: deps.summarizerConfigDir });
     const parsed = parseSummary(raw);
     if (!parsed) {
@@ -324,6 +333,7 @@ async function summarizeOne(
           verdict: "unparseable",
           decision: "promote",
           reason: "unparseable classify (fail-open)",
+          durationMs: durMs(),
         });
         await bellPromote(deps, surface, "unparseable classify (fail-open)");
       }
@@ -365,6 +375,7 @@ async function summarizeOne(
         verdict,
         decision,
         reason: parsed.summary,
+        durationMs: durMs(),
       });
       if (parsed.attention !== false) await bellPromote(deps, surface, parsed.summary);
     }
@@ -393,6 +404,11 @@ async function summarizeOne(
         verdict: "error",
         decision: "promote",
         reason: "classify error (fail-open)",
+        // The real failure — so a fail-open promotion caused by the classifier's OWN
+        // account being rate-limited (vs. some other error) is visible in the trace.
+        error: (err instanceof Error ? err.message : String(err)).slice(0, 300),
+        errorKind: what,
+        durationMs: durMs(),
       });
       await bellPromote(deps, surface, "classify error (fail-open)");
     }
@@ -590,6 +606,8 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     }
     if (probed === "ok") {
       log(`rate-limit backoff cleared after ${bo.failureStreak} failure(s); resuming`);
+      // (diagnostics) The classifier's own account recovered — bells stop fail-opening.
+      recordDiag("backoff", { edge: "clear", afterFailures: bo.failureStreak });
       bo.failureStreak = 0;
       bo.nextProbeMs = 0;
     } else if (probed === "fail") {
@@ -597,6 +615,11 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
       const delay = backoffDelayMs(bo.failureStreak, deps.cfg.debounceMs, deps.cfg.rateLimitBackoffMaxMs);
       bo.nextProbeMs = deps.now() + delay;
       log(`rate-limit backoff: probe failed (streak ${bo.failureStreak}); next probe in ${Math.round(delay / 1000)}s`);
+      recordDiag("backoff", {
+        edge: "probe_fail",
+        streak: bo.failureStreak,
+        nextProbeInS: Math.round(delay / 1000),
+      });
     }
     // probed === null ⇒ no real call this sweep (all gate-skipped); leave the backoff
     // untouched and retry on the next sweep.
@@ -623,6 +646,14 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
     const delay = backoffDelayMs(bo.failureStreak, deps.cfg.debounceMs, deps.cfg.rateLimitBackoffMaxMs);
     bo.nextProbeMs = deps.now() + delay;
     log(`rate-limit backoff engaged: ${results.filter((r) => r === "fail").length} call(s) failed; next probe in ${Math.round(delay / 1000)}s`);
+    // (diagnostics) The classifier's own account is throttled ⇒ from here, bell
+    // classifies fail-open (verdict:error) into "fake" promotions until it clears.
+    recordDiag("backoff", {
+      edge: "engage",
+      streak: bo.failureStreak,
+      failed: results.filter((r) => r === "fail").length,
+      nextProbeInS: Math.round(delay / 1000),
+    });
   }
   // NOTE: the AGENT QUEUE SUPERVISOR is NOT run here. It is a deterministic,
   // latency-sensitive loop that must NOT be gated behind the (slow, LLM-bound)
