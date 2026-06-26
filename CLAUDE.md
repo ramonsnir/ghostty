@@ -244,7 +244,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     is the user's deliberate choice for a private tailnet. If SET, it is fully enforced
     (constant-time compare; `?token=` only on the bootstrap `GET /` + asset routes, which can't
     send a header; `/api/*` requires the `X-Ghostty-Token` header) and is a SHELL-EXECUTION
-    credential (rotate if leaked). `tokenAcceptable` (≥16 chars) is now a soft warning, not a
+    credential (rotate if leaked). `tokenAcceptable` (≥16 chars) is a soft warning, not a
     refusal.
   - **Color/scrollback architecture (the core of v2):** under the fork's `pty-host` `.client`
     backend the GUI's screen mirror is VIEWPORT-ONLY and colorless, so the live view comes from
@@ -360,8 +360,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     (18787), ReleaseLocal `+1` (18788), Debug `+2` (18789); `tailscale serve` maps each external
     (8787/8788/8789) to its identity's loopback port. Pure helpers `portOffset(forBundleID:)` /
     `applyPortOffset(_:offset:)` are unit-tested (`WebMonitorServerTests`).
-    `tailscale serve` only proxies to `127.0.0.1` but — contrary to an earlier wrong note here —
-    it does NOT rewrite `Host` to the loopback backend; it forwards the ORIGINAL tailnet
+    `tailscale serve` only proxies to `127.0.0.1` but it does NOT rewrite `Host` to the
+    loopback backend; it forwards the ORIGINAL tailnet
     `Host: <machine>.<tailnet>.ts.net:<external port>` (also in `X-Forwarded-Host`, with
     `X-Forwarded-Proto: https` + Tailscale identity headers). So `hostHeaderAllowed` explicitly
     **accepts any `*.ts.net` host on any port** (verified against the real forwarded request);
@@ -443,9 +443,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     .build/release/ghostty-mcp ~/.local/bin/`); (2) the shim **falls back to reading
     `mcp-token` from `~/.config/ghostty-ramon/local`** when `GHOSTTY_MCP_TOKEN` is unset
     (`tokenFromLocalConfig()` in `main.swift` — same canonical secret store the agent-state
-    hook reads), so the committed JSON needs no token. The OLD doc registered a brittle
-    `.build/debug/ghostty-mcp` absolute path with the token baked into the `claude mcp add`
-    invocation — replaced by this. Dev identities still reachable via
+    hook reads), so the committed JSON needs no token. Dev identities still reachable via
     `GHOSTTY_MCP_URL=…:8766/:8767`. Wiring: `.mcp.json` (repo root), `macos/mcp-shim/Sources/ghostty-mcp/main.swift`
     (`tokenFromLocalConfig`); see `MCP-SERVER.md` → "Connecting an agent".
   - **12 tools:** `list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`,
@@ -545,10 +543,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
         Under pty-host the GUI mirror's `dumpText` is row-accurate (exactly one text line
         per grid row, no soft-wrap, blank rows preserved, every row newline-terminated),
         so `realSurface.cachedVisibleContents.get()` split on `\n` (drop one trailing "")
-        IS the viewport grid. (An EARLIER attempt added a Zig `RenderState.trailingBlankRows()`
-        core getter + C export for a grid-accurate blank count — reverted in favor of this,
-        since the mirror text is already row-accurate and pure-Swift keeps it GUI-only +
-        tunable with no host-linking change.) `read_text`'s general path is NOT usable for
+        IS the viewport grid. Keeping this pure-Swift (no Zig core getter) keeps it GUI-only
+        + tunable with no host-linking change. `read_text`'s general path is NOT usable for
         a row count (it uses `unwrap=true` + trims trailing blanks) — but the **mirror**
         path (the only one the dashboard hits) does neither, which is what makes this work.
       - **Footer detection is CONSERVATIVE — never hides content** (the load-bearing
@@ -566,17 +562,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
         real-content row. This handles BOTH the input box AND content boxes: the
         `/workflows` viewer's filled phase rows are real content (kept), while its empty
         interior tail + bottom border + help line are dropped; a permission prompt keeps its
-        question/options and only loses the bottom border. (The earlier version special-cased
-        a SMALL empty-interior input box and rejected tall boxes via a `maxBoxRows` cap — that
-        preserved the whole `/workflows` box including its wasted empty bottom; the unified
-        peel replaced it.) **GOTCHA
-        (the "nothing changed for two builds" bug, fixed):** Claude Code pads the prompt
-        line with a **NO-BREAK SPACE U+00A0**, not a normal space — `❯\u{00A0}…` — and the
-        rule rows are real U+2500 (confirmed by hexdumping the live `cachedVisibleContents`).
-        `isEmptyInteriorRow`/`isBlankRow` therefore test the **Unicode whitespace property**
-        (covers U+00A0), NOT just U+0020/U+0009; the old codepoint-only check read the NBSP
-        as content, so the interior never looked empty and `chromeTrailingSkip` returned 0
-        for EVERY footer. The per-tile refresh also runs off a `.task` poll tied to view
+        question/options and only loses the bottom border. **GOTCHA:** Claude Code pads the
+        prompt line with a **NO-BREAK SPACE U+00A0**, not a normal space — `❯\u{00A0}…` — and
+        the rule rows are real U+2500. So `isEmptyInteriorRow`/`isBlankRow` MUST test the
+        **Unicode whitespace property** (covers U+00A0), NOT just U+0020/U+0009 — a
+        codepoint-only check reads the NBSP as content, the interior never looks empty, and
+        `chromeTrailingSkip` returns 0 for every footer. The per-tile refresh also runs off a `.task` poll tied to view
         identity (not a `Timer.publish`, which restarts on every re-render). Handles both
         Claude Code footer shapes (full-width `───`/`❯`/`───` rules and rounded `╭─╮`/`│ │`/
         `╰─╯` boxes). When a footer IS found it also drops the ENTIRE blank gap above it
@@ -599,10 +590,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     additive `foreground_pid` frame (**protocol minor bumped 3→4**); the GUI walks that
     pid's process subtree locally with libproc and path-component-matches the configured
     commands. **Detection silently finds nothing until `ghostty-host` is on a minor-4
-    build** — a GUI upgrade alone is not enough (this was the multi-bug detection-failure
-    chase: stale xcframework left the app on minor 3, plus `proc_listchildpids` is
-    unreliable on macOS — use `proc_listpids`+`proc_pidinfo` parent links — plus a
-    versioned exe basename isn't the command name, hence path-component match).
+    build** — a GUI upgrade alone is not enough (and a stale xcframework can leave the app
+    on minor 3). Gotchas: `proc_listchildpids` is unreliable on macOS — use
+    `proc_listpids`+`proc_pidinfo` parent links; a versioned exe basename isn't the command
+    name, hence path-component match.
   - **Threading / cost:** the detector is a ~2s off-main `.utility` poll (pure
     `matchAgent`/`resolve` behind an injectable `ProcEnumerator`); paused while the panel
     is hidden/occluded, and mirror renderers pause via `ghostty_surface_set_occlusion` —
@@ -638,8 +629,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     controlling terminal**, so the hook's OWN tty is `??`/none. The script therefore
     **walks up its ppid chain** (`ps -o tty= -p <pid>`, then `ps -o ppid=`) and takes the
     nearest ancestor with a real tty — the `claude` process itself runs on the surface's
-    tty (e.g. `ttys030`). (The original "read your own `ps -o tty=`" assumption was WRONG
-    and made the hook silently `exit 0` with a blank tty — see the 2026-06-22 debug note.)
+    tty (e.g. `ttys030`). (Reading the hook's OWN tty does NOT work — it's `??`/none because
+    the hook is spawned detached; the ppid walk is required.)
     The MCP handler
     (`MCPServer.handleAgentState`) resolves it to a surface UUID by reading each surface's
     **host-pushed minor-4 `foregroundPID`** (the SAME pid the dashboard detector already
@@ -712,14 +703,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     sink was a quiescent (`waiting`/`idle`) agent whose ANIMATED footer (spinner / "esc to
     interrupt" / elapsed-time counter) flipped the old exact-hash `fingerprint` every poll,
     so it re-summarized every debounce window forever. **(1) Throttle (not skip) hidden tiles
-    — UPDATED 2026-06-25 so the rate-limit watchdog survives hiding:** the dashboard's
+    — so the rate-limit watchdog survives hiding:** the dashboard's
     `hidden` set is exposed through `list_surfaces` (Swift: `HookSnapshotEntry.hidden` unioned
     from `model.hidden` → `MCPLayout.SurfaceRow.hidden`, emitted only when true; TS:
-    `Surface.hidden`). A hidden tile is now summarized on a MUCH LARGER per-session debounce
+    `Surface.hidden`). A hidden tile is summarized on a MUCH LARGER per-session debounce
     (`hiddenDebounceMs`, default 600000 = 10 min) via the pure `effectiveDebounceMs(surface,
     cfg)` = `surface.hidden ? max(debounceMs, hiddenDebounceMs) : debounceMs`, consulted by the
-    debounce clause of BOTH `preGate` and `shouldSummarize`. **`skipHidden` is now default
-    FALSE** (was true) — it's the explicit opt-out for the OLD zero-cost behavior (when true,
+    debounce clause of BOTH `preGate` and `shouldSummarize`. **`skipHidden` defaults
+    FALSE** — it's the explicit opt-out for zero-cost behavior (when true,
     both gates still short-circuit `{reason:"hidden"}` and skip the `read_surface` entirely).
     **Why the flip:** the rate-limit attention bell (below) has Haiku as its SOLE classifier, so
     a fully-skipped hidden tile NEVER rings — and hidden tiles are exactly the long-running,
@@ -737,11 +728,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-summarizes so a `working` agent's phase still tracks. **(4) Config overlay
     (`src/config.ts`, no rebuild):** `~/.config/ghostty-ramon/agent-manager/config.json` (pure
     `parseConfig` overlay on `DEFAULT_CONFIG` over an injected `readFile`, restart-to-apply,
-    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→30000→**120000**
+    malformed/unknown keys ignored) tunes `debounceMs` (default **120000**
     = 2 min), `hiddenDebounceMs` (default **600000** = 10 min), `changeRatioThreshold`,
-    `skipHidden` (default **false**), `idleSkipSeconds`, `maxConcurrent`, `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
-    `changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
-    `lineMultiset`, all pure + tested). Wiring: Swift — `AgentDashboardController.swift`
+    `skipHidden` (default **false**), `idleSkipSeconds`, `maxConcurrent`, `agentProcessNames`. The change-detection
+    pure helpers are `changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
+    `lineMultiset` (all tested). Wiring: Swift — `AgentDashboardController.swift`
     (`HookSnapshotEntry.hidden`), `MCPLayout.swift` (`SurfaceRow.hidden` + JSON emit); sidecar
     — `mcp.ts` (`Surface.hidden`), `summarizer.ts` (config fields + `LastSummary` shape + the
     new pure helpers + `shouldSummarize`/`preGate`), `config.ts` (NEW), `index.ts` (`loadConfig`
@@ -894,12 +885,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     the prompt tells Haiku to judge the CURRENT/LIVE state at the BOTTOM of the screen and set
     `"rate_limited"` only while the agent is actually halted on that prompt right now — NOT
     when the same text merely sits scrolled-up in history. **Why no deterministic regex
-    backstop (the design pivot — an earlier version had one, removed):** a regex matches the
+    backstop (deliberate — do NOT add one):** a regex matches the
     text ANYWHERE in the viewport, so it (a) can't detect RECOVERY (the prompt scrolls up but
     stays in view → would never clear) and (b) on the idle-skip/model-fail paths would
     re-scan and FALSELY RE-RING after Haiku had already cleared it. Only a whole-screen
-    classifier can tell "live prompt" from "scrolled-up history", so the regex was dropped
-    entirely. The alert state therefore changes ONLY when a Haiku call SUCCEEDS + parses:
+    classifier can tell "live prompt" from "scrolled-up history". The alert state therefore changes ONLY when a Haiku call SUCCEEDS + parses:
     `maybeSignalAlert(parsed.alert)` runs on the due path only; idle-skip / parse-fail /
     model-throw branches LEAVE the alert state untouched (a held alert stays armed, nothing
     rings or clears without a fresh classify). EDGE-TRIGGERED via a per-surface
@@ -923,22 +913,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     changed-tag-rerings, failed-ring rollback, non-agent never rung, dead-id prune). **Rebuilt
     sidecar `dist` + a sidecar restart (kill the node child or relaunch the GUI) is enough; no
     host/Zig change, no GUI relaunch needed for the GUI itself.**
-  - **NO reply-suggestion feature (removed end-to-end).** An earlier "manager" pass proposed
-    replies on `waiting` tiles (Approve/Edit/Dismiss + a per-tile notes field); it drained quota
-    for low value and is GONE — both the TS sidecar pass (`manager.ts` + `model.ts suggest()` +
-    `MANAGER_BASE_PROMPT` + the manager override loader + the second sweep pass) AND the entire
-    Swift UI (`AgentPreviewTile` suggestion/notes rows + confidence dimming, `AgentDashboardController`
-    `approveSuggestion`/`dismissSuggestion`/`setUserNotes`/`userNotes`/`suggestionDismissed` +
-    the `UserNotesStore`, `AgentAnnotation.suggestion`/`confidence` + `Surface.userNotes`/
-    `suggestionDismissed`, `MCPSafety.swift`). `AgentAnnotation` / the `set_surface_annotation`
-    tool now carry ONLY `summary`/`phase`/`needsUser` + the Agent Queue tags
-    (`queueKey`/`queueName`/`queueUrl`); the MERGE tool stays because the Queue uses it. The
-    only send path left is the `send_text`/`send_key` MCP tools (used by the Queue's exit
-    prelude). No Zig/host change. Wiring touched: macOS — `AgentDashboard/{AgentStateBridge,
-    AgentDashboardController,AgentPreviewTile,AgentDashboardView}.swift`, `MCP/{MCPAnnotation,
-    MCPLayout,MCPTools,MCPInput}.swift` (deleted `MCPSafety.swift`), `project.pbxproj`; sidecar —
-    `mcp.ts` (dropped the dead `Surface`/`Annotation` fields). Tests updated in
-    `AgentDashboardTests`/`MCPAnnotationTests`/`MCPServerTests` + sidecar `mcp.test.ts`.
+  - **`AgentAnnotation` / the `set_surface_annotation` tool carry ONLY `summary`/`phase`/`needsUser`
+    + the Agent Queue tags (`queueKey`/`queueName`/`queueUrl`); the partial-MERGE behavior stays
+    because the Queue uses it. The only autonomous send path is the `send_text`/`send_key` MCP
+    tools (used by the Queue's exit prelude). (NOTE: do NOT rebuild a reply-suggestion feature —
+    a previous Approve/Edit/Dismiss-on-`waiting`-tiles pass was removed end-to-end as
+    low-value/quota-draining.)
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default) — turns the Agent
   Dashboard/Manager into an active **supervisor + driver**: start a **queue** from a
@@ -991,8 +971,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     labeled / moved off the queried state); a FAILED list never re-arms (no false re-enable on a
     transient provider error). So re-dispatch requires a real **status round-trip** (leave the
     list, return) — the user's explicit "block it off unless it literally changes status and back
-    to Todo." BEHAVIOR CHANGE this subsumes: a crashed (EXITED) agent whose item stays listed is
-    no longer auto-retried after cooldown — it needs the round-trip too (a crashed agent is not
+    to Todo." Consequence: a crashed (EXITED) agent whose item stays listed is
+    NOT auto-retried — it needs the round-trip too (a crashed agent is not
     blindly re-run on the same item). Latched at dispatch intent (rolled back only if the spawn
     itself fails), persisted on every store write, rehydrated on the first reconcile (so the
     suppression survives a sidecar/GUI restart), and cleared on `abort` (a deliberate re-start is
@@ -1093,11 +1073,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     actual tiling is a **balanced binary-space-partition done GUI-side**: `spawn_split_command`
     with `balanced:true` splits the **LARGEST pane in the run's tab along its longer side**
     (`SplitTree.largestLeafSplit(within: realPixelBounds)` — wider/square → `.right`, taller →
-    `.down`). **Why the rework:** the old planner derived each split's target+direction from the
-    slot's grid neighbor, which is correct ONLY for a hole-free fill — but Ghostty's binary tree
-    RE-FLOWS when a pane closes (the sibling absorbs the parent region), so after any agent
-    finished the slot model diverged from the real geometry and a refill split a geometrically-
-    wrong pane → **stray extra columns/rows** (the reported bug). The BSP places every split from
+    `.down`). **Why BSP, not slot-neighbor planning:** Ghostty's binary tree
+    RE-FLOWS when a pane closes (the sibling absorbs the parent region), so a slot→grid-neighbor
+    planner diverges from real geometry after any agent finishes and a refill splits a
+    geometrically-wrong pane → **stray extra columns/rows**. The BSP places every split from
     the REAL tree, so it stays evenly tiled and self-heals across closures. **CRITICAL:**
     `largestLeafSplit` MUST use real pixel `bounds` (the window content size) — `spatial()`'s
     no-bounds fallback uses artificial 1×1 column/row units where every leaf looks square →
@@ -1110,7 +1089,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     the grid is NO longer a term (overflow handles >grid). Wiring: sidecar — `grid.ts`
     (`tabIndexForSlot` + tab-aware `splitPlan` + `MAX_QUEUE_TABS`), `runner.ts` (`dispatchOne` slot
     `[0,concurrency)` + 3-case spawn: firstTab / newTab+windowAnchorUUID / balanced+targetUUID;
-    `effectiveConcurrency` clamps to `capPerTab*MAX_QUEUE_TABS`; `effectiveGridCap` REMOVED),
+    `effectiveConcurrency` clamps to `capPerTab*MAX_QUEUE_TABS`),
     `supervisor.ts` (`remainingSlots` drops the grid term), `templates.ts` (`clampConcurrency` →
     `[1, cap*MAX_QUEUE_TABS]`), `mcp.ts` (`spawnSplitCommand` `windowAnchorUUID` arg). Swift —
     `SplitTree.swift` (`largestLeafSplit(within:)`, pure), `MCPLayout.swift` (`newSplitCommand`
@@ -1153,13 +1132,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
     `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only
-    recognizes hyphenated names (`ctrl-d`/`ctrl-c`/`enter`/…) — the engine's old `"ctrl_d"`
-    default silently no-op'd (saved only by the force-close timeout) until `ctrl-d` was added to
-    `MCPInput.keySpecs(forKey:)` (keycode 2 + ctrl). Claude Code swallows Ctrl-D, so use
+    recognizes hyphenated names (`ctrl-d`/`ctrl-c`/`enter`/…) — a non-hyphenated `"ctrl_d"`
+    silently no-ops. Claude Code swallows Ctrl-D, so use
     `{text:"/quit"}`. The close sequence is sendText/sendKey-prelude → `awaitExited`
     (bounded; force-closes anyway on timeout, so a `/quit` that leaves the launching shell alive
-    still tears down) → forceClose. **`quitWhenEmpty` was REMOVED** — see the hardening bullet at
-    the end of this section; a run is now removed only by an explicit stop/abort.
+    still tears down) → forceClose. **There is no `quitWhenEmpty`** — a run is removed only by an
+    explicit stop/abort.
   - **Close path (§10) — the subtle one:** `close_surface`/`request_close` HONORS
     `confirm-close-surface` and would pop a modal for a live agent. So the supervisor sends the
     template `agent.exit` prelude (→ child exits) then calls **`force_close_surface`**, which
@@ -1317,10 +1295,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       ACCENT fallback so an unknown-but-non-empty label still reads as "marked"; nil/empty ⇒ no
       mark. The Linear conversion lives in `example-graph.py` (`PRIORITY_LABELS = {1:"Urgent",
       2:"High"}`, emitted only for those — none/medium/low omit it; edit that map to mark
-      more/fewer, no Ghostty change). (The raw tracker `priority` int was REMOVED end-to-end —
-      it was dead/unrendered and a tracker-specific footgun; `priorityLabel` is the only priority
-      signal now. If numeric ordering is ever wanted, add a generic provider-decided `priorityRank`,
-      not the raw int.) Wiring: sidecar — `types.ts` (`GraphNode.priorityLabel`),
+      more/fewer, no Ghostty change). (Do NOT use the raw tracker `priority` int — it's a
+      tracker-specific footgun; `priorityLabel` is the only priority signal. If numeric ordering
+      is ever wanted, add a generic provider-decided `priorityRank`, not the raw int.) Wiring:
+      sidecar — `types.ts` (`GraphNode.priorityLabel`),
       `provider.ts` (`parseGraphOutput` keeps a non-empty string; `mcp.ts` forwards `nodes`
       verbatim, no change); Swift — `MCPTools.swift` (`report_queue_graph` node schema +
       `priorityLabel`), `QueueCommandBridge.swift` (`QueueGraph.Node.priorityLabel` + parse),
@@ -1357,7 +1335,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     NO-OP that ignores the second start's maxItems — so you can't rescope or re-cap a live run by
     re-starting it; `set_max_items` is the in-place cap edit. A DIFFERENT scope of the same template is
     a DISTINCT run that proceeds in PARALLEL (own tab + state file), so two milestones run at once from
-    ONE template — you do NOT need two template files (this supersedes the earlier basename-only dedup).
+    ONE template — you do NOT need two template files.
     Engine: a new
     mutable `QueueRun.maxItemsLive` (`undefined`=no edit, `null`=unlimited, N=cap) that `effectiveMaxItemsCap`
     consults FIRST (over the start-time param + template cap); persisted in the active-runs record
@@ -1387,8 +1365,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `concurrencyLive ?? template.concurrency`, CLAMPED to `[1, capPerTab*MAX_QUEUE_TABS]`. It is the
     run's TOTAL pane budget across ALL its tabs — concurrency above one tab's `cols×rows` OVERFLOWS
     to additional tabs (§12 multi-tab — see the GRID layout bullet), so bumping example 6→9 with a
-    3×2 grid spreads 6 panes in tab 1 + 3 in tab 2 (NOT crammed into one tab — an earlier
-    `effectiveGridCap` single-tab-lift approach was REPLACED by real overflow). `remainingSlots`
+    3×2 grid spreads 6 panes in tab 1 + 3 in tab 2 (NOT crammed into one tab). `remainingSlots`
     bounds dispatch by `min(effectiveConcurrency − active, global)` (the grid is no longer a term);
     `dispatchOne` allocates `lowestFreeSlot(occupied, effectiveConcurrency)` and `splitPlan` routes
     overflow slots to new tabs. Parsed by a pure `parseConcurrencyValue` (positive int
@@ -1461,8 +1438,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     `set_max_items` bump / `resume` re-enables dispatch, but the NEW dispatch lands on the next
     list-DUE sweep (≤`listMs`), not the next 5s sweep — the dashboard cap/phase still updates
     INSTANTLY (the optimistic + fast-confirm path above); only the actual spawn waits for the
-    poll. **Default ALIGNED to `{listMs:60000, statusMs:30000}`** (was 45000/20000) and the user's
-    near-identical 60/30 override was REMOVED from `example.json` so config == default. Wiring:
+    poll. **Default is `{listMs:60000, statusMs:30000}`.** Wiring:
     `runner.ts` (`QueueRun.lastListAtMs`/`lastStatusAtMs` + `makeQueueRun` init + list gate in
     `dispatchCandidates` + status gate in `advanceStates`), `templates.ts`
     (`TEMPLATE_DEFAULTS.intervals` → 60000/30000). Tests: `runner.test.ts` (list throttled +
@@ -1528,37 +1504,27 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     different-scope start + same-scope no-op + factory-consulted-on-restart); Swift `QueuePaletteTests`
     (`discoverUsesJSONNameForDisplayAndSort`, `templateDisplayNameFallsBackToBasename`, updated discovery
     assertions to `[QueueTemplateEntry]`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
-  - **RESTART-SURVIVAL HARDENING (the "queue vanished on restart" + "splits detached" fix).** A real
-    incident: a run with `quitWhenEmpty:true` self-removed at 19:34 while its 3 agents were still ALIVE,
-    so a later GUI restart found an empty `active-runs.json` → no queue, detached splits. Root cause
-    (confirmed by reading `reconcile`): the session-gone prune grace keys off the record's `sinceMs`,
-    which for a LONG-LIVED RUNNING record is ancient → ZERO protection against a SUCCESSFUL-but-INCOMPLETE
-    `list_surfaces` right after a (re)start (surfaces still coming up). So a transient post-restart list
-    pruned live records → `active.size→0` → `quitWhenEmpty` removed the whole run (abandoning live agents).
-    Three sidecar-only fixes:
-    - **(A) `quitWhenEmpty` REMOVED end-to-end.** The template knob + the `runOne` quit branch +
-      `QueueRun.sawEmptyListThisSweep` are gone; a run is removed ONLY by explicit stop/abort. An empty
-      `list` just means "nothing actionable now" → keep polling. A `quitWhenEmpty` key in template JSON
-      is now silently ignored (tolerant parse). Wiring: `types.ts` (field removed), `templates.ts`
-      (default + parse removed), `runner.ts` (quit branch + field removed). Tests: `runner.test.ts`
-      "an empty list + no active agents does NOT remove the run" (replaced the 3 quitWhenEmpty tests).
-    - **(B) PREMATURE-PRUNE FIX — reconcile-start grace.** `reconcile` gained an optional
-      `reconcileStartedMs` (default `-Infinity` = old behavior); a finalized record's session-gone prune
-      is now shielded for `pendingGraceMs` (30s) after the LATER of its `sinceMs` AND the run's first
+  - **RESTART-SURVIVAL HARDENING.** A started run + its in-flight items survive a sidecar/GUI restart
+    without the queue vanishing or its splits detaching. (Removing `quitWhenEmpty` — above — is part of
+    this: a transient SUCCESSFUL-but-INCOMPLETE post-restart `list_surfaces` must not self-remove a live
+    run.) Two further sidecar-only safeguards:
+    - **(A) PREMATURE-PRUNE FIX — reconcile-start grace.** `reconcile` takes an optional
+      `reconcileStartedMs` (default `-Infinity` = no grace); a finalized record's session-gone prune
+      is shielded for `pendingGraceMs` (30s) after the LATER of its `sinceMs` AND the run's first
       reconcile in the current process (`run.reconcileStartedMs`, stamped once per process; a restart
       re-stamps). So a long-lived RUNNING record survives a transient/incomplete post-restart list for a
       full grace window. Conservative — can only DELAY a prune (hold a slot longer), never cause a
       duplicate. Wiring: `store.ts reconcile` (param + `Math.max(sinceMs, reconcileStartedMs)` gate),
       `runner.ts` (`QueueRun.reconcileStartedMs` stamp + pass-through). Tests: `store.test.ts`
-      (shield within grace / prune past grace / default-arg = pre-fix behavior); the latch-persists
-      restart test updated to expect the held-then-pruned sequence.
-    - **(C) PERSISTENT SIDECAR LOG (so the next incident is debuggable).** The Swift controller pipes the
-      sidecar's stdout to an UNREAD pipe and sends stderr to `nullDevice`, so the engine's run/prune/command
-      logs had NO durable trail (this incident was undiagnosable after the fact). New `src/logfile.ts`
-      tees `console.{log,info,warn,error}` to a ROTATING file `~/Library/Logs/ghostty-ramon-agent-manager.log`
-      (append, rotate at ~5MB → `.1`); best-effort (any fs error falls back to console only, never throws);
-      installed first thing in `index.ts main()`. Pure `formatLogLine`/`defaultLogPath` unit-tested
-      (`logfile.test.ts`). **Sidecar-only — rebuilt `dist` + sidecar restart; no host/Zig/GUI-Swift change.**
+      (shield within grace / prune past grace / default-arg = no-grace behavior); the latch-persists
+      restart test expects the held-then-pruned sequence.
+    - **(B) PERSISTENT SIDECAR LOG.** The Swift controller pipes the sidecar's stdout to an UNREAD pipe
+      and sends stderr to `nullDevice`, so the engine's run/prune/command logs have no other durable
+      trail. `src/logfile.ts` tees `console.{log,info,warn,error}` to a ROTATING file
+      `~/Library/Logs/ghostty-ramon-agent-manager.log` (append, rotate at ~5MB → `.1`); best-effort
+      (any fs error falls back to console only, never throws); installed first thing in `index.ts main()`.
+      Pure `formatLogLine`/`defaultLogPath` unit-tested (`logfile.test.ts`). **Sidecar-only — rebuilt
+      `dist` + sidecar restart; no host/Zig/GUI-Swift change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
