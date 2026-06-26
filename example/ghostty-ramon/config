@@ -188,6 +188,24 @@ keybind = ctrl+a>r=reload_config
 # arms the visual bell at all.
 bell-features-focused = system,no-attention,no-title
 
+# --- Bell Attention v2: two-tier "bell vs needs-you" ---------------------
+# Fork-only keys (see BELL-ATTENTION.md). Every bell fires `bell-features`
+# (dialed to sound-only below); when the Agent Manager's Haiku classifier
+# PROMOTES a notable bell (fail-open — only a confident "ignore" suppresses),
+# it ADDS `attention-features` (the loud set). Promotion is per-bell + fail-open
+# and decoupled from the continuous summarizer, so it stays cheap.
+agent-manager-bell-filter = true
+# Tier 1 — fires on EVERY bell: sound only. FORK-ONLY OVERRIDE of the shared
+# `bell-features` (system,attention,title,border) so an official Ghostty keeps
+# its full visual bell while the fork stays quiet-until-promoted. Parsed from the
+# BellFeatures defaults (attention+title ON), so attention+title are negated
+# explicitly; the rest default off. Non-repeatable ⇒ last-wins over the shared file.
+bell-features = system,audio,no-attention,no-title
+# Tier 2 — ADDED when a bell is promoted to "needs you" (equals the compiled
+# default; listed for clarity): tab 🔔, surface border, dock bounce+badge,
+# dashboard unhide/float, web push, web-monitor indicator.
+attention-features = title,border,bounce,badge,dashboard,push,monitor
+
 # --- PTY host: emulation-on-host (always-on) -----------------------------
 # Fork-only key (an official Ghostty would error on it). Non-null selects the
 # out-of-process `.client` backend: terminal emulation + the live shell run in
