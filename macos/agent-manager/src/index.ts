@@ -506,6 +506,73 @@ async function maybeSignalAlert(
 }
 
 /**
+ * (bell-attention v2) PREEMPTIVE bell classify — the latency fix.
+ *
+ * A bell used to wake the classify via `runSweepCoalesced()`, which COALESCES: if a
+ * continuous batch sweep was already in flight (and with many agents that takes tens of
+ * seconds — each summary cold-spawns the `claude` CLI), the bell's forced pass didn't run
+ * until that whole batch drained. So a real "needs you" promotion landed ~tens of seconds
+ * late — after the user had already focused the pane, at which point the focus guard
+ * (correctly) suppressed it. Net: the alert was silently swallowed.
+ *
+ * This runs the ONE rung surface's forced classify IMMEDIATELY, in parallel with any
+ * in-flight batch, bounded by the SHARED concurrency budget (so it can never exceed
+ * `maxConcurrent` — at saturation it defers to the sweep instead). It deliberately relaxes
+ * the non-overlap invariant for the BELL PATH ONLY; the continuous pass is untouched.
+ *
+ * Falls back to the old enqueue+coalesce path (`pendingBellIds` + `wakeSweep`) whenever it
+ * can't act now — list failure, the surface raced away, or the budget is full — so a bell
+ * is NEVER lost. Returns nothing; self-contained error handling (summarizeOne never throws;
+ * listSurfaces is guarded). Exported for testing.
+ */
+export async function classifyBellNow(
+  deps: LoopDeps,
+  id: string,
+  wakeSweep: () => void,
+): Promise<void> {
+  const enqueue = (): void => {
+    deps.pendingBellIds.add(id);
+    wakeSweep();
+  };
+
+  let surface: Surface | undefined;
+  try {
+    surface = (await deps.client.listSurfaces()).find((s) => s.id === id);
+  } catch (err) {
+    errlog(`bell fast-path list failed: ${err instanceof Error ? err.message : String(err)}`);
+    enqueue();
+    return;
+  }
+  // Raced away (closed) or not yet visible in the list — let a later sweep retry/handle it.
+  if (!surface) {
+    enqueue();
+    return;
+  }
+  // Same gate as the in-sweep forced pass (runSweep): a bell forces past DEBOUNCE but NEVER
+  // past the not-agent/hidden gate — we don't promote a non-agent or hidden surface.
+  const pre = preGate(surface, deps.lastBySession.get(surface.id), deps.now(), deps.cfg);
+  if (!(pre.pass || pre.reason === "debounce")) return;
+  // Respect the shared budget. If the batch is already at max concurrency, defer to the
+  // coalesced sweep rather than exceed maxConcurrent (which would worsen rate-limits).
+  if (!deps.budget.tryAcquire()) {
+    enqueue();
+    return;
+  }
+  // Claim the debounce clock NOW so a continuous sweep that starts during our (~15s) call
+  // sees this surface as freshly attempted and skips it — no double classify. summarizeOne
+  // overwrites this with the real summary on completion; bellRang bypasses debounce, so the
+  // claim does not block our own classify.
+  const prev = deps.lastBySession.get(surface.id);
+  deps.lastBySession.set(surface.id, {
+    signals: prev?.signals ?? "",
+    tail: prev?.tail ?? "",
+    atMs: deps.now(),
+    summary: prev?.summary ?? "",
+  });
+  await summarizeOne(surface, deps, { bellRang: true }); // releases the budget slot in finally
+}
+
+/**
  * One sweep: list surfaces, then run the SUMMARIZER pass over every due agent
  * surface, sharing the loop's MCP client + concurrency budget. Awaits all fired
  * calls so the budget is settled before the next sweep. Catches list_surfaces
@@ -857,13 +924,17 @@ async function main(): Promise<void> {
       }
       if (stopped) return;
       if (ev) {
-        // Record the RINGING surface id (the truthful signal — independent of whether the
-        // GUI armed its visual bell flag), then wake an immediate classify. runSweep drains
-        // pendingBellIds into forcedBell, so this surface is classified even when
-        // list_surfaces.bell is never set (the system,audio config).
-        deps.pendingBellIds.add(ev.id);
-        log(`bell event on ${ev.id} -> wake immediate classify`);
-        void runSweepCoalesced();
+        // PREEMPTIVE classify: run the rung surface's forced classify NOW, in parallel with
+        // any in-flight continuous batch (bounded by the shared budget), instead of coalescing
+        // behind it — so a real promotion lands in ~1 model-call instead of after the whole
+        // batch drains. classifyBellNow falls back to the enqueue+coalesce path (pendingBellIds
+        // + runSweepCoalesced) when it can't act now, so a bell is never lost. Detached so the
+        // loop keeps long-polling for the next bell; it owns its errors but .catch belt-and-
+        // suspenders against an unexpected reject in a detached promise.
+        log(`bell event on ${ev.id} -> preemptive classify`);
+        void classifyBellNow(deps, ev.id, runSweepCoalesced).catch((err) =>
+          errlog(`bell fast-path failed: ${err instanceof Error ? err.message : String(err)}`),
+        );
       }
       // ev === null ⇒ park timeout; just loop and re-park.
     }

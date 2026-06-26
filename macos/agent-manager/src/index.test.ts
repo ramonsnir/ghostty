@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   runSweep,
+  classifyBellNow,
   makeCoalescedRunner,
   parseLoopEnablement,
   type LoopDeps,
@@ -1120,4 +1121,82 @@ test("loops: queue is opt-in on exactly 1 (any other value = off)", () => {
   assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "true" }).queue, false);
   assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "0" }).queue, false);
   assert.equal(parseLoopEnablement({ GHOSTTY_AGENT_QUEUE: "1" }).queue, true);
+});
+
+// ---------------------------------------------------------------------------
+// classifyBellNow — the PREEMPTIVE bell fast path (latency fix). It must
+// classify the rung surface IMMEDIATELY (not wait for a sweep), respect the
+// shared budget, and fall back to enqueue+wake when it can't act now.
+// ---------------------------------------------------------------------------
+
+test("classifyBellNow: an agent surface is classified+promoted immediately, no sweep wake", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "needs your approval" },
+  });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: okSummary, bellFilter: true });
+  let woke = 0;
+  const wake = (): void => { woke += 1; };
+
+  await classifyBellNow(deps, "s1", wake);
+
+  assert.equal(summarizeCalls.length, 1, "classified inline");
+  assert.equal(fake.attentionCalls.filter((c) => c.on).length, 1, "promoted via set_attention");
+  assert.equal(woke, 0, "did NOT fall back to a coalesced sweep");
+  assert.equal(deps.pendingBellIds.size, 0, "not enqueued (handled directly)");
+  assert.equal(deps.budget.active, 0, "budget slot released");
+});
+
+test("classifyBellNow: budget saturated => defers to the sweep (enqueue + wake, no inline call)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "x" },
+  });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: okSummary, bellFilter: true, budgetMax: 1 });
+  assert.ok(deps.budget.tryAcquire(), "occupy the only slot (simulate an in-flight batch)");
+  let woke = 0;
+  const wake = (): void => { woke += 1; };
+
+  await classifyBellNow(deps, "s1", wake);
+
+  assert.equal(summarizeCalls.length, 0, "no inline classify when budget is full");
+  assert.deepEqual([...deps.pendingBellIds], ["s1"], "enqueued for the next sweep");
+  assert.equal(woke, 1, "woke the coalesced sweep as the fallback");
+});
+
+test("classifyBellNow: an unknown/closed surface id falls back to enqueue+wake", async () => {
+  const fake = makeFakeClient({ surfaces: [makeSurface({ id: "other", agentState: "working" })] });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: okSummary, bellFilter: true });
+  let woke = 0;
+
+  await classifyBellNow(deps, "ghost", () => { woke += 1; });
+
+  assert.equal(summarizeCalls.length, 0);
+  assert.deepEqual([...deps.pendingBellIds], ["ghost"], "enqueued so a later sweep can retry");
+  assert.equal(woke, 1);
+});
+
+test("classifyBellNow: a NON-agent surface is skipped — no classify, no enqueue, no wake", async () => {
+  // No agentKind/agentState/processName => not an agent => the gate never promotes it.
+  const fake = makeFakeClient({ surfaces: [makeSurface({ id: "s1", title: "vim" })] });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: okSummary, bellFilter: true });
+  let woke = 0;
+
+  await classifyBellNow(deps, "s1", () => { woke += 1; });
+
+  assert.equal(summarizeCalls.length, 0, "non-agent never classified");
+  assert.equal(deps.pendingBellIds.size, 0, "non-agent never enqueued");
+  assert.equal(woke, 0, "non-agent never wakes a sweep");
+});
+
+test("classifyBellNow: listSurfaces failure falls back to enqueue+wake (never lost)", async () => {
+  const fake = makeFakeClient({ surfaces: [], listThrows: true });
+  const { deps, summarizeCalls } = makeDeps({ fake, summarize: okSummary, bellFilter: true });
+  let woke = 0;
+
+  await classifyBellNow(deps, "s1", () => { woke += 1; });
+
+  assert.equal(summarizeCalls.length, 0);
+  assert.deepEqual([...deps.pendingBellIds], ["s1"], "enqueued despite the list failure");
+  assert.equal(woke, 1);
 });
