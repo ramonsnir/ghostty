@@ -231,6 +231,75 @@ test("moveSurfaceIntoTab: encodes move_surface_into_tab + forwards source/anchor
   assert.equal("balanced" in noBalanced.args, false);
 });
 
+// --- (§12 grid cap) maxCols/maxRows forwarding ------------------------------
+
+test("spawnSplitCommand: sends maxCols/maxRows when positive", async () => {
+  const { args } = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({
+      targetUUID: "t1",
+      balanced: true,
+      command: "claude work",
+      maxCols: 3,
+      maxRows: 2,
+    }),
+  );
+  assert.equal(args.maxCols, 3);
+  assert.equal(args.maxRows, 2);
+});
+
+test("spawnSplitCommand: omits grid caps when undefined or <=0", async () => {
+  // undefined ⇒ absent from the wire (pure-aspect on the GUI).
+  const undef = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({ targetUUID: "t1", balanced: true, command: "claude work" }),
+  );
+  assert.equal("maxCols" in undef.args, false);
+  assert.equal("maxRows" in undef.args, false);
+  // 0 / negative are non-positive ⇒ also omitted (a malformed cap never forces no-cap).
+  const zero = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({
+      targetUUID: "t1",
+      balanced: true,
+      command: "claude work",
+      maxCols: 0,
+      maxRows: -1,
+    }),
+  );
+  assert.equal("maxCols" in zero.args, false);
+  assert.equal("maxRows" in zero.args, false);
+});
+
+test("moveSurfaceIntoTab: sends/omits grid caps", async () => {
+  const sent = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({
+      sourceUUID: "src",
+      targetAnchorUUID: "anchor",
+      balanced: true,
+      maxCols: 3,
+      maxRows: 2,
+    }),
+  );
+  assert.equal(sent.args.maxCols, 3);
+  assert.equal(sent.args.maxRows, 2);
+  // omitted when undefined.
+  const undef = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({ sourceUUID: "src", targetAnchorUUID: "anchor", balanced: true }),
+  );
+  assert.equal("maxCols" in undef.args, false);
+  assert.equal("maxRows" in undef.args, false);
+  // omitted when non-positive.
+  const zero = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({
+      sourceUUID: "src",
+      targetAnchorUUID: "anchor",
+      balanced: true,
+      maxCols: 0,
+      maxRows: 0,
+    }),
+  );
+  assert.equal("maxCols" in zero.args, false);
+  assert.equal("maxRows" in zero.args, false);
+});
+
 test("spawnSplitCommand: forwards the item env (GHOSTTY_ITEM_*) and omits an empty env", async () => {
   const withEnv = await captureCall('{"id":"u","sessionId":1}', (c) =>
     c.spawnSplitCommand({

@@ -1306,8 +1306,18 @@ async function dispatchOne(
       const windowAnchorUUID = occupiedUUID(run, sp.windowAnchorSlotIndex);
       spawnArgs = { ...base, firstTab: true, ...(windowAnchorUUID !== undefined ? { windowAnchorUUID } : {}) };
     } else {
+      // Balanced split WITHIN the slot's tab — pass the template grid caps (§12 grid cap)
+      // so the BSP never exceeds cols columns / rows rows in that tab (further splits stack
+      // into rows / add columns). firstTab/newTab branches do NOT pass caps: a fresh tab's
+      // first leaf has no grid context and largestLeafSplit isn't called for them.
       const targetUUID = occupiedUUID(run, sp.anchorSlotIndex);
-      spawnArgs = { ...base, ...(targetUUID !== undefined ? { targetUUID } : {}), balanced: true };
+      spawnArgs = {
+        ...base,
+        ...(targetUUID !== undefined ? { targetUUID } : {}),
+        balanced: true,
+        maxCols: t.grid.cols,
+        maxRows: t.grid.rows,
+      };
     }
     spawned = await deps.client.spawnSplitCommand(spawnArgs);
   } catch (err) {
@@ -1447,6 +1457,10 @@ export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
         sourceUUID: asgn.surfaceUUID!,
         targetAnchorUUID,
         balanced: true,
+        // (§12 grid cap) Respect the destination tab's grid so consolidating a fragmented
+        // run never re-introduces a 4th column in a 3-col grid.
+        maxCols: run.template.grid.cols,
+        maxRows: run.template.grid.rows,
       });
     } catch (err) {
       errlog(`run "${run.runName}": pack move ${asgn.key} failed: ${msg(err)}`);

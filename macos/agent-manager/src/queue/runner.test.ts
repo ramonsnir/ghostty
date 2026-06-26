@@ -100,7 +100,7 @@ interface QueueFake {
     forceClose: string[];
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
-    moveIntoTab: Array<{ sourceUUID: string; targetAnchorUUID: string; balanced?: boolean }>;
+    moveIntoTab: Array<{ sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }>;
     list: number;
     graph: number;
     status: string[];
@@ -158,7 +158,7 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     async sendKey(id: string, key: string): Promise<void> {
       calls.sendKey.push({ id, key });
     },
-    async moveSurfaceIntoTab(args: { sourceUUID: string; targetAnchorUUID: string; balanced?: boolean }): Promise<void> {
+    async moveSurfaceIntoTab(args: { sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }): Promise<void> {
       calls.moveIntoTab.push(args);
     },
     async reportQueueStatus(status: QueueStatusReport): Promise<void> {
@@ -361,6 +361,9 @@ test("runQueueSweep: first sweep is dispatch-suppressed; second sweep dispatches
   await runQueueSweep(deps);
   assert.equal(fake.calls.spawn.length, 1, "second sweep dispatches");
   assert.equal(fake.calls.spawn[0].firstTab, true, "first item opens the run tab");
+  // (§12 grid cap) a firstTab spawn opens a fresh tab — no grid context — so it sends NO caps.
+  assert.equal(fake.calls.spawn[0].maxCols, undefined, "firstTab spawn omits grid caps");
+  assert.equal(fake.calls.spawn[0].maxRows, undefined, "firstTab spawn omits grid caps");
   // The command is the item-env PREFIX (delivered via the command since the host spawn
   // protocol drops env_vars under .client) + the verbatim template launch line.
   assert.equal(
@@ -638,16 +641,24 @@ test("runQueueSweep: concurrency ABOVE the per-tab grid OVERFLOWS to a new tab (
   await runQueueSweep(deps); // dispatch all 3
   const spawns = fake.calls.spawn;
   assert.equal(spawns.length, 3, "all 3 dispatched across 2 tabs");
-  // Slot 0 → the run's FIRST tab (firstTab, no window anchor).
+  // Slot 0 → the run's FIRST tab (firstTab, no window anchor). NO grid caps (a fresh tab's
+  // first leaf has no grid context; largestLeafSplit isn't called).
   assert.equal(spawns[0].firstTab, true);
   assert.equal(spawns[0].windowAnchorUUID, undefined);
-  // Slot 1 → balanced split WITHIN tab 1 (same tab, has a pane) — not a new tab.
+  assert.equal(spawns[0].maxCols, undefined, "firstTab spawn omits grid caps");
+  assert.equal(spawns[0].maxRows, undefined, "firstTab spawn omits grid caps");
+  // Slot 1 → balanced split WITHIN tab 1 (same tab, has a pane) — not a new tab. It forwards
+  // the template grid caps (2×1) so the BSP respects the per-tab grid.
   assert.equal(spawns[1].balanced, true);
   assert.notEqual(spawns[1].targetUUID, undefined);
   assert.equal(spawns[1].firstTab, undefined);
-  // Slot 2 → OVERFLOW: a NEW tab (firstTab:true) anchored on the run's window.
+  assert.equal(spawns[1].maxCols, 2, "balanced split forwards template grid.cols");
+  assert.equal(spawns[1].maxRows, 1, "balanced split forwards template grid.rows");
+  // Slot 2 → OVERFLOW: a NEW tab (firstTab:true) anchored on the run's window. NO grid caps.
   assert.equal(spawns[2].firstTab, true);
   assert.notEqual(spawns[2].windowAnchorUUID, undefined);
+  assert.equal(spawns[2].maxCols, undefined, "overflow newTab spawn omits grid caps");
+  assert.equal(spawns[2].maxRows, undefined, "overflow newTab spawn omits grid caps");
 });
 
 // ---------------------------------------------------------------------------
@@ -674,6 +685,10 @@ test("packRun: merges a fragmented run (moves the survivor into the lower tab + 
   assert.equal(fake.calls.moveIntoTab[0].sourceUUID, "uuid-b", "the higher tab's pane moves");
   assert.equal(fake.calls.moveIntoTab[0].targetAnchorUUID, "uuid-a", "anchored on the lower tab");
   assert.equal(fake.calls.moveIntoTab[0].balanced, true);
+  // (§12 grid cap) the pack move forwards the template grid caps (2×1) so consolidating a
+  // fragmented run respects the destination tab's grid.
+  assert.equal(fake.calls.moveIntoTab[0].maxCols, 2, "pack move forwards template grid.cols");
+  assert.equal(fake.calls.moveIntoTab[0].maxRows, 1, "pack move forwards template grid.rows");
   // B is reassigned to tab0's free slot 1 (tab membership now matches the move).
   assert.equal(run.active.get("B")!.gridSlot, 1);
 });
@@ -1499,6 +1514,10 @@ test("runQueueSweep: a dispatch after an orphan adoption splits into the adopted
   assert.equal(spawnArgs.balanced, true, "the refill is a balanced BSP split");
   assert.equal(spawnArgs.direction, undefined, "balanced mode sends no explicit direction");
   assert.equal(spawnArgs.targetUUID, "orphan-1", "the split anchors on the adopted pane's tab");
+  // (§12 grid cap) the balanced refill forwards the template grid caps so the BSP never
+  // exceeds cols columns / rows rows (default tmpl() grid is 3×3).
+  assert.equal(spawnArgs.maxCols, 3, "balanced split forwards template grid.cols");
+  assert.equal(spawnArgs.maxRows, 3, "balanced split forwards template grid.rows");
   // The adopted pane is still tracked (NOT clobbered/closed by the refill).
   assert.equal(run.active.has("ORPH-1"), true, "adopted pane survives the refill dispatch");
   assert.equal(run.active.has("NEW-1"), true, "new item tracked");

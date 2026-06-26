@@ -246,6 +246,13 @@ export class McpClient {
      *  to the tool as `env`; the Swift handler sets it on the new split's
      *  environmentVariables. Omitted from the wire payload when empty/undefined. */
     env?: Record<string, string>;
+    /** (grid cap §12) Never exceed this many COLUMNS in the split pane's row band
+     *  (with balanced:true); further splits stack into rows. From template grid.cols.
+     *  Omitted ⇒ pure-aspect balanced BSP. */
+    maxCols?: number;
+    /** (grid cap §12) Never exceed this many ROWS; further splits add columns. From
+     *  template grid.rows. Omitted ⇒ pure-aspect. */
+    maxRows?: number;
   }): Promise<{ id: string; sessionId: number }> {
     const toolArgs: Record<string, unknown> = { command: args.command };
     if (args.targetUUID !== undefined) toolArgs.targetUUID = args.targetUUID;
@@ -257,6 +264,10 @@ export class McpClient {
     if (args.env !== undefined && Object.keys(args.env).length > 0) {
       toolArgs.env = args.env;
     }
+    // (grid cap §12) Send only positive caps, keeping the wire clean and absence ⇒
+    // pure-aspect on the GUI (byte-identical to today).
+    if (args.maxCols !== undefined && args.maxCols > 0) toolArgs.maxCols = args.maxCols;
+    if (args.maxRows !== undefined && args.maxRows > 0) toolArgs.maxRows = args.maxRows;
     const payload = await this.call("spawn_split_command", toolArgs);
     const obj = parseToolJson(payload) as { id?: unknown; sessionId?: unknown };
     if (typeof obj.id !== "string" || obj.id.length === 0) {
@@ -278,11 +289,20 @@ export class McpClient {
     sourceUUID: string;
     targetAnchorUUID: string;
     balanced?: boolean;
+    /** (grid cap §12) Never exceed this many COLUMNS in the destination tab's largest
+     *  pane's row band; further splits stack into rows. From template grid.cols. */
+    maxCols?: number;
+    /** (grid cap §12) Never exceed this many ROWS; further splits add columns. From
+     *  template grid.rows. */
+    maxRows?: number;
   }): Promise<void> {
     await this.call("move_surface_into_tab", {
       sourceUUID: args.sourceUUID,
       targetAnchorUUID: args.targetAnchorUUID,
       ...(args.balanced !== undefined ? { balanced: args.balanced } : {}),
+      // (grid cap §12) Send only positive caps; absence ⇒ pure-aspect on the GUI.
+      ...(args.maxCols !== undefined && args.maxCols > 0 ? { maxCols: args.maxCols } : {}),
+      ...(args.maxRows !== undefined && args.maxRows > 0 ? { maxRows: args.maxRows } : {}),
     });
   }
 

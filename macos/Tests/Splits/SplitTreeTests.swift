@@ -1044,6 +1044,23 @@ struct SplitTreeTests {
 
     /// Builds a 3-leaf tree where v2/v3 form a sub-split:
     ///   root = .split(left: .leaf(v1), right: .split(left: .leaf(v2), right: .leaf(v3)))
+    /// Leaf pixel bounds keyed by view identity, for asserting grid-cap fixture geometry
+    /// directly (so a layout regression is caught at the slot level, not only via direction).
+    /// Reads the SAME `spatial(within:).slots` that `largestLeafSplit` consumes (Y-down, left
+    /// child = top), so asserted rects match exactly what the production decision sees — NOT
+    /// `calculateViewBounds`, which uses the inverted-Y convention.
+    private func leafRects(
+        _ tree: SplitTree<MockView>, within bounds: CGSize
+    ) -> [ObjectIdentifier: CGRect] {
+        guard let root = tree.root else { return [:] }
+        var out: [ObjectIdentifier: CGRect] = [:]
+        for slot in root.spatial(within: bounds).slots {
+            guard case .leaf(let view) = slot.node else { continue }
+            out[ObjectIdentifier(view)] = slot.bounds
+        }
+        return out
+    }
+
     private func makeThreeLeafTree() throws -> (SplitTree<MockView>, MockView, MockView, MockView) {
         let v1 = MockView()
         let v2 = MockView()
@@ -1162,5 +1179,256 @@ struct SplitTreeTests {
     @Test func largestLeafSplitZeroBoundsIsNil() {
         let tree = SplitTree(view: MockView())
         #expect(tree.largestLeafSplit(within: .zero) == nil)
+    }
+
+    // MARK: - largestLeafSplit grid cap (Agent Queue §12 grid-constrained BSP)
+
+    @Test func gridBackCompatZeroCapsEqualsAspect() throws {
+        // The existing 3-leaf [v1 | [v2/v3]] fixture: largest is v1 (800×1000), longer side
+        // vertical ⇒ .down. maxCols:0,maxRows:0 must equal the no-arg pure-aspect result.
+        let v1 = MockView(), v2 = MockView(), v3 = MockView()
+        var tree = SplitTree(view: v1)
+        tree = try tree.inserting(view: v2, at: v1, direction: .right)
+        tree = try tree.inserting(view: v3, at: v2, direction: .down)
+        let bounds = CGSize(width: 1600, height: 1000)
+        let capped = tree.largestLeafSplit(within: bounds, maxCols: 0, maxRows: 0)
+        #expect(capped?.view === v1)
+        #expect(capped?.direction == .down)
+    }
+
+    @Test func gridCapAbsentViaWrapperEqualsAspect() throws {
+        // The no-arg wrapper must produce the identical (view, direction) as maxCols:0,maxRows:0.
+        let v1 = MockView(), v2 = MockView(), v3 = MockView()
+        var tree = SplitTree(view: v1)
+        tree = try tree.inserting(view: v2, at: v1, direction: .right)
+        tree = try tree.inserting(view: v3, at: v2, direction: .down)
+        let bounds = CGSize(width: 1600, height: 1000)
+        let wrapper = tree.largestLeafSplit(within: bounds)
+        let explicit = tree.largestLeafSplit(within: bounds, maxCols: 0, maxRows: 0)
+        #expect(wrapper?.view === v1)
+        #expect(wrapper?.view === explicit?.view)
+        #expect(wrapper?.direction == explicit?.direction)
+        #expect(wrapper?.direction == .down)
+    }
+
+    @Test func gridUltrawideThirdPaneStillRight() throws {
+        // A | B (1920 | 1920) within 3840×1010; 2 columns < cap 3 ⇒ still add a column.
+        let a = MockView(), b = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 3840, height: 1010), maxCols: 3, maxRows: 2)
+        #expect(pick?.view === a) // area tie ⇒ first in DFS
+        #expect(pick?.direction == .right)
+    }
+
+    @Test func gridUltrawideFourthPaneStacksRow() throws {
+        // A; B right of A; C right of A ⇒ tree (A|C)|B. Slots: A 0,0,960,1010 ·
+        // C 960,0,960,1010 · B 1920,0,1920,1010. Largest area = B (1920×1010). B's row band
+        // has 3 cols {0,960,1920} = colCap ⇒ canRight=false; B's col band has 1 row<2 ⇒
+        // canDown ⇒ stack a row under B (NOT a 4th column).
+        let a = MockView(), b = MockView(), c = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = try tree.inserting(view: c, at: a, direction: .right)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 3840, height: 1010), maxCols: 3, maxRows: 2)
+        #expect(pick?.view === b)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func gridFifthPaneSplitsSecondColumn() throws {
+        // A; B right of A; C right of A; D below B ⇒ tree (A|C)|(B/D). Slots: A 0,0,960,1010 ·
+        // C 960,0,960,1010 · B 1920,0,1920,505 · D 1920,505,1920,505 — all area 969,600 (4-way
+        // tie) ⇒ best=A (DFS-first). A's row band has 3 cols (capped, canRight=false) but its
+        // col band has 1 row<2 ⇒ canDown ⇒ .down.
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = try tree.inserting(view: c, at: a, direction: .right)
+        tree = try tree.inserting(view: d, at: b, direction: .down)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 3840, height: 1010), maxCols: 3, maxRows: 2)
+        #expect(pick?.view === a)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func gridBothCappedLeafIsSkipped() throws {
+        // A; C right of A; B right of C; D below A ⇒ tree (A/D)|(C|B). Slots all area 969,600
+        // (4-way tie): A 0,0,1920,505 · D 0,505,1920,505 · C 1920,0,960,1010 · B 2880,0,960,1010.
+        // DFS order A, D, C, B. A is BOTH-capped (row band 3 cols, col band 2 rows) ⇒ SKIPPED;
+        // D both-capped ⇒ skipped; C's col band has 1 row<2 ⇒ selected, .down. NOT (A,.right).
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: c, at: a, direction: .right)
+        tree = try tree.inserting(view: b, at: c, direction: .right)
+        tree = try tree.inserting(view: d, at: a, direction: .down)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 3840, height: 1010), maxCols: 3, maxRows: 2)
+        #expect(pick?.view === c)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func gridCols1Stacks() throws {
+        // A | B (each 800×1000) within 1600×1000; colCap=1 ⇒ row band already 2≥1 cols ⇒
+        // never .right ⇒ stack (.down). maxRows:0 ⇒ rows unbounded.
+        let a = MockView(), b = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 1600, height: 1000), maxCols: 1, maxRows: 0)
+        #expect(pick?.view === a)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func gridCols1SingleLeaf() {
+        // A lone wide leaf with colCap=1 must be forced to .down (a 2nd column is forbidden).
+        let v1 = MockView()
+        let tree = SplitTree(view: v1)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 1600, height: 1000), maxCols: 1, maxRows: 0)
+        #expect(pick?.view === v1)
+        #expect(pick?.direction == .down)
+    }
+
+    @Test func gridRows1Columns() throws {
+        // A / B (each 1000×800) within 1000×1600; rowCap=1 ⇒ col band already 2≥1 rows ⇒
+        // never .down ⇒ add a column (.right). maxCols:0 ⇒ cols unbounded.
+        let a = MockView(), b = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .down)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 1000, height: 1600), maxCols: 0, maxRows: 1)
+        #expect(pick?.view === a)
+        #expect(pick?.direction == .right)
+    }
+
+    @Test func gridRows1SingleLeaf() {
+        // A lone tall leaf with rowCap=1 must be forced to .right (a 2nd row is forbidden).
+        let v1 = MockView()
+        let tree = SplitTree(view: v1)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 800, height: 1200), maxCols: 0, maxRows: 1)
+        #expect(pick?.view === v1)
+        #expect(pick?.direction == .right)
+    }
+
+    @Test func gridSingleLeafFollowsAspectWithCaps() {
+        // Caps ≥1 + a single leaf ⇒ both axes legal ⇒ pure aspect.
+        let v1 = MockView()
+        let tree = SplitTree(view: v1)
+        let wide = tree.largestLeafSplit(
+            within: CGSize(width: 1600, height: 1000), maxCols: 3, maxRows: 2)
+        #expect(wide?.view === v1)
+        #expect(wide?.direction == .right)
+        let tall = tree.largestLeafSplit(
+            within: CGSize(width: 800, height: 1200), maxCols: 3, maxRows: 2)
+        #expect(tall?.view === v1)
+        #expect(tall?.direction == .down)
+    }
+
+    @Test func gridTallWindowWalkRespectsRows() throws {
+        // Tall analog of the ultrawide walk, grid 2 cols × 3 rows in a 1000×1600 window. Rebuild
+        // the tree at each returned (view, dir); assert the layout never exceeds 2 cols / 3 rows.
+        let bounds = CGSize(width: 1000, height: 1600)
+        let a = MockView()
+        var tree = SplitTree(view: a)
+        // Step 1: single leaf A 1000×1600, taller ⇒ aspect .down, allowed ⇒ A,.down.
+        let s1 = tree.largestLeafSplit(within: bounds, maxCols: 2, maxRows: 3)
+        #expect(s1?.view === a)
+        #expect(s1?.direction == .down)
+        let b = MockView()
+        tree = try tree.inserting(view: b, at: a, direction: .down)
+        // Now A 0,0,1000,800 / B 0,800,1000,800. Step 2: tie ⇒ best=A (DFS-first). A is wider
+        // (1000>800) ⇒ aspect .right; col band 1 row<3 and row band 1 col<2 ⇒ both legal ⇒
+        // .right.
+        let s2 = tree.largestLeafSplit(within: bounds, maxCols: 2, maxRows: 3)
+        #expect(s2?.view === a)
+        #expect(s2?.direction == .right)
+        let c = MockView()
+        tree = try tree.inserting(view: c, at: a, direction: .right)
+        // Now A 0,0,500,800 · C 500,0,500,800 · B 0,800,1000,800. Largest = B (1000×800,
+        // area 800k > A,C 400k). B's row band (Y 800..1600) overlaps only B ⇒ 1 col<2 ⇒
+        // canRight; B is wider ⇒ aspect .right ⇒ B,.right.
+        let s3 = tree.largestLeafSplit(within: bounds, maxCols: 2, maxRows: 3)
+        #expect(s3?.view === b)
+        #expect(s3?.direction == .right)
+    }
+
+    @Test func gridEveryLeafCappedFallsBackToAspect() throws {
+        // Filled 2×2: A; B right of A; C below A; D below B ⇒ four 800×500 quadrants.
+        // A 0,0,800,500 · C 0,500,800,500 · B 800,0,800,500 · D 800,500,800,500. EVERY leaf is
+        // both-capped (2 cols, 2 rows) ⇒ loop falls through; defensive fallback = largest (A,
+        // DFS-first on the tie) + aspect (800≥500 ⇒ .right).
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = try tree.inserting(view: c, at: a, direction: .down)
+        tree = try tree.inserting(view: d, at: b, direction: .down)
+        let pick = tree.largestLeafSplit(
+            within: CGSize(width: 1600, height: 1000), maxCols: 2, maxRows: 2)
+        #expect(pick?.view === a)
+        #expect(pick?.direction == .right)
+    }
+
+    @Test func gridEpsilonOverlapRobustness() throws {
+        // Clean 2×2 quadrant geometry, built so two leaves genuinely SHARE a minX (one
+        // sub-split column) and two share another minX — exactly the case position-dedup must
+        // collapse. Build: B right of A; C below A; D below B ⇒ tree (A/C)|(B/D), four 800×500
+        // quadrants:
+        //   A 0,0,800,500 · C 0,500,800,500 · B 800,0,800,500 · D 800,500,800,500.
+        // A & C share minX=0 (column 1); B & D share minX=800 (column 2). With caps 2×2 every
+        // leaf is both-capped (its row band has 2 distinct columns AFTER dedup, its col band 2
+        // rows) ⇒ the loop skips them all and falls back to largest (A, DFS-first on the 4-way
+        // area tie) + aspect (800≥500 ⇒ .right). Epsilon position-dedup is what collapses each
+        // shared-minX pair to ONE column here (raw distinct-value counting would too on exact
+        // floats; the count flip that a BROKEN dedup would cause is exercised directly by
+        // gridStackedColumnDedupFlipsDirection below). Assert the documented slot geometry then
+        // the result.
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = try tree.inserting(view: c, at: a, direction: .down)
+        tree = try tree.inserting(view: d, at: b, direction: .down)
+        let bounds = CGSize(width: 1600, height: 1000)
+        // Verify the slot geometry up front so a layout regression is caught directly.
+        let rects = leafRects(tree, within: bounds)
+        #expect(rects[ObjectIdentifier(a)] == CGRect(x: 0, y: 0, width: 800, height: 500))
+        #expect(rects[ObjectIdentifier(c)] == CGRect(x: 0, y: 500, width: 800, height: 500))
+        #expect(rects[ObjectIdentifier(b)] == CGRect(x: 800, y: 0, width: 800, height: 500))
+        #expect(rects[ObjectIdentifier(d)] == CGRect(x: 800, y: 500, width: 800, height: 500))
+        let pick = tree.largestLeafSplit(within: bounds, maxCols: 2, maxRows: 2)
+        #expect(pick?.view === a)
+        #expect(pick?.direction == .right)
+    }
+
+    @Test func gridStackedColumnDedupFlipsDirection() throws {
+        // THE dedup→cap→direction branch: a candidate leaf whose ROW BAND contains a SUB-SPLIT
+        // column (two leaves stacked in rows, sharing one minX) where position-dedup is the only
+        // thing keeping the band UNDER the column cap. Build B right of A; C below B ⇒ tree
+        // A|(B/C) in a 2000×1000 window:
+        //   A 0,0,1000,1000 · B 1000,0,1000,500 · C 1000,500,1000,500.
+        // A is the largest leaf (1,000,000 vs 500,000) and SQUARE ⇒ aspect .right. caps 3×2.
+        // A's row band (Y 0..1000) overlaps A, B, C with minX {0, 1000, 1000}:
+        //   • CORRECT position-dedup ⇒ 2 distinct columns ⇒ canRight = 2<3 = true.
+        //   • BROKEN dedup (counting leaves, not positions) ⇒ 3 ⇒ canRight = 3<3 = FALSE.
+        // A's col band (X 0..1000) overlaps only A ⇒ 1 row ⇒ canDown = 1<2 = true (both cases).
+        // aspect .right ⇒ direction(.right, canRight, canDown):
+        //   • CORRECT (canRight=true)  ⇒ .right   ← asserted here
+        //   • BROKEN  (canRight=false) ⇒ .down    (the flip a regression would produce)
+        // So this fixture FAILS if the stacked column is not deduped to a single column — the
+        // coverage gap reviewers flagged for gridEpsilonOverlapRobustness.
+        let a = MockView(), b = MockView(), c = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = try tree.inserting(view: c, at: b, direction: .down)
+        let bounds = CGSize(width: 2000, height: 1000)
+        let rects = leafRects(tree, within: bounds)
+        #expect(rects[ObjectIdentifier(a)] == CGRect(x: 0, y: 0, width: 1000, height: 1000))
+        #expect(rects[ObjectIdentifier(b)] == CGRect(x: 1000, y: 0, width: 1000, height: 500))
+        #expect(rects[ObjectIdentifier(c)] == CGRect(x: 1000, y: 500, width: 1000, height: 500))
+        let pick = tree.largestLeafSplit(within: bounds, maxCols: 3, maxRows: 2)
+        #expect(pick?.view === a)
+        #expect(pick?.direction == .right)
     }
 }

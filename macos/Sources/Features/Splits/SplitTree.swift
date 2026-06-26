@@ -254,18 +254,123 @@ extension SplitTree {
     /// nil for an empty tree. Ties (equal area) resolve to the first leaf in spatial order
     /// (deterministic).
     func largestLeafSplit(within bounds: CGSize) -> (view: ViewType, direction: NewDirection)? {
+        largestLeafSplit(within: bounds, maxCols: 0, maxRows: 0)
+    }
+
+    /// (ramon fork / Agent Queue, GRID-constrained balanced BSP §12) Grid-aware overload.
+    /// Same balanced-BSP intent as the no-arg wrapper, but CONSTRAINED so a tab never
+    /// exceeds `maxCols` columns or `maxRows` rows (from the template grid): once the
+    /// layout reaches `maxCols` columns, further splits stack into rows, and once it
+    /// reaches `maxRows` rows, further splits add columns. PURE.
+    ///
+    /// `maxCols`/`maxRows` ≤ 0 mean "unbounded on that axis"; when BOTH are ≤ 0 the result
+    /// is BYTE-IDENTICAL to today's pure-aspect rule (the no-arg wrapper takes this path),
+    /// so every non-queue caller and existing test is unaffected.
+    ///
+    /// Algorithm (see the §1 spec): pick the LARGEST-area leaf that can still split WITHIN
+    /// the caps (a leaf whose row band already has `maxCols` columns AND whose column band
+    /// already has `maxRows` rows is "both-capped" and is SKIPPED, walking down by area).
+    /// For the chosen leaf, prefer its longer-side direction, but force `.down` if `.right`
+    /// would exceed `maxCols`, and force `.right` if `.down` would exceed `maxRows`. If NO
+    /// leaf can split within caps (grid genuinely full) fall back to largest-leaf + aspect.
+    func largestLeafSplit(
+        within bounds: CGSize, maxCols: Int, maxRows: Int
+    ) -> (view: ViewType, direction: NewDirection)? {
         guard let root, bounds.width > 0, bounds.height > 0 else { return nil }
-        var best: (view: ViewType, bounds: CGRect)?
+
+        // Collect every LEAF slot with its pixel bounds (split slots span their children
+        // and would distort a band, so they are excluded).
+        var leaves: [(view: ViewType, bounds: CGRect)] = []
         for slot in root.spatial(within: bounds).slots {
             guard case .leaf(let view) = slot.node else { continue }
-            let area = slot.bounds.width * slot.bounds.height
-            if best == nil || area > (best!.bounds.width * best!.bounds.height) {
-                best = (view, slot.bounds)
+            leaves.append((view, slot.bounds))
+        }
+        guard !leaves.isEmpty else { return nil }
+
+        // Aspect helper — today's whole rule (wider-or-square → .right, taller → .down).
+        func aspect(_ r: CGRect) -> NewDirection { r.width >= r.height ? .right : .down }
+
+        // Back-compat short-circuit (FIRST, before any grid math): absent/disabled grid ⇒
+        // today's pure-aspect behavior on the single largest leaf, byte-identical.
+        var best = leaves[0]
+        for leaf in leaves.dropFirst()
+        where leaf.bounds.width * leaf.bounds.height
+            > best.bounds.width * best.bounds.height {
+            best = leaf
+        }
+        guard maxCols > 0 || maxRows > 0 else { return (best.view, aspect(best.bounds)) }
+
+        // Normalize an absent/≤0 axis to "unbounded".
+        let colCap = maxCols > 0 ? maxCols : Int.max
+        let rowCap = maxRows > 0 ? maxRows : Int.max
+
+        // Sub-pixel slack to absorb ratio * size float drift in band counting.
+        let eps: CGFloat = 0.5
+
+        let leafBounds = leaves.map { $0.bounds }
+
+        // Count DISTINCT leading-edge positions (deduped with epsilon).
+        func distinctPositions(_ values: [CGFloat]) -> Int {
+            let sorted = values.sorted()
+            var count = 0
+            var last = -CGFloat.greatestFiniteMagnitude
+            for v in sorted where v - last > eps {
+                count += 1
+                last = v
+            }
+            return count
+        }
+
+        // Columns in B's ROW BAND (leaves whose Y-range overlaps B, keyed by minX) and
+        // rows in B's COLUMN BAND (leaves whose X-range overlaps B, keyed by minY).
+        func bandCounts(for b: CGRect) -> (cols: Int, rows: Int) {
+            func sharesRowBand(_ r: CGRect) -> Bool {
+                Swift.min(r.maxY, b.maxY) - Swift.max(r.minY, b.minY) > eps
+            }
+            func sharesColBand(_ r: CGRect) -> Bool {
+                Swift.min(r.maxX, b.maxX) - Swift.max(r.minX, b.minX) > eps
+            }
+            let cols = distinctPositions(leafBounds.filter { sharesRowBand($0) }.map { $0.minX })
+            let rows = distinctPositions(leafBounds.filter { sharesColBand($0) }.map { $0.minY })
+            return (cols, rows)
+        }
+
+        // Per-candidate constrained direction. Only called when canRight || canDown, so the
+        // "else" arm is always a legal override. The `default:` keeps the switch exhaustive
+        // over the four-case NewDirection enum but is never executed (aspect() returns only
+        // .right/.down).
+        func direction(forAspect a: NewDirection, canRight: Bool, canDown: Bool) -> NewDirection {
+            switch a {
+            case .right: return canRight ? .right : .down
+            case .down:  return canDown  ? .down  : .right
+            default:     return canRight ? .right : .down
             }
         }
-        guard let best else { return nil }
-        let direction: NewDirection = best.bounds.width >= best.bounds.height ? .right : .down
-        return (best.view, direction)
+
+        // Walk leaves in area-descending order (ties keep first-in-spatial-order, as today)
+        // and pick the first that can still split within the caps.
+        let order = leaves.indices.sorted {
+            let a0 = leaves[$0].bounds.width * leaves[$0].bounds.height
+            let a1 = leaves[$1].bounds.width * leaves[$1].bounds.height
+            return a0 != a1 ? a0 > a1 : $0 < $1
+        }
+
+        for i in order {
+            let cand = leaves[i]
+            let (cols, rows) = bandCounts(for: cand.bounds)
+            let canRight = cols < colCap
+            let canDown = rows < rowCap
+            if canRight || canDown {
+                let d = direction(forAspect: aspect(cand.bounds), canRight: canRight, canDown: canDown)
+                return (cand.view, d)
+            }
+        }
+
+        // FALLBACK — no leaf can split within caps (grid genuinely full). Defensive only:
+        // the caller's per-tab cap (cols*rows) spills to a new tab before a tab reaches
+        // cols*rows panes, so this is unreachable on the happy path. Behave like today.
+        let fallback = leaves[order[0]]
+        return (fallback.view, aspect(fallback.bounds))
     }
 
     /// Equalize all splits in the tree so that each split's ratio is based on the

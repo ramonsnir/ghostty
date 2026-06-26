@@ -527,6 +527,53 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   `cap*MAX_QUEUE_TABS`); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
   biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
+### GRID-CONSTRAINED BSP — never exceed cols columns / rows rows (§12)
+
+- **GRID CAP (§12) — the balanced BSP now RESPECTS the template grid SHAPE, not just
+  `cols×rows` as a pane cap.** Previously `largestLeafSplit` was grid-BLIND: on an ultrawide
+  (3840×1010) a 4th pane tiled as a 4th COLUMN (a single row of four) even with `grid:{cols:3,
+  rows:2}`. Now the template `grid.cols`/`grid.rows` are threaded as HARD CAPS so a tab never
+  exceeds `cols` columns or `rows` rows: once the layout reaches `cols` columns, further splits
+  STACK into rows, and once it reaches `rows` rows, further splits ADD columns. The decision is
+  purely structural/geometric and lives in the macOS Swift spatial layer — **no Zig/host/
+  protocol change**.
+- **The algorithm** (`SplitTree.largestLeafSplit(within:maxCols:maxRows:)`): pick the
+  LARGEST-area leaf that can still split WITHIN the caps; for it, prefer the longer-side
+  direction but force `.down` if `.right` would exceed `maxCols`, and force `.right` if `.down`
+  would exceed `maxRows`. A leaf whose ROW BAND already has `cols` columns AND whose COLUMN BAND
+  already has `rows` rows is "both-capped" and is SKIPPED (walking down by area) — this is the
+  fix that keeps the canonical 3×2 ultrawide case from inserting a forbidden 4th column (the
+  largest-area leaf can be both-capped). If NO leaf can split within caps (grid genuinely full)
+  it falls back to largest-leaf + aspect (defensive only — the per-tab `cols*rows` cap spills to
+  a new tab first). **Band counting:** columns in a leaf's row band = DISTINCT `minX` positions
+  (epsilon-deduped, 0.5px) among leaf slots whose Y-range overlaps it; rows in its column band =
+  distinct `minY` among leaves whose X-range overlaps it. Leading-edge (`minX`/`minY`) keying is
+  the robust grid-cell identity because BSP leaves share exact leading edges within a row/column.
+- **BACK-COMPAT is byte-identical:** `maxCols`/`maxRows` ≤ 0 (or absent) short-circuit BEFORE
+  any grid math to today's pure-aspect rule on the single largest leaf. The no-arg
+  `largestLeafSplit(within:)` is now a thin wrapper delegating with `maxCols:0,maxRows:0`, so
+  every non-queue caller and old sidecar is unaffected. The MCP schema fields are OPTIONAL; the
+  dispatch reads them via `(NSNumber).intValue` and keeps only positive values (a malformed cap
+  falls back to no-cap, never errors). The sidecar sends them only when positive.
+- **Threading path:** template `grid.cols/rows` → `runner.ts` `dispatchOne` (balanced spawnArgs)
+  / `packRun` (`moveSurfaceIntoTab`) → `mcp.ts` `spawnSplitCommand`/`moveSurfaceIntoTab`
+  (`maxCols?`/`maxRows?`, wired only when >0) → MCP wire (`spawn_split_command`/
+  `move_surface_into_tab` OPTIONAL `maxCols`/`maxRows`) → `MCPTools.swift` dispatch (`positiveInt`
+  parse) → `MCPLayout.newSplitCommand`/`moveSurfaceIntoTab` (`maxCols:Int?`/`maxRows:Int?`) →
+  `BaseTerminalController.moveSurfaceIntoThisTab` (pack only) → `largestLeafSplit(within:maxCols:
+  maxRows:)`. The `firstTab`/`newTab` spawn branches do NOT pass caps (a fresh tab's first leaf
+  has no grid context). The PACKING path carries the grid too (for layout consistency — packing a
+  fragmented run must not re-introduce a 4th column). Wiring: Swift — `SplitTree.swift`
+  (no-arg wrapper + grid-aware overload), `MCPLayout.swift`, `BaseTerminalController.swift`,
+  `MCPTools.swift` (schema + `positiveInt` parse + forward in both arms); sidecar — `mcp.ts`,
+  `runner.ts`. Tests: Swift `SplitTreeTests` (`grid*`: back-compat == aspect, ultrawide
+  3rd/4th/5th pane, both-capped-leaf-skipped, cols1/rows1 stacks + single-leaf, single-leaf
+  follows aspect with caps, tall 2×3 walk, every-leaf-capped fallback, epsilon overlap); sidecar
+  `runner.test.ts` (balanced spawn + pack forward grid caps; firstTab/newTab omit them),
+  `mcp.test.ts` (client sends caps when positive, omits when undefined/≤0), `grid.test.ts`
+  (`gridCap == cols*rows` consistency). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig
+  change.**
+
 ### Continuous packing — `packMove` (§12)
 
 - **CONTINUOUS PACKING (§12) — consolidate fragmented tabs by MOVING panes.** When agents

@@ -221,6 +221,8 @@ enum MCPTools {
                     "firstTab": ["type": "boolean", "default": false, "description": "Open a new tab instead of splitting a target. The run's first tab uses the frontmost window; an OVERFLOW tab passes windowAnchorUUID to join the run's existing window."],
                     "windowAnchorUUID": ["type": "string", "description": "With firstTab:true, the UUID of a live pane of the SAME run so the new (overflow) tab joins that pane's window — keeping all of a run's tabs in one window. Omit for the run's first tab."],
                     "env": ["type": "object", "description": "Item-context env vars (GHOSTTY_ITEM_*) set on the launched shell. NEVER splice these into 'command'.", "additionalProperties": ["type": "string"]],
+                    "maxCols": ["type": "integer", "minimum": 1, "description": "Agent Queue grid cap: with balanced:true, never exceed this many COLUMNS in the split pane's row band (further splits stack into rows). Omit ⇒ pure-aspect balanced BSP (no grid cap). From the template grid.cols."],
+                    "maxRows": ["type": "integer", "minimum": 1, "description": "Agent Queue grid cap: with balanced:true, never exceed this many ROWS in the split pane's column band (further splits add columns). Omit ⇒ pure-aspect. From the template grid.rows."],
                 ],
                 "required": ["command"],
                 "additionalProperties": false,
@@ -236,6 +238,8 @@ enum MCPTools {
                     "sourceUUID": ["type": "string", "description": "The surface to move."],
                     "targetAnchorUUID": ["type": "string", "description": "Any surface in the destination tab; identifies which tab to move into."],
                     "balanced": ["type": "boolean", "default": true, "description": "Split the largest pane in the destination tab (the queue's tiling). Currently always balanced."],
+                    "maxCols": ["type": "integer", "minimum": 1, "description": "Agent Queue grid cap: with balanced:true, never exceed this many COLUMNS in the destination tab's largest pane's row band (further splits stack into rows). Omit ⇒ pure-aspect balanced BSP (no grid cap). From the template grid.cols."],
+                    "maxRows": ["type": "integer", "minimum": 1, "description": "Agent Queue grid cap: with balanced:true, never exceed this many ROWS in the destination tab's largest pane's column band (further splits add columns). Omit ⇒ pure-aspect. From the template grid.rows."],
                 ],
                 "required": ["sourceUUID", "targetAnchorUUID"],
                 "additionalProperties": false,
@@ -517,11 +521,16 @@ enum MCPTools {
             // UUID so the new tab joins the run's existing window. Invalid/absent ⇒ nil
             // (frontmost window — the run's first tab).
             let windowAnchorUUID = (arguments["windowAnchorUUID"] as? String).flatMap { UUID(uuidString: $0) }
+            // (GRID cap §12) Optional template grid caps. JSON ints arrive as NSNumber (the
+            // house idiom — `as? Int` would nil out a valid JSON number); keep only positive,
+            // else nil ⇒ no cap (pure-aspect, byte-identical to today).
+            let maxCols = positiveInt(arguments["maxCols"])
+            let maxRows = positiveInt(arguments["maxRows"])
             let result: (id: String, sessionID: UInt64)? = DispatchQueue.main.sync {
                 MCPLayout.newSplitCommand(
                     targetUUID: targetUUID, direction: direction, command: command,
                     cwd: cwd, firstTab: firstTab, env: env, balanced: balanced,
-                    windowAnchorUUID: windowAnchorUUID)
+                    windowAnchorUUID: windowAnchorUUID, maxCols: maxCols, maxRows: maxRows)
             }
             guard let result else { return .toolError("failed to spawn split") }
             // Casing note: this returns "sessionId" (lowercase); list_surfaces emits
@@ -536,9 +545,14 @@ enum MCPTools {
                 return .invalidParams("missing or invalid targetAnchorUUID")
             }
             let balanced = (arguments["balanced"] as? Bool) ?? true
+            // (GRID cap §12) Same optional grid caps as spawn_split_command — keep the packed
+            // pane within the destination tab's grid. Positive ⇒ cap; else nil ⇒ pure-aspect.
+            let maxCols = positiveInt(arguments["maxCols"])
+            let maxRows = positiveInt(arguments["maxRows"])
             let ok = DispatchQueue.main.sync {
                 MCPLayout.moveSurfaceIntoTab(
-                    sourceUUID: sourceUUID, targetAnchorUUID: targetAnchorUUID, balanced: balanced)
+                    sourceUUID: sourceUUID, targetAnchorUUID: targetAnchorUUID, balanced: balanced,
+                    maxCols: maxCols, maxRows: maxRows)
             }
             return ok ? .ok(["ok": true]) : .toolError("could not move surface (unresolved id or insert failed)")
 
@@ -584,5 +598,15 @@ enum MCPTools {
     static func uuidArg(_ arguments: [String: Any]) -> UUID? {
         guard let s = arguments["id"] as? String else { return nil }
         return UUID(uuidString: s)
+    }
+
+    /// (GRID cap §12) Parse an optional positive JSON integer tool argument. JSON numbers
+    /// cross the JSONSerialization boundary as NSNumber, so cast to NSNumber and take
+    /// `.intValue` (the house idiom — `as? Int` would nil out a valid JSON number). Returns
+    /// the value only when strictly positive; anything else (missing / non-number / ≤ 0) ⇒
+    /// nil, so a malformed cap falls back to no-cap rather than erroring.
+    static func positiveInt(_ value: Any?) -> Int? {
+        guard let n = (value as? NSNumber)?.intValue, n > 0 else { return nil }
+        return n
     }
 }

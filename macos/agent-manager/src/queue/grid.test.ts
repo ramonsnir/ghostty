@@ -17,6 +17,21 @@ test("gridCap", () => {
   assert.equal(gridCap(1, 1), 1);
 });
 
+// (§12 grid cap) The per-tab pane cap gridCap = cols*rows is consistent with the BSP grid
+// caps that are now forwarded to the GUI (maxCols=cols, maxRows=rows): a tab capped at
+// cols columns × rows rows holds exactly cols*rows panes. The BSP direction logic itself is
+// Swift-side (largestLeafSplit); this just pins the shared invariant.
+test("gridCap == cols*rows (consistent with the forwarded BSP grid caps)", () => {
+  for (const [cols, rows] of [
+    [3, 2],
+    [2, 1],
+    [1, 1],
+    [4, 4],
+  ]) {
+    assert.equal(gridCap(cols, rows), cols * rows);
+  }
+});
+
 test("lowestFreeSlot: empty grid => 0", () => {
   assert.equal(lowestFreeSlot(new Set(), 9), 0);
 });

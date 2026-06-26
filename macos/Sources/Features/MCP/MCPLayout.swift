@@ -415,7 +415,9 @@ enum MCPLayout {
         firstTab: Bool,
         env: [String: String],
         balanced: Bool = false,
-        windowAnchorUUID: UUID? = nil
+        windowAnchorUUID: UUID? = nil,
+        maxCols: Int? = nil,
+        maxRows: Int? = nil
     ) -> (id: String, sessionID: UInt64)? {
         // Render the command as a single line of initial input with one trailing
         // newline = one submit. `singleLine` collapses INTERIOR newlines (so a
@@ -475,7 +477,10 @@ enum MCPLayout {
             // column/row units). Fall back to a wide default so the first split goes right.
             let bounds = controller.window?.contentView?.bounds.size
                 ?? CGSize(width: 1600, height: 1000)
-            guard let pick = controller.surfaceTree.largestLeafSplit(within: bounds) else { return nil }
+            // (GRID cap §12) Constrain the BSP so the tab never exceeds maxCols columns /
+            // maxRows rows. nil/≤0 ⇒ pure-aspect (byte-identical to the no-grid path).
+            guard let pick = controller.surfaceTree.largestLeafSplit(
+                within: bounds, maxCols: maxCols ?? 0, maxRows: maxRows ?? 0) else { return nil }
             target = pick.view
             newDir = pick.direction
         } else {
@@ -499,12 +504,14 @@ enum MCPLayout {
     /// their controllers/views and calls the destination controller's `moveSurfaceIntoThisTab`.
     /// Returns false if either UUID is unresolved or the move fails. MUST be called on main.
     static func moveSurfaceIntoTab(
-        sourceUUID: UUID, targetAnchorUUID: UUID, balanced: Bool
+        sourceUUID: UUID, targetAnchorUUID: UUID, balanced: Bool,
+        maxCols: Int? = nil, maxRows: Int? = nil
     ) -> Bool {
         guard let (_, source) = controllerAndView(forUUID: sourceUUID),
               let (destController, _) = controllerAndView(forUUID: targetAnchorUUID)
         else { return false }
-        return destController.moveSurfaceIntoThisTab(source: source, balanced: balanced)
+        return destController.moveSurfaceIntoThisTab(
+            source: source, balanced: balanced, maxCols: maxCols, maxRows: maxRows)
     }
 
     /// PURE: read a freshly-created leaf's stable identity. `sessionID` via the C

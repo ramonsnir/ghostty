@@ -1375,7 +1375,10 @@ class BaseTerminalController: NSWindowController,
     /// drag-and-drop (`surfaceTree.inserting` on the destination + `removeSurfaceNode` on the
     /// source). The source's tab/window closes automatically if it empties. Returns false if
     /// the source can't be located or the insert fails. MUST be called on main.
-    func moveSurfaceIntoThisTab(source: Ghostty.SurfaceView, balanced: Bool) -> Bool {
+    func moveSurfaceIntoThisTab(
+        source: Ghostty.SurfaceView, balanced: Bool,
+        maxCols: Int? = nil, maxRows: Int? = nil
+    ) -> Bool {
         // Already in this tree → nothing to do (treat as success).
         if surfaceTree.root?.node(view: source) != nil { return true }
 
@@ -1398,7 +1401,10 @@ class BaseTerminalController: NSWindowController,
         // aspect test is honest (same as the queue's spawn path). A nil pick (empty tree)
         // aborts. Non-balanced isn't used by the packer; fall back to balanced too.
         let bounds = window?.contentView?.bounds.size ?? CGSize(width: 1600, height: 1000)
-        guard let pick = surfaceTree.largestLeafSplit(within: bounds) else { return false }
+        // (GRID cap §12) Respect the destination tab's grid caps so packing a fragmented run
+        // never re-introduces a 4th column in a 3-col grid. nil/≤0 ⇒ pure-aspect.
+        guard let pick = surfaceTree.largestLeafSplit(
+            within: bounds, maxCols: maxCols ?? 0, maxRows: maxRows ?? 0) else { return false }
         _ = balanced // currently always balanced; kept for symmetry with spawn_split_command
 
         // Compute the new (destination) tree first so a failure aborts before we mutate the
