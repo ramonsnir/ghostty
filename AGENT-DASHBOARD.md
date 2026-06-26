@@ -306,3 +306,224 @@ gains a live state chip.
   pin/window-level tests in
   `macos/Tests/AgentDashboard/AgentDashboardTests.swift` and the hook/agent-state
   pure-helper tests in `macos/Tests/MCP/MCPAgentStateTests.swift`.
+
+---
+
+## Implementation notes (for agents touching the code)
+
+These are the load-bearing internals for an agent working on the Agent Dashboard
+code — the dev nuance behind the user-facing behavior above. (The high-level
+config/usage and the code map are above; this section is the deep mechanism + the
+gotchas, not a recap.)
+
+### Action + config keys, and the pin window-level/activation semantics
+
+- **Action + config (fork-only, default off):** the payload-less keybind action
+  `toggle_agent_dashboard` (also a command-palette entry "Toggle Agent Dashboard");
+  `agent-dashboard` (master enable) + `agent-dashboard-commands` (exe names that count
+  as an agent; comma-split OR repeated, default `claude,codex`; both reuse
+  `RepeatableString`) + **`agent-dashboard-pin`** (bool, default false → floating window
+  level + activating window when true; wired `Config.zig` → `Ghostty.Config.agentDashboardPin`
+  → `AgentDashboardPanel(pinned:)`, which sets `level = pinned ? .floating : .normal` AND
+  drops `.nonactivatingPanel` from the style mask when pinned). Keep all in
+  `~/.config/ghostty-ramon/config`. Read at launch (relaunch to change).
+- **Window-level / activation rationale.** The panel is **normal-level by default**
+  (other windows can cover it) with a visible title ("Agent Dashboard") + standard-window
+  AX subrole; the fork-only **`agent-dashboard-pin`** key flips it to a **floating window
+  level** (native always-on-top). The pin is in-process precisely because an external
+  window manager keyed on bundle id (Rectangle Pro's "pin one app to a side") CANNOT
+  distinguish the panel from the terminals — they share one bundle id — so its pin manages
+  the terminals too; pinning here sidesteps that. The AX subrole stays `.standardWindow`
+  even when pinned (a floating subrole is filtered out by most window managers; only the
+  window *level* changes). **Pinning ALSO drops `.nonactivatingPanel`** from the style
+  mask: the default overlay never activates Ghostty so it never becomes the app's focused
+  window, and Rectangle/Rectangle Pro keyboard shortcuts act on "the frontmost app's
+  focused window" — so a non-activating pinned panel is UNMOVABLE by Rectangle (Rectangle
+  itself manages any window with level < 21, so the floating level 3 is fine; the blocker
+  was the non-activating panel never being the focused window). As an activating window it
+  can become key/focused on click, so Rectangle can move/snap it while the floating level
+  keeps it on top; it STILL never becomes `main` (`canBecomeMain = false` unchanged), so
+  "new window inherits from main" is unaffected. Trade-off: clicking a pinned dashboard
+  activates Ghostty (fine — clicking a tile jumps into a terminal anyway).
+
+### Live previews need pty-host (the mirror SurfaceView)
+
+- **Live previews need `pty-host`.** Each tile mounts a read-only **mirror**
+  `SurfaceView` (`mirror = true` + the host session id) and lets the existing
+  `SurfaceWrapper` render it natively (full color, viewport-only — right for a
+  thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
+  Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
+
+### Smart bottom-anchor — skip empty rows AND the info-less footer
+
+- **Smart bottom-anchor (fork-only, always on, no config, PURE-SWIFT / ZERO Zig).** A
+  bottom-anchored thumbnail of a partially-filled screen (a fresh agent chat, a TUI not
+  yet at the bottom) wastes the preview on empty trailing rows; worse, an idle Claude
+  Code/Codex agent ALWAYS pins its input box + mode/status lines at the bottom, so the
+  meaningful content is pushed off-view. So the preview shifts the bottom-anchored mirror
+  DOWN by the number of trailing rows to drop — blanks PLUS a detected footer — so the
+  LAST row of CONTENT lands at the bottom (the dropped rows fall below the clip). It does
+  NOT collapse interior repeated/blank lines (the native Metal mirror renders the host
+  grid as-is — no seam to inject a "… N more …" marker; that would need a separate
+  self-rendered text preview that loses color/TUI fidelity — deliberately not done).
+
+- **Row source is the existing `cachedVisibleContents`, NOT a new core getter.** Under
+  pty-host the GUI mirror's `dumpText` is row-accurate (exactly one text line per grid
+  row, no soft-wrap, blank rows preserved, every row newline-terminated), so
+  `realSurface.cachedVisibleContents.get()` split on `\n` (drop one trailing "") IS the
+  viewport grid. Keeping this pure-Swift (no Zig core getter) keeps it GUI-only + tunable
+  with no host-linking change. `read_text`'s general path is NOT usable for a row count
+  (it uses `unwrap=true` + trims trailing blanks) — but the **mirror** path (the only one
+  the dashboard hits) does neither, which is what makes this work.
+
+- **Footer detection is CONSERVATIVE — never hides content** (the load-bearing design
+  constraint, found by reading real screens). `AgentMirrorPreview.chromeTrailingSkip(rows:)`
+  (pure, tested) peels trailing chrome and stops at the first row with REAL content, so
+  nothing meaningful is hidden. It peels, from the bottom: (1) up to `maxStatusLines` (3)
+  status/help lines — plain text with NO box-drawing (e.g. `⏵⏵ auto mode on…`, `↑↓ select
+  · x stop workflow…`); the no-box-drawing test is what distinguishes an outside-the-box
+  status line from a filled box-interior row (which carries `│`); then (2) it REQUIRES a
+  horizontal-rule row (`─`×≥12 — a box's bottom border; ASCII `-` does NOT count, so
+  markdown rules are safe) or it bails to blanks-only; then (3) it peels the box's
+  structural rows upward — borders (incl. a border carrying embedded status text, e.g. the
+  claude-pool line), empty interior cells (`│   │`), the empty `❯` prompt, and blank gap —
+  stopping at the first real-content row. This handles BOTH the input box AND content
+  boxes: the `/workflows` viewer's filled phase rows are real content (kept), while its
+  empty interior tail + bottom border + help line are dropped; a permission prompt keeps
+  its question/options and only loses the bottom border.
+
+- **GOTCHA — the NO-BREAK SPACE U+00A0.** Claude Code pads the prompt line with a
+  **NO-BREAK SPACE U+00A0**, not a normal space — `❯\u{00A0}…` — and the rule rows are
+  real U+2500. So `isEmptyInteriorRow`/`isBlankRow` MUST test the **Unicode whitespace
+  property** (covers U+00A0), NOT just U+0020/U+0009 — a codepoint-only check reads the
+  NBSP as content, the interior never looks empty, and `chromeTrailingSkip` returns 0 for
+  every footer.
+
+- **Footer shapes + whole-gap absorption.** The per-tile refresh runs off a `.task` poll
+  tied to view identity (not a `Timer.publish`, which restarts on every re-render).
+  Handles both Claude Code footer shapes (full-width `───`/`❯`/`───` rules and rounded
+  `╭─╮`/`│ │`/`╰─╯` boxes). When a footer IS found it also drops the ENTIRE blank gap
+  above it (not just one separator) — a near-empty session has content at the TOP, a big
+  blank gap, then the footer pinned at the bottom, so absorbing the whole gap lands the
+  last real content row at the bottom instead of a blank row mid-gap.
+
+- **The offset + the poll.** The offset is a pure, tested
+  `AgentMirrorPreview.bottomAnchorOffset(skipRows:…)` (clamped to `rows-1` so an all-blank
+  screen keeps one row visible), refreshed by `refreshSkipRows()` on a light ~0.8s
+  per-tile `.task` poll (live frames render off the Metal path, not via `@Published`, so a
+  poll — not an observer — drives it). Limitation: a placeholder prompt (`❯ Try "…"`)
+  reads as non-empty interior → the box is shown (conservative); most active agents show a
+  bare `❯`. **GUI-only, no Zig/host change, GUI relaunch to pick up.**
+  - Wiring: `AgentDashboard/AgentPreviewTile.swift` (`chromeTrailingSkip` +
+    `isRuleRow`/`isEmptyInteriorRow`/`isBlankRow` + `bottomAnchorOffset` + `refreshSkipRows`
+    + `.offset` + timer).
+  - Tests: `macos/Tests/AgentDashboard/AgentDashboardTests.swift` (`ChromeTrailingSkipTests`
+    — grounded in real captured footers — + `BottomAnchorOffsetTests`).
+
+### Detection is HOST-GATED on a new protocol frame
+
+- **Detection is HOST-GATED on a NEW protocol frame.** Under `.client` the GUI mirror
+  can't read the foreground process, so the host pushes the raw foreground pid via an
+  additive `foreground_pid` frame (**protocol minor bumped 3→4**); the GUI walks that
+  pid's process subtree locally with libproc and path-component-matches the configured
+  commands. **Detection silently finds nothing until `ghostty-host` is on a minor-4
+  build** — a GUI upgrade alone is not enough (and a stale xcframework can leave the app
+  on minor 3). Gotchas: `proc_listchildpids` is unreliable on macOS — use
+  `proc_listpids`+`proc_pidinfo` parent links; a versioned exe basename isn't the command
+  name, hence path-component match.
+
+### Threading / cost, and core wiring
+
+- **Threading / cost:** the detector is a ~2s off-main `.utility` poll (pure
+  `matchAgent`/`resolve` behind an injectable `ProcEnumerator`); paused while the panel is
+  hidden/occluded, and mirror renderers pause via `ghostty_surface_set_occlusion` — a
+  hidden panel costs ~nothing. The model is `@MainActor`; the detector hops to main only
+  to snapshot value types `(uuid, foregroundPID)` and to publish results. Hide set
+  persists in the per-bundle-id UserDefaults; a ringing agent is never left hidden.
+  GUI-only changes relaunch the GUI; the `foreground_pid` frame is a HOST change (host
+  rebuild + LaunchAgent reload — see `CLAUDE.md`).
+- Wiring: core — `src/config/Config.zig` (`agent-dashboard`/`-commands`),
+  `src/input/{Binding,command}.zig` + `src/apprt/action.zig` (action), the minor-4 frame
+  in `src/host/{protocol,Server,Session}.zig` + `src/termio/Client.zig` +
+  `ghostty_surface_foreground_pid` (`include/ghostty.h`, `src/apprt/embedded.zig`,
+  `src/Surface.zig`); macOS — `macos/Sources/Features/AgentDashboard/*` (Controller +
+  Model + Panel + View + PreviewTile + Detector), `AppDelegate.swift`,
+  `Ghostty.Config.swift`, `Ghostty.Surface.swift` (`foregroundPID`), `project.pbxproj`
+  (iOS exclusion).
+- Tests: `macos/Tests/AgentDashboard/AgentDashboardTests.swift`; Zig
+  `agent-dashboard config` + `Binding toggle_agent_dashboard` + the minor-4/`ForegroundPid`
+  round-trip in `src/host/test.zig` + the `foreground_pid` Client decode.
+
+### Per-tile agent state via Claude Code hooks
+
+- **Per-tile agent state via Claude Code hooks (fork-only, GUI + hooks ONLY, ZERO
+  Zig/host change).** Each tile can show an authoritative `working`/`waiting`/`idle` chip
+  (+ `lastTool`/`lastPrompt`) driven by Claude Code's lifecycle hooks, NOT a heuristic. A
+  tiny shell hook (`example/claude-hooks/ghostty-agent-state.sh`, wired by
+  `example/claude-hooks/settings-hooks.json` into `~/.claude/settings.json`) fires on
+  `UserPromptSubmit`/`PreToolUse`/`SessionStart` (→ `working`), `Notification` (→
+  `waiting`), `Stop`/`SessionEnd` (→ `idle`) and **POSTs `{tty,state,prompt?,tool?,message?}`
+  to the EXISTING in-GUI MCP server** at `POST /agent-state` (`X-Ghostty-Token`,
+  `127.0.0.1:8765`; `GHOSTTY_MCP_PORT` overrides for the 8766/8767 dev offsets). The hook
+  is fire-and-forget (backgrounded `curl --max-time 2`, never blocks/fails the agent),
+  debounces only the chatty `PreToolUse`/`working` with a ~1s per-tty stamp file, and
+  reads the token from `$GHOSTTY_MCP_TOKEN` or `~/.config/ghostty-ramon/local`.
+
+- **tty correlation is the load-bearing trick (the ppid walk):** the hook reports the
+  surface's controlling tty — but Claude Code spawns hooks (like Bash tool calls)
+  **DETACHED from the controlling terminal**, so the hook's OWN tty is `??`/none. The
+  script therefore **walks up its ppid chain** (`ps -o tty= -p <pid>`, then `ps -o ppid=`)
+  and takes the nearest ancestor with a real tty — the `claude` process itself runs on the
+  surface's tty (e.g. `ttys030`). (Reading the hook's OWN tty does NOT work — it's
+  `??`/none because the hook is spawned detached; the ppid walk is required.)
+
+- **The MCP `/agent-state` handler (tty → surface UUID).** The MCP handler
+  (`MCPServer.handleAgentState`) resolves it to a surface UUID by reading each surface's
+  **host-pushed minor-4 `foregroundPID`** (the SAME pid the dashboard detector already
+  consumes — no new frame) and mapping that pid → controlling tty via libproc
+  `proc_pidinfo(PROC_PIDTBSDINFO).pbi_e_tdev` → `devname()`, normalizing both sides
+  (`/dev/ttysNNN`/`ttysNNN`/`sNNN` → `ttysNNN`). A no-match returns 200 (the hook is
+  fire-and-forget; a momentary miss isn't an error). The handler posts
+  `.ghosttyAgentStateDidChange`.
+
+- **Model application (`applyAgentState`).** `AgentDashboardModel.applyAgentState` is
+  **hook-authoritative + alongside** (any surface that ever POSTed joins `hookBacked` and
+  thereafter MUTES the `idleSeconds` heuristic), app-side **coalesces** an unchanged state
+  (the second `PreToolUse` debounce), auto-unhides + sorts-first on `.waiting` (mirrors the
+  bell auto-unhide), and on the working/idle→`.waiting` EDGE posts
+  `.ghosttyAgentNeedsAttention`, which `WebPushManager` observes to fire a Web Push (an
+  `⏳ ` push, reusing the bell fan-out via the shared `enqueuePush`; the per-surface ~3s
+  debounce is keyed per-kind so a bell never swallows the waiting push). **No TTL** — the
+  ~2s detector poll removes dead agents; a missed `Stop` is an accepted cosmetic
+  stale-`working`.
+
+- **Persistence via AgentStateStore (keyed by session id, not surface UUID).** Persisted
+  across GUI restart (hooks only POST on transitions, so a relaunched GUI would otherwise
+  show blank chips until the agent next acts): the model write-throughs each state to an
+  `AgentStateStore` (UserDefaults) keyed by the **stable host session id** — NOT the
+  surface UUID, which is freshly minted each launch — and `rebuild(live:)` rehydrates it
+  onto the new UUID by session id (silent restore — no push / no waiting-edge re-fire; the
+  next live hook takes over). Records age-prune (14d / 256-cap, timestamp touched for live
+  sessions). Caveat: a HOST restart resets the session-id counter, so a stale record could
+  briefly hydrate a reused id with wrong state until the next hook self-corrects (host
+  restarts are rare + lose all sessions anyway). `prune` / `AgentStateStore` /
+  `UserDefaultsAgentStateStore` are unit-tested. Claude-Code-only (Codex tiles stay
+  preview-only).
+
+- **Shared symbols + wiring.** Pinned shared symbols (`AgentState`/`AgentStatePayload`/the
+  two `Notification.Name`s/`AgentStateUserInfoKey`) live in
+  `macos/Sources/Features/AgentDashboard/AgentStateBridge.swift`.
+  - Wiring: hooks — `example/claude-hooks/*`; MCP —
+    `macos/Sources/Features/MCP/MCPAgentState.swift` (pure parser + tty normalize/match +
+    the injectable `TTYResolver` proc seam) + `MCPServer.swift` (`/agent-state` route +
+    `handleAgentState`); dashboard — `AgentStateBridge.swift` +
+    `AgentDashboardController.swift` (model state + observer + `postNeedsAttention` +
+    drop-stale) + `AgentPreviewTile.swift` (state chip + waiting border/pill + tool/prompt);
+    push — `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (attention observer →
+    `onAttention`/`enqueuePush`); `project.pbxproj` (iOS exclusion of the 2 new source files).
+  - Tests: `macos/Tests/MCP/MCPAgentStateTests.swift` (parse / normalizeTTY / ttyMatches /
+    resolveSurface w/ injected resolver / decideRoute `/agent-state`) + the `applyAgentState`
+    model tests in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
+  - **GUI relaunch only** to pick it up (no host restart); the user copies the hook to
+    `~/.config/ghostty-ramon/claude-hooks/` + merges the settings block (see the user-facing
+    setup section above).
