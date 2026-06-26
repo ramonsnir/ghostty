@@ -206,6 +206,13 @@ bell-features = system,audio,no-attention,no-title
 # dashboard unhide/float, web push, web-monitor indicator.
 attention-features = title,border,bounce,badge,dashboard,push,monitor
 
+# Diagnostics: trace the bell -> attention lifecycle to
+# ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl (GUI + sidecar). Off by
+# default; on while investigating "why did the bell fire / why didn't it" and
+# ring->attention delay. Append-only — turn it back off when done. See
+# BELL-ATTENTION.md (-> Diagnostics).
+bell-diagnostics = true
+
 # --- PTY host: emulation-on-host (always-on) -----------------------------
 # Fork-only key (an official Ghostty would error on it). Non-null selects the
 # out-of-process `.client` backend: terminal emulation + the live shell run in
