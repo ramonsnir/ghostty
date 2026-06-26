@@ -168,6 +168,17 @@ final class MCPEventBus {
             ) { [weak self] note in
                 guard let self else { return }
                 guard let view = note.object as? Ghostty.SurfaceView else { return }
+                // (ramon fork / Bell Attention v2) A bell on a surface the user is
+                // actively looking at never needs promotion — we don't summon you to a
+                // split you're already focused on. Don't surface it as a `.bell` event,
+                // so the Agent Manager sidecar doesn't even spend a Haiku classify on it
+                // (the bell-reactive promotion loop is the only consumer of `.bell`).
+                // The GUI still fires the tier-1 `bell-features-focused` effects
+                // independently via `ghosttyBellDidRing` in SurfaceView/AppDelegate.
+                // Focus is read live on main at RING time — the freshest truth, unlike
+                // the polled `surface.focused` the sidecar would otherwise see. Unfocused
+                // bells still flow through and get classified/promoted as before.
+                if view.bellIsFocused { return }
                 self.record(Event(id: view.id, type: .bell, ts: Date()))
             }
 

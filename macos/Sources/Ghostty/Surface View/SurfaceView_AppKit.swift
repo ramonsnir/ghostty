@@ -921,6 +921,18 @@ extension Ghostty {
                   let uuid = info[AgentStateUserInfoKey.surfaceID] as? UUID,
                   uuid == self.id else { return }
             let on = (info[AgentStateUserInfoKey.attention] as? Bool) ?? false
+            // (ramon fork / Bell Attention v2) Never RAISE the sticky attention state on
+            // a surface the user is actively looking at — we don't need to be summoned to
+            // a split we're already focused on. This is the mechanism-agnostic backstop
+            // for the delayed-promotion race: a bell classify (~1-2s) or the poll-driven
+            // rate-limit watchdog (up to 5s, 10min for hidden tiles) can land a late
+            // `set_attention(true)` AFTER `focusDidChange` already cleared attention,
+            // re-lighting a healthy, focused session ("random bell from nothing"). The
+            // event-bus skip above stops most bell promotions at the source; this also
+            // covers the watchdog path (which bypasses the bell event) and the race where
+            // focus lands between classify start and this notification. A CLEAR
+            // (on == false) ALWAYS applies — suppression only blocks raising.
+            if on && bellIsFocused { return }
             attentionNeeded = on
         }
 

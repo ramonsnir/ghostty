@@ -77,7 +77,13 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   dial down with explicit `no-*`); promotion is FAIL-OPEN (only a confident `attention===false`
   suppresses — do NOT use the lax `coerceBool`); promotion is EVENT-DRIVEN and must NOT depend
   on `view.bell`; the GUI never auto-sets `attentionNeeded` (only the sidecar via
-  `set_attention`). Same mechanism as the Agent Manager's rate-limit watchdog. **See
+  `set_attention`). **A truly focused surface (`bellIsFocused`) is NEVER promoted** — two
+  guards close the "random bell from a healthy session" delayed-promotion race: (1)
+  `MCPEventBus` skips emitting the `.bell` event for a focused surface, so the sidecar spends
+  NO Haiku classify on it; (2) `SurfaceView.ghosttyAttentionDidChange` ignores a late
+  `set_attention(true)` while focused (a clear always applies — this also covers the
+  poll-driven rate-limit watchdog, which bypasses the bell event). Same mechanism as the Agent
+  Manager's rate-limit watchdog. **See
   `BELL-ATTENTION.md` (→ Implementation notes) for the vocabulary table, launch gating, per-tier
   consumer routing, wiring + tests.** GUI relaunch + rebuilt sidecar `dist`; no host change.
 

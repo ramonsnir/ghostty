@@ -58,10 +58,10 @@ This is one opinion. Anyone can route any effect to either tier in their own con
 
 ## How a bell gets promoted (fail-open)
 
-When the [Agent Manager](AGENT-MANAGER.md) is running with the filter on, every bell wakes
-its Haiku classifier (event-driven, so promotion lands in ~1–2s, not on the 5s poll). The
-classifier reads the surface and returns an `attention` verdict, and the **non-AI code
-treats every uncertain state as "promote":**
+When the [Agent Manager](AGENT-MANAGER.md) is running with the filter on, every bell **on a
+surface you're not looking at** wakes its Haiku classifier (event-driven, so promotion lands
+in ~1–2s, not on the 5s poll). The classifier reads the surface and returns an `attention`
+verdict, and the **non-AI code treats every uncertain state as "promote":**
 
 | classifier result | outcome |
 |---|---|
@@ -78,6 +78,25 @@ watchdog in [Agent Manager](AGENT-MANAGER.md) is this same mechanism with a dedi
 **The GUI never promotes on its own.** `attentionNeeded` is set *only* by the sidecar (via
 the MCP `set_attention` tool); the GUI just renders the two states. A promotion clears when
 you focus the surface (you've seen it) or when the sidecar reports recovery.
+
+### Focus never raises attention (no bell from a split you're looking at)
+
+You don't need to be summoned to a split you're already focused on, so a **truly focused**
+surface (focused split + key window + active app — the same `bellIsFocused` rule
+`bell-features-focused` uses) never gets promoted, by two independent guards:
+
+1. **Don't even classify.** A bell on a focused surface is **not surfaced as a `.bell`
+   event** to the sidecar, so the Haiku classifier never even runs for it — no spend, no
+   promotion. (The tier-1 `bell-features-focused` effects still fire normally.) Focus is
+   read live at *ring* time, the freshest truth.
+2. **Don't raise late, either.** A `set_attention(true)` that arrives **while** the surface
+   is focused is ignored GUI-side (a *clear* always applies). This is the mechanism-agnostic
+   backstop for the **delayed-promotion race** that otherwise made "random bells from a
+   healthy session": a bell classify (~1–2s) or the poll-driven **rate-limit watchdog** (up
+   to 5s, 10 min for hidden tiles) could land a late promotion *after* `focusDidChange`
+   already cleared attention, re-lighting a split you're actively watching. Guard 1 stops
+   most bell promotions at the source; guard 2 also covers the watchdog (which bypasses the
+   bell event entirely) and the race where focus lands mid-classify.
 
 ## Config
 
@@ -248,6 +267,29 @@ the raw `bell`: on focus (`focusDidChange` clears both), `resetBell()` clears on
 button, P5). `list_surfaces` carries BOTH `bell` + `attentionNeeded` truthfully (no flag —
 principle F).
 
+### Focus suppresses promotion (two guards — `bellIsFocused`)
+
+A truly focused surface is never promoted, so a bell on a split you're looking at can't
+re-light attention (the "random bell from a healthy session" race). Two independent guards,
+both keyed on the existing `SurfaceView.bellIsFocused` (focused split + `isKeyWindow` +
+`NSApp.isActive`), read on `.main` at the relevant instant:
+
+1. **`MCPEventBus.start`'s bell observer** skips `record(.bell)` when `view.bellIsFocused` —
+   so a focused bell never becomes a `.bell` event, the sidecar's `bellReactiveLoop` never
+   sees it, and **no Haiku classify is spent**. Focus is read at RING time (freshest), not
+   the sidecar's polled `surface.focused`. The `.bell` event's only consumer is the
+   bell-reactive promotion loop; tier-1 effects come from `ghosttyBellDidRing` (separate
+   `NotificationCenter` observers in SurfaceView/AppDelegate/WebMonitorPush), so suppressing
+   the event does NOT dim tier-1 `bell-features-focused`.
+2. **`SurfaceView.ghosttyAttentionDidChange`** ignores an incoming `set_attention(true)` when
+   `bellIsFocused` (a *clear*, `on == false`, always applies). Mechanism-agnostic backstop
+   for the async race (focus lands between classify-start and the notification) AND for the
+   poll-driven rate-limit watchdog, which bypasses the bell event so guard 1 can't catch it.
+
+Not unit-tested: `bellIsFocused` depends on live `NSApp`/window state (like
+`bellFeaturesForCurrentFocus` itself, also untested) — verified by build + the existing
+MCP/WebMonitor/Config suites staying green.
+
 ### Cross-language `BellFeatures` bit-ABI (Zig packed struct ⇄ Swift OptionSet rawValue)
 
 `ghostty_config_get` hands the struct to Swift as a raw int reinterpreted by FIXED bit
@@ -282,7 +324,9 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
   `AppDelegate.swift`, `BaseTerminalController.swift`, `Surface
   View/{SurfaceView,SurfaceView_AppKit}.swift`, `Terminal/TerminalView.swift`,
   `AgentDashboard/AgentDashboardController.swift`, `WebMonitor/{WebMonitorServer,WebMonitorPush}.swift`,
-  `MCP/{MCPAnnotation,MCPLayout}.swift` (`set_attention` + `attentionNeeded` row).
+  `MCP/{MCPAnnotation,MCPLayout}.swift` (`set_attention` + `attentionNeeded` row),
+  `MCP/MCPEventBus.swift` (focus guard 1 — skip `.bell` for a focused surface) +
+  `Surface View/SurfaceView_AppKit.swift` `ghosttyAttentionDidChange` (focus guard 2).
 - **sidecar** — `macos/agent-manager/src/{index,summarizer,mcp,prompts}.ts` (`coerceAttention`,
   `pendingBellIds`/`bellReactiveLoop`, `makeCoalescedRunner`, `waitForEvent`/`parseWaitForEvent`).
 
