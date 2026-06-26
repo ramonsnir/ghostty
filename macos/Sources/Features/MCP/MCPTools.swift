@@ -355,6 +355,61 @@ enum MCPTools {
                 "additionalProperties": false,
             ],
         ],
+        [
+            // (ramon fork / MCP knowledge) Discover the effective configuration.
+            "name": "get_effective_config",
+            "description": "Read the fork's effective configuration: the current value of a curated set of keys (every fork-only key plus high-signal upstream keys) and whether each equals its built-in default. changedOnly (default true) returns ONLY keys whose value differs from the default — i.e. what the user actually set. Pass keys:[…] to restrict to specific keys. Secrets (mcp-token, web-monitor-token) are REDACTED to \"<set>\"/\"\" — never echoed. Returns {config:[{key,value,isDefault}]}.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "changedOnly": ["type": "boolean", "default": true, "description": "Only keys whose value differs from the default."],
+                    "keys": ["type": "array", "items": ["type": "string"], "description": "Restrict to these exact keys (optional)."],
+                ],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / MCP knowledge) Explain a fork feature + its live status.
+            "name": "docs_for_feature",
+            "description": "Explain a fork feature: its summary, the config keys that control it, the steps to enable it, whether it is currently ENABLED, and any UNMET requirements (computed LIVE from the config with the real precondition predicates — e.g. the Agent Manager needs its flag on AND mcp-listen+mcp-token set AND node resolvable). feature is one of agent-dashboard|agent-manager|agent-queue|web-monitor|mcp|project-selector|splits|all (default all). Returns {features:[{name,summary,configKeys,enableSteps,requires,enabled,docPath}]}.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "feature": [
+                        "type": "string",
+                        "enum": ["agent-dashboard", "agent-manager", "agent-queue", "web-monitor", "mcp", "project-selector", "splits", "all"],
+                        "default": "all",
+                    ],
+                ],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / MCP knowledge) Explain a single config key.
+            "name": "describe_config_key",
+            "description": "Explain a single configuration key: its full documentation (the same text `ghostty +explain-config` prints), whether it is a FORK-ONLY key (doc begins with the \"(ramon fork)\" marker), and — when the app config is loaded — its current value. Returns {key,doc,forkOnly,known,currentValue?}. known:false for an unrecognized key.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "key": ["type": "string", "description": "The config key name, e.g. \"font-size\" or \"agent-dashboard\"."],
+                ],
+                "required": ["key"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            // (ramon fork / MCP knowledge) List every config key.
+            "name": "list_config_keys",
+            "description": "List EVERY configuration key with its one-line summary (first line of the doc) and fork-only flag. filter (optional, case-insensitive substring) restricts to matching key names. forkOnly:true returns ONLY fork-added keys (the fork's features). Returns {keys:[{key,forkOnly,summary}]}.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "filter": ["type": "string", "description": "Case-insensitive substring match on the key name (optional)."],
+                    "forkOnly": ["type": "boolean", "description": "If true, only fork-added keys."],
+                ],
+                "additionalProperties": false,
+            ],
+        ],
     ]
 
     // MARK: - dispatch
@@ -589,6 +644,87 @@ enum MCPTools {
             // a nested `queue.sync` (which would DEADLOCK on this serial queue).
             let drained = server.drainQueueCommands()
             return .ok(MCPServer.queueCommandsJSONData(drained))
+
+        case "get_effective_config":
+            let changedOnly = (arguments["changedOnly"] as? Bool) ?? true
+            // Optional key restriction; non-string entries are ignored.
+            let keys: Set<String>? = (arguments["keys"] as? [Any]).map {
+                Set($0.compactMap { $0 as? String })
+            }
+            // Read the live config + a fresh default on MAIN (Ghostty.Config is
+            // main-isolated), returning ONLY value types across the hop.
+            let entries: [[String: Any]]? = DispatchQueue.main.sync {
+                guard let live = MCPKnowledge.liveConfig() else { return nil }
+                let defaults = Ghostty.Config.defaultConfig()
+                return MCPKnowledge.entries(
+                    live: live, defaults: defaults,
+                    changedOnly: changedOnly, keys: keys
+                ).map { ["key": $0.key, "value": $0.value, "isDefault": $0.isDefault] }
+            }
+            guard let entries else { return .toolError("config not available") }
+            return .ok(["config": entries])
+
+        case "docs_for_feature":
+            let feature = (arguments["feature"] as? String) ?? "all"
+            let ids: [String]
+            if feature == "all" {
+                ids = MCPKnowledge.featureIDs
+            } else if MCPKnowledge.featureIDs.contains(feature) {
+                ids = [feature]
+            } else {
+                return .invalidParams("unknown feature: \(feature)")
+            }
+            // Capture the live preconditions on MAIN; the per-feature status is then
+            // pure. nodeResolvable is approximated by the configured node path being
+            // set (a login-shell probe is the controller's job, not a read tool).
+            let docs: [[String: Any]]? = DispatchQueue.main.sync {
+                guard let live = MCPKnowledge.liveConfig() else { return nil }
+                let nodeResolvable = (live.agentManagerNodePath?.isEmpty == false)
+                let pre = MCPKnowledge.Preconditions.from(live, nodeResolvable: nodeResolvable)
+                return ids.compactMap { id -> [String: Any]? in
+                    guard let d = MCPKnowledge.featureDoc(id, pre: pre) else { return nil }
+                    return [
+                        "name": d.name, "summary": d.summary,
+                        "configKeys": d.configKeys, "enableSteps": d.enableSteps,
+                        "requires": d.requires, "enabled": d.enabled, "docPath": d.docPath,
+                    ]
+                }
+            }
+            guard let docs else { return .toolError("config not available") }
+            return .ok(["features": docs])
+
+        case "describe_config_key":
+            guard let key = arguments["key"] as? String, !key.isEmpty else {
+                return .invalidParams("missing key")
+            }
+            // The doc/forkOnly come from the C API (no live config needed, so it
+            // works headless). The current value, when the app config is loaded,
+            // is read on MAIN.
+            let kd = Ghostty.Config.describeKey(key)
+            var payload: [String: Any] = [
+                "key": kd.key, "doc": kd.doc, "forkOnly": kd.forkOnly, "known": kd.known,
+            ]
+            let current: String? = DispatchQueue.main.sync {
+                guard let live = MCPKnowledge.liveConfig() else { return nil }
+                return MCPKnowledge.readers.first { $0.key == key }?.read(live)
+            }
+            if let current {
+                // Redact secrets even on the single-key path.
+                payload["currentValue"] = (key == "mcp-token" || key == "web-monitor-token")
+                    ? MCPKnowledge.redact(current) : current
+            }
+            return .ok(payload)
+
+        case "list_config_keys":
+            let filter = (arguments["filter"] as? String)?.lowercased()
+            let forkOnly = (arguments["forkOnly"] as? Bool) ?? false
+            // ghostty_config_key_count/_at are pure C (no live config); safe off-main.
+            let rows = Ghostty.Config.allConfigKeys().filter { info in
+                if forkOnly && !info.forkOnly { return false }
+                if let filter, !filter.isEmpty, !info.key.lowercased().contains(filter) { return false }
+                return true
+            }.map { ["key": $0.key, "forkOnly": $0.forkOnly, "summary": $0.summary] }
+            return .ok(["keys": rows])
 
         default:
             return .methodNotFound

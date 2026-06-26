@@ -179,6 +179,7 @@
 				"Features/MCP/MCPRPC.swift",
 				"Features/MCP/MCPTools.swift",
 				"Features/MCP/MCPInput.swift",
+				"Features/MCP/MCPKnowledge.swift",
 				"Features/MCP/MCPLayout.swift",
 				"Features/MCP/MCPEventBus.swift",
 				"Features/MCP/MCPQueueCommands.swift",

@@ -982,6 +982,83 @@ extension Ghostty {
             guard let v else { return defaultValue }
             return v
         }
+
+        // MARK: - Config knowledge (fork: MCP "knowledge" tools)
+
+        /// One config key's documentation, used by the MCP `describe_config_key`
+        /// tool. Value type (no C pointers escape).
+        struct KeyDoc {
+            let key: String
+            /// The doc text (same as `ghostty +explain-config`), "" if unknown/none.
+            let doc: String
+            /// True if `key` is a real config key.
+            let known: Bool
+            /// True if the doc begins with the fork marker "(ramon fork)".
+            let forkOnly: Bool
+        }
+
+        /// One config key's name + first-line summary + fork flag, used by the
+        /// MCP `list_config_keys` tool. Value type.
+        struct KeyInfo {
+            let key: String
+            /// First non-empty line of the key's doc (a one-line summary), "" if none.
+            let summary: String
+            let forkOnly: Bool
+        }
+
+        /// Describe a single config key (doc text + fork-only flag). Backed by the
+        /// `ghostty_config_describe_key` C API, which reads the generated
+        /// help_strings (no live config needed) — so this works even without a
+        /// loaded config. `known=false` for an unknown key.
+        static func describeKey(_ key: String) -> KeyDoc {
+            let r = key.withCString { cstr in
+                ghostty_config_describe_key(cstr, UInt(key.utf8.count))
+            }
+            let doc = r.doc.map { String(cString: $0) } ?? ""
+            return KeyDoc(key: key, doc: doc, known: r.known, forkOnly: r.fork_only)
+        }
+
+        /// Enumerate every config key (name + one-line summary + fork-only flag),
+        /// in Key-enum order. Backed by the `ghostty_config_key_count` /
+        /// `ghostty_config_key_at` C API. No live config needed.
+        static func allConfigKeys() -> [KeyInfo] {
+            let count = ghostty_config_key_count()
+            var out: [KeyInfo] = []
+            out.reserveCapacity(Int(count))
+            var i: UInt32 = 0
+            while i < count {
+                let info = ghostty_config_key_at(i)
+                i += 1
+                guard let namePtr = info.name else { continue }
+                let name = String(cString: namePtr)
+                if name.isEmpty { continue }
+                let doc = info.doc.map { String(cString: $0) } ?? ""
+                out.append(KeyInfo(key: name, summary: Self.firstLine(doc), forkOnly: info.fork_only))
+            }
+            return out
+        }
+
+        /// A fresh, FINALIZED default config — initial defaults with NO user files
+        /// loaded — so a caller can compare a live value against the built-in
+        /// default (the MCP `get_effective_config` isDefault check). Returns a new
+        /// Config each call; the caller owns it.
+        static func defaultConfig() -> Config {
+            // ghostty_config_new() already fills initial defaults; finalize so the
+            // computed defaults are populated, exactly like loadConfig's finalize.
+            guard let cfg = ghostty_config_new() else { return Config(config: nil) }
+            ghostty_config_finalize(cfg)
+            return Config(config: cfg)
+        }
+
+        /// First non-empty, trimmed line of a doc blob (the key's one-line summary).
+        /// PURE + testable.
+        static func firstLine(_ doc: String) -> String {
+            for line in doc.split(separator: "\n", omittingEmptySubsequences: false) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty { return trimmed }
+            }
+            return ""
+        }
     }
 }
 

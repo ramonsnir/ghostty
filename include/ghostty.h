@@ -405,6 +405,22 @@ typedef struct {
   bool sentinel;
 } ghostty_string_s;
 
+// (ramon fork) Read-only config-key introspection for the MCP "knowledge" tools.
+// `doc`/`name` are STATIC pointers (help_strings literals / enum tag names) — do
+// NOT free them. `fork_only` is true when the key's doc begins with the fork
+// marker "(ramon fork)".
+typedef struct {
+  const char* doc;
+  bool known;
+  bool fork_only;
+} ghostty_config_key_doc_s;
+
+typedef struct {
+  const char* name;
+  const char* doc;
+  bool fork_only;
+} ghostty_config_key_info_s;
+
 typedef struct {
   double tl_px_x;
   double tl_px_y;
@@ -1152,6 +1168,10 @@ GHOSTTY_API bool ghostty_config_key_is_binding(ghostty_config_t, ghostty_input_k
 GHOSTTY_API uint32_t ghostty_config_diagnostics_count(ghostty_config_t);
 GHOSTTY_API ghostty_diagnostic_s ghostty_config_get_diagnostic(ghostty_config_t, uint32_t);
 GHOSTTY_API ghostty_string_s ghostty_config_open_path(void);
+// (ramon fork) Read-only config-key knowledge (no ghostty_config_t needed).
+GHOSTTY_API ghostty_config_key_doc_s ghostty_config_describe_key(const char*, uintptr_t);
+GHOSTTY_API uint32_t ghostty_config_key_count(void);
+GHOSTTY_API ghostty_config_key_info_s ghostty_config_key_at(uint32_t);
 
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);

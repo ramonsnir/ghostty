@@ -355,9 +355,12 @@ struct MCPServerTests {
             "spawn_split_command", "force_close_surface", "signal_attention",
             "take_queue_commands", "report_queue_status", "report_queue_graph",
             "move_surface_into_tab",
+            // MCP knowledge: read-only config/feature discovery + explanation.
+            "get_effective_config", "docs_for_feature",
+            "describe_config_key", "list_config_keys",
         ]
         #expect(names == expected)
-        #expect(tools.count == 21)
+        #expect(tools.count == 25)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -1164,6 +1167,254 @@ struct MCPServerTests {
         guard case .invalidParams = outcome else {
             Issue.record("expected invalidParams for invalid direction")
             return
+        }
+    }
+
+    // MARK: - MCP knowledge: tool registration + schemas
+
+    @Test func knowledgeToolsRegistered() {
+        let names = Set(MCPTools.toolSchemas.compactMap { $0["name"] as? String })
+        #expect(names.contains("get_effective_config"))
+        #expect(names.contains("docs_for_feature"))
+        #expect(names.contains("describe_config_key"))
+        #expect(names.contains("list_config_keys"))
+    }
+
+    @Test func describeConfigKeyRequiredKey() {
+        let tools = MCPTools.toolSchemas
+        let schema = (tools.first { $0["name"] as? String == "describe_config_key" }!["inputSchema"] as! [String: Any])
+        #expect((schema["required"] as? [String]) == ["key"])
+    }
+
+    @Test func docsForFeatureEnum() {
+        let tools = MCPTools.toolSchemas
+        let schema = (tools.first { $0["name"] as? String == "docs_for_feature" }!["inputSchema"] as! [String: Any])
+        let props = schema["properties"] as! [String: Any]
+        let featureEnum = Set(((props["feature"] as! [String: Any])["enum"] as! [String]))
+        #expect(featureEnum == ["agent-dashboard", "agent-manager", "agent-queue", "web-monitor", "mcp", "project-selector", "splits", "all"])
+    }
+
+    // MARK: - MCP knowledge: describe_config_key dispatch (backed by the C API)
+
+    @Test func dispatchDescribeConfigKeyMissingKeyInvalidParams() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "describe_config_key", arguments: [:], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for missing key")
+        }
+        // Empty key string also invalid.
+        switch MCPTools.dispatch(name: "describe_config_key", arguments: ["key": ""], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for empty key")
+        }
+    }
+
+    @Test func dispatchDescribeConfigKeyKnownUpstream() {
+        // Backed by the Zig ghostty_config_describe_key C export. font-size is a
+        // real upstream key with a non-empty doc and forkOnly=false.
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "describe_config_key", arguments: ["key": "font-size"], server: server) {
+        case .ok(let payload):
+            #expect(payload["key"] as? String == "font-size")
+            #expect(payload["known"] as? Bool == true)
+            #expect(payload["forkOnly"] as? Bool == false)
+            #expect((payload["doc"] as? String)?.isEmpty == false)
+        default:
+            Issue.record("expected .ok for known key")
+        }
+    }
+
+    @Test func dispatchDescribeConfigKeyForkOnly() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "describe_config_key", arguments: ["key": "agent-dashboard"], server: server) {
+        case .ok(let payload):
+            #expect(payload["known"] as? Bool == true)
+            #expect(payload["forkOnly"] as? Bool == true)
+        default:
+            Issue.record("expected .ok for fork-only key")
+        }
+    }
+
+    @Test func dispatchDescribeConfigKeyUnknown() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "describe_config_key", arguments: ["key": "not-a-real-key"], server: server) {
+        case .ok(let payload):
+            #expect(payload["known"] as? Bool == false)
+            #expect((payload["doc"] as? String) == "")
+        default:
+            Issue.record("expected .ok with known=false")
+        }
+    }
+
+    // MARK: - MCP knowledge: list_config_keys dispatch (backed by the C API)
+
+    @Test func dispatchListConfigKeysAll() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "list_config_keys", arguments: [:], server: server) {
+        case .ok(let payload):
+            let keys = payload["keys"] as! [[String: Any]]
+            #expect(keys.count > 50)  // the full enum is large
+            // font-size present, not fork-only.
+            #expect(keys.contains { ($0["key"] as? String) == "font-size" && ($0["forkOnly"] as? Bool) == false })
+        default:
+            Issue.record("expected .ok")
+        }
+    }
+
+    @Test func dispatchListConfigKeysForkOnlyFilter() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "list_config_keys", arguments: ["forkOnly": true], server: server) {
+        case .ok(let payload):
+            let keys = payload["keys"] as! [[String: Any]]
+            #expect(!keys.isEmpty)
+            // Every returned key is fork-only, and agent-dashboard is among them.
+            #expect(keys.allSatisfy { ($0["forkOnly"] as? Bool) == true })
+            #expect(keys.contains { ($0["key"] as? String) == "agent-dashboard" })
+        default:
+            Issue.record("expected .ok")
+        }
+    }
+
+    @Test func dispatchListConfigKeysSubstringFilter() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "list_config_keys", arguments: ["filter": "AGENT"], server: server) {
+        case .ok(let payload):
+            let keys = payload["keys"] as! [[String: Any]]
+            #expect(!keys.isEmpty)
+            // Case-insensitive substring: every key contains "agent".
+            #expect(keys.allSatisfy { ($0["key"] as? String)?.lowercased().contains("agent") == true })
+        default:
+            Issue.record("expected .ok")
+        }
+    }
+
+    @Test func dispatchDocsForFeatureUnknown() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        switch MCPTools.dispatch(name: "docs_for_feature", arguments: ["feature": "bogus"], server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for unknown feature")
+        }
+    }
+
+    // MARK: - MCP knowledge: pure helpers
+
+    @Test func firstLineExtractsSummary() {
+        #expect(Ghostty.Config.firstLine("First line.\nSecond.") == "First line.")
+        // Leading blank lines are skipped.
+        #expect(Ghostty.Config.firstLine("\n\n  Real summary  \nmore") == "Real summary")
+        #expect(Ghostty.Config.firstLine("") == "")
+        #expect(Ghostty.Config.firstLine("\n\n") == "")
+    }
+
+    @Test func redactHidesSecrets() {
+        #expect(MCPKnowledge.redact("supersecret") == "<set>")
+        #expect(MCPKnowledge.redact("") == "")
+    }
+
+    @Test func describeBellFeaturesListsFlags() {
+        var f = Ghostty.Config.BellFeatures()
+        #expect(MCPKnowledge.describeBellFeatures(f) == "")
+        f.insert(.audio); f.insert(.title)
+        // Order follows the declared list (audio before title).
+        #expect(MCPKnowledge.describeBellFeatures(f) == "audio,title")
+    }
+
+    // MARK: - MCP knowledge: feature status predicates (pure)
+
+    private func pre(
+        dashboard: Bool = false, manager: Bool = false, queue: Bool = false,
+        mcpListen: String = "", mcpToken: String = "", webMonitor: String = "",
+        projects: [String] = [], node: Bool = false
+    ) -> MCPKnowledge.Preconditions {
+        MCPKnowledge.Preconditions(
+            agentDashboard: dashboard, agentManager: manager, agentQueue: queue,
+            mcpListen: mcpListen, mcpToken: mcpToken, webMonitorListen: webMonitor,
+            projectDirectories: projects, nodeResolvable: node)
+    }
+
+    @Test func featureStatusSplitsAlwaysEnabled() {
+        let s = MCPKnowledge.status("splits", pre: pre())
+        #expect(s.enabled)
+        #expect(s.requires.isEmpty)
+    }
+
+    @Test func featureStatusAgentDashboardGate() {
+        #expect(MCPKnowledge.status("agent-dashboard", pre: pre(dashboard: false)).enabled == false)
+        #expect(MCPKnowledge.status("agent-dashboard", pre: pre(dashboard: true)).enabled == true)
+    }
+
+    @Test func featureStatusAgentManagerMirrorsSidecarGate() {
+        // OFF: flag off ⇒ disabled, lists every unmet requirement.
+        let off = MCPKnowledge.status("agent-manager", pre: pre())
+        #expect(off.enabled == false)
+        #expect(off.requires.contains("agent-manager = true"))
+        #expect(off.requires.contains("mcp-listen set"))
+        #expect(off.requires.contains("mcp-token set"))
+        #expect(off.requires.contains { $0.contains("node") })
+        // ON: flag on AND mcp-listen+token AND node ⇒ enabled, no unmet reqs.
+        let on = MCPKnowledge.status(
+            "agent-manager",
+            pre: pre(manager: true, mcpListen: "127.0.0.1:8765", mcpToken: "x", node: true))
+        #expect(on.enabled == true)
+        #expect(on.requires.isEmpty)
+        // Missing only node ⇒ still disabled with just that requirement.
+        let noNode = MCPKnowledge.status(
+            "agent-manager",
+            pre: pre(manager: true, mcpListen: "127.0.0.1:8765", mcpToken: "x", node: false))
+        #expect(noNode.enabled == false)
+        #expect(noNode.requires.count == 1)
+        #expect(noNode.requires.first?.contains("node") == true)
+    }
+
+    @Test func featureStatusMcpAndWebMonitorAndProjects() {
+        // mcp: only mcp-listen required (token optional — server runs open).
+        #expect(MCPKnowledge.status("mcp", pre: pre()).enabled == false)
+        #expect(MCPKnowledge.status("mcp", pre: pre(mcpListen: "127.0.0.1:8765")).enabled == true)
+        // web-monitor: listen required.
+        #expect(MCPKnowledge.status("web-monitor", pre: pre()).enabled == false)
+        #expect(MCPKnowledge.status("web-monitor", pre: pre(webMonitor: "1.2.3.4:8787")).enabled == true)
+        // project-selector: at least one base dir.
+        #expect(MCPKnowledge.status("project-selector", pre: pre()).enabled == false)
+        #expect(MCPKnowledge.status("project-selector", pre: pre(projects: ["~/git"])).enabled == true)
+    }
+
+    @Test func featureDocCarriesStaticFacts() {
+        let d = MCPKnowledge.featureDoc("agent-queue", pre: pre())!
+        #expect(d.name == "Agent Queue Supervisor")
+        #expect(d.docPath == "AGENT-QUEUE.md")
+        #expect(d.configKeys.contains("agent-queue"))
+        #expect(!d.enableSteps.isEmpty)
+        // Unknown feature id ⇒ nil.
+        #expect(MCPKnowledge.featureDoc("nope", pre: pre()) == nil)
+    }
+
+    // MARK: - MCP knowledge: get_effective_config entry computation (pure)
+
+    @Test func entriesChangedOnlyFiltersDefaults() {
+        // entries() is pure over two configs; construct a default config twice so
+        // every reader sees identical values ⇒ all isDefault ⇒ changedOnly empties.
+        let defaults = Ghostty.Config.defaultConfig()
+        let live = Ghostty.Config.defaultConfig()
+        let changed = MCPKnowledge.entries(live: live, defaults: defaults, changedOnly: true, keys: nil)
+        #expect(changed.isEmpty)
+        // changedOnly:false returns the full curated set, all isDefault=true.
+        let all = MCPKnowledge.entries(live: live, defaults: defaults, changedOnly: false, keys: nil)
+        #expect(all.count == MCPKnowledge.readers.count)
+        #expect(all.allSatisfy { $0.isDefault })
+        // keys restriction narrows the set.
+        let one = MCPKnowledge.entries(
+            live: live, defaults: defaults, changedOnly: false, keys: ["agent-dashboard"])
+        #expect(one.count == 1)
+        #expect(one.first?.key == "agent-dashboard")
+    }
+
+    @Test func readersIncludeAllForkOnlyKeys() {
+        // The curated reader set MUST cover every fork-only key (the whole point of
+        // the discovery tool). Cross-check against the C-API fork-only list.
+        let readerKeys = Set(MCPKnowledge.readers.map { $0.key })
+        let forkKeys = Ghostty.Config.allConfigKeys().filter { $0.forkOnly }.map { $0.key }
+        for key in forkKeys {
+            #expect(readerKeys.contains(key), "reader missing fork-only key: \(key)")
         }
     }
 }
