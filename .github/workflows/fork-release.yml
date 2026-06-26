@@ -184,6 +184,20 @@ jobs:
           rm -rf "$DST/node_modules"   # never let node_modules into the notarized bundle
           test -f "$DST/dist/index.js" && test -f "$DST/package.json"
 
+      # Bundle the colleague-onboarding files into Contents/Resources so they travel
+      # with the app (carried by Sparkle, no repo clone needed): the Claude Code
+      # agent-state hooks (dashboard per-tile state + queue auto-close depend on them)
+      # and ONBOARDING.md (the cheat sheet the seed/welcome point at). Pure data —
+      # notarization-safe (the app seal covers Resources/).
+      - name: Bundle claude-hooks + ONBOARDING.md
+        run: |
+          APP="macos/build/Release/Ghostty.app"
+          HOOKS_DST="$APP/Contents/Resources/claude-hooks"
+          rm -rf "$HOOKS_DST"; mkdir -p "$HOOKS_DST"
+          cp -R example/claude-hooks/. "$HOOKS_DST/"
+          cp ONBOARDING.md "$APP/Contents/Resources/ONBOARDING.md"
+          test -f "$HOOKS_DST/ghostty-agent-state.sh" && test -f "$APP/Contents/Resources/ONBOARDING.md"
+
       - name: Inject version + updater keys into Info.plist
         env:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
@@ -328,9 +342,21 @@ jobs:
           # Idempotent publish WITHOUT a destructive delete window (a delete-then-failed-
           # create would leave `releases/latest/download/...` 404ing): create the release
           # if it doesn't exist, then (re)upload assets with --clobber, then ensure latest.
+          # Notes to a file + --notes-file (an inline $(cat <<EOF) heredoc is mishandled
+          # by older bash inside $()).
+          cat > release-notes.md <<EOF
+          **Ghostty (ramon)** — a personal fork of Ghostty that runs side-by-side with the official build.
+
+          **Install (2 min):** download \`Ghostty.dmg\` below → drag it to \`/Applications\` → open it → **relaunch once** (the hosted terminal backend turns on for the second launch). It's signed + notarized, so it should open cleanly; if macOS ever complains, right-click → Open.
+
+          **New here?** Start with the onboarding guide (install, the \`ctrl+a\` keybind cheat sheet, what's optional):
+          https://github.com/${{ github.repository }}/blob/main/ONBOARDING.md
+
+          _Built from ${GHOSTTY_COMMIT}._
+          EOF
           gh release create "$TAG" --target "${{ github.sha }}" \
             --title "Ghostty (ramon) build ${GHOSTTY_BUILD} (${GHOSTTY_COMMIT})" \
-            --notes "Automated fork build from ${GHOSTTY_COMMIT}." \
+            --notes-file release-notes.md \
             --latest 2>/dev/null || true
           # --latest makes `releases/latest/download/{Ghostty.dmg,appcast.xml}`
           # resolve here, which is the stable URL Sparkle's feed points at.

@@ -313,4 +313,109 @@ struct ForkSetupTests {
             bundledShimExists: true, installedShimExists: false,
             installedVersion: "5", bundleVersion: "5") == .install)
     }
+
+    // MARK: - planCLIInstall(): ghostty-ramon CLI launcher install gate
+
+    @Test func cliSkipsWhenNoBundledBinary() {
+        // Dev/local builds with no bundled multitool -> do nothing, even if a file
+        // already occupies the PATH target.
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: false, installedFileExists: true, installedIsOurs: true,
+            installedVersion: "1", bundleVersion: "2") == .skipNoBundledBinary)
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: false, installedFileExists: false, installedIsOurs: false,
+            installedVersion: nil, bundleVersion: "2") == .skipNoBundledBinary)
+    }
+
+    @Test func cliInstallsOnCleanMachine() {
+        // Bundled multitool, nothing on PATH yet -> install.
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: true, installedFileExists: false, installedIsOurs: false,
+            installedVersion: nil, bundleVersion: "5") == .install)
+    }
+
+    @Test func cliUpToDateWhenOursAndVersionMatches() {
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: true, installedFileExists: true, installedIsOurs: true,
+            installedVersion: "5", bundleVersion: "5") == .upToDate)
+    }
+
+    @Test func cliReinstallsOnVersionChange() {
+        // A Sparkle update bumps CFBundleVersion / relocates the app -> re-point.
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: true, installedFileExists: true, installedIsOurs: true,
+            installedVersion: "5", bundleVersion: "6") == .install)
+    }
+
+    @Test func cliReinstallsWhenFileMissingDespiteRecordedVersion() {
+        // Recorded version matches but the colleague deleted the symlink -> reinstall.
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: true, installedFileExists: false, installedIsOurs: false,
+            installedVersion: "5", bundleVersion: "5") == .install)
+    }
+
+    @Test func cliSkipsPreExistingNonManagedFile() {
+        // SAFETY: a foreign file/symlink already at ~/.local/bin/ghostty-ramon (one
+        // we did NOT create) must never be clobbered, even on a version mismatch.
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: true, installedFileExists: true, installedIsOurs: false,
+            installedVersion: nil, bundleVersion: "5") == .skipExternallyManaged)
+        // ...even if a stale recorded version happens to match the bundle version.
+        #expect(ForkSetup.planCLIInstall(
+            bundledBinaryExists: true, installedFileExists: true, installedIsOurs: false,
+            installedVersion: "5", bundleVersion: "5") == .skipExternallyManaged)
+    }
+
+    // MARK: - shouldShowWelcome(): first-run welcome predicate
+
+    @Test func welcomeShownOnFirstLaunch() {
+        // Never recorded -> fire it exactly once.
+        #expect(ForkSetup.shouldShowWelcome(alreadyShown: false) == true)
+    }
+
+    @Test func welcomeNeverShownAgain() {
+        // Already recorded -> never fire again (idempotent).
+        #expect(ForkSetup.shouldShowWelcome(alreadyShown: true) == false)
+    }
+
+    // MARK: - seed template: new onboarding content
+
+    @Test func configSeedHasQuickStartAndCheatSheetPointer() throws {
+        let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
+        // The top-of-file quick start must point at the concrete cheat sheet, NOT
+        // tell the colleague to browse the command palette.
+        #expect(seed.contains("QUICK START"))
+        #expect(seed.contains("ghostty-ramon +list-keybinds"))
+        #expect(seed.contains("ONBOARDING.md"))
+    }
+
+    @Test func configSeedAgentQueueCommentedOptIn() throws {
+        let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
+        // agent-queue must be present (reconciling the example drift) but COMMENTED
+        // out — never enabled by default.
+        #expect(seed.contains("#agent-queue = true"))
+        for line in seed.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            #expect(!(t.hasPrefix("agent-queue") && !t.hasPrefix("#")))
+        }
+    }
+
+    @Test func configSeedFocusedBellIsVisualOnly() throws {
+        let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
+        // The focused bell must NOT beep (no audible `system`); it is visual-only.
+        #expect(seed.contains("bell-features-focused = no-system,no-attention,no-title"))
+    }
+
+    @Test func configSeedProjectDirectoryCommentedOut() throws {
+        let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
+        // project-directory must be commented out (so an unconfigured colleague
+        // doesn't get a half-empty ctrl+a>f palette) — but the project selector
+        // keybind + the explanatory comment stay.
+        for line in seed.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            #expect(!(t.hasPrefix("project-directory") && !t.hasPrefix("#")))
+        }
+        #expect(seed.contains("#project-directory = ~/git"))
+        #expect(seed.contains("keybind = ctrl+a>f=toggle_project_selector"))
+    }
 }

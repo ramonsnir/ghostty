@@ -104,9 +104,14 @@ committed `.mcp.json` needs. (The shim changes rarely — rebuild only if `main.
 
 ---
 
-## The tools (12)
+## The tools
 
-Every tool addresses a surface by its **stable UUID** from `list_surfaces` (window/tab are
+The server registers **25** tools total: the 12 agent-control tools documented here,
+`set_attention` (the Bell Attention promotion tool — see BELL-ATTENTION.md), the queue-
+supervisor internals (driven by the Agent Queue sidecar, not meant for hand use — see
+AGENT-QUEUE.md), and the 4 read-only **knowledge** tools at the end of this section.
+
+Most tools address a surface by its **stable UUID** from `list_surfaces` (window/tab are
 positional encounter-order indices, **not** durable — only `id` is).
 
 **Discover / read**
@@ -150,6 +155,28 @@ positional encounter-order indices, **not** durable — only `id` is).
 **The intended loop:** `wait_for_event` (or `watch_for_pattern`) → `read_surface` to see
 what's being asked → `send_key`/`send_text` to respond → repeat; plus `perform_action` /
 `new_tab` / `focus_surface` to arrange the workspace.
+
+**Knowledge / discovery** (read-only; answer "what can I configure / is feature X on?")
+- **`get_effective_config {changedOnly?, keys?}`** — the fork's effective configuration:
+  the current value of a curated key set (every fork-only key + high-signal upstream keys)
+  and whether each equals its built-in default. `changedOnly` (default `true`) returns ONLY
+  keys the user actually set; `keys:[…]` restricts to specific keys. Secrets (`mcp-token`,
+  `web-monitor-token`) are **redacted** to `<set>`/`` — never echoed. Returns
+  `{config:[{key,value,isDefault}]}`.
+- **`docs_for_feature {feature?}`** — explain a fork feature: its summary, the config keys
+  that control it, the steps to enable it, whether it is currently **enabled**, and any
+  **unmet requirements** (computed LIVE from the config with the real precondition predicates
+  — e.g. the Agent Manager needs its flag on AND `mcp-listen`+`mcp-token` set AND node
+  resolvable). `feature` is one of `agent-dashboard | agent-manager | agent-queue |
+  web-monitor | mcp | project-selector | splits | all` (default `all`). Returns
+  `{features:[{name,summary,configKeys,enableSteps,requires,enabled,docPath}]}`.
+- **`describe_config_key {key}`** — one key's full documentation (the same text
+  `ghostty +explain-config` prints), whether it's a **fork-only** key, and — when the app
+  config is loaded — its current value. Returns `{key,doc,forkOnly,known,currentValue?}`;
+  `known:false` for an unrecognized key.
+- **`list_config_keys {filter?, forkOnly?}`** — every config key with a one-line summary
+  and fork-only flag. `filter` is a case-insensitive substring on the key name; `forkOnly:
+  true` returns only the fork's keys. Returns `{keys:[{key,forkOnly,summary}]}`.
 
 ---
 
@@ -311,7 +338,7 @@ stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`, built with `swift build`) so
 
 A committed **`.mcp.json`** at the repo root registers the server project-scoped as
 `ghostty -- ghostty-mcp` (bare PATH name, **no secret, no clone-specific path**), so any
-Claude Code session opened in the repo auto-gets the 12 tools after a one-time approval +
+Claude Code session opened in the repo auto-gets all the tools after a one-time approval +
 restart. Two pieces make a secret-less, path-less registration work: (1) the shim is
 installed on PATH at **`~/.local/bin/ghostty-mcp`** (release build, alongside
 `ghostty-host`; new-machine: `cd macos/mcp-shim && swift build -c release && cp
@@ -323,13 +350,20 @@ hook reads), so the committed JSON needs no token. Dev identities still reachabl
 `macos/mcp-shim/Sources/ghostty-mcp/main.swift` (`tokenFromLocalConfig`); see "Connecting
 an agent" above.
 
-### The 12 tools
+### The registered tools (25)
 
-`list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`, `scroll`,
-`wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`, `close_surface`,
-`perform_action` (the keybind-action grammar string). All address a surface by **stable
-UUID**; `wait_for_event`/`watch_for_pattern` are long-poll (idle-watchdog-exempt, bounded
-by a clamped `timeoutMs` 1000–120000).
+The 12 agent-control tools: `list_surfaces`, `read_surface`, `get_layout`, `send_text`,
+`send_key`, `scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
+`close_surface`, `perform_action` (the keybind-action grammar string). All address a surface
+by **stable UUID**; `wait_for_event`/`watch_for_pattern` are long-poll (idle-watchdog-exempt,
+bounded by a clamped `timeoutMs` 1000–120000). Plus **`set_attention`** (promote a bell to
+the sticky attention state — the Bell Attention v2 loud tier; see BELL-ATTENTION.md), the
+Agent Queue supervisor internals (`spawn_split_command`, `force_close_surface`,
+`signal_attention`, `take_queue_commands`, `report_queue_status`, `report_queue_graph`,
+`move_surface_into_tab`, `set_surface_annotation` — see AGENT-QUEUE.md) and the 4 knowledge
+tools below. So the inventory is **12 agent-control + `set_attention` + 8 queue/supervisor
++ 4 knowledge = 25**, and `MCPServerTests.toolsListHasAllTools` asserts the total is **25**
+— keep it in sync when a tool is added or removed.
 
 `list_surfaces` rows carry `id, title, pwd, window/tab/split position, focused, bell,
 exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /
@@ -361,6 +395,33 @@ of scope).
 
 Relative layout verbs focus the target first (anchor-parameterizing `SplitTree` is a
 follow-up).
+
+### Knowledge tools (read-only config/feature discovery)
+
+The 4 knowledge tools are pure, read-only, and never touch a surface. They exist so an agent
+can answer "what can I configure?" / "is feature X on, and how do I enable it?" without the
+human scrolling the command palette.
+
+- `get_effective_config` / `docs_for_feature` read the **live** `Ghostty.Config` (main-isolated)
+  on a `DispatchQueue.main.sync` hop and return ONLY value types across it (the WebMonitor/MCP
+  threading rule). `isDefault` is computed against a fresh `Ghostty.Config.defaultConfig()` (a
+  finalized initial-defaults config). `docs_for_feature`'s `enabled`/`requires` come from the
+  pure `MCPKnowledge.status(_:pre:)`, whose predicates MIRROR the real runtime gates (e.g.
+  `AgentManagerController.sidecarShouldStart`: feature flag on AND `mcp-listen`+`mcp-token` set
+  AND node resolvable). Secrets are redacted (`MCPKnowledge.redact`) on every path.
+- `describe_config_key` / `list_config_keys` are backed by a NEW read-only **Zig C API** that
+  needs no `*Config` (reads the generated `help_strings` + the `Key` enum, so it works headless):
+  `ghostty_config_describe_key(name,len)` → `ghostty_config_key_doc_s`,
+  `ghostty_config_key_count()`, `ghostty_config_key_at(idx)` → `ghostty_config_key_info_s`.
+  Returned `const char*`s are STATIC (do not free). **Fork-only-key detection is the doc's
+  leading `(ramon fork)` marker**, so any new fork key is auto-classified.
+
+Wiring: `src/config/CApi.zig` (the 3 exports + `keyDoc`), `include/ghostty.h`
+(`ghostty_config_key_doc_s`/`_info_s` + prototypes), `macos/Sources/Features/MCP/MCPKnowledge.swift`
+(NEW), `MCPTools.swift` (4 schemas + dispatch), `Ghostty.Config.swift`
+(`describeKey`/`allConfigKeys`/`defaultConfig`/`firstLine`). Tests: the knowledge cases in
+`MCPServerTests.swift` (tool count now 25) + the `ghostty_config_describe_key`/`_key_count`/
+`_key_at` Zig tests in `src/config/CApi.zig`.
 
 ### Wiring
 

@@ -142,6 +142,19 @@ cp macos/agent-manager/package.json "$SIDECAR_DST/package.json"
 # Belt-and-suspenders: never let node_modules sneak into the notarized bundle.
 rm -rf "$SIDECAR_DST/node_modules"
 
+# ---- 3c. bundle colleague-onboarding files ---------------------------------
+# Ship the Claude Code agent-state hooks (so a DMG user has the hook script +
+# settings block locally — the dashboard per-tile state + queue auto-close depend
+# on them) and ONBOARDING.md (the cheat sheet the seed/welcome point at), inside
+# Contents/Resources so they travel with the app (carried by Sparkle; no repo
+# clone needed). Pure data — notarization-safe (the app seal covers Resources/).
+echo ">> [3c/8] bundle claude-hooks + ONBOARDING.md"
+HOOKS_DST="$APP/Contents/Resources/claude-hooks"
+rm -rf "$HOOKS_DST"
+mkdir -p "$HOOKS_DST"
+cp -R example/claude-hooks/. "$HOOKS_DST/"
+cp ONBOARDING.md "$APP/Contents/Resources/ONBOARDING.md"
+
 # ---- 4. version + enable updates -------------------------------------------
 echo ">> [4/8] inject version"
 PLIST="$APP/Contents/Info.plist"
@@ -198,10 +211,25 @@ export APPCAST_OUT="$WORKDIR/appcast.xml"
 python3 dist/macos/fork_appcast.py
 test -f "$WORKDIR/appcast.xml"
 
+# Recipient-facing release notes (the first thing a colleague reads). Written to a
+# file + --notes-file rather than an inline $(cat <<EOF) — a heredoc inside $() is
+# mishandled by macOS's bash 3.2 (swallows the closing paren).
+NOTES_FILE="$WORKDIR/release-notes.md"
+cat > "$NOTES_FILE" <<EOF
+**Ghostty (ramon)** — a personal fork of Ghostty that runs side-by-side with the official build.
+
+**Install (2 min):** download \`Ghostty.dmg\` below → drag it to \`/Applications\` → open it → **relaunch once** (the hosted terminal backend turns on for the second launch). It's signed + notarized, so it should open cleanly; if macOS ever complains, right-click → Open.
+
+**New here?** Start with the onboarding guide (install, the \`ctrl+a\` keybind cheat sheet, what's optional):
+https://github.com/$REPO/blob/main/ONBOARDING.md
+
+_Built from $GHOSTTY_COMMIT._
+EOF
+
 # Idempotent publish (no destructive delete window).
 gh release create "$TAG" --repo "$REPO" --target "$GHOSTTY_COMMIT_LONG" \
   --title "Ghostty (ramon) build $GHOSTTY_BUILD ($GHOSTTY_COMMIT)" \
-  --notes "Local fork build from $GHOSTTY_COMMIT." --latest 2>/dev/null || true
+  --notes-file "$NOTES_FILE" --latest 2>/dev/null || true
 gh release upload "$TAG" "$DMG" "$WORKDIR/appcast.xml" --repo "$REPO" --clobber
 gh release edit   "$TAG" --repo "$REPO" --latest
 

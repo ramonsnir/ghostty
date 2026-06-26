@@ -187,16 +187,25 @@ shell-execution credential and the hook reads it from `~/.config/ghostty-ramon/l
 out of other local users' reach.
 
 **2. Install the hook script.** Copy it into the fork config dir and make it
-executable:
+executable. The source files ship in two places — use whichever you have:
+
+- **DMG / colleague install:** they're bundled inside the app at
+  `…/Ghostty (ramon).app/Contents/Resources/claude-hooks/`.
+- **Repo clone (developers):** they're at `example/claude-hooks/` in the checkout.
 
 ```sh
+# Pick the SRC dir for your install (bundled vs. repo clone):
+SRC="/Applications/Ghostty (ramon).app/Contents/Resources/claude-hooks"   # DMG
+# SRC="example/claude-hooks"                                              # repo clone
+
 mkdir -p ~/.config/ghostty-ramon/claude-hooks
-cp example/claude-hooks/ghostty-agent-state.sh ~/.config/ghostty-ramon/claude-hooks/
+cp "$SRC/ghostty-agent-state.sh" ~/.config/ghostty-ramon/claude-hooks/
 chmod +x ~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh
 ```
 
 **3. Wire the hooks into Claude Code.** Merge the `hooks` block from
-`example/claude-hooks/settings-hooks.json` into your `~/.claude/settings.json`. It
+`$SRC/settings-hooks.json` (the bundled `…/Contents/Resources/claude-hooks/` copy for DMG
+users, or `example/claude-hooks/` in a repo clone) into your `~/.claude/settings.json`. It
 maps each Claude Code event to the script with the state as an argument:
 
 | Claude Code event | state passed |

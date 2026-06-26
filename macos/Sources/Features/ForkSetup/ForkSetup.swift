@@ -4,7 +4,7 @@ import UserNotifications
 
 /// (ramon fork) First-launch setup for COLLEAGUE distribution builds.
 ///
-/// Two independent, idempotent jobs, safe to run on every launch:
+/// Five independent, idempotent jobs, safe to run on every launch:
 ///
 ///   1. **Config seed** — write a sanitized default `~/.config/ghostty-ramon/config`
 ///      if (and only if) the file is absent, so the fork's keybinds/features work
@@ -15,6 +15,20 @@ import UserNotifications
 ///      app (`Contents/MacOS/ghostty-host`), so the pty-host backend works with no
 ///      manual terminal setup. The agent is `RunAtLoad`+`KeepAlive`, exactly like
 ///      the hand-rolled one documented in CLAUDE.md.
+///
+///   3. **MCP shim** — install the bundled `ghostty-mcp` stdio shim onto PATH at
+///      `~/.local/bin/ghostty-mcp` so an MCP client can reach the in-GUI server.
+///
+///   4. **`ghostty-ramon` CLI** — install a launcher onto PATH at
+///      `~/.local/bin/ghostty-ramon` pointing at the app's multitool binary
+///      (`Contents/MacOS/ghostty`), so a colleague can run discovery commands like
+///      `ghostty-ramon +list-keybinds`. (NOT named `ghostty`, to avoid colliding
+///      with an official ghostty CLI.) Symlink, so it always tracks the app.
+///
+///   5. **First-run welcome** — a ONE-TIME notification (idempotent via a persisted
+///      bool) pointing the colleague at discovery (`ghostty-ramon +list-keybinds` /
+///      ONBOARDING.md), since they won't scroll the command palette to find the
+///      fork's features.
 ///
 /// ── CRITICAL SAFETY ───────────────────────────────────────────────────────────
 /// This must NEVER disturb a host LaunchAgent that a developer manages by hand
@@ -49,6 +63,14 @@ enum ForkSetup {
     /// UserDefaults key: the CFBundleVersion the `ghostty-mcp` shim was last
     /// installed to `~/.local/bin` for. Drives version-aware reinstall.
     static let kInstalledShimVersion = "forkSetup.mcpShimVersion"
+
+    /// UserDefaults key: the CFBundleVersion the `ghostty-ramon` CLI launcher was
+    /// last installed to `~/.local/bin` for. Drives version-aware reinstall.
+    static let kInstalledCLIVersion = "forkSetup.cliLauncherVersion"
+
+    /// UserDefaults key: whether the one-time first-run welcome notification has
+    /// already been shown. Idempotent — shown at most once per UserDefaults domain.
+    static let kWelcomeShown = "forkSetup.welcomeShown"
 
     /// Top-level plist key marking a LaunchAgent plist as written by this app.
     /// Value is the managing bundle id. launchd ignores unknown keys.
@@ -217,10 +239,69 @@ enum ForkSetup {
         return .install
     }
 
+    // MARK: - ghostty-ramon CLI launcher install (pure)
+
+    /// Decision for installing the `ghostty-ramon` CLI launcher onto PATH
+    /// (`~/.local/bin/ghostty-ramon` → the app's `Contents/MacOS/ghostty` multitool).
+    /// Mirrors `ShimPlan` exactly: gated on the multitool binary actually being
+    /// present in the bundle, version-gated, and refusing to clobber a pre-existing
+    /// NON-managed file (one we did not author — e.g. a hand-rolled launcher).
+    enum CLIPlan: Equatable {
+        /// No `Contents/MacOS/ghostty` multitool in the app → do nothing.
+        case skipNoBundledBinary
+        /// A file is already at the target that we did NOT create (not our symlink
+        /// to this app's binary) → leave it strictly alone.
+        case skipExternallyManaged
+        /// Installed launcher is present, ours, AND recorded for this exact version.
+        case upToDate
+        /// Missing on PATH, or recorded for a different version → (re)install.
+        case install
+    }
+
+    /// Pure decision for the CLI launcher. Reinstalls when the on-disk launcher is
+    /// missing (covers a manual delete) OR the recorded version differs from the
+    /// running bundle (covers a Sparkle update relocating the app) — otherwise a
+    /// no-op. NEVER clobbers a pre-existing file that isn't ours.
+    /// - Parameters:
+    ///   - bundledBinaryExists: the app's `Contents/MacOS/ghostty` multitool exists.
+    ///   - installedFileExists: a file/symlink already occupies the PATH target.
+    ///   - installedIsOurs: that existing entry is one WE created (a symlink whose
+    ///     destination is the running app's multitool binary). nil/false when the
+    ///     target is absent or a foreign file.
+    ///   - installedVersion: the recorded install version, or nil.
+    ///   - bundleVersion: the running bundle's CFBundleVersion.
+    static func planCLIInstall(
+        bundledBinaryExists: Bool,
+        installedFileExists: Bool,
+        installedIsOurs: Bool,
+        installedVersion: String?,
+        bundleVersion: String
+    ) -> CLIPlan {
+        guard bundledBinaryExists else { return .skipNoBundledBinary }
+        // A foreign file already at the target → never overwrite it.
+        if installedFileExists && !installedIsOurs { return .skipExternallyManaged }
+        // Ours and current → nothing to do. (Requires the file to still exist; a
+        // recorded version with a deleted file falls through to .install below.)
+        if installedFileExists && installedIsOurs && installedVersion == bundleVersion {
+            return .upToDate
+        }
+        return .install
+    }
+
+    // MARK: - First-run welcome (pure)
+
+    /// Pure predicate: should the one-time first-run welcome notification fire?
+    /// True exactly once — the first launch where it hasn't been recorded as shown.
+    /// (The caller has already gated on a bundled host, i.e. the distribution path.)
+    static func shouldShowWelcome(alreadyShown: Bool) -> Bool {
+        !alreadyShown
+    }
+
     // MARK: - Execution (impure)
 
-    /// Run both setup jobs. Call OFF the main thread (it does file IO and shells
-    /// out to `launchctl`). Idempotent; safe on every launch.
+    /// Run all setup jobs (see the type doc for the list). Call OFF the main thread
+    /// (it does file IO and shells out to `launchctl`). Idempotent; safe on every
+    /// launch. All jobs are gated on a bundled host (the distribution path).
     static func perform(
         bundle: Bundle = .main,
         defaults: UserDefaults = .ghostty,
@@ -241,6 +322,8 @@ enum ForkSetup {
         seedConfigIfNeeded(home: home, fileManager: fileManager)
         manageHostLaunchAgentIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
         installShimIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
+        installCLILauncherIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
+        showWelcomeIfNeeded(defaults: defaults)
     }
 
     /// Install the bundled `ghostty-mcp` stdio shim onto PATH at
@@ -292,6 +375,116 @@ enum ForkSetup {
                 logger.warning("failed to install ghostty-mcp shim: \(error.localizedDescription, privacy: .public)")
             }
         }
+    }
+
+    /// Install the `ghostty-ramon` CLI launcher onto PATH at
+    /// `~/.local/bin/ghostty-ramon`, pointing at the app's multitool binary
+    /// (`Contents/MacOS/ghostty`). A SYMLINK is preferred (it always tracks the
+    /// installed app — no rewrite needed when the app moves on update), so the
+    /// colleague can run discovery commands like `ghostty-ramon +list-keybinds`.
+    /// Idempotent + version-aware, with the SAME safety gates as the MCP shim:
+    ///
+    ///   * Acts only when the multitool binary is actually BUNDLED (the caller has
+    ///     already early-returned unless a host is bundled, so this is reached only
+    ///     on distribution builds; this guard is belt-and-braces).
+    ///   * NEVER clobbers a pre-existing NON-managed file at the target — only a
+    ///     symlink we ourselves created (one whose destination is THIS app's
+    ///     multitool binary) is replaced.
+    ///
+    /// CRITICAL: the name is `ghostty-ramon`, NOT `ghostty`, so it can't collide
+    /// with an official ghostty CLI already on the colleague's PATH.
+    private static func installCLILauncherIfNeeded(
+        bundle: Bundle, defaults: UserDefaults, home: String, fileManager: FileManager
+    ) {
+        let multitool = bundle.bundleURL.appendingPathComponent("Contents/MacOS/ghostty").path
+        let targetDir = "\(home)/.local/bin"
+        let target = "\(targetDir)/ghostty-ramon"
+        let bundleVersion = (bundle.infoDictionary?["CFBundleVersion"] as? String) ?? "0"
+
+        // "Ours" iff the target is a symlink whose resolved destination is this
+        // app's multitool binary. A regular file, a dangling/foreign symlink, or a
+        // symlink pointing elsewhere all read as NOT ours → we leave it alone.
+        let installedFileExists = fileExistsOrSymlink(target, fileManager: fileManager)
+        let installedIsOurs = symlinkPointsAt(target, expected: multitool, fileManager: fileManager)
+
+        let plan = planCLIInstall(
+            bundledBinaryExists: fileManager.isExecutableFile(atPath: multitool),
+            installedFileExists: installedFileExists,
+            installedIsOurs: installedIsOurs,
+            installedVersion: defaults.string(forKey: kInstalledCLIVersion),
+            bundleVersion: bundleVersion)
+
+        switch plan {
+        case .skipNoBundledBinary:
+            logger.debug("no bundled ghostty multitool; leaving ghostty-ramon CLI unmanaged")
+        case .skipExternallyManaged:
+            logger.info("a non-managed file occupies \(target, privacy: .public); not installing ghostty-ramon CLI")
+        case .upToDate:
+            logger.debug("ghostty-ramon CLI already installed for version \(bundleVersion, privacy: .public)")
+        case .install:
+            do {
+                try fileManager.createDirectory(atPath: targetDir, withIntermediateDirectories: true)
+                // Replace only an entry that is OURS (planCLIInstall guarantees we
+                // never reach .install over a foreign file). Removing first lets the
+                // symlink be re-pointed at a relocated app after an update.
+                if installedFileExists && installedIsOurs {
+                    // Let a removal failure surface in the catch below (named cause in
+                    // the log) rather than masking it behind a "file exists" symlink error.
+                    try fileManager.removeItem(atPath: target)
+                }
+                try fileManager.createSymbolicLink(atPath: target, withDestinationPath: multitool)
+                defaults.set(bundleVersion, forKey: kInstalledCLIVersion)
+                logger.info("installed ghostty-ramon CLI at \(target, privacy: .public) -> \(multitool, privacy: .public)")
+            } catch {
+                // Non-fatal: the launcher is a discovery convenience. Leave the
+                // recorded version stale so the next launch retries.
+                logger.warning("failed to install ghostty-ramon CLI: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// True if a file OR symlink (incl. a dangling one) exists at `path`.
+    /// `fileExists` follows symlinks (a dangling symlink reads as absent), so we
+    /// also check the link attributes to catch a broken/foreign symlink we must not
+    /// overwrite.
+    private static func fileExistsOrSymlink(_ path: String, fileManager: FileManager) -> Bool {
+        if fileManager.fileExists(atPath: path) { return true }
+        return (try? fileManager.attributesOfItem(atPath: path)) != nil
+    }
+
+    /// True iff `path` is a symlink whose destination (resolved relative to its own
+    /// directory if relative) equals `expected`. Used to recognize a launcher WE
+    /// created so a reinstall replaces only our own symlink, never a foreign file.
+    private static func symlinkPointsAt(
+        _ path: String, expected: String, fileManager: FileManager
+    ) -> Bool {
+        guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: path) else {
+            return false
+        }
+        let resolved: String
+        if (dest as NSString).isAbsolutePath {
+            resolved = dest
+        } else {
+            let dir = (path as NSString).deletingLastPathComponent
+            resolved = (dir as NSString).appendingPathComponent(dest)
+        }
+        return (resolved as NSString).standardizingPath == (expected as NSString).standardizingPath
+    }
+
+    /// Fire the one-time first-run welcome notification (idempotent via a persisted
+    /// bool). Reuses `notify()` and points the colleague at discovery — they won't
+    /// scroll the command palette, so we name the concrete cheat-sheet entrypoints.
+    private static func showWelcomeIfNeeded(defaults: UserDefaults) {
+        guard shouldShowWelcome(alreadyShown: defaults.bool(forKey: kWelcomeShown)) else {
+            return
+        }
+        // Record BEFORE firing so a notify failure / permission prompt can't cause
+        // it to re-fire on every launch; the welcome is a one-shot nicety.
+        defaults.set(true, forKey: kWelcomeShown)
+        logger.info("first-run welcome: pointing the colleague at ghostty-ramon +list-keybinds / ONBOARDING.md")
+        notify(
+            title: "Welcome to Ghostty (ramon)",
+            body: "Run 'ghostty-ramon +list-keybinds' or see ONBOARDING.md for the keybind cheat sheet.")
     }
 
     private static func seedConfigIfNeeded(home: String, fileManager: FileManager) {
@@ -526,6 +719,26 @@ enum ForkSetup {
     /// out, the pty-host socket parameterized, and the open mcp-listen disabled
     /// (a colleague opts in via the untracked `local` include + a token).
     static let seedTemplate = """
+    # ============================================================================
+    # QUICK START — the fork's headline gestures use a tmux-style `ctrl+a` prefix.
+    # Press `ctrl+a` then the key below (this is a chord, not a chord-held combo):
+    #
+    #   Splits:  ctrl+a then %  split right        ctrl+a then "  split down
+    #            ctrl+a then arrows  move focus     ctrl+a then z  zoom a split
+    #            ctrl+a then x  close split         ctrl+a then o / ;  cycle splits
+    #   Resize:  ctrl+a then h/j/k/l  (hold-repeat) ctrl+a then space  equalize
+    #   Tabs:    ctrl+a then c  new tab             ctrl+a then n / p  next/prev tab
+    #            ctrl+a then 1..9  go to tab N
+    #   Move:    ctrl+a then q  mark split          ctrl+a then m  pull marked here
+    #   Find:    ctrl+a then f  project picker       ctrl+a then d  Agent Dashboard
+    #   Last:    ctrl+a then ctrl+a  jump to last split
+    #
+    # FULL CHEAT SHEET: run 'ghostty-ramon +list-keybinds', or see ONBOARDING.md.
+    # (Don't go hunting in the command palette — the cheat sheet is the fast path.)
+    # NOTE: the exact bindings below are what's actually active; the keys above are
+    # the curated highlights. Tweak any of them to taste.
+    # ============================================================================
+    #
     # Ghostty fork (ramon) — fork-only config (auto-seeded on first launch)
     #
     # Loaded ONLY by the forked build ("Ghostty (ramon)"), layered on top of the
@@ -567,8 +780,9 @@ enum ForkSetup {
 
     # Dynamic project selector: opens a fuzzy palette of the immediate subdirs of
     # each `project-directory`; selecting one opens it in a new tab. Point this at
-    # wherever you keep your repos.
-    project-directory = ~/git
+    # wherever you keep your repos, then uncomment it (left off so an unconfigured
+    # machine doesn't get a half-empty ctrl+a>f palette):
+    #project-directory = ~/git
     keybind = ctrl+a>f=toggle_project_selector
 
     # Agent Dashboard (fork-only): a panel of live mini-previews of every split
@@ -579,6 +793,12 @@ enum ForkSetup {
     agent-dashboard = true
     agent-dashboard-commands = claude,codex
     keybind = ctrl+a>d=toggle_agent_dashboard
+
+    # Agent Queue (fork-only, OPT-IN — left OFF by default). Turns the dashboard
+    # into an active supervisor that launches one CLI agent per work item from a
+    # JSON template. Requires `node` on PATH, the Claude Code agent-state hooks
+    # installed, and a queue template (see AGENT-QUEUE.md). Uncomment to enable:
+    #agent-queue = true
 
     # --- tmux pane/split bindings --------------------------------------------
     keybind = ctrl+a>shift+%=new_split:right
@@ -631,8 +851,10 @@ enum ForkSetup {
     # alerting. (bell-features is an upstream key; seeded here, in the fork-only
     # path, so it's set without touching the shared ~/.config/ghostty/config.)
     bell-features = system,attention,title,border
-    # In focus: sound only (system beep), no dock attention, no title bell.
-    bell-features-focused = system,no-attention,no-title
+    # In focus: VISUAL-ONLY — no audible beep (no-system), no dock attention, no
+    # title bell. Gentler default, close to upstream's silent-when-focused behavior;
+    # add `system` back if you want a beep while the ringing split is focused.
+    bell-features-focused = no-system,no-attention,no-title
 
     # --- PTY host: emulation-on-host (always-on) -----------------------------
     # Selects the out-of-process `.client` backend: emulation + the live shell run

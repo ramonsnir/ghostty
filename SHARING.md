@@ -1,11 +1,38 @@
 # Sharing the fork ("Ghostty (ramon)") with colleagues
 
-This is the user-facing install/update guide for the **distribution build** of the
+This is the **install/update/release** guide for the **distribution build** of the
 fork. It runs **side-by-side** with an official Ghostty (different bundle id, name,
 and config domain), so installing it won't disturb a colleague's existing Ghostty.
 
+> **If you just received a Ghostty (ramon) DMG — start with `ONBOARDING.md`.** It is
+> the colleague-facing walkthrough: the keybind cheat sheet, what works out of the
+> box vs. what needs a one-time setup, and how to discover the fork's features
+> (without scrolling the command palette — you won't). This file (SHARING.md) is the
+> install/update reference; `ONBOARDING.md` is what to read first. After install, the
+> bundled copy lives at `…/Ghostty (ramon).app/Contents/Resources/ONBOARDING.md`, and
+> the first-run notification + your seeded config both point you there too.
+
 For the build/release internals (CI, signing, Sparkle wiring) see the
 "Distribution / sharing the fork" section of `CLAUDE.md`.
+
+## What works out of the box vs. what needs setup
+
+After installing the DMG and relaunching once, this is the lay of the land:
+
+| Feature | Status after install |
+|---|---|
+| Fork keybinds (`ctrl+a` splits/tabs/resize/move) | **Works OOTB** — seeded config |
+| Hosted backend (session survival, live previews) | **Works OOTB** after one relaunch |
+| Agent Dashboard (live CLI-agent tiles) | **Works OOTB** (on by default; `ctrl+a>d`) |
+| `ghostty-ramon` discovery CLI | **Works OOTB** — installed to `~/.local/bin` |
+| Project selector (`ctrl+a>f`) | Needs `project-directory` set (1 line in config) |
+| MCP server (let an agent drive splits) | Needs `mcp-listen` + `mcp-token` in `local` |
+| Web monitor (drive splits from a phone) | Needs `web-monitor-listen` (+ Tailscale) in `local` |
+| Agent **Queue** (one agent per work item) | Needs `node` on PATH + agent-state hooks + a template |
+| Agent **Manager** Haiku tile summaries | **Dev-only** — needs npm packages not in the DMG |
+
+"OOTB" = nothing to configure; the rest are deliberate opt-ins (see the `local` and
+node sections below). `ONBOARDING.md` walks through each.
 
 ## What a colleague needs
 
@@ -107,6 +134,32 @@ agent-state hooks installed (see **AGENT-DASHBOARD.md**) so it can auto-close fi
 and a queue **template** describing your tracker (see **AGENT-QUEUE.md**). Note: the one-line
 Haiku tile *summaries* (the "Agent Manager") need extra node packages that are NOT shipped in
 the DMG, so they stay off for colleagues — the **queue itself works without them**.
+
+## Day-2 discovery (find the fork's features)
+
+The fork adds a lot of keybinds and config keys. **Don't go hunting in the command
+palette** — use the concrete entrypoints instead:
+
+- **`ONBOARDING.md`** — the curated cheat sheet (also bundled at
+  `…/Ghostty (ramon).app/Contents/Resources/ONBOARDING.md`).
+- **`ghostty-ramon` CLI** (installed to `~/.local/bin/ghostty-ramon` on first launch):
+  ```sh
+  ghostty-ramon +list-keybinds   # every active keybind (your seeded + custom bindings)
+  ghostty-ramon +show-config     # your effective configuration
+  ```
+  It's a symlink to the app's multitool, named `ghostty-ramon` so it never collides
+  with an official `ghostty` CLI. (If `~/.local/bin` isn't on your `PATH`, add it.)
+- **The MCP "knowledge" tools** — if you've connected an agent (above), it can answer
+  "what can I configure?" / "is feature X on?" for you without any of the above:
+  - `get_effective_config` — your current config values + which differ from defaults
+    (secrets are redacted to `<set>`).
+  - `docs_for_feature` — a feature's summary, the keys that control it, the steps to
+    enable it, whether it's currently ON, and any unmet requirements (computed live).
+  - `describe_config_key` — one key's documentation + current value.
+  - `list_config_keys` — every config key with a one-line summary (filter by
+    name, or `forkOnly:true` for just the fork's keys).
+
+  See **MCP-SERVER.md** for the full tool list.
 
 ## Uninstall
 

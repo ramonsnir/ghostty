@@ -1,3 +1,9 @@
+<!-- FORK NOTICE -->
+> **This is Ghostty (ramon)** — a personal fork of Ghostty that runs side-by-side with
+> the official build. **New here? Start with [ONBOARDING.md](ONBOARDING.md)** (install,
+> the `ctrl+a` keybind cheat sheet, and what's optional). For the official Ghostty, see
+> [ghostty.org](https://ghostty.org). The upstream README follows below.
+
 <!-- LOGO -->
 <h1>
 <p align="center">
