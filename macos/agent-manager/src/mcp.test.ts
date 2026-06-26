@@ -215,6 +215,22 @@ test("spawnSplitCommand: encodes the tool + forwards only present fields", async
   assert.deepEqual(result, { id: "new-uuid", sessionId: 17 });
 });
 
+test("moveSurfaceIntoTab: encodes move_surface_into_tab + forwards source/anchor/balanced", async () => {
+  const { method, name, args } = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({ sourceUUID: "src", targetAnchorUUID: "anchor", balanced: true }),
+  );
+  assert.equal(method, "tools/call");
+  assert.equal(name, "move_surface_into_tab");
+  assert.equal(args.sourceUUID, "src");
+  assert.equal(args.targetAnchorUUID, "anchor");
+  assert.equal(args.balanced, true);
+  // balanced omitted when not given.
+  const noBalanced = await captureCall('{"ok":true}', (c) =>
+    c.moveSurfaceIntoTab({ sourceUUID: "src", targetAnchorUUID: "anchor" }),
+  );
+  assert.equal("balanced" in noBalanced.args, false);
+});
+
 test("spawnSplitCommand: forwards the item env (GHOSTTY_ITEM_*) and omits an empty env", async () => {
   const withEnv = await captureCall('{"id":"u","sessionId":1}', (c) =>
     c.spawnSplitCommand({
@@ -252,6 +268,7 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       active: 2,
       dispatched: 2,
       maxItems: null,
+      concurrency: 6,
       next: [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }],
       running: [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }],
     }),
@@ -264,6 +281,7 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   assert.equal(args.queued, 7);
   assert.equal(args.active, 2);
   assert.equal(args.maxItems, null);
+  assert.equal(args.concurrency, 6);
   assert.deepEqual(args.next, [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }]);
   assert.deepEqual(args.running, [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }]);
 });
@@ -413,6 +431,21 @@ test("coerceQueueCommands: carries set_max_items + its string maxItems value (no
     { action: "set_max_items", run: "r2", maxItems: "unlimited" },
     { action: "set_max_items", run: "r3" },
     { action: "set_max_items", run: "r4" },
+  ]);
+});
+
+test("coerceQueueCommands: carries set_concurrency + its string concurrency value (non-strings dropped)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "set_concurrency", run: "r", concurrency: "9" },
+      { action: "set_concurrency", run: "r2", concurrency: 9 }, // non-string dropped, action kept
+      { action: "set_concurrency", run: "r3" }, // no value (kept; reducer ignores)
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "set_concurrency", run: "r", concurrency: "9" },
+    { action: "set_concurrency", run: "r2" },
+    { action: "set_concurrency", run: "r3" },
   ]);
 });
 

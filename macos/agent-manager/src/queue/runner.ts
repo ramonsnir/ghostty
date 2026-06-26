@@ -41,7 +41,7 @@ import {
   runProvider,
   type Exec,
 } from "./provider.js";
-import { lowestFreeSlot, splitPlan, gridCap } from "./grid.js";
+import { lowestFreeSlot, splitPlan, gridCap, MAX_QUEUE_TABS, packMove } from "./grid.js";
 import {
   ConcurrencyBudget,
   closeSequencePlan,
@@ -232,6 +232,14 @@ export interface QueueRun {
    *  cap. Persisted in the active-runs record so a restart re-applies it. Reducing it below
    *  what is already dispatched only stops FUTURE dispatch (running agents are never killed). */
   maxItemsLive?: number | null;
+  /** (live concurrency edit) A run-level OVERRIDE of the max SIMULTANEOUS agents, set by a
+   *  `set_concurrency` command WHILE the run is live (the dashboard parallel control). Takes
+   *  PRECEDENCE over the template `concurrency` in `effectiveConcurrency`. The grid `cols*rows`
+   *  is the PER-TAB pane cap; a concurrency above it OVERFLOWS to additional tabs (§12), so
+   *  this can exceed one grid. `undefined` = no live edit (use the template). A positive integer
+   *  (clamped to `capPerTab * MAX_QUEUE_TABS`). Persisted in the active-runs record so a restart
+   *  re-applies it. Lowering it only stops FUTURE dispatch (running agents are never killed). */
+  concurrencyLive?: number;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -248,6 +256,7 @@ export function makeQueueRun(
     draining?: boolean;
     params?: Record<string, string>;
     maxItemsLive?: number | null;
+    concurrencyLive?: number;
   } = {},
 ): QueueRun {
   const params = opts.params ?? {};
@@ -259,6 +268,7 @@ export function makeQueueRun(
     storeIO,
     params,
     maxItemsLive: opts.maxItemsLive,
+    concurrencyLive: opts.concurrencyLive,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
@@ -289,6 +299,18 @@ export function effectiveMaxItemsCap(run: QueueRun): number | null {
   const override = resolveMaxItemsOverride(run.template, run.params);
   const cap = override === undefined ? run.template.maxItems : override;
   return cap <= 0 ? null : cap;
+}
+
+/** The run's EFFECTIVE max simultaneous agents (the TOTAL pane budget across all its tabs):
+ *  the LIVE `set_concurrency` edit if set, else the template `concurrency`. PURE. CLAMPED to
+ *  `[1, capPerTab * MAX_QUEUE_TABS]` so a fat-fingered live edit can't open hundreds of
+ *  overflow tabs. The grid `cols*rows` is the PER-TAB cap; this total may exceed it (panes
+ *  overflow to more tabs, §12). Shared by the dispatch gate + the health report so they agree. */
+export function effectiveConcurrency(run: QueueRun): number {
+  const raw = run.concurrencyLive ?? run.template.concurrency;
+  const capPerTab = gridCap(run.template.grid.cols, run.template.grid.rows);
+  const maxPanes = Math.max(1, capPerTab) * MAX_QUEUE_TABS;
+  return Math.max(1, Math.min(raw, maxPanes));
 }
 
 /** The injectable seams the supervisor pass needs (mirrors LoopDeps). */
@@ -349,6 +371,9 @@ export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
     // Persist a LIVE maxItems edit so a restart re-applies it (null = unlimited; omitted
     // when never live-edited, so a restart falls back to the start-time/template cap).
     if (run.maxItemsLive !== undefined) rec.maxItemsLive = run.maxItemsLive;
+    // Persist a LIVE concurrency edit so a restart re-applies it (omitted when never edited,
+    // so a restart falls back to the template concurrency).
+    if (run.concurrencyLive !== undefined) rec.concurrencyLive = run.concurrencyLive;
     out.push(rec);
   }
   return out;
@@ -665,6 +690,10 @@ async function runOne(
   } else if (run.paused || run.draining) {
     // PAUSED / DRAINING (§8a): keep tracking + closing (done above), dispatch NOTHING new.
   } else {
+    // --- 3.5) CONTINUOUS PACKING (§12): consolidate fragmented tabs BEFORE dispatch, so a
+    // new dispatch fills the packed layout's low tabs rather than a stray fragment. One merge
+    // per sweep; a no-op once the layout is minimal. Best-effort (never throws into the sweep).
+    await packRun(run, deps);
     dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining);
   }
 
@@ -768,6 +797,7 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     listOk: run.lastListOk,
     dispatched: run.lifetimeDispatched,
     maxItemsCap: effectiveMaxItemsCap(run),
+    concurrency: effectiveConcurrency(run),
     // A generous cap for the "N waiting" dropdown (the count itself is always exact);
     // beyond this the GUI shows "… and N more".
     nextLimit: 25,
@@ -1073,11 +1103,12 @@ async function dispatchCandidates(
 ): Promise<number> {
   const t = run.template;
 
-  // Remaining slots = min(concurrency room, grid room, global remaining). The active
-  // count is every assignment currently OCCUPYING a slot (EXITED kept-but-freed ones
-  // excluded, §6).
+  // Remaining slots = min(EFFECTIVE concurrency room, global remaining). The active count
+  // is every assignment currently OCCUPYING a slot (EXITED kept-but-freed ones excluded,
+  // §6). The per-tab `cols*rows` is NOT a global cap — concurrency is the total pane budget
+  // and panes overflow to additional tabs (§12), so it does not bound this.
   const activeCount = slotOccupancy(run);
-  const slots = remainingSlots(t, activeCount, globalRemaining);
+  const slots = remainingSlots(t, activeCount, globalRemaining, effectiveConcurrency(run));
   // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap
   // (null = unlimited ⇒ Infinity remaining; selectCandidates' Math.min(slots, Infinity) =
   // slots). The global `agent-queue-max-total` + grid/concurrency still bound an unlimited run.
@@ -1210,13 +1241,16 @@ async function dispatchOne(
   for (const a of run.active.values()) {
     if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
   }
-  const cap = gridCap(t.grid.cols, t.grid.rows);
+  // The total pane budget is the EFFECTIVE concurrency (across ALL the run's tabs); the
+  // lowest free slot fills the lowest tab first, then overflows (§12). A slot exists for
+  // every agent the (gated) concurrency allows.
+  const cap = effectiveConcurrency(run);
   const slot = lowestFreeSlot(occupied, cap);
-  if (slot === null) return false; // grid full — shouldn't happen (remainingSlots gated)
-  // The split is a BALANCED BSP (§12): the GUI splits the largest pane in the run's tab.
-  // `slot` is just the occupancy token (caps concurrency, refills holes); placement no
-  // longer derives from the slot's abstract grid position.
-  const sp = splitPlan(occupied);
+  if (slot === null) return false; // full — shouldn't happen (remainingSlots gated)
+  // Plan how to materialize this slot's pane (§12): the run's first tab, an OVERFLOW tab
+  // (slot is the first of a fresh tab), or a BALANCED split within the slot's existing tab.
+  // `slot`'s only geometry is which tab it belongs to (floor(slot / cols*rows)).
+  const sp = splitPlan(occupied, slot, gridCap(t.grid.cols, t.grid.rows));
 
   // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
   // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
@@ -1251,28 +1285,31 @@ async function dispatchOne(
   //     single-quoting (shellEnvPrefix) keeps a hostile title inert (no injection); the
   //     template `command` itself is still appended VERBATIM. Belt-and-suspenders: both
   //     set the same vars, so it works on either backend.
-  // A non-firstTab split targets the live UUID occupying the planner's target slot; we
-  // omit `targetUUID` entirely (undefined, not "") when there is no live target so the
-  // tool's first-tab fallback applies cleanly.
+  // Three spawn shapes from the §12 plan:
+  //   - firstTab           → open the run's FIRST tab (frontmost window; no run window yet).
+  //   - newTab + window-   → open an OVERFLOW tab in the run's EXISTING window, anchored on a
+  //     anchor UUID         live pane so all the run's tabs share one window (firstTab:true +
+  //                         windowAnchorUUID).
+  //   - balanced + target  → split WITHIN the slot's tab; the anchor UUID identifies the tab
+  //     UUID                and the GUI splits its largest pane. We omit a missing UUID so the
+  //                         tool's first-tab fallback applies cleanly.
   const itemEnv = buildItemEnv(item);
   const commandWithItemEnv = shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
   try {
-    // Balanced BSP: the anchor UUID just identifies the run's tab; the GUI splits the
-    // largest pane in it. (firstTab opens the run's tab from app defaults.)
-    const targetUUID =
-      sp.firstTab === true ? undefined : occupiedUUID(run, sp.anchorSlotIndex);
-    spawned = await deps.client.spawnSplitCommand({
-      command: commandWithItemEnv,
-      cwd: t.workdir,
-      env: itemEnv,
-      ...(sp.firstTab === true
-        ? { firstTab: true }
-        : {
-            ...(targetUUID !== undefined ? { targetUUID } : {}),
-            balanced: true,
-          }),
-    });
+    let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
+    const base = { command: commandWithItemEnv, cwd: t.workdir, env: itemEnv };
+    if (sp.firstTab === true) {
+      spawnArgs = { ...base, firstTab: true };
+    } else if (sp.newTab === true) {
+      // Overflow tab: open a new tab anchored on the run's window (any live pane).
+      const windowAnchorUUID = occupiedUUID(run, sp.windowAnchorSlotIndex);
+      spawnArgs = { ...base, firstTab: true, ...(windowAnchorUUID !== undefined ? { windowAnchorUUID } : {}) };
+    } else {
+      const targetUUID = occupiedUUID(run, sp.anchorSlotIndex);
+      spawnArgs = { ...base, ...(targetUUID !== undefined ? { targetUUID } : {}), balanced: true };
+    }
+    spawned = await deps.client.spawnSplitCommand(spawnArgs);
   } catch (err) {
     // Spawn failed → FAILED (§6). Free the slot so the run never deadlocks behind a
     // failed spawn; drop the pending record. The key is NOT cooled (it can retry next
@@ -1352,6 +1389,79 @@ function occupiedUUID(run: QueueRun, slotIndex: number): string | undefined {
     if (a.gridSlot === slotIndex && a.surfaceUUID !== undefined) return a.surfaceUUID;
   }
   return undefined;
+}
+
+/** The SEATED assignment occupying a grid slot (has a `surfaceUUID`), or undefined. PURE. */
+function seatedAtSlot(run: QueueRun, slotIndex: number): Assignment | undefined {
+  for (const a of run.active.values()) {
+    if (a.gridSlot === slotIndex && occupiesSlot(a) && a.surfaceUUID !== undefined) return a;
+  }
+  return undefined;
+}
+
+/**
+ * CONTINUOUS PACKING (§12): consolidate a fragmented run's tabs. When agents finish unevenly,
+ * a run can end up with e.g. tabs of 3 + 1 + 1 panes that could sit in one tab. Each sweep we
+ * compute ONE merge (`packMove`) — a whole source tab whose panes fit an earlier tab's free
+ * space — and MOVE its panes there (a focus-preserving cross-tab move), closing the emptied
+ * source tab. Applying one merge per sweep converges to the fewest tabs WITHOUT reshuffling a
+ * balanced layout (4+4 / 5+2 don't fit, so they never move). Best-effort: a failed move stops
+ * this sweep (the next retries); an un-seated source pane (host still attaching) defers the
+ * whole merge. Returns the number of panes moved (0 = nothing to pack / deferred).
+ */
+export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
+  const capPerTab = gridCap(run.template.grid.cols, run.template.grid.rows);
+  // Occupied slots = every slot-occupying assignment (seated or not) so the tab grouping is
+  // accurate; the move itself only proceeds when the source panes are seated (have a UUID).
+  const occupied = new Set<number>();
+  for (const a of run.active.values()) {
+    if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
+  }
+  const plan = packMove(occupied, capPerTab);
+  if (plan === null) return 0;
+
+  // Resolve a SEATED anchor pane in the target tab (any occupied target-range slot with a
+  // UUID); without one we can't address the destination tab — defer to a later sweep.
+  let targetAnchorUUID: string | undefined;
+  for (let k = 0; k < capPerTab; k++) {
+    const uuid = occupiedUUID(run, plan.targetTab * capPerTab + k);
+    if (uuid !== undefined) { targetAnchorUUID = uuid; break; }
+  }
+  if (targetAnchorUUID === undefined) return 0;
+
+  // Resolve every source pane as a SEATED assignment up front; if ANY is un-seated (host
+  // still attaching), defer the WHOLE merge so we never half-move a tab (which would itself
+  // fragment). The slot lists are positionally paired by `packMove`.
+  const moves: Array<{ asgn: Assignment; toSlot: number }> = [];
+  for (let i = 0; i < plan.sourceSlots.length; i++) {
+    const asgn = seatedAtSlot(run, plan.sourceSlots[i]);
+    if (asgn === undefined || asgn.surfaceUUID === undefined) return 0; // defer
+    moves.push({ asgn, toSlot: plan.targetSlots[i] });
+  }
+
+  let moved = 0;
+  for (const { asgn, toSlot } of moves) {
+    if (deps.client.moveSurfaceIntoTab === undefined) break; // optional capability
+    try {
+      await deps.client.moveSurfaceIntoTab({
+        sourceUUID: asgn.surfaceUUID!,
+        targetAnchorUUID,
+        balanced: true,
+      });
+    } catch (err) {
+      errlog(`run "${run.runName}": pack move ${asgn.key} failed: ${msg(err)}`);
+      break; // stop this sweep; the next re-evaluates from the new (partial) layout.
+    }
+    // The pane now lives in the target tab → reassign its grid slot (tab membership) so the
+    // occupancy model + future dispatch/pack stay consistent.
+    asgn.gridSlot = toSlot;
+    moved += 1;
+  }
+  if (moved > 0) {
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+    log(`run "${run.runName}": packed ${moved} pane(s) into tab ${plan.targetTab} (continuous packing)`);
+  }
+  return moved;
 }
 
 // ---------------------------------------------------------------------------

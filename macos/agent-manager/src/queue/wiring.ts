@@ -320,6 +320,7 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
         draining: rec.draining,
         params: runParams,
         maxItemsLive: rec.maxItemsLive,
+        concurrencyLive: rec.concurrencyLive,
       }),
     );
   }

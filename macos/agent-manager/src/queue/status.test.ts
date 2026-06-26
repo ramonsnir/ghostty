@@ -82,6 +82,12 @@ test("maxItemsCap passes through (null = unlimited)", () => {
   assert.equal(queueStatusReport(input({ maxItemsCap: null })).maxItems, null);
 });
 
+test("concurrency passes through (present + present:false), defaulting to 0 when omitted", () => {
+  assert.equal(queueStatusReport(input({ concurrency: 9 })).concurrency, 9);
+  assert.equal(queueStatusReport(input()).concurrency, 0); // omitted → 0
+  assert.equal(queueStatusReport(input({ present: false, concurrency: 6 })).concurrency, 6);
+});
+
 test("null listItems (arm sweep) → 0 queued, no next, starting", () => {
   const r = queueStatusReport(input({ listItems: null, listOk: false, dispatchArmed: false }));
   assert.equal(r.queued, 0);
@@ -119,4 +125,15 @@ test("backlogCount: excludes both waiting (list) and running (active) keys", () 
 
 test("backlogCount: empty board → 0", () => {
   assert.equal(backlogCount([], new Set(["X"])), 0);
+});
+
+test("backlogCount: in-progress (stateType 'started') nodes are NOT counted", () => {
+  const nodes = [
+    node({ key: "TODO", stateType: "unstarted" }), // groomable → counts
+    node({ key: "WIP", stateType: "started" }), // in progress → NOT counted
+    node({ key: "WIP2", stateType: "Started" }), // case-insensitive → NOT counted
+    node({ key: "BACK", stateType: "backlog" }), // groomable → counts
+    node({ key: "NOTYPE" }), // unknown/absent stateType → counts (safe default)
+  ];
+  assert.equal(backlogCount(nodes, new Set()), 3);
 });

@@ -707,16 +707,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     touches no tools), parses strict JSON, and writes `set_surface_annotation`. MCP I/O is a
     dependency-free fetch JSON-RPC client (`src/mcp.ts`) — no MCP-client dep; tests are
     Node's built-in `node --test`.
-  - **COST CONTROLS — skip-hidden + animation-proof fuzzy change + quiescent-skip +
+  - **COST CONTROLS — hidden-throttle + animation-proof fuzzy change + quiescent-skip +
     config (the "Haiku burns my usage" fix).** Four levers cut the call rate; the dominant
     sink was a quiescent (`waiting`/`idle`) agent whose ANIMATED footer (spinner / "esc to
     interrupt" / elapsed-time counter) flipped the old exact-hash `fingerprint` every poll,
-    so it re-summarized every debounce window forever. **(1) Skip hidden tiles:** the
-    dashboard's `hidden` set is now exposed through `list_surfaces` (Swift:
-    `HookSnapshotEntry.hidden` unioned from `model.hidden` → `MCPLayout.SurfaceRow.hidden`,
-    emitted only when true; TS: `Surface.hidden`), and BOTH `preGate` (so a hidden tile skips
-    the `read_surface` entirely) and `shouldSummarize` short-circuit `{reason:"hidden"}` when
-    `cfg.skipHidden` (default true). **(2) Fuzzy change detection (replaces the binary
+    so it re-summarized every debounce window forever. **(1) Throttle (not skip) hidden tiles
+    — UPDATED 2026-06-25 so the rate-limit watchdog survives hiding:** the dashboard's
+    `hidden` set is exposed through `list_surfaces` (Swift: `HookSnapshotEntry.hidden` unioned
+    from `model.hidden` → `MCPLayout.SurfaceRow.hidden`, emitted only when true; TS:
+    `Surface.hidden`). A hidden tile is now summarized on a MUCH LARGER per-session debounce
+    (`hiddenDebounceMs`, default 600000 = 10 min) via the pure `effectiveDebounceMs(surface,
+    cfg)` = `surface.hidden ? max(debounceMs, hiddenDebounceMs) : debounceMs`, consulted by the
+    debounce clause of BOTH `preGate` and `shouldSummarize`. **`skipHidden` is now default
+    FALSE** (was true) — it's the explicit opt-out for the OLD zero-cost behavior (when true,
+    both gates still short-circuit `{reason:"hidden"}` and skip the `read_surface` entirely).
+    **Why the flip:** the rate-limit attention bell (below) has Haiku as its SOLE classifier, so
+    a fully-skipped hidden tile NEVER rings — and hidden tiles are exactly the long-running,
+    stepped-away agents the watchdog is for. Throttling instead of skipping keeps the watchdog
+    alive on them within `hiddenDebounceMs` at a fraction of the visible-tile cost. **(2) Fuzzy change detection (replaces the binary
     `fingerprint`):** `LastSummary` now stores `signals` (exact hash of the AUTHORITATIVE hook
     tuple agentState|lastPrompt|lastTool — any diff = change) + `tail` (the NORMALIZED
     change-tail kept as TEXT). `changeTail` strips spinner glyphs (Braille U+2800–28FF + dot/
@@ -729,9 +737,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-summarizes so a `working` agent's phase still tracks. **(4) Config overlay
     (`src/config.ts`, no rebuild):** `~/.config/ghostty-ramon/agent-manager/config.json` (pure
     `parseConfig` overlay on `DEFAULT_CONFIG` over an injected `readFile`, restart-to-apply,
-    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→**30000**),
-    `changeRatioThreshold`, `skipHidden`, `idleSkipSeconds`, `maxConcurrent`,
-    `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
+    malformed/unknown keys ignored) tunes `debounceMs` (default RAISED 12000→30000→**120000**
+    = 2 min), `hiddenDebounceMs` (default **600000** = 10 min), `changeRatioThreshold`,
+    `skipHidden` (default **false**), `idleSkipSeconds`, `maxConcurrent`, `agentProcessNames`. The `fingerprint()` fn is GONE (replaced by
     `changeSignals`/`changeTail`/`tailChangeRatio`/`isQuiescent`/`normalizeChangeLine`/
     `lineMultiset`, all pure + tested). Wiring: Swift — `AgentDashboardController.swift`
     (`HookSnapshotEntry.hidden`), `MCPLayout.swift` (`SurfaceRow.hidden` + JSON emit); sidecar
@@ -740,7 +748,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     in `main`, record `signals`/`tail`). Tests: Swift `MCPServerTests`
     (`surfacesJSONDataEmitsHiddenWhenTrue` + omit-when-false), `AgentDashboardTests`
     (`hookSnapshot` hidden bit); sidecar `summarizer.test.ts` (change-detection +
-    quiescent/hidden truth table), `config.test.ts` (NEW), `index.test.ts` (record shape).
+    quiescent/hidden truth table + `effectiveDebounceMs` + hidden-throttle/skip cases),
+    `config.test.ts` (NEW + `hiddenDebounceMs` parse), `index.test.ts` (record shape; backoff
+    windows now reference `cfg.debounceMs`).
     **GUI relaunch (for the `hidden` field) + rebuilt sidecar `dist` + sidecar restart; no
     host/Zig change.**
   - **RATE-LIMIT AUTO-BACKOFF (sidecar-only) — when the summarizer's OWN account is
@@ -1067,11 +1077,19 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       `QueuePaletteTests` (`templateParamsParsesTargetAndValuesCommand`, `templateProbe*`,
       `providerEnv*`, `parseValues*`, `previewState*`). **GUI relaunch to pick up (Swift change); the
       `valuesCommand` field needs no sidecar restart (the running sidecar ignores unknown param fields).**
-  - **GRID layout = BALANCED BSP, GUI-placed (§12; reworked from the old slot-geometry
-    planner).** All of a run's splits live in ONE tab, capped at `cols×rows` panes. The engine
-    no longer computes split geometry from an abstract grid: `grid.ts` is now pure OCCUPANCY
-    ACCOUNTING (`gridCap`, `lowestFreeSlot`, `splitPlan` → `firstTab` | `{balanced, anchorSlotIndex}`)
-    and `gridSlot` is just a concurrency token (caps panes, refills the lowest free hole). The
+  - **GRID layout = BALANCED BSP, GUI-placed, with MULTI-TAB OVERFLOW (§12; reworked from the
+    old slot-geometry planner — then extended from single-tab to overflow).** A run lays its
+    splits out as up to `cols×rows` panes PER TAB and OVERFLOWS to additional tabs (in the run's
+    own window) when `concurrency` exceeds one tab — so concurrency 9 with a 3×2 grid fills tab 1
+    (6) then spills 3 into tab 2, and 18 fills three tabs. The engine no longer computes split
+    geometry from an abstract grid: `grid.ts` is pure OCCUPANCY ACCOUNTING — slots are integers in
+    `[0, concurrency)`, slot `i` lives in **tab `floor(i / capPerTab)`** (`tabIndexForSlot`), and
+    `lowestFreeSlot` fills the lowest tab first (reusing a closed split's hole before opening a
+    higher slot). `splitPlan(occupied, newSlot, capPerTab)` → `firstTab` (the run's first tab) |
+    `{newTab, windowAnchorSlotIndex}` (the first pane of a fresh OVERFLOW tab — open a new tab in
+    the run's window, anchored on any live pane so all the run's tabs share ONE window) |
+    `{balanced, anchorSlotIndex}` (a split WITHIN the target slot's tab, anchored at the lowest
+    occupied slot OF THAT TAB). The
     actual tiling is a **balanced binary-space-partition done GUI-side**: `spawn_split_command`
     with `balanced:true` splits the **LARGEST pane in the run's tab along its longer side**
     (`SplitTree.largestLeafSplit(within: realPixelBounds)` — wider/square → `.right`, taller →
@@ -1083,18 +1101,55 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     the REAL tree, so it stays evenly tiled and self-heals across closures. **CRITICAL:**
     `largestLeafSplit` MUST use real pixel `bounds` (the window content size) — `spatial()`'s
     no-bounds fallback uses artificial 1×1 column/row units where every leaf looks square →
-    always `.right` → a single row of N columns. `concurrency` still clamps to `cols×rows`; the
-    template `grid.fill` / col-vs-row split is now IGNORED for placement (only `cols*rows` = the
-    pane cap matters). Wiring: sidecar — `grid.ts` (simplified `splitPlan`; `slotForIndex`/
-    `indexForSlot`/`Slot` removed), `runner.ts` (`dispatchOne` sends `balanced:true` + the
-    lowest-occupied UUID as the tab anchor), `mcp.ts` (`spawnSplitCommand` `balanced` arg). Swift —
+    always `.right` → a single row of N columns (it's scoped per-TAB — each tab is its own
+    `TerminalController.surfaceTree`, so the BSP correctly tiles within one tab). `cols×rows` is
+    now the PER-TAB pane cap; `concurrency` is the TOTAL across tabs and MAY exceed it (overflow),
+    clamped to `cols×rows × MAX_QUEUE_TABS` (8) so a fat-finger can't open hundreds of tabs. The
+    template `grid.fill` / col-vs-row split is IGNORED for placement (only `cols*rows` = the
+    per-tab cap matters). `remainingSlots` bounds dispatch by `min(concurrency − active, global)` —
+    the grid is NO longer a term (overflow handles >grid). Wiring: sidecar — `grid.ts`
+    (`tabIndexForSlot` + tab-aware `splitPlan` + `MAX_QUEUE_TABS`), `runner.ts` (`dispatchOne` slot
+    `[0,concurrency)` + 3-case spawn: firstTab / newTab+windowAnchorUUID / balanced+targetUUID;
+    `effectiveConcurrency` clamps to `capPerTab*MAX_QUEUE_TABS`; `effectiveGridCap` REMOVED),
+    `supervisor.ts` (`remainingSlots` drops the grid term), `templates.ts` (`clampConcurrency` →
+    `[1, cap*MAX_QUEUE_TABS]`), `mcp.ts` (`spawnSplitCommand` `windowAnchorUUID` arg). Swift —
     `SplitTree.swift` (`largestLeafSplit(within:)`, pure), `MCPLayout.swift` (`newSplitCommand`
-    `balanced` path → window content size → `largestLeafSplit`), `MCPTools.swift`
-    (`spawn_split_command` `balanced` schema + dispatch; direction required only when NOT
-    balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `splitPlan`
-    firstTab/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
-    direction); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
+    `balanced` path → window content size → `largestLeafSplit`; `windowAnchorUUID` → open the
+    overflow tab in that pane's window), `MCPTools.swift`
+    (`spawn_split_command` `balanced` + `windowAnchorUUID` schema + dispatch; direction required only when NOT
+    balanced). Tests: sidecar `grid.test.ts` (rewritten: cap/lowestFreeSlot + `tabIndexForSlot` +
+    `splitPlan` firstTab/newTab-overflow/balanced/anchor), `runner.test.ts` (refill asserts `balanced:true` + anchor, no
+    direction; **concurrency>grid OVERFLOWS to a new tab** — slot 0 firstTab, slot in-tab balanced,
+    overflow slot newTab+windowAnchorUUID), `supervisor.test.ts` (`remainingSlots` concurrency-only +
+    effConcurrency override), `templates.test.ts` (concurrency may exceed one grid, clamps at
+    `cap*MAX_QUEUE_TABS`); Swift `SplitTreeTests` (`largestLeafSplit*`: empty/single-aspect/2-col-down/
     biggest-pane/zero-bounds). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+    - **CONTINUOUS PACKING (§12) — consolidate fragmented tabs by MOVING panes.** When agents
+      finish unevenly a run fragments (e.g. tabs of 3 + 1 + 1 panes that could sit in one tab).
+      Each healthy sweep (after close, BEFORE dispatch) the engine computes ONE merge via pure
+      `packMove(occupied, capPerTab)` — the HIGHEST non-empty tab whose panes ALL fit the free
+      space of the LEFTMOST earlier tab — and physically MOVES that whole tab's panes there,
+      closing the emptied source tab. Applying one merge per sweep CONVERGES to the fewest tabs
+      WITHOUT reshuffling a balanced layout: `4+4` / `5+2` (cap 6) never move because the higher
+      tab doesn't FIT the lower tab's free space; `3+1+1` packs to one tab over two sweeps. No
+      hard-coded numbers — everything derives from `capPerTab` + occupancy. The move is a
+      FOCUS-PRESERVING cross-tab relocation reusing Ghostty's proven drag-and-drop primitive
+      (`surfaceTree.inserting` on the destination + `removeSurfaceNode` on the source), so it
+      never steals focus or raises a window; a moved pane's `gridSlot` is reassigned to the
+      target tab's range (tab membership). SAFE-DEFERS: if any source pane is not yet seated
+      (host still attaching, no `surfaceUUID`) the WHOLE merge defers to a later sweep (never a
+      half-move that re-fragments); a failed move stops the sweep (next retries). Runs only on
+      the dispatch-eligible gate (armed, not disabled/paused/draining). Wiring: sidecar —
+      `grid.ts` (`packMove` + `PackMove`), `runner.ts` (`packRun` — exported; `seatedAtSlot`;
+      called in `runOne` before `dispatchCandidates`), `mcp.ts` (`moveSurfaceIntoTab` client).
+      Swift — `BaseTerminalController.moveSurfaceIntoThisTab(source:balanced:)` (focus-preserving
+      cross-tab move), `MCPLayout.moveSurfaceIntoTab(sourceUUID:targetAnchorUUID:balanced:)`,
+      `MCPTools.swift` (`move_surface_into_tab` tool — now 20 tools). Tests: sidecar
+      `grid.test.ts` (`packMove`: 3+1+1 merge / 4+4 + 5+2 no-reshuffle / full-tab-skip / hole
+      reuse / multi-pane), `runner.test.ts` (`packRun` moves + reassigns slot / single+balanced
+      no-op / defers-when-unseated), `mcp.test.ts` (`moveSurfaceIntoTab` forwarding); Swift
+      `MCPServerTests` (`toolsListHasAllTools` now 20). **GUI relaunch + rebuilt sidecar `dist`;
+      no host/Zig change.**
   - **Exit forms (template knob):** `agent.exit` supports a TYPED exit
     command (`{text:"/quit"}` → send_text + Enter; `submit:false` to skip Enter) AND/OR control
     `{keys:[…]}` — DEFAULT `["ctrl-d"]`. NOTE the hyphen form: the MCP `send_key` tool only
@@ -1210,9 +1265,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
       (`intervals.listMs`, reusing a `lastGraphAtMs` throttle), INDEPENDENT of dispatch (runs while
       paused/draining, skipped only when `disabled`), cached on `QueueRun.lastGraph`, and PUSHED via
       a new MCP tool **`report_queue_graph`** (`{queueName,present,backlog,nodes[]}`; `present:false`
-      on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE remainder:
-      non-terminal nodes NOT currently waiting/running (`backlogCount`, pure — exclude = the
-      actionable-list keys ∪ active assignment keys). STAYS GENERIC: the node's `done` (terminal,
+      on run removal, alongside `reportRunGone`). The `backlog` count is the GROOMABLE/SCHEDULABLE
+      remainder: non-terminal nodes that are NOT currently waiting/running AND NOT already
+      in-progress (`backlogCount`, pure — exclude = the actionable-list keys ∪ active assignment
+      keys, plus any node whose `stateType` is in `IN_PROGRESS_STATE_TYPES` = {`started`}). The
+      in-progress exclusion fixes the "2 backlog but only 1 schedulable" report: an In-Progress
+      issue is non-terminal and not in the actionable Todo `list`, so it WOULD have been counted as
+      backlog even though the queue can never dispatch it (the `list` provider only yields Todo).
+      It is still RENDERED in the DAG (blue node) — only the badge number drops it; an absent/unknown
+      `stateType` still counts (safe default). STAYS GENERIC: the node's `done` (terminal,
       excluded+dimmed) and `stateType` (color category) are PROVIDER-decided — Ghostty maps no
       tracker; `QueueBacklogColors` is a cosmetic category→color map with a neutral fallback. The
       DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
@@ -1315,8 +1376,49 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
     re-enables-dispatch), `store.test.ts` (round-trip + tolerant parse), `mcp.test.ts` (coerce carries it);
     Swift `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`).
     **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  - **LIVE concurrency EDIT — change a running queue's max SIMULTANEOUS agents from the dashboard,
+    no restart (the headline ask: bump example 6→9 mid-run).** Mirrors the live maxItems edit. A new
+    `set_concurrency{run,concurrency}` command re-sets a LIVE run's max parallel agents WITHOUT
+    restarting it (a re-`start` is a same-scope no-op, so this is the only in-place path). The
+    dashboard header gets a tap-to-edit **`⇉ N` parallel chip** (`rectangle.split.3x1` +
+    presets 1/2/3/4/6/9 + a custom field; shown once the run reports `concurrency > 0`). Engine:
+    a mutable `QueueRun.concurrencyLive?: number` (`undefined`=no edit; always a positive int — NO
+    "unlimited", an unbounded fan-out would spawn a pane per item). `effectiveConcurrency(run)` =
+    `concurrencyLive ?? template.concurrency`, CLAMPED to `[1, capPerTab*MAX_QUEUE_TABS]`. It is the
+    run's TOTAL pane budget across ALL its tabs — concurrency above one tab's `cols×rows` OVERFLOWS
+    to additional tabs (§12 multi-tab — see the GRID layout bullet), so bumping example 6→9 with a
+    3×2 grid spreads 6 panes in tab 1 + 3 in tab 2 (NOT crammed into one tab — an earlier
+    `effectiveGridCap` single-tab-lift approach was REPLACED by real overflow). `remainingSlots`
+    bounds dispatch by `min(effectiveConcurrency − active, global)` (the grid is no longer a term);
+    `dispatchOne` allocates `lowestFreeSlot(occupied, effectiveConcurrency)` and `splitPlan` routes
+    overflow slots to new tabs. Parsed by a pure `parseConcurrencyValue` (positive int
+    only; blank/garbage/zero/negative → ignored, so a fat-finger never changes parallelism). Persisted
+    in the active-runs record (`concurrencyLive`) so a restart re-applies it; surfaced in the §11
+    health report (`QueueStatusReport.concurrency` = effective value) so the dashboard shows + edits it.
+    The GUI optimistically updates the chip (`QueueStatus.withConcurrency` +
+    `parseConcurrencyOptimistic`) before the sidecar's authoritative push. Lowering it only stops
+    FUTURE dispatch (running agents are never killed); raising it re-enables dispatch on the next
+    list-DUE sweep (≤`listMs`). Wiring: sidecar — `templates.ts` (`parseConcurrencyValue`),
+    `supervisor.ts` (`remainingSlots` `effConcurrency` param), `runner.ts` (`QueueRun.concurrencyLive` +
+    `effectiveConcurrency` clamp + `makeQueueRun` opt + `activeRunRecords` + dispatch
+    gate + `reportQueueStatus`), `status.ts` (`QueueStatusReport.concurrency` + inputs + builder),
+    `commands.ts` (`set_concurrency` action + `concurrency` field + reducer + `applyCommands`
+    change-bit), `store.ts` (`ActiveRunRecord.concurrencyLive` + tolerant parse), `wiring.ts`
+    (rehydrate), `mcp.ts` (`coerceQueueCommands` whitelist + `reportQueueStatus` forward). Swift —
+    `QueueCommandBridge.swift` (`QueueCommand.Action.setConcurrency`="set_concurrency" + `concurrency`
+    field + `jsonObject`; `QueueStatus.concurrency` + `withConcurrency`/`parseConcurrencyOptimistic` +
+    payload parse), `MCPTools.swift` (`report_queue_status` schema `concurrency`),
+    `AgentDashboardController.swift` (`setQueueConcurrency(run:value:)`), `AgentDashboardView.swift`
+    (`OriginSectionHeader` `⇉ N` chip + `concurrencyEditorPopover` + `onSetConcurrency`). Tests:
+    sidecar `templates.test.ts` (`parseConcurrencyValue`), `supervisor.test.ts` (`remainingSlots` eff
+    override), `runner.test.ts` (`effectiveConcurrency` clamp + bump-dispatches-3rd + overflow-new-tab),
+    `commands.test.ts` (set_concurrency apply/ignore-garbage/unknown-run/change-bit), `store.test.ts`
+    (round-trip + tolerant parse), `mcp.test.ts` (coerce + report forward), `status.test.ts`
+    (concurrency passthrough); Swift `MCPServerTests` (`queueCommandJSONObjectSetConcurrency*` +
+    `queueStatusPayload` concurrency), `AgentDashboardTests` (`parseConcurrencyOptimistic*` +
+    `setQueueConcurrencyOptimistically*`). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
   - **INSTANT command feedback (snappiness fix for ALL queue commands).** A queue command
-    (`set_max_items`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
+    (`set_max_items`/`set_concurrency`/pause/resume/stop/abort) only reflected in the dashboard on the sidecar's
     NEXT health push — i.e. after the ~5s `QUEUE_POLL_INTERVAL_MS` poll gap AND that sweep's
     provider round-trips (per-agent `status` probes + `list`), since `reportQueueStatus` is the
     LAST step of a sweep. Felt like 5–15s ("really slow"). Two-part fix: **(GUI optimistic)**

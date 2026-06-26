@@ -1368,6 +1368,57 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// (ramon fork / Agent Queue §12 continuous packing) Move `source` (a surface living in
+    /// ANY window/tab) INTO this controller's tab as a `balanced` split (the largest leaf of
+    /// this tab, along its longer side), **focus-preserving** — unlike a user drag it does NOT
+    /// steal focus or raise this window. Reuses the same proven cross-window move primitive as
+    /// drag-and-drop (`surfaceTree.inserting` on the destination + `removeSurfaceNode` on the
+    /// source). The source's tab/window closes automatically if it empties. Returns false if
+    /// the source can't be located or the insert fails. MUST be called on main.
+    func moveSurfaceIntoThisTab(source: Ghostty.SurfaceView, balanced: Bool) -> Bool {
+        // Already in this tree → nothing to do (treat as success).
+        if surfaceTree.root?.node(view: source) != nil { return true }
+
+        // Locate the source's controller + node across all windows.
+        var sourceController: BaseTerminalController?
+        var sourceNode: SplitTree<Ghostty.SurfaceView>.Node?
+        for window in NSApp.windows {
+            guard let controller = window.windowController as? BaseTerminalController else { continue }
+            guard controller !== self else { continue }
+            if let node = controller.surfaceTree.root?.node(view: source) {
+                sourceController = controller
+                sourceNode = node
+                break
+            }
+        }
+        guard let sourceController, let sourceNode else { return false }
+
+        // Pick the destination split target + direction. Balanced (the packer's mode) splits
+        // the LARGEST leaf in THIS tab along its longer side, using real pixel bounds so the
+        // aspect test is honest (same as the queue's spawn path). A nil pick (empty tree)
+        // aborts. Non-balanced isn't used by the packer; fall back to balanced too.
+        let bounds = window?.contentView?.bounds.size ?? CGSize(width: 1600, height: 1000)
+        guard let pick = surfaceTree.largestLeafSplit(within: bounds) else { return false }
+        _ = balanced // currently always balanced; kept for symmetry with spawn_split_command
+
+        // Compute the new (destination) tree first so a failure aborts before we mutate the
+        // source.
+        let newTree: SplitTree<Ghostty.SurfaceView>
+        do {
+            newTree = try surfaceTree.inserting(view: source, at: pick.view, direction: pick.direction)
+        } catch {
+            Ghostty.logger.warning("failed to insert surface during queue pack: \(error, privacy: .public)")
+            return false
+        }
+
+        // Remove from the source (its tab/window closes if now empty) then install our new
+        // tree WITHOUT moving focus — packing must never steal the user's focus or raise a
+        // window.
+        sourceController.removeSurfaceNode(sourceNode)
+        replaceSurfaceTree(newTree)
+        return true
+    }
+
     // MARK: Appearance
 
     /// Toggle the background opacity between transparent and opaque states.

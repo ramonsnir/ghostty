@@ -87,32 +87,44 @@ struct AgentDashboardView: View {
                     .moveDisabled(true)
             }
             ForEach(model.sections) { section in
+                // A lone `(other)` section (the legacy, no-queue case) shows no
+                // header — keep the classic flat look until a queue origin exists.
+                // Without a header there's no collapse affordance, so it never
+                // collapses; once there are 2+ origins, every section is labeled
+                // and collapsible.
+                let hasHeader = !(model.sections.count == 1 && section.isOther)
+                let collapsed = hasHeader && model.isCollapsed(section.id)
                 Section {
-                    ForEach(section.entries) { entry in
-                        AgentPreviewTile(
-                            entry: entry,
-                            ghostty: ghostty,
-                            previewsEnabled: ptyHostEnabled,
-                            onHide: { model.hide(entry.id) },
-                            onClose: { model.closeSurface(entry.id) }
-                        )
-                        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
-                    }
-                    .onMove { source, destination in
-                        // Reorder ACROSS all sections: capture the global displayed
-                        // session-id order, apply the in-section move at the right
-                        // offset, then hand the full order to the model.
-                        moveWithinSection(section, source: source, destination: destination)
+                    if !collapsed {
+                        ForEach(section.entries) { entry in
+                            AgentPreviewTile(
+                                entry: entry,
+                                ghostty: ghostty,
+                                previewsEnabled: ptyHostEnabled,
+                                onHide: { model.hide(entry.id) },
+                                onClose: { model.closeSurface(entry.id) }
+                            )
+                            .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                        }
+                        .onMove { source, destination in
+                            // Reorder ACROSS all sections: capture the global displayed
+                            // session-id order, apply the in-section move at the right
+                            // offset, then hand the full order to the model.
+                            moveWithinSection(section, source: source, destination: destination)
+                        }
                     }
                 } header: {
-                    // A lone `(other)` section (the legacy, no-queue case) shows no
-                    // header — keep the classic flat look until a queue origin
-                    // exists. Once there are 2+ origins, every section is labeled.
-                    if !(model.sections.count == 1 && section.isOther) {
+                    if hasHeader {
                         OriginSectionHeader(
                             section: section,
+                            collapsed: collapsed,
+                            onToggleCollapse: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.toggleCollapsed(section.id)
+                                }
+                            },
                             status: model.queueStatuses[section.id],
                             onPause: { model.sendRunCommand(.pause, run: section.id) },
                             onResume: { model.sendRunCommand(.resume, run: section.id) },
@@ -126,6 +138,9 @@ struct AgentDashboardView: View {
                             },
                             onSetMaxItems: { value in
                                 model.setQueueMaxItems(run: section.id, value: value)
+                            },
+                            onSetConcurrency: { value in
+                                model.setQueueConcurrency(run: section.id, value: value)
                             },
                             graph: model.queueGraphs[section.id],
                             onOpenBacklog: {
@@ -354,6 +369,11 @@ struct AgentDashboardView: View {
 /// it — `textContent`-safe; it is untrusted queue-template / annotation data).
 private struct OriginSectionHeader: View {
     let section: AgentDashboardModel.OriginSection
+    /// Whether this section is collapsed (tiles hidden). When collapsed the header
+    /// shows a compact "unhidden / total · bells" summary in place of the tiles.
+    let collapsed: Bool
+    /// Toggle this section's collapsed state (the disclosure chevron gesture).
+    let onToggleCollapse: () -> Void
     /// (§11 health) The run's latest health snapshot, when the supervisor has reported
     /// one. nil for `(other)` and for a queue that hasn't reported yet.
     let status: QueueStatus?
@@ -368,6 +388,10 @@ private struct OriginSectionHeader: View {
     /// raw user string ("10"/"unlimited"/…) is posted as a `set_max_items` command; the
     /// sidecar parses it (blank/garbage = ignored).
     let onSetMaxItems: (String) -> Void
+    /// (live concurrency edit) Re-set this run's max SIMULTANEOUS agents (the dashboard
+    /// parallel control). The raw user string ("9") is posted as a `set_concurrency`
+    /// command; the sidecar parses it (blank/garbage/non-positive = ignored).
+    let onSetConcurrency: (String) -> Void
     /// (backlog graph) The run's latest whole-board snapshot, when the supervisor has pushed
     /// one (only when the template declares `provider.graph`). nil ⇒ no backlog button.
     let graph: QueueGraph?
@@ -384,21 +408,40 @@ private struct OriginSectionHeader: View {
     // (live maxItems edit) The "dispatched/cap" tap-to-edit popover + its draft field.
     @State private var showCapEditor = false
     @State private var capDraft = ""
+    // (live concurrency edit) The "⇉ N" tap-to-edit popover + its draft field.
+    @State private var showConcurrencyEditor = false
+    @State private var concurrencyDraft = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
+                // Disclosure chevron — collapse/expand the section's tiles.
+                Button(action: onToggleCollapse) {
+                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(collapsed ? "Expand section" : "Collapse section")
                 Text(section.id)
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text("\(section.count)")
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Color.secondary.opacity(0.18))
-                    .clipShape(Capsule())
+                if collapsed {
+                    // The tiles are hidden, so surface their counts: unhidden /
+                    // total + the number of bells ringing in this section.
+                    collapsedSummary
+                } else {
+                    Text("\(section.count)")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.18))
+                        .clipShape(Capsule())
+                }
                 Spacer(minLength: 4)
                 if !section.isOther {
                     // Cheap run-control intents (§8/§11). Pause and Resume are both
@@ -444,6 +487,26 @@ private struct OriginSectionHeader: View {
                         .help("Change the lifetime cap (maxItems) for this run")
                         .popover(isPresented: $showCapEditor, arrowEdge: .bottom) {
                             capEditorPopover(status)
+                        }
+                        // (live concurrency edit) A "⇉ N" chip = max simultaneous agents,
+                        // tap-to-edit (raise/lower the parallelism WITHOUT restarting the run).
+                        // Shown only once the report carries a concurrency (>0).
+                        if status.concurrency > 0 {
+                            Button {
+                                concurrencyDraft = String(status.concurrency)
+                                showConcurrencyEditor = true
+                            } label: {
+                                HStack(spacing: 2) {
+                                    Image(systemName: "rectangle.split.3x1")
+                                    Text("\(status.concurrency)")
+                                }
+                                .font(.caption2).foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Change max simultaneous agents (concurrency) for this run")
+                            .popover(isPresented: $showConcurrencyEditor, arrowEdge: .bottom) {
+                                concurrencyEditorPopover(status)
+                            }
                         }
                     } else {
                         Text("reading the queue…").font(.caption2).foregroundStyle(.secondary)
@@ -496,6 +559,42 @@ private struct OriginSectionHeader: View {
         .buttonStyle(.plain)
         .foregroundStyle(.secondary)
         .help("Open the backlog dependency graph (\(graph.nodes.count) items in scope)")
+    }
+
+    /// The compact collapsed-section summary: unhidden count, total count, and the
+    /// number of bells ringing — shown in the header when the section's tiles are
+    /// hidden so the counts aren't lost behind the collapse.
+    @ViewBuilder
+    private var collapsedSummary: some View {
+        HStack(spacing: 4) {
+            // "{unhidden} of {total}" when some agents are hidden; just the count
+            // (in a capsule, matching the expanded look) when none are hidden.
+            if section.hiddenCount > 0 {
+                Text("\(section.count) of \(section.totalCount)")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.18))
+                    .clipShape(Capsule())
+                    .help("\(section.count) shown · \(section.hiddenCount) hidden · \(section.totalCount) total")
+            } else {
+                Text("\(section.totalCount)")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.18))
+                    .clipShape(Capsule())
+            }
+            if section.bellCount > 0 {
+                Label("\(section.bellCount)", systemImage: "bell.fill")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .labelStyle(.titleAndIcon)
+                    .help("\(section.bellCount) agent\(section.bellCount == 1 ? "" : "s") ringing the bell")
+            }
+        }
     }
 
     @ViewBuilder
@@ -565,6 +664,43 @@ private struct OriginSectionHeader: View {
     private func commitCap(_ value: String) {
         onSetMaxItems(value)
         showCapEditor = false
+    }
+
+    /// (live concurrency edit) The tap-to-edit parallel popover: quick presets + a custom
+    /// field. Commits the raw string (the sidecar parses + ignores garbage/non-positive),
+    /// so a fat-finger never silently changes parallelism.
+    @ViewBuilder
+    private func concurrencyEditorPopover(_ status: QueueStatus) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Max simultaneous agents").font(.caption.weight(.semibold))
+            Text("Currently \(status.concurrency) at once (\(status.active) running). Raising it lets the run dispatch more in parallel on the next poll; lowering it only stops FUTURE dispatch — running agents keep going.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                ForEach([1, 2, 3, 4, 6, 9], id: \.self) { v in
+                    Button("\(v)") { commitConcurrency(String(v)) }
+                        .buttonStyle(.bordered)
+                }
+            }
+            HStack(spacing: 6) {
+                TextField("custom", text: $concurrencyDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+                    .onSubmit { commitConcurrency(concurrencyDraft) }
+                Button("Set") { commitConcurrency(concurrencyDraft) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(QueueStatus.parseConcurrencyOptimistic(concurrencyDraft) == nil)
+            }
+        }
+        .padding(12)
+        .frame(width: 300)
+    }
+
+    private func commitConcurrency(_ value: String) {
+        onSetConcurrency(value)
+        showConcurrencyEditor = false
     }
 
     private func queueButton(_ systemImage: String, help: String, action: @escaping () -> Void) -> some View {

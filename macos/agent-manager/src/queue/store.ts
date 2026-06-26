@@ -640,6 +640,11 @@ export interface ActiveRunRecord {
    *  live cap. OMITTED when never live-edited (a restart then falls back to the start-time /
    *  template cap). Persisted so a restart re-applies the user's live edit. */
   maxItemsLive?: number | null;
+  /** (live concurrency edit) The run-level max-simultaneous-agents OVERRIDE set by a
+   *  `set_concurrency` command while the run was live. A positive integer; OMITTED when never
+   *  live-edited (a restart then falls back to the template concurrency). Persisted so a
+   *  restart re-applies the user's live edit. */
+  concurrencyLive?: number;
 }
 
 /** The on-disk active-runs file shape. Versioned for additive migration. */
@@ -706,6 +711,13 @@ export function parseActiveRuns(text: string | null): ActiveRunRecord[] {
       rec.maxItemsLive = null;
     } else if (typeof mil === "number" && Number.isInteger(mil) && mil > 0) {
       rec.maxItemsLive = mil;
+    }
+    // (live concurrency edit) carry a live concurrency override: a positive integer only.
+    // Anything else (absent / non-finite / <=0) is dropped → no override rehydrates (falls
+    // back to the template concurrency), matching the tolerant default.
+    const cl = r.concurrencyLive;
+    if (typeof cl === "number" && Number.isInteger(cl) && cl > 0) {
+      rec.concurrencyLive = cl;
     }
     out.push(rec);
   }

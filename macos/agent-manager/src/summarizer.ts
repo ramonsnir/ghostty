@@ -12,7 +12,7 @@ import { composeSystemPrompt } from "./prompt.js";
  *  agentState OR a known agent processName — i.e. the dashboard detected an agent.
  *  Tunable via cfg.agentProcessNames. */
 export interface SummarizerConfig {
-  /** Min ms between model calls for one session. Default 30000. */
+  /** Min ms between model calls for one session. Default 120000 (2 min). */
   debounceMs: number;
   /** If the change-tail is unchanged AND idleSeconds >= this, skip. Default 45.
    *  (A quiescent waiting/idle agent is skipped on an unchanged tail regardless of
@@ -38,9 +38,18 @@ export interface SummarizerConfig {
    *  trigger a re-summary. Default 0.2 (> ~20% of the tail lines must differ). Set 0
    *  to treat ANY difference as a change (the old binary behavior). */
   changeRatioThreshold: number;
-  /** When true (default), the summarizer SKIPS surfaces the user has HIDDEN in the
-   *  Agent Dashboard — no Haiku call for a decluttered tile. */
+  /** When true, the summarizer FULLY SKIPS surfaces the user has HIDDEN in the Agent
+   *  Dashboard — no Haiku call at all for a decluttered tile. Default FALSE: a hidden
+   *  tile is still summarized, just RARELY (every `hiddenDebounceMs`), so the rate-limit
+   *  attention watchdog still covers a hidden, long-running, stepped-away agent — the
+   *  exact case it exists for. Set true to opt back into zero-cost-on-hidden. */
   skipHidden: boolean;
+  /** Per-session debounce (ms) for HIDDEN surfaces — much larger than `debounceMs` so a
+   *  decluttered tile costs little while the watchdog still notices a rate-limit prompt
+   *  within this window. Ignored when `skipHidden` is true (hidden tiles skip entirely).
+   *  The effective hidden debounce is `max(debounceMs, hiddenDebounceMs)` so a hidden
+   *  tile is never summarized MORE often than a visible one. Default 600000 (10 min). */
+  hiddenDebounceMs: number;
   /** Cap (ms) on the adaptive RATE-LIMIT BACKOFF: when the summarizer's OWN model
    *  calls keep failing (its account is rate-limited / returns no usable summary), the
    *  loop backs off exponentially — `debounceMs * 2^(streak-1)` — up to this cap, and
@@ -52,13 +61,14 @@ export interface SummarizerConfig {
 }
 
 export const DEFAULT_CONFIG: SummarizerConfig = {
-  debounceMs: 30000,
+  debounceMs: 120000,
   idleSkipSeconds: 45,
   maxConcurrent: 10,
   fingerprintTailLines: 20,
   promptTailLines: 40,
   changeRatioThreshold: 0.2,
-  skipHidden: true,
+  skipHidden: false,
+  hiddenDebounceMs: 600000,
   rateLimitBackoffMaxMs: 600000,
   agentProcessNames: ["claude", "codex"],
 };
@@ -163,6 +173,18 @@ export function isAgentSurface(s: Surface, cfg: SummarizerConfig): boolean {
   return false;
 }
 
+/** The per-session debounce (ms) that applies to this surface. PURE. A HIDDEN surface
+ *  (and `skipHidden` is false, else it's skipped before this is consulted) uses the
+ *  much larger `hiddenDebounceMs` so a decluttered tile is summarized RARELY — enough
+ *  for the rate-limit watchdog to still notice it, without the visible-tile call rate.
+ *  Floored at `debounceMs` so a misconfigured `hiddenDebounceMs < debounceMs` never makes
+ *  a hidden tile MORE frequent than a visible one. A visible surface uses `debounceMs`. */
+export function effectiveDebounceMs(s: Surface, cfg: SummarizerConfig): number {
+  return s.hidden === true
+    ? Math.max(cfg.debounceMs, cfg.hiddenDebounceMs)
+    : cfg.debounceMs;
+}
+
 /** True for an agent whose hook state is QUIESCENT — waiting for the user or idle
  *  (done with its turn). A quiescent agent's summary won't change on its own, so an
  *  unchanged change-tail means there's nothing new to say even if the footer is still
@@ -219,7 +241,10 @@ export function tailChangeRatio(prevTail: string, curTail: string): number {
  * The skip/due decision. PURE. Rules (each tested), in order:
  *   - not an agent surface              -> {due:false, reason:"not-agent"}
  *   - hidden (and cfg.skipHidden)       -> {due:false, reason:"hidden"}
- *   - within debounceMs of last call    -> {due:false, reason:"debounce"}
+ *   - within the effective debounce     -> {due:false, reason:"debounce"}
+ *     (HIDDEN surfaces use `hiddenDebounceMs` — see `effectiveDebounceMs` — so a
+ *      decluttered tile is summarized RARELY, keeping the rate-limit watchdog alive
+ *      on it at low cost rather than skipping it entirely.)
  *   - first time for this session       -> {due:true,  reason:"first"}
  *   - hook signals changed              -> {due:true,  reason:"changed-signal"}
  *   - change-tail ratio > threshold     -> {due:true,  reason:"changed"}
@@ -248,7 +273,7 @@ export function shouldSummarize(
     return { due: false, reason: "hidden" };
   }
 
-  if (last && nowMs - last.atMs < cfg.debounceMs) {
+  if (last && nowMs - last.atMs < effectiveDebounceMs(s.surface, cfg)) {
     return { due: false, reason: "debounce" };
   }
 
@@ -283,10 +308,12 @@ export function shouldSummarize(
  * runs after the read. Returns:
  *   - not an agent surface           -> {pass:false, reason:"not-agent"}
  *   - hidden (and cfg.skipHidden)    -> {pass:false, reason:"hidden"}
- *   - within debounceMs of last call -> {pass:false, reason:"debounce"}
+ *   - within the effective debounce  -> {pass:false, reason:"debounce"}
  *   - otherwise                      -> {pass:true,  reason:"candidate"}
- * Mirrors the row-only clauses of shouldSummarize so the two never disagree (and the
- * hidden skip here AVOIDS the read_surface entirely for a hidden tile).
+ * Mirrors the row-only clauses of shouldSummarize so the two never disagree (incl. the
+ * HIDDEN-surface `hiddenDebounceMs` via `effectiveDebounceMs`). When `skipHidden` is
+ * true the hidden skip AVOIDS the read_surface entirely for a hidden tile; otherwise a
+ * hidden tile is just throttled to the larger hidden debounce.
  */
 export function preGate(
   s: Surface,
@@ -296,7 +323,7 @@ export function preGate(
 ): { pass: boolean; reason: string } {
   if (!isAgentSurface(s, cfg)) return { pass: false, reason: "not-agent" };
   if (cfg.skipHidden && s.hidden === true) return { pass: false, reason: "hidden" };
-  if (last && nowMs - last.atMs < cfg.debounceMs) {
+  if (last && nowMs - last.atMs < effectiveDebounceMs(s, cfg)) {
     return { pass: false, reason: "debounce" };
   }
   return { pass: true, reason: "candidate" };

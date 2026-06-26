@@ -12,7 +12,7 @@
 
 import { statSync, readFileSync } from "node:fs";
 
-import { gridCap } from "./grid.js";
+import { gridCap, MAX_QUEUE_TABS } from "./grid.js";
 import type {
   AgentSpec,
   GridFill,
@@ -53,7 +53,8 @@ export type ValidateResult =
  * `name`, `workdir`, `agent.command`, and the `provider.list`/`provider.status`
  * commands + `provider.list.keyField` / `provider.status.doneStates`. Everything
  * else falls back to TEMPLATE_DEFAULTS. The grid must be sane (positive integer
- * cols/rows, known fill); `concurrency` is CLAMPED to [1, gridCap]. Returns
+ * cols/rows, known fill); `concurrency` is CLAMPED to [1, gridCap * MAX_QUEUE_TABS]
+ * (it may exceed ONE grid — panes overflow to more tabs, §12). Returns
  * `{ok:false, errors}` listing EVERY problem found (not just the first) so a user
  * fixing their JSON sees all issues at once.
  */
@@ -540,6 +541,22 @@ export function parseMaxItemsValue(raw: string): number | null | undefined {
 }
 
 /**
+ * Parse a raw CONCURRENCY value string (the live `set_concurrency` dashboard control). PURE.
+ * Unlike maxItems there is NO "unlimited" — concurrency is always a finite positive count of
+ * simultaneous agents (an unbounded fan-out would spawn a pane per actionable item). Returns:
+ *   - a positive integer N for an explicit numeric value.
+ *   - `undefined` for blank or garbage (incl. 0 / negatives / non-integers) — the caller
+ *     IGNORES it (keeps the current concurrency), so a fat-finger never silently changes it.
+ */
+export function parseConcurrencyValue(raw: string): number | undefined {
+  const s = raw.trim();
+  if (s === "") return undefined;
+  const n = Number(s);
+  if (Number.isInteger(n) && n > 0) return n;
+  return undefined; // blank / garbage / non-positive
+}
+
+/**
  * (§8b) Resolve the run's maxItems OVERRIDE from a "maxItems"-target param's answer. PURE.
  * Returns:
  *   - `undefined` when the template declares no maxItems param, OR the answer is blank, OR
@@ -710,8 +727,10 @@ function clampConcurrency(
     errors.push("concurrency must be a positive integer");
     return undefined;
   }
-  // Clamp to the grid cap (cols*rows) — can never exceed the visible grid (§7/§12).
-  if (cap > 0 && n > cap) n = cap;
+  // Clamp to `cols*rows * MAX_QUEUE_TABS` — concurrency MAY exceed ONE grid (panes overflow
+  // to additional tabs, §12), but not beyond the multi-tab ceiling (a fat-fingered value
+  // can't open hundreds of tabs). `cap` is the per-tab cols*rows.
+  if (cap > 0 && n > cap * MAX_QUEUE_TABS) n = cap * MAX_QUEUE_TABS;
   return n;
 }
 

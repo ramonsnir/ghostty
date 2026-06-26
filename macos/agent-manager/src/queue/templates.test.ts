@@ -8,6 +8,7 @@ import {
   TEMPLATE_DEFAULTS,
   makeTemplateLoader,
   missingRequiredParams,
+  parseConcurrencyValue,
   parseMaxItemsValue,
   resolveMaxItemsOverride,
   resolveParamsEnv,
@@ -222,6 +223,16 @@ test("parseMaxItemsValue: unlimited tokens → null, positive int → N, blank/g
   }
 });
 
+test("parseConcurrencyValue: positive int → N, blank/garbage/zero/negative → undefined (NO unlimited)", () => {
+  assert.equal(parseConcurrencyValue("1"), 1);
+  assert.equal(parseConcurrencyValue(" 9 "), 9);
+  assert.equal(parseConcurrencyValue("12"), 12);
+  // Unlike maxItems there is NO "unlimited"/0 token — concurrency is always a finite count.
+  for (const v of ["", "   ", "0", "-3", "1.5", "abc", "unlimited", "∞", "NaN"]) {
+    assert.equal(parseConcurrencyValue(v), undefined, `"${v}" → undefined`);
+  }
+});
+
 test("resolveMaxItemsOverride: blank/garbage → undefined, unlimited tokens → 0, positive int → N", () => {
   const t = {
     params: [{ name: "maxItems", target: "maxItems", default: "1" }],
@@ -307,15 +318,24 @@ test("validateTemplate: full template with all optionals", () => {
   assert.deepEqual(r.template.provider.claim, { command: ["claim", "{key}"] });
 });
 
-test("validateTemplate: concurrency is clamped to the grid cap", () => {
-  const obj = {
+test("validateTemplate: concurrency MAY exceed one grid (multi-tab) but clamps to capPerTab*MAX_QUEUE_TABS", () => {
+  // grid 3x3 = 9 per tab; ceiling = 9 * 8 (MAX_QUEUE_TABS) = 72.
+  // A value between the per-tab cap and the ceiling is KEPT (panes overflow to more tabs, §12).
+  const kept = validateTemplate({
     ...goodTemplateObj(),
-    concurrency: 50,
+    concurrency: 18,
     grid: { cols: 3, rows: 3, fill: "columns" },
-  };
-  const r = validateTemplate(obj);
-  assert.equal(r.ok, true);
-  if (r.ok) assert.equal(r.template.concurrency, 9); // clamped from 50 to 3*3
+  });
+  assert.equal(kept.ok, true);
+  if (kept.ok) assert.equal(kept.template.concurrency, 18); // NOT clamped to 9
+  // Beyond the ceiling it clamps (a fat-finger can't open hundreds of tabs).
+  const clamped = validateTemplate({
+    ...goodTemplateObj(),
+    concurrency: 1000,
+    grid: { cols: 3, rows: 3, fill: "columns" },
+  });
+  assert.equal(clamped.ok, true);
+  if (clamped.ok) assert.equal(clamped.template.concurrency, 72); // clamped to 9*8
 });
 
 // ---------------------------------------------------------------------------

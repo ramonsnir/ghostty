@@ -42,6 +42,7 @@ export function parseConfig(
   };
 
   numInRange("debounceMs", 0, 3_600_000, false);
+  numInRange("hiddenDebounceMs", 0, 3_600_000, false);
   numInRange("idleSkipSeconds", 0, 86_400, false);
   numInRange("maxConcurrent", 1, 64, true);
   numInRange("fingerprintTailLines", 1, 1000, true);

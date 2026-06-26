@@ -179,15 +179,24 @@ test("cross-restart dedup: reconcile re-adopts a live key, then selectCandidates
 // remainingSlots — concurrency vs grid vs global.
 // ---------------------------------------------------------------------------
 
-test("remainingSlots: smaller of concurrency room, grid room, global remaining", () => {
-  // concurrency 9, grid 3x3=9, active 2 -> room 7; global 100 -> 7
+test("remainingSlots: smaller of concurrency room and global remaining (grid is NOT a term)", () => {
+  // concurrency 9, active 2 -> room 7; global 100 -> 7
   assert.equal(remainingSlots(tmpl(), 2, 100), 7);
-  // grid is the binding cap: 2x2=4, active 1 -> grid room 3 even if concurrency=9
-  assert.equal(remainingSlots(tmpl({ grid: { cols: 2, rows: 2, fill: "columns" } }), 1, 100), 3);
+  // The per-tab grid does NOT bind (§12 — panes overflow to more tabs): a 2x2 grid with
+  // concurrency 9, active 1 -> 8 (NOT 3 — concurrency is the total pane budget).
+  assert.equal(remainingSlots(tmpl({ grid: { cols: 2, rows: 2, fill: "columns" } }), 1, 100), 8);
   // global is the binding cap
   assert.equal(remainingSlots(tmpl(), 0, 2), 2);
   // floored at 0 when over-subscribed
   assert.equal(remainingSlots(tmpl(), 20, 100), 0);
+});
+
+test("remainingSlots: effConcurrency OVERRIDES the template (live set_concurrency)", () => {
+  // Template concurrency 6; a live concurrency of 9 gives room 9-2=7 (the per-tab grid 3x2=6
+  // does NOT cap it — the extra panes overflow to a second tab, §12).
+  const t = tmpl({ concurrency: 6, grid: { cols: 3, rows: 2, fill: "columns" } });
+  assert.equal(remainingSlots(t, 2, 100), 4, "template concurrency 6: 6-2 = 4");
+  assert.equal(remainingSlots(t, 2, 100, 9), 7, "live 9: 9-2 = 7 (grid 6 does not bind)");
 });
 
 // ---------------------------------------------------------------------------

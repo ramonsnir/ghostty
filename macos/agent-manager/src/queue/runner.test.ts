@@ -19,6 +19,8 @@ import {
   makeQueueRun,
   occupiesSlot,
   effectiveMaxItemsCap,
+  effectiveConcurrency,
+  packRun,
   DEFAULT_PENDING_GRACE_MS,
   type QueueDeps,
   type QueueRun,
@@ -98,6 +100,7 @@ interface QueueFake {
     forceClose: string[];
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
+    moveIntoTab: Array<{ sourceUUID: string; targetAnchorUUID: string; balanced?: boolean }>;
     list: number;
     graph: number;
     status: string[];
@@ -113,6 +116,7 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     forceClose: [],
     signal: [],
     sendKey: [],
+    moveIntoTab: [],
     list: 0,
     graph: 0,
     status: [],
@@ -153,6 +157,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     },
     async sendKey(id: string, key: string): Promise<void> {
       calls.sendKey.push({ id, key });
+    },
+    async moveSurfaceIntoTab(args: { sourceUUID: string; targetAnchorUUID: string; balanced?: boolean }): Promise<void> {
+      calls.moveIntoTab.push(args);
     },
     async reportQueueStatus(status: QueueStatusReport): Promise<void> {
       calls.reports.push(status);
@@ -558,6 +565,147 @@ test("runQueueSweep: BUMPING the live cap re-enables dispatch past an already-re
   now += 5000;
   await runQueueSweep(deps); // now dispatches the remaining two (lifetimeDispatched 1 → 3)
   assert.equal(fake.calls.spawn.length, 3, "bumping the live cap re-enables dispatch past the reached cap");
+});
+
+// ---------------------------------------------------------------------------
+// (live concurrency edit + multi-tab overflow §12) effectiveConcurrency clamp,
+// live bump dispatch, and overflow tabs.
+// ---------------------------------------------------------------------------
+
+test("effectiveConcurrency: a live override WINS over the template, clamped to capPerTab*MAX_QUEUE_TABS", () => {
+  const t = tmpl({ concurrency: 6, grid: { cols: 3, rows: 2, fill: "columns" } }); // capPerTab 6
+  const run = makeQueueRun(t, memStore());
+  assert.equal(effectiveConcurrency(run), 6);
+  // A live edit beats the template — and MAY exceed one grid (panes overflow to more tabs).
+  run.concurrencyLive = 9;
+  assert.equal(effectiveConcurrency(run), 9);
+  // Clamped at the multi-tab ceiling capPerTab*MAX_QUEUE_TABS = 6*8 = 48 (a fat-finger can't
+  // open hundreds of tabs).
+  run.concurrencyLive = 1000;
+  assert.equal(effectiveConcurrency(run), 48);
+  // Floored at 1.
+  run.concurrencyLive = 1;
+  assert.equal(effectiveConcurrency(run), 1);
+});
+
+test("runQueueSweep: BUMPING the live concurrency dispatches MORE simultaneous agents", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  // concurrency 2 → at most 2 simultaneous agents.
+  const t = tmpl({ concurrency: 2, grid: { cols: 2, rows: 1, fill: "columns" } });
+  const run = makeQueueRun(t, memStore());
+  let now = 8_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — capped to 2 (concurrency)
+  assert.equal(fake.calls.spawn.length, 2, "starts capped at concurrency 2");
+
+  // BUMP the live concurrency to 3.
+  run.concurrencyLive = 3;
+  now += 5000;
+  await runQueueSweep(deps); // the 3rd agent now dispatches
+  assert.equal(fake.calls.spawn.length, 3, "raising live concurrency dispatches the 3rd agent");
+});
+
+test("runQueueSweep: concurrency ABOVE the per-tab grid OVERFLOWS to a new tab (§12)", async () => {
+  // grid 2x1 = 2 panes per tab; concurrency 3 → tab 1 holds slots 0,1; slot 2 overflows to a
+  // NEW tab anchored on the run's window.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
+    spawns: [
+      { id: "s-a", sessionId: 1 },
+      { id: "s-b", sessionId: 2 },
+      { id: "s-c", sessionId: 3 },
+    ],
+  });
+  const t = tmpl({ concurrency: 3, grid: { cols: 2, rows: 1, fill: "columns" } });
+  const run = makeQueueRun(t, memStore());
+  let now = 9_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch all 3
+  const spawns = fake.calls.spawn;
+  assert.equal(spawns.length, 3, "all 3 dispatched across 2 tabs");
+  // Slot 0 → the run's FIRST tab (firstTab, no window anchor).
+  assert.equal(spawns[0].firstTab, true);
+  assert.equal(spawns[0].windowAnchorUUID, undefined);
+  // Slot 1 → balanced split WITHIN tab 1 (same tab, has a pane) — not a new tab.
+  assert.equal(spawns[1].balanced, true);
+  assert.notEqual(spawns[1].targetUUID, undefined);
+  assert.equal(spawns[1].firstTab, undefined);
+  // Slot 2 → OVERFLOW: a NEW tab (firstTab:true) anchored on the run's window.
+  assert.equal(spawns[2].firstTab, true);
+  assert.notEqual(spawns[2].windowAnchorUUID, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// (§12 continuous packing) packRun — merge a fragmented run's tabs.
+// ---------------------------------------------------------------------------
+
+/** A seated RUNNING assignment at a given grid slot, for packing tests. */
+function seatedAsgn(key: string, uuid: string, slot: number): import("./types.js").Assignment {
+  return { queueName: "Q", key, sessionID: slot + 1, surfaceUUID: uuid, gridSlot: slot, state: "RUNNING", sinceMs: 0 };
+}
+
+test("packRun: merges a fragmented run (moves the survivor into the lower tab + reassigns its slot)", async () => {
+  const fake = makeQueueFake({ surfaces: [] });
+  // grid 2x1 = 2 panes/tab. tab0={slot 0}, tab1={slot 2} → 1 + 1 fragmentation.
+  const t = tmpl({ concurrency: 4, grid: { cols: 2, rows: 1, fill: "columns" } });
+  const run = makeQueueRun(t, memStore());
+  run.active.set("A", seatedAsgn("A", "uuid-a", 0)); // tab 0
+  run.active.set("B", seatedAsgn("B", "uuid-b", 2)); // tab 1
+  const deps = makeQueueDeps(fake, [run], () => 1000);
+
+  const moved = await packRun(run, deps);
+  assert.equal(moved, 1, "one pane moved");
+  assert.equal(fake.calls.moveIntoTab.length, 1);
+  assert.equal(fake.calls.moveIntoTab[0].sourceUUID, "uuid-b", "the higher tab's pane moves");
+  assert.equal(fake.calls.moveIntoTab[0].targetAnchorUUID, "uuid-a", "anchored on the lower tab");
+  assert.equal(fake.calls.moveIntoTab[0].balanced, true);
+  // B is reassigned to tab0's free slot 1 (tab membership now matches the move).
+  assert.equal(run.active.get("B")!.gridSlot, 1);
+});
+
+test("packRun: no-op on a non-fragmented run (single tab) and a balanced 2+2 (cap 2 doesn't fit)", async () => {
+  const fake = makeQueueFake({ surfaces: [] });
+  const t = tmpl({ concurrency: 4, grid: { cols: 2, rows: 1, fill: "columns" } });
+  // Single tab (slots 0,1 both in tab0) → nothing to merge.
+  const single = makeQueueRun(t, memStore());
+  single.active.set("A", seatedAsgn("A", "uuid-a", 0));
+  single.active.set("B", seatedAsgn("B", "uuid-b", 1));
+  assert.equal(await packRun(single, makeQueueDeps(fake, [single], () => 1)), 0);
+  // 2+2 across two FULL tabs (cap 2): the higher tab can't fit the lower → no reshuffle.
+  const balanced = makeQueueRun(t, memStore());
+  balanced.active.set("A", seatedAsgn("A", "uuid-a", 0));
+  balanced.active.set("B", seatedAsgn("B", "uuid-b", 1));
+  balanced.active.set("C", seatedAsgn("C", "uuid-c", 2));
+  balanced.active.set("D", seatedAsgn("D", "uuid-d", 3));
+  assert.equal(await packRun(balanced, makeQueueDeps(fake, [balanced], () => 1)), 0);
+  assert.equal(fake.calls.moveIntoTab.length, 0);
+});
+
+test("packRun: DEFERS the whole merge when a source pane is not yet seated (no UUID)", async () => {
+  const fake = makeQueueFake({ surfaces: [] });
+  const t = tmpl({ concurrency: 4, grid: { cols: 2, rows: 1, fill: "columns" } });
+  const run = makeQueueRun(t, memStore());
+  run.active.set("A", seatedAsgn("A", "uuid-a", 0)); // tab 0 (seated anchor)
+  const unseated = seatedAsgn("B", "uuid-b", 2);
+  unseated.surfaceUUID = undefined; // host still attaching → not movable yet
+  run.active.set("B", unseated);
+  assert.equal(await packRun(run, makeQueueDeps(fake, [run], () => 1)), 0);
+  assert.equal(fake.calls.moveIntoTab.length, 0, "no partial move");
 });
 
 // ---------------------------------------------------------------------------

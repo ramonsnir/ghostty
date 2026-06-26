@@ -188,6 +188,7 @@ export class McpClient {
       active: status.active,
       dispatched: status.dispatched,
       maxItems: status.maxItems,
+      concurrency: status.concurrency,
       next: status.next,      // each carries key/title?/url?
       running: status.running, // key/title?/url? per running agent
     });
@@ -237,6 +238,10 @@ export class McpClient {
     command: string;
     cwd?: string;
     firstTab?: boolean;
+    /** (multi-tab overflow §12) When opening an OVERFLOW tab (`firstTab:true`), the UUID of a
+     *  live pane of the SAME run so the new tab joins that pane's window — keeping all of a
+     *  run's tabs in ONE window. Omitted for the run's very first tab (frontmost window). */
+    windowAnchorUUID?: string;
     /** The item-context env (GHOSTTY_ITEM_*) for the launched agent (§13). Forwarded
      *  to the tool as `env`; the Swift handler sets it on the new split's
      *  environmentVariables. Omitted from the wire payload when empty/undefined. */
@@ -248,6 +253,7 @@ export class McpClient {
     if (args.balanced !== undefined) toolArgs.balanced = args.balanced;
     if (args.cwd !== undefined) toolArgs.cwd = args.cwd;
     if (args.firstTab !== undefined) toolArgs.firstTab = args.firstTab;
+    if (args.windowAnchorUUID !== undefined) toolArgs.windowAnchorUUID = args.windowAnchorUUID;
     if (args.env !== undefined && Object.keys(args.env).length > 0) {
       toolArgs.env = args.env;
     }
@@ -258,6 +264,26 @@ export class McpClient {
     }
     const sessionId = typeof obj.sessionId === "number" ? obj.sessionId : 0;
     return { id: obj.id, sessionId };
+  }
+
+  /**
+   * (Agent Queue, §12 continuous packing) move_surface_into_tab — MOVE an existing surface
+   * (`sourceUUID`) into the TAB that holds `targetAnchorUUID`, as a balanced split, FOCUS-
+   * PRESERVING. Used by the packer to consolidate a fragmented run's tabs (merge a whole tab
+   * into an earlier one with room); the source tab closes when it empties. Throws McpError on
+   * failure (the packer logs + retries next sweep). Reuses Ghostty's proven cross-tab/window
+   * move primitive GUI-side.
+   */
+  async moveSurfaceIntoTab(args: {
+    sourceUUID: string;
+    targetAnchorUUID: string;
+    balanced?: boolean;
+  }): Promise<void> {
+    await this.call("move_surface_into_tab", {
+      sourceUUID: args.sourceUUID,
+      targetAnchorUUID: args.targetAnchorUUID,
+      ...(args.balanced !== undefined ? { balanced: args.balanced } : {}),
+    });
   }
 
   /**
@@ -483,6 +509,7 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   "pause",
   "resume",
   "set_max_items",
+  "set_concurrency",
 ]);
 
 /**
@@ -490,8 +517,8 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
  * PURE + TOLERANT — exported for unit testing. Accepts the `{commands:[...]}` envelope
  * (the wire shape). Anything else — a non-object, a missing/non-array `commands`, a
  * non-object entry, or an entry with an unrecognized `action` — yields `[]` / drops that
- * entry. Only `action`, `template`, `run`, `params`, and `maxItems` are carried (and only
- * when correctly typed).
+ * entry. Only `action`, `template`, `run`, `params`, `maxItems`, and `concurrency` are
+ * carried (and only when correctly typed).
  */
 export function coerceQueueCommands(obj: unknown): QueueCommand[] {
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return [];
@@ -516,6 +543,8 @@ export function coerceQueueCommands(obj: unknown): QueueCommand[] {
     }
     // (live maxItems edit) the raw cap value for set_max_items — a string only.
     if (typeof r.maxItems === "string" && r.maxItems.length > 0) cmd.maxItems = r.maxItems;
+    // (live concurrency edit) the raw value for set_concurrency — a string only.
+    if (typeof r.concurrency === "string" && r.concurrency.length > 0) cmd.concurrency = r.concurrency;
     out.push(cmd);
   }
   return out;
