@@ -15,7 +15,7 @@ window manager (Rectangle Pro etc.) can target it by title.
 Each row shows the agent's last rows in full ANSI color, highlights the ones that
 **rang the bell** (needs-your-input) with the amber bell border, and **jumps you to
 that split** (raising its window, selecting its tab, un-zooming if it's hidden under
-a split-zoom) on click. A per-tile **Hide ✕** declutters idle sessions; a hidden
+a split-zoom) on click. A per-tile **Hide (eye-slash)** declutters idle sessions; a hidden
 agent **auto-unhides the instant it rings**.
 
 **OFF by default.** macOS-only, GUI-only — one rebuild/relaunch, no second process,
@@ -79,14 +79,14 @@ keybind = ctrl+a>d=toggle_agent_dashboard
   UserDefaults). The default first-run frame is the right ~40% × full height of your widest
   screen.
 - **Rows** are full-width cards stacked vertically: a header (`agent badge · title · bell
-  dot · Hide ✕`), the live preview (showing the agent's **latest rows** — bottom-anchored,
+  dot · Hide (eye-slash)`), the live preview (showing the agent's **latest rows** — bottom-anchored,
   the top is clipped), and a footer (`cwd · "needs input"` pill when ringing). They sort
   **bell-first**, then most-recently-seen-as-an-agent, then a stable tie-break.
 - **Click a row** to jump to that real split — it raises the window, selects the tab,
   **un-zooms** if the split is hidden under a zoom, and gives the standard locate-pane
   highlight flash. The tiles are **read-only**: no inline reply / key forwarding (jump
   to the split to type).
-- **Hide ✕** (hover a tile) hides an idle agent; the hide set persists across launches.
+- **Hide (eye-slash)** (hover a tile) hides an idle agent; the hide set persists across launches.
   A **"N hidden"** chip at the bottom opens a popover listing hidden agents
   (`badge · title · Show`) with a **Show all**. A hidden agent that **rings the bell**
   is revealed automatically — an agent asking for input never stays hidden.
@@ -125,7 +125,7 @@ A hook-backed tile shows one of three states next to its badge:
   **auto-unhides** if you'd hidden it, and fires a **Web Push** if you've armed the web
   monitor's Notify toggle. **Unlike a real bell, waiting does NOT clear when you focus
   the split** — it is a *status*, not a transient alert, so it persists until the agent
-  reports a new state. You can leave a waiting tile up on purpose; **Hide ✕** is the
+  reports a new state. You can leave a waiting tile up on purpose; **Hide (eye-slash)** is the
   manual dismiss. (Deliberately, the tile's amber **frame + bell icon** are driven by the
   **real terminal bell ONLY** — and clear on focus, like any bell — so the two signals
   stay visually distinct: bell = "something pinged, now cleared by looking"; waiting =

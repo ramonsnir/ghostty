@@ -3,7 +3,7 @@ import AppKit
 import GhosttyKit
 
 /// (ramon fork / Agent Dashboard, Layer 3) One row: a full-width card with a
-/// compact header (badge · title · bell dot · hide ✕), a live (or metadata-only)
+/// compact header (badge · title · bell dot · keep 📌 · close ⊗ · hide 👁⃠), a live (or metadata-only)
 /// preview showing the agent's LATEST rows, and a dim footer. READ-ONLY:
 /// clicking the card jumps to the real split (present + unzoom). No inline reply
 /// / key forwarding (LOCKED #3).
@@ -153,20 +153,29 @@ struct AgentPreviewTile: View {
                 // for a wedged queue slot. On a non-queue agent it would be an unscoped
                 // "kill this terminal" sitting next to the harmless Hide — needless risk.
                 if isQueueOwned {
+                    // DESTRUCTIVE: kill the agent + free the slot. A red stop-sign octagon
+                    // reads as "terminate this" and is visually distinct from the soft,
+                    // reversible Hide (eye.slash) so the two are never confused. Still gated
+                    // behind a confirmation dialog (no undo).
                     Button { confirmClose = true } label: {
-                        Image(systemName: "stop.circle")
+                        Image(systemName: "xmark.octagon")
                             .font(.caption2)
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(.red)
                     .help("Close this split (ends the agent; frees its queue slot)")
                 }
+                // SOFT / reversible: declutter the dashboard — the split keeps running and
+                // re-surfaces on a bell / waiting. `eye.slash` (the canonical "hide from
+                // view", pairing with the Show affordance) + secondary color keep it clearly
+                // distinct from the red destructive Close.
                 Button(action: onHide) {
-                    Image(systemName: "xmark")
+                    Image(systemName: "eye.slash")
                         .font(.caption2)
                 }
+                .foregroundStyle(.secondary)
                 .buttonStyle(.borderless)
-                .help("Hide this agent")
+                .help("Hide this tile (declutter — the split keeps running and re-surfaces on a bell)")
             }
         }
         .padding(.horizontal, 8)
