@@ -966,15 +966,26 @@ extension SplitTree.Node {
         }
     }
 
-    /// Equalize this node and all its children, returning a new node with splits
-    /// adjusted so that each split's ratio is based on the relative weight
-    /// (number of leaves) of its children.
+    /// Equalize this node and all its children, returning a new node whose split
+    /// ratios make every VISIBLE column the same width and every VISIBLE row the
+    /// same height — independent of how the binary tree happens to nest the
+    /// splits. A pane that shares a column (or row) with others is correspondingly
+    /// smaller in area; that's intended. See `equalizeWithWeight()`.
     func equalize() -> Node {
         let (equalizedNode, _) = equalizeWithWeight()
         return equalizedNode
     }
 
     /// Internal helper that equalizes and returns both the node and its weight.
+    /// Each split's ratio is set from the relative EXTENT of its two children
+    /// along the split's OWN axis — columns for a left/right split, rows for a
+    /// top/bottom split (`weightForDirection`). Because that extent recurses
+    /// through a perpendicular nested split by taking the MAX of its children, a
+    /// grid nested on one side is counted at its true column/row span: e.g. a 2×2
+    /// nested beside a single pane counts as 2 columns vs 1, so the divider lands
+    /// at 2/3 and all three columns come out equal width. This is the fix for
+    /// "splits change direction" — upstream flattened any perpendicular split to
+    /// weight 1, hiding the grid inside it and mis-placing the divider.
     private func equalizeWithWeight() -> (node: Node, weight: Int) {
         switch self {
         case .leaf:
@@ -982,19 +993,19 @@ extension SplitTree.Node {
             return (self, 1)
 
         case .split(let split):
-            // Calculate weights based on split direction
+            // Weight each side by how many columns/rows it spans along THIS
+            // split's axis (not its raw leaf count — a stacked pair beside a
+            // single pane is still two equal-width columns).
             let leftWeight = split.left.weightForDirection(split.direction)
             let rightWeight = split.right.weightForDirection(split.direction)
 
-            // Calculate new ratio based on relative weights
             let totalWeight = leftWeight + rightWeight
             let newRatio = Double(leftWeight) / Double(totalWeight)
 
-            // Recursively equalize children
+            // Recursively equalize children.
             let (leftNode, _) = split.left.equalizeWithWeight()
             let (rightNode, _) = split.right.equalizeWithWeight()
 
-            // Create new split with equalized ratio
             let newSplit = Split(
                 direction: split.direction,
                 ratio: newRatio,
@@ -1006,9 +1017,13 @@ extension SplitTree.Node {
         }
     }
 
-    /// Calculate weight for equalization based on split direction.
-    /// Children with the same direction contribute their full weight,
-    /// children with different directions count as 1.
+    /// The number of leaf "tracks" this subtree spans along `direction` — columns
+    /// for `.horizontal`, rows for `.vertical`. A split along the SAME axis adds
+    /// its children's tracks; a PERPENDICULAR split spans the MAX of its children
+    /// (they stack across the other axis, so in `direction` the subtree is only
+    /// as wide/tall as its widest/tallest child). The max-recursion is what makes
+    /// equalize handle nested direction changes correctly — upstream returned a
+    /// flat 1 for any perpendicular split, undercounting a grid nested inside it.
     private func weightForDirection(_ direction: SplitTree.Direction) -> Int {
         switch self {
         case .leaf:
@@ -1017,7 +1032,9 @@ extension SplitTree.Node {
             if split.direction == direction {
                 return split.left.weightForDirection(direction) + split.right.weightForDirection(direction)
             } else {
-                return 1
+                return Swift.max(
+                    split.left.weightForDirection(direction),
+                    split.right.weightForDirection(direction))
             }
         }
     }
