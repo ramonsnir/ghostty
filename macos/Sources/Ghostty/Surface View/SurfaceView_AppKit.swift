@@ -530,6 +530,12 @@ extension Ghostty {
                 // has seen it — clear the sticky "attention needed" state too.
                 attentionNeeded = false
 
+                // (ramon fork) Persist the cleared state: re-encode the window so a
+                // dismissed bell/attention doesn't resurrect on the next restart.
+                if hadBell || hadAttention {
+                    invalidateBellRestorableState()
+                }
+
                 // Remove any notifications for this surface once we gain focus.
                 if !notificationIdentifiers.isEmpty {
                     UNUserNotificationCenter.current()
@@ -901,6 +907,7 @@ extension Ghostty {
         /// bell-clearing the focus path does (state + delivered notifications).
         func resetBell() {
             bell = false
+            invalidateBellRestorableState()
             if !notificationIdentifiers.isEmpty {
                 UNUserNotificationCenter.current()
                     .removeDeliveredNotifications(withIdentifiers: Array(notificationIdentifiers))
@@ -916,6 +923,24 @@ extension Ghostty {
         /// sidecar's own alert edge re-arms on its next clean classify.
         func resetAttention() {
             attentionNeeded = false
+            invalidateBellRestorableState()
+        }
+
+        /// (ramon fork) Mark this surface's window restorable state dirty whenever the
+        /// persisted `bell` / `attentionNeeded` flags change, so AppKit re-encodes the
+        /// window (and thus these flags) before the next quit.
+        ///
+        /// macOS window restoration is DIRTY-TRACKED: it only re-runs
+        /// `window(_:willEncodeRestorableState:)` for a window whose restorable state was
+        /// invalidated since the last encode. The split tree itself invalidates on every
+        /// structural change (`TerminalController.surfaceTreeDidChange`), but a bell /
+        /// attention change is NOT a tree change — without this call AppKit persists the
+        /// STALE blob captured at the previous tree change (bell=false), so the indicators
+        /// silently vanish on restart even though `encode(to:)`/`init(from:)` are correct.
+        /// (Reaches the window the same way `TerminalController` does via its window
+        /// controller; a detached surface with no window is harmlessly skipped.)
+        private func invalidateBellRestorableState() {
+            window?.invalidateRestorableState()
         }
 
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
@@ -927,6 +952,7 @@ extension Ghostty {
             let features = bellFeaturesForCurrentFocus(appState.config)
             if features.contains(.title) || features.contains(.border) {
                 bell = true
+                invalidateBellRestorableState()
             }
         }
 
@@ -964,6 +990,7 @@ extension Ghostty {
             // (on == false) ALWAYS applies — suppression only blocks raising.
             if on && bellIsFocused { return }
             attentionNeeded = on
+            invalidateBellRestorableState()
         }
 
         @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {

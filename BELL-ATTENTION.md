@@ -398,6 +398,23 @@ Load-bearing details:
 - **Back-compat both ways:** decode is `decodeIfPresent(...) ?? false` (pre-fork / `.exec`
   archives read `false`, unchanged); encode is gated `if bell` / `if attentionNeeded`, so a
   healthy surface's archive is byte-identical (no new keys emitted).
+- **⚠️ The encode MUST be re-triggered when the flag changes (`invalidateBellRestorableState`).**
+  macOS window restoration is DIRTY-TRACKED: AppKit only re-runs
+  `TerminalController.window(_:willEncodeRestorableState:)` for a window whose restorable state
+  was `invalidateRestorableState()`'d since the last encode. The split tree invalidates on every
+  structural change (`surfaceTreeDidChange`), but a bell / attention change is NOT a tree change.
+  Correct `encode(to:)`/`init(from:)` is therefore NOT sufficient on its own — without an
+  invalidation, AppKit persists the STALE blob captured at the previous tree change (`bell=false`)
+  and the indicator silently vanishes on restart **even though the Codable is right**. (This was
+  the original bug: the persistence shipped but the markers still disappeared because nothing
+  marked the window dirty.) Fix: every mutation of `bell`/`attentionNeeded` in
+  `SurfaceView_AppKit.swift` calls the `invalidateBellRestorableState()` helper
+  (`window?.invalidateRestorableState()`) — the ring handler (`ghosttyBellDidRing`), the
+  attention setter (`ghosttyAttentionDidChange`), the focus-clear (`focusDidChange`, only when it
+  actually cleared something), and the web-monitor clears (`resetBell`/`resetAttention`). Clears
+  invalidate too, so a dismissed bell doesn't resurrect on the next restart. Tell-tale of this
+  class of bug: the split TREE restores fine (tree changes invalidate) but the per-surface flag
+  doesn't (its mutation never invalidated).
 - **Clearing is unchanged:** focusing a restored surface fires `focusDidChange`, which clears
   both — exactly as at runtime. Restored on a surface that fails to reattach (RAM-only host
   restart ⇒ blank surface) is harmless and intentionally NOT coupled to reattach success.
@@ -473,7 +490,10 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
   + `AgentManager/AgentManagerController.swift` (`GHOSTTY_BELL_DIAG` env).
 - **restart persistence** — `Surface View/SurfaceView_AppKit.swift` `SurfaceView` Codable
   (`bell` + `attentionNeeded` in `CodingKeys`, gated encode + `decodeIfPresent ?? false`
-  restore set directly in `init(from:)`).
+  restore set directly in `init(from:)`) **+ `invalidateBellRestorableState()`** called at
+  every `bell`/`attentionNeeded` mutation (ring/attention setters, focus-clear, web-monitor
+  clears) so AppKit re-encodes the window — without it the persisted blob stays stale and the
+  markers vanish on restart despite the correct Codable.
 - **sidecar (diagnostics)** — `macos/agent-manager/src/diag.ts` (`recordDiag`/`formatDiagLine`)
   + `index.ts` (`classify`/`alert` records). Tests: `diag.test.ts`,
   `macos/Tests/BellDiagnostics/BellDiagnosticsTests.swift`.
