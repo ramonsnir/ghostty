@@ -112,6 +112,30 @@ surface (focused split + key window + active app — the same `bellIsFocused` ru
    most bell promotions at the source; guard 2 also covers the watchdog (which bypasses the
    bell event entirely) and the race where focus lands mid-classify.
 
+## Surviving a GUI restart (fork-only, always on)
+
+The bell (🔔) and the promoted "needs you" (`attentionNeeded`) **persist across a GUI
+restart** — e.g. quitting + relaunching to pick up a new build — instead of silently
+vanishing. They ride the same macOS window-state archive that already restores your split
+tree + per-surface `uuid`/`sessionID` (the pty-host reattach path), so a restored surface
+comes back **still flagged**.
+
+What re-lights and what doesn't is deliberate:
+
+- **Re-lights** — the *sticky* visuals derived from the state: the 🔔 tab-title prefix, the
+  amber surface border, the dock badge, the Agent Dashboard mark.
+- **Does NOT re-fire** — the *one-shot* loud effects: dock bounce, system beep, Web Push.
+  Restoring sets the state directly, NOT through the `ghosttyBellDidRing` /
+  `ghosttyAttentionDidChange` paths that drive those effects — so a relaunch never bounces
+  the dock or re-pushes to your phone for a bell that rang before the restart.
+
+Focusing a restored surface clears both, exactly as at runtime. Two caveats:
+
+1. This rides macOS window-state restoration (`window-save-state`) — the same mechanism that
+   restores your tree/sessions. With restoration off, nothing persists (unchanged).
+2. The flag is restored even if a session fails to reattach (a RAM-only host restart ⇒ a
+   blank surface). Harmless — focusing clears it — and not worth coupling to reattach success.
+
 ## Diagnostics (`bell-diagnostics`) — "why did it fire / why didn't it?"
 
 Set `bell-diagnostics = true` and **both** the GUI and the sidecar append a structured
@@ -350,6 +374,36 @@ Not unit-tested: `bellIsFocused` depends on live `NSApp`/window state (like
 `bellFeaturesForCurrentFocus` itself, also untested) — verified by build + the existing
 MCP/WebMonitor/Config suites staying green.
 
+### Persisted across GUI restart (`SurfaceView` Codable)
+
+`bell` + `attentionNeeded` are persisted in `SurfaceView`'s `Codable` so they survive a GUI
+relaunch instead of resetting to `false`. They were @Published runtime-only state absent from
+the `CodingKeys`, so every restart-for-a-new-build re-archived the window tree without them.
+The fix adds both keys to the EXISTING archive that already restores the split tree +
+per-surface `uuid`/`sessionID` (the phase-2b pty-host reattach path in
+`SurfaceView_AppKit.swift` `init(from:)`/`encode(to:)`), so a restored surface comes back
+still flagged — no new persistence layer, no new identity.
+
+Load-bearing details:
+- **Restore sets the @Published values DIRECTLY** in `init(from:)` (after `self.init`,
+  legal on `private(set)` from inside the class), NOT via the `ghosttyBellDidRing` /
+  `ghosttyAttentionDidChange` notifications. So restoring re-lights only the STICKY visuals
+  derived from these states (🔔 title, amber border via the publishers' current-value emit,
+  dock badge, dashboard mark) — it deliberately does NOT re-fire the one-shot loud effects
+  (dock bounce, system beep, Web Push), which are driven by those notification handlers we
+  never re-post. This is the right behavior: a relaunch must not bounce/re-push for a
+  pre-restart bell.
+- **Back-compat both ways:** decode is `decodeIfPresent(...) ?? false` (pre-fork / `.exec`
+  archives read `false`, unchanged); encode is gated `if bell` / `if attentionNeeded`, so a
+  healthy surface's archive is byte-identical (no new keys emitted).
+- **Clearing is unchanged:** focusing a restored surface fires `focusDidChange`, which clears
+  both — exactly as at runtime. Restored on a surface that fails to reattach (RAM-only host
+  restart ⇒ blank surface) is harmless and intentionally NOT coupled to reattach success.
+- Always-on, GUI-only, no config key; rides the existing `window-save-state` restoration
+  (off ⇒ nothing persists). No host change. Not unit-tested in isolation — `SurfaceView`
+  decode needs a live `AppDelegate`/`Ghostty.app` (same reason the adjacent `sessionID`
+  round-trip has no dedicated test); verified by build + the existing suites staying green.
+
 ### Diagnostics trace (`bell-diagnostics`)
 
 `bell-diagnostics` (Zig bool, default false) makes the GUI + sidecar append a shared JSONL
@@ -413,6 +467,9 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
   `Features/BellDiagnostics/BellDiagnostics.swift` (new, pure-Foundation JSONL appender) +
   the `ring`/`attention`/`clear` call sites (`AppDelegate.swift`, `SurfaceView_AppKit.swift`)
   + `AgentManager/AgentManagerController.swift` (`GHOSTTY_BELL_DIAG` env).
+- **restart persistence** — `Surface View/SurfaceView_AppKit.swift` `SurfaceView` Codable
+  (`bell` + `attentionNeeded` in `CodingKeys`, gated encode + `decodeIfPresent ?? false`
+  restore set directly in `init(from:)`).
 - **sidecar (diagnostics)** — `macos/agent-manager/src/diag.ts` (`recordDiag`/`formatDiagLine`)
   + `index.ts` (`classify`/`alert` records). Tests: `diag.test.ts`,
   `macos/Tests/BellDiagnostics/BellDiagnosticsTests.swift`.
