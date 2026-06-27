@@ -227,7 +227,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   control path). HARD DEPS (self-disables otherwise): pty-host + the Claude agent-state hooks (Codex
   can dispatch but not auto-close). No-duplicates rests on a persisted dispatch LATCH (re-dispatch
   needs a real status round-trip) + reconcile + restart survival. Grid is a balanced BSP with
-  multi-tab overflow (`largestLeafSplit` MUST use real pixel bounds). The dashboard shows per-queue
+  multi-tab overflow (`largestLeafSplit` MUST use real pixel bounds) that is **grid-CONSTRAINED** —
+  the template `grid.cols`/`grid.rows` are threaded as HARD caps (sidecar → MCP → `largestLeafSplit`)
+  so a tab never exceeds `cols` columns / `rows` rows (e.g. on an ultrawide a 3×2 grid now stacks a
+  2nd row instead of a 4th column); caps ≤0/absent = byte-identical pure-aspect back-compat. The dashboard shows per-queue
   health + a backlog dependency DAG; cap and concurrency are editable live. **See `AGENT-QUEUE.md`
   (→ Implementation notes) for the full engine, MCP tools, grid/packing, health/backlog, live edits,
   restart hardening, wiring + tests.**
