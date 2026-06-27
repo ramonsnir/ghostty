@@ -188,8 +188,16 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   archives read false) + gated `if bell`/`if attentionNeeded` encode (healthy surface's
   archive byte-identical). Focusing a restored surface clears both via `focusDidChange`,
   exactly as at runtime; rides the existing `window-save-state` restoration (off ⇒ nothing
-  persists). GUI-only, no host change. Wiring: `macos/Sources/Ghostty/Surface
-  View/SurfaceView_AppKit.swift` (`SurfaceView` `CodingKeys` + `init(from:)`/`encode(to:)`).
+  persists). **⚠️ Correct Codable is NOT enough on its own:** macOS restoration is
+  dirty-tracked, so every `bell`/`attentionNeeded` mutation must call
+  `invalidateBellRestorableState()` (`window?.invalidateRestorableState()`) or AppKit re-saves
+  the STALE blob from the last surface-tree change and the markers vanish on restart anyway —
+  this was the original "still not working" bug (the persistence shipped without the
+  invalidation; the split tree restored fine but the per-surface flag didn't). Helper is called
+  from the ring/attention setters, focus-clear, and the web-monitor clears. GUI-only, no host
+  change. Wiring: `macos/Sources/Ghostty/Surface
+  View/SurfaceView_AppKit.swift` (`SurfaceView` `CodingKeys` + `init(from:)`/`encode(to:)` +
+  `invalidateBellRestorableState()` at each mutation site).
   See `BELL-ATTENTION.md` (→ Surviving a GUI restart / Implementation notes).
 
 - **Web monitor** (fork-only, OFF by default; config `web-monitor-listen` / `web-monitor-token`)
