@@ -226,6 +226,64 @@ struct SplitTreeTests {
         }
     }
 
+    /// Equalize targets equal VISIBLE column width, not equal area: a stacked
+    /// pair and a single pane are two columns of equal width, so the divider sits
+    /// at 1/2 (NOT 2/3 by leaf count). Layout: H( V(a, b) | c ).
+    @Test func equalizedStackedPairIsOneColumn() throws {
+        let a = MockView()
+        let b = MockView()
+        let c = MockView()
+        var tree = SplitTree<MockView>(view: a)
+        tree = try tree.inserting(view: c, at: a, direction: .right)
+        tree = try tree.inserting(view: b, at: a, direction: .down)
+
+        guard case .split(let root) = tree.equalized().root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        // Two equal-width columns -> 1/2 (leaf count would wrongly give 2/3).
+        #expect(abs(root.ratio - 0.5) < 0.001)
+
+        // The stacked pair (perpendicular split) splits its height evenly.
+        guard case .split(let stack) = root.left else {
+            Issue.record("expected a nested split on the left")
+            return
+        }
+        #expect(abs(stack.ratio - 0.5) < 0.001)
+    }
+
+    /// A grid nested behind a perpendicular split is counted at its true column
+    /// span, so columns across a direction change come out equal. Layout (the
+    /// real-world case this fixes): H( V(H(a,b), H(c,d)) | V(e,f) ) — a 2×2 grid
+    /// on the left beside a stacked pair on the right. The left spans 2 columns,
+    /// the right spans 1, so the outer divider must sit at 2/3 — giving three
+    /// equal-width columns. Upstream's flat perpendicular weight gave 1/2 here.
+    @Test func equalizedCountsNestedGridColumns() throws {
+        let a = MockView(); let b = MockView()
+        let c = MockView(); let d = MockView()
+        let e = MockView(); let f = MockView()
+        var tree = SplitTree<MockView>(view: a)
+        tree = try tree.inserting(view: e, at: a, direction: .right)   // H(a, e)
+        tree = try tree.inserting(view: c, at: a, direction: .down)    // H(V(a,c), e)
+        tree = try tree.inserting(view: b, at: a, direction: .right)   // H(V(H(a,b),c), e)
+        tree = try tree.inserting(view: d, at: c, direction: .right)   // H(V(H(a,b),H(c,d)), e)
+        tree = try tree.inserting(view: f, at: e, direction: .down)    // H(V(H(a,b),H(c,d)), V(e,f))
+
+        guard case .split(let root) = tree.equalized().root else {
+            Issue.record("unexpected node type")
+            return
+        }
+        // Left = 2 columns, right = 1 column -> 2/3.
+        #expect(abs(root.ratio - 2.0/3.0) < 0.001)
+
+        // Right stacked pair splits its height evenly.
+        guard case .split(let right) = root.right else {
+            Issue.record("expected a nested split on the right")
+            return
+        }
+        #expect(abs(right.ratio - 0.5) < 0.001)
+    }
+
     // MARK: - Resizing
 
     @Test(arguments: [
