@@ -16,6 +16,10 @@ struct AgentPreviewTile: View {
     /// Force-close this split + free its (queue) slot — the escape hatch for a wedged
     /// queue agent. Gated behind a confirmation (no undo: it ends the agent).
     let onClose: () -> Void
+    /// (keep) Toggle this queue split's KEEP state — exempt it from the queue's auto-close so
+    /// you can do manual work after the task is done (or un-keep it). The argument is the
+    /// DESIRED new value (true = keep, false = allow auto-close). Queue tiles only.
+    let onKeep: (Bool) -> Void
 
     @State private var hovering = false
     @State private var confirmClose = false
@@ -75,6 +79,12 @@ struct AgentPreviewTile: View {
         !(entry.annotation?.queueName ?? "").isEmpty
     }
 
+    /// (keep) Whether this split is KEPT — exempt from the queue's auto-close (the supervisor
+    /// stamps `queueKeep` each sweep). Drives the 📌 pin's filled/outline state.
+    private var isKept: Bool {
+        entry.annotation?.queueKeep ?? false
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -121,6 +131,22 @@ struct AgentPreviewTile: View {
                 Image(systemName: "bell.badge.fill")
                     .font(.caption2)
                     .foregroundStyle(Self.bellAmber)
+            }
+            // (keep) The 📌 pin toggle — queue tiles only. Shown PERSISTENTLY when kept (so
+            // a pinned split is obvious without hovering) and on hover otherwise. Filled +
+            // accent when kept; outline + secondary when not. Clicking flips the keep state
+            // (optimistic; the supervisor's set_keep confirms it). It's the "exempt this
+            // split from auto-close so I can keep working" control.
+            if isQueueOwned && (isKept || hovering) {
+                Button { onKeep(!isKept) } label: {
+                    Image(systemName: isKept ? "pin.fill" : "pin")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(isKept ? Color.accentColor : Color.secondary)
+                .help(isKept
+                    ? "Kept — the queue won't auto-close this split. Click to allow auto-close."
+                    : "Keep this split open (exempt it from the queue's auto-close so you can do manual work).")
             }
             if hovering {
                 // Force-close is offered ONLY for queue-owned tiles: it's the escape hatch

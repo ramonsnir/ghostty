@@ -2278,6 +2278,31 @@ struct AgentQueueHealthTests {
         #expect(model.queueStatuses["Ghost"] == nil)
     }
 
+    // MARK: - (keep) setQueueKeep optimistic annotation merge
+
+    @Test func setQueueKeepOptimisticallyMergesTheKeepFlag() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let id = UUID()
+        // A pre-existing queue annotation (as the supervisor would have stamped it).
+        model.applyAnnotation(id, AgentAnnotation(queueKey: "K-1", queueName: "ExampleOS", queueKeep: false))
+        // Pin → queueKeep flips to true IMMEDIATELY (no waiting for the sidecar's restamp);
+        // the queue tag is preserved (a partial merge).
+        model.setQueueKeep(id: id, run: "ExampleOS", key: "K-1", keep: true)
+        #expect(model.annotations[id]?.queueKeep == true)
+        #expect(model.annotations[id]?.queueName == "ExampleOS")  // preserved
+        #expect(model.annotations[id]?.queueKey == "K-1")         // preserved
+        // Un-pin → flips back to false.
+        model.setQueueKeep(id: id, run: "ExampleOS", key: "K-1", keep: false)
+        #expect(model.annotations[id]?.queueKeep == false)
+        // No-op for the (other) origin / empty key: no annotation conjured.
+        let other = UUID()
+        model.setQueueKeep(id: other, run: AgentDashboardModel.otherOrigin, key: "K", keep: true)
+        #expect(model.annotations[other] == nil)
+        let noKey = UUID()
+        model.setQueueKeep(id: noKey, run: "ExampleOS", key: "", keep: true)
+        #expect(model.annotations[noKey] == nil)
+    }
+
     @Test func sendRunCommandOptimisticallyUpdatesPhase() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         model.applyQueueStatus(status("ExampleOS", phase: "running"))

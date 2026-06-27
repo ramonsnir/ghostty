@@ -55,6 +55,14 @@ export interface StoreFile {
    *  list) must NOT be re-grabbed on the next sweep just because its key is still actionable.
    *  Additive (absent in a pre-upgrade file → an empty latch, the prior behavior). */
   dispatched: string[];
+  /** (keep) The per-split KEEP overrides: work-item key → explicit keep verdict (true =
+   *  keep open / never auto-close, false = allow auto-close even if the template defaults to
+   *  keep). The dashboard 📌 pin sets these via the `set_keep` command; the supervisor's
+   *  `effectiveKeep` consults this FIRST, falling back to the template `keepOnComplete`.
+   *  Persisted (run-level, NOT per-record — like `dispatched` — so it survives reconcile,
+   *  which rebuilds the active map from records) so a kept split stays kept across a
+   *  sidecar/GUI restart. Additive (absent in a pre-upgrade file → no overrides). */
+  keep?: Record<string, boolean>;
 }
 
 /** The current store schema version. */
@@ -97,6 +105,7 @@ export function serializeStore(
   records: Assignment[],
   lifetimeDispatched = 0,
   dispatched: string[] = [],
+  keep: Record<string, boolean> = {},
 ): string {
   const lifetime =
     Number.isFinite(lifetimeDispatched) && lifetimeDispatched > 0
@@ -111,7 +120,24 @@ export function serializeStore(
     lifetimeDispatched: lifetime,
     dispatched: latch,
   };
+  // (keep) Serialize the per-split keep overrides: non-empty keys with a boolean value, in
+  // stable (sorted) key order so the file is deterministic for tests. Omit the field entirely
+  // when there are none (back-compat: a pre-keep file simply has no `keep` key).
+  const keepOut = sanitizeKeep(keep);
+  if (Object.keys(keepOut).length > 0) file.keep = keepOut;
   return JSON.stringify(file, null, 2);
+}
+
+/** Sanitize an arbitrary keep map into a clean `{key: boolean}` with non-empty string keys,
+ *  boolean values, in sorted key order. PURE. Used by serialize + parse so the on-disk shape
+ *  is deterministic and tolerant of a hand-edit. */
+function sanitizeKeep(keep: Record<string, unknown>): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const k of Object.keys(keep).sort()) {
+    const v = keep[k];
+    if (typeof k === "string" && k.length > 0 && typeof v === "boolean") out[k] = v;
+  }
+  return out;
 }
 
 /**
@@ -185,6 +211,41 @@ export function loadDispatched(io: StoreIO): string[] {
   return parseDispatched(text);
 }
 
+/**
+ * (keep) Parse the persisted per-split KEEP overrides. PURE + TOLERANT. A null/empty input
+ * (first run), unparseable JSON, a wrong-shaped object, or a missing / non-object `keep` all
+ * yield `{}` (no overrides — the safe pre-upgrade default). Non-string keys and non-boolean
+ * values are dropped. Read alongside `parseStore` on the first reconcile to rehydrate the keep
+ * overrides across a restart so a kept split stays kept.
+ */
+export function parseKeep(text: string | null): Record<string, boolean> {
+  if (text === null || text.trim().length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+  const k = (parsed as { keep?: unknown }).keep;
+  if (k === null || typeof k !== "object" || Array.isArray(k)) return {};
+  return sanitizeKeep(k as Record<string, unknown>);
+}
+
+/** Read + parse the persisted keep overrides via the seam. Returns `{}` on any read/parse
+ *  failure; never throws into the loop. */
+export function loadKeep(io: StoreIO): Record<string, boolean> {
+  let text: string | null;
+  try {
+    text = io.read();
+  } catch {
+    return {};
+  }
+  return parseKeep(text);
+}
+
 /** Coerce arbitrary parsed JSON into a valid Assignment, or null when it lacks the
  *  required identity fields. PURE. (Defensive against a hand-edited / older file.) */
 function coerceAssignment(raw: unknown): Assignment | null {
@@ -255,9 +316,10 @@ export function persistStore(
   records: Assignment[],
   lifetimeDispatched = 0,
   dispatched: string[] = [],
+  keep: Record<string, boolean> = {},
 ): boolean {
   try {
-    io.write(serializeStore(records, lifetimeDispatched, dispatched));
+    io.write(serializeStore(records, lifetimeDispatched, dispatched, keep));
     return true;
   } catch {
     return false;

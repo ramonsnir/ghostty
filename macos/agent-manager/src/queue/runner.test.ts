@@ -28,7 +28,7 @@ import {
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
 import type { QueueStatusReport, QueueGraphReport } from "./status.js";
-import { loadStore, type StoreIO } from "./store.js";
+import { loadKeep, loadStore, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
 
@@ -58,6 +58,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     },
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
+    keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
     ...over,
@@ -991,6 +992,174 @@ test("runQueueSweep: closeOnComplete=false leaves a done+stably-idle split OPEN 
   assert.equal(fake.calls.forceClose.length, 0, "the completed split is left OPEN for manual close");
   assert.equal(run.active.has("K-1"), true, "the assignment is still tracked (slot held)");
   assert.equal(run.cooldown.has("K-1"), false, "not closed → no cooldown");
+});
+
+// ---------------------------------------------------------------------------
+// (keep) A per-split set_keep PIN holds a done+stably-idle split OPEN (no close), stamps
+//        the keep flag onto the annotation, and survives across a fresh run on the same store.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: a set_keep PIN holds a done+idle split OPEN and stamps keep:true on the annotation", async () => {
+  let surfaces: Surface[] = [];
+  let statusByKey: Record<string, string> = {};
+  let pending: QueueCommand[] = [];
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1","title":"task"}]',
+    spawns: [{ id: "spawned-1", sessionId: 900 }],
+  });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+  const baseExec = fake.exec;
+  const exec: Exec = async (argv: string[]) => {
+    if (argv[0] === "status") {
+      const key = argv[1] ?? "";
+      fake.calls.status.push(key);
+      return { code: 0, stdout: statusByKey[key] ?? '{"state":"working"}', stderr: "" };
+    }
+    return baseExec(argv, {});
+  };
+
+  // Default template (auto-close ON, keepOnComplete OFF) — only the per-split pin keeps it.
+  const store = memStore();
+  const run = makeQueueRun(tmpl({ closeStableSeconds: 5 }), store);
+  let now = 11_500_000;
+  const deps: QueueDeps = {
+    client: fake.client,
+    exec,
+    budget: new QueueBudget(8),
+    now: () => now,
+    registry: registryOf([run]),
+    factory: noFactory,
+    takeCommands: async () => {
+      const c = pending;
+      pending = [];
+      return c;
+    },
+    maxTotal: 8,
+    pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+  };
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → SPAWNED
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps); // → RUNNING
+  statusByKey = { "K-1": '{"state":"done"}' };
+  now += 5000;
+  await runQueueSweep(deps); // → DONE_PENDING
+  assert.equal(run.active.get("K-1")!.state, "DONE_PENDING");
+
+  // PIN the split via a set_keep command (the dashboard 📌 toggle).
+  pending = [{ action: "set_keep", run: "backlog", key: "K-1", keep: true }];
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "idle", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 1000;
+  await runQueueSweep(deps); // command applied; idle anchor starts
+  assert.equal(run.keep.get("K-1"), true, "the pin set the per-split keep override");
+  now += 60000; // far past the stable window — would normally close
+  await runQueueSweep(deps);
+
+  assert.equal(run.active.get("K-1")!.state, "DONE_PENDING", "kept — held in DONE_PENDING, never CLOSING");
+  assert.equal(fake.calls.sendKey.length, 0, "no exit keys sent (close sequence never runs)");
+  assert.equal(fake.calls.forceClose.length, 0, "the kept split is left OPEN for manual work");
+  // The latest annotation stamp for K-1 carries keep:true so the dashboard pin reflects it.
+  const k1Annotates = fake.calls.annotate.filter((a) => a.ann.queueKey === "K-1");
+  assert.ok(k1Annotates.length > 0, "K-1 was annotated");
+  assert.equal(k1Annotates[k1Annotates.length - 1].ann.keep, true, "annotation stamps keep:true");
+
+  // The keep override is persisted to the per-run store so it survives a restart.
+  assert.deepEqual(loadKeep(store), { "K-1": true }, "keep persisted to the per-run store");
+});
+
+test("runQueueSweep: keepOnComplete=true template default keeps a done+idle split OPEN (no per-split pin)", async () => {
+  let surfaces: Surface[] = [];
+  let statusByKey: Record<string, string> = {};
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1","title":"task"}]',
+    spawns: [{ id: "spawned-1", sessionId: 900 }],
+  });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+  const baseExec = fake.exec;
+  const exec: Exec = async (argv: string[]) => {
+    if (argv[0] === "status") {
+      const key = argv[1] ?? "";
+      fake.calls.status.push(key);
+      return { code: 0, stdout: statusByKey[key] ?? '{"state":"working"}', stderr: "" };
+    }
+    return baseExec(argv, {});
+  };
+
+  const run = makeQueueRun(tmpl({ closeStableSeconds: 5, keepOnComplete: true }), memStore());
+  let now = 12_000_000;
+  const deps: QueueDeps = {
+    client: fake.client,
+    exec,
+    budget: new QueueBudget(8),
+    now: () => now,
+    registry: registryOf([run]),
+    factory: noFactory,
+    takeCommands: async () => [],
+    maxTotal: 8,
+    pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+  };
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch → SPAWNED
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps); // → RUNNING
+  statusByKey = { "K-1": '{"state":"done"}' };
+  now += 5000;
+  await runQueueSweep(deps); // → DONE_PENDING
+  surfaces = [
+    queueSurface({ id: "spawned-1", sessionID: 900, agentState: "idle", queueKey: "K-1", queueName: "backlog" }),
+  ];
+  now += 1000;
+  await runQueueSweep(deps);
+  now += 60000;
+  await runQueueSweep(deps);
+
+  assert.equal(run.active.get("K-1")!.state, "DONE_PENDING", "kept by template default — never auto-closed");
+  assert.equal(fake.calls.forceClose.length, 0, "no force-close");
+  const k1 = fake.calls.annotate.filter((a) => a.ann.queueKey === "K-1");
+  assert.equal(k1[k1.length - 1].ann.keep, true, "annotation stamps keep:true from the template default");
+});
+
+test("runQueueSweep: a keep override rehydrates from the per-run store on a fresh run (restart)", async () => {
+  // Persist a keep override, then start a FRESH run object on the SAME store (a sidecar/GUI
+  // restart) — its first reconcile must rehydrate the override so the split stays kept.
+  const store = memStore();
+  store.write(JSON.stringify({ version: 1, records: [], lifetimeDispatched: 0, dispatched: [], keep: { "K-9": true } }));
+
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]", spawns: [] });
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => [];
+  const run = makeQueueRun(tmpl(), store);
+  let now = 13_000_000;
+  const deps: QueueDeps = {
+    client: fake.client,
+    exec: fake.exec,
+    budget: new QueueBudget(8),
+    now: () => now,
+    registry: registryOf([run]),
+    factory: noFactory,
+    takeCommands: async () => [],
+    maxTotal: 8,
+    pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+  };
+
+  await runQueueSweep(deps); // first sweep reconciles + rehydrates keep
+  assert.equal(run.keep.get("K-9"), true, "the keep override rehydrated from the per-run store");
 });
 
 // ---------------------------------------------------------------------------

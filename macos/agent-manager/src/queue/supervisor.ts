@@ -173,6 +173,15 @@ export interface NextStateContext {
    *  LEFT OPEN for manual close (so the slot stays held until a human closes it).
    *  Defaults to `true` (auto-close) when omitted, preserving the prior behavior. */
   closeOnComplete?: boolean;
+  /** (keep) The PER-SPLIT "keep this open" verdict (the dashboard 📌 pin / the template
+   *  `keepOnComplete` default), computed by the loop as
+   *  `run.keep.get(key) ?? template.keepOnComplete ?? false`. When `true`, a DONE_PENDING
+   *  assignment is NEVER advanced to CLOSING — the completed split is left open for manual
+   *  work (the slot stays held, exactly like `closeOnComplete:false`). It suppresses BOTH
+   *  the idle-hold close AND the exited-short-circuit close, so a kept split is never
+   *  auto-torn-down. Independent of `closeOnComplete` (either being a hold reason is enough
+   *  — see `nextState`). Defaults to false (auto-close). */
+  keep?: boolean;
 }
 
 /**
@@ -193,17 +202,19 @@ export interface NextStateContext {
  *     The ONLY completion trigger.
  *   - DONE_PENDING → CLOSING: the agent is QUIESCENT (agentState `idle` OR `waiting`)
  *     held UNCHANGED for `closeStableSeconds` — i.e. `idleStableSinceMs` is set AND
- *     `nowMs - idleStableSinceMs >= closeStableSeconds*1000` — AND
- *     `closeOnComplete !== false`. `waiting` counts because a finished Claude Code agent
- *     reliably settles in `waiting` (its `Stop`→idle hook is overwritten by a later
- *     `Notification` nudge), so an idle-ONLY gate would never close it.
+ *     `nowMs - idleStableSinceMs >= closeStableSeconds*1000` — AND NOT KEPT
+ *     (`keep !== true && closeOnComplete !== false`). `waiting` counts because a finished
+ *     Claude Code agent reliably settles in `waiting` (its `Stop`→idle hook is overwritten
+ *     by a later `Notification` nudge), so an idle-ONLY gate would never close it.
  *     A flap to working (idleStableSinceMs undefined) HOLDS in DONE_PENDING (never closes early).
- *     A template with `closeOnComplete === false` HOLDS in DONE_PENDING forever (the
- *     done split is left open for manual close, §5/§6/§10). `idleSeconds` is NEVER
- *     consulted (§10). EXCEPTION: a DONE_PENDING assignment whose CHILD has already
- *     EXITED short-circuits straight to CLOSING (when `closeOnComplete !== false`),
- *     since the idle-hold would never be satisfied by a child that crashed/exited
- *     before reporting a stable idle — without this the slot would be held forever.
+ *     A KEPT split (`keep === true`, the per-split 📌 pin / `keepOnComplete` default) or a
+ *     template with `closeOnComplete === false` HOLDS in DONE_PENDING forever (the done split
+ *     is left open for manual work, §5/§6/§10). `idleSeconds` is NEVER consulted (§10).
+ *     EXCEPTION: a DONE_PENDING assignment whose CHILD has already EXITED short-circuits
+ *     straight to CLOSING (when NOT kept), since the idle-hold would never be satisfied by a
+ *     child that crashed/exited before reporting a stable idle — without this the slot would
+ *     be held forever. (A KEPT split suppresses even this exit short-circuit — it is never
+ *     auto-closed; force-close it from the dashboard when truly done.)
  *   - TERMINAL/transitional states (CLOSING/FINISHED/FAILED/EXITED/COOLDOWN) are
  *     returned unchanged — the loop, not the machine, drives the close sequence and
  *     the cooldown→eligible transition.
@@ -238,8 +249,14 @@ export function nextState(a: Assignment, ctx: NextStateContext): AssignmentState
   // pins the assignment in DONE_PENDING forever (the completed split is left open for
   // manual close, §5/§6/§10); `undefined`/`true` keep the auto-close behavior.
   if (s === "DONE_PENDING") {
-    if (ctx.closeOnComplete === false) {
-      return "DONE_PENDING"; // opted out of auto-close → leave open for manual close
+    // (keep) A KEPT split is exempt from auto-close ENTIRELY — it stays in DONE_PENDING
+    // (slot held) so the user can do manual work in it after the task is done. This
+    // suppresses BOTH the idle-hold AND the exited-short-circuit below, so a kept split is
+    // never torn down by the supervisor (force-close it from the dashboard ⏹ when truly done).
+    // `closeOnComplete:false` is the equivalent HARD template-wide hold (no per-split override);
+    // either being true holds.
+    if (ctx.keep === true || ctx.closeOnComplete === false) {
+      return "DONE_PENDING"; // kept / opted out of auto-close → leave open for manual work
     }
     // A provider-done agent whose CHILD has already EXITED is done draining: short-circuit
     // straight to CLOSING (don't wait on the idle-hold, which a crashed-before-idle child

@@ -125,6 +125,7 @@ shell the engine just runs.
   },
   "onAgentExit": "leave-and-bell",           // a crashed agent: keep the split for review + ring the bell everywhere
   "closeOnComplete": true,
+  "keepOnComplete": false,                   // KEEP DEFAULT: when true, every completed split is left OPEN (held, slot kept) for manual work; the per-split 📌 pin overrides either way. Default false (auto-close).
   "closeStableSeconds": 5
 }
 ```
@@ -232,6 +233,16 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   show their item key + link.
 - **Control:** per-queue **Pause / Resume / Stop (drain) / Abort** from the section header.
   Stop = finish in-flight, dispatch no more; Abort = close everything and clear the run.
+- **Keep a split (manual work after Done):** each queue tile has a **📌 pin** toggle (next to
+  Hide ✕ / the ⏹ close). Pin a split to **exempt it from the queue's auto-close** — when its
+  item completes the supervisor leaves it OPEN (held in DONE_PENDING) instead of force-closing
+  it, so you can keep working in that pane. Click again to un-pin (allow auto-close). The pin
+  shows **persistently** when a split is kept (filled, accent) so a pinned split is obvious
+  without hovering; it survives a sidecar/GUI restart. **A kept split still holds its
+  concurrency slot** (exactly like `closeOnComplete:false`), so the queue won't dispatch into
+  it until you close it — when you're truly done, force-close it with the ⏹ button (or it stays
+  as an ordinary pane after a Stop/Abort drains the run). To keep *every* split of a queue by
+  default, set `keepOnComplete: true` in the template (the per-split pin still overrides).
 - **Health bar:** each running queue's section header shows a live status line — a phase chip
   (**starting → running → paused / draining / disabled**) plus **"N waiting · M running ·
   dispatched/cap"** (the cap is `∞` when unlimited, so a reached `maxItems` like `1/1` is
@@ -295,6 +306,10 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   process exit (so no confirmation dialog stalls the teardown). (Waiting counts because a
   finished Claude Code agent reliably settles in `waiting`, not `idle` — an idle-only gate
   would leave the completed split open forever.)
+- **A KEPT split is never auto-closed** — a 📌-pinned split (or any split when the template
+  sets `keepOnComplete: true`) is exempt from the close gate: when its item completes it is
+  held OPEN for manual work (slot kept) until you force-close it. The keep verdict is persisted
+  and survives a sidecar/GUI restart.
 - **A crashed agent is never silently lost** — its split stays for you to inspect and the
   bell rings across the dashboard, web monitor, and push (`onAgentExit: leave-and-bell`).
 
@@ -824,6 +839,54 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   completes); this only governs WHEN a provider-DONE item's split tears down. Tests:
   `supervisor.test.ts` (close-on-waiting-held, foldIdleAnchor anchors-on-waiting + keeps-anchor-
   across-transition). **Sidecar-only — rebuilt `dist` + sidecar restart; no GUI/host/Zig change.**
+
+### KEEP — exempt a split from auto-close (manual work after Done)
+
+- **KEEP a split open for manual work** — a per-split toggle (the dashboard **📌 pin**) + a
+  template default (`keepOnComplete`) that EXEMPTS a completed split from the close gate so the
+  user can keep working in it. A kept split is HELD in DONE_PENDING (slot kept — same semantics
+  as `closeOnComplete:false`, the user's explicit choice), never force-closed; force-close it
+  with the per-tile ⏹ when done.
+- **State model (mirrors the `dispatched` latch):** per-split keep is a RUN-LEVEL
+  `QueueRun.keep: Map<key, boolean>` (NOT per-record — so reconcile, which rebuilds the active
+  map from store records every sweep, never wipes it), persisted in the per-run store
+  (`StoreFile.keep`) + rehydrated on the first reconcile (so a kept split survives a sidecar/GUI
+  restart), cleared on abort. `effectiveKeep(run, key) = run.keep.get(key) ?? template.keepOnComplete`.
+  `nextState` holds DONE_PENDING when `ctx.keep === true || ctx.closeOnComplete === false`
+  (keep suppresses BOTH the idle-hold AND the exited-short-circuit close); `closeOnComplete:false`
+  stays the separate HARD never-close (no per-split override), `keepOnComplete:true` is the SOFT
+  default the pin overrides.
+- **Toggle path:** the pin posts a `set_keep{run,key,keep}` command (the GUI→sidecar FIFO, like
+  the other run controls; the GUI optimistically merges the annotation's `queueKeep` for instant
+  feedback). `applyCommand` set_keep sets `run.keep` + marks `run.keepDirty` (a non-persisted
+  per-sweep set); `runOne` drains `keepDirty` → restamps the annotation so the pin reflects the
+  new state immediately (belt-and-suspenders over the per-sweep `restampAnnotation`, which already
+  fires for every active assignment because `list_surfaces` never echoes the queueKey →
+  `needsAnnotationRestamp` is always true). `set_keep` is NOT an active-runs change (keep lives in
+  the per-run store, persisted by the run's own sweep).
+- **GUI state via the annotation:** the supervisor stamps `keep: effectiveKeep` onto the surface
+  annotation (`restampAnnotation` every sweep + `dispatchOne`); the GUI reads
+  `entry.annotation?.queueKeep` to draw the pin (filled/accent when kept, shown persistently;
+  outline on hover otherwise). The pin is QUEUE-tile-only (gated on `queueName`, like the ⏹ close).
+- Wiring: sidecar — `types.ts` (`QueueTemplate.keepOnComplete`), `templates.ts`
+  (`TEMPLATE_DEFAULTS.keepOnComplete` + validate), `store.ts` (`StoreFile.keep` +
+  serialize/`parseKeep`/`loadKeep` + `persistStore` 5th arg), `supervisor.ts`
+  (`NextStateContext.keep` + the gate), `runner.ts` (`QueueRun.keep`/`keepDirty` + `effectiveKeep`
+  + `keepRecord` + rehydrate + ctx pass + annotation stamps + keepDirty drain), `commands.ts`
+  (`set_keep` action + `key`/`keep` + reducer + keepDirty mark), `mcp.ts` (`Annotation.keep` +
+  `setAnnotation` send + `QUEUE_ACTIONS` + `coerceQueueCommands` carry key/keep). macOS —
+  `QueueCommandBridge.swift` (`.setKeep` + `key`/`keep` + `jsonObject`), `AgentStateBridge.swift`
+  (`AgentAnnotation.queueKeep` + merge), `MCPAnnotation.swift` (parse `keep`), `MCPTools.swift`
+  (`set_surface_annotation` schema `keep` + error string), `AgentDashboardController.swift`
+  (`setQueueKeep` optimistic), `AgentDashboardView.swift` (`onKeep` wiring),
+  `AgentPreviewTile.swift` (`onKeep` + `isKept` + the 📌 pin). Tests: sidecar `supervisor.test.ts`
+  (keep holds DONE_PENDING + suppresses exit short-circuit), `store.test.ts` (keep
+  serialize/parse/persist/load), `commands.test.ts` (set_keep apply/guards + not-an-active-runs-change),
+  `templates.test.ts` (keepOnComplete default/parse), `runner.test.ts` (pin holds + stamps annotation
+  + persists; keepOnComplete default holds; rehydrate), `mcp.test.ts` (coerce carries key+keep;
+  setAnnotation sends keep); Swift `MCPServerTests` (`queueCommandJSONObjectSetKeep*`),
+  `MCPAnnotationTests` (parse/merge keep), `AgentDashboardTests` (`setQueueKeepOptimistically*`).
+  **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ### LIVE maxItems EDIT (§8b)
 

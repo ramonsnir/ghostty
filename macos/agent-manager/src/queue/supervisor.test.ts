@@ -38,6 +38,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     },
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
+    keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
     ...over,
@@ -296,6 +297,42 @@ test("nextState: closeOnComplete=false PINS DONE_PENDING — a stably-idle agent
     nextState(a, ctx({ agentState: "idle", idleStableSinceMs: now - 60000, nowMs: now, closeStableSeconds: 5 })),
     "CLOSING",
     "closeOnComplete undefined defaults to auto-close",
+  );
+});
+
+test("nextState: keep=true PINS DONE_PENDING — a stably-idle KEPT split is NOT auto-closed", () => {
+  const a = asgn({ state: "DONE_PENDING" });
+  const now = 100000;
+  // Idle held well past closeStableSeconds (would normally CLOSE) — but the split is KEPT
+  // (the dashboard 📌 pin), so it is left open for manual work.
+  assert.equal(
+    nextState(
+      a,
+      ctx({ agentState: "idle", idleStableSinceMs: now - 60000, nowMs: now, closeStableSeconds: 5, keep: true }),
+    ),
+    "DONE_PENDING",
+  );
+  // keep=false (an explicit un-keep) with closeOnComplete default → closes normally.
+  assert.equal(
+    nextState(
+      a,
+      ctx({ agentState: "idle", idleStableSinceMs: now - 60000, nowMs: now, closeStableSeconds: 5, keep: false }),
+    ),
+    "CLOSING",
+  );
+});
+
+test("nextState: keep=true suppresses even the exited-child short-circuit (never auto-closed)", () => {
+  // A kept split whose child exits is NOT torn down — it stays for the user to inspect/close.
+  const a = asgn({ state: "DONE_PENDING" });
+  assert.equal(
+    nextState(a, ctx({ exited: true, agentState: "working", idleStableSinceMs: undefined, keep: true })),
+    "DONE_PENDING",
+  );
+  // Without keep, an exited child short-circuits to CLOSING (the existing behavior).
+  assert.equal(
+    nextState(a, ctx({ exited: true, agentState: "working", idleStableSinceMs: undefined })),
+    "CLOSING",
   );
 });
 

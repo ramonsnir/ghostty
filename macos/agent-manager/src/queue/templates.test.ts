@@ -286,6 +286,9 @@ test("validateTemplate: minimal good template fills defaults", () => {
   assert.deepEqual(TEMPLATE_DEFAULTS.intervals, { listMs: 60000, statusMs: 30000 });
   assert.equal(t.onAgentExit, "leave-and-bell");
   assert.equal(t.closeOnComplete, true);
+  // (keep) the per-queue keep default is false (auto-close) unless the template opts in.
+  assert.equal(t.keepOnComplete, false);
+  assert.equal(TEMPLATE_DEFAULTS.keepOnComplete, false);
   assert.equal(t.closeStableSeconds, TEMPLATE_DEFAULTS.closeStableSeconds);
   assert.equal(t.provider.list.keyField, "identifier");
   assert.deepEqual(t.provider.status.doneStates, ["done", "merged"]);
@@ -301,6 +304,7 @@ test("validateTemplate: full template with all optionals", () => {
     intervals: { listMs: 30000, statusMs: 10000 },
     onAgentExit: "leave-and-bell",
     closeOnComplete: false,
+    keepOnComplete: true,
     closeStableSeconds: 8,
     agent: { command: "claude", exit: { keys: ["ctrl_d"] } },
     provider: {
@@ -314,6 +318,7 @@ test("validateTemplate: full template with all optionals", () => {
   if (!r.ok) return;
   assert.equal(r.template.concurrency, 5);
   assert.equal(r.template.closeOnComplete, false);
+  assert.equal(r.template.keepOnComplete, true);
   assert.deepEqual(r.template.agent.exit, { keys: ["ctrl_d"] });
   assert.deepEqual(r.template.provider.claim, { command: ["claim", "{key}"] });
 });

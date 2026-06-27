@@ -33,10 +33,18 @@ import { parseConcurrencyValue, parseMaxItemsValue } from "./templates.js";
  *  (the run's `runName` IDENTITY = `template.name` + its env-param scope, the dashboard
  *  origin) for pause/resume/stop/abort/set_max_items. */
 export interface QueueCommand {
-  action: "start" | "stop" | "abort" | "pause" | "resume" | "set_max_items" | "set_concurrency";
+  action:
+    | "start"
+    | "stop"
+    | "abort"
+    | "pause"
+    | "resume"
+    | "set_max_items"
+    | "set_concurrency"
+    | "set_keep";
   /** The template basename to start (start only). */
   template?: string;
-  /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency. */
+  /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency/set_keep. */
   run?: string;
   /** (§8b) START-TIME parameter answers (param name → value) collected by the GUI prompt,
    *  passed through to the factory (start only). Absent when the template declares no params. */
@@ -49,6 +57,12 @@ export interface QueueCommand {
    *  raw string the dashboard parallel control collected ("9", etc.), parsed by
    *  `parseConcurrencyValue` (blank/garbage/non-positive = ignored). Absent for other actions. */
   concurrency?: string;
+  /** (keep) The work-item KEY whose split's keep state `set_keep` toggles (the dashboard 📌
+   *  pin). Required for `set_keep`; absent for other actions. */
+  key?: string;
+  /** (keep) The new keep verdict for `set_keep` (true = keep open, false = allow auto-close).
+   *  Absent for other actions. */
+  keep?: boolean;
 }
 
 /** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME (+ the
@@ -81,6 +95,7 @@ export interface ApplyResult {
     | "aborting"
     | "maxItemsSet"
     | "concurrencySet"
+    | "keepSet"
     | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
@@ -226,6 +241,38 @@ export function applyCommand(
       log(`run "${name}" concurrency set LIVE to ${parsed}`);
       return { kind: "concurrencySet", runName: name };
     }
+    case "set_keep": {
+      // (keep) Toggle one split's keep state (the dashboard 📌 pin). Sets the PER-SPLIT
+      // override in `run.keep` (the value the supervisor's `effectiveKeep` consults first).
+      // The override is persisted to the per-run store on the run's next sweep (runOne's
+      // reconcile persist) and re-stamped onto the surface annotation so the pin reflects it.
+      // NOT counted as an active-runs change (keep lives in the per-run store, not
+      // active-runs.json) — see `applyCommands`.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`set_keep command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const key = cmd.key;
+      if (key === undefined || key.length === 0) {
+        errlog(`set_keep command with no key — ignored`);
+        return { kind: "noop" };
+      }
+      if (typeof cmd.keep !== "boolean") {
+        errlog(`set_keep for run "${name}" key "${key}" with no boolean keep — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`set_keep for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      run.keep.set(key, cmd.keep);
+      // Mark for an immediate annotation re-stamp so the dashboard 📌 pin updates this sweep.
+      run.keepDirty.add(key);
+      log(`run "${name}" key "${key}" keep set to ${cmd.keep}`);
+      return { kind: "keepSet", runName: name };
+    }
     default: {
       // Exhaustive guard for an unknown action (tolerant — a malformed drained command).
       errlog(`unknown queue command action "${String((cmd as { action?: unknown }).action)}" — ignored`);
@@ -238,7 +285,9 @@ export function applyCommand(
  *  active-run SET (a start, or a field the active-runs persistence captures: pause/resume/
  *  stop/set_max_items — the last persists the live cap so a restart re-applies it). Abort is
  *  NOT counted as a persistence change here — the run is removed this sweep and the caller
- *  re-persists after the removal regardless. PURE (delegates to applyCommand). */
+ *  re-persists after the removal regardless. (keep) `set_keep` is likewise NOT counted: the
+ *  keep overrides live in the PER-RUN store (not active-runs.json), which the run's own sweep
+ *  (`runOne`) persists + re-stamps to the annotation. PURE (delegates to applyCommand). */
 export function applyCommands(
   registry: RunRegistry,
   cmds: QueueCommand[],

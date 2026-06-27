@@ -95,6 +95,11 @@ export interface Annotation {
   queueName?: string;
   /** (Agent Queue, §8.5) The work-item url for the dashboard's clickable badge. */
   queueUrl?: string;
+  /** (keep) The split's KEEP verdict (effectiveKeep): true ⇒ the queue will NOT auto-close
+   *  this completed split (kept open for manual work); false ⇒ normal auto-close. The
+   *  supervisor stamps this each sweep so the dashboard 📌 pin reflects the live state.
+   *  Partial-merge, like the rest. */
+  keep?: boolean;
 }
 
 /** Minimal shape of a JSON-RPC response we care about. */
@@ -168,6 +173,7 @@ export class McpClient {
     if (ann.queueKey !== undefined) args.queueKey = ann.queueKey;
     if (ann.queueName !== undefined) args.queueName = ann.queueName;
     if (ann.queueUrl !== undefined) args.queueUrl = ann.queueUrl;
+    if (ann.keep !== undefined) args.keep = ann.keep;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.
     await this.call("set_surface_annotation", args);
   }
@@ -530,6 +536,7 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   "resume",
   "set_max_items",
   "set_concurrency",
+  "set_keep",
 ]);
 
 /**
@@ -537,8 +544,8 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
  * PURE + TOLERANT — exported for unit testing. Accepts the `{commands:[...]}` envelope
  * (the wire shape). Anything else — a non-object, a missing/non-array `commands`, a
  * non-object entry, or an entry with an unrecognized `action` — yields `[]` / drops that
- * entry. Only `action`, `template`, `run`, `params`, `maxItems`, and `concurrency` are
- * carried (and only when correctly typed).
+ * entry. Only `action`, `template`, `run`, `params`, `maxItems`, `concurrency`, `key`, and
+ * `keep` are carried (and only when correctly typed).
  */
 export function coerceQueueCommands(obj: unknown): QueueCommand[] {
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return [];
@@ -565,6 +572,9 @@ export function coerceQueueCommands(obj: unknown): QueueCommand[] {
     if (typeof r.maxItems === "string" && r.maxItems.length > 0) cmd.maxItems = r.maxItems;
     // (live concurrency edit) the raw value for set_concurrency — a string only.
     if (typeof r.concurrency === "string" && r.concurrency.length > 0) cmd.concurrency = r.concurrency;
+    // (keep) set_keep carries the work-item key (string) + the keep verdict (boolean).
+    if (typeof r.key === "string" && r.key.length > 0) cmd.key = r.key;
+    if (typeof r.keep === "boolean") cmd.keep = r.keep;
     out.push(cmd);
   }
   return out;

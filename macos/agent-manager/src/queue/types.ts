@@ -206,6 +206,16 @@ export interface QueueTemplate {
   provider: ProviderSpec;
   onAgentExit: OnAgentExit;
   closeOnComplete: boolean;
+  /** (keep) The per-QUEUE default for "keep" — when true, a completed split is KEPT OPEN
+   *  (held in DONE_PENDING, never auto-closed) by default so you can do manual work in it
+   *  after the task is done; a per-split toggle (the dashboard 📌 pin → the `set_keep`
+   *  command → the run's `keep` map) OVERRIDES this either way. Default false (auto-close,
+   *  the prior behavior). Distinct from `closeOnComplete:false`, which is the HARD,
+   *  template-wide never-auto-close with NO per-split override; `keepOnComplete:true` is a
+   *  SOFT default the per-split pin can turn off. A kept split still OCCUPIES its slot
+   *  (same as `closeOnComplete:false`), so the queue won't dispatch into it until it is
+   *  closed. */
+  keepOnComplete: boolean;
   /** agentState==idle, unchanged this long, before the close sequence fires (§10). */
   closeStableSeconds: number;
   // NOTE: there is intentionally NO `quitWhenEmpty`. A run is removed only by an explicit

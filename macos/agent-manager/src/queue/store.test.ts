@@ -12,9 +12,11 @@ import {
   isAssignmentState,
   loadLifetimeDispatched,
   loadDispatched,
+  loadKeep,
   loadStore,
   makePendingRecord,
   parseDispatched,
+  parseKeep,
   parseLifetimeDispatched,
   parseStore,
   persistStore,
@@ -131,6 +133,53 @@ test("persistStore writes + loadDispatched reads back the latch", () => {
   // The latch is independent of the records + counter on the same file.
   assert.equal(loadLifetimeDispatched(io), 5);
   assert.equal(loadStore(io).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// (keep) per-split keep overrides — serialize/parse/persist round-trips.
+// ---------------------------------------------------------------------------
+
+test("serializeStore persists the keep overrides; parseKeep round-trips them", () => {
+  const text = serializeStore([asgn()], 3, ["K-1"], { "K-1": true, "K-2": false });
+  assert.deepEqual(parseKeep(text), { "K-1": true, "K-2": false });
+  // keep is independent of records / counter / latch on the same file.
+  assert.equal(parseStore(text).length, 1);
+  assert.deepEqual(parseDispatched(text), ["K-1"]);
+});
+
+test("serializeStore omits the keep field entirely when there are no overrides (back-compat)", () => {
+  const text = serializeStore([asgn()], 0, []);
+  assert.ok(!Object.prototype.hasOwnProperty.call(JSON.parse(text), "keep"));
+  assert.deepEqual(parseKeep(text), {});
+});
+
+test("parseKeep tolerates absent / garbage / wrong-shape / non-boolean entries => {}", () => {
+  assert.deepEqual(parseKeep(null), {});
+  assert.deepEqual(parseKeep(""), {});
+  assert.deepEqual(parseKeep("not json"), {});
+  assert.deepEqual(parseKeep("[1,2,3]"), {}); // top-level array
+  assert.deepEqual(parseKeep('{"records":[]}'), {}); // no keep field (pre-upgrade)
+  assert.deepEqual(parseKeep('{"keep":["K-1"]}'), {}); // not an object
+  assert.deepEqual(parseKeep('{"keep":{"K-1":true,"K-2":"yes","":true,"K-3":false}}'), {
+    "K-1": true,
+    "K-3": false,
+  }); // booleans + non-empty keys only
+});
+
+test("persistStore writes + loadKeep reads back the keep overrides", () => {
+  const io = memIO();
+  persistStore(io, [asgn()], 1, [], { "K-7": true });
+  assert.deepEqual(loadKeep(io), { "K-7": true });
+});
+
+test("loadKeep returns {} when the seam read throws", () => {
+  const io: StoreIO = {
+    read() {
+      throw new Error("boom");
+    },
+    write() {},
+  };
+  assert.deepEqual(loadKeep(io), {});
 });
 
 test("loadDispatched returns [] when the seam read throws", () => {

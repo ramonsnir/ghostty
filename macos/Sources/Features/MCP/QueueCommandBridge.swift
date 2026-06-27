@@ -30,12 +30,15 @@ struct QueueCommand: Equatable, Sendable {
         case start, stop, abort, pause, resume
         case setMaxItems = "set_max_items"
         case setConcurrency = "set_concurrency"
+        /// (keep) Toggle one split's keep state (the dashboard 📌 pin). Serializes to the
+        /// snake_case `"set_keep"` the sidecar's `coerceQueueCommands` whitelists.
+        case setKeep = "set_keep"
     }
 
     let action: Action
     /// The template basename to start (start only).
     let template: String?
-    /// The active run name to pause/resume/stop/abort/setMaxItems/setConcurrency.
+    /// The active run name to pause/resume/stop/abort/setMaxItems/setConcurrency/setKeep.
     let run: String?
     /// (§8b) START-TIME parameter answers (param name → value) collected by the
     /// queue palette's prompt, passed through to the sidecar factory (start only).
@@ -50,6 +53,11 @@ struct QueueCommand: Equatable, Sendable {
     /// ("9", …). The sidecar parses it (blank/garbage/non-positive = ignored, NO
     /// "unlimited" token). nil for other actions.
     let concurrency: String?
+    /// (keep) The work-item KEY whose split `setKeep` toggles. nil for other actions.
+    let key: String?
+    /// (keep) The new keep verdict for `setKeep` (true = keep open, false = allow
+    /// auto-close). nil for other actions (a non-bool is dropped by the sidecar).
+    let keep: Bool?
 
     init(
         action: Action,
@@ -57,7 +65,9 @@ struct QueueCommand: Equatable, Sendable {
         run: String? = nil,
         params: [String: String]? = nil,
         maxItems: String? = nil,
-        concurrency: String? = nil
+        concurrency: String? = nil,
+        key: String? = nil,
+        keep: Bool? = nil
     ) {
         self.action = action
         self.template = template
@@ -65,6 +75,8 @@ struct QueueCommand: Equatable, Sendable {
         self.params = params
         self.maxItems = maxItems
         self.concurrency = concurrency
+        self.key = key
+        self.keep = keep
     }
 
     /// PURE: the wire dict drained by `take_queue_commands`. `action` is always
@@ -79,6 +91,10 @@ struct QueueCommand: Equatable, Sendable {
         if let params, !params.isEmpty { d["params"] = params }
         if let maxItems, !maxItems.isEmpty { d["maxItems"] = maxItems }
         if let concurrency, !concurrency.isEmpty { d["concurrency"] = concurrency }
+        if let key, !key.isEmpty { d["key"] = key }
+        // (keep) emit the boolean verbatim (the sidecar requires a real boolean — a string
+        // "true" would be dropped); only when present (nil for non-setKeep actions).
+        if let keep { d["keep"] = keep }
         return d
     }
 }

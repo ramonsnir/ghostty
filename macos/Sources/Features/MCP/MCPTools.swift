@@ -183,6 +183,7 @@ enum MCPTools {
                     "queueKey": ["type": "string", "description": "Agent Queue: the work-item key this surface is bound to."],
                     "queueName": ["type": "string", "description": "Agent Queue: the run/origin name (dashboard grouping)."],
                     "queueUrl": ["type": "string", "description": "Agent Queue: the work-item URL (clickable in the tile)."],
+                    "keep": ["type": "boolean", "description": "Agent Queue: the split's keep verdict — true ⇒ the queue will NOT auto-close this completed split (kept open for manual work); drives the dashboard pin."],
                 ],
                 "required": ["id"],
                 "additionalProperties": false,
@@ -476,7 +477,7 @@ enum MCPTools {
             // above). At least one updatable field (summary/phase/needsUser or a
             // queue tag) must be present.
             guard let payload = AgentAnnotationPayload.fromArguments(arguments) else {
-                return .invalidParams("empty annotation: provide at least one of summary/phase/needsUser/queueKey/queueName/queueUrl")
+                return .invalidParams("empty annotation: provide at least one of summary/phase/needsUser/queueKey/queueName/queueUrl/keep")
             }
             let ok = server.applyAnnotation(uuid: uuid, annotation: payload.annotation)
             return ok ? .ok(["ok": true]) : .toolError("unknown surface id")

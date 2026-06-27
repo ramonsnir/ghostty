@@ -18,10 +18,11 @@ import AppKit
 /// provided fields (so the model can MERGE it onto the prior stored annotation
 /// without clobbering — see `AgentDashboardModel.applyAnnotation`).
 ///
-/// AT LEAST ONE updatable field (summary, phase, needsUser, queueKey, queueName, or
-/// queueUrl) must be present, else the call is rejected (a fully-empty body is
+/// AT LEAST ONE updatable field (summary, phase, needsUser, queueKey, queueName,
+/// queueUrl, or keep) must be present, else the call is rejected (a fully-empty body is
 /// invalid). The summarizer (summary-only) and the Agent Queue supervisor
-/// (queueKey/queueName/queueUrl at dispatch) both write through this same parser.
+/// (queueKey/queueName/queueUrl + the keep verdict at dispatch/restamp) both write
+/// through this same parser.
 struct AgentAnnotationPayload {
     let annotation: AgentAnnotation
 
@@ -44,6 +45,9 @@ struct AgentAnnotationPayload {
         let queueKey = trimmedString("queueKey")
         let queueName = trimmedString("queueName")
         let queueUrl = trimmedString("queueUrl")
+        // (keep) the split's keep verdict — present-as-bool ⇒ that bool; absent/non-bool ⇒
+        // nil (so a partial update omitting it preserves the prior value on merge).
+        let queueKeep = arguments["keep"] as? Bool
 
         // At least one updatable field must be present; otherwise the update is a
         // no-op and we reject it (mirrors the old "blank summary" rejection but for
@@ -51,11 +55,13 @@ struct AgentAnnotationPayload {
         guard summary != nil || phase != nil
             || needsUser != nil
             || queueKey != nil || queueName != nil || queueUrl != nil
+            || queueKeep != nil
         else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
             summary: summary, phase: phase, needsUser: needsUser,
-            queueKey: queueKey, queueName: queueName, queueUrl: queueUrl))
+            queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
+            queueKeep: queueKeep))
     }
 }
 
