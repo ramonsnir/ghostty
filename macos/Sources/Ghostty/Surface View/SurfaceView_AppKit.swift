@@ -2036,6 +2036,13 @@ extension Ghostty {
             case title
             case isUserSetTitle
             case sessionID
+            // (ramon fork) Persist the bell / attention indicators so they
+            // survive a GUI restart-for-a-new-build instead of silently
+            // vanishing. They ride the same window-state archive that already
+            // restores the split tree + per-surface uuid/sessionID, so a
+            // restored surface comes back still flagged "rang" / "needs you".
+            case bell
+            case attentionNeeded
         }
 
         required convenience init(from decoder: Decoder) throws {
@@ -2070,6 +2077,18 @@ extension Ghostty {
                     self.titleFromTerminal = title
                 }
             }
+
+            // (ramon fork) Restore the bell / attention indicators. Absent in
+            // pre-fork archives ⇒ `false` (unchanged). We set the @Published
+            // values DIRECTLY (not via the bell/attention notifications), so
+            // restoring re-lights only the STICKY visuals derived from these
+            // states (🔔 title, amber border, dock badge, dashboard mark) — it
+            // deliberately does NOT re-fire the one-shot loud effects (dock
+            // bounce, system beep, Web Push), which come from the
+            // ghosttyBellDidRing / ghosttyAttentionDidChange handlers we never
+            // re-post. Focusing the surface clears both, exactly as at runtime.
+            self.bell = try container.decodeIfPresent(Bool.self, forKey: .bell) ?? false
+            self.attentionNeeded = try container.decodeIfPresent(Bool.self, forKey: .attentionNeeded) ?? false
         }
 
         func encode(to encoder: Encoder) throws {
@@ -2091,6 +2110,12 @@ extension Ghostty {
                 return id != 0 ? String(id) : nil
             }
             try container.encodeIfPresent(liveSessionID ?? sessionID, forKey: .sessionID)
+
+            // (ramon fork) Persist the bell / attention indicators so they
+            // survive a GUI restart (see CodingKeys + init(from:)). Only
+            // emitted when set, so a healthy surface's archive is unchanged.
+            if bell { try container.encode(bell, forKey: .bell) }
+            if attentionNeeded { try container.encode(attentionNeeded, forKey: .attentionNeeded) }
         }
     }
 }
