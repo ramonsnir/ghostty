@@ -370,15 +370,17 @@ final class WebPushManager {
 
     /// (ramon fork / Agent hooks) Called on main from the attention observer when
     /// an agent enters `.waiting`. Reuses the SAME fan-out as `onBell` (enable
-    /// flag, per-surface debounce, payload shape, send). The only differences: an
-    /// "⏳ " title prefix and a body that prefers the "needs input" `message` over
-    /// the pwd.
+    /// flag, per-surface debounce, payload shape, send). The only difference is a
+    /// body that prefers the "needs input" `message` over the pwd; the title shares
+    /// the SAME "🔔 " prefix as a raw bell, so bells and promoted attentions look
+    /// unified on the phone (the hourglass read as unclear). The `kind: .attention`
+    /// still keeps the debounce independent from a raw bell.
     private func onAttention(id: UUID, title: String, pwd: String?, message: String) {
         let body = message.isEmpty ? (pwd ?? "") : message
         enqueuePush(
             id: id,
             kind: .attention,
-            title: "⏳ " + (title.isEmpty ? "Ghostty" : title),
+            title: "🔔 " + (title.isEmpty ? "Ghostty" : title),
             body: body)
     }
 

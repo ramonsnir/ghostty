@@ -1967,9 +1967,11 @@ final class WebMonitorServer {
         <button id="clearbell" style="display:none"
                 title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
         <!-- (Bell Attention v2) Shown only while this split has a PROMOTED attention
-             state; clears it independently of the raw bell (P5). -->
+             state; clears it independently of the raw bell (P5). Uses the same 🔔
+             glyph as Clear-bell (the hourglass read as unclear) — the two stay
+             distinguished by their tooltips, not by icon. -->
         <button id="clearattn" style="display:none"
-                title="Acknowledge/clear the &quot;needs you&quot; state for this split (it can re-promote later)">&#9203; Clear</button>
+                title="Acknowledge/clear the &quot;needs you&quot; state for this split (it can re-promote later)">&#128276; Clear</button>
       </div>
       <!-- Arrows + remote-control scroll on ONE row to save vertical space.
            Scroll is forwarded to the host as mouse-wheel input, so a TUI (Claude
@@ -2227,13 +2229,14 @@ final class WebMonitorServer {
               var t = document.createElement("div"); t.className = "t";
               t.textContent = row.title || "(untitled)";
               // (Bell Attention v2) The alert flag follows the monitor-tier-routed
-              // `attnIndicator`. A PROMOTED attention shows an hourglass (distinct from a
-              // raw bell, P5); a raw bell shows the bell. Default config ⇒ either shows.
+              // `attnIndicator`. Both a PROMOTED attention and a raw bell render the
+              // SAME 🔔 glyph — the hourglass for "needs you" read as unclear, so the two
+              // tiers are visually unified to one bell. The underlying `attentionNeeded`
+              // vs `bell` distinction still drives the Clear-attention / Clear-bell
+              // controls; only the at-a-glance list marker is unified.
               if (row.attnIndicator) {
                 var bf = document.createElement("span"); bf.className = "bellflag";
-                bf.textContent = row.attentionNeeded
-                  ? "\\u23F3"            // ⏳ — promoted "needs you"
-                  : "\\uD83D\\uDD14";    // 🔔 — an unacknowledged bell rang here
+                bf.textContent = "\\uD83D\\uDD14";    // 🔔 — a bell OR a promoted "needs you"
                 t.appendChild(bf);
               }
               if ((row.splitCount || 1) > 1) {
