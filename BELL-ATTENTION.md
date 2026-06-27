@@ -221,10 +221,12 @@ you name. It does **not** zero the set first. So:
 
 ## On your phone (Web Monitor)
 
-The [Web Monitor](WEB-MONITOR.md) shows the two states **distinctly**: a raw bell as 🔔 and
-a promoted "needs you" as ⏳, each routed by whether `monitor` is on its tier. Each has its
-**own** clear button, so from your phone you can acknowledge a promotion without clearing
-(or being confused by) a separate raw bell — and vice-versa.
+The [Web Monitor](WEB-MONITOR.md) shows both states with the **same 🔔 glyph** (a raw bell
+and a promoted "needs you" are visually unified — the old hourglass for "needs you" read as
+unclear), each routed by whether `monitor` is on its tier. The two states are still tracked
+separately: each has its **own** clear button (distinguished by tooltip, not icon), so from
+your phone you can acknowledge a promotion without clearing (or being confused by) a separate
+raw bell — and vice-versa. The phone push title also shares the 🔔 prefix for both.
 
 ## Requirements
 
@@ -437,9 +439,11 @@ misroute every effect; it now fails a test.
 ### Web monitor (P5)
 
 `/api/surfaces` rows carry `bell`, `attentionNeeded`, and a monitor-tier-routed
-`attnIndicator = (bell && monitorBell) || (attentionNeeded && monitorAttn)`; the page shows 🔔
-(raw) vs ⏳ (promoted) distinctly, each with its own clear button (`POST
-/api/surface/{uuid}/{bell,attention}`).
+`attnIndicator = (bell && monitorBell) || (attentionNeeded && monitorAttn)`; the page renders
+the SAME 🔔 glyph for both a raw bell and a promoted "needs you" (visually unified — the old
+hourglass read as unclear), but the two remain functionally separate via their own clear
+buttons (`POST /api/surface/{uuid}/{bell,attention}`, distinguished by tooltip). The phone
+push (`WebMonitorPush`) likewise gives both kinds the 🔔 title prefix.
 
 ### DEFERRED (the one open design decision, NOT built): §78 crashed-sidecar GUI fallback
 
