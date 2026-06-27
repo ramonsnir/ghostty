@@ -161,6 +161,25 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`zoomedHiddenBell` protocol requirement + `HiddenSplitBellBadge`). Tests:
   `macos/Tests/Splits/SplitTreeTests.swift` (`hasBellOutsideZoom*`, `zoomedLeaves*`).
 
+- **Bell/attention persist across GUI restart** (fork-only tweak to upstream macOS Swift; no
+  config key — always on) — `bell` (🔔) + `attentionNeeded` ("needs you") were @Published
+  runtime-only state on `SurfaceView`, ABSENT from its `Codable` `CodingKeys`, so every GUI
+  restart-for-a-new-build reset them to `false` and the indicators silently vanished. Fix:
+  persist BOTH in the SAME window-state archive that already restores the split tree +
+  per-surface `uuid`/`sessionID` (the phase-2b pty-host reattach path), so a restored surface
+  comes back still flagged — no new persistence layer. **Restore sets the @Published values
+  DIRECTLY in `init(from:)` (legal on `private(set)` from inside the class), NOT via the
+  `ghosttyBellDidRing`/`ghosttyAttentionDidChange` notifications** — so a relaunch re-lights
+  only the STICKY visuals derived from these states (🔔 title, amber border, dock badge,
+  dashboard mark) and deliberately does NOT re-fire the one-shot loud effects (dock bounce,
+  system beep, Web Push). Back-compat both ways: `decodeIfPresent ?? false` (pre-fork/`.exec`
+  archives read false) + gated `if bell`/`if attentionNeeded` encode (healthy surface's
+  archive byte-identical). Focusing a restored surface clears both via `focusDidChange`,
+  exactly as at runtime; rides the existing `window-save-state` restoration (off ⇒ nothing
+  persists). GUI-only, no host change. Wiring: `macos/Sources/Ghostty/Surface
+  View/SurfaceView_AppKit.swift` (`SurfaceView` `CodingKeys` + `init(from:)`/`encode(to:)`).
+  See `BELL-ATTENTION.md` (→ Surviving a GUI restart / Implementation notes).
+
 - **Web monitor** (fork-only, OFF by default; config `web-monitor-listen` / `web-monitor-token`)
   — a GUI-embedded HTTP server (one `NWListener` on a dedicated serial queue) that, from a phone
   over Tailscale, lists live surfaces, renders one in full color via `xterm.js` fed the host's
