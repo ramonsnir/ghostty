@@ -234,13 +234,13 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 - **Control:** per-queue **Pause / Resume / Stop (drain) / Abort** from the section header.
   Stop = finish in-flight, dispatch no more; Abort = close everything and clear the run.
 - **Keep a split (manual work after Done):** each queue tile has a **📌 pin** toggle (next to
-  Hide ✕ / the ⏹ close). Pin a split to **exempt it from the queue's auto-close** — when its
+  the **Hide** eye-slash / the red **Close** `xmark.octagon`). Pin a split to **exempt it from the queue's auto-close** — when its
   item completes the supervisor leaves it OPEN (held in DONE_PENDING) instead of force-closing
   it, so you can keep working in that pane. Click again to un-pin (allow auto-close). The pin
   shows **persistently** when a split is kept (filled, accent) so a pinned split is obvious
   without hovering; it survives a sidecar/GUI restart. **A kept split still holds its
   concurrency slot** (exactly like `closeOnComplete:false`), so the queue won't dispatch into
-  it until you close it — when you're truly done, force-close it with the ⏹ button (or it stays
+  it until you close it — when you're truly done, force-close it with the red **Close** button (or it stays
   as an ordinary pane after a Stop/Abort drains the run). To keep *every* split of a queue by
   default, set `keepOnComplete: true` in the template (the per-split pin still overrides).
 - **Health bar:** each running queue's section header shows a live status line — a phase chip
@@ -674,9 +674,9 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
 ### Per-tile CLOSE button (wedged-slot escape hatch)
 
 - **Per-tile CLOSE button (GUI-only, queue tiles only) — the wedged-slot escape hatch.** On
-  hover each tile shows the existing **Hide ✕** (view-only declutter; the split keeps
-  running) and, ONLY on a **queue-owned** tile (one carrying a `queueName` annotation), a red
-  **⏹ `stop.circle`** that **force-closes** the split: it ends the agent + frees the queue
+  hover each tile shows the existing **Hide** (`eye.slash`, secondary; view-only declutter — the
+  split keeps running) and, ONLY on a **queue-owned** tile (one carrying a `queueName` annotation), a red
+  **`xmark.octagon`** Close that **force-closes** the split: it ends the agent + frees the queue
   slot (the surface vanishing makes the next sweep reconcile + prune the record). It routes
   through the confirm-FREE `MCPLayout.forceClose` (same path the queue's own auto-close uses),
   so it works on a live agent without the `confirm-close-surface` modal — gated behind a
@@ -846,7 +846,7 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   template default (`keepOnComplete`) that EXEMPTS a completed split from the close gate so the
   user can keep working in it. A kept split is HELD in DONE_PENDING (slot kept — same semantics
   as `closeOnComplete:false`, the user's explicit choice), never force-closed; force-close it
-  with the per-tile ⏹ when done.
+  with the per-tile **Close** (`xmark.octagon`) when done.
 - **State model (mirrors the `dispatched` latch):** per-split keep is a RUN-LEVEL
   `QueueRun.keep: Map<key, boolean>` (NOT per-record — so reconcile, which rebuilds the active
   map from store records every sweep, never wipes it), persisted in the per-run store
@@ -867,7 +867,7 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
 - **GUI state via the annotation:** the supervisor stamps `keep: effectiveKeep` onto the surface
   annotation (`restampAnnotation` every sweep + `dispatchOne`); the GUI reads
   `entry.annotation?.queueKeep` to draw the pin (filled/accent when kept, shown persistently;
-  outline on hover otherwise). The pin is QUEUE-tile-only (gated on `queueName`, like the ⏹ close).
+  outline on hover otherwise). The pin is QUEUE-tile-only (gated on `queueName`, like the `xmark.octagon` Close).
 - Wiring: sidecar — `types.ts` (`QueueTemplate.keepOnComplete`), `templates.ts`
   (`TEMPLATE_DEFAULTS.keepOnComplete` + validate), `store.ts` (`StoreFile.keep` +
   serialize/`parseKeep`/`loadKeep` + `persistStore` 5th arg), `supervisor.ts`
