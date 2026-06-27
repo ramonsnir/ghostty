@@ -165,6 +165,32 @@ struct MCPAnnotationTests {
         #expect(merged.queueUrl == "https://x.test/9")  // preserved
     }
 
+    // MARK: - (keep) the keep verdict
+
+    @Test func parseKeepTrueAndFalse() {
+        // The supervisor stamps the keep verdict (a real boolean) — present-as-bool ⇒ that
+        // bool; it is a valid update on its own.
+        let on = AgentAnnotationPayload.fromArguments(["id": UUID().uuidString, "keep": true])
+        #expect(on?.annotation.queueKeep == true)
+        let off = AgentAnnotationPayload.fromArguments(["id": UUID().uuidString, "keep": false])
+        #expect(off?.annotation.queueKeep == false)
+    }
+
+    @Test func keepOnlyAcceptedAndNonBoolBecomesNil() {
+        // keep alone is a valid partial update; a non-bool keep ⇒ nil (and, with no other
+        // field, the whole body is rejected as empty).
+        #expect(AgentAnnotationPayload.fromArguments(["keep": true])?.annotation.queueKeep == true)
+        #expect(AgentAnnotationPayload.fromArguments(["summary": "ok", "keep": "yes"])?.annotation.queueKeep == nil)
+        #expect(AgentAnnotationPayload.fromArguments(["keep": "yes"]) == nil) // non-bool + nothing else ⇒ empty
+    }
+
+    @Test func mergeKeepNilPreservesPriorElseOverwrites() {
+        // A summary-only update (keep nil) preserves a prior keep; an explicit keep overwrites.
+        let kept = AgentAnnotation(queueKey: "K-1", queueKeep: true)
+        #expect(kept.merging(AgentAnnotation(summary: "x")).queueKeep == true) // preserved
+        #expect(kept.merging(AgentAnnotation(queueKeep: false)).queueKeep == false) // overwritten
+    }
+
     // MARK: - dispatch (AppKit-free validation paths)
 
     @Test func dispatchMissingIdInvalidParams() {

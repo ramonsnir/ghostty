@@ -1307,6 +1307,29 @@ final class AgentDashboardModel: ObservableObject {
                     QueueCommand(action: .setConcurrency, run: run, concurrency: trimmed),
             ])
     }
+
+    /// (keep) Toggle one queue split's KEEP state (the dashboard 📌 pin) — exempt it from the
+    /// supervisor's auto-close so the user can do manual work after the task is done (or
+    /// un-keep it). `id` is the surface, `run` its queue (origin) name, `key` its work-item
+    /// key. OPTIMISTICALLY flips the stored annotation's `queueKeep` so the pin updates
+    /// instantly; the sidecar's `set_keep` is the authoritative path (it sets the per-split
+    /// override, persists it, and re-stamps the annotation, reconciling this). No-op for the
+    /// `(other)` catch-all or a missing key. Same FIFO path as the other run controls.
+    func setQueueKeep(id: UUID, run: String, key: String, keep: Bool) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !key.isEmpty else { return }
+        // OPTIMISTIC: merge the new keep verdict onto the stored annotation so the tile flips
+        // immediately (the sidecar's next restamp confirms / corrects it).
+        let prior = annotations[id] ?? AgentAnnotation()
+        annotations[id] = prior.merging(AgentAnnotation(queueKeep: keep))
+        rebuildEntriesFromCurrentState()
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .setKeep, run: run, key: key, keep: keep),
+            ])
+    }
 }
 
 /// (ramon fork / Agent Dashboard, Layer 3) Owns the panel, the SwiftUI host

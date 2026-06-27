@@ -192,6 +192,14 @@ test("setAnnotation: omits the queue fields when undefined", async () => {
   assert.equal("queueKey" in args, false);
   assert.equal("queueName" in args, false);
   assert.equal("queueUrl" in args, false);
+  assert.equal("keep" in args, false);
+});
+
+test("setAnnotation: forwards the keep flag (true and false are both present)", async () => {
+  const on = await captureSetAnnotationArgs("s1", { queueKey: "K-1", keep: true });
+  assert.equal(on.keep, true);
+  const off = await captureSetAnnotationArgs("s1", { queueKey: "K-1", keep: false });
+  assert.equal(off.keep, false);
 });
 
 test("spawnSplitCommand: encodes the tool + forwards only present fields", async () => {
@@ -515,6 +523,23 @@ test("coerceQueueCommands: carries set_concurrency + its string concurrency valu
     { action: "set_concurrency", run: "r", concurrency: "9" },
     { action: "set_concurrency", run: "r2" },
     { action: "set_concurrency", run: "r3" },
+  ]);
+});
+
+test("coerceQueueCommands: carries set_keep + its key (string) and keep (boolean); bad shapes dropped", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "set_keep", run: "r", key: "K-1", keep: true },
+      { action: "set_keep", run: "r", key: "K-2", keep: false },
+      { action: "set_keep", run: "r", key: 5, keep: true }, // non-string key dropped, action kept
+      { action: "set_keep", run: "r", key: "K-3", keep: "yes" }, // non-boolean keep dropped
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "set_keep", run: "r", key: "K-1", keep: true },
+    { action: "set_keep", run: "r", key: "K-2", keep: false },
+    { action: "set_keep", run: "r", keep: true }, // bad key dropped; valid keep kept
+    { action: "set_keep", run: "r", key: "K-3" }, // bad keep dropped; valid key kept
   ]);
 });
 

@@ -58,6 +58,7 @@ import {
   finalizeRecord,
   loadLifetimeDispatched,
   loadDispatched,
+  loadKeep,
   loadStore,
   makePendingRecord,
   persistStore,
@@ -240,6 +241,22 @@ export interface QueueRun {
    *  (clamped to `capPerTab * MAX_QUEUE_TABS`). Persisted in the active-runs record so a restart
    *  re-applies it. Lowering it only stops FUTURE dispatch (running agents are never killed). */
   concurrencyLive?: number;
+  /** (keep) PER-SPLIT keep overrides: work-item key → explicit keep verdict (true = keep
+   *  open / never auto-close, false = allow auto-close even when the template defaults to
+   *  keep). Set by the dashboard 📌 pin via the `set_keep` command; consulted by
+   *  `effectiveKeep` (which falls back to `template.keepOnComplete`). RUN-LEVEL state (NOT
+   *  per-record) so reconcile — which rebuilds `active` from the store records every sweep —
+   *  never wipes it; mirrors the `dispatched` latch. Persisted in the per-run store
+   *  (`StoreFile.keep`) + rehydrated on the first reconcile so a kept split stays kept across
+   *  a sidecar/GUI restart. Cleared on abort. */
+  keep: Map<string, boolean>;
+  /** (keep) Keys whose keep was just toggled by a `set_keep` command and need their surface
+   *  annotation RE-STAMPED this sweep so the dashboard 📌 pin reflects it immediately. Drained
+   *  + cleared by `runOne` after reconcile. NON-persisted (a transient per-sweep intent). This
+   *  is belt-and-suspenders over the per-sweep `restampAnnotation` (which fires for every active
+   *  assignment only because `list_surfaces` does not echo the queueKey, making
+   *  `needsAnnotationRestamp` always true) — so the pin stays correct even if that ever changes. */
+  keepDirty: Set<string>;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -272,6 +289,8 @@ export function makeQueueRun(
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
+    keep: new Map<string, boolean>(),
+    keepDirty: new Set<string>(),
     idleAnchor: new Map<string, number | undefined>(),
     closeAwait: new Map<string, { exitKeysSent: boolean; sinceMs: number }>(),
     lifetimeDispatched: 0,
@@ -299,6 +318,27 @@ export function effectiveMaxItemsCap(run: QueueRun): number | null {
   const override = resolveMaxItemsOverride(run.template, run.params);
   const cap = override === undefined ? run.template.maxItems : override;
   return cap <= 0 ? null : cap;
+}
+
+/** (keep) Whether an item's split is KEPT — exempt from the supervisor's auto-close. PURE.
+ *  The PER-SPLIT override (the dashboard 📌 pin → `run.keep`) wins; absent it, the template's
+ *  `keepOnComplete` default applies; absent that, false (auto-close). This is the value fed to
+ *  `nextState` (so a kept split holds in DONE_PENDING) AND stamped onto the surface annotation
+ *  (`keep`) so the dashboard pin reflects the live verdict. NOTE: `closeOnComplete:false` is a
+ *  SEPARATE, harder hold checked directly in `nextState` (not folded here), so the pin's
+ *  displayed state stays meaningful for the common (closeOnComplete:true) case. */
+export function effectiveKeep(run: QueueRun, key: string): boolean {
+  const override = run.keep.get(key);
+  if (override !== undefined) return override;
+  return run.template.keepOnComplete;
+}
+
+/** (keep) Snapshot the run's keep overrides as a plain `{key: boolean}` for `persistStore`
+ *  (the durable store holds an object, not a Map). PURE. */
+export function keepRecord(run: QueueRun): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const [k, v] of run.keep) out[k] = v;
+  return out;
 }
 
 /** The run's EFFECTIVE max simultaneous agents (the TOTAL pane budget across all its tabs):
@@ -538,8 +578,12 @@ async function abortRun(run: QueueRun, surfaces: Surface[], deps: QueueDeps): Pr
   // of this template begins fresh (an aborted item still in the list is re-dispatchable
   // again), matching the records being cleared here.
   run.dispatched.clear();
+  // (keep) Drop the per-split keep overrides too — an aborted run is gone; a fresh start
+  // begins with no keeps.
+  run.keep.clear();
+  run.keepDirty.clear();
   // Clear the durable assignment store so a restart won't re-adopt the closed panes.
-  persistStore(run.storeIO, [], run.lifetimeDispatched, []);
+  persistStore(run.storeIO, [], run.lifetimeDispatched, [], {});
 }
 
 /** Whether an assignment OCCUPIES a concurrency + grid slot. PURE. An EXITED
@@ -622,6 +666,11 @@ async function runOne(
     // actionable `list`, so without restoring the latch the first post-restart dispatch
     // sweep would re-grab it. Union into whatever the fresh run already holds (empty here).
     for (const k of loadDispatched(run.storeIO)) run.dispatched.add(k);
+    // (keep) Rehydrate the per-split keep overrides so a kept split stays kept across a
+    // sidecar/GUI restart (a fresh run already started keep.set above won't be clobbered).
+    for (const [k, v] of Object.entries(loadKeep(run.storeIO))) {
+      if (!run.keep.has(k)) run.keep.set(k, v);
+    }
   }
 
   // Rebuild the in-memory active set from the kept records BEFORE any dispatch.
@@ -658,8 +707,19 @@ async function runOne(
       );
     }
   }
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
   run.reconciledOnce = true;
+
+  // (keep) Re-stamp the annotation for any split whose keep was just toggled (a `set_keep`
+  // command this sweep) so the dashboard 📌 pin reflects it immediately, independent of the
+  // needsAnnotationRestamp path above. Drain + clear the dirty set.
+  if (run.keepDirty.size > 0) {
+    for (const key of [...run.keepDirty]) {
+      const a = run.active.get(key);
+      if (a !== undefined) await restampAnnotation(deps, run, a);
+    }
+    run.keepDirty.clear();
+  }
 
   // --- 2) ADVANCE active assignment states ----------------------------------------
   const liveByUUID = new Map<string, Surface>();
@@ -868,9 +928,12 @@ export function projectLiveSurfaces(
   return out;
 }
 
-/** Re-stamp the queueKey/queueName/queueUrl annotation on a surface from the durable
+/** Re-stamp the queueKey/queueName/queueUrl/keep annotation on a surface from the durable
  *  assignment (used on reconcile when the GUI dropped the in-memory map, and on orphan
- *  adoption). Best-effort: a write failure is logged, never thrown into the loop. */
+ *  adoption). Best-effort: a write failure is logged, never thrown into the loop.
+ *  (keep) `keep` is stamped EVERY sweep this runs (which, since list_surfaces does not echo
+ *  the queueKey, is every sweep for every active assignment) so the dashboard 📌 pin reflects
+ *  the live `effectiveKeep` — including after a per-split toggle or a GUI restart. */
 async function restampAnnotation(
   deps: QueueDeps,
   run: QueueRun,
@@ -882,6 +945,7 @@ async function restampAnnotation(
       queueKey: a.key,
       queueName: run.runName,
       ...(a.url !== undefined ? { queueUrl: a.url } : {}),
+      keep: effectiveKeep(run, a.key),
     });
   } catch (err) {
     errlog(`restamp ${a.key}: ${msg(err)}`);
@@ -958,6 +1022,9 @@ async function advanceStates(
       // DONE_PENDING (never advances to CLOSING), so runCloseSequences never tears its
       // completed split down — it is left open for manual close.
       closeOnComplete: run.template.closeOnComplete,
+      // (keep) the per-split keep verdict (dashboard 📌 pin / keepOnComplete default) — a
+      // kept split holds in DONE_PENDING and is never auto-torn-down.
+      keep: effectiveKeep(run, a.key),
     };
     const next = nextState(a, ctx);
     if (next !== a.state) {
@@ -985,7 +1052,7 @@ async function advanceStates(
   // Consume the status-probe window only when a probe actually fired this sweep (see the
   // `statusDue`/`probed` note above).
   if (probed) run.lastStatusAtMs = nowMs;
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,7 +1143,7 @@ async function runCloseSequences(
     }
     // else: still within the await window and not yet exited → keep polling next sweep.
   }
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
 }
 
 /** Move a closed assignment to FINISHED and start its key's COOLDOWN, freeing the
@@ -1166,7 +1233,7 @@ async function dispatchCandidates(
         }
       }
       if (rearmed) {
-        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
       }
     }
   } catch (err) {
@@ -1271,7 +1338,7 @@ async function dispatchOne(
   // re-grabbed. Stamped at the intent (alongside the lifetime counter) + persisted, so it
   // holds across a crash/restart; rolled back below only if the spawn itself fails.
   run.dispatched.add(item.key);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
 
   // (d) Spawn the split, DELIVERING item context to the agent (§13, the #1 requirement).
   // Item fields ride as GHOSTTY_ITEM_* env, NEVER spliced as bare shell text. They are
@@ -1330,7 +1397,7 @@ async function dispatchOne(
     // Roll back the §7.1 latch too: nothing actually launched, so the key must stay
     // eligible to retry on the next list (mirrors the lifetime-counter rollback).
     run.dispatched.delete(item.key);
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
     errlog(`run "${run.runName}": spawn ${item.key} failed: ${msg(err)}`);
     return false;
   }
@@ -1360,7 +1427,7 @@ async function dispatchOne(
   // a pending session id reconcile will backfill (see above).
   const finalized = finalizeRecord(pending, spawned.sessionId, spawned.id, deps.now());
   run.active.set(item.key, finalized);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
 
   // (f) Stamp the {queueKey} annotation so the dashboard groups it + reconcile can
   // adopt it after a crash (§8.5/§9). Best-effort.
@@ -1369,6 +1436,9 @@ async function dispatchOne(
       queueKey: item.key,
       queueName: run.runName,
       ...(item.url !== undefined ? { queueUrl: item.url } : {}),
+      // (keep) stamp the initial keep verdict (template keepOnComplete default, or any
+      // pre-existing override for this key — e.g. a re-dispatch after a round-trip).
+      keep: effectiveKeep(run, item.key),
     });
   } catch (err) {
     errlog(`run "${run.runName}": annotate ${item.key}: ${msg(err)}`);
@@ -1472,7 +1542,7 @@ export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
     moved += 1;
   }
   if (moved > 0) {
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched]);
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
     log(`run "${run.runName}": packed ${moved} pane(s) into tab ${plan.targetTab} (continuous packing)`);
   }
   return moved;

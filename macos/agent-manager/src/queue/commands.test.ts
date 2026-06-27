@@ -36,6 +36,7 @@ function tmpl(name: string): QueueTemplate {
     },
     onAgentExit: "leave-and-bell",
     closeOnComplete: true,
+    keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
   };
@@ -325,6 +326,47 @@ test("applyCommands: a set_concurrency is a persistence-affecting change (garbag
     applyCommands(reg, [{ action: "set_concurrency", run: "r", concurrency: "junk" }], factory),
     false,
   );
+});
+
+test("applyCommand set_keep: sets the per-split keep override on a live run", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const on = applyCommand(reg, { action: "set_keep", run: "r", key: "K-1", keep: true }, factory);
+  assert.equal(on.kind, "keepSet");
+  assert.equal(on.runName, "r");
+  assert.equal(reg.get("r")!.keep.get("K-1"), true);
+  // A second toggle flips it back (explicit false override).
+  const off = applyCommand(reg, { action: "set_keep", run: "r", key: "K-1", keep: false }, factory);
+  assert.equal(off.kind, "keepSet");
+  assert.equal(reg.get("r")!.keep.get("K-1"), false);
+});
+
+test("applyCommand set_keep: missing run / key / non-boolean keep / unknown run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  assert.equal(applyCommand(reg, { action: "set_keep", key: "K-1", keep: true }, factory).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "set_keep", run: "r", keep: true }, factory).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "set_keep", run: "r", key: "K-1" }, factory).kind, "noop");
+  assert.equal(
+    applyCommand(reg, { action: "set_keep", run: "ghost", key: "K-1", keep: true }, factory).kind,
+    "noop",
+  );
+  assert.equal(reg.get("r")!.keep.size, 0, "the real run is untouched");
+});
+
+test("applyCommands: a set_keep is NOT counted as an active-runs change (keep lives in the per-run store)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommands(reg, [{ action: "start", template: "f" }], factory);
+  // A set_keep mutates run.keep but must NOT mark the active-run SET dirty (that file does
+  // not hold keep) — its durability rides the per-run store persisted by the run's own sweep.
+  assert.equal(
+    applyCommands(reg, [{ action: "set_keep", run: "r", key: "K-1", keep: true }], factory),
+    false,
+  );
+  assert.equal(reg.get("r")!.keep.get("K-1"), true, "the override was still applied");
 });
 
 test("applyCommand: pause/resume/stop/abort for an unknown run is a no-op", () => {

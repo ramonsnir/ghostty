@@ -973,6 +973,25 @@ struct MCPServerTests {
         #expect(empty["concurrency"] == nil)
     }
 
+    @Test func queueCommandJSONObjectSetKeepCarriesRunKeyAndBool() {
+        // setKeep serializes to the snake_case action the sidecar whitelists, carrying the
+        // run name, the work-item key, and the keep verdict as a REAL boolean (a string
+        // "true" would be dropped by the sidecar's coerce).
+        let on = QueueCommand(action: .setKeep, run: "ExampleOS", key: "EX-1", keep: true).jsonObject
+        #expect(on["action"] as? String == "set_keep")
+        #expect(on["run"] as? String == "ExampleOS")
+        #expect(on["key"] as? String == "EX-1")
+        #expect(on["keep"] as? Bool == true)
+        #expect(on["template"] == nil)
+        // false is still PRESENT (it's a real toggle value, not "absent").
+        let off = QueueCommand(action: .setKeep, run: "Q", key: "K-2", keep: false).jsonObject
+        #expect(off["keep"] as? Bool == false)
+        // An empty key is omitted; a nil keep is omitted.
+        let bare = QueueCommand(action: .setKeep, run: "Q", key: "").jsonObject
+        #expect(bare["key"] == nil)
+        #expect(bare["keep"] == nil)
+    }
+
     // MARK: - Agent Queue: report_queue_status payload parsing (§11 health)
 
     @Test func queueStatusPayloadParsesFullArgs() {

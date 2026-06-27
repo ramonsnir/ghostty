@@ -13,6 +13,18 @@ covers what's specific to the fork.
 > first — it has the architecture decisions, invariants/gotchas, and open items.
 > (`.claude/` is gitignored / local-only; feature docs live at the repo root.)
 
+## 📝 Documentation discipline (BLOCKING)
+
+**Every code change MUST update the relevant Markdown docs in the same change — this is
+not optional.** When you touch a feature, update its feature doc at the repo root (e.g.
+`AGENT-QUEUE.md`, `AGENT-DASHBOARD.md`, `AGENT-MANAGER.md`, `BELL-ATTENTION.md`,
+`WEB-MONITOR.md`, `MCP-SERVER.md`, `PTYHOST.md`) AND the matching summary bullet + wiring
+list in this `CLAUDE.md`, so the docs never drift from the code. A new config key / keybind
+action / template knob / MCP tool / protocol field is incomplete until it is documented
+(user-facing behavior in the feature doc, the load-bearing facts + file wiring in the
+"Implementation notes" section, and the one-line summary here). Treat a docs update as part
+of the definition of done for the work — land it in the same commit, not "later."
+
 ## Functional changes — new keybind actions (also in the command palette)
 All act on the focused surface. flip/toggle walk **up** to the nearest enclosing
 split of the given orientation (like `resize_split`), so outer splits are
@@ -250,9 +262,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   the template `grid.cols`/`grid.rows` are threaded as HARD caps (sidecar → MCP → `largestLeafSplit`)
   so a tab never exceeds `cols` columns / `rows` rows (e.g. on an ultrawide a 3×2 grid now stacks a
   2nd row instead of a 4th column); caps ≤0/absent = byte-identical pure-aspect back-compat. The dashboard shows per-queue
-  health + a backlog dependency DAG; cap and concurrency are editable live. **See `AGENT-QUEUE.md`
+  health + a backlog dependency DAG; cap and concurrency are editable live. A per-split **📌 KEEP
+  pin** (dashboard tile; template default `keepOnComplete`) **exempts a completed split from
+  auto-close** so you can do manual work in it — held in DONE_PENDING (slot kept, like
+  `closeOnComplete:false`), never force-closed, persisted across restart; toggled via a
+  `set_keep{run,key,keep}` command, state carried on the surface annotation (`queueKeep`). Keep is
+  RUN-LEVEL state (`QueueRun.keep` map, mirrors the `dispatched` latch — survives reconcile),
+  `effectiveKeep = run.keep[key] ?? template.keepOnComplete`. **See `AGENT-QUEUE.md`
   (→ Implementation notes) for the full engine, MCP tools, grid/packing, health/backlog, live edits,
-  restart hardening, wiring + tests.**
+  keep, restart hardening, wiring + tests.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

@@ -40,6 +40,9 @@ export const TEMPLATE_DEFAULTS = {
   intervals: { listMs: 60000, statusMs: 30000 },
   onAgentExit: "leave-and-bell" as OnAgentExit,
   closeOnComplete: true,
+  // (keep) default false: a completed split auto-closes unless the per-split pin (or this
+  // template knob) opts it into being kept open for manual work.
+  keepOnComplete: false,
   closeStableSeconds: 5,
 };
 
@@ -93,6 +96,11 @@ export function validateTemplate(obj: unknown): ValidateResult {
     rec.closeOnComplete,
     TEMPLATE_DEFAULTS.closeOnComplete,
   );
+  // (keep) the per-queue default for keeping a completed split open (per-split pin overrides).
+  const keepOnComplete = boolOrDefault(
+    rec.keepOnComplete,
+    TEMPLATE_DEFAULTS.keepOnComplete,
+  );
   // NOTE: `quitWhenEmpty` was removed (see types.ts) — a `quitWhenEmpty` key in template
   // JSON is now silently ignored, never parsed.
   const params = validateParams(rec.params, errors);
@@ -121,6 +129,7 @@ export function validateTemplate(obj: unknown): ValidateResult {
     provider,
     onAgentExit,
     closeOnComplete,
+    keepOnComplete,
     closeStableSeconds,
     params,
   };

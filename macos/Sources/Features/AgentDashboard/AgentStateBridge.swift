@@ -46,6 +46,12 @@ struct AgentAnnotation: Equatable, Sendable {
     /// (ramon fork / Agent Queue, §8.5) The work-item URL for the dashboard's
     /// clickable origin badge.
     let queueUrl: String?
+    /// (ramon fork / Agent Queue, keep) The split's KEEP verdict (effectiveKeep) the
+    /// supervisor stamps each sweep: true ⇒ the queue will NOT auto-close this completed
+    /// split (kept open for manual work); false ⇒ normal auto-close. Drives the dashboard
+    /// 📌 pin's on/off state. OPTIONAL so a partial update that omits it preserves the prior
+    /// value on merge; nil reads as "not kept" at the tile.
+    let queueKeep: Bool?
 
     init(
         summary: String? = nil,
@@ -53,7 +59,8 @@ struct AgentAnnotation: Equatable, Sendable {
         needsUser: Bool? = nil,
         queueKey: String? = nil,
         queueName: String? = nil,
-        queueUrl: String? = nil
+        queueUrl: String? = nil,
+        queueKeep: Bool? = nil
     ) {
         self.summary = summary
         self.phase = phase
@@ -61,6 +68,7 @@ struct AgentAnnotation: Equatable, Sendable {
         self.queueKey = queueKey
         self.queueName = queueName
         self.queueUrl = queueUrl
+        self.queueKeep = queueKeep
     }
 
     /// Overlay `other`'s PROVIDED (non-nil) fields onto `self`, keeping `self`'s
@@ -75,7 +83,8 @@ struct AgentAnnotation: Equatable, Sendable {
             needsUser: other.needsUser ?? needsUser,
             queueKey: other.queueKey ?? queueKey,
             queueName: other.queueName ?? queueName,
-            queueUrl: other.queueUrl ?? queueUrl)
+            queueUrl: other.queueUrl ?? queueUrl,
+            queueKeep: other.queueKeep ?? queueKeep)
     }
 }
 
