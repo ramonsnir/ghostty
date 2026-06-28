@@ -935,6 +935,18 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Agent Manager) Haiku usage/budget tracking. Default TRUE
+        // (matches the Zig default). The GUI forwards this to the sidecar as
+        // GHOSTTY_HAIKU_USAGE=1/0; the sidecar records one JSONL line per Haiku call,
+        // queried via the get_haiku_usage MCP tool. Defaults true on a missing config.
+        var agentManagerUsageTracking: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "agent-manager-usage-tracking"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
         // nil/empty when unset (the controller falls back to a login-shell probe).
         var agentManagerNodePath: String? {
