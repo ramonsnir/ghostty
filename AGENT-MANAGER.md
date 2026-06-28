@@ -223,6 +223,40 @@ re-probe more often, or to `0` to effectively disable the backoff.
 - **Summaries look generic?** That's the no-hooks fallback (viewport-only). Install the
   Claude Code hooks so your prompt + working/waiting state reach the summarizer.
 
+## Haiku usage / budget tracking
+
+Every Haiku call the Agent Manager makes is recorded so you can answer **"how much did each
+feature spend over the last N hours"** — and it **survives GUI/sidecar restarts** (the log
+is an on-disk file; the sidecar restarts with the GUI but totals stay cumulative).
+
+- **What's tracked:** one entry per call with tokens (input / output / cache-read /
+  cache-creation), the SDK's reported `costUsd`, the **feature** that triggered it, and the
+  billed **account**. The two features are `summarizer` (the continuous per-tile status pass)
+  and `bell-classify` (the Bell Attention per-bell promotion). All Haiku traffic funnels
+  through one place, so every feature is covered automatically.
+- **Where:** `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` (one JSON object per line).
+  Always on whenever the sidecar runs; set `GHOSTTY_HAIKU_USAGE=0` to disable. Entries older
+  than 14 days are pruned on sidecar startup, so the file can't grow without bound.
+- **How to ask:** the **`get_haiku_usage` MCP tool** (`{hours?}`, default 3) returns a grand
+  total plus per-feature and per-account breakdowns — so an agent (or you, via the MCP
+  server) can just ask "usage by feature over the last 3 hours." It's a pure file read and
+  never spends a Haiku call itself.
+- **Reading the numbers:** cost is the SDK's `total_cost_usd` summed per call (verified
+  non-zero on pool auth). It is usually dominated by **cache-creation** tokens on a *cold*
+  call (the system prompt is cached) and is cheap on subsequent **cache-read** calls — so a
+  burst of cold classifies costs more than the call count alone suggests. The per-account
+  breakdown pairs naturally with *Account routing* above to see which account a feature drains.
+
+```sh
+# quick peek without the MCP tool — per-feature cost in the last 3h (jq):
+jq -rs --arg since "$(date -u -v-3H +%Y-%m-%dT%H:%M:%S)" '
+  map(select(.ts >= $since)) | group_by(.feature)
+  | map({feature: .[0].feature, calls: length, costUsd: (map(.costUsd) | add)})' \
+  ~/Library/Logs/ghostty-ramon-haiku-usage.jsonl
+```
+
+(You can also just hand the file to Claude and ask in plain English.)
+
 ## Cost & privacy
 
 Each summary is one Haiku call, gated by a per-session debounce (~2 min; ~10 min for a
@@ -524,3 +558,40 @@ model-failure-leaves-untouched, model-alert-rings-regardless-of-text, changed-ta
 failed-ring rollback, non-agent never rung, dead-id prune). **Rebuilt sidecar `dist` + a
 sidecar restart (kill the node child or relaunch the GUI) is enough; no host/Zig change, no
 GUI relaunch needed for the GUI itself.**
+
+### Haiku usage / budget tracking (sidecar records, Swift MCP tool queries)
+
+All Haiku traffic funnels through ONE chokepoint — `model.ts` `summarize()` — so usage is
+captured there and tagged by the caller, covering every feature with one sink. The SDK
+SUCCESS result carries `usage` (input/output/cache tokens) + `total_cost_usd` (verified
+non-zero on pool auth: a cold call ~5¢, dominated by ~25.7k cache-CREATION tokens; a warm
+call is cents on cache READS). Load-bearing details:
+
+- **Capture**: `summarize()` gained an optional `onUsage` callback (model.ts), called with a
+  `HaikuUsage` read off the success message BEFORE returning (never on an error result).
+  model.ts's import of `HaikuUsage` is **type-only** so `dist/model.js` keeps its
+  no-`node_modules` lazy-load property.
+- **Tag + record**: the single `index.ts` call site passes `onUsage` that stamps
+  `feature` (`bellRang ? "bell-classify" : "summarizer"`) + `account` (basename of
+  `summarizerConfigDir`, else `"ambient"`) and calls `recordUsage` (usage.ts). The
+  `SummarizeFn` type was widened with the same optional `onUsage`.
+- **Persistence + retention**: `usage.ts` appends one JSONL line per call to
+  `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` (best-effort, never throws — mirrors
+  diag.ts). ALWAYS ON unless `GHOSTTY_HAIKU_USAGE=0`. `trimUsageLog(14, Date.now())` runs
+  once at sidecar startup (`main()`), dropping entries older than 14 days. Survives restarts
+  because it's a file (the sidecar dies/respawns with the GUI; totals are cumulative).
+- **Query (Swift)**: the `get_haiku_usage` MCP tool (`MCPTools.dispatch`, `hours` arg
+  clamped to [1 min, 30 days], default 3) calls the PURE `MCPUsage.aggregate(lines:sinceIso:)`
+  which filters `ts >= sinceIso` (lexicographic — `MCPUsage.isoString` emits the SAME
+  fractional-seconds `…Z` format as JS `toISOString`, so the string compare is correct) and
+  sums into total + byFeature + byAccount (each cost-sorted). Pure file read, no main-thread
+  hop. Added to the iOS-exclusion `membershipExceptions` in `project.pbxproj` like the other
+  MCP files.
+
+Wiring: sidecar — `agent-manager/src/usage.ts` (new), `model.ts` (`onUsage` + extraction),
+`index.ts` (tag at the call site + `SummarizeFn` + startup trim). macOS —
+`Features/MCP/MCPUsage.swift` (new), `MCPTools.swift` (schema + dispatch),
+`project.pbxproj`. Tests: `usage.test.ts` (`formatUsageLine`/`trimUsageText`/`usageEnabled`),
+`model.test.ts` (`onUsage` paths), `MCPUsageTests.swift` (aggregate/cutoff/junk/empty/ISO),
+`MCPServerTests.swift` (`toolsListHasAllTools` count 22). **Rebuilt sidecar `dist` (records)
++ a GUI relaunch (the Swift tool); no host/Zig change.**

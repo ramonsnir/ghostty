@@ -104,7 +104,7 @@ committed `.mcp.json` needs. (The shim changes rarely — rebuild only if `main.
 
 ---
 
-## The tools (12)
+## The tools (13)
 
 Every tool addresses a surface by its **stable UUID** from `list_surfaces` (window/tab are
 positional encounter-order indices, **not** durable — only `id` is).
@@ -120,6 +120,10 @@ positional encounter-order indices, **not** durable — only `id` is).
   is not exposed* — see Known limits. To see output that scrolled off, `scroll` it into
   view, then read again.
 - **`get_layout`** — the window → tab → split-tree of every window.
+- **`get_haiku_usage {hours?}`** — Agent Manager Haiku token/cost usage over the last
+  `hours` (default 3), broken down **by feature** (`summarizer` vs `bell-classify`) and **by
+  account**, plus a grand total. Read-only; survives GUI restarts (the sidecar logs each
+  call to disk). See [AGENT-MANAGER.md](AGENT-MANAGER.md) → *Haiku usage / budget tracking*.
 
 **Respond** (real key events, not paste)
 - **`send_text {id, text, submit?}`** — types text; `submit:true` appends a real Return.
@@ -311,7 +315,7 @@ stdin↔HTTP pipe, NOT in `Ghostty.xcodeproj`, built with `swift build`) so
 
 A committed **`.mcp.json`** at the repo root registers the server project-scoped as
 `ghostty -- ghostty-mcp` (bare PATH name, **no secret, no clone-specific path**), so any
-Claude Code session opened in the repo auto-gets the 12 tools after a one-time approval +
+Claude Code session opened in the repo auto-gets the 13 tools after a one-time approval +
 restart. Two pieces make a secret-less, path-less registration work: (1) the shim is
 installed on PATH at **`~/.local/bin/ghostty-mcp`** (release build, alongside
 `ghostty-host`; new-machine: `cd macos/mcp-shim && swift build -c release && cp
@@ -323,13 +327,15 @@ hook reads), so the committed JSON needs no token. Dev identities still reachabl
 `macos/mcp-shim/Sources/ghostty-mcp/main.swift` (`tokenFromLocalConfig`); see "Connecting
 an agent" above.
 
-### The 12 tools
+### The 13 tools
 
-`list_surfaces`, `read_surface`, `get_layout`, `send_text`, `send_key`, `scroll`,
-`wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`, `close_surface`,
-`perform_action` (the keybind-action grammar string). All address a surface by **stable
-UUID**; `wait_for_event`/`watch_for_pattern` are long-poll (idle-watchdog-exempt, bounded
-by a clamped `timeoutMs` 1000–120000).
+`list_surfaces`, `read_surface`, `get_layout`, `get_haiku_usage`, `send_text`, `send_key`,
+`scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
+`close_surface`, `perform_action` (the keybind-action grammar string). All surface-scoped
+tools address a surface by **stable UUID**; `wait_for_event`/`watch_for_pattern` are
+long-poll (idle-watchdog-exempt, bounded by a clamped `timeoutMs` 1000–120000).
+`get_haiku_usage` is a pure file read (no surface, no GUI hop) — see the Agent Manager doc.
+(The Agent Queue registers further tools, documented in AGENT-QUEUE.md.)
 
 `list_surfaces` rows carry `id, title, pwd, window/tab/split position, focused, bell,
 exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /
