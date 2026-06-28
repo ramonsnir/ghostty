@@ -208,7 +208,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   a bell→Web-Push "I stepped away" notifier. **SCOPE: phone workflows ONLY — do not build new
   features on it; other work may COPY its patterns but must stand alone.** Load-bearing gotchas:
   input is sent as REAL key/wheel events (`ghostty_surface_key` with the NATIVE macOS virtual
-  keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path; Web
+  keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path;
+  **Scroll ↑/↓ is "smart" (`smartScroll`, page-side)** — it reads the LIVE terminal mode off
+  `xterm.js` (`buffer.active.type` + `modes.mouseTrackingMode`) and sends PageUp/PageDown for an
+  alt-screen TUI with no mouse capture (less/man/vim — a wheel is a dead no-op there because the
+  `.client` mirror's alt-screen state isn't applied, a documented `src/termio/Client.zig`
+  residual), else a real wheel (scrollback / mouse-capturing apps like Claude Code); Web
   Push needs a SECURE CONTEXT (`tailscale serve` in front, external HTTPS port ≠ internal bind
   port or the bind hits `EADDRINUSE`); the raw-tee is a HOST change (host restart loses sessions).
   **See `WEB-MONITOR.md` (→ Implementation notes) for the color/scrollback architecture, HTTP
