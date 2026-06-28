@@ -410,12 +410,90 @@ struct ForkSetupTests {
         let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
         // project-directory must be commented out (so an unconfigured colleague
         // doesn't get a half-empty ctrl+a>f palette) — but the project selector
-        // keybind + the explanatory comment stay.
+        // keybind (now a COMMENTED example) + the explanatory comment stay.
         for line in seed.split(separator: "\n") {
             let t = line.trimmingCharacters(in: .whitespaces)
             #expect(!(t.hasPrefix("project-directory") && !t.hasPrefix("#")))
         }
         #expect(seed.contains("#project-directory = ~/git"))
-        #expect(seed.contains("keybind = ctrl+a>f=toggle_project_selector"))
+        // The whole ctrl+a layer (incl. this keybind) is commented out now: the
+        // project-selector keybind appears ONLY as a commented example.
+        #expect(seed.contains("#keybind = ctrl+a>f=toggle_project_selector"))
+    }
+
+    @Test func configSeedHasNoActiveKeybindsButHasCommentedCtrlALayer() throws {
+        let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
+        // No ACTIVE keybind lines: every `keybind = ` is commented with a leading
+        // `#` (the whole personal ctrl+a layer is offered as an example, not imposed).
+        for line in seed.split(separator: "\n", omittingEmptySubsequences: false) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            #expect(!(t.hasPrefix("keybind") && !t.hasPrefix("#")))
+        }
+        // But the commented ctrl+a prefix layer IS present, under a header marking
+        // it optional, so a colleague can adopt it.
+        #expect(seed.contains("#keybind = ctrl+a>"))
+        #expect(seed.contains("OPTIONAL"))
+    }
+
+    // MARK: - local secrets: planLocalSecretsInstall + token generation
+
+    @Test func localSecretsCreatesWhenFileAbsent() {
+        // No `local` file yet -> create it (with both lines + a header).
+        #expect(ForkSetup.planLocalSecretsInstall(localExists: false, hasToken: false) == .create)
+        // localExists is the dominant gate: absent always means create.
+        #expect(ForkSetup.planLocalSecretsInstall(localExists: false, hasToken: true) == .create)
+    }
+
+    @Test func localSecretsSkipsWhenTokenPresent() {
+        // SAFETY: a live shell-execution credential is NEVER rotated by a re-run.
+        #expect(ForkSetup.planLocalSecretsInstall(localExists: true, hasToken: true) == .skipHasToken)
+    }
+
+    @Test func localSecretsAppendsWhenFileExistsWithoutToken() {
+        // An existing file (e.g. with web-monitor-listen) but no mcp-token -> append.
+        #expect(ForkSetup.planLocalSecretsInstall(localExists: true, hasToken: false) == .append)
+    }
+
+    @Test func localHasMCPTokenDetectsActiveLineOnly() {
+        // An active token line counts...
+        #expect(ForkSetup.localHasMCPToken("mcp-token = abc123") == true)
+        #expect(ForkSetup.localHasMCPToken("  mcp-token=abc123  ") == true)
+        #expect(ForkSetup.localHasMCPToken("web-monitor-listen = 100.0.0.1:8787\nmcp-token = deadbeef") == true)
+        // ...a commented example does NOT (so the seed's `#mcp-token` never blocks us).
+        #expect(ForkSetup.localHasMCPToken("#mcp-token = <generate...>") == false)
+        #expect(ForkSetup.localHasMCPToken("# mcp-token = x") == false)
+        // ...and an empty / unrelated file does not.
+        #expect(ForkSetup.localHasMCPToken("") == false)
+        #expect(ForkSetup.localHasMCPToken("web-monitor-listen = 100.0.0.1:8787") == false)
+        // A key that merely starts with the same prefix must not match.
+        #expect(ForkSetup.localHasMCPToken("mcp-token-extra = x") == false)
+    }
+
+    @Test func generateMCPTokenIsRandomLongHex() {
+        let a = ForkSetup.generateMCPToken()
+        let b = ForkSetup.generateMCPToken()
+        // Sufficiently long: >= 48 hex chars (the spec floor); default is 32 bytes
+        // -> 64 hex chars.
+        #expect(a.count >= 48)
+        #expect(a.count == 64)
+        // Pure lowercase hex.
+        #expect(a.allSatisfy { $0.isHexDigit && !$0.isUppercase })
+        // Real CSPRNG output -> two draws differ (never a constant).
+        #expect(a != b)
+    }
+
+    @Test func localSecretsBlocksCarryListenAndToken() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        let create = ForkSetup.localSecretsFileContents(token: token)
+        // The created file carries a machine-local-secrets header + both lines, and
+        // localHasMCPToken recognizes its own output (idempotency closes the loop).
+        #expect(create.contains("mcp-listen = 127.0.0.1:8765"))
+        #expect(create.contains("mcp-token = \(token)"))
+        #expect(ForkSetup.localHasMCPToken(create) == true)
+
+        let block = ForkSetup.localSecretsAppendBlock(token: token)
+        #expect(block.contains("mcp-listen = 127.0.0.1:8765"))
+        #expect(block.contains("mcp-token = \(token)"))
+        #expect(ForkSetup.localHasMCPToken(block) == true)
     }
 }

@@ -279,16 +279,33 @@ class AppDelegate: NSObject,
             toggleSecureInput(self)
         }
 
+        // (ramon fork) HOST-CRITICAL first-launch setup, run SYNCHRONOUSLY and
+        // EARLY — before any window/`.client` surface is created (surfaces are
+        // created later, in applicationDidBecomeActive / window restoration). This
+        // seeds the config + the machine-local secrets and, crucially, installs +
+        // bootstraps the bundled ghostty-host LaunchAgent so the host is reliably
+        // RUNNING before a surface dials its socket, eliminating the blank-pane
+        // race. In the steady state (host already up) this returns fast (one
+        // `launchctl print`); only the first-install / version-change path spends
+        // the bootstrap retry budget — exactly when the host would otherwise be
+        // down. A no-op on dev/local builds (no bundled host) and when a host
+        // LaunchAgent is externally managed. NOTE: pty-host still only takes EFFECT
+        // on the second launch (the GUI reads `pty-host` in Ghostty.App.init, before
+        // any launch callback, so the freshly-seeded value isn't seen until next
+        // launch); what this buys is "no race once configured", not first-launch
+        // hosting. See ForkSetup's LAUNCH ORDERING doc.
+        let forkHostSetupRan = ForkSetup.performHostSetup()
+
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
 
-        // (ramon fork) First-launch setup for distribution builds: seed a
-        // default ~/.config/ghostty-ramon/config if absent, and install/reload
-        // the LaunchAgent for the bundled ghostty-host (CI release builds only).
-        // Idempotent and safe on every launch; a no-op on dev/local builds (no
-        // bundled host) and when a host LaunchAgent is externally managed. Runs
-        // off-main because it does file IO + shells out to launchctl.
-        DispatchQueue.global(qos: .utility).async { ForkSetup.perform() }
+        // (ramon fork) The NON-critical first-launch jobs (ghostty-mcp shim,
+        // ghostty-ramon CLI launcher, one-time welcome) don't gate surface
+        // connection, so run them off-main after the host-critical step. Gated on
+        // the same bundled-host check (performHostSetup's return value).
+        if forkHostSetupRan {
+            DispatchQueue.global(qos: .utility).async { ForkSetup.performDeferred() }
+        }
 
         // (ramon fork) Start the embedded web monitor if configured. It reads
         // config only here (changing listen/token requires a relaunch); the

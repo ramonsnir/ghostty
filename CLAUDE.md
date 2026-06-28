@@ -292,9 +292,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   the Agent Queue (per-feature env flags gate the two loops; the summarizer's `GHOSTTY_SUMMARIZER`
   absent=ON for back-compat); cost is controlled by hidden-throttle + fuzzy change-detection +
   quiescent-skip + a config overlay + rate-limit auto-backoff; for colleagues the sidecar is bundled
-  dist-only (the queue works; the Haiku summarizer stays dev-only — it needs `node_modules`). **See
+  dist-only AND the Haiku summarizer + rate-limit bell watchdog now WORK for DMG users (no longer
+  dev-only) — the release build inlines ONLY the SDK's JS via esbuild (no 215MB native binary) and
+  `model.ts` points the SDK at the colleague's ALREADY-INSTALLED `claude` via
+  `pathToClaudeCodeExecutable` (the `GHOSTTY_CLAUDE_PATH` env, set by `AgentManagerController` from a
+  login-shell `command -v claude` probe), billed to their own Claude subscription; needs `node` +
+  `claude` on PATH, else the summarizer self-disables per-surface while the queue still runs. **See
   `AGENT-MANAGER.md` (→ Implementation notes) for the loop, cost controls, account routing, the
-  rate-limit attention watchdog, wiring + tests.**
+  rate-limit attention watchdog, the system-`claude`/esbuild bundle, wiring + tests.**
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default; config `agent-queue` /
   `agent-queue-templates-dir` / `agent-queue-max-total`, action `start_agent_queue`) — turns the
@@ -364,33 +369,61 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   builds never auto-check; the CI release build DELETES that key (enables checks) and
   injects the fork's `SUPublicEDKey`. Wiring: `macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`.
 
-- **First-launch setup (`ForkSetup`, GUI-only, distribution builds).** On launch the
-  app (off-main, in `AppDelegate.applicationDidFinishLaunching`) runs
-  `ForkSetup.perform()`, which is idempotent and now does FIVE jobs: (1) seed a sanitized
-  `~/.config/ghostty-ramon/config` if absent (embedded `seedTemplate`, `__HOME__`
-  substituted, personal launchers commented out, open `mcp-listen`/`web-monitor-listen`
-  disabled — opt-in via `local`); (2) install/version-reload a launchd LaunchAgent for
-  a `ghostty-host` BUNDLED at `Contents/MacOS/ghostty-host`; (3) install the bundled
-  `ghostty-mcp` shim onto PATH (see the MCP-shim bullet below); (4) install a
-  **`ghostty-ramon` CLI launcher** onto PATH (see the next bullet); (5) fire a **one-time
+- **First-launch setup (`ForkSetup`, GUI-only, distribution builds).** Idempotent, safe on
+  every launch, and now SPLIT in two by launch ordering: `performHostSetup()` (host-critical)
+  + `performDeferred()` (the rest); `perform()` still runs both for callers/tests. SIX jobs
+  total: (1) seed a sanitized `~/.config/ghostty-ramon/config` if absent (embedded
+  `seedTemplate`, `__HOME__` substituted, the whole `ctrl+a` keybind layer commented out, open
+  `mcp-listen`/`web-monitor-listen` disabled — see the seed bullet below); (2) **auto-provision
+  the untracked machine-local `~/.config/ghostty-ramon/local`** with `mcp-listen` + a CSPRNG
+  `mcp-token` (see the local-secrets bullet below); (3) install/version-reload a launchd
+  LaunchAgent for a `ghostty-host` BUNDLED at `Contents/MacOS/ghostty-host`; (4) install the
+  bundled `ghostty-mcp` shim onto PATH (see the MCP-shim bullet below); (5) install a
+  **`ghostty-ramon` CLI launcher** onto PATH (see the next bullet); (6) fire a **one-time
   first-run welcome notification** (idempotent via the persisted `forkSetup.welcomeShown`
   bool; pure predicate `shouldShowWelcome(alreadyShown:)`) that points the colleague at
   `ghostty-ramon +list-keybinds` / `ONBOARDING.md` — concrete discovery, NOT "scroll the
   command palette". The welcome bool is recorded BEFORE `notify()` fires so a failed/denied
-  notification can't re-fire it every launch. **Two safety gates make it impossible to
-  clobber a hand-managed host** (Ramon's own dev setup uses the SAME label
+  notification can't re-fire it every launch. **`performHostSetup()` (jobs 1–3) runs
+  SYNCHRONOUSLY and EARLY in `AppDelegate.applicationDidFinishLaunching` — before any window/
+  `.client` surface is created — so the bundled host is installed + bootstrapped + RUNNING
+  before a surface dials its socket, eliminating the blank-pane race** (steady-state fast path:
+  one `launchctl print`; only first-install/version-change spends the bootstrap budget). It
+  returns a Bool (true iff a host is bundled = the distribution path); the deferred jobs 4–6
+  run off-main only when it returned true. **HONEST CAVEAT: pty-host still only takes EFFECT on
+  the SECOND launch on a fresh machine** — the GUI reads `pty-host` in `Ghostty.App.init()`
+  (before any launch callback), so the freshly-seeded value isn't seen until the next launch.
+  `performHostSetup()` removes the connection RACE on every configured launch, not the one-time
+  relaunch (no `Client.zig` connect-retry was added — deliberate). **Two safety gates make it
+  impossible to clobber a hand-managed host** (Ramon's own dev setup uses the SAME label
   `com.mitchellh.ghostty-ramon.host`): it only acts when a host is actually bundled
   (local/dev builds skip — they don't bundle it), and it writes an ownership marker
   (`GhosttyAppManaged` = bundle id) into any plist it creates, refusing to touch a
   pre-existing plist that lacks the marker. The version-aware reload (bootout+bootstrap,
   never kill) re-derives launchd's LWCR after a Sparkle update gives the bundled host a
   new cdhash — encoding the LWCR gotcha (below) into the app. Pure planner `plan(...)`,
-  `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`
-  are unit-tested. Wiring:
-  `macos/Sources/Features/ForkSetup/ForkSetup.swift`, `AppDelegate.swift` (the
-  off-main call), `project.pbxproj` (iOS exclusion). Tests:
-  `macos/Tests/ForkSetup/ForkSetupTests.swift` (incl. `cli*` plan gates, `welcome*`, and
-  the seed-content `configSeed*` assertions for the new onboarding content).
+  `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`,
+  `planLocalSecretsInstall`, `localHasMCPToken` are unit-tested. Wiring:
+  `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG),
+  `AppDelegate.swift` (the synchronous `performHostSetup()` call + the off-main
+  `performDeferred()`), `project.pbxproj` (iOS exclusion). Tests:
+  `macos/Tests/ForkSetup/ForkSetupTests.swift` (incl. `cli*` plan gates, `welcome*`,
+  `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, and the seed-content `configSeed*`
+  assertions for the new onboarding content).
+
+- **Auto-provisioned MCP secrets (`~/.config/ghostty-ramon/local`, ForkSetup job 2).** On
+  first launch the fork writes the untracked machine-local `local` with `mcp-listen =
+  127.0.0.1:8765` + a freshly-generated CSPRNG `mcp-token` (`generateMCPToken` = 32
+  `SecRandomCopyBytes` bytes → 64 hex chars, well over the 16-byte floor), so the MCP server,
+  the `ghostty-mcp` shim, the Claude agent-state hooks, and the dashboard chips / agent queue /
+  manager **work OUT OF THE BOX with no hand-written token** (the seeded config already pulls
+  `local` in via the optional include). Pure decision `planLocalSecretsInstall(localExists:
+  hasToken:)` → `.skipHasToken` / `.create` / `.append`: it NEVER rotates or clobbers an
+  existing token (presence of a non-comment `mcp-token`, detected by `localHasMCPToken`, is the
+  idempotency key); a missing `local` is created with a header; an existing `local` WITHOUT a
+  token is APPENDED to (preserving any other machine-local keys like `web-monitor-listen`).
+  Impure `seedLocalSecretsIfNeeded`; the token value is never logged. Wiring/Tests as in the
+  ForkSetup bullet above.
 
 - **`ghostty-ramon` CLI launcher on PATH (fork-only, ForkSetup job 4).** A SYMLINK at
   `~/.local/bin/ghostty-ramon` → the app's multitool binary `Contents/MacOS/ghostty`, so a
@@ -409,22 +442,26 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   `ForkSetup.swift` (`CLIPlan`/`planCLIInstall`/`installCLILauncherIfNeeded` +
   `fileExistsOrSymlink`/`symlinkPointsAt` helpers). Tests: `ForkSetupTests.swift` (`cli*`).
 
-- **Seed-template changes for colleague onboarding (`ForkSetup.seedTemplate`).** The
-  auto-seeded `~/.config/ghostty-ramon/config` got onboarding-focused edits (all
-  asserted by `configSeed*` tests): (1) a top-of-file **QUICK START** block — a curated
-  `ctrl+a`-prefix cheat sheet of the headline gestures (splits/resize/tabs/move/find/last)
-  with the load-bearing pointer `run 'ghostty-ramon +list-keybinds', or see ONBOARDING.md`
-  and an explicit "don't go hunting in the command palette". (2) **`agent-queue` drift
-  reconciled** — the key is now PRESENT but COMMENTED (`#agent-queue = true`), with a note
-  that it's opt-in and needs node + the agent-state hooks + a template (it was previously
-  absent from the seed). (3) **softened `bell-features-focused`** — the focused-bell default
-  is now VISUAL-ONLY `no-system,no-attention,no-title` (was `system,no-attention,no-title`),
-  i.e. no audible beep while the ringing split is focused (gentler, close to upstream
-  silent-when-focused; add `system` back for a beep). (4) **`project-directory` commented
-  out** — `#project-directory = ~/git` (was an active `project-directory = ~/git`) so an
-  unconfigured machine doesn't get a half-empty `ctrl+a>f` palette; the keybind + the
-  explanatory comment stay. (Keep `example/ghostty-ramon/config` in sync if the live config
-  also changes — the seed is a separate sanitized template, not a copy of `example/`.)
+- **Seed-template REFRAME — FEATURE-FIRST, keybindings opt-in (`ForkSetup.seedTemplate`).**
+  The auto-seeded `~/.config/ghostty-ramon/config` no longer IMPOSES the personal keybind
+  layer (all asserted by `configSeed*` tests): (1) **the WHOLE tmux-style `ctrl+a` keybind
+  layer is COMMENTED OUT** at the bottom of the file under an "OPTIONAL: my personal tmux-style
+  `ctrl+a` keybindings — ALL COMMENTED OUT" header — nothing is bound for a colleague (so any
+  matrix/example claim that the seed ships ACTIVE fork keybinds is no longer true). (2) the
+  top-of-file **QUICK START** block now explains the FEATURES and the **Command Palette**
+  (cmd+shift+p → type "split"/"tab"/"project"/"agent"), not keybindings, with the discovery
+  pointers `ghostty-ramon +list-keybinds` / `+show-config --default --docs` and ONBOARDING.md.
+  (3) feature SETTINGS stay ACTIVE — `agent-dashboard = true`, `agent-dashboard-commands`,
+  `auto-update = check`, `bell-features`, the `pty-host` socket (parameterized), etc.; only the
+  binds are commented. (4) `agent-queue = true` is present but COMMENTED (opt-in; needs node +
+  the agent-state hooks + a template). (5) `project-directory = ~/git` is COMMENTED (so an
+  unconfigured machine doesn't get an empty project picker). (6) softened
+  `bell-features-focused` = VISUAL-ONLY `no-system,no-attention,no-title` (was
+  `system,no-attention,no-title`) — no audible beep while the ringing split is focused. (7) the
+  MCP section documents that `local` is AUTO-PROVISIONED with a bind + random token on first
+  launch (no longer "enable only WITH a hand-written token"). (Keep `example/ghostty-ramon/config`
+  in sync if the live config also changes — the seed is a separate sanitized template, not a
+  copy of `example/`.)
 
 - **`claude-hooks` + `ONBOARDING.md` bundled into `Contents/Resources` (BOTH release
   paths).** The colleague-onboarding deliverables ship INSIDE the notarized bundle (carried

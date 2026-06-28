@@ -12,21 +12,50 @@
 // spreading process.env so HOME/PATH/OAuth are PRESERVED and only the config dir is
 // overridden — which routes auth/billing to that specific account.
 //
+// COLLEAGUE / DMG note (the big one): the SDK's `query()` does NOT make HTTP itself
+// — it SPAWNS the native `claude` CLI (a ~215MB arm64 binary shipped inside the SDK's
+// `@anthropic-ai/claude-agent-sdk-darwin-arm64` platform package). We do NOT bundle
+// that binary (notarization hazard + huge). Instead we bundle ONLY the SDK's JS (via
+// esbuild, see `npm run build`) and point the SDK at the colleague's ALREADY-INSTALLED
+// `claude` via `pathToClaudeCodeExecutable` — resolved from `GHOSTTY_CLAUDE_PATH` (set
+// by the Swift controller after a login-shell `command -v claude` probe), falling back
+// to a bare `claude` (PATH resolution by the SDK's spawn). If the SDK JS can't load
+// (no bundle) OR no `claude` is resolvable, `summarize()` THROWS, so the per-surface
+// error path skips it (the summarizer self-disables per-surface; the Agent QUEUE, which
+// makes NO Haiku calls, is unaffected). See CLAUDE.md / AGENT-MANAGER.md (Agent Manager).
+//
 // Returns the RAW assistant text for summarizer.parseSummary to validate. THROWS
 // on a spawn-time failure or an error-subtype result so the loop catches + logs
 // + continues (one bad call never stops the loop).
 
-// TYPE-ONLY import: fully erased at compile, so `dist/model.js` carries NO static
-// `import`/`require` of the SDK. The real `query` is loaded LAZILY (dynamic import)
-// only when `summarize()` actually runs — so the sidecar (and the Agent Queue, which
-// needs NO npm deps) loads and runs even when `node_modules` is absent, e.g. a
-// colleague's DMG that bundles only `dist/`. A summary attempt with no SDK present
-// throws → the per-surface error path skips it (the summarizer self-disables; the
-// queue is unaffected). See the COLLEAGUE/DMG note in CLAUDE.md (Agent Manager).
+// TYPE-ONLY import: fully erased at compile, so the pre-bundle `model.js` carries NO
+// static `import`/`require` of the SDK. The real `query` is loaded LAZILY (dynamic
+// import) only when `summarize()` actually runs. The release build then RE-bundles the
+// SDK's JS into `dist/` via esbuild (NO native binary), so the dynamic import resolves
+// from the bundle with `node_modules` absent (a colleague's DMG ships dist-only). The
+// Agent Queue needs NO npm deps and is unaffected either way. See the COLLEAGUE/DMG
+// note above + CLAUDE.md (Agent Manager).
 import type * as ClaudeAgentSDK from "@anthropic-ai/claude-agent-sdk";
 
 /** The default summarizer model. Free-form string (no SDK enum). */
 export const SUMMARIZER_MODEL = "claude-haiku-4-5";
+
+/**
+ * Resolve the path to the `claude` CLI the SDK should spawn. PURE over its `env`
+ * argument so it is unit-testable. `GHOSTTY_CLAUDE_PATH` (set by the Swift controller
+ * from a login-shell `command -v claude` probe) WINS when non-empty after trimming;
+ * otherwise returns `undefined`, which tells `summarize()` to omit
+ * `pathToClaudeCodeExecutable` so the SDK falls back to resolving a bare `claude` on
+ * its own PATH. (We never resolve to a 215MB bundled binary — colleagues use their
+ * already-installed `claude`.)
+ */
+export function resolveClaudePath(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  const p = env.GHOSTTY_CLAUDE_PATH;
+  if (p !== undefined && p.trim() !== "") return p.trim();
+  return undefined;
+}
 
 export interface SummarizeRequest {
   system: string;
@@ -54,6 +83,9 @@ export async function summarize(
 ): Promise<string> {
   const runQuery =
     queryFn ?? (await import("@anthropic-ai/claude-agent-sdk")).query;
+  // The colleague's already-installed `claude` (so we don't ship the 215MB native
+  // binary). Omitted when unresolved ⇒ the SDK resolves a bare `claude` on PATH itself.
+  const claudePath = resolveClaudePath();
   const q = runQuery({
     prompt: req.user,
     options: {
@@ -65,6 +97,9 @@ export async function summarize(
       // the higher ceiling just lets the query reach a success result instead of erroring.
       model: req.model ?? SUMMARIZER_MODEL,
       systemPrompt: req.system,
+      // Point the SDK at the system `claude` (NOT the un-bundled 215MB native binary).
+      // Omitted when unresolved so the SDK falls back to its own bare-`claude` lookup.
+      ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
       // env: by default OMITTED so the spawned claude inherits process.env (OAuth
       // creds + HOME/PATH + GHOSTTY_AGENT_MANAGER). When a configDir is set we pass
       // {...process.env, CLAUDE_CONFIG_DIR} — spreading so we PRESERVE the rest of

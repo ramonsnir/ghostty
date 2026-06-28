@@ -125,15 +125,25 @@ test -x "$APP/Contents/MacOS/ghostty-mcp"
 # ---- 3b. bundle the agent-manager sidecar (Agent Queue + Manager) ----------
 # Build the TS sidecar and bundle ONLY dist/ + package.json into
 # Contents/Resources/agent-manager (the path resolveSidecarDir() prefers). We do
-# NOT bundle node_modules: it is ~271MB and ships a native `claude` binary that
-# would break notarization — and the Agent QUEUE has ZERO npm deps, so it runs from
-# dist alone (model.ts lazy-imports the SDK only when a summary actually runs, so a
-# missing SDK self-disables the summarizer without affecting the queue). package.json
-# is required so node treats dist/*.js as ESM ("type":"module"). RUNTIME PREREQ on the
-# target Mac: `node` on PATH (the controller's self-disable gate handles its absence).
-echo ">> [3b/8] bundle agent-manager sidecar (dist only; node prereq)"
+# NOT bundle node_modules: it is ~271MB and ships a native ~215MB `claude` Mach-O
+# (in @anthropic-ai/claude-agent-sdk-darwin-arm64) that would break notarization.
+# `npm run build` = tsc + esbuild: esbuild RE-bundles dist/index.js with the Claude
+# Agent SDK's JAVASCRIPT inlined (a few MB, NO native binary — it's marked external),
+# so the SUMMARIZER works for colleagues from dist alone: model.ts points the SDK at
+# the colleague's ALREADY-INSTALLED `claude` via pathToClaudeCodeExecutable
+# (GHOSTTY_CLAUDE_PATH, set by AgentManagerController). The Agent QUEUE has ZERO npm
+# deps and runs from dist regardless. package.json is required so node treats dist/*.js
+# as ESM ("type":"module"). RUNTIME PREREQ on the target Mac: `node` on PATH (and, for
+# the summarizer specifically, `claude` on PATH — both handled gracefully if absent).
+echo ">> [3b/8] bundle agent-manager sidecar (dist only; SDK JS inlined; node prereq)"
 ( cd macos/agent-manager && npm ci && npm run build )
 test -f macos/agent-manager/dist/index.js
+# Sanity: the SDK JS must be inlined (so the summarizer works with no node_modules) and
+# NO bare @anthropic-ai import may remain (which would throw at runtime under dist-only).
+grep -q "Claude Code executable" macos/agent-manager/dist/index.js \
+  || { echo "ERROR: Agent SDK JS not inlined into dist/index.js (esbuild bundle missing)"; exit 1; }
+! grep -qE '(import|require)\(["'"'"'"]@anthropic-ai' macos/agent-manager/dist/index.js \
+  || { echo "ERROR: a bare @anthropic-ai import survived bundling (would break dist-only)"; exit 1; }
 SIDECAR_DST="$APP/Contents/Resources/agent-manager"
 rm -rf "$SIDECAR_DST"
 mkdir -p "$SIDECAR_DST"

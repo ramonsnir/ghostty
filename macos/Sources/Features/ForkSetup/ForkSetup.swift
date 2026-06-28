@@ -1,34 +1,60 @@
 import Foundation
 import OSLog
+import Security
 import UserNotifications
 
 /// (ramon fork) First-launch setup for COLLEAGUE distribution builds.
 ///
-/// Five independent, idempotent jobs, safe to run on every launch:
+/// Six independent, idempotent jobs, safe to run on every launch:
 ///
 ///   1. **Config seed** — write a sanitized default `~/.config/ghostty-ramon/config`
 ///      if (and only if) the file is absent, so the fork's keybinds/features work
 ///      out of the box on a fresh machine. We never overwrite an existing config.
 ///
-///   2. **Host LaunchAgent** — install (and version-reload) a launchd user
+///   2. **Local secrets** — auto-provision the untracked, machine-local
+///      `~/.config/ghostty-ramon/local` with `mcp-listen = 127.0.0.1:8765` and a
+///      freshly-generated CSPRNG `mcp-token`, so the MCP server (and everything
+///      that needs the token — the `ghostty-mcp` shim, the Claude agent-state
+///      hooks, the agent dashboard chips / queue / manager) works out of the box
+///      without the colleague hand-writing a token. Idempotent + NEVER clobbers:
+///      if `local` already sets `mcp-token` we leave it strictly alone; if `local`
+///      is absent we create it; if it exists without `mcp-token` we APPEND the two
+///      lines. The seeded config already pulls `local` in via an optional include.
+///
+///   3. **Host LaunchAgent** — install (and version-reload) a launchd user
 ///      LaunchAgent that supervises the `ghostty-host` binary BUNDLED inside the
 ///      app (`Contents/MacOS/ghostty-host`), so the pty-host backend works with no
 ///      manual terminal setup. The agent is `RunAtLoad`+`KeepAlive`, exactly like
 ///      the hand-rolled one documented in CLAUDE.md.
 ///
-///   3. **MCP shim** — install the bundled `ghostty-mcp` stdio shim onto PATH at
+///   4. **MCP shim** — install the bundled `ghostty-mcp` stdio shim onto PATH at
 ///      `~/.local/bin/ghostty-mcp` so an MCP client can reach the in-GUI server.
 ///
-///   4. **`ghostty-ramon` CLI** — install a launcher onto PATH at
+///   5. **`ghostty-ramon` CLI** — install a launcher onto PATH at
 ///      `~/.local/bin/ghostty-ramon` pointing at the app's multitool binary
 ///      (`Contents/MacOS/ghostty`), so a colleague can run discovery commands like
 ///      `ghostty-ramon +list-keybinds`. (NOT named `ghostty`, to avoid colliding
 ///      with an official ghostty CLI.) Symlink, so it always tracks the app.
 ///
-///   5. **First-run welcome** — a ONE-TIME notification (idempotent via a persisted
+///   6. **First-run welcome** — a ONE-TIME notification (idempotent via a persisted
 ///      bool) pointing the colleague at discovery (`ghostty-ramon +list-keybinds` /
 ///      ONBOARDING.md), since they won't scroll the command palette to find the
 ///      fork's features.
+///
+/// ── LAUNCH ORDERING (pty-host first-launch reliability) ─────────────────────────
+/// The host-CRITICAL jobs (config seed, local secrets, host LaunchAgent) are split
+/// out into `performHostSetup()`, which the AppDelegate runs SYNCHRONOUSLY and EARLY
+/// (before any window/`.client` surface is created) so the bundled `ghostty-host` is
+/// reliably installed + bootstrapped + RUNNING before a surface tries to connect to
+/// its socket — eliminating the blank-pane race. The non-critical jobs (shim, CLI,
+/// welcome) stay in `performDeferred()`, run off-main, since they don't gate surface
+/// connection. (See the note on `perform(...)`.) NOTE: pty-host still only takes
+/// EFFECT on the SECOND launch, because the GUI reads `pty-host` from the config in
+/// `Ghostty.App.init()` (the AppDelegate constructor) — strictly BEFORE any launch
+/// callback runs — so the freshly-seeded value isn't seen until the next launch.
+/// What `performHostSetup()` buys is that on every launch where pty-host IS
+/// configured, the host is up before surfaces connect (no race), without a risky
+/// mid-launch backend-switching config reload.
 ///
 /// ── CRITICAL SAFETY ───────────────────────────────────────────────────────────
 /// This must NEVER disturb a host LaunchAgent that a developer manages by hand
@@ -85,6 +111,92 @@ enum ForkSetup {
     static func configSeedContents(fileExists: Bool, home: String) -> String? {
         guard !fileExists else { return nil }
         return seedTemplate.replacingOccurrences(of: "__HOME__", with: home)
+    }
+
+    // MARK: - Local secrets (mcp-listen / mcp-token) (pure)
+
+    /// The localhost MCP bind seeded into `local`. The MCPServer applies a
+    /// per-identity port offset on top (Release +0 → 8765), so this exact value is
+    /// correct for the installed colleague build.
+    static let mcpListenDefault = "127.0.0.1:8765"
+
+    /// Decision for provisioning the untracked, machine-local
+    /// `~/.config/ghostty-ramon/local` with an MCP listen + token. NEVER clobbers a
+    /// token a colleague (or a prior run) already wrote.
+    enum LocalSecretsPlan: Equatable {
+        /// `local` already sets `mcp-token` → leave the whole file strictly alone.
+        case skipHasToken
+        /// `local` is absent → create it with a header comment + both lines.
+        case create
+        /// `local` exists but has NO `mcp-token` → APPEND the two lines (don't
+        /// rewrite the file, so any other machine-local keys are preserved).
+        case append
+    }
+
+    /// Pure decision for the local-secrets file. The cleanest safe behavior:
+    /// presence of a `mcp-token` is the idempotency key (re-running never rotates a
+    /// live shell-execution credential); an existing file without one is appended to
+    /// rather than rewritten (preserves a colleague's other `local` keys, e.g.
+    /// `web-monitor-listen`).
+    static func planLocalSecretsInstall(localExists: Bool, hasToken: Bool) -> LocalSecretsPlan {
+        if !localExists { return .create }
+        if hasToken { return .skipHasToken }
+        return .append
+    }
+
+    /// True iff `contents` already sets a non-comment `mcp-token` (so we must not
+    /// add another). Matches a line whose first non-whitespace token is `mcp-token`
+    /// — a commented `#mcp-token = …` does NOT count (it's the seed example).
+    static func localHasMCPToken(_ contents: String) -> Bool {
+        for raw in contents.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#") { continue }
+            // Key/value lines are `key = value`; match the key token exactly.
+            let key = line.split(separator: "=", maxSplits: 1).first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            if key == "mcp-token" { return true }
+        }
+        return false
+    }
+
+    /// Generate a cryptographically-strong MCP token: 32 random bytes (well above
+    /// the 16-byte / 32-hex-char floor) rendered as lowercase hex (64 chars). Uses
+    /// `SecRandomCopyBytes` (the system CSPRNG); falls back to the also-CSPRNG
+    /// `UInt64.random` only if that ever fails (it effectively never does), so the
+    /// returned value is always a real random token, never a constant.
+    static func generateMCPToken(byteCount: Int = 32) -> String {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        let status = SecRandomCopyBytes(kSecRandomDefault, byteCount, &bytes)
+        if status != errSecSuccess {
+            // Fallback (should not happen): SystemRandomNumberGenerator is a CSPRNG.
+            var rng = SystemRandomNumberGenerator()
+            for i in 0..<byteCount { bytes[i] = UInt8.random(in: 0...255, using: &rng) }
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The full file body to CREATE when `local` is absent: a short header marking
+    /// it as machine-local secrets, plus the two lines.
+    static func localSecretsFileContents(token: String) -> String {
+        """
+        # Ghostty fork (ramon) — machine-local secrets (auto-provisioned on first launch).
+        #
+        # This file is UNTRACKED and pulled in by the seeded config via an optional
+        # include. Put SECRETS and PER-MACHINE values here, NOT in the tracked config.
+        # Safe to edit. The mcp-token below is a SHELL-EXECUTION credential (the MCP
+        # tools spawn tabs + run commands) — rotate it if it ever leaks.
+        \(localSecretsAppendBlock(token: token))
+        """
+    }
+
+    /// The block to APPEND when `local` exists but has no `mcp-token`. A leading
+    /// blank line + a brief marker keep it readable when tacked onto existing keys.
+    static func localSecretsAppendBlock(token: String) -> String {
+        """
+        # --- MCP server (auto-provisioned) ---
+        mcp-listen = \(mcpListenDefault)
+        mcp-token = \(token)
+        """
     }
 
     // MARK: - Host LaunchAgent (pure)
@@ -299,14 +411,37 @@ enum ForkSetup {
 
     // MARK: - Execution (impure)
 
-    /// Run all setup jobs (see the type doc for the list). Call OFF the main thread
-    /// (it does file IO and shells out to `launchctl`). Idempotent; safe on every
-    /// launch. All jobs are gated on a bundled host (the distribution path).
+    /// Run ALL setup jobs (host-critical THEN deferred). Idempotent; safe on every
+    /// launch. Kept for callers/tests that want the whole thing in one call; the
+    /// AppDelegate instead calls `performHostSetup()` synchronously+early and
+    /// `performDeferred()` off-main (see the type doc's LAUNCH ORDERING note).
     static func perform(
         bundle: Bundle = .main,
         defaults: UserDefaults = .ghostty,
         fileManager: FileManager = .default
     ) {
+        guard performHostSetup(bundle: bundle, defaults: defaults, fileManager: fileManager) else { return }
+        performDeferred(bundle: bundle, defaults: defaults, fileManager: fileManager)
+    }
+
+    /// HOST-CRITICAL jobs that must complete BEFORE any `.client` surface connects:
+    /// seed the config, provision the machine-local secrets, and install/bootstrap
+    /// the host LaunchAgent. Intended to be called SYNCHRONOUSLY and EARLY in launch
+    /// (before window/surface creation) so the bundled `ghostty-host` is reliably
+    /// running by the time a surface dials its socket — eliminating the blank-pane
+    /// race. It still does file IO and shells out to `launchctl`; in the common
+    /// steady state (host already up, version unchanged) it returns fast (one
+    /// `launchctl print`), and only the first-install / version-change path spends
+    /// the bootstrap retry budget — exactly when the host would otherwise be down.
+    ///
+    /// Returns true iff a host is bundled (the distribution path) and the deferred
+    /// jobs should follow; false on a dev/local build (no bundled host → no-op).
+    @discardableResult
+    static func performHostSetup(
+        bundle: Bundle = .main,
+        defaults: UserDefaults = .ghostty,
+        fileManager: FileManager = .default
+    ) -> Bool {
         let home = NSHomeDirectory()
         // Gate ALL distribution setup on "is a ghostty-host bundled in this app?".
         // Only CI release builds bundle it; dev/ReleaseLocal/Debug builds (and a
@@ -317,13 +452,73 @@ enum ForkSetup {
         let bundledHost = bundle.bundleURL.appendingPathComponent("Contents/MacOS/ghostty-host").path
         guard fileManager.isExecutableFile(atPath: bundledHost) else {
             logger.debug("no bundled ghostty-host (dev/local build); skipping fork distribution setup")
-            return
+            return false
         }
         seedConfigIfNeeded(home: home, fileManager: fileManager)
+        seedLocalSecretsIfNeeded(home: home, fileManager: fileManager)
         manageHostLaunchAgentIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
+        return true
+    }
+
+    /// NON-critical jobs that do NOT gate surface connection: the `ghostty-mcp`
+    /// shim, the `ghostty-ramon` CLI launcher, and the one-time welcome. Safe to run
+    /// off-main AFTER `performHostSetup()`. Caller is responsible for the bundled-host
+    /// gate (call only when `performHostSetup()` returned true).
+    static func performDeferred(
+        bundle: Bundle = .main,
+        defaults: UserDefaults = .ghostty,
+        fileManager: FileManager = .default
+    ) {
+        let home = NSHomeDirectory()
         installShimIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
         installCLILauncherIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
         showWelcomeIfNeeded(defaults: defaults)
+    }
+
+    /// Auto-provision `~/.config/ghostty-ramon/local` with `mcp-listen` + a CSPRNG
+    /// `mcp-token` so MCP-dependent features work out of the box. Idempotent + never
+    /// clobbers an existing token (see `planLocalSecretsInstall`).
+    private static func seedLocalSecretsIfNeeded(home: String, fileManager: FileManager) {
+        let localPath = "\(home)/.config/ghostty-ramon/local"
+        let localExists = fileManager.fileExists(atPath: localPath)
+        let existing = localExists ? ((try? String(contentsOfFile: localPath, encoding: .utf8)) ?? "") : ""
+        let plan = planLocalSecretsInstall(
+            localExists: localExists, hasToken: localHasMCPToken(existing))
+        switch plan {
+        case .skipHasToken:
+            logger.debug("~/.config/ghostty-ramon/local already sets mcp-token; leaving it")
+        case .create:
+            let body = localSecretsFileContents(token: generateMCPToken())
+            let dir = (localPath as NSString).deletingLastPathComponent
+            do {
+                try fileManager.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                try body.write(toFile: localPath, atomically: true, encoding: .utf8)
+                // The token is a shell-execution credential — never log its value.
+                logger.info("created ~/.config/ghostty-ramon/local with an mcp-listen + a generated mcp-token")
+            } catch {
+                logger.warning("failed to create local secrets file: \(error.localizedDescription, privacy: .public)")
+            }
+        case .append:
+            // Preserve any existing keys: append, don't rewrite. Ensure a separating
+            // newline so we never glue onto a trailing non-newline-terminated line.
+            let sep = existing.isEmpty || existing.hasSuffix("\n") ? "\n" : "\n\n"
+            let block = sep + localSecretsAppendBlock(token: generateMCPToken()) + "\n"
+            do {
+                let handle = FileHandle(forWritingAtPath: localPath)
+                if let handle {
+                    defer { try? handle.close() }
+                    handle.seekToEndOfFile()
+                    handle.write(Data(block.utf8))
+                } else {
+                    // Fallback: rewrite existing + block (still no clobber of a token,
+                    // since .append only runs when there is none).
+                    try (existing + block).write(toFile: localPath, atomically: true, encoding: .utf8)
+                }
+                logger.info("appended mcp-listen + a generated mcp-token to ~/.config/ghostty-ramon/local")
+            } catch {
+                logger.warning("failed to append local secrets: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     /// Install the bundled `ghostty-mcp` stdio shim onto PATH at
@@ -715,28 +910,34 @@ enum ForkSetup {
 
     /// Sanitized, portable, secret-free default fork config. `__HOME__` is
     /// substituted with the user's home dir at seed time. Mirrors
-    /// example/ghostty-ramon/config but with personal project launchers commented
-    /// out, the pty-host socket parameterized, and the open mcp-listen disabled
-    /// (a colleague opts in via the untracked `local` include + a token).
+    /// example/ghostty-ramon/config but FEATURE-FIRST for a colleague: the personal
+    /// tmux-style `ctrl+a` keybind layer is COMMENTED OUT (offered as a ready-made
+    /// example, not imposed), project launchers are commented, the pty-host socket
+    /// is parameterized, and the open mcp/web-monitor binds are disabled (a
+    /// colleague opts in via the untracked `local` include + a token).
     static let seedTemplate = """
     # ============================================================================
-    # QUICK START — the fork's headline gestures use a tmux-style `ctrl+a` prefix.
-    # Press `ctrl+a` then the key below (this is a chord, not a chord-held combo):
+    # QUICK START — what this fork adds, and how to reach it
     #
-    #   Splits:  ctrl+a then %  split right        ctrl+a then "  split down
-    #            ctrl+a then arrows  move focus     ctrl+a then z  zoom a split
-    #            ctrl+a then x  close split         ctrl+a then o / ;  cycle splits
-    #   Resize:  ctrl+a then h/j/k/l  (hold-repeat) ctrl+a then space  equalize
-    #   Tabs:    ctrl+a then c  new tab             ctrl+a then n / p  next/prev tab
-    #            ctrl+a then 1..9  go to tab N
-    #   Move:    ctrl+a then q  mark split          ctrl+a then m  pull marked here
-    #   Find:    ctrl+a then f  project picker       ctrl+a then d  Agent Dashboard
-    #   Last:    ctrl+a then ctrl+a  jump to last split
+    # You do NOT need any special keybindings to use this fork. Its additions are:
+    #   • Agent Dashboard — a panel of live previews of every split running a CLI
+    #     agent (claude/codex); it opens on its own (agent-dashboard = true). Toggle
+    #     it from the Command Palette → "Toggle Agent Dashboard".
+    #   • Split & tab power-tools — flip / swap / merge splits, eject a pane to a
+    #     tab, mark & pull a split, "go to last split", a fuzzy project picker, and
+    #     more. Every one is in the Command Palette: press cmd+shift+p (or use the
+    #     View ▸ Command Palette menu) and type "split", "tab", "project", "agent".
+    #   • Optional power features (OFF by default): MCP server, Web monitor, Agent
+    #     Queue / Manager — see their sections below and ONBOARDING.md.
     #
-    # FULL CHEAT SHEET: run 'ghostty-ramon +list-keybinds', or see ONBOARDING.md.
-    # (Don't go hunting in the command palette — the cheat sheet is the fast path.)
-    # NOTE: the exact bindings below are what's actually active; the keys above are
-    # the curated highlights. Tweak any of them to taste.
+    # See everything with:  ghostty-ramon +list-keybinds  (currently-active binds)
+    #                       ghostty-ramon +show-config --default --docs  (all keys)
+    #
+    # KEYBINDINGS: I personally drive all of the above from a tmux-style `ctrl+a`
+    # prefix — that's MY muscle memory (it deliberately shadows readline's ctrl+a),
+    # NOT something you need. My full layout is at the BOTTOM of this file, COMMENTED
+    # OUT: uncomment it to adopt my bindings, or bind the same actions to your own
+    # keys. The cheat sheet is in ONBOARDING.md.
     # ============================================================================
     #
     # Ghostty fork (ramon) — fork-only config (auto-seeded on first launch)
@@ -756,43 +957,20 @@ enum ForkSetup {
     # automatically, or `off` to disable.
     auto-update = check
 
-    # --- Fork split/tab commands (edit combos to taste) ----------------------
-    keybind = ctrl+cmd+shift+f=flip_split:horizontal
-    #keybind = ctrl+cmd+shift+v=flip_split:vertical
-    #keybind = ctrl+cmd+shift+h=toggle_split_direction:horizontal
-    #keybind = ctrl+cmd+shift+u=toggle_split_direction:vertical
-    #keybind = ctrl+cmd+shift+t=move_split_to_new_tab
-    #keybind = ctrl+cmd+shift+right=merge_tabs:next_horizontal
-    #keybind = ctrl+cmd+shift+down=merge_tabs:next_vertical
-    #keybind = ctrl+cmd+shift+left=merge_tabs:previous_horizontal
-    #keybind = ctrl+cmd+shift+up=merge_tabs:previous_vertical
-
-    # --- tmux-shaped prefix layer for fork-specific actions -----------------
-    keybind = ctrl+a>q=mark_split
-    keybind = ctrl+a>shift+q=clear_split_mark
-    keybind = ctrl+a>m=pull_marked_split:auto
-    keybind = ctrl+a>shift+!=move_split_to_new_tab
-
-    # One-key project launchers — open a new tab with cwd set to a project.
-    # Personal examples; uncomment + edit to your own repo paths.
-    #keybind = ctrl+a>g=new_tab:~/git/your-project
-    #keybind = ctrl+a>i=new_tab:~/git/another-project
-
-    # Dynamic project selector: opens a fuzzy palette of the immediate subdirs of
-    # each `project-directory`; selecting one opens it in a new tab. Point this at
-    # wherever you keep your repos, then uncomment it (left off so an unconfigured
-    # machine doesn't get a half-empty ctrl+a>f palette):
+    # --- Features (settings, not keybindings) --------------------------------
+    # Project picker (Command Palette → "Open Project…"): point this at wherever
+    # you keep your repos; each immediate subdir becomes a new-tab target. Left
+    # commented so an unconfigured machine doesn't get an empty picker:
     #project-directory = ~/git
-    keybind = ctrl+a>f=toggle_project_selector
 
     # Agent Dashboard (fork-only): a panel of live mini-previews of every split
     # running a CLI agent (claude/codex) across all tabs/windows; click to jump.
-    # `ctrl+a>d` toggles it. NOTE: live previews appear only once the HOSTED
-    # backend is active — i.e. after the one-time relaunch below (pty-host) — so on
-    # the very first run the panel may open empty/metadata-only until you relaunch.
+    # It opens on its own; toggle it from the Command Palette → "Toggle Agent
+    # Dashboard". NOTE: live previews appear only once the HOSTED backend is active
+    # — i.e. after the one-time relaunch below (pty-host) — so on the very first run
+    # the panel may open empty/metadata-only until you relaunch.
     agent-dashboard = true
     agent-dashboard-commands = claude,codex
-    keybind = ctrl+a>d=toggle_agent_dashboard
 
     # Agent Queue (fork-only, OPT-IN — left OFF by default). Turns the dashboard
     # into an active supervisor that launches one CLI agent per work item from a
@@ -800,51 +978,8 @@ enum ForkSetup {
     # installed, and a queue template (see AGENT-QUEUE.md). Uncomment to enable:
     #agent-queue = true
 
-    # --- tmux pane/split bindings --------------------------------------------
-    keybind = ctrl+a>shift+%=new_split:right
-    keybind = ctrl+a>shift+@=new_split:right
-    keybind = ctrl+a>shift+"=new_split:down
-    keybind = ctrl+a>left=goto_split:left
-    keybind = ctrl+a>right=goto_split:right
-    keybind = ctrl+a>up=goto_split:up
-    keybind = ctrl+a>down=goto_split:down
-    keybind = ctrl+a>o=goto_split:next
-    keybind = ctrl+a>;=goto_split:previous
-    keybind = ctrl+a>x=close_surface
-    keybind = ctrl+a>z=toggle_split_zoom
-    keybind = ctrl+a>space=equalize_splits
-    keybind = ctrl+a>shift+{=swap_split:previous
-    keybind = ctrl+a>shift+}=swap_split:next
-    keybind = repeatable:ctrl+a>h=resize_split:left,10
-    keybind = repeatable:ctrl+a>j=resize_split:down,10
-    keybind = repeatable:ctrl+a>k=resize_split:up,10
-    keybind = repeatable:ctrl+a>l=resize_split:right,10
-    keybind = repeatable:ctrl+a>shift+h=resize_split:left,50
-    keybind = repeatable:ctrl+a>shift+j=resize_split:down,50
-    keybind = repeatable:ctrl+a>shift+k=resize_split:up,50
-    keybind = repeatable:ctrl+a>shift+l=resize_split:right,50
-
-    # --- tmux window/tab bindings --------------------------------------------
-    keybind = ctrl+a>c=new_tab
-    keybind = ctrl+a>n=next_tab
-    keybind = ctrl+a>p=previous_tab
-    keybind = ctrl+a>shift+&=close_tab
-    keybind = ctrl+a>,=prompt_tab_title
-    keybind = ctrl+a>w=toggle_tab_overview
-    keybind = ctrl+a>1=goto_tab:1
-    keybind = ctrl+a>2=goto_tab:2
-    keybind = ctrl+a>3=goto_tab:3
-    keybind = ctrl+a>4=goto_tab:4
-    keybind = ctrl+a>5=goto_tab:5
-    keybind = ctrl+a>6=goto_tab:6
-    keybind = ctrl+a>7=goto_tab:7
-    keybind = ctrl+a>8=goto_tab:8
-    keybind = ctrl+a>9=goto_tab:9
-
-    # --- tmux misc -----------------------------------------------------------
-    keybind = ctrl+a>ctrl+a=goto_last_surface
-    keybind = ctrl+a>shift+:=toggle_command_palette
-    keybind = ctrl+a>r=reload_config
+    # (My tmux-style `ctrl+a` keybindings live at the BOTTOM of this file, commented
+    # out. None are required — the same actions are all in the Command Palette.)
 
     # --- Bell -----------------------------------------------------------------
     # Out of focus (backgrounded window / non-focused split / another Space): full
@@ -871,17 +1006,93 @@ enum ForkSetup {
     # web-monitor-listen = 100.x.y.z:8787
     # web-monitor-token = <generate with: openssl rand -hex 24>
 
-    # --- MCP server (fork-only, OFF by default) ----------------------------------
+    # --- MCP server (fork-only) --------------------------------------------------
     # GUI-embedded MCP server for agent control. The token is a SHELL-EXECUTION
-    # credential, so enable this only WITH a token, in the untracked
-    # ~/.config/ghostty-ramon/local:
+    # credential. On first launch the fork AUTO-PROVISIONS a localhost bind + a
+    # random token into the untracked ~/.config/ghostty-ramon/local:
     #   mcp-listen = 127.0.0.1:8765
-    #   mcp-token  = <generate with: openssl rand -hex 24>
-    # The `ghostty-mcp` stdio shim is installed to ~/.local/bin on first launch;
-    # connect a local agent with:
+    #   mcp-token  = <random, generated for this machine>
+    # (so MCP-dependent features — the dashboard chips, the agent queue/manager,
+    # and the `ghostty-mcp` shim — work out of the box). To rotate the token, edit
+    # that file. The `ghostty-mcp` stdio shim is installed to ~/.local/bin on first
+    # launch; connect a local agent with:
     #   claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"
-    # (the shim reads the token above from ~/.config/ghostty-ramon/local). See
-    # MCP-SERVER.md.
+    # (the shim reads the token from ~/.config/ghostty-ramon/local). See MCP-SERVER.md.
+
+    # ============================================================================
+    # OPTIONAL: my personal tmux-style `ctrl+a` keybindings — ALL COMMENTED OUT.
+    #
+    # None of these are required; they're my muscle memory from years on tmux. Each
+    # line binds a fork ACTION (the part after `=`). To adopt my whole layout,
+    # uncomment this block; or copy individual actions onto keys you prefer. Heads
+    # up: `ctrl+a` shadows readline's start-of-line — a deliberate tmux-ism. Every
+    # action here is also in the Command Palette, so you can skip all of this and
+    # still use the fork.
+    # ----------------------------------------------------------------------------
+    # Split reorganization (fork-only actions), on a non-prefix combo:
+    #keybind = ctrl+cmd+shift+f=flip_split:horizontal
+    #keybind = ctrl+cmd+shift+v=flip_split:vertical
+    #keybind = ctrl+cmd+shift+h=toggle_split_direction:horizontal
+    #keybind = ctrl+cmd+shift+u=toggle_split_direction:vertical
+    #keybind = ctrl+cmd+shift+t=move_split_to_new_tab
+    #keybind = ctrl+cmd+shift+right=merge_tabs:next_horizontal
+    #keybind = ctrl+cmd+shift+down=merge_tabs:next_vertical
+    #keybind = ctrl+cmd+shift+left=merge_tabs:previous_horizontal
+    #keybind = ctrl+cmd+shift+up=merge_tabs:previous_vertical
+    #
+    # tmux-shaped `ctrl+a` prefix layer — fork-specific actions:
+    #keybind = ctrl+a>q=mark_split
+    #keybind = ctrl+a>shift+q=clear_split_mark
+    #keybind = ctrl+a>m=pull_marked_split:auto
+    #keybind = ctrl+a>shift+!=move_split_to_new_tab
+    #keybind = ctrl+a>f=toggle_project_selector
+    #keybind = ctrl+a>d=toggle_agent_dashboard
+    # One-key project launchers — open a new tab with cwd set to a project:
+    #keybind = ctrl+a>g=new_tab:~/git/your-project
+    #keybind = ctrl+a>i=new_tab:~/git/another-project
+    # Panes / splits:
+    #keybind = ctrl+a>shift+%=new_split:right
+    #keybind = ctrl+a>shift+@=new_split:right
+    #keybind = ctrl+a>shift+"=new_split:down
+    #keybind = ctrl+a>left=goto_split:left
+    #keybind = ctrl+a>right=goto_split:right
+    #keybind = ctrl+a>up=goto_split:up
+    #keybind = ctrl+a>down=goto_split:down
+    #keybind = ctrl+a>o=goto_split:next
+    #keybind = ctrl+a>;=goto_split:previous
+    #keybind = ctrl+a>x=close_surface
+    #keybind = ctrl+a>z=toggle_split_zoom
+    #keybind = ctrl+a>space=equalize_splits
+    #keybind = ctrl+a>shift+{=swap_split:previous
+    #keybind = ctrl+a>shift+}=swap_split:next
+    #keybind = repeatable:ctrl+a>h=resize_split:left,10
+    #keybind = repeatable:ctrl+a>j=resize_split:down,10
+    #keybind = repeatable:ctrl+a>k=resize_split:up,10
+    #keybind = repeatable:ctrl+a>l=resize_split:right,10
+    #keybind = repeatable:ctrl+a>shift+h=resize_split:left,50
+    #keybind = repeatable:ctrl+a>shift+j=resize_split:down,50
+    #keybind = repeatable:ctrl+a>shift+k=resize_split:up,50
+    #keybind = repeatable:ctrl+a>shift+l=resize_split:right,50
+    # Tabs / windows:
+    #keybind = ctrl+a>c=new_tab
+    #keybind = ctrl+a>n=next_tab
+    #keybind = ctrl+a>p=previous_tab
+    #keybind = ctrl+a>shift+&=close_tab
+    #keybind = ctrl+a>,=prompt_tab_title
+    #keybind = ctrl+a>w=toggle_tab_overview
+    #keybind = ctrl+a>1=goto_tab:1
+    #keybind = ctrl+a>2=goto_tab:2
+    #keybind = ctrl+a>3=goto_tab:3
+    #keybind = ctrl+a>4=goto_tab:4
+    #keybind = ctrl+a>5=goto_tab:5
+    #keybind = ctrl+a>6=goto_tab:6
+    #keybind = ctrl+a>7=goto_tab:7
+    #keybind = ctrl+a>8=goto_tab:8
+    #keybind = ctrl+a>9=goto_tab:9
+    # Misc:
+    #keybind = ctrl+a>ctrl+a=goto_last_surface
+    #keybind = ctrl+a>shift+:=toggle_command_palette
+    #keybind = ctrl+a>r=reload_config
 
     """
 }

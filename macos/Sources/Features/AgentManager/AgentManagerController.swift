@@ -242,6 +242,16 @@ final class AgentManagerController {
         env["GHOSTTY_MCP_URL"] = Self.mcpURL(listen: mcpListen, offset: mcpPortOffset)
         env["GHOSTTY_MCP_TOKEN"] = mcpToken
         env["GHOSTTY_AGENT_MANAGER"] = "1"
+        // (Agent Manager / colleague DMG) Point the sidecar's Haiku summarizer at the
+        // colleague's ALREADY-INSTALLED `claude` CLI, so we never ship the SDK's 215MB
+        // native binary. The bundled sidecar carries only the SDK JS; `model.ts` passes
+        // this as the SDK's `pathToClaudeCodeExecutable`. Resolved like `node` (a GUI app
+        // doesn't inherit the shell PATH). ABSENT (no `claude` found) ⇒ the env var is not
+        // set; the SDK then resolves a bare `claude` on its own PATH, and if there is none
+        // the summary call throws → the summarizer self-disables PER-SURFACE. This MUST
+        // NOT block the sidecar from starting — the Agent QUEUE makes no Haiku calls and
+        // runs regardless (the §8 gate does not consider `claude`).
+        env = Self.applyClaudePathEnv(into: env, claudePath: resolveClaudePath())
         // (ramon fork / Bell Attention) Arm the sidecar's bell-promotion pass when
         // the feature is on; absent ⇒ the sidecar does no bell-edge work.
         if bellFilterEnabled { env["GHOSTTY_BELL_FILTER"] = "1" }
@@ -337,13 +347,47 @@ final class AgentManagerController {
 
     /// Run the user's login shell to print `node`'s resolved path (so the GUI sees
     /// the same `node` the terminal would). Best-effort + bounded; returns nil on
-    /// any failure.
+    /// any failure. Delegates to the shared `probeExecutableViaLoginShell`.
     private static func probeNodeViaLoginShell() -> String? {
+        probeExecutableViaLoginShell("node")
+    }
+
+    /// Resolve the `claude` CLI for the SUMMARIZER's SDK calls (colleague DMG: use the
+    /// system `claude`, never the un-bundled 215MB native binary). Best-effort + cheap:
+    /// a login-shell `command -v claude` (a GUI app does not inherit the shell PATH).
+    /// Returns nil when no executable `claude` resolves — the sidecar still starts (the
+    /// queue is unaffected) and the summarizer self-disables per-surface. Called once at
+    /// childEnvironment build time (start + each restart).
+    private func resolveClaudePath() -> String? {
+        Self.probeExecutableViaLoginShell("claude")
+    }
+
+    /// (Agent Manager) Layer the resolved `claude` path onto the sidecar env. PURE +
+    /// unit-tested. A non-empty path ⇒ `GHOSTTY_CLAUDE_PATH=<path>` (the sidecar passes
+    /// it as the SDK's `pathToClaudeCodeExecutable`); nil/empty ⇒ the key is REMOVED so
+    /// the sidecar falls back to resolving a bare `claude` on its own PATH (and, failing
+    /// that, the summarizer self-disables per-surface). Stripping a stray inherited value
+    /// keeps the contract crisp: the controller is the sole authority on this path.
+    static func applyClaudePathEnv(into env: [String: String], claudePath: String?) -> [String: String] {
+        var env = env
+        if let p = claudePath, !p.isEmpty {
+            env["GHOSTTY_CLAUDE_PATH"] = p
+        } else {
+            env.removeValue(forKey: "GHOSTTY_CLAUDE_PATH")
+        }
+        return env
+    }
+
+    /// Run the user's login shell to print an executable's resolved path (so the GUI
+    /// sees the same binary the terminal would). Best-effort + bounded; returns nil on
+    /// any failure / non-executable result. Generalizes `probeNodeViaLoginShell` so
+    /// `node` and `claude` share one probe.
+    private static func probeExecutableViaLoginShell(_ name: String) -> String? {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: shell)
         // -l so the login shell sources the user's PATH; `command -v` is POSIX.
-        proc.arguments = ["-l", "-c", "command -v node"]
+        proc.arguments = ["-l", "-c", "command -v \(name)"]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice

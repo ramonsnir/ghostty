@@ -165,17 +165,26 @@ jobs:
       # Bundle the agent-manager sidecar (Agent Queue + Manager) as dist/ + package.json
       # into Contents/Resources/agent-manager (the path resolveSidecarDir() prefers). We
       # bundle ONLY dist + package.json — NOT node_modules: it is ~271MB and ships a native
-      # `claude` binary that would break notarization. The Agent QUEUE has ZERO npm deps so
-      # it runs from dist alone; model.ts lazy-imports the SDK only when a summary actually
-      # runs, so a colleague WITHOUT node_modules gets a working queue and a self-disabled
-      # summarizer. package.json carries "type":"module" (node needs it to treat dist/*.js
-      # as ESM). RUNTIME PREREQ on the colleague's Mac: `node` on PATH (the controller's
-      # self-disable gate handles its absence). Uses the runner's system node (like the
-      # swift step above), NOT nix.
-      - name: Build + bundle agent-manager sidecar (dist only)
+      # ~215MB `claude` Mach-O (in @anthropic-ai/claude-agent-sdk-darwin-arm64) that would
+      # break notarization. `npm run build` = tsc + esbuild: esbuild RE-bundles dist/index.js
+      # with the Claude Agent SDK's JAVASCRIPT inlined (a few MB, NO native binary — it's
+      # marked external), so the SUMMARIZER works for colleagues from dist alone: model.ts
+      # points the SDK at the colleague's ALREADY-INSTALLED `claude` via
+      # pathToClaudeCodeExecutable (GHOSTTY_CLAUDE_PATH, set by AgentManagerController). The
+      # Agent QUEUE has ZERO npm deps and runs from dist regardless. package.json carries
+      # "type":"module" (node needs it to treat dist/*.js as ESM). RUNTIME PREREQ on the
+      # colleague's Mac: `node` on PATH (and, for the summarizer, `claude` on PATH — both
+      # handled gracefully if absent). Uses the runner's system node, NOT nix.
+      - name: Build + bundle agent-manager sidecar (dist only; SDK JS inlined)
         run: |
           ( cd macos/agent-manager && npm ci && npm run build )
           test -f macos/agent-manager/dist/index.js
+          # Sanity: SDK JS inlined (summarizer works with no node_modules) + no bare
+          # @anthropic-ai import survived (which would throw at runtime under dist-only).
+          grep -q "Claude Code executable" macos/agent-manager/dist/index.js \
+            || { echo "ERROR: Agent SDK JS not inlined into dist/index.js"; exit 1; }
+          ! grep -qE '(import|require)\(["'"'"'"]@anthropic-ai' macos/agent-manager/dist/index.js \
+            || { echo "ERROR: a bare @anthropic-ai import survived bundling"; exit 1; }
           APP="macos/build/Release/Ghostty.app"
           DST="$APP/Contents/Resources/agent-manager"
           rm -rf "$DST"; mkdir -p "$DST"

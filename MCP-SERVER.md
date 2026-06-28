@@ -28,6 +28,15 @@ mcp-listen = 127.0.0.1:8765                 # BIND address — localhost recomme
 mcp-token  = <48-hex secret>                # `openssl rand -hex 24`
 ```
 
+> **On a fork INSTALL (the DMG build), this is auto-configured for you.** On first launch
+> the app provisions the untracked `~/.config/ghostty-ramon/local` with
+> `mcp-listen = 127.0.0.1:8765` + a freshly-generated random `mcp-token` (64 hex chars from
+> the system CSPRNG), so the MCP server — and everything built on it (the `ghostty-mcp`
+> shim, the Claude agent-state hooks, the dashboard chips, the agent queue/manager) — works
+> out of the box with no hand-written token. It never rotates or clobbers a token you
+> already set there; to rotate, edit the `mcp-token` line in `local`. The keys below are
+> for a from-scratch / repo-clone setup, or to override the auto-provisioned values.
+
 - **`mcp-listen`** — `addr:port` to bind. **Localhost (`127.0.0.1`)** is recommended: the
   agent (a local Claude Code / Codex, via the stdio shim) runs on this same Mac. It's a
   *bind address*, not an allowlist. Empty/unset ⇒ the server is disabled.

@@ -21,15 +21,16 @@ After installing the DMG and relaunching once, this is the lay of the land:
 
 | Feature | Status after install |
 |---|---|
-| Fork keybinds (`ctrl+a` splits/tabs/resize/move) | **Works OOTB** — seeded config |
+| Fork features (splits/tabs/move/find, Agent Dashboard, …) | **Works OOTB** via the Command Palette |
 | Hosted backend (session survival, live previews) | **Works OOTB** after one relaunch |
-| Agent Dashboard (live CLI-agent tiles) | **Works OOTB** (on by default; `ctrl+a>d`) |
+| Agent Dashboard (live CLI-agent tiles) | **Works OOTB** (on by default) |
 | `ghostty-ramon` discovery CLI | **Works OOTB** — installed to `~/.local/bin` |
-| Project selector (`ctrl+a>f`) | Needs `project-directory` set (1 line in config) |
-| MCP server (let an agent drive splits) | Needs `mcp-listen` + `mcp-token` in `local` |
+| MCP server (let an agent drive splits) | **Works OOTB** — bind + token auto-written to `local` on first launch |
+| Fork keybinds (a tmux-style `ctrl+a` layer) | **Opt-in** — shipped COMMENTED in the seed; uncomment to adopt |
+| Project selector | Needs `project-directory` set (1 line in config) |
 | Web monitor (drive splits from a phone) | Needs `web-monitor-listen` (+ Tailscale) in `local` |
 | Agent **Queue** (one agent per work item) | Needs `node` on PATH + agent-state hooks + a template |
-| Agent **Manager** Haiku tile summaries | **Dev-only** — needs npm packages not in the DMG |
+| Agent **Manager** Haiku tile summaries + rate-limit watchdog | **Works** with `node` + `claude` on PATH (billed to your Claude subscription) |
 
 "OOTB" = nothing to configure; the rest are deliberate opt-ins (see the `local` and
 node sections below). `ONBOARDING.md` walks through each.
@@ -56,22 +57,31 @@ node sections below). `ONBOARDING.md` walks through each.
 The app does a one-time, idempotent setup:
 
 - **Seeds `~/.config/ghostty-ramon/config`** (only if you don't already have one)
-  with the fork's keybinds + sensible defaults. Safe to edit afterward — it's
-  never overwritten.
+  with the fork's feature settings + sensible defaults. The personal tmux-style
+  `ctrl+a` keybind layer is shipped **COMMENTED OUT** — nothing is bound for you;
+  every fork action is in the Command Palette, and you can uncomment the block (or
+  bind your own keys) if you want it. Safe to edit afterward — it's never overwritten.
+- **Auto-provisions `~/.config/ghostty-ramon/local`** with a localhost MCP bind
+  (`mcp-listen = 127.0.0.1:8765`) + a freshly-generated random `mcp-token`, so the
+  MCP server (and the agent-control features built on it) works out of the box with
+  no hand-written token. It never rotates or clobbers a token you already set there.
 - **Installs a launchd LaunchAgent** (`com.mitchellh.ghostty-ramon.host`) that
   supervises the bundled `ghostty-host` daemon. This is what powers session
   survival across app restarts, live agent-dashboard previews, and the
-  color/scrollback web monitor.
+  color/scrollback web monitor. (Run synchronously+early on launch so the daemon is
+  up before terminals connect — no blank-pane race.)
 - **Opens the Agent Dashboard panel** (a sidebar of live previews of any
   Claude/Codex splits) — it's enabled by default. On the very first launch it may
-  appear empty until you relaunch (previews need the hosted backend, below).
-  Toggle it any time with `ctrl+a>d`, or set `agent-dashboard = false` in
-  `~/.config/ghostty-ramon/config` to keep it off.
+  appear empty until you relaunch (previews need the hosted backend, below). Toggle
+  it any time from the Command Palette → "Toggle Agent Dashboard", or set
+  `agent-dashboard = false` in `~/.config/ghostty-ramon/config` to keep it off.
 
 > **Relaunch once after the first run.** The hosted (`pty-host`) backend is enabled
-> by the seeded config, which only takes effect on the *next* launch. So the very
-> first launch uses the simpler in-process backend (everything works, just no
+> by the seeded config, which is only read at the *next* launch. So the very first
+> launch uses the simpler in-process backend (everything works, just no
 > session-survival/live-preview); quit and reopen once to get the full feature set.
+> From then on the host is brought up before terminals connect, so the hosted backend
+> is reliable on every launch (no more occasional blank panes on a cold start).
 
 ## Updates (no git, no rebuild)
 
@@ -85,14 +95,18 @@ Updates…**. Updating replaces the app in place and reloads the host daemon.
 
 ## Optional: secrets / per-machine settings (`local`)
 
-Some features need a per-machine value or a secret. Those live in an **untracked**
-file the seeded config already includes:
+Per-machine values and secrets live in an **untracked** file the seeded config
+already includes:
 
 ```
 ~/.config/ghostty-ramon/local
 ```
 
-Create it by hand if you want either of these:
+**The MCP server's bind + token are written here for you on first launch** —
+localhost-only with a random token — so the MCP feature works with no setup. To
+**rotate** the token, just edit the `mcp-token` line in that file.
+
+Add the web-monitor lines by hand if you want that feature:
 
 ```ini
 # Web monitor (watch/drive splits from your phone over Tailscale).
@@ -100,19 +114,17 @@ Create it by hand if you want either of these:
 web-monitor-listen = 100.x.y.z:8787
 web-monitor-token  = <openssl rand -hex 24>
 
-# MCP server (let a local Claude Code / Codex drive splits/tabs). Localhost-only,
-# and ALWAYS set a token — it can spawn tabs and run commands.
+# MCP server — auto-provisioned on first launch (shown for reference). The token
+# is a shell-execution credential (it can spawn tabs and run commands).
 mcp-listen = 127.0.0.1:8765
-mcp-token  = <openssl rand -hex 24>
+mcp-token  = <random, generated for this machine>
 ```
-
-If `local` is absent the app still launches fine; those two features just stay off.
 
 ### Connecting an agent to the MCP server
 
 The app installs the `ghostty-mcp` stdio shim to `~/.local/bin/ghostty-mcp` on first
-launch (and refreshes it on each update). Once `mcp-listen` + `mcp-token` are set in
-`local`, point your local Claude Code at it:
+launch (and refreshes it on each update). Since `mcp-listen` + `mcp-token` are
+auto-provisioned in `local` (above), just point your local Claude Code at it:
 
 ```sh
 claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"
@@ -127,13 +139,15 @@ ghostty -- ghostty-mcp` works too.) See **MCP-SERVER.md** for the tool list.
 The Agent Dashboard (live tiles of your CLI-agent splits) and the Agent **Queue** (a
 supervisor that launches one agent per work item) are bundled in the app. To turn them on:
 set `agent-dashboard = true` (and, for the queue, `agent-queue = true` + `agent-manager =
-true`) in `~/.config/ghostty-ramon/config`, set `mcp-listen`/`mcp-token` in `local` (above),
+true`) in `~/.config/ghostty-ramon/config` — MCP is already configured in `local` for you —
 and **have `node` on your `PATH`** — the queue/manager sidecar runs under node, and silently
 stays off (one log line, no error) if node is missing. The queue also wants the Claude Code
 agent-state hooks installed (see **AGENT-DASHBOARD.md**) so it can auto-close finished agents,
-and a queue **template** describing your tracker (see **AGENT-QUEUE.md**). Note: the one-line
-Haiku tile *summaries* (the "Agent Manager") need extra node packages that are NOT shipped in
-the DMG, so they stay off for colleagues — the **queue itself works without them**.
+and a queue **template** describing your tracker (see **AGENT-QUEUE.md**). The one-line Haiku
+tile *summaries* + the rate-limit attention watchdog (the "Agent Manager") **now work for
+colleagues too** — they use your already-installed `claude` CLI (so also have `claude` on your
+`PATH`), billed to your own Claude subscription; if `claude` isn't found the summaries stay off
+while the queue keeps running.
 
 ## Day-2 discovery (find the fork's features)
 

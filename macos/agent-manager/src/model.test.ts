@@ -7,7 +7,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { summarize, SUMMARIZER_MODEL, type QueryFn } from "./model.js";
+import {
+  summarize,
+  resolveClaudePath,
+  SUMMARIZER_MODEL,
+  type QueryFn,
+} from "./model.js";
 
 /**
  * Build a fake `queryFn` that yields the given message-like objects in order.
@@ -128,6 +133,67 @@ test("summarize: honors a model override", async () => {
   await summarize({ system: "S", user: "U", model: "claude-sonnet-4-5" }, q);
   const params = cap.params as { options: { model: string } };
   assert.equal(params.options.model, "claude-sonnet-4-5");
+});
+
+// --- claude-path resolution (colleague: use the system `claude`) ------------
+
+test("resolveClaudePath: GHOSTTY_CLAUDE_PATH (trimmed) wins when non-empty", () => {
+  assert.equal(
+    resolveClaudePath({ GHOSTTY_CLAUDE_PATH: "/opt/homebrew/bin/claude" }),
+    "/opt/homebrew/bin/claude",
+  );
+  assert.equal(
+    resolveClaudePath({ GHOSTTY_CLAUDE_PATH: "  /usr/local/bin/claude  " }),
+    "/usr/local/bin/claude",
+  );
+});
+
+test("resolveClaudePath: unset/blank => undefined (SDK falls back to PATH)", () => {
+  assert.equal(resolveClaudePath({}), undefined);
+  assert.equal(resolveClaudePath({ GHOSTTY_CLAUDE_PATH: "" }), undefined);
+  assert.equal(resolveClaudePath({ GHOSTTY_CLAUDE_PATH: "   " }), undefined);
+});
+
+test("summarize: GHOSTTY_CLAUDE_PATH => pathToClaudeCodeExecutable passed through", async () => {
+  const prev = process.env.GHOSTTY_CLAUDE_PATH;
+  process.env.GHOSTTY_CLAUDE_PATH = "/opt/homebrew/bin/claude";
+  try {
+    const cap: { params?: unknown } = {};
+    const q = recordingQuery(
+      [{ type: "result", subtype: "success", result: "ok" }],
+      cap,
+    );
+    await summarize({ system: "S", user: "U" }, q);
+    const params = cap.params as {
+      options: { pathToClaudeCodeExecutable?: string };
+    };
+    assert.equal(
+      params.options.pathToClaudeCodeExecutable,
+      "/opt/homebrew/bin/claude",
+    );
+  } finally {
+    if (prev === undefined) delete process.env.GHOSTTY_CLAUDE_PATH;
+    else process.env.GHOSTTY_CLAUDE_PATH = prev;
+  }
+});
+
+test("summarize: no GHOSTTY_CLAUDE_PATH => pathToClaudeCodeExecutable omitted", async () => {
+  const prev = process.env.GHOSTTY_CLAUDE_PATH;
+  delete process.env.GHOSTTY_CLAUDE_PATH;
+  try {
+    const cap: { params?: unknown } = {};
+    const q = recordingQuery(
+      [{ type: "result", subtype: "success", result: "ok" }],
+      cap,
+    );
+    await summarize({ system: "S", user: "U" }, q);
+    const params = cap.params as {
+      options: { pathToClaudeCodeExecutable?: string };
+    };
+    assert.equal(params.options.pathToClaudeCodeExecutable, undefined);
+  } finally {
+    if (prev !== undefined) process.env.GHOSTTY_CLAUDE_PATH = prev;
+  }
 });
 
 // --- account routing via configDir ------------------------------------------

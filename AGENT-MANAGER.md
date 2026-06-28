@@ -85,15 +85,19 @@ summarizer — the only thing here that spends Haiku — stays completely silent
 
 1. **pty-host + Agent Dashboard** enabled (the summarizer annotates dashboard tiles):
    `pty-host = …` and `agent-dashboard = true` already in your fork config.
-2. **MCP server** enabled — the sidecar's only transport:
-   `mcp-listen = 127.0.0.1:8765` plus an `mcp-token` (in `~/.config/ghostty-ramon/local`).
+2. **MCP server** enabled — the sidecar's only transport: `mcp-listen = 127.0.0.1:8765`
+   plus an `mcp-token` (in `~/.config/ghostty-ramon/local`). On a **fork install** these are
+   auto-provisioned on first launch, so this is already satisfied.
 3. **node** on your login shell `PATH` (the GUI probes `command -v node`), or set
    `agent-manager-node-path` explicitly.
-4. **The sidecar must be built** (it is not bundled into the app yet):
-   ```sh
-   cd ~/git/ghostty/macos/agent-manager && npm ci && npm run build
-   ```
-5. **Claude Code hooks** (the same ones the Agent Dashboard uses — see
+4. **`claude` on your login-shell `PATH`** (the GUI probes `command -v claude`) — the
+   summarizer drives your installed `claude` CLI for its Haiku calls (billed to your own
+   Claude subscription). If `claude` isn't found, the summarizer self-disables per-surface;
+   the Agent Queue is unaffected.
+5. **The sidecar** — bundled inside a **fork install** at
+   `…/Ghostty (ramon).app/Contents/Resources/agent-manager` (no action needed). In a **repo
+   clone** (dev), build it once: `cd ~/git/ghostty/macos/agent-manager && npm ci && npm run build`.
+6. **Claude Code hooks** (the same ones the Agent Dashboard uses — see
    `AGENT-DASHBOARD.md`) for the *best* summaries: they feed your latest prompt and the
    working/waiting state, which make the one-liners specific. Without them the summarizer
    falls back to the on-screen text alone and reads thinner.
@@ -430,31 +434,52 @@ the Queue's exit prelude). **Do NOT rebuild a reply-suggestion feature** — a p
 Approve/Edit/Dismiss-on-`waiting`-tiles pass was removed end-to-end as
 low-value/quota-draining.
 
-### COLLEAGUE / DMG distribution — the sidecar IS bundled (dist-only), so the QUEUE works
+### COLLEAGUE / DMG distribution — BOTH the QUEUE and the Haiku SUMMARIZER work
 
 Both release paths (`dist/macos/release-local.sh` step 3b +
 `.github/workflows/fork-release.yml`) build the sidecar and copy **`dist/` + `package.json`
 ONLY** into `Contents/Resources/agent-manager` — the path `resolveSidecarDir()` prefers
 over the dev `#filePath`. **`node_modules` is deliberately NOT bundled** (~271MB and it
-ships a native `claude` binary that would break notarization), so the bundle is pure-JS
-data — notarization-safe, no extra signing (the app seal covers `Resources/`). Three things
-make this work: (1) the Agent **Queue** engine has ZERO npm deps (Node built-ins + global
-`fetch`); (2) `model.ts` imports the SDK as a **TYPE-ONLY import + a LAZY `await import()`**
-inside `summarize()`, so `dist/index.js` loads with no `node_modules` and only a real
-summary call pulls the SDK (a missing SDK throws → the summarizer self-disables
-per-surface, queue unaffected); (3) `package.json` is bundled so node treats `dist/*.js` as
-ESM (`"type":"module"`).
+ships a ~215MB native `claude` Mach-O — in `@anthropic-ai/claude-agent-sdk-darwin-arm64` —
+that would break notarization), so the bundle is pure-JS data — notarization-safe, no extra
+signing (the app seal covers `Resources/`).
 
-**RUNTIME PREREQ: `node` on PATH** — the controller's §8 self-disable gate probes a
-login-shell `command -v node` and stays dormant (one log line, no crash) if absent, so a
-colleague without node just doesn't get the features. **So for a colleague: the Agent QUEUE
-works** (given node + the usual opt-in: `agent-queue`/`agent-manager` on,
-`mcp-listen`/`mcp-token` set, the agent-state hooks installed, a template) — **but the
-Haiku tile SUMMARIZER stays dev-only** (it needs the un-bundled `node_modules`; without it,
-the SDK import throws and the summarizer self-disables while the queue runs fine). Verified
-the dist-only bundle boots with no `node_modules`. Wiring: `model.ts` (type-only + lazy
-import), `dist/macos/release-local.sh` (step 3b), `.github/workflows/fork-release.yml`
-("Build + bundle agent-manager sidecar").
+**The summarizer is NO LONGER dev-only** (this supersedes the old "needs un-bundled
+`node_modules`" note). The release `npm run build` is now `tsc` + **esbuild**
+(`esbuild.config.mjs`): after `tsc` emits `dist/`, esbuild RE-bundles `dist/index.js` into a
+single self-contained ESM file with **the Claude Agent SDK's JavaScript inlined** (a few MB,
+minified) — so the summarizer's lazy `import("@anthropic-ai/claude-agent-sdk")` resolves from
+the bundle with `node_modules` absent. The native platform package is marked **external** so
+esbuild never drags a Mach-O in (a size guard + Mach-O-magic check in the config FAIL the
+build if one ever sneaks in). The trick that makes shipping NO native binary OK: the SDK's
+`query()` does not make HTTP itself — it SPAWNS the `claude` CLI — and `model.ts` points it at
+the **colleague's ALREADY-INSTALLED `claude`** via the SDK's `pathToClaudeCodeExecutable`
+option (`resolveClaudePath(env)` reads `GHOSTTY_CLAUDE_PATH`, falling back to a bare `claude`
+on the SDK's own PATH lookup when unset). `AgentManagerController` resolves `claude` via a
+login-shell `command -v claude` probe (the generalized `probeExecutableViaLoginShell`, shared
+with the `node` probe) and sets `GHOSTTY_CLAUDE_PATH` in the sidecar env (pure, tested
+`applyClaudePathEnv`).
+
+**RUNTIME PREREQS on the colleague's Mac: `node` on PATH (for any sidecar feature) AND
+`claude` on PATH (for the summarizer + the rate-limit watchdog).** The §8 launch gate is
+UNCHANGED — it does NOT consider `claude`, so `claude`'s absence NEVER blocks the sidecar:
+the Agent Queue still runs; only the summarizer self-disables PER-SURFACE (a summary call with
+no resolvable `claude` throws → the per-surface error path skips it). So for a colleague with
+both `node` + `claude` installed (plus the usual opt-in: `agent-queue`/`agent-manager` on, MCP
+configured, the agent-state hooks, a template) **both the queue AND the Haiku tile summaries +
+the rate-limit attention watchdog work, billed to their own Claude subscription**. Three
+remaining load-bearing facts: (1) the Agent Queue engine has ZERO npm deps (Node built-ins +
+global `fetch`); (2) `model.ts` still uses a TYPE-ONLY import + a LAZY `await import()` so the
+pre-bundle entry carries no static SDK import (esbuild inlines the real JS at release); (3)
+`package.json` is bundled so node treats `dist/*.js` as ESM (`"type":"module"`). Both release
+scripts add sanity greps (the SDK JS is inlined — a "Claude Code executable" marker present —
+and NO bare `@anthropic-ai` import survived bundling). Wiring: `model.ts` (`resolveClaudePath`
++ `pathToClaudeCodeExecutable`), `esbuild.config.mjs` (NEW), `package.json` (`build` =
+tsc+esbuild, esbuild devDep), `AgentManagerController.swift` (`applyClaudePathEnv` +
+`resolveClaudePath`/`probeExecutableViaLoginShell` + `GHOSTTY_CLAUDE_PATH` in
+`childEnvironment`), `dist/macos/release-local.sh` (step 3b), `.github/workflows/fork-release.yml`
+("Build + bundle agent-manager sidecar (dist only; SDK JS inlined)"). Tests:
+`AgentManagerControllerTests` (`applyClaudePathEnv`), `model.test.ts` (`resolveClaudePath`).
 
 ### Account routing (optional) — dev internals
 

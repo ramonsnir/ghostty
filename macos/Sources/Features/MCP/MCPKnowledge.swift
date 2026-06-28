@@ -68,6 +68,7 @@ enum MCPKnowledge {
         ("agent-queue", { String($0.agentQueueEnabled) }),
         ("agent-queue-templates-dir", { $0.agentQueueTemplatesDir ?? "" }),
         ("agent-queue-max-total", { String($0.agentQueueMaxTotal) }),
+        ("pty-host", { $0.ptyHost ?? "" }),
         // --- high-signal upstream keys ---
         ("bell-features", { describeBellFeatures($0.bellFeatures) }),
         ("background-opacity", { String($0.backgroundOpacity) }),

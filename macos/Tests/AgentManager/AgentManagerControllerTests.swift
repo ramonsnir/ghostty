@@ -275,4 +275,32 @@ struct AgentManagerControllerTests {
         #expect(out["GHOSTTY_SUMMARIZER"] == "0")
         #expect(out["PATH"] == "/usr/bin")
     }
+
+    // MARK: - applyClaudePathEnv (colleague: route the summarizer at the system claude)
+
+    /// A resolved path ⇒ GHOSTTY_CLAUDE_PATH is set (the sidecar passes it as the SDK's
+    /// pathToClaudeCodeExecutable), other keys untouched.
+    @Test func claudePathEnvSetWhenResolved() {
+        let out = AgentManagerController.applyClaudePathEnv(
+            into: ["PATH": "/usr/bin"], claudePath: "/opt/homebrew/bin/claude")
+        #expect(out["GHOSTTY_CLAUDE_PATH"] == "/opt/homebrew/bin/claude")
+        #expect(out["PATH"] == "/usr/bin")
+    }
+
+    /// nil ⇒ the key is REMOVED (so the sidecar falls back to a bare `claude` on PATH;
+    /// failing that, the summarizer self-disables per-surface). A stray inherited value
+    /// must not leak through — the controller is the sole authority on this path.
+    @Test func claudePathEnvRemovedWhenNil() {
+        let out = AgentManagerController.applyClaudePathEnv(
+            into: ["PATH": "/usr/bin", "GHOSTTY_CLAUDE_PATH": "/stale/claude"], claudePath: nil)
+        #expect(out["GHOSTTY_CLAUDE_PATH"] == nil)
+        #expect(out["PATH"] == "/usr/bin")
+    }
+
+    /// An empty string is treated like nil (removed) — never set an empty exe path.
+    @Test func claudePathEnvRemovedWhenEmpty() {
+        let out = AgentManagerController.applyClaudePathEnv(
+            into: ["GHOSTTY_CLAUDE_PATH": "/stale/claude"], claudePath: "")
+        #expect(out["GHOSTTY_CLAUDE_PATH"] == nil)
+    }
 }
