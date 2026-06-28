@@ -369,6 +369,74 @@ test("applyCommands: a set_keep is NOT counted as an active-runs change (keep li
   assert.equal(reg.get("r")!.keep.get("K-1"), true, "the override was still applied");
 });
 
+/** A minimal Assignment for seeding `run.active` in the release tests. */
+function asg(run: QueueRun, key: string): void {
+  run.active.set(key, {
+    queueName: run.runName, key, sessionID: 1, gridSlot: 0, state: "RUNNING", sinceMs: 0,
+  });
+}
+
+test("applyCommand release: clears the latch + cooldown for one item", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const run = reg.get("r")!;
+  run.dispatched.add("K-1");
+  run.dispatched.add("K-2");
+  run.cooldown.set("K-1", 9_999_999);
+  const res = applyCommand(reg, { action: "release", run: "r", key: "K-1" }, factory);
+  assert.equal(res.kind, "released");
+  assert.equal(res.runName, "r");
+  assert.equal(run.dispatched.has("K-1"), false, "the latch was cleared");
+  assert.equal(run.cooldown.has("K-1"), false, "the cooldown was cleared");
+  assert.equal(run.dispatched.has("K-2"), true, "an unrelated latched key is untouched");
+});
+
+test("applyCommand release: releasing a not-latched key is a tolerant 'released' (no throw)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const res = applyCommand(reg, { action: "release", run: "r", key: "never-latched" }, factory);
+  assert.equal(res.kind, "released");
+  assert.equal(reg.get("r")!.dispatched.size, 0);
+});
+
+test("applyCommand release (bulk, no key): clears every HELD item = latched ∩ listed ∩ ¬active", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const run = reg.get("r")!;
+  for (const k of ["A", "B", "C", "D"]) run.dispatched.add(k);
+  run.cooldown.set("B", 9_999_999);
+  asg(run, "A"); // A is still active (running) → NOT released
+  run.lastListItems = [{ key: "A" }, { key: "B" }, { key: "D" }]; // C not listed → NOT released
+  const res = applyCommand(reg, { action: "release", run: "r" }, factory);
+  assert.equal(res.kind, "released");
+  // B + D were latched, listed, and not active → released (+ B's cooldown cleared).
+  assert.deepEqual([...run.dispatched].sort(), ["A", "C"], "only held items released");
+  assert.equal(run.cooldown.has("B"), false, "released item's cooldown cleared");
+});
+
+test("applyCommand release: unknown / missing run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  assert.equal(applyCommand(reg, { action: "release", key: "K-1" }, factory).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "release", run: "ghost", key: "K-1" }, factory).kind, "noop");
+});
+
+test("applyCommands: release is NOT counted as an active-runs change (latch lives in the per-run store)", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommands(reg, [{ action: "start", template: "f" }], factory);
+  reg.get("r")!.dispatched.add("K-1");
+  assert.equal(
+    applyCommands(reg, [{ action: "release", run: "r", key: "K-1" }], factory),
+    false,
+  );
+  assert.equal(reg.get("r")!.dispatched.has("K-1"), false, "the latch was still cleared");
+});
+
 test("applyCommand: pause/resume/stop/abort for an unknown run is a no-op", () => {
   const reg: RunRegistry = new Map();
   const { factory } = makeFactory({});

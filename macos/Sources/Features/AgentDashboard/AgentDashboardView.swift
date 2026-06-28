@@ -149,6 +149,12 @@ struct AgentDashboardView: View {
                             onSetConcurrency: { value in
                                 model.setQueueConcurrency(run: section.id, value: value)
                             },
+                            onReleaseItem: { key in
+                                model.releaseQueueItem(run: section.id, key: key)
+                            },
+                            onReleaseAll: {
+                                model.releaseQueueItem(run: section.id, key: nil)
+                            },
                             graph: model.queueGraphs[section.id],
                             onOpenBacklog: {
                                 QueueBacklogWindowManager.shared.open(
@@ -399,6 +405,11 @@ private struct OriginSectionHeader: View {
     /// parallel control). The raw user string ("9") is posted as a `set_concurrency`
     /// command; the sidecar parses it (blank/garbage/non-positive = ignored).
     let onSetConcurrency: (String) -> Void
+    /// (release) Release ONE held item from the dispatch latch (its key) so the queue
+    /// re-dispatches it without a tracker round-trip.
+    let onReleaseItem: (String) -> Void
+    /// (release) Release ALL held items in this run from the dispatch latch at once.
+    let onReleaseAll: () -> Void
     /// (backlog graph) The run's latest whole-board snapshot, when the supervisor has pushed
     /// one (only when the template declares `provider.graph`). nil ⇒ no backlog button.
     let graph: QueueGraph?
@@ -412,6 +423,8 @@ private struct OriginSectionHeader: View {
     // (§11 health) The "N waiting" / "M running" count dropdowns (items + Linear links).
     @State private var showWaiting = false
     @State private var showRunning = false
+    // (release) The "N held" dropdown (held items + per-item / bulk Release).
+    @State private var showHeld = false
     // (live maxItems edit) The "dispatched/cap" tap-to-edit popover + its draft field.
     @State private var showCapEditor = false
     @State private var capDraft = ""
@@ -513,6 +526,25 @@ private struct OriginSectionHeader: View {
                             .help("Change max simultaneous agents (concurrency) for this run")
                             .popover(isPresented: $showConcurrencyEditor, arrowEdge: .bottom) {
                                 concurrencyEditorPopover(status)
+                            }
+                        }
+                        // (release) The "N held" chip — items dispatched once but suppressed by
+                        // the dispatch latch (agent crashed/exited or killed before claiming).
+                        // Shown only when there ARE held items; opens a popover to Release them
+                        // (clears the latch so the queue re-dispatches, no tracker round-trip).
+                        if status.heldCount > 0 {
+                            Button { showHeld.toggle() } label: {
+                                HStack(spacing: 2) {
+                                    Image(systemName: "pause.circle")
+                                    Text("\(status.heldCount) held")
+                                }
+                                .font(.caption2)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.orange)
+                            .help("Items dispatched once but held by the latch — release to re-queue")
+                            .popover(isPresented: $showHeld, arrowEdge: .bottom) {
+                                heldPopover(status)
                             }
                         }
                     } else {
@@ -777,6 +809,53 @@ private struct OriginSectionHeader: View {
         .frame(width: 420)
     }
 
+
+    /// (release) The "N held" popover: an explanation, a "Release all" button, and one row per
+    /// held item (key badge · title · Linear link · Release). Releasing clears the dispatch
+    /// latch so the queue re-dispatches that item on its next `list` poll — the in-place escape
+    /// from the latch's "needs a tracker status round-trip" rule. All text via `Text`/`Link`
+    /// (SwiftUI escapes the untrusted tracker data; only http(s) urls are made clickable).
+    @ViewBuilder
+    private func heldPopover(_ status: QueueStatus) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("\(status.heldCount) held").font(.headline)
+                Spacer(minLength: 8)
+                Button("Release all", action: onReleaseAll)
+                    .controlSize(.small)
+                    .help("Clear the latch for all held items so the queue re-dispatches them")
+            }
+            Text("Dispatched once but the queue won't re-run them — the agent crashed, exited, or was killed before claiming, and the item is back in the backlog. Release clears the latch so it re-dispatches (no tracker status round-trip).")
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+            if status.held.isEmpty {
+                Text("Nothing held.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(status.held) { item in
+                    HStack(spacing: 6) {
+                        Text(item.key)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.18))
+                            .clipShape(Capsule())
+                        itemLink(item)
+                        Spacer(minLength: 4)
+                        Button("Release") { onReleaseItem(item.key) }
+                            .controlSize(.small)
+                            .help("Clear the latch for this item so the queue re-dispatches it")
+                    }
+                }
+                if status.heldCount > status.held.count {
+                    Text("… and \(status.heldCount - status.held.count) more (use Release all)")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(12)
+        .frame(width: 460)
+    }
 
     /// The item's title as a Linear `Link` when it carries an http(s) url; else plain text.
     @ViewBuilder

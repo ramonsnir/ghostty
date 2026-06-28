@@ -335,6 +335,20 @@ enum MCPTools {
                             "required": ["key"],
                         ],
                     ],
+                    "heldCount": ["type": "integer", "description": "Count of HELD items: dispatched once but suppressed by the dispatch latch while still in the backlog (agent crashed/exited or was killed before claiming). Exact count (the 'held' list may be capped)."],
+                    "held": [
+                        "type": "array",
+                        "description": "A few of the HELD items — each releasable in-place (clears the latch so it re-dispatches, no tracker round-trip).",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "key": ["type": "string"],
+                                "title": ["type": "string"],
+                                "url": ["type": "string"],
+                            ],
+                            "required": ["key"],
+                        ],
+                    ],
                 ],
                 "required": ["queueName"],
                 "additionalProperties": false,

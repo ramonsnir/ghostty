@@ -197,6 +197,8 @@ export class McpClient {
       concurrency: status.concurrency,
       next: status.next,      // each carries key/title?/url?
       running: status.running, // key/title?/url? per running agent
+      heldCount: status.heldCount, // (release) exact count of latch-held items
+      held: status.held,           // (release) a few held items, each releasable in-place
     });
   }
 
@@ -537,6 +539,7 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   "set_max_items",
   "set_concurrency",
   "set_keep",
+  "release",
 ]);
 
 /**

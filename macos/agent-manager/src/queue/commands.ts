@@ -21,6 +21,13 @@
 //                      without restarting it; persisted so a restart re-applies it.
 //   set_concurrency{run,concurrency} → re-set a LIVE run's max simultaneous agents (the dashboard
 //                      parallel control) without restarting it; persisted so a restart re-applies it.
+//   release{run,key?} → clear the §7.1 dispatch LATCH for one item (`key`) or every HELD item
+//                      (no key): a key dispatched once that the queue won't re-dispatch (its agent
+//                      crashed/exited, or was killed before claiming) because the item is still in
+//                      the `list` and the latch suppresses it. Clearing the latch (+ cooldown)
+//                      re-enables dispatch on the next `list` poll — the in-place escape from the
+//                      "needs a tracker status round-trip" rule. The cleared latch lives in the
+//                      PER-RUN store (persisted by the run's next reconcile sweep, like set_keep).
 //
 // A command naming an UNKNOWN run (pause/resume/stop/abort with no matching active run) or a
 // start whose template fails to load is a logged NO-OP — never a throw into the loop.
@@ -41,7 +48,8 @@ export interface QueueCommand {
     | "resume"
     | "set_max_items"
     | "set_concurrency"
-    | "set_keep";
+    | "set_keep"
+    | "release";
   /** The template basename to start (start only). */
   template?: string;
   /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency/set_keep. */
@@ -58,7 +66,9 @@ export interface QueueCommand {
    *  `parseConcurrencyValue` (blank/garbage/non-positive = ignored). Absent for other actions. */
   concurrency?: string;
   /** (keep) The work-item KEY whose split's keep state `set_keep` toggles (the dashboard 📌
-   *  pin). Required for `set_keep`; absent for other actions. */
+   *  pin). Required for `set_keep`. (release) ALSO the key to RELEASE from the dispatch latch
+   *  for `release` — OPTIONAL there (absent ⇒ release every HELD item in the run). Absent for
+   *  other actions. */
   key?: string;
   /** (keep) The new keep verdict for `set_keep` (true = keep open, false = allow auto-close).
    *  Absent for other actions. */
@@ -96,6 +106,7 @@ export interface ApplyResult {
     | "maxItemsSet"
     | "concurrencySet"
     | "keepSet"
+    | "released"
     | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
@@ -273,6 +284,44 @@ export function applyCommand(
       log(`run "${name}" key "${key}" keep set to ${cmd.keep}`);
       return { kind: "keepSet", runName: name };
     }
+    case "release": {
+      // (release) Clear the §7.1 dispatch LATCH (and the time-based cooldown) for one item, or
+      // for every HELD item when no key is given, so the queue re-dispatches it on the next
+      // `list` poll WITHOUT a tracker status round-trip. PURE: mutates only `run.dispatched`/
+      // `run.cooldown` (both per-run state); the cleared latch is persisted by the run's next
+      // reconcile sweep (like `set_keep`), so this is NOT counted as an active-runs change.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`release command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`release for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      const key = cmd.key;
+      if (key !== undefined && key.length > 0) {
+        // Single item: clear its latch + cooldown. A no-op if it wasn't latched (tolerant).
+        const had = run.dispatched.delete(key);
+        run.cooldown.delete(key);
+        log(`run "${name}" RELEASED key "${key}"${had ? "" : " (was not latched)"} — eligible next list poll`);
+        return { kind: "released", runName: name };
+      }
+      // Bulk: release every HELD item = latched ∩ listed ∩ ¬active (mirrors the `held` set the
+      // dashboard shows). A latched key NOT in the current list is left alone (the §7.1 re-arm
+      // clears it on the next successful list); a latched key still active is left latched.
+      const listed = new Set((run.lastListItems ?? []).map((i) => i.key));
+      let n = 0;
+      for (const k of [...run.dispatched]) {
+        if (!listed.has(k) || run.active.has(k)) continue;
+        run.dispatched.delete(k);
+        run.cooldown.delete(k);
+        n += 1;
+      }
+      log(`run "${name}" RELEASED ${n} held item(s) — eligible next list poll`);
+      return { kind: "released", runName: name };
+    }
     default: {
       // Exhaustive guard for an unknown action (tolerant — a malformed drained command).
       errlog(`unknown queue command action "${String((cmd as { action?: unknown }).action)}" — ignored`);
@@ -287,7 +336,9 @@ export function applyCommand(
  *  NOT counted as a persistence change here — the run is removed this sweep and the caller
  *  re-persists after the removal regardless. (keep) `set_keep` is likewise NOT counted: the
  *  keep overrides live in the PER-RUN store (not active-runs.json), which the run's own sweep
- *  (`runOne`) persists + re-stamps to the annotation. PURE (delegates to applyCommand). */
+ *  (`runOne`) persists + re-stamps to the annotation. (release) `release` is also NOT counted:
+ *  it mutates the per-run dispatch latch, which the run's next reconcile sweep persists. PURE
+ *  (delegates to applyCommand). */
 export function applyCommands(
   registry: RunRegistry,
   cmds: QueueCommand[],

@@ -33,12 +33,16 @@ struct QueueCommand: Equatable, Sendable {
         /// (keep) Toggle one split's keep state (the dashboard 📌 pin). Serializes to the
         /// snake_case `"set_keep"` the sidecar's `coerceQueueCommands` whitelists.
         case setKeep = "set_keep"
+        /// (release) Clear the §7.1 dispatch latch for one HELD item (`key` set) or every held
+        /// item in the run (`key` nil), so the queue re-dispatches it WITHOUT a tracker status
+        /// round-trip. Serializes to the lowercase `"release"` the sidecar whitelists.
+        case release
     }
 
     let action: Action
     /// The template basename to start (start only).
     let template: String?
-    /// The active run name to pause/resume/stop/abort/setMaxItems/setConcurrency/setKeep.
+    /// The active run name to pause/resume/stop/abort/setMaxItems/setConcurrency/setKeep/release.
     let run: String?
     /// (§8b) START-TIME parameter answers (param name → value) collected by the
     /// queue palette's prompt, passed through to the sidecar factory (start only).
@@ -53,7 +57,9 @@ struct QueueCommand: Equatable, Sendable {
     /// ("9", …). The sidecar parses it (blank/garbage/non-positive = ignored, NO
     /// "unlimited" token). nil for other actions.
     let concurrency: String?
-    /// (keep) The work-item KEY whose split `setKeep` toggles. nil for other actions.
+    /// (keep) The work-item KEY whose split `setKeep` toggles. (release) ALSO the key to
+    /// release from the dispatch latch for `release` — nil there means "release ALL held
+    /// items in the run". nil for other actions.
     let key: String?
     /// (keep) The new keep verdict for `setKeep` (true = keep open, false = allow
     /// auto-close). nil for other actions (a non-bool is dropped by the sidecar).
@@ -158,6 +164,13 @@ struct QueueStatus: Equatable, Sendable {
     /// The currently-RUNNING items (one per slot-occupying agent) — the "M running"
     /// dropdown. `running.count == active`.
     let running: [Item]
+    /// (release) Count of HELD items — dispatched once but suppressed by the §7.1 latch while
+    /// still in the backlog (agent crashed/exited or was killed before claiming). `held.count`
+    /// may be < `heldCount` (the items list is capped); the count is exact.
+    let heldCount: Int
+    /// (release) Up to ~25 of those HELD items — the "N held" dropdown, each with a Release
+    /// button (clears its latch so the queue re-dispatches it, no tracker round-trip).
+    let held: [Item]
 
     // MARK: - Optimistic edits (instant dashboard feedback before the sidecar confirms)
 
@@ -167,7 +180,8 @@ struct QueueStatus: Equatable, Sendable {
         QueueStatus(
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: newMax,
-            concurrency: concurrency, next: next, running: running)
+            concurrency: concurrency, next: next, running: running,
+            heldCount: heldCount, held: held)
     }
 
     /// A copy with `phase` replaced — optimistic pause/resume/stop feedback.
@@ -175,7 +189,8 @@ struct QueueStatus: Equatable, Sendable {
         QueueStatus(
             queueName: queueName, present: present, phase: newPhase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
-            concurrency: concurrency, next: next, running: running)
+            concurrency: concurrency, next: next, running: running,
+            heldCount: heldCount, held: held)
     }
 
     /// A copy with `concurrency` replaced — optimistic parallel-edit feedback (the
@@ -184,7 +199,20 @@ struct QueueStatus: Equatable, Sendable {
         QueueStatus(
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
-            concurrency: newConcurrency, next: next, running: running)
+            concurrency: newConcurrency, next: next, running: running,
+            heldCount: heldCount, held: held)
+    }
+
+    /// (release) A copy with the HELD set replaced — optimistic release feedback. Dropping a
+    /// released key (or all of them) from `held`/`heldCount` updates the "N held" chip
+    /// instantly; the sidecar's next authoritative push reconciles (the released items move to
+    /// running/next once re-dispatched). PURE.
+    func withHeld(_ newHeld: [Item]) -> QueueStatus {
+        QueueStatus(
+            queueName: queueName, present: present, phase: phase, queued: queued,
+            listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
+            concurrency: concurrency, next: next, running: running,
+            heldCount: newHeld.count, held: newHeld)
     }
 
     /// (pure, testable) Parse the concurrency-editor's raw string the SAME way the sidecar's
@@ -243,12 +271,18 @@ struct QueueStatusPayload {
             return out
         }
 
+        // (release) heldCount is the EXACT count (the `held` list is capped); fall back to the
+        // held list's length when the sidecar omits it (legacy).
+        let heldItems = items("held")
+        let heldCount = (arguments["heldCount"] as? NSNumber)?.intValue ?? heldItems.count
+
         return QueueStatusPayload(status: QueueStatus(
             queueName: queueName, present: present, phase: phase,
             queued: int("queued"), listOk: listOk, active: int("active"),
             dispatched: int("dispatched"), maxItems: maxItems,
             concurrency: int("concurrency"),
-            next: items("next"), running: items("running")))
+            next: items("next"), running: items("running"),
+            heldCount: heldCount, held: heldItems))
     }
 }
 

@@ -297,7 +297,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `closeOnComplete:false`), never force-closed, persisted across restart; toggled via a
   `set_keep{run,key,keep}` command, state carried on the surface annotation (`queueKeep`). Keep is
   RUN-LEVEL state (`QueueRun.keep` map, mirrors the `dispatched` latch — survives reconcile),
-  `effectiveKeep = run.keep[key] ?? template.keepOnComplete`. **See `AGENT-QUEUE.md`
+  `effectiveKeep = run.keep[key] ?? template.keepOnComplete`. A **`release{run,key?}`** command
+  is the in-place escape from the dispatch latch's "needs a tracker status round-trip" rule: an
+  agent that crashed/exited or was killed before claiming leaves its item latched-but-listed
+  ("held"), never rescheduled. The health bar surfaces an orange **`N held`** chip (the sidecar
+  status report now carries `held`/`heldCount` = listed ∩ latched ∩ ¬active) → **Release** (per
+  item or all) clears the latch (+ cooldown) so the queue re-dispatches it on the next `list`
+  poll, NO Linear round-trip. Like `set_keep`, release lives in the per-run store (persisted by
+  the next reconcile sweep, not an active-runs change). **See `AGENT-QUEUE.md`
   (→ Implementation notes) for the full engine, MCP tools, grid/packing, health/backlog, live edits,
   keep, restart hardening, wiring + tests.**
 

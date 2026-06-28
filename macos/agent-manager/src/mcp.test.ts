@@ -348,6 +348,8 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       concurrency: 6,
       next: [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }],
       running: [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }],
+      heldCount: 1,
+      held: [{ key: "EX-4", title: "Held one", url: "https://linear.app/x/EX-4" }],
     }),
   );
   assert.equal(method, "tools/call");
@@ -361,6 +363,8 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   assert.equal(args.concurrency, 6);
   assert.deepEqual(args.next, [{ key: "EX-1", title: "Fix seed", url: "https://linear.app/x/EX-1" }, { key: "EX-2" }]);
   assert.deepEqual(args.running, [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }]);
+  assert.equal(args.heldCount, 1);
+  assert.deepEqual(args.held, [{ key: "EX-4", title: "Held one", url: "https://linear.app/x/EX-4" }]);
 });
 
 test("reportQueueGraph: encodes report_queue_graph + forwards backlog + nodes", async () => {
@@ -540,6 +544,21 @@ test("coerceQueueCommands: carries set_keep + its key (string) and keep (boolean
     { action: "set_keep", run: "r", key: "K-2", keep: false },
     { action: "set_keep", run: "r", keep: true }, // bad key dropped; valid keep kept
     { action: "set_keep", run: "r", key: "K-3" }, // bad keep dropped; valid key kept
+  ]);
+});
+
+test("coerceQueueCommands: carries release with an optional key (key omitted = release all held)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "release", run: "r", key: "K-1" }, // single item
+      { action: "release", run: "r" },              // no key → release all held (kept)
+      { action: "release", run: "r", key: 9 },      // non-string key dropped, action kept
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "release", run: "r", key: "K-1" },
+    { action: "release", run: "r" },
+    { action: "release", run: "r" },
   ]);
 });
 

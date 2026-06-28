@@ -70,6 +70,44 @@ test("backlog excludes active/latched keys + de-dupes; next is limited + carries
   assert.deepEqual(r.running, [{ key: "A", title: "Active A", url: "https://x/A" }]);
 });
 
+test("held = listed ∩ latched ∩ ¬active (the dispatch-latch escape set)", () => {
+  // A latched + active (running) → NOT held. B latched + listed + not active → HELD.
+  // C latched but NOT listed → NOT held (it left the set; the re-arm clears it). D listed but
+  // not latched → just waiting. E latched + listed + not active → HELD.
+  const r = queueStatusReport(input({
+    listItems: items("A", ["B", "Fix B"], "D", "E"),
+    excludeKeys: new Set(["A", "B", "C", "E"]),          // active ∪ latched
+    activeKeys: new Set(["A"]),                           // only A is tracked/active
+    latchedKeys: new Set(["A", "B", "C", "E"]),
+    runningItems: [{ key: "A", title: "A" }],
+  }));
+  assert.equal(r.heldCount, 2);
+  assert.deepEqual(r.held, [{ key: "B", title: "Fix B" }, { key: "E" }]);
+  // D is the only non-excluded listed item → the sole waiting entry.
+  assert.deepEqual(r.next, [{ key: "D" }]);
+});
+
+test("held de-dupes + caps at nextLimit; heldCount is the capped list length", () => {
+  const r = queueStatusReport(input({
+    listItems: items("B", "B", "E", "F", "G"),            // B duplicated
+    activeKeys: new Set<string>(),
+    latchedKeys: new Set(["B", "E", "F", "G"]),
+    excludeKeys: new Set(["B", "E", "F", "G"]),
+    nextLimit: 2,
+  }));
+  // B,E,F,G held (B de-duped) but the list is capped to 2.
+  assert.equal(r.held.length, 2);
+  assert.deepEqual(r.held, [{ key: "B" }, { key: "E" }]);
+});
+
+test("held is empty when nothing latched, and on a present:false report", () => {
+  assert.deepEqual(queueStatusReport(input({ listItems: items("A", "B") })).held, []);
+  assert.equal(queueStatusReport(input({ listItems: items("A", "B") })).heldCount, 0);
+  const gone = queueStatusReport(input({ present: false, listItems: items("A"), latchedKeys: new Set(["A"]) }));
+  assert.deepEqual(gone.held, []);
+  assert.equal(gone.heldCount, 0);
+});
+
 test("next carries item url (for the waiting-dropdown Linear link)", () => {
   const r = queueStatusReport(input({
     listItems: [{ key: "EX-9", title: "Fix it", url: "https://linear.app/x/EX-9" }],

@@ -853,6 +853,11 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     dispatchArmed: run.dispatchArmed,
     runningItems,
     excludeKeys: exclude,
+    // (release) HELD items are derived from these two: latched keys that are still listed but
+    // no longer active. `activeKeys` is the full active map (any state), distinct from `exclude`
+    // (which also carries the latch) so the builder can compute listed ∩ latched ∩ ¬active.
+    latchedKeys: run.dispatched,
+    activeKeys: new Set<string>(run.active.keys()),
     listItems: run.lastListItems,
     listOk: run.lastListOk,
     dispatched: run.lifetimeDispatched,
