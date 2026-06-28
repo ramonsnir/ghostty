@@ -994,6 +994,21 @@ struct MCPServerTests {
         #expect(bare["keep"] == nil)
     }
 
+    @Test func queueCommandReleaseSerializesWithOptionalKey() {
+        // (release) release serializes to the lowercase action the sidecar whitelists, carrying
+        // the run and — for a SINGLE item — its key.
+        let one = QueueCommand(action: .release, run: "ExampleOS", key: "EX-1").jsonObject
+        #expect(one["action"] as? String == "release")
+        #expect(one["run"] as? String == "ExampleOS")
+        #expect(one["key"] as? String == "EX-1")
+        #expect(one["keep"] == nil)
+        // A bulk release (no key) omits the key — the sidecar treats that as "release all held".
+        let all = QueueCommand(action: .release, run: "ExampleOS").jsonObject
+        #expect(all["action"] as? String == "release")
+        #expect(all["run"] as? String == "ExampleOS")
+        #expect(all["key"] == nil)
+    }
+
     // MARK: - Agent Queue: report_queue_status payload parsing (§11 health)
 
     @Test func queueStatusPayloadParsesFullArgs() {
@@ -1021,6 +1036,47 @@ struct MCPServerTests {
         #expect(s?.next.last?.url == nil)
         #expect(s?.running.first?.key == "EX-9")
         #expect(s?.running.first?.url == "https://linear.app/x/EX-9")
+    }
+
+    @Test func queueStatusPayloadParsesHeld() {
+        // (release) heldCount is the exact count; held is the (capped) item list.
+        let s = QueueStatusPayload.fromArguments([
+            "queueName": "ExampleOS",
+            "heldCount": 3,
+            "held": [["key": "EX-4", "title": "Held", "url": "https://linear.app/x/EX-4"],
+                     ["key": "EX-5"]],
+        ])?.status
+        #expect(s?.heldCount == 3)
+        #expect(s?.held.count == 2)
+        #expect(s?.held.first?.key == "EX-4")
+        #expect(s?.held.first?.title == "Held")
+        #expect(s?.held.last?.title == nil)
+    }
+
+    @Test func queueStatusPayloadHeldDefaultsAndCountFallback() {
+        // Absent held ⇒ [] and heldCount 0.
+        let none = QueueStatusPayload.fromArguments(["queueName": "Q"])?.status
+        #expect(none?.held.isEmpty == true)
+        #expect(none?.heldCount == 0)
+        // heldCount falls back to the held list's length when the sidecar omits the count.
+        let fallback = QueueStatusPayload.fromArguments([
+            "queueName": "Q", "held": [["key": "A"], ["key": "B"]],
+        ])?.status
+        #expect(fallback?.heldCount == 2)
+    }
+
+    @Test func queueStatusWithHeldDropsReleasedItems() {
+        // (release) optimistic-edit helper: withHeld replaces the held set + recomputes the count.
+        let s = QueueStatusPayload.fromArguments([
+            "queueName": "Q", "heldCount": 2,
+            "held": [["key": "A"], ["key": "B"]],
+        ])!.status
+        let afterOne = s.withHeld(s.held.filter { $0.key != "A" })
+        #expect(afterOne.held.map(\.key) == ["B"])
+        #expect(afterOne.heldCount == 1)
+        let afterAll = s.withHeld([])
+        #expect(afterAll.held.isEmpty)
+        #expect(afterAll.heldCount == 0)
     }
 
     @Test func queueStatusPayloadRejectsMissingName() {
