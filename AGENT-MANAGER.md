@@ -235,8 +235,10 @@ is an on-disk file; the sidecar restarts with the GUI but totals stay cumulative
   and `bell-classify` (the Bell Attention per-bell promotion). All Haiku traffic funnels
   through one place, so every feature is covered automatically.
 - **Where:** `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` (one JSON object per line).
-  Always on whenever the sidecar runs; set `GHOSTTY_HAIKU_USAGE=0` to disable. Entries older
-  than 14 days are pruned on sidecar startup, so the file can't grow without bound.
+  **On by default** whenever the sidecar runs; turn it off with the fork-only config key
+  **`agent-manager-usage-tracking = false`** in `~/.config/ghostty-ramon/config` (a GUI
+  relaunch applies the change). Entries older than 14 days are pruned on sidecar startup, so
+  the file can't grow without bound.
 - **How to ask:** the **`get_haiku_usage` MCP tool** (`{hours?}`, default 3) returns a grand
   total plus per-feature and per-account breakdowns — so an agent (or you, via the MCP
   server) can just ask "usage by feature over the last 3 hours." It's a pure file read and
@@ -577,9 +579,16 @@ call is cents on cache READS). Load-bearing details:
   `SummarizeFn` type was widened with the same optional `onUsage`.
 - **Persistence + retention**: `usage.ts` appends one JSONL line per call to
   `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` (best-effort, never throws — mirrors
-  diag.ts). ALWAYS ON unless `GHOSTTY_HAIKU_USAGE=0`. `trimUsageLog(14, Date.now())` runs
-  once at sidecar startup (`main()`), dropping entries older than 14 days. Survives restarts
-  because it's a file (the sidecar dies/respawns with the GUI; totals are cumulative).
+  diag.ts). `trimUsageLog(14, Date.now())` runs once at sidecar startup (`main()`), dropping
+  entries older than 14 days. Survives restarts because it's a file (the sidecar dies/respawns
+  with the GUI; totals are cumulative).
+- **Config toggle (first-class)**: the Zig bool `agent-manager-usage-tracking` (default
+  **true**) gates it. `AgentManagerController.childEnvironment` forwards the resolved value to
+  the sidecar EXPLICITLY both ways — `GHOSTTY_HAIKU_USAGE = "1"/"0"` — so the config wins over
+  the sidecar's default-on; `usage.ts usageEnabled()` returns `GHOSTTY_HAIKU_USAGE !== "0"`
+  (so a bare `"0"` disables; unset still defaults on for a manual sidecar run). A GUI relaunch
+  re-spawns the sidecar with the new env. Adding the key is a Zig/lib change (rebuild
+  lib+xcframework+GUI) but **GUI-relaunch only — no host restart** (the host ignores the key).
 - **Query (Swift)**: the `get_haiku_usage` MCP tool (`MCPTools.dispatch`, `hours` arg
   clamped to [1 min, 30 days], default 3) calls the PURE `MCPUsage.aggregate(lines:sinceIso:)`
   which filters `ts >= sinceIso` (lexicographic — `MCPUsage.isoString` emits the SAME
@@ -589,9 +598,13 @@ call is cents on cache READS). Load-bearing details:
   MCP files.
 
 Wiring: sidecar — `agent-manager/src/usage.ts` (new), `model.ts` (`onUsage` + extraction),
-`index.ts` (tag at the call site + `SummarizeFn` + startup trim). macOS —
-`Features/MCP/MCPUsage.swift` (new), `MCPTools.swift` (schema + dispatch),
-`project.pbxproj`. Tests: `usage.test.ts` (`formatUsageLine`/`trimUsageText`/`usageEnabled`),
+`index.ts` (tag at the call site + `SummarizeFn` + startup trim). core — `Config.zig`
+(`agent-manager-usage-tracking` bool, default true, + parse test). macOS —
+`Ghostty.Config.swift` (`agentManagerUsageTracking` getter), `AgentManagerController.swift`
+(`GHOSTTY_HAIKU_USAGE` forward), `Features/MCP/MCPUsage.swift` (new), `MCPTools.swift`
+(schema + dispatch), `project.pbxproj`. Tests: `Config.zig`
+(`agent-manager-usage-tracking`), `usage.test.ts`
+(`formatUsageLine`/`trimUsageText`/`usageEnabled`),
 `model.test.ts` (`onUsage` paths), `MCPUsageTests.swift` (aggregate/cutoff/junk/empty/ISO),
 `MCPServerTests.swift` (`toolsListHasAllTools` count 22). **Rebuilt sidecar `dist` (records)
 + a GUI relaunch (the Swift tool); no host/Zig change.**

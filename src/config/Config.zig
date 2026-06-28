@@ -3307,6 +3307,21 @@ keybind: Keybinds = .{},
 /// `~/.config/ghostty-ramon/config`.
 @"bell-diagnostics": bool = false,
 
+/// (ramon fork / Agent Manager) Haiku usage / budget tracking. When true (the
+/// default), the Agent Manager sidecar records one JSONL line per Haiku call to
+/// `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` — tokens (input / output /
+/// cache-read / cache-creation), the SDK-reported `costUsd`, the FEATURE that
+/// triggered it (`summarizer` = the continuous per-tile status pass; `bell-classify`
+/// = the Bell Attention per-bell promotion), and the billed account. This is the data
+/// behind the `get_haiku_usage` MCP tool's "how much did each feature spend over the
+/// last N hours". It is an append-only on-disk file, so totals SURVIVE GUI/sidecar
+/// restarts; entries older than 14 days are pruned on sidecar startup. The recording
+/// is cheap (one small line per call, and Haiku calls are already throttled), so it is
+/// ON by default — set this to `false` to disable it entirely. The GUI forwards the
+/// resolved value to the sidecar as `GHOSTTY_HAIKU_USAGE=1`/`0`; a GUI relaunch picks
+/// up a change. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+@"agent-manager-usage-tracking": bool = true,
+
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
 /// from a phone (e.g. over Tailscale). Empty/null (the default) DISABLES the
@@ -11421,6 +11436,27 @@ test "bell-diagnostics: default off and parse" {
         try cfg.loadIter(alloc, &it);
         try cfg.finalize();
         try testing.expectEqual(true, cfg.@"bell-diagnostics");
+    }
+}
+
+test "agent-manager-usage-tracking: default on and parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"agent-manager-usage-tracking");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--agent-manager-usage-tracking=false"} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(false, cfg.@"agent-manager-usage-tracking");
     }
 }
 
