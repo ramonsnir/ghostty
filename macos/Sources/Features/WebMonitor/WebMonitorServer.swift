@@ -2679,28 +2679,38 @@ final class WebMonitorServer {
         }).catch(function () {});
       }
 
-      // Smart scroll: pick wheel vs. PageUp/PageDown based on the LIVE terminal's
-      // mode, read off xterm.js (so it tracks the remote app moment-to-moment).
-      // Three cases:
-      //  (1) Normal screen (shell): real scrollback lives on the host -> WHEEL
-      //      (the host repins its scrollback / xterm scrolls its own buffer).
-      //  (2) Alt screen + the app captures the mouse (Claude Code, htop, vim
-      //      with mouse): WHEEL -> mouse-wheel report the app handles itself.
-      //  (3) Alt screen, NO mouse capture (less, man, plain vim): there is no
-      //      scrollback to wheel through and the wheel->arrow translation is a
-      //      no-op under pty-host, so send PAGEUP/PAGEDOWN, which those apps honor.
-      // Without a live xterm (plain-text poll fallback) there is no mode to read,
-      // so fall back to the plain wheel behavior. dir: +1 = up/back, -1 = down.
+      // Smart scroll: pick the gesture from the LIVE terminal mode, read off
+      // xterm.js (so it tracks the remote app moment-to-moment). KEY FACT: the
+      // host's raw stream only carries CHILD pty output, so a host-side viewport
+      // scroll emits NOTHING back to the phone — scrolling the host is useless
+      // here. The browser's xterm.js holds the real scrollback (the replayed ring
+      // + everything streamed since connect). So:
+      //  (1) Normal buffer (shell, Claude Code, anything using terminal
+      //      scrollback): the history is ALREADY in xterm.js -> scroll IT LOCALLY
+      //      (term.scrollLines), no host round-trip. This is the common case and
+      //      the one that was silently broken (a wheel POST did nothing visible).
+      //  (2) Alt screen + the app captures the mouse (htop, vim with mouse): no
+      //      xterm scrollback exists in the alt buffer, so forward a WHEEL so the
+      //      app itself redraws (those bytes then stream back).
+      //  (3) Alt screen, NO mouse capture (less, man, plain vim): send
+      //      PAGEUP/PAGEDOWN so the app pages and redraws (a wheel is a no-op
+      //      there under pty-host — the mirror's alt-screen state isn't applied).
+      // Without a live xterm (plain-text poll fallback) there is no local buffer,
+      // so fall back to the plain host wheel. dir: +1 = up/back, -1 = down.
       function smartScroll(dir) {
         var term = stream && stream.term;
         if (!term) { sendScroll(dir * 3); return; }
         var alt = false, mouse = false;
         try { alt = term.buffer.active.type === "alternate"; } catch (e) {}
         try { mouse = term.modes && term.modes.mouseTrackingMode !== "none"; } catch (e) {}
-        if (alt && !mouse) {
-          sendKey(dir > 0 ? "pageup" : "pagedown");
-        } else {
+        if (!alt) {
+          // Negative scrolls toward history (up); xterm keeps the user's position
+          // when new output arrives while scrolled up, so this stays put.
+          try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
+        } else if (mouse) {
           sendScroll(dir * 3);
+        } else {
+          sendKey(dir > 0 ? "pageup" : "pagedown");
         }
       }
       addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });

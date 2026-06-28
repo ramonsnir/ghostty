@@ -1118,10 +1118,13 @@ struct WebMonitorServerTests {
     @Test func htmlPageHasSmartScroll() {
         let page = WebMonitorServer.htmlPage
         // The scroll buttons drive smartScroll, which reads the LIVE xterm.js
-        // terminal mode to pick wheel vs. PageUp/PageDown.
+        // terminal mode to pick the right gesture.
         #expect(page.contains("function smartScroll"))
         #expect(page.contains("smartScroll(1)"))
         #expect(page.contains("smartScroll(-1)"))
+        // Normal buffer: the scrollback lives IN xterm.js, so it scrolls LOCALLY
+        // (term.scrollLines) — a host wheel emits no raw bytes back to the phone.
+        #expect(page.contains("term.scrollLines(dir > 0 ? -3 : 3)"))
         // It branches on the alternate-screen buffer + mouse-tracking mode, and
         // sends PageUp/PageDown in the alt-screen-without-mouse case.
         #expect(page.contains("active.type === \"alternate\""))
