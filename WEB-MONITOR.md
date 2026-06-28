@@ -122,8 +122,12 @@ is loopback, hence identical; only your `ts.net` hostname differs:
    - **Enter** quick-key — submits (a real Enter keypress).
    - Quick-keys: **Enter · y · n · Esc · Tab · ⌫ Backspace · Clear (Ctrl-U) · Ctrl-C**, the
      **digits 1–4** (numbered agent menus), and **arrows**.
-   - **Scroll ↑ / Scroll ↓** — remote-control scroll (a real mouse wheel to the host), so a TUI
-     (Claude Code / `less` / `vim`) scrolls and the result streams back.
+   - **Scroll ↑ / Scroll ↓** — *smart* remote-control scroll. The page reads the **live
+     terminal mode** off `xterm.js` and picks the right gesture per app: a real **mouse wheel**
+     to the host on the normal screen (scrollback) or for an app that captures the mouse (Claude
+     Code, `htop`, `vim` with mouse), but **PageUp / PageDown** for a full-screen TUI that owns
+     the screen with no scrollback to wheel through (`less`, `man`, plain `vim`). So the one pair
+     of buttons "just scrolls" whatever you're looking at.
    - **Press-and-hold to auto-repeat** on **scroll, arrows, and backspace** (a tap still fires
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
    - All input is sent as **real key/wheel events** (`ghostty_surface_key` / `_mouse_scroll`),
@@ -243,6 +247,16 @@ real scrollback can't come from the GUI. Instead:
 - Scrollback replay on connect is bounded by the host ring buffer; xterm.js then keeps its own
   scrollback for everything streamed since connecting (and Scroll ↑/↓ drives the host for
   deeper/alt-screen history).
+- **Why Scroll is "smart" (PageUp/PageDown for alt-screen TUIs).** Under `pty-host` the GUI's
+  mirror terminal is viewport-only and its **alt-screen state is intentionally not applied**
+  (`src/termio/Client.zig`, documented residual): the only thing that reads the local
+  `active_key` is the wheel→arrow alternate-scroll translation, so for an alt-screen TUI that
+  does **not** capture the mouse (`less`/`man`/plain `vim`) a wheel event is a dead no-op (no
+  scrollback in the alt screen; the translation is skipped). The page sidesteps this entirely:
+  `xterm.js` exposes the live mode (`term.buffer.active.type` + `term.modes.mouseTrackingMode`),
+  so `smartScroll` sends **PageUp/PageDown** in exactly that case and a real **wheel** otherwise.
+  Purely page-side — no Zig/host change. (The underlying mirror-alt-screen residual is a separate,
+  larger fix that would also benefit real trackpad scrolling under `pty-host`.)
 
 ---
 
@@ -389,8 +403,21 @@ host routes it per the app's mode: SGR wheel / alternate-scroll arrows / scrollb
 input model: **Send (and Return-in-field) TYPE the text only — they do NOT submit**; the
 **Enter quick-key submits**; quick-keys are
 enter/y/n/esc/tab/backspace/ctrl-u(Clear)/ctrl-c, digits 1–4, arrows, and Scroll ↑/↓.
+`keySpecs(forKey:)` also maps **pageup/pagedown/home/end** (native macOS keycodes 116/121/115/119)
+for the smart-scroll path below.
 **Press-and-hold auto-repeat** (`addRepeat`: 350ms delay → 90ms repeat; `touch-action:none` +
 preventDefault) on scroll/arrows/backspace only; the rest are single-fire.
+
+**Smart scroll (`smartScroll`, page-side).** The Scroll ↑/↓ buttons do NOT blindly POST a wheel
+delta. They read the LIVE terminal mode off the `xterm.js` instance — `term.buffer.active.type`
+(`normal`/`alternate`) and `term.modes.mouseTrackingMode` — exposed to the page by adding `term`
+to the stream handle (`{ dispose, term }`). Decision: **alt screen AND no mouse tracking** ⇒
+`sendKey("pageup"/"pagedown")` (less/man/vim own the screen, have no scrollback, and the
+mirror's wheel→arrow translation is a no-op under `pty-host` — see Known limits); **otherwise**
+⇒ `sendScroll(±3)` (normal-screen scrollback, or a mouse-capturing app like Claude Code that
+handles the wheel itself). With no live `xterm` (plain-text poll fallback) there is no mode to
+read, so it falls back to the plain wheel. This is the answer to "how do I know dynamically
+whether to scroll or page" — the terminal's own mode tells us, and `xterm.js` already tracks it.
 
 ### Security defense-in-depth
 
