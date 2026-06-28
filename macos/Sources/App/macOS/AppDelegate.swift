@@ -130,6 +130,11 @@ class AppDelegate: NSObject,
     /// AND mcp-listen + mcp-token are set AND a node binary resolves.
     private var agentManager: AgentManagerController?
 
+    /// (ramon fork / Agent Hooks) UserDefaults key recording whether the one-time
+    /// launch offer to install the Claude agent-state hooks has been shown. Set
+    /// once (per bundle-id domain) so the prompt never re-fires.
+    static let kAgentHooksAskedKey = "agentHooks.offered"
+
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
 
@@ -354,6 +359,12 @@ class AppDelegate: NSObject,
         self.agentManager = agentManager
         agentManager.start()
 
+        // (ramon fork / Agent Hooks) One-time offer to install the Claude Code
+        // agent-state hooks when a queue/manager feature is on but the hooks
+        // aren't installed yet. Detects installation off-main and prompts on main;
+        // self-suppresses after a single ask. No-op when no feature is enabled.
+        maybeOfferAgentHooks()
+
         // Start our update checker.
         updateController.startUpdater()
 
@@ -421,6 +432,11 @@ class AppDelegate: NSObject,
             self,
             selector: #selector(ghosttyToggleAgentDashboard(_:)),
             name: Ghostty.Notification.ghosttyToggleAgentDashboard,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(ghosttyInstallAgentHooks(_:)),
+            name: Ghostty.Notification.ghosttyInstallAgentHooks,
             object: nil)
 
         // Configure user notifications
@@ -572,6 +588,114 @@ class AppDelegate: NSObject,
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
             agentDashboard?.toggle()
+        }
+    }
+
+    /// (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks
+    /// (command-palette "Install Claude Agent Hooks"). Runs the filesystem work
+    /// off-main, then reports the outcome in an NSAlert on main.
+    @objc private func ghosttyInstallAgentHooks(_ notification: Notification) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome: Result<AgentHooksInstaller.InstallResult, Error>
+            do {
+                outcome = .success(try AgentHooksInstaller.install())
+            } catch {
+                outcome = .failure(error)
+            }
+            DispatchQueue.main.async {
+                AppDelegate.presentAgentHooksResult(outcome)
+            }
+        }
+    }
+
+    /// Present an NSAlert describing an agent-hooks install outcome. Main-thread.
+    private static func presentAgentHooksResult(
+        _ outcome: Result<AgentHooksInstaller.InstallResult, Error>
+    ) {
+        let alert = NSAlert()
+        switch outcome {
+        case .failure(let error):
+            alert.alertStyle = .warning
+            alert.messageText = "Couldn't install the Claude agent hooks"
+            alert.informativeText = "\(error)"
+        case .success(let result):
+            alert.alertStyle = .informational
+            let merge = result.merge
+            if merge.created {
+                alert.messageText = "Claude agent hooks installed"
+            } else if merge.added.isEmpty {
+                alert.messageText = "Claude agent hooks already installed"
+            } else {
+                alert.messageText = "Claude agent hooks installed"
+            }
+            var lines: [String] = []
+            if merge.created {
+                lines.append("Created ~/.claude/settings.json with all six hooks.")
+            } else {
+                if !merge.added.isEmpty {
+                    lines.append("Added: \(merge.added.joined(separator: ", ")).")
+                }
+                if !merge.skipped.isEmpty {
+                    lines.append(
+                        "Already present (left untouched): " +
+                        "\(merge.skipped.joined(separator: ", ")).")
+                }
+            }
+            if let backup = result.backupPath {
+                lines.append("Backed up your previous settings to \(backup).")
+            }
+            lines.append("Restart your Claude Code sessions to pick up the hooks.")
+            alert.informativeText = lines.joined(separator: "\n\n")
+        }
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    /// (ramon fork / Agent Hooks) One-time launch-time offer to install the hooks
+    /// when a queue/manager feature is enabled but the hooks aren't installed.
+    /// Persists an "asked" flag in the per-bundle-id UserDefaults so it never
+    /// re-prompts (whether the colleague installs or declines).
+    private func maybeOfferAgentHooks() {
+        let defaults = UserDefaults.ghostty
+        let alreadyAsked = defaults.bool(forKey: AppDelegate.kAgentHooksAskedKey)
+        let featureEnabled =
+            ghostty.config.agentQueueEnabled || ghostty.config.agentManagerEnabled
+
+        // Detect installation off-main (filesystem), then decide + prompt on main.
+        DispatchQueue.global(qos: .utility).async {
+            let installed: Bool = {
+                let path = AgentHooksInstaller.settingsPath(home: NSHomeDirectory())
+                // `readSettings` returns `[String:Any]?` (nil when absent) and throws
+                // on malformed; Swift's `try?` flattens both to a single optional.
+                guard let settings = try? AgentHooksInstaller.readSettings(path: path)
+                else { return false }
+                return AgentHooksInstaller.hooksInstalled(settings: settings)
+            }()
+
+            guard AgentHooksInstaller.shouldAutoOfferHooks(
+                featureEnabled: featureEnabled,
+                installed: installed,
+                alreadyAsked: alreadyAsked)
+            else { return }
+
+            DispatchQueue.main.async {
+                // Record "asked" BEFORE prompting so a crash/dismiss can't loop
+                // the prompt on every launch (mirrors ForkSetup's welcome bool).
+                defaults.set(true, forKey: AppDelegate.kAgentHooksAskedKey)
+
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "Install Ghostty's Claude Code hooks?"
+                alert.informativeText =
+                    "Enables per-agent status and Agent Queue auto-close."
+                alert.addButton(withTitle: "Install")
+                alert.addButton(withTitle: "Not now")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    NotificationCenter.default.post(
+                        name: Ghostty.Notification.ghosttyInstallAgentHooks,
+                        object: nil)
+                }
+            }
         }
     }
 

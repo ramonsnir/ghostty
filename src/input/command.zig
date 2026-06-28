@@ -581,6 +581,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show or hide the floating dashboard of running CLI agents.",
         }},
 
+        .install_agent_hooks => comptime &.{.{
+            .action = .install_agent_hooks,
+            .title = "Install Claude Agent Hooks",
+            .description = "Set up the Claude Code hooks for agent status + queue auto-close.",
+        }},
+
         .start_agent_queue => comptime &.{.{
             // Bare (picker) form; the palette opens the queue-template picker.
             .action = .{ .start_agent_queue = .{} },

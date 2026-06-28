@@ -6264,6 +6264,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .install_agent_hooks => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .install_agent_hooks,
+            {},
+        ),
+
         .start_agent_queue => |v| {
             // Render the (optional) template basename as a sentinel C string;
             // an absent template becomes the empty string "" (the picker form).

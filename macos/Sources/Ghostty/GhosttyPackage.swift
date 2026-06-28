@@ -420,6 +420,11 @@ extension Ghostty.Notification {
     /// AppDelegate, which owns the dashboard controller.
     static let ghosttyToggleAgentDashboard = Notification.Name("com.mitchellh.ghostty.toggleAgentDashboard")
 
+    /// (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks.
+    /// App-wide (no object payload); observed by the AppDelegate, which runs the
+    /// install off-main and presents an alert.
+    static let ghosttyInstallAgentHooks = Notification.Name("com.mitchellh.ghostty.installAgentHooks")
+
     /// Toggle fullscreen of current window
     static let ghosttyToggleFullscreen = Notification.Name("com.mitchellh.ghostty.toggleFullscreen")
     static let FullscreenModeKey = ghosttyToggleFullscreen.rawValue

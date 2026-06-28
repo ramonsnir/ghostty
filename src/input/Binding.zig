@@ -921,6 +921,13 @@ pub const Action = union(enum) {
     /// payload-less.
     toggle_agent_dashboard,
 
+    /// (ramon fork) Install the fork's Claude Code agent-state hooks (macOS): copy
+    /// the hook script into `~/.config/ghostty-ramon/claude-hooks/` and merge the
+    /// six hook events into `~/.claude/settings.json` (idempotently, with a
+    /// backup). Enables the per-tile agent status + Agent Queue auto-close.
+    /// App-global, payload-less.
+    install_agent_hooks,
+
     /// (ramon fork / Agent Queue Supervisor) Start an Agent Queue run. With NO
     /// value (bare `start_agent_queue`) this opens a fuzzy palette of the
     /// available queue templates; selecting one starts that run. With a value
@@ -1617,6 +1624,7 @@ pub const Action = union(enum) {
             .toggle_command_palette,
             .toggle_project_selector,
             .toggle_agent_dashboard,
+            .install_agent_hooks,
             .start_agent_queue,
             .goto_last_surface,
             .toggle_background_opacity,
@@ -3775,6 +3783,21 @@ test "Binding toggle_agent_dashboard" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("toggle_agent_dashboard", buf.written());
+}
+
+test "Binding install_agent_hooks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=install_agent_hooks");
+    try testing.expect(binding.action == .install_agent_hooks);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("install_agent_hooks", buf.written());
 }
 
 test "Binding start_agent_queue" {

@@ -46,7 +46,10 @@ The supervisor **self-disables silently** (one info log) unless all of these hol
    hook-driven agent state: it closes once the item is provider-`done` **and** the agent has
    been **quiescent** (`idle` *or* `waiting`) for a few seconds. *Without the hooks a queue can
    dispatch and track but will not auto-close* (Claude Code is a repainting TUI, so the
-   idle heuristic never fires).
+   idle heuristic never fires). **Install them the easy way:** run **"Install Claude Agent
+   Hooks"** from the Command Palette (cmd+shift+p), or accept the one-time prompt offered on
+   launch when the queue/manager is enabled (it backs up + merges `~/.claude/settings.json`
+   safely; re-running is a no-op). A manual copy/merge fallback is in `AGENT-DASHBOARD.md`.
    The hooks post to the **installed Release** on the default MCP port, so run real queues
    there, not a dev `+1/+2` build.
 

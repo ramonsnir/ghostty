@@ -647,6 +647,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_AGENT_DASHBOARD:
                 toggleAgentDashboard(app, target: target)
 
+            case GHOSTTY_ACTION_INSTALL_AGENT_HOOKS:
+                installAgentHooks(app, target: target)
+
             case GHOSTTY_ACTION_START_AGENT_QUEUE:
                 startAgentQueue(app, target: target, v: action.action.start_agent_queue)
 
@@ -1206,6 +1209,19 @@ extension Ghostty {
             target: ghostty_target_s) {
             NotificationCenter.default.post(
                 name: Notification.ghosttyToggleAgentDashboard,
+                object: nil
+            )
+        }
+
+        // (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks.
+        // App-wide and target-less (like the dashboard toggle): the install
+        // edits user files under $HOME, not a surface. The AppDelegate observes
+        // this notification, runs the install off-main, and shows an NSAlert.
+        private static func installAgentHooks(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) {
+            NotificationCenter.default.post(
+                name: Notification.ghosttyInstallAgentHooks,
                 object: nil
             )
         }

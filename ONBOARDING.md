@@ -68,8 +68,10 @@ absent (nothing crashes):
   `claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"` — the shim is on your PATH and
   reads the auto-generated token for you. → `MCP-SERVER.md`
 - **Rich agent status + auto-close (Manager / Queue).** Install the Claude Code agent-state
-  hooks — they ship inside the app at `Contents/Resources/claude-hooks/`; see
-  `AGENT-DASHBOARD.md`. Then set `agent-queue = true` and add a template to run a queue.
+  hooks the easy way: run **"Install Claude Agent Hooks"** from the Command Palette (⌘⇧P), or
+  accept the one-time prompt offered on launch when the queue/manager is enabled. (It safely
+  backs up + merges `~/.claude/settings.json`; a manual copy/merge fallback is in
+  `AGENT-DASHBOARD.md`.) Then set `agent-queue = true` and add a template to run a queue.
 - **Phone monitor.** Set `web-monitor-listen` + a token in `~/.config/ghostty-ramon/local`
   and put `tailscale serve` in front. → `WEB-MONITOR.md`
 

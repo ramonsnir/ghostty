@@ -385,6 +385,10 @@ pub const Action = union(Key) {
     /// (ramon fork) Toggle the app-global floating Agent Dashboard panel.
     toggle_agent_dashboard,
 
+    /// (ramon fork) Install the fork's Claude Code agent-state hooks (macOS).
+    /// App-global, payload-less.
+    install_agent_hooks,
+
     /// (ramon fork / Agent Queue Supervisor) Start an Agent Queue run. An empty
     /// template opens the queue-template picker for the target surface; a
     /// non-empty template basename starts that run directly (the apprt enqueues
@@ -473,6 +477,7 @@ pub const Action = union(Key) {
         swap_split,
         toggle_project_selector,
         toggle_agent_dashboard,
+        install_agent_hooks,
         start_agent_queue,
         goto_last_surface,
 
