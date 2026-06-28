@@ -221,9 +221,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 
 - **MCP server** (fork-only, OFF by default; config `mcp-listen` / `mcp-token` — the token is a
   SHELL-EXECUTION credential, so bind localhost + always set it) — a GUI-embedded MCP server
-  (HTTP JSON-RPC + a stdio shim `ghostty-mcp`) giving an orchestrating agent 12 tools to control
+  (HTTP JSON-RPC + a stdio shim `ghostty-mcp`) giving an orchestrating agent 13 tools to control
   the fork (splits/tabs, open/run) and watch+respond to sessions (read screen, type input,
-  approve prompts). Built entirely on existing libghostty/Swift abstractions — the only Zig
+  approve prompts) — plus `get_haiku_usage` (Agent Manager budget query, see that bullet). Built entirely on existing libghostty/Swift abstractions — the only Zig
   change is two default-null config keys, so enabling/changing it is a GUI relaunch, never a host
   restart. COPIES the web monitor, never depends on it. Load-bearing gotchas: same NATIVE-keycode
   input rule; `processName`/`command` are HOST-GATED (absent until the host is a minor-3 build);
@@ -257,9 +257,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   the Agent Queue (per-feature env flags gate the two loops; the summarizer's `GHOSTTY_SUMMARIZER`
   absent=ON for back-compat); cost is controlled by hidden-throttle + fuzzy change-detection +
   quiescent-skip + a config overlay + rate-limit auto-backoff; for colleagues the sidecar is bundled
-  dist-only (the queue works; the Haiku summarizer stays dev-only — it needs `node_modules`). **See
-  `AGENT-MANAGER.md` (→ Implementation notes) for the loop, cost controls, account routing, the
-  rate-limit attention watchdog, wiring + tests.**
+  dist-only (the queue works; the Haiku summarizer stays dev-only — it needs `node_modules`).
+  **Haiku usage/budget tracking (always-on; `GHOSTTY_HAIKU_USAGE=0` to disable):** every Haiku call
+  is recorded as one JSONL line to `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` tagged with the
+  FEATURE (`summarizer`/`bell-classify`) + account, so you can ask "how much per feature over the
+  last N hours" — captured at the single chokepoint `model.ts summarize()` (an `onUsage` callback
+  reading the SDK's `usage`+`total_cost_usd`, verified non-zero), tagged at the `index.ts` call site,
+  persisted by `usage.ts` (survives GUI restarts — it's a file; 14-day retention trimmed at startup),
+  and queried by the **`get_haiku_usage` MCP tool** (`{hours?}`, default 3 → total + per-feature +
+  per-account, via the pure `MCPUsage.aggregate`). **See `AGENT-MANAGER.md` (→ Implementation notes)
+  for the loop, cost controls, account routing, the rate-limit attention watchdog, Haiku usage/budget
+  tracking, wiring + tests.**
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default; config `agent-queue` /
   `agent-queue-templates-dir` / `agent-queue-max-total`, action `start_agent_queue`) — turns the

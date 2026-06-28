@@ -46,6 +46,8 @@ import { pathToFileURL } from "node:url";
 
 import { installFileLogger } from "./logfile.js";
 import { recordDiag } from "./diag.js";
+import { recordUsage, trimUsageLog, type HaikuUsage } from "./usage.js";
+import { basename } from "node:path";
 import { McpClient, McpError, type Surface } from "./mcp.js";
 import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
 import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
@@ -171,7 +173,12 @@ export function parseLoopEnablement(
  *  Injectable so the loop can be exercised without spawning the CLI. `configDir`
  *  (optional) routes the spawned `claude`'s auth/billing to a specific account. */
 export type SummarizeFn = (
-  req: { system: string; user: string; configDir?: string },
+  req: {
+    system: string;
+    user: string;
+    configDir?: string;
+    onUsage?: (usage: HaikuUsage) => void;
+  },
 ) => Promise<string>;
 
 export interface LoopDeps {
@@ -318,7 +325,21 @@ async function summarizeOne(
     );
 
     modelStartedAt = deps.now();
-    const raw = await deps.summarize({ system, user, configDir: deps.summarizerConfigDir });
+    // (usage/budget tracking) Tag this Haiku call with the FEATURE that triggered
+    // it (a bell-triggered classify vs the continuous summarizer) and the routed
+    // ACCOUNT, then record the token/cost usage the SDK reports. Survives restarts
+    // via the on-disk JSONL (see usage.ts); queried by the get_haiku_usage MCP tool.
+    const usageFeature = bellRang ? "bell-classify" : "summarizer";
+    const usageAccount = deps.summarizerConfigDir
+      ? basename(deps.summarizerConfigDir)
+      : "ambient";
+    const raw = await deps.summarize({
+      system,
+      user,
+      configDir: deps.summarizerConfigDir,
+      onUsage: (u) =>
+        recordUsage({ ...u, feature: usageFeature, account: usageAccount, durationMs: durMs() }),
+    });
     const parsed = parseSummary(raw);
     if (!parsed) {
       // Spent a model call but got nothing usable — throttle the retry. No usable
@@ -748,6 +769,10 @@ async function main(): Promise<void> {
   // controller pipes stdout to an unread pipe and discards stderr, so without this there
   // is no trail (see logfile.ts).
   installFileLogger();
+  // (usage/budget tracking) Bound the Haiku-usage log on startup: drop entries
+  // older than 14 days so the append-only file can't grow without limit. Recent
+  // data (what "last N hours" queries need) is always kept. Best-effort.
+  trimUsageLog(14, Date.now());
   const url = process.env.GHOSTTY_MCP_URL ?? "http://127.0.0.1:8765/mcp";
   const token = process.env.GHOSTTY_MCP_TOKEN;
 

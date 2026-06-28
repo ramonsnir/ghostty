@@ -355,9 +355,11 @@ struct MCPServerTests {
             "spawn_split_command", "force_close_surface", "signal_attention",
             "take_queue_commands", "report_queue_status", "report_queue_graph",
             "move_surface_into_tab",
+            // Agent Manager: Haiku usage/budget query.
+            "get_haiku_usage",
         ]
         #expect(names == expected)
-        #expect(tools.count == 21)
+        #expect(tools.count == 22)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")

@@ -45,6 +45,53 @@ test("summarize: success result message => returns its .result text", async () =
   assert.equal(text, "Running tests");
 });
 
+test("summarize: onUsage receives tokens + cost off the success result", async () => {
+  const q = fakeQuery([
+    {
+      type: "result",
+      subtype: "success",
+      result: "ok",
+      total_cost_usd: 0.0032886,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 141,
+        cache_read_input_tokens: 25736,
+        cache_creation_input_tokens: 0,
+      },
+    },
+  ]);
+  let seen: unknown;
+  await summarize({ system: "S", user: "U", onUsage: (u) => (seen = u) }, q);
+  assert.deepEqual(seen, {
+    model: SUMMARIZER_MODEL,
+    inputTokens: 10,
+    outputTokens: 141,
+    cacheReadTokens: 25736,
+    cacheCreationTokens: 0,
+    costUsd: 0.0032886,
+  });
+});
+
+test("summarize: onUsage tolerates a missing usage block (defaults to 0)", async () => {
+  const q = fakeQuery([{ type: "result", subtype: "success", result: "ok" }]);
+  let seen: { inputTokens: number; costUsd: number } | undefined;
+  await summarize(
+    { system: "S", user: "U", model: "m", onUsage: (u) => (seen = u) },
+    q,
+  );
+  assert.equal(seen?.inputTokens, 0);
+  assert.equal(seen?.costUsd, 0);
+});
+
+test("summarize: onUsage is NOT called on an error result", async () => {
+  const q = fakeQuery([{ type: "result", subtype: "error_max_turns" }]);
+  let called = false;
+  await assert.rejects(() =>
+    summarize({ system: "S", user: "U", onUsage: () => (called = true) }, q),
+  );
+  assert.equal(called, false);
+});
+
 test("summarize: error-subtype result => throws with subtype + joined errors", async () => {
   const q = fakeQuery([
     {
