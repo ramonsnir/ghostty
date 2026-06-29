@@ -83,6 +83,9 @@ agent-dashboard = true
 agent-dashboard-commands = claude,codex
 agent-dashboard-pin = true
 keybind = ctrl+a>d=toggle_agent_dashboard
+# ctrl+a>shift+D hides/reveals the FOCUSED split from the dashboard (keyboard
+# equivalent of a tile's eye-slash Hide; reversible, auto-unhides on bell).
+keybind = ctrl+a>shift+d=toggle_dashboard_hide
 
 # Agent Manager (fork-only): a Haiku summarizer that replaces each dashboard
 # tile's raw working/waiting chip with a live one-line semantic status
