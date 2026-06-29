@@ -39,6 +39,15 @@ import type * as ClaudeAgentSDK from "@anthropic-ai/claude-agent-sdk";
 // TYPE-ONLY: erased at compile, so dist/model.js gains NO runtime require of
 // usage.ts — preserves the "loads with no node_modules" property.
 import type { HaikuUsage } from "./usage.js";
+// WarmBase is a CLASS used as a TYPE on the seam param; WarmBaseUnavailable is the
+// cold-fallback signal we instanceof-check; costFromUsage is the shared token-bucket
+// cost (LOCKED #1). These are value imports (warmbase.ts itself loads the SDK lazily,
+// so importing it does NOT pull the SDK in at module load).
+import {
+  WarmBaseUnavailable,
+  costFromUsage,
+  type WarmBase,
+} from "./warmbase.js";
 
 /** The default summarizer model. Free-form string (no SDK enum). */
 export const SUMMARIZER_MODEL = "claude-haiku-4-5";
@@ -88,7 +97,32 @@ export type QueryFn = typeof ClaudeAgentSDK.query;
 export async function summarize(
   req: SummarizeRequest,
   queryFn?: QueryFn,
+  warm?: WarmBase,
 ): Promise<string> {
+  // WARM-BASE path (cost optimization, layered over the cold floor). When a WarmBase
+  // is wired in, try the fork-per-call reuse. On a warm-MECHANISM failure
+  // (WarmBaseUnavailable) fall THROUGH to today's cold one-shot for THIS call. On a
+  // GENUINE model error/result (a plain Error) RETHROW — same as cold would surface
+  // it, so the loop logs+skips and we do NOT make a second (cold) call (no double-cost).
+  if (warm) {
+    try {
+      return await warm.run({
+        system: req.system,
+        user: req.user,
+        model: req.model ?? SUMMARIZER_MODEL,
+        configDir: req.configDir,
+        onUsage: req.onUsage,
+      });
+    } catch (e) {
+      if (!(e instanceof WarmBaseUnavailable)) throw e; // genuine error -> no cold retry
+      // COLD FALLBACK (the floor): warm mechanism unavailable for this call.
+      console.error(
+        `agent-manager: warm-base fell back to cold (${e.kind}): ${e.message}`,
+      );
+      // fall through to the cold path below
+    }
+  }
+
   const runQuery =
     queryFn ?? (await import("@anthropic-ai/claude-agent-sdk")).query;
   // The colleague's already-installed `claude` (so we don't ship the 215MB native
@@ -122,9 +156,20 @@ export async function summarize(
     if (message.type === "result") {
       if (message.subtype === "success") {
         // Report token/cost usage off the SUCCESS result before returning. The
-        // SDK result carries `usage` (input/output/cache tokens) + `total_cost_usd`
-        // (verified non-zero on pool auth). Read defensively (?? 0) so a shape
-        // change can never throw into the loop.
+        // SDK result carries `usage` (input/output/cache tokens). Read defensively
+        // (?? 0) so a shape change can never throw into the loop. COST is now a
+        // TOKEN-BUCKET estimate via costFromUsage (LOCKED #1) — NOT the SDK's
+        // cumulative-per-session `total_cost_usd` — so warm and cold are directly
+        // comparable in get_haiku_usage; tagged mode:"cold".
+        //
+        // ⚠️ DEPLOY DISCONTINUITY (cost REPORTING only, NOT control flow): even with
+        // the warm-base gate OFF, this cold path is now control-flow IDENTICAL to
+        // before BUT the recorded `costUsd` shifts — it used to be the SDK's
+        // `total_cost_usd`, it is now `costFromUsage(buckets)`. So every cold call's
+        // logged cost number changes at the deploy that lands this. This is INERT
+        // (the number is reporting in get_haiku_usage, not a decision), but flag it
+        // so a one-time discontinuity in the prod cost history isn't mistaken for a
+        // regression.
         if (req.onUsage) {
           const m = message as unknown as {
             usage?: {
@@ -133,16 +178,19 @@ export async function summarize(
               cache_read_input_tokens?: number;
               cache_creation_input_tokens?: number;
             };
-            total_cost_usd?: number;
           };
           const u = m.usage ?? {};
-          req.onUsage({
-            model: req.model ?? SUMMARIZER_MODEL,
+          const buckets = {
             inputTokens: u.input_tokens ?? 0,
             outputTokens: u.output_tokens ?? 0,
             cacheReadTokens: u.cache_read_input_tokens ?? 0,
             cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
-            costUsd: m.total_cost_usd ?? 0,
+          };
+          req.onUsage({
+            model: req.model ?? SUMMARIZER_MODEL,
+            ...buckets,
+            costUsd: costFromUsage(buckets),
+            mode: "cold",
           });
         }
         return message.result;

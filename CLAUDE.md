@@ -299,7 +299,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   sidecar SELF-DISABLES unless a feature is on + MCP configured + `node` on PATH; it is SHARED with
   the Agent Queue (per-feature env flags gate the two loops; the summarizer's `GHOSTTY_SUMMARIZER`
   absent=ON for back-compat); cost is controlled by hidden-throttle + fuzzy change-detection +
-  quiescent-skip + a config overlay + rate-limit auto-backoff; for colleagues the sidecar is bundled
+  quiescent-skip + a config overlay + rate-limit auto-backoff + **warm-base fork-per-call reuse**
+  (default OFF, `GHOSTTY_WARMBASE=1`; `src/warmbase.ts`): keep ONE system-only base session per
+  `(configDir,model,systemHash)` and `forkSession`→`resume`→`deleteSession` per call so the fork
+  READS the cached ~25–32k system prefix instead of re-CREATING it (~79% of the bill) — measured
+  **$0.0561→$0.0035/call (~94%)**, isolation clean BY CONSTRUCTION (each fork branches from the
+  system-only base, so it's safe for the summarizer AND the fail-open bell-classify); the cold
+  one-shot is the FLOOR (every warm failure → `WarmBaseUnavailable` → cold fallback, gate OFF =
+  control-flow identical); account/store bound by setting `CLAUDE_CONFIG_DIR` ONCE at construction
+  (single sidecar-wide account, race-free) with a `run()` config-mismatch guard; costing is
+  token-bucket (NEVER the cumulative `total_cost_usd`); fork GC = `deleteSession` in `finally` +
+  per-instance/per-pid `projectDir` + dead-pid startup sweep (so coexisting Release/ReleaseLocal
+  sidecars can't sweep each other); see AGENT-MANAGER.md → "Warm-base fork-per-call reuse"; for colleagues the sidecar is bundled
   dist-only AND the Haiku summarizer + rate-limit bell watchdog now WORK for DMG users (no longer
   dev-only) — the release build inlines ONLY the SDK's JS via esbuild (no 215MB native binary) and
   `model.ts` points the SDK at the colleague's ALREADY-INSTALLED `claude` via

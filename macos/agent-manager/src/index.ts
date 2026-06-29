@@ -43,15 +43,30 @@
 
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 
 import { installFileLogger } from "./logfile.js";
 import { recordDiag } from "./diag.js";
 import { recordUsage, trimUsageLog, type HaikuUsage } from "./usage.js";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 import { McpClient, McpError, type Surface } from "./mcp.js";
 import { SUMMARIZER_BASE_PROMPT } from "./prompts.js";
 import { makeOverrideLoader, type OverrideLoader } from "./prompt.js";
-import { summarize as defaultSummarize } from "./model.js";
+import {
+  summarize as defaultSummarize,
+  resolveClaudePath,
+  SUMMARIZER_MODEL,
+} from "./model.js";
+import {
+  WarmBase,
+  warmbaseEnabled,
+  loadForkSeam,
+  warmbaseProjectDir,
+  warmbaseInstanceDir,
+  warmbaseInstanceKey,
+  warmbaseRunDirName,
+  planDeadRunDirs,
+} from "./warmbase.js";
 import { readAccountSpec, resolveAccountDir } from "./account.js";
 import { loadConfig } from "./config.js";
 import {
@@ -169,6 +184,21 @@ export function parseLoopEnablement(
   };
 }
 
+/**
+ * PURE gate predicate for the warm-base mechanism: ON iff `GHOSTTY_WARMBASE=1`
+ * (via `warmbaseEnabled`) AND a Haiku-making feature (summarizer or bell-filter)
+ * is armed. A queue-only process makes ZERO Haiku calls, so it never builds a
+ * WarmBase. Extracted so a regression that flips the gate condition is caught by
+ * a unit test. PURE over its injected env + the two feature bools.
+ */
+export function shouldEnableWarmBase(
+  env: Record<string, string | undefined>,
+  summarizerEnabled: boolean,
+  bellFilter: boolean,
+): boolean {
+  return warmbaseEnabled(env) && (summarizerEnabled || bellFilter);
+}
+
 /** The single-shot model call seam (defaults to the real SDK-backed summarize).
  *  Injectable so the loop can be exercised without spawning the CLI. `configDir`
  *  (optional) routes the spawned `claude`'s auth/billing to a specific account. */
@@ -180,6 +210,112 @@ export type SummarizeFn = (
     onUsage?: (usage: HaikuUsage) => void;
   },
 ) => Promise<string>;
+
+/**
+ * The underlying model.ts `summarize` signature (3-arg: req, queryFn?, warm?). It IS
+ * `typeof defaultSummarize`, so `makeSummarizeFn` can be unit-tested with a spy that
+ * records HOW it was called (2-arg bare vs 3-arg with a WarmBase).
+ */
+export type BaseSummarizeFn = typeof defaultSummarize;
+
+/**
+ * PURE wiring of the loop's `summarize` seam (extracted so a regression that
+ * mis-wires warm vs cold is caught by a unit test): when a WarmBase is present, route
+ * through it (`base(req, undefined, warmBase)`); when ABSENT, return the BARE
+ * `base` UNWRAPPED so the cold path is control-flow IDENTICAL to before the feature
+ * existed (the 1-arg call `base(req)` — no queryFn, no warm). The gate decision
+ * itself is `shouldEnableWarmBase`.
+ */
+export function makeSummarizeFn(
+  base: BaseSummarizeFn,
+  warmBase: WarmBase | undefined,
+): SummarizeFn {
+  return warmBase
+    ? (req) => base(req, undefined, warmBase)
+    : (base as SummarizeFn);
+}
+
+/** Deps for {@link buildWarmBase} — the impure bits injected so the startup
+ *  construction floor is unit-testable WITHOUT a real SDK import or a real sweep. */
+export interface BuildWarmBaseDeps {
+  projectDir: string;
+  model: string;
+  /** The SINGLE account this sidecar binds (summarizer + bell-classify); set ONCE on
+   *  the WarmBase. OMITTED ⇒ ambient (no binding). ROUND-2 resolution #1. */
+  configDir?: string;
+  claudePath?: string;
+  /** Best-effort mkdir of projectDir; a throw is swallowed. */
+  ensureDir: (dir: string) => void;
+  /** Best-effort per-launch dead-pid run-dir sweep (ROUND-2 resolution #2): remove
+   *  sibling run dirs whose owning sidecar pid is dead. Returns the count removed; a
+   *  throw is swallowed. OMITTED ⇒ no run-dir sweep (back-compat / legacy shared
+   *  dir). Composed in main() from the pure `planDeadRunDirs` + fs. */
+  sweepDeadRunDirs?: () => number;
+  /** Store roots the startup sweep scans for OUR orphan forks/bases. Always include
+   *  ambient (`undefined`); add the account configDir under account routing so an
+   *  account-dir base/fork from a prior run is reaped (not just ~/.claude leftovers).
+   *  Defaults to `[undefined]` (ambient only) for back-compat. */
+  sweepConfigDirs?: ReadonlyArray<string | undefined>;
+  log: (m: string) => void;
+  errlog: (m: string) => void;
+}
+
+/**
+ * FLOOR-critical: construct the WarmBase, guarding EVERY impure step so that ANY
+ * failure leaves the result `undefined` and the COLD path (the floor) + the queue
+ * still come up. This is the "never worse than today even at startup" branch:
+ * `loadSeam()` does a dynamic SDK import (the exact no-bundle / module-resolution
+ * failure the lazy-load seam exists to survive) and the orphan sweep can throw —
+ * neither may kill the sidecar merely because GHOSTTY_WARMBASE=1. Extracted from
+ * `main()` (with `loadSeam` injectable) so a regression here — e.g. a rethrow where
+ * a swallow was intended — is caught by a unit test rather than only by inspection.
+ *
+ * Contract: loadSeam-throw ⇒ returns undefined (cold deps still build); a
+ * sweep-throw is swallowed (count 0) and the WarmBase is STILL returned.
+ */
+export async function buildWarmBase(
+  deps: BuildWarmBaseDeps,
+  loadSeam: () => Promise<Awaited<ReturnType<typeof loadForkSeam>>>,
+): Promise<WarmBase | undefined> {
+  try {
+    deps.ensureDir(deps.projectDir);
+    // Per-launch dead-pid run-dir sweep (ROUND-2 resolution #2): reap sibling run
+    // dirs whose owning sidecar pid is dead, BEFORE this launch's own base lands.
+    // Best-effort (swallowed) so it can never block construction; never touches a
+    // live peer's dir or this launch's own run dir (see `planDeadRunDirs`).
+    let reapedRunDirs = 0;
+    try {
+      reapedRunDirs = deps.sweepDeadRunDirs?.() ?? 0;
+    } catch {
+      /* best-effort */
+    }
+    const wb = new WarmBase({
+      seam: await loadSeam(),
+      projectDir: deps.projectDir,
+      model: deps.model,
+      // SET-ONCE account binding (ROUND-2 resolution #1) — bound in the constructor.
+      configDir: deps.configDir,
+      claudePath: deps.claudePath,
+      log: (m) => deps.log(`warm-base: ${m}`),
+    });
+    const swept = await wb
+      .sweepOrphanForks(deps.sweepConfigDirs ?? [undefined])
+      .catch(() => 0);
+    deps.log(
+      `warm-base: ENABLED (projectDir=${deps.projectDir}, swept ${swept} orphan fork(s)` +
+        `, reaped ${reapedRunDirs} dead run dir(s))`,
+    );
+    return wb;
+  } catch (e) {
+    // Cold path is the floor — never worse than today. Log and carry on.
+    deps.errlog(
+      `warm-base: construction failed, falling back to COLD path: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+    return undefined;
+  }
+}
 
 export interface LoopDeps {
   client: McpClient;
@@ -818,13 +954,86 @@ async function main(): Promise<void> {
     }
   }
 
+  // (warm-base) Fork-per-call Haiku reuse — DEFAULT OFF (GHOSTTY_WARMBASE=1). When on
+  // AND a Haiku-making feature is armed (summarizer or bell-filter), keep ONE system-only
+  // base session per (configDir, systemHash) and fork it per call; every warm-mechanism
+  // failure cold-falls-back. Constructed only when enabled; off ⇒ defaultSummarize is
+  // wired two-arg as before (byte-identical cold behavior, no projectDir, no sweep).
+  let warmBase: WarmBase | undefined;
+  if (shouldEnableWarmBase(process.env, summarizerEnabled, bellFilter)) {
+    // FLOOR: construction is fully guarded by buildWarmBase (extracted + unit-tested).
+    // It runs BEFORE the queue is wired, so an unguarded throw here would kill the
+    // whole sidecar at startup merely because GHOSTTY_WARMBASE=1 — buildWarmBase
+    // guarantees ANY failure (dynamic SDK import / sweep) leaves warmBase=undefined
+    // so the COLD path (the floor) + the QUEUE (zero Haiku calls) still come up.
+    // Per-INSTANCE parent (Release vs ReleaseLocal differ by MCP URL port) + a
+    // per-LAUNCH run subdir keyed on THIS sidecar's pid (ROUND-2 resolution #2), so
+    // neither a coexisting instance NOR an overlapping relaunch can sweep THIS
+    // launch's live base. The startup dead-pid sweep reaps only sibling run dirs
+    // whose owning pid is dead.
+    const instanceKey = warmbaseInstanceKey(url);
+    const instanceDir = warmbaseInstanceDir(home, instanceKey);
+    const selfRunDirName = warmbaseRunDirName(process.pid);
+    warmBase = await buildWarmBase(
+      {
+        projectDir: warmbaseProjectDir(home, instanceKey, process.pid),
+        model: SUMMARIZER_MODEL,
+        // SET-ONCE account binding: the single sidecar-wide account used for BOTH
+        // summarizer and bell-classify (ROUND-2 resolution #1).
+        configDir: summarizerConfigDir,
+        claudePath: resolveClaudePath(),
+        // Sweep BOTH ambient (~/.claude) and the routed account dir so an account-dir
+        // base/fork orphaned by a prior run is reaped, not just ~/.claude leftovers.
+        sweepConfigDirs: [undefined, summarizerConfigDir],
+        ensureDir: (dir) => {
+          try {
+            mkdirSync(dir, { recursive: true });
+          } catch {
+            /* best-effort */
+          }
+        },
+        // Reap sibling run dirs whose owning sidecar pid is dead (pure plan + fs).
+        sweepDeadRunDirs: () => {
+          let entries: string[] = [];
+          try {
+            entries = readdirSync(instanceDir);
+          } catch {
+            return 0; // parent absent on first launch ⇒ nothing to reap
+          }
+          const dead = planDeadRunDirs(entries, selfRunDirName, (pid) => {
+            try {
+              process.kill(pid, 0); // signal 0 = liveness probe; throws ESRCH if dead
+              return true;
+            } catch (e) {
+              // EPERM ⇒ alive but not ours; ESRCH ⇒ dead. Only ESRCH means reap.
+              return (e as NodeJS.ErrnoException)?.code !== "ESRCH";
+            }
+          });
+          let n = 0;
+          for (const name of dead) {
+            try {
+              rmSync(join(instanceDir, name), { recursive: true, force: true });
+              n++;
+            } catch {
+              /* best-effort */
+            }
+          }
+          return n;
+        },
+        log,
+        errlog,
+      },
+      loadForkSeam,
+    );
+  }
+
   const deps: LoopDeps = {
     client,
     overrides: makeOverrideLoader(),
     cfg,
     budget: new ConcurrencyBudget(cfg.maxConcurrent),
     now: () => Date.now(),
-    summarize: defaultSummarize,
+    summarize: makeSummarizeFn(defaultSummarize, warmBase),
     lastBySession: new Map<string, LastSummary>(),
     alertBySession: new Map<string, string>(),
     summarizerEnabled,
@@ -887,7 +1096,8 @@ async function main(): Promise<void> {
 
   log(
     `sidecar started; MCP=${url} summarizer=${summarizerEnabled} ` +
-      `queue=${deps.queue !== undefined} bellFilter=${bellFilter} (poll ${POLL_INTERVAL_MS}ms)`,
+      `queue=${deps.queue !== undefined} bellFilter=${bellFilter} ` +
+      `warmBase=${warmBase !== undefined} (poll ${POLL_INTERVAL_MS}ms)`,
   );
 
   // The controller's gate guarantees at least one of the THREE loops is armed, but guard

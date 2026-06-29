@@ -13,6 +13,21 @@ import {
   SUMMARIZER_MODEL,
   type QueryFn,
 } from "./model.js";
+import {
+  WarmBaseUnavailable,
+  type WarmBase,
+  type WarmRunRequest,
+} from "./warmbase.js";
+import type { HaikuUsage } from "./usage.js";
+
+/**
+ * A minimal stub `WarmBase` for the model.ts integration tests. We only need its
+ * `run(req)` method (summarize calls nothing else on it), so we build an object
+ * with a fake `run` and cast it to WarmBase — no real SDK / fork seam involved.
+ */
+function stubWarm(run: (req: WarmRunRequest) => Promise<string>): WarmBase {
+  return { run } as unknown as WarmBase;
+}
 
 /**
  * Build a fake `queryFn` that yields the given message-like objects in order.
@@ -51,12 +66,15 @@ test("summarize: success result message => returns its .result text", async () =
 });
 
 test("summarize: onUsage receives tokens + cost off the success result", async () => {
+  // total_cost_usd is now IGNORED — cost is a token-bucket estimate (LOCKED #1):
+  // (10*1 + 141*5 + 0*2 + 25736*0.10)/1e6 = (10 + 705 + 2573.6)/1e6 = 0.0032886
+  // (numerically identical here because cacheRead dominates at $0.10/MTok).
   const q = fakeQuery([
     {
       type: "result",
       subtype: "success",
       result: "ok",
-      total_cost_usd: 0.0032886,
+      total_cost_usd: 999, // deliberately wrong — proves it is NOT read
       usage: {
         input_tokens: 10,
         output_tokens: 141,
@@ -65,27 +83,30 @@ test("summarize: onUsage receives tokens + cost off the success result", async (
       },
     },
   ]);
-  let seen: unknown;
+  let seen: HaikuUsage | undefined;
   await summarize({ system: "S", user: "U", onUsage: (u) => (seen = u) }, q);
-  assert.deepEqual(seen, {
+  const { costUsd, ...rest } = seen as HaikuUsage;
+  assert.deepEqual(rest, {
     model: SUMMARIZER_MODEL,
     inputTokens: 10,
     outputTokens: 141,
     cacheReadTokens: 25736,
     cacheCreationTokens: 0,
-    costUsd: 0.0032886,
+    mode: "cold",
   });
+  assert.ok(Math.abs(costUsd - 0.0032886) < 1e-9, `cost ${costUsd}`);
 });
 
 test("summarize: onUsage tolerates a missing usage block (defaults to 0)", async () => {
   const q = fakeQuery([{ type: "result", subtype: "success", result: "ok" }]);
-  let seen: { inputTokens: number; costUsd: number } | undefined;
+  let seen: { inputTokens: number; costUsd: number; mode?: string } | undefined;
   await summarize(
     { system: "S", user: "U", model: "m", onUsage: (u) => (seen = u) },
     q,
   );
   assert.equal(seen?.inputTokens, 0);
   assert.equal(seen?.costUsd, 0);
+  assert.equal(seen?.mode, "cold");
 });
 
 test("summarize: onUsage is NOT called on an error result", async () => {
@@ -244,6 +265,103 @@ test("summarize: no GHOSTTY_CLAUDE_PATH => pathToClaudeCodeExecutable omitted", 
 });
 
 // --- account routing via configDir ------------------------------------------
+
+// --- warm-base integration (third-arg seam) --------------------------------
+
+/** Count how many times the COLD queryFn is invoked, to assert no double-call. */
+function countingQuery(
+  messages: unknown[],
+  counter: { calls: number },
+): QueryFn {
+  return (() => {
+    counter.calls += 1;
+    return (async function* () {
+      for (const m of messages) yield m;
+    })();
+  }) as unknown as QueryFn;
+}
+
+test("summarize warm: WarmBaseUnavailable => COLD fallback returns the cold result (one cold call)", async () => {
+  const counter = { calls: 0 };
+  const cold = countingQuery(
+    [{ type: "result", subtype: "success", result: "cold-text" }],
+    counter,
+  );
+  const warm = stubWarm(async () => {
+    throw new WarmBaseUnavailable("fork");
+  });
+  const text = await summarize({ system: "S", user: "U" }, cold, warm);
+  assert.equal(text, "cold-text");
+  assert.equal(counter.calls, 1); // exactly one cold call
+});
+
+test("summarize warm: a PLAIN Error from run() REJECTS without a cold call (no double-cost)", async () => {
+  const counter = { calls: 0 };
+  const cold = countingQuery(
+    [{ type: "result", subtype: "success", result: "cold-text" }],
+    counter,
+  );
+  const warm = stubWarm(async () => {
+    throw new Error("overloaded");
+  });
+  await assert.rejects(
+    () => summarize({ system: "S", user: "U" }, cold, warm),
+    (e: unknown) =>
+      e instanceof Error &&
+      !(e instanceof WarmBaseUnavailable) &&
+      /overloaded/.test(e.message),
+  );
+  assert.equal(counter.calls, 0); // cold queryFn NEVER invoked
+});
+
+test("summarize warm: success => returns warm text; cold queryFn never called; onUsage rides through", async () => {
+  const counter = { calls: 0 };
+  const cold = countingQuery(
+    [{ type: "result", subtype: "success", result: "cold-text" }],
+    counter,
+  );
+  let seen: HaikuUsage | undefined;
+  const warmUsage: HaikuUsage = {
+    model: SUMMARIZER_MODEL,
+    inputTokens: 1,
+    outputTokens: 2,
+    cacheReadTokens: 3,
+    cacheCreationTokens: 0,
+    costUsd: 0.000017,
+    mode: "warm",
+  };
+  const warm = stubWarm(async (req) => {
+    req.onUsage?.(warmUsage);
+    return "warm-text";
+  });
+  const text = await summarize(
+    { system: "S", user: "U", onUsage: (u) => (seen = u) },
+    cold,
+    warm,
+  );
+  assert.equal(text, "warm-text");
+  assert.equal(counter.calls, 0);
+  assert.equal(seen?.mode, "warm");
+  assert.deepEqual(seen, warmUsage);
+});
+
+test("summarize warm: req fields (model/configDir) are threaded into run()", async () => {
+  let captured: WarmRunRequest | undefined;
+  const warm = stubWarm(async (req) => {
+    captured = req;
+    return "ok";
+  });
+  const cold = fakeQuery([{ type: "result", subtype: "success", result: "x" }]);
+  await summarize(
+    { system: "SYS", user: "USR", model: "m-override", configDir: "/acct" },
+    cold,
+    warm,
+  );
+  assert.equal(captured?.system, "SYS");
+  assert.equal(captured?.user, "USR");
+  assert.equal(captured?.model, "m-override");
+  assert.equal(captured?.configDir, "/acct");
+});
 
 test("summarize: configDir sets options.env CLAUDE_CONFIG_DIR but PRESERVES process.env", async () => {
   process.env.__AM_TEST__ = "preserved";

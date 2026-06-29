@@ -383,6 +383,57 @@ Tests: `summarizer.test.ts` (`backoffDelayMs`), `config.test.ts` (parse), `index
 one-probe-recovers, failed-probe-extends, unparseable-is-fail). **Rebuilt sidecar `dist` +
 sidecar restart only; no GUI/host/Zig change.**
 
+### Warm-base fork-per-call reuse — the cache-CREATION cost fix (default OFF: `GHOSTTY_WARMBASE=1`)
+
+**The big cost lever.** Every Haiku call is a fresh `claude` spawn that re-writes a
+~25–32k-token prompt-cache CREATION entry (`$2/MTok`) — ~79% of the bill (`cacheRead≈0` in
+prod). `src/warmbase.ts` removes that: keep ONE **system-only base session** per
+`(configDir, model, systemHash)` and, per call, `forkSession(base)` → run the surface turn
+via `query({ resume: forkId })` → `deleteSession(forkId)`. The fork READS the base's cached
+system prefix instead of re-creating it. **Measured: $0.0561 → $0.0035/call (~94% cheaper),
+isolation clean by construction** (each fork branches from the system-only base, never from
+another surface — so it is safe for BOTH the summarizer AND the fail-open bell-classify).
+
+Load-bearing facts (all unit-tested; `model.test.ts`/`warmbase.test.ts`/`index.test.ts`):
+
+- **The cold path is the FLOOR.** `model.ts` routes through `WarmBase.run()` only when a
+  `WarmBase` is wired; a warm-MECHANISM failure throws `WarmBaseUnavailable` (kinds:
+  `base-create`/`fork`/`resume`/`timeout`/`config-mismatch`) → model.ts falls back to today's
+  cold one-shot for THAT surface. A GENUINE model error/result is rethrown PLAIN so model.ts
+  does NOT cold-retry (no double-charge). Gate OFF ⇒ `summarize()` is wired two-arg, the cold
+  path is control-flow identical. So warm-base can never be worse than cold.
+- **Account/store binding = set `CLAUDE_CONFIG_DIR` ONCE at construction** (the BLOCKER the
+  review caught): the SDK's in-process store fns (`forkSession`/`deleteSession`/`listSessions`)
+  take NO env arg and resolve their store root from `process.env.CLAUDE_CONFIG_DIR` at call
+  time. The whole sidecar uses ONE account (`summarizerConfigDir`, both features), so the
+  constructor binds it once — race-free — and every op (base-create, fork, resume, delete,
+  sweep) resolves the SAME account store. `run()` GUARDS that each `req.configDir` equals the
+  bound one and cold-falls-back (`config-mismatch`) if it ever differs, so the constant
+  binding is never wrong for a served call. (Per-call env mutation was rejected as racy.)
+- **Token-bucket costing, NEVER `total_cost_usd`** (`costFromUsage` × `HAIKU_RATES`): the SDK's
+  `total_cost_usd` is cumulative-per-session, so warm/cold both price from `usage` token
+  buckets, immune to the cumulative question and directly comparable; usage records are tagged
+  `mode:"warm"|"cold"` for `get_haiku_usage`.
+- **Fork GC**: `deleteSession(forkId)` in a `finally` on EVERY path (success/throw/timeout) +
+  a startup `sweepOrphanForks` that reaps only sibling `run-<pid>` dirs whose owning pid is
+  dead. **Per-instance + per-launch `projectDir`** (instance key from the MCP URL port +
+  `process.pid`, pinned as `options.cwd` on every query) so coexisting Release/ReleaseLocal
+  sidecars — or an overlapping relaunch — can never sweep each other's live base.
+- **Timeout** via an `AbortController` + a `timedOut` flag set ONLY in the timer callback and
+  checked FIRST in `catch`, so a genuine deadline → `timeout`/cold-fallback while a real model
+  error is classified correctly. Resume query keeps `tools:[]` + `maxTurns:3` (no tool-arming
+  inside a fork) and NO `systemPrompt` (inherited from the base via resume).
+- **`buildWarmBase` fully guards construction** (dynamic SDK import + startup sweep): ANY
+  failure leaves `warmBase=undefined` so the cold floor + the (Haiku-free) queue still come up
+  even with `GHOSTTY_WARMBASE=1`.
+
+Wiring: `src/warmbase.ts` (new), `src/model.ts` (route + token-bucket usage), `src/index.ts`
+(gate `shouldEnableWarmBase` + `buildWarmBase` + per-instance dirs), `src/usage.ts`
+(`mode?:"warm"|"cold"` tag). **Rebuilt sidecar `dist` + sidecar restart only; no GUI/host/Zig
+change.** Status / open verification: see `AGENT-MANAGER-WARMBASE-DESIGN.md` (real-claude
+cache+isolation confirmed; GC unit-tested; live-module GC-delta to confirm via the running
+sidecar before relying on it).
+
 ### Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha)
 
 Under the `claude-pool` wrapper the surface's foreground process is `bash` (and even bare,
