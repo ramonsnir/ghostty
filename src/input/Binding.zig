@@ -950,6 +950,11 @@ pub const Action = union(enum) {
     /// returns to where you were. Payload-less.
     goto_last_surface,
 
+    /// (ramon fork) Open the fork's GitHub "new issue" chooser
+    /// (github.com/ramonsnir/ghostty/issues/new/choose) in the default
+    /// browser, for a quick bug report. Payload-less.
+    report_bug,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1635,6 +1640,7 @@ pub const Action = union(enum) {
             .install_agent_hooks,
             .start_agent_queue,
             .goto_last_surface,
+            .report_bug,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,
@@ -3883,6 +3889,21 @@ test "Binding goto_last_surface" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("goto_last_surface", buf.written());
+}
+
+test "Binding report_bug" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=report_bug");
+    try testing.expect(binding.action == .report_bug);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("report_bug", buf.written());
 }
 
 test "format: new_tab round-trips bare and with value" {

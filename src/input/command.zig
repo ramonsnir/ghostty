@@ -606,6 +606,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Focus the previously focused split, across any tab or window.",
         }},
 
+        .report_bug => comptime &.{.{
+            .action = .report_bug,
+            .title = "Report Bug…",
+            .description = "Open the fork's GitHub new-issue page in your browser.",
+        }},
+
         .merge_tabs => comptime &.{
             .{
                 .action = .{ .merge_tabs = .next_horizontal },

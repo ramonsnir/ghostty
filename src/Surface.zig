@@ -6297,6 +6297,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .report_bug => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .open_url,
+            .{
+                .kind = .unknown,
+                .url = "https://github.com/ramonsnir/ghostty/issues/new/choose",
+            },
+        ),
+
         .toggle_background_opacity => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_background_opacity,
