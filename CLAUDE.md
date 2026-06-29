@@ -433,9 +433,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 
 ## Distribution / sharing the fork (colleague builds, CI release, auto-update)
 
-The fork can be shared with colleagues as a signed/notarized DMG, auto-released by
-CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
-`SHARING.md`.** The load-bearing facts for an agent touching this code:
+The fork can be shared with colleagues as a signed/notarized DMG, released from the
+PRIMARY local build script `dist/macos/release-local.sh` (the manual-only
+`workflow_dispatch` CI workflow `fork-release.yml` is a fallback — NOT auto-on-push),
+with in-app Sparkle updates. **User-facing guide: `SHARING.md`.** The load-bearing
+facts for an agent touching this code:
 
 - **Sparkle is RE-ENABLED but pinned to the fork's OWN feed.** `UpdateController`'s
   three methods (startUpdater/checkForUpdates/validateMenuItem) are restored to the
@@ -614,8 +616,11 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   `macos-26` queue + notary cost). It builds on `macos-26` (the `macos-15` image crashes
   AssetCatalogAgent on the Liquid Glass `.icon` via a MediaToolbox override cryptex).
   Fork-only (`if:
-  github.repository == 'ramonsnir/ghostty'`); the inherited upstream workflows are
-  already inert on the fork (owner/tag/repo guards), so no neutering. Builds the
+  github.repository == 'ramonsnir/ghostty'`); the inherited upstream CI/release +
+  vouch/issue-template workflows were REMOVED from the fork (issue #1 — "reset issue
+  templates and such for the fork to be independent"), so `fork-release.yml` is now the
+  ONLY workflow under `.github/workflows/` (the upstream ones were previously left inert
+  via owner/tag/repo guards; they are gone now, not merely guarded). Builds the
   xcframework + `ghostty-host` (`nix develop -c zig build … -Demit-macos-app=false`),
   builds the app (`xcodebuild -configuration Release` → already the fork's Release id +
   display name), bundles + signs the host AND the `ghostty-mcp` shim inside the app, injects

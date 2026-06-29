@@ -1,11 +1,12 @@
 # Fork release: build + (sign + notarize + DMG + Sparkle appcast) + publish a
-# GitHub Release on every push to `main` of the ramon fork.
+# GitHub Release for the ramon fork. MANUAL-ONLY (`workflow_dispatch`); the
+# PRIMARY release path is the local script `dist/macos/release-local.sh`.
 #
 # This is FORK-ONLY. It is guarded to `ramonsnir/ghostty` so it never runs on
-# the upstream `ghostty-org/ghostty` (origin). The inherited upstream workflows
-# (release-tip / release-tag / test) are already inert on the fork — they are
-# guarded by `github.repository_owner == 'ghostty-org'`, version-tag triggers, or
-# `github.repository == 'ghostty-org/ghostty'` — so no neutering is needed.
+# the upstream `ghostty-org/ghostty` (origin). The inherited upstream CI/release +
+# vouch/issue-template workflows were REMOVED from the fork (issue #1 — "reset issue
+# templates and such for the fork to be independent"), so this is now the ONLY
+# workflow under `.github/workflows/`; there is nothing left to neuter.
 #
 # SIGNING IS OPTIONAL UNTIL ENROLLED: when the signing secrets are absent the
 # workflow still builds the app (proving the pipeline + compile) and uploads the

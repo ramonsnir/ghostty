@@ -1,5 +1,4 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Features, Bug Reports, Questions
-    url: https://github.com/ghostty-org/ghostty/discussions/new/choose
-    about: Our preferred starting point if you have any questions or suggestions about configuration, features or behavior.
+# This is a personal fork of Ghostty. Issues are used as a private work queue
+# (see CONTRIBUTING.md). Blank issues are allowed; there are no upstream-style
+# templates or discussion redirects.
+blank_issues_enabled: true
