@@ -395,10 +395,22 @@ rebuild for the new Zig key; no host restart) picks up a change.
 ~25–32k-token prompt-cache CREATION entry (`$2/MTok`) — ~79% of the bill (`cacheRead≈0` in
 prod). `src/warmbase.ts` removes that: keep ONE **system-only base session** per
 `(configDir, model, systemHash)` and, per call, `forkSession(base)` → run the surface turn
-via `query({ resume: forkId })` → `deleteSession(forkId)`. The fork READS the base's cached
-system prefix instead of re-creating it. **Measured: $0.0561 → $0.0035/call (~94% cheaper),
-isolation clean by construction** (each fork branches from the system-only base, never from
-another surface — so it is safe for BOTH the summarizer AND the fail-open bell-classify).
+via `query({ resume: forkId, systemPrompt })` → `deleteSession(forkId)`. **Isolation is clean
+by construction** (each fork branches from the system-only base, never from another surface —
+so it is safe for BOTH the summarizer AND the fail-open bell-classify).
+
+**Cost, measured LIVE (the honest numbers):** ~$0.056/call (cold) → **~$0.011/call median (~81%
+cheaper)**, verified in prod on a healthy account. NOT the ~$0.0035/94% an isolated probe showed
+— two caveats learned the hard way:
+- The probe ran with extended **thinking OFF** (output ≈ 24 tok); live, thinking is ON (the
+  pre-existing summarizer behavior), so output is ~900–2,800 tok/call and now DOMINATES the
+  bill. Disabling thinking is therefore the BIGGEST remaining lever (it was dismissed as "only
+  24%" back when the 25k creation dominated — warm-base inverted that calculus).
+- Live, **`cacheRead = 0`** — the fork is NOT cache-reading the system prefix the way the probe
+  did. The savings come from a DIFFERENT mechanism than first claimed: the resumed fork simply
+  doesn't carry the ~25–32k Claude-Code-CLI system bloat the cold path re-CREATES each call
+  (`create=0` too), so the per-call prefix is just our ~1.5k summarizer system as cheap input.
+  Net is still ~81% off cold; just not via prompt-cache reuse.
 
 Load-bearing facts (all unit-tested; `model.test.ts`/`warmbase.test.ts`/`index.test.ts`):
 
@@ -408,6 +420,13 @@ Load-bearing facts (all unit-tested; `model.test.ts`/`warmbase.test.ts`/`index.t
   cold one-shot for THAT surface. A GENUINE model error/result is rethrown PLAIN so model.ts
   does NOT cold-retry (no double-charge). Gate OFF ⇒ `summarize()` is wired two-arg, the cold
   path is control-flow identical. So warm-base can never be worse than cold.
+  - **Unusable-reply fallback (`SummarizeRequest.isUsable`):** a warm call can SUCCEED yet
+    return an UNUSABLE reply (e.g. unparseable — the hollow-fork symptom). That is NOT a
+    `WarmBaseUnavailable`, so without this it silently skipped the surface WITHOUT cold-falling-
+    back — the floor had a HOLE. `index.ts` passes `isUsable = (r) => parseSummary(r) !== null`;
+    an unusable warm reply now falls THROUGH to the cold one-shot. So even an unforeseen hollow
+    warm reply degrades to working cold summaries, not silent breakage (you'll see a steady
+    stream of "warm-base reply UNUSABLE; falling back to cold" logs — the intended signal).
 - **Account/store binding = set `CLAUDE_CONFIG_DIR` ONCE at construction** (the BLOCKER the
   review caught): the SDK's in-process store fns (`forkSession`/`deleteSession`/`listSessions`)
   take NO env arg and resolve their store root from `process.env.CLAUDE_CONFIG_DIR` at call
@@ -428,17 +447,27 @@ Load-bearing facts (all unit-tested; `model.test.ts`/`warmbase.test.ts`/`index.t
 - **Timeout** via an `AbortController` + a `timedOut` flag set ONLY in the timer callback and
   checked FIRST in `catch`, so a genuine deadline → `timeout`/cold-fallback while a real model
   error is classified correctly. Resume query keeps `tools:[]` + `maxTurns:3` (no tool-arming
-  inside a fork) and NO `systemPrompt` (inherited from the base via resume).
+  inside a fork) AND **RE-SENDS `systemPrompt: req.system`**. ⚠️ This is load-bearing and was a
+  SHIPPED BUG: `resume` does NOT replay the base session's system into the request, so omitting
+  it ran every call HOLLOW (no contract → unparseable replies, `cacheRead=0`, frozen tiles). The
+  isolated probe masked it by spreading `systemPrompt` into the resume; the module had dropped
+  it. Re-sending the SAME system the base was created with restores the model's contract (and is
+  what every cold call sends too). Regression-guarded by `warmbase.test.ts` ("run happy path"
+  asserts the resume query carries `systemPrompt`).
 - **`buildWarmBase` fully guards construction** (dynamic SDK import + startup sweep): ANY
   failure leaves `warmBase=undefined` so the cold floor + the (Haiku-free) queue still come up
   even with `GHOSTTY_WARMBASE=1`.
 
-Wiring: `src/warmbase.ts` (new), `src/model.ts` (route + token-bucket usage), `src/index.ts`
-(gate `shouldEnableWarmBase` + `buildWarmBase` + per-instance dirs), `src/usage.ts`
-(`mode?:"warm"|"cold"` tag). **Rebuilt sidecar `dist` + sidecar restart only; no GUI/host/Zig
-change.** Status / open verification: see `AGENT-MANAGER-WARMBASE-DESIGN.md` (real-claude
-cache+isolation confirmed; GC unit-tested; live-module GC-delta to confirm via the running
-sidecar before relying on it).
+Wiring: `src/warmbase.ts` (new; resume re-sends `systemPrompt`), `src/model.ts` (route +
+token-bucket usage + `isUsable` unusable-reply→cold fallback), `src/index.ts` (gate
+`shouldEnableWarmBase` + `buildWarmBase` + per-instance dirs + passes `isUsable=parseSummary`),
+`src/usage.ts` (`mode?:"warm"|"cold"` tag). The fork-only config key `agent-manager-warm-base`
+(default OFF) gates it (Zig `Config.zig` + `AgentManagerController` forwards `GHOSTTY_WARMBASE=1/0`).
+Tests: `warmbase.test.ts` (resume MUST carry `systemPrompt` — regression guard; GC/fallback
+classes), `model.test.ts` (unusable-warm→cold, usable-warm→returned). **Rebuilt sidecar `dist` +
+sidecar restart only for the TS; the config key needed a one-time lib+app rebuild.** Status:
+**LIVE + verified** (post-relaunch: parseable summaries, 0 fallbacks, ~81% cheaper); the two
+shipped bugs above were caught by the live relaunch check and fixed.
 
 ### Agent DETECTION is via `agentKind`, NOT `processName` (load-bearing gotcha)
 
