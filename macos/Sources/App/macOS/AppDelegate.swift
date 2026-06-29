@@ -435,6 +435,11 @@ class AppDelegate: NSObject,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(ghosttyToggleDashboardHide(_:)),
+            name: Ghostty.Notification.ghosttyToggleDashboardHide,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(ghosttyInstallAgentHooks(_:)),
             name: Ghostty.Notification.ghosttyInstallAgentHooks,
             object: nil)
@@ -588,6 +593,24 @@ class AppDelegate: NSObject,
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
             agentDashboard?.toggle()
+        }
+    }
+
+    /// (ramon fork / Agent Dashboard) Toggle whether the focused surface is
+    /// hidden from the dashboard (the `toggle_dashboard_hide` keybind). The
+    /// notification's object is the `SurfaceView` to toggle. Lazily creates the
+    /// dashboard controller (like the toggle above) so the hide is recorded +
+    /// persisted even if the panel has never been shown this session; it does
+    /// NOT show the panel.
+    @objc private func ghosttyToggleDashboardHide(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        // Posted from the apprt action callback, which arrives on the main
+        // thread; the controller is @MainActor-isolated.
+        MainActor.assumeIsolated {
+            if agentDashboard == nil {
+                agentDashboard = AgentDashboardController(ghostty: ghostty)
+            }
+            agentDashboard?.toggleHide(surfaceID: surfaceView.id)
         }
     }
 

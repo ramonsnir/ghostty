@@ -647,6 +647,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_AGENT_DASHBOARD:
                 toggleAgentDashboard(app, target: target)
 
+            case GHOSTTY_ACTION_TOGGLE_DASHBOARD_HIDE:
+                return toggleDashboardHide(app, target: target)
+
             case GHOSTTY_ACTION_INSTALL_AGENT_HOOKS:
                 installAgentHooks(app, target: target)
 
@@ -1211,6 +1214,34 @@ extension Ghostty {
                 name: Notification.ghosttyToggleAgentDashboard,
                 object: nil
             )
+        }
+
+        // (ramon fork / Agent Dashboard) Toggle whether the FOCUSED surface is
+        // hidden from the Agent Dashboard — the keyboard equivalent of a tile's
+        // Hide button. Surface-attached (no-op on an APP target): we post the
+        // SurfaceView so the AppDelegate (which owns the dashboard controller) can
+        // read its UUID and toggle the hide set. Mirrors `markSplit`'s target
+        // handling + `pullMarkedSplit`'s "post the surfaceView" pattern.
+        private static func toggleDashboardHide(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                NotificationCenter.default.post(
+                    name: Notification.ghosttyToggleDashboardHide,
+                    object: surfaceView
+                )
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
         }
 
         // (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks.

@@ -277,7 +277,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   xcframework rebuild (the 3 C exports are new); no host restart.**
 
 - **Agent Dashboard** (fork-only, macOS, OFF by default; config `agent-dashboard` /
-  `agent-dashboard-commands` / `agent-dashboard-pin`, action `toggle_agent_dashboard`) — a sidebar
+  `agent-dashboard-commands` / `agent-dashboard-pin`, actions `toggle_agent_dashboard` +
+  `toggle_dashboard_hide`) — a sidebar
   `NSPanel` with a live natively-rendered preview of every split running a CLI agent (Claude/Codex)
   across all tabs/windows; click to jump, Hide to declutter, bell auto-unhides; `agent-dashboard-pin`
   floats + activates the panel (so Rectangle can move it). Live previews need `pty-host` (each tile
@@ -286,7 +287,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   is unreliable — use `proc_listpids`); the smart bottom-anchor footer-trim must test the Unicode
   whitespace property (Claude pads the prompt with NBSP U+00A0); per-tile working/waiting/idle state
   comes from Claude Code hooks POSTing to the MCP `/agent-state` route, correlated to a surface by
-  walking the hook's ppid chain for the controlling tty (the hook's own tty is detached/`??`). **See
+  walking the hook's ppid chain for the controlling tty (the hook's own tty is detached/`??`).
+  **`toggle_dashboard_hide`** is the keyboard equivalent of a tile's eye-slash Hide button: a
+  payload-less but **surface-scoped** action (resolves the focused split like `mark_split`, posts
+  the `SurfaceView` to the AppDelegate, which calls `agentDashboard.toggleHide(surfaceID:)` →
+  model `toggleHide` on the same UUID-keyed persisted hide set; lazily creates the controller so
+  the hide persists even with the panel closed; auto-unhide-on-bell still applies). Command-palette
+  entry "Hide Split from Agent Dashboard"; its apprt `Action`/`Key`/`ghostty.h` enum entry is
+  appended LAST (union order must match the `Key` enum). **See
   `AGENT-DASHBOARD.md` (→ Implementation notes) for the bottom-anchor subsystem, detection, hook
   plumbing, wiring + tests.**
 
