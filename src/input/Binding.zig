@@ -921,6 +921,13 @@ pub const Action = union(enum) {
     /// payload-less.
     toggle_agent_dashboard,
 
+    /// (ramon fork) Toggle whether the FOCUSED split is hidden from the Agent
+    /// Dashboard (macOS) — the keyboard equivalent of a tile's eye-slash Hide
+    /// button, so you can declutter the dashboard from the agent's own split.
+    /// Reversible (press again to reveal). A hidden agent still auto-unhides the
+    /// instant it rings / needs input. Surface-scoped, payload-less.
+    toggle_dashboard_hide,
+
     /// (ramon fork) Install the fork's Claude Code agent-state hooks (macOS): copy
     /// the hook script into `~/.config/ghostty-ramon/claude-hooks/` and merge the
     /// six hook events into `~/.claude/settings.json` (idempotently, with a
@@ -1624,6 +1631,7 @@ pub const Action = union(enum) {
             .toggle_command_palette,
             .toggle_project_selector,
             .toggle_agent_dashboard,
+            .toggle_dashboard_hide,
             .install_agent_hooks,
             .start_agent_queue,
             .goto_last_surface,
@@ -3783,6 +3791,21 @@ test "Binding toggle_agent_dashboard" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("toggle_agent_dashboard", buf.written());
+}
+
+test "Binding toggle_dashboard_hide" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=toggle_dashboard_hide");
+    try testing.expect(binding.action == .toggle_dashboard_hide);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("toggle_dashboard_hide", buf.written());
 }
 
 test "Binding install_agent_hooks" {
