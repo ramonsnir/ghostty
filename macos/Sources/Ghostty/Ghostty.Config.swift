@@ -947,6 +947,18 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Agent Manager) Warm-base fork-per-call Haiku reuse (cost
+        // optimization). Default FALSE (matches the Zig default). The GUI forwards this
+        // to the sidecar as GHOSTTY_WARMBASE=1/0; off ⇒ the cold single-shot path (the
+        // floor). Defaults false on a missing config.
+        var agentManagerWarmBase: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "agent-manager-warm-base"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
         // nil/empty when unset (the controller falls back to a login-shell probe).
         var agentManagerNodePath: String? {

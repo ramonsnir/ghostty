@@ -383,7 +383,13 @@ Tests: `summarizer.test.ts` (`backoffDelayMs`), `config.test.ts` (parse), `index
 one-probe-recovers, failed-probe-extends, unparseable-is-fail). **Rebuilt sidecar `dist` +
 sidecar restart only; no GUI/host/Zig change.**
 
-### Warm-base fork-per-call reuse — the cache-CREATION cost fix (default OFF: `GHOSTTY_WARMBASE=1`)
+### Warm-base fork-per-call reuse — the cache-CREATION cost fix (config `agent-manager-warm-base`, default OFF)
+
+The user-facing knob is the fork-only config key **`agent-manager-warm-base`** (default `false`)
+in `~/.config/ghostty-ramon/config`; `AgentManagerController` forwards the resolved value to the
+sidecar as `GHOSTTY_WARMBASE=1`/`0` — the same Swift→sidecar env-flag transport as
+`GHOSTTY_SUMMARIZER` / `GHOSTTY_HAIKU_USAGE` (NOT a user-set env var). A GUI relaunch (lib
+rebuild for the new Zig key; no host restart) picks up a change.
 
 **The big cost lever.** Every Haiku call is a fresh `claude` spawn that re-writes a
 ~25–32k-token prompt-cache CREATION entry (`$2/MTok`) — ~79% of the bill (`cacheRead≈0` in
