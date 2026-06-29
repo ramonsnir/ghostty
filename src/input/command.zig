@@ -581,6 +581,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Show or hide the floating dashboard of running CLI agents.",
         }},
 
+        .toggle_dashboard_hide => comptime &.{.{
+            .action = .toggle_dashboard_hide,
+            .title = "Hide Split from Agent Dashboard",
+            .description = "Hide (or reveal) the focused split in the Agent Dashboard.",
+        }},
+
         .install_agent_hooks => comptime &.{.{
             .action = .install_agent_hooks,
             .title = "Install Claude Agent Hooks",

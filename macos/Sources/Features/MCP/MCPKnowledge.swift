@@ -189,9 +189,9 @@ enum MCPKnowledge {
             summary: "A GUI-embedded HTTP server to list/render/control live surfaces from a phone over Tailscale, with a bell→Web-Push notifier. Phone workflows only.",
             configKeys: ["web-monitor-listen", "web-monitor-token"],
             enableSteps: [
-                "Set web-monitor-listen = addr:port in ~/.config/ghostty-ramon/local (this Mac's Tailscale IP).",
-                "Optionally set web-monitor-token (open on a private tailnet if empty).",
-                "Relaunch Ghostty. For Web Push, front it with `tailscale serve` (HTTPS) — see WEB-MONITOR.md.",
+                "Set web-monitor-listen = 127.0.0.1:18787 (LOOPBACK) in ~/.config/ghostty-ramon/config. Do NOT bind a Tailscale IP/0.0.0.0 — that's unsupported (plain HTTP, breaks Web Push).",
+                "Set a long random web-monitor-token (the server refuses to start without it).",
+                "Relaunch Ghostty, then front it with HTTPS — REQUIRED to reach it at all: `tailscale serve --bg --https=8787 127.0.0.1:18787`. Open https://<machine>.<tailnet>.ts.net:8787/. See WEB-MONITOR.md.",
             ],
             docPath: "WEB-MONITOR.md"),
         "mcp": FeatureSpec(

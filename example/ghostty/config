@@ -7,6 +7,8 @@ font-feature = -calt
 font-feature = -liga
 font-feature = -dlig
 background-opacity = 1
+# Divider between splits — neutral gray so it's visible on the dark blue bg.
+split-divider-color = #888888
 cursor-style = block
 cursor-style-blink = false
 bell-features = system,attention,title,border

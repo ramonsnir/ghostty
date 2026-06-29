@@ -38,6 +38,10 @@ agent-dashboard-pin      = true                # float the panel above other win
 
 # Keybind to toggle the panel (also in the command palette: "Toggle Agent Dashboard").
 keybind = ctrl+a>d=toggle_agent_dashboard
+
+# Keybind to HIDE the focused split from the dashboard (also in the command
+# palette: "Hide Split from Agent Dashboard"). Reversible — press again to reveal.
+keybind = ctrl+a>shift+d=toggle_dashboard_hide
 ```
 
 - **`agent-dashboard`** — master enable. `true` ⇒ the panel is created at launch and
@@ -63,8 +67,16 @@ keybind = ctrl+a>d=toggle_agent_dashboard
 - **`toggle_agent_dashboard`** — a payload-less keybind action (fork-only). Bind it to
   whatever you like; `ctrl+a>d` is the tmux-flavored default. It's also in the command
   palette as **"Toggle Agent Dashboard"**.
+- **`toggle_dashboard_hide`** — a payload-less, **surface-scoped** keybind action
+  (fork-only). It **toggles whether the FOCUSED split is hidden** from the dashboard — the
+  keyboard equivalent of a tile's eye-slash **Hide** button, so you can declutter the
+  dashboard from inside the agent's own split without reaching for the panel. Reversible:
+  press again on the same split to reveal it. A hidden agent still **auto-unhides the
+  instant it rings / needs input**, exactly as when hidden from its tile. Works even if the
+  panel has never been shown this session (the hide is recorded + persisted); it does NOT
+  open the panel. Also in the command palette as **"Hide Split from Agent Dashboard"**.
 
-> Both keys and the action are fork-only. Keep them in `~/.config/ghostty-ramon/config`
+> All these keys and actions are fork-only. Keep them in `~/.config/ghostty-ramon/config`
 > — an official Ghostty sharing `~/.config/ghostty/config` would error on them.
 
 ---
@@ -90,6 +102,10 @@ keybind = ctrl+a>d=toggle_agent_dashboard
   A **"N hidden"** chip at the bottom opens a popover listing hidden agents
   (`badge · title · Show`) with a **Show all**. A hidden agent that **rings the bell**
   is revealed automatically — an agent asking for input never stays hidden.
+- **Hide from the keyboard** — the **`toggle_dashboard_hide`** action (command palette:
+  "Hide Split from Agent Dashboard") hides/reveals the **currently focused** split without
+  touching the panel, so you can declutter the dashboard from inside the agent you're
+  working in. Same persisted hide set + same auto-unhide-on-bell as the eye-slash button.
 
 ### Degraded states (never a blank panel)
 
@@ -280,8 +296,21 @@ gains a live state chip.
 ## Where it lives (code map)
 
 - **Config:** `src/config/Config.zig` (`agent-dashboard`, `agent-dashboard-commands`
-  reusing `RepeatableString`, and `agent-dashboard-pin` bool); the action in
-  `src/input/Binding.zig`, `src/apprt/action.zig`, `src/input/command.zig`.
+  reusing `RepeatableString`, and `agent-dashboard-pin` bool); the `toggle_agent_dashboard`
+  action in `src/input/Binding.zig`, `src/apprt/action.zig`, `src/input/command.zig`.
+- **`toggle_dashboard_hide` action (hide focused split from the keyboard):** core —
+  `src/input/Binding.zig` (action + surface scope + `Binding toggle_dashboard_hide` test),
+  `src/apprt/action.zig` (union + `Key`, appended after `goto_last_surface` — the union
+  field order MUST match the `Key` enum order), `include/ghostty.h`
+  (`GHOSTTY_ACTION_TOGGLE_DASHBOARD_HIDE`), `src/Surface.zig` (dispatch),
+  `src/input/command.zig` ("Hide Split from Agent Dashboard" palette entry). macOS —
+  `Ghostty.App.swift` `toggleDashboardHide` (resolves the focused `SurfaceView` from the
+  target, posts `ghosttyToggleDashboardHide` with it as `object`),
+  `GhosttyPackage.swift` (the `Notification.Name`), `AppDelegate.swift`
+  (`ghosttyToggleDashboardHide` observer → lazily creates the controller, then
+  `agentDashboard.toggleHide(surfaceID:)`), `AgentDashboardController.swift`
+  (`toggleHide(surfaceID:)` + model `toggleHide(_:)`). Tests: `Binding toggle_dashboard_hide`
+  (Zig) + `toggleHideTogglesAndPersists` in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
 - **Foreground-pid plumbing (the minor-4 frame):** `src/host/protocol.zig`
   (`foreground_pid` FrameType + `ForegroundPid` struct, `PROTOCOL_VERSION_MINOR = 4`),
   `src/host/Session.zig` (resolve-on-change + reattach seed), `src/host/Server.zig`
@@ -316,7 +345,8 @@ gains a live state chip.
   `onAttention`/`enqueuePush`). **GUI + hooks only — no Zig/host change** (it reuses the
   existing minor-4 foreground-pid).
 - **Tests:** `src/config/Config.zig` (`agent-dashboard config`),
-  `src/input/Binding.zig` (`Binding toggle_agent_dashboard`), `src/host/test.zig`
+  `src/input/Binding.zig` (`Binding toggle_agent_dashboard`, `Binding toggle_dashboard_hide`),
+  `src/host/test.zig`
   (minor-4 / `ForegroundPid` round-trip), `src/termio/Client.zig` (`foreground_pid`
   decode), plus the Swift detector/model/sort tests + the `AgentDashboardPanelTests`
   pin/window-level tests in
@@ -343,6 +373,24 @@ gotchas, not a recap.)
   → `AgentDashboardPanel(pinned:)`, which sets `level = pinned ? .floating : .normal` AND
   drops `.nonactivatingPanel` from the style mask when pinned). Keep all in
   `~/.config/ghostty-ramon/config`. Read at launch (relaunch to change).
+- **`toggle_dashboard_hide` (hide the focused split from the keyboard).** A second
+  payload-less keybind action, but **surface-scoped** (NOT app-scoped like
+  `toggle_agent_dashboard`) — it acts on the focused split, so it follows the
+  `mark_split`/`pull_marked_split` target-resolution pattern, NOT the app-global notify
+  pattern. Flow: `Surface.zig` → apprt `.toggle_dashboard_hide` → `Ghostty.App.toggleDashboardHide`
+  resolves the `SurfaceView` from the `GHOSTTY_TARGET_SURFACE` (no-op + `false` on an APP
+  target) and posts `.ghosttyToggleDashboardHide` with **the SurfaceView as `object`** (like
+  `pullMarkedSplit`); `AppDelegate.ghosttyToggleDashboardHide` reads `surfaceView.id` and calls
+  `agentDashboard.toggleHide(surfaceID:)`, which delegates to the model's `toggleHide(_:)`
+  (`hidden.contains(id)` ? `show(id)` : `hide(id)`). The model's hide set is keyed by the
+  **surface UUID** (`view.id`, the same id the eye-slash button and `entry.id` use), so the
+  keybind and the tile button share one persisted set. **The AppDelegate handler lazily
+  creates the controller** (mirrors `ghosttyToggleAgentDashboard`) so the hide is recorded +
+  persisted even if the panel has never been shown this session — but it does NOT call
+  `show()`, so the panel stays closed. **`Key` enum ordering gotcha:** the apprt `Action`
+  union field order MUST match the `Action.Key` enum order (a Zig comptime check), and the
+  `Key` enum order MUST match `ghostty.h` (`checkGhosttyHEnum`); this action is appended at
+  the END of both (after `goto_last_surface`) — don't interleave it.
 - **Window-level / activation rationale.** The panel is **normal-level by default**
   (other windows can cover it) with a visible title ("Agent Dashboard") + standard-window
   AX subrole; the fork-only **`agent-dashboard-pin`** key flips it to a **floating window

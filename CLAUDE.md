@@ -277,7 +277,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   xcframework rebuild (the 3 C exports are new); no host restart.**
 
 - **Agent Dashboard** (fork-only, macOS, OFF by default; config `agent-dashboard` /
-  `agent-dashboard-commands` / `agent-dashboard-pin`, action `toggle_agent_dashboard`) — a sidebar
+  `agent-dashboard-commands` / `agent-dashboard-pin`, actions `toggle_agent_dashboard` +
+  `toggle_dashboard_hide`) — a sidebar
   `NSPanel` with a live natively-rendered preview of every split running a CLI agent (Claude/Codex)
   across all tabs/windows; click to jump, Hide to declutter, bell auto-unhides; `agent-dashboard-pin`
   floats + activates the panel (so Rectangle can move it). Live previews need `pty-host` (each tile
@@ -286,7 +287,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   is unreliable — use `proc_listpids`); the smart bottom-anchor footer-trim must test the Unicode
   whitespace property (Claude pads the prompt with NBSP U+00A0); per-tile working/waiting/idle state
   comes from Claude Code hooks POSTing to the MCP `/agent-state` route, correlated to a surface by
-  walking the hook's ppid chain for the controlling tty (the hook's own tty is detached/`??`). **See
+  walking the hook's ppid chain for the controlling tty (the hook's own tty is detached/`??`).
+  **`toggle_dashboard_hide`** is the keyboard equivalent of a tile's eye-slash Hide button: a
+  payload-less but **surface-scoped** action (resolves the focused split like `mark_split`, posts
+  the `SurfaceView` to the AppDelegate, which calls `agentDashboard.toggleHide(surfaceID:)` →
+  model `toggleHide` on the same UUID-keyed persisted hide set; lazily creates the controller so
+  the hide persists even with the panel closed; auto-unhide-on-bell still applies). Command-palette
+  entry "Hide Split from Agent Dashboard"; its apprt `Action`/`Key`/`ghostty.h` enum entry is
+  appended LAST (union order must match the `Key` enum). **See
   `AGENT-DASHBOARD.md` (→ Implementation notes) for the bottom-anchor subsystem, detection, hook
   plumbing, wiring + tests.**
 
@@ -393,11 +401,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`config-file = ?~/.config/ghostty-ramon/local` — the `?` suppresses the
   file-not-found error, and config-file entries load *after* the file that defines
   them, so `local` cleanly supplies/overrides values). What lives in `local` today:
-  `mcp-token` (a shell-execution credential) and `web-monitor-listen` (this Mac's
-  Tailscale IP). When adding a new secret or per-machine key, put it in `local`, not in
-  the tracked config. On a new machine, create `local` by hand (generate a fresh
-  `mcp-token` with `openssl rand -hex 24`, set that Mac's own Tailscale IP); if `local`
-  is absent the fork still launches (web monitor + MCP just disabled / token-less).
+  `mcp-token` and `web-monitor-token` (both shell-execution credentials). NOTE:
+  `web-monitor-listen` is **no longer** a per-machine value — the supported setup binds
+  **loopback** `127.0.0.1:18787` (same on every Mac, fronted by `tailscale serve` for
+  HTTPS — see WEB-MONITOR.md), so it can live in the tracked config; do NOT bind a
+  Tailscale IP / `0.0.0.0` (unsupported: plain HTTP, breaks Web Push). When adding a new
+  secret, put it in `local`, not in the tracked config. On a new machine, create `local`
+  by hand (generate a fresh `mcp-token` with `openssl rand -hex 24`); if `local` is absent
+  the fork still launches (MCP token-less / web monitor disabled until you add a token).
 
 ## Distribution / sharing the fork (colleague builds, CI release, auto-update)
 

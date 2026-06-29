@@ -576,6 +576,30 @@ struct AgentDashboardModelTests {
         #expect(!model.entries.map(\.id).contains(a)) // dropped from grid
     }
 
+    @Test func toggleHideTogglesAndPersists() {
+        // The `toggle_dashboard_hide` keybind path: model.toggleHide flips the
+        // hide state for a surface and persists, returning the new state. It
+        // shares the exact UUID-keyed set the eye-slash button uses.
+        let store = InMemoryHideStore()
+        let model = AgentDashboardModel(store: store)
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents(agents([a]))
+        #expect(!model.hidden.contains(a))
+
+        // First press hides.
+        #expect(model.toggleHide(a) == true)
+        #expect(model.hidden.contains(a))
+        #expect(store.load().contains(a))            // persisted
+        #expect(!model.entries.map(\.id).contains(a)) // dropped from grid
+
+        // Second press reveals.
+        #expect(model.toggleHide(a) == false)
+        #expect(!model.hidden.contains(a))
+        #expect(!store.load().contains(a))           // persistence updated
+        #expect(model.entries.map(\.id).contains(a))  // back in the grid
+    }
+
     @Test func nonAgentNeverShown() {
         // LOCKED "agent-only": a live split with NO detected agent must never
         // produce a tile, so spec §2.6 state-2 stays reachable.

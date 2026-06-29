@@ -449,6 +449,22 @@ final class AgentDashboardModel: ObservableObject {
         rebuildEntriesFromCurrentState()
     }
 
+    /// Toggle whether a surface is hidden (user gesture from the
+    /// `toggle_dashboard_hide` keybind — the keyboard equivalent of a tile's
+    /// eye-slash). Returns the resulting hidden state. A still-ringing/waiting
+    /// agent that gets hidden is auto-unhidden by the normal bell/attention path,
+    /// exactly as when hidden from its tile.
+    @discardableResult
+    func toggleHide(_ id: UUID) -> Bool {
+        if hidden.contains(id) {
+            show(id)
+            return false
+        } else {
+            hide(id)
+            return true
+        }
+    }
+
     /// Force-close a surface from its tile (user gesture, escape hatch). Tears the split
     /// down via the confirm-FREE path (`MCPLayout.forceClose`, the same one the queue's
     /// auto-close uses) — so it works even on a live agent without popping the
@@ -1434,6 +1450,15 @@ final class AgentDashboardController: NSWindowController {
 
     func toggle() {
         if isShown { hide() } else { show() }
+    }
+
+    /// Toggle whether the given surface is hidden from the dashboard (driven by
+    /// the `toggle_dashboard_hide` keybind, routed here by the AppDelegate). This
+    /// only mutates the persisted hide set — it does NOT show/hide the panel
+    /// itself. Returns the resulting hidden state.
+    @discardableResult
+    func toggleHide(surfaceID id: UUID) -> Bool {
+        model.toggleHide(id)
     }
 
     func show() {
