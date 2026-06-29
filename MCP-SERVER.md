@@ -64,10 +64,18 @@ mcp-token  = <48-hex secret>                # `openssl rand -hex 24`
 
 ## Connecting an agent
 
-A Claude Code session opened anywhere in this repo gets the `ghostty` MCP server
-**automatically** — the committed **`.mcp.json`** at the repo root registers it (Claude
-Code prompts once to approve a project-scoped server, then remembers). No per-machine
-`claude mcp add`, no secret in the registration. Two things make that work:
+**DMG colleagues: this is automatic.** On first launch `ForkSetup` (job 7) runs
+`claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp` for you (when `claude` is
+on PATH), so the `ghostty` MCP shows up in EVERY Claude Code session, any directory — nothing
+to run. It records success so it won't re-add, never clobbers a pre-existing `ghostty` server,
+and retries on a later launch if you installed `claude` after Ghostty. (CLAUDE.md → the
+MCP-registration bullet has the planner/idempotency details.)
+
+**Repo-clone developers** get it a different way: a Claude Code session opened anywhere in this
+repo gets the `ghostty` MCP server **automatically** — the committed **`.mcp.json`** at the
+repo root registers it (Claude Code prompts once to approve a project-scoped server, then
+remembers). No per-machine `claude mcp add`, no secret in the registration. Two things make
+that work:
 
 1. **The shim is on `PATH`** as `ghostty-mcp` (installed to `~/.local/bin/ghostty-mcp` —
    see *New-machine setup* below). `.mcp.json` invokes the bare name, not a clone-specific

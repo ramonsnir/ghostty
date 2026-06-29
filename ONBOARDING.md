@@ -29,9 +29,9 @@ setup. This is the first thing to read after installing.
 - **Split & tab power-tools** — flip / swap / merge splits, eject a pane into its own tab,
   mark-and-pull a split across tabs and windows, equalize splits, "go to last split", and
   a fuzzy project picker. All in the Command Palette.
-- **Let an agent drive your terminal (MCP)** — a local MCP server (auto-configured on
-  install) lets Claude Code or Codex list your splits, type into them, reorganize your
-  layout, and watch for prompts. → `MCP-SERVER.md`
+- **Let an agent drive your terminal (MCP)** — a local MCP server (auto-configured AND
+  auto-registered with Claude Code on first launch) lets Claude Code or Codex list your
+  splits, type into them, reorganize your layout, and watch for prompts. → `MCP-SERVER.md`
 - **Agent Manager** — a live one-line status on each agent tile, plus a **rate-limit
   bell watchdog** that rings when an agent gets throttled so you're not left staring at a
   stuck session. → `AGENT-MANAGER.md`
@@ -49,7 +49,7 @@ setup. This is the first thing to read after installing.
 | Auto-updates (from the fork's own feed) | ✅ | notify-only by default |
 | Hosted sessions (survive app quit/relaunch) | ✅ after **one relaunch** | first launch installs the host; relaunch once and it's reliable thereafter |
 | Agent Dashboard (live agent previews) | ✅ | shows tiles once a `claude`/`codex` is actually running in a split |
-| MCP server (let an agent drive your terminal) | ✅ | auto-configured: localhost + a random token in `~/.config/ghostty-ramon/local` |
+| MCP server (let an agent drive your terminal) | ✅ | auto-configured AND auto-registered with Claude Code on first launch (localhost + a random token in `~/.config/ghostty-ramon/local`) |
 | Agent Manager status + rate-limit bell watchdog | ✅ if `node` + `claude` installed | uses your installed Claude Code CLI (your own subscription); self-disables if either is missing |
 | Agent Queue (supervised runs) | ⚙️ opt-in | `node` + the Claude hooks + a template — see `AGENT-QUEUE.md` |
 | Phone monitor | ⚙️ opt-in | Tailscale + a bind address in `local` — see `WEB-MONITOR.md` |
@@ -64,9 +64,12 @@ absent (nothing crashes):
 
 ## Optional power features — "is this for me?"
 
-- **An agent driving your terminal (MCP).** Already configured. Connect Claude Code once:
-  `claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"` — the shim is on your PATH and
-  reads the auto-generated token for you. → `MCP-SERVER.md`
+- **An agent driving your terminal (MCP).** Already configured **and** auto-registered with
+  Claude Code on first launch (if `claude` is on your PATH) — open a new `claude` session and
+  the `ghostty` MCP is just there. Nothing to run. If you installed `claude` *after* Ghostty,
+  relaunch Ghostty once (it registers on the next launch), or do it by hand:
+  `claude mcp add ghostty --scope user -- "$HOME/.local/bin/ghostty-mcp"` (the shim is on your
+  PATH and reads the auto-generated token for you). → `MCP-SERVER.md`
 - **Rich agent status + auto-close (Manager / Queue).** Install the Claude Code agent-state
   hooks the easy way: run **"Install Claude Agent Hooks"** from the Command Palette (⌘⇧P), or
   accept the one-time prompt offered on launch when the queue/manager is enabled. (It safely

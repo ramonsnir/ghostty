@@ -5,7 +5,7 @@ import UserNotifications
 
 /// (ramon fork) First-launch setup for COLLEAGUE distribution builds.
 ///
-/// Six independent, idempotent jobs, safe to run on every launch:
+/// Seven independent, idempotent jobs, safe to run on every launch:
 ///
 ///   1. **Config seed** — write a sanitized default `~/.config/ghostty-ramon/config`
 ///      if (and only if) the file is absent, so the fork's keybinds/features work
@@ -40,6 +40,15 @@ import UserNotifications
 ///      bool) pointing the colleague at discovery (`ghostty-ramon +list-keybinds` /
 ///      ONBOARDING.md), since they won't scroll the command palette to find the
 ///      fork's features.
+///
+///   7. **MCP registration** — register the Ghostty MCP server with Claude Code
+///      (`claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp`) so a
+///      fresh `claude` session can actually SEE it. Without this the colleague has
+///      the shim + token + bind on disk but Claude Code knows nothing about it, so
+///      the very tool they'd use to finish setup is missing. Idempotent: skips when
+///      already recorded, when `claude`/the shim aren't present yet (retries later),
+///      and never clobbers a pre-existing `ghostty` server. Runs in `performDeferred`
+///      AFTER the shim install (job 4).
 ///
 /// ── LAUNCH ORDERING (pty-host first-launch reliability) ─────────────────────────
 /// The host-CRITICAL jobs (config seed, local secrets, host LaunchAgent) are split
@@ -97,6 +106,13 @@ enum ForkSetup {
     /// UserDefaults key: whether the one-time first-run welcome notification has
     /// already been shown. Idempotent — shown at most once per UserDefaults domain.
     static let kWelcomeShown = "forkSetup.welcomeShown"
+
+    /// UserDefaults key: whether we've successfully registered the Ghostty MCP
+    /// server with Claude Code (`claude mcp add ghostty`). Set ONLY on success (or
+    /// when an entry already exists), so we keep retrying across launches until
+    /// `claude` is present + the shim is installed, but never fight a colleague who
+    /// later removes the registration by hand.
+    static let kMCPRegistered = "forkSetup.mcpRegisteredWithClaude"
 
     /// Top-level plist key marking a LaunchAgent plist as written by this app.
     /// Value is the managing bundle id. launchd ignores unknown keys.
@@ -409,6 +425,52 @@ enum ForkSetup {
         !alreadyShown
     }
 
+    // MARK: - MCP registration with Claude Code (pure)
+
+    /// Decision for auto-registering the Ghostty MCP server with Claude Code via
+    /// `claude mcp add ghostty --scope user -- <shim>`. Without this, a DMG colleague
+    /// has the shim + token + `mcp-listen` on disk but Claude Code knows nothing about
+    /// it, so a brand-new `claude` session shows NO Ghostty MCP — and the very tool
+    /// they'd reach for to finish setup is missing. This closes that gap.
+    enum MCPRegisterPlan: Equatable {
+        /// We already recorded a successful registration → never re-add (respects a
+        /// colleague who later `claude mcp remove`s it).
+        case skipAlreadyRecorded
+        /// `claude` CLI not found on PATH (yet) → skip WITHOUT recording, so a later
+        /// launch retries once `claude` is installed.
+        case skipNoClaude
+        /// The `ghostty-mcp` shim isn't on PATH (yet) → skip WITHOUT recording; the
+        /// shim install is a sibling deferred job, so retry next launch.
+        case skipNoShim
+        /// A server named `ghostty` is ALREADY registered with Claude Code → leave it
+        /// strictly alone (don't clobber a hand-managed entry) but record so we stop
+        /// probing on every launch.
+        case skipAlreadyRegistered
+        /// All clear → run `claude mcp add` (user scope).
+        case register
+    }
+
+    /// Pure decision for MCP registration. Order matters: a recorded success short-
+    /// circuits before we shell out at all; otherwise we only register when `claude`
+    /// is present, the shim is on PATH, and no `ghostty` server is already registered.
+    /// - Parameters:
+    ///   - alreadyRecorded: the persisted success bool (`kMCPRegistered`).
+    ///   - claudeFound: a `claude` executable was resolved on the login-shell PATH.
+    ///   - shimExists: `~/.local/bin/ghostty-mcp` exists (our sibling job installed it).
+    ///   - alreadyRegistered: `claude mcp get ghostty` reports an existing entry.
+    static func planMCPRegister(
+        alreadyRecorded: Bool,
+        claudeFound: Bool,
+        shimExists: Bool,
+        alreadyRegistered: Bool
+    ) -> MCPRegisterPlan {
+        if alreadyRecorded { return .skipAlreadyRecorded }
+        guard claudeFound else { return .skipNoClaude }
+        guard shimExists else { return .skipNoShim }
+        if alreadyRegistered { return .skipAlreadyRegistered }
+        return .register
+    }
+
     // MARK: - Execution (impure)
 
     /// Run ALL setup jobs (host-critical THEN deferred). Idempotent; safe on every
@@ -461,9 +523,10 @@ enum ForkSetup {
     }
 
     /// NON-critical jobs that do NOT gate surface connection: the `ghostty-mcp`
-    /// shim, the `ghostty-ramon` CLI launcher, and the one-time welcome. Safe to run
-    /// off-main AFTER `performHostSetup()`. Caller is responsible for the bundled-host
-    /// gate (call only when `performHostSetup()` returned true).
+    /// shim, the `ghostty-ramon` CLI launcher, the Claude Code MCP registration, and
+    /// the one-time welcome. Safe to run off-main AFTER `performHostSetup()` (it shells
+    /// out to the login shell for the MCP registration). Caller is responsible for the
+    /// bundled-host gate (call only when `performHostSetup()` returned true).
     static func performDeferred(
         bundle: Bundle = .main,
         defaults: UserDefaults = .ghostty,
@@ -472,6 +535,9 @@ enum ForkSetup {
         let home = NSHomeDirectory()
         installShimIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
         installCLILauncherIfNeeded(bundle: bundle, defaults: defaults, home: home, fileManager: fileManager)
+        // Must follow installShimIfNeeded — it registers the just-installed shim with
+        // Claude Code so a fresh `claude` session can see the Ghostty MCP server.
+        registerMCPWithClaudeIfNeeded(defaults: defaults, home: home, fileManager: fileManager)
         showWelcomeIfNeeded(defaults: defaults)
     }
 
@@ -680,6 +746,93 @@ enum ForkSetup {
         notify(
             title: "Welcome to Ghostty (ramon)",
             body: "Run 'ghostty-ramon +list-keybinds' or see ONBOARDING.md for the keybind cheat sheet.")
+    }
+
+    /// Register the Ghostty MCP server with Claude Code so a fresh `claude` session
+    /// sees it — `claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp`.
+    /// Without this, a DMG colleague has the shim + token + `mcp-listen` on disk, but
+    /// Claude Code knows nothing about it, so the very tool they'd reach for to finish
+    /// setup is absent from a new session. The shim reads the token from `local` at
+    /// runtime, so this registration carries NO secret.
+    ///
+    /// Idempotent + safe: a recorded success skips all probing; we only register when
+    /// `claude` is on PATH and the shim is installed; we NEVER clobber a pre-existing
+    /// `ghostty` server (a hand-managed entry is left strictly alone); success/already-
+    /// registered is persisted so we stop probing, while a transient failure (claude or
+    /// shim not yet present, `claude mcp add` non-zero) is left UNrecorded so the next
+    /// launch retries. `--scope user` makes it global (every Claude Code session, any cwd).
+    private static func registerMCPWithClaudeIfNeeded(
+        defaults: UserDefaults, home: String, fileManager: FileManager
+    ) {
+        // Cheap gate first: a recorded success skips ALL shelling-out.
+        if defaults.bool(forKey: kMCPRegistered) {
+            logger.debug("Ghostty MCP already registered with Claude Code; skipping")
+            return
+        }
+        let shimPath = "\(home)/.local/bin/ghostty-mcp"
+        let shimExists = fileManager.isExecutableFile(atPath: shimPath)
+        let claudeFound = claudeOnPath()
+        let alreadyRegistered = (claudeFound && shimExists) ? ghosttyMCPRegistered() : false
+
+        switch planMCPRegister(
+            alreadyRecorded: false,
+            claudeFound: claudeFound,
+            shimExists: shimExists,
+            alreadyRegistered: alreadyRegistered
+        ) {
+        case .skipAlreadyRecorded:
+            break  // unreachable (early-returned above); kept for an exhaustive switch.
+        case .skipNoClaude:
+            logger.debug("claude CLI not found on PATH; deferring MCP registration to a later launch")
+        case .skipNoShim:
+            logger.debug("ghostty-mcp shim not yet on PATH; deferring MCP registration to a later launch")
+        case .skipAlreadyRegistered:
+            defaults.set(true, forKey: kMCPRegistered)
+            logger.info("Claude Code already has a 'ghostty' MCP server; leaving it untouched")
+        case .register:
+            // Shell-quote the (home-derived) shim path defensively, even though a
+            // macOS home dir doesn't contain quotes.
+            let quoted = "'" + shimPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            let status = loginShellStatus("claude mcp add ghostty --scope user -- \(quoted)")
+            if status == 0 {
+                defaults.set(true, forKey: kMCPRegistered)
+                logger.info("registered Ghostty MCP server with Claude Code (user scope)")
+            } else {
+                // Non-fatal: leave UNrecorded so the next launch retries. The colleague
+                // can also register by hand (ONBOARDING.md documents the command).
+                logger.warning("`claude mcp add ghostty` failed (status \(status ?? -1, privacy: .public)); will retry next launch")
+            }
+        }
+    }
+
+    /// True iff `claude` resolves on the user's login-shell PATH.
+    private static func claudeOnPath() -> Bool {
+        loginShellStatus("command -v claude >/dev/null 2>&1") == 0
+    }
+
+    /// True iff Claude Code already has a server named `ghostty` registered.
+    private static func ghosttyMCPRegistered() -> Bool {
+        loginShellStatus("claude mcp get ghostty >/dev/null 2>&1") == 0
+    }
+
+    /// Run a command string in the user's login shell, returning its exit status
+    /// (nil if the shell couldn't be launched). `-l` sources the user's PATH (a GUI
+    /// app doesn't inherit the terminal PATH); stdout/stderr are discarded — callers
+    /// only care about the status code.
+    private static func loginShellStatus(_ command: String) -> Int32? {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        proc.arguments = ["-l", "-c", command]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+        return proc.terminationStatus
     }
 
     private static func seedConfigIfNeeded(home: String, fileManager: FileManager) {

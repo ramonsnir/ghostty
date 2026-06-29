@@ -404,7 +404,7 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
 
 - **First-launch setup (`ForkSetup`, GUI-only, distribution builds).** Idempotent, safe on
   every launch, and now SPLIT in two by launch ordering: `performHostSetup()` (host-critical)
-  + `performDeferred()` (the rest); `perform()` still runs both for callers/tests. SIX jobs
+  + `performDeferred()` (the rest); `perform()` still runs both for callers/tests. SEVEN jobs
   total: (1) seed a sanitized `~/.config/ghostty-ramon/config` if absent (embedded
   `seedTemplate`, `__HOME__` substituted, the whole `ctrl+a` keybind layer commented out, open
   `mcp-listen`/`web-monitor-listen` disabled — see the seed bullet below); (2) **auto-provision
@@ -417,7 +417,9 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   bool; pure predicate `shouldShowWelcome(alreadyShown:)`) that points the colleague at
   `ghostty-ramon +list-keybinds` / `ONBOARDING.md` — concrete discovery, NOT "scroll the
   command palette". The welcome bool is recorded BEFORE `notify()` fires so a failed/denied
-  notification can't re-fire it every launch. **`performHostSetup()` (jobs 1–3) runs
+  notification can't re-fire it every launch; (7) **auto-register the Ghostty MCP server with
+  Claude Code** (`claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp`) so a fresh
+  `claude` session can SEE it — see the MCP-registration bullet below. **`performHostSetup()` (jobs 1–3) runs
   SYNCHRONOUSLY and EARLY in `AppDelegate.applicationDidFinishLaunching` — before any window/
   `.client` surface is created — so the bundled host is installed + bootstrapped + RUNNING
   before a surface dials its socket, eliminating the blank-pane race** (steady-state fast path:
@@ -436,13 +438,14 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   never kill) re-derives launchd's LWCR after a Sparkle update gives the bundled host a
   new cdhash — encoding the LWCR gotcha (below) into the app. Pure planner `plan(...)`,
   `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`,
-  `planLocalSecretsInstall`, `localHasMCPToken` are unit-tested. Wiring:
-  `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG),
+  `planLocalSecretsInstall`, `localHasMCPToken`, `planMCPRegister` are unit-tested. Wiring:
+  `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG;
+  `registerMCPWithClaudeIfNeeded` + `loginShellStatus`/`claudeOnPath`/`ghosttyMCPRegistered`),
   `AppDelegate.swift` (the synchronous `performHostSetup()` call + the off-main
   `performDeferred()`), `project.pbxproj` (iOS exclusion). Tests:
   `macos/Tests/ForkSetup/ForkSetupTests.swift` (incl. `cli*` plan gates, `welcome*`,
-  `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, and the seed-content `configSeed*`
-  assertions for the new onboarding content).
+  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, and the seed-content
+  `configSeed*` assertions for the new onboarding content).
 
 - **Auto-provisioned MCP secrets (`~/.config/ghostty-ramon/local`, ForkSetup job 2).** On
   first launch the fork writes the untracked machine-local `local` with `mcp-listen =
@@ -590,13 +593,31 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   is actually BUNDLED, and the whole of `perform()` early-returns unless a host is bundled
   — so a dev/local build never overwrites Ramon's hand-installed `~/.local/bin/ghostty-mcp`.
   The copy is a byte-level `Data.write(.atomic)` (NOT `copyItem`) so the bundle's quarantine
-  xattr doesn't propagate to the loose copy. A colleague then registers with
-  `claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"` (token auto-read from `local`);
-  the committed `.mcp.json` (bare `ghostty-mcp`) serves repo-clone developers, not DMG users.
+  xattr doesn't propagate to the loose copy. The colleague no longer registers by hand —
+  ForkSetup job 7 runs `claude mcp add` for them (see the next bullet; token auto-read from
+  `local`); the committed `.mcp.json` (bare `ghostty-mcp`) serves repo-clone developers, not
+  DMG users.
   Wiring: `dist/macos/release-local.sh` (step 3a build+bundle + the `sign` line) and
   `.github/workflows/fork-release.yml` (build+bundle+sign steps),
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`ShimPlan`/`planShimInstall`/
   `installShimIfNeeded`); tests in `macos/Tests/ForkSetup/ForkSetupTests.swift` (`shim*`).
+
+- **Auto-registered MCP server with Claude Code (fork-only, ForkSetup job 7).** Installing the
+  shim onto PATH is NOT enough for the MCP to appear in a colleague's Claude Code — Claude Code
+  must be TOLD about it. So on first launch (deferred, AFTER the shim install) the fork runs
+  `claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp` for them, making the Ghostty
+  MCP visible in EVERY `claude` session (user scope = any cwd). The shim reads the token from
+  `local` at runtime, so the registration carries NO secret. Pure decision
+  `planMCPRegister(alreadyRecorded:claudeFound:shimExists:alreadyRegistered:)` →
+  `.skipAlreadyRecorded` / `.skipNoClaude` / `.skipNoShim` / `.skipAlreadyRegistered` /
+  `.register`: it records success (persisted `forkSetup.mcpRegisteredWithClaude`) so it stops
+  probing, but leaves a transient miss (`claude` or the shim not present yet, or `claude mcp add`
+  non-zero) UNrecorded so a later launch retries; it NEVER clobbers a pre-existing `ghostty`
+  server (a hand-managed entry is left strictly alone). Impure `registerMCPWithClaudeIfNeeded`
+  shells out via a login shell (`loginShellStatus`/`claudeOnPath`/`ghosttyMCPRegistered` —
+  `-l` so it sees the user's PATH). If `claude` is never installed, this is a silent no-op (the
+  colleague can still register by hand; ONBOARDING.md documents the command). Wiring/Tests as in
+  the ForkSetup bullet above (`planMCPRegister`, `mcpRegister*`).
 
 ## PTY-host runs under a launchd LaunchAgent (deploy + new-machine setup)
 
