@@ -2991,12 +2991,14 @@ keybind: Keybinds = .{},
 // (mirrors `agent-manager-node-path`).
 @"agent-queue-templates-dir": ?[:0]const u8 = null,
 
-/// (ramon fork / Agent Queue Supervisor) Global concurrency cap across ALL
-/// queue runs — the hard ceiling on how many queue agents the supervisor may
+/// (ramon fork / Agent Queue Supervisor) Optional global concurrency cap across
+/// ALL queue runs — a hard ceiling on how many queue agents the supervisor may
 /// have live at once, fleet-wide (each run additionally has its own
-/// `concurrency` + grid cap in its template). Default 8. Fork-only — keep it
-/// in `~/.config/ghostty-ramon/config`.
-@"agent-queue-max-total": u32 = 8,
+/// `concurrency` + grid cap in its template). **`0` (the default) means
+/// UNLIMITED** — no fleet-wide ceiling, so a queue is bounded only by its own
+/// `concurrency`/`maxItems`/grid. Set a positive value only if you want an
+/// opt-in fleet cap. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+@"agent-queue-max-total": u32 = 0,
 
 /// (ramon fork / Phase 2b) AF_UNIX socket path of a running `ghostty-host`
 /// (`zig-out/bin/ghostty-host --listen=<sockpath>`). When set, a new surface
@@ -11659,7 +11661,7 @@ test "agent-queue: parse and default" {
         try cfg.finalize();
         try testing.expectEqual(false, cfg.@"agent-queue");
         try testing.expect(cfg.@"agent-queue-templates-dir" == null);
-        try testing.expectEqual(@as(u32, 8), cfg.@"agent-queue-max-total");
+        try testing.expectEqual(@as(u32, 0), cfg.@"agent-queue-max-total");
     }
 
     {

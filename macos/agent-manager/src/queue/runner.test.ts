@@ -1482,6 +1482,26 @@ test("runQueueSweep: agent-queue-max-total caps total dispatches across runs", a
   assert.equal(fakeA.calls.spawn.length, 2, "global maxTotal(2) capped the fleet across runs");
 });
 
+test("runQueueSweep: maxTotal = Infinity (unlimited) imposes no fleet cap — bounded only by per-run concurrency", async () => {
+  // Same two-run setup as the cap test, but with the new default: an UNLIMITED
+  // fleet (maxTotal = Infinity). Each run lists 3 candidates and has ample
+  // concurrency (tmpl default 9), so all 6 dispatch — the global cap never binds.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A-1"},{"id":"A-2"},{"id":"A-3"}]',
+  });
+  const runA = makeQueueRun(tmpl({ name: "A" }), memStore());
+  const runB = makeQueueRun(tmpl({ name: "B" }), memStore());
+  let now = 5_000_000;
+  const deps = makeQueueDeps(fake, [runA, runB], () => now, Infinity);
+
+  await runQueueSweep(deps); // arm both
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — no global ceiling
+
+  assert.equal(fake.calls.spawn.length, 6, "unlimited maxTotal dispatched both runs' full lists");
+});
+
 // ---------------------------------------------------------------------------
 // (6b) §8b START-TIME PARAMS: a run's params are injected into the provider command env.
 // ---------------------------------------------------------------------------

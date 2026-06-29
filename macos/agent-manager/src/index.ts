@@ -843,7 +843,12 @@ async function main(): Promise<void> {
   if (queueEnabled) {
     const templatesDir = process.env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR ?? defaultTemplatesDir();
     const stateDir = defaultStateDir();
-    const maxTotal = parsePositiveInt(process.env.GHOSTTY_AGENT_QUEUE_MAX_TOTAL, 8);
+    // agent-queue-max-total: an OPTIONAL fleet-wide cap. A positive value caps the
+    // total agents across ALL runs; 0 / absent / invalid ⇒ UNLIMITED (Infinity), so
+    // the fleet is bounded only by each run's own concurrency/maxItems/grid. (The GUI
+    // forwards the config value, defaulting to 0 = unlimited.)
+    const maxTotal =
+      parsePositiveInt(process.env.GHOSTTY_AGENT_QUEUE_MAX_TOTAL, 0) || Infinity;
 
     // ON-DEMAND run lifecycle (§8a): runs are NOT auto-started from every template.
     // Build a DYNAMIC registry, REHYDRATE any previously-started runs from the persisted

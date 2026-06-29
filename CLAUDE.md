@@ -325,7 +325,13 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `agent-queue-templates-dir` / `agent-queue-max-total`, action `start_agent_queue`) — turns the
   dashboard into an active supervisor: from a user-authored JSON template it opens a tab of splits,
   launches one CLI agent per work item, caps concurrency, never doubles up on an item key, tracks
-  each to completion via status, force-closes a done+idle split, and re-polls. GENERIC by design —
+  each to completion via status, force-closes a done+idle split, and re-polls. **`agent-queue-max-total`
+  is an OPTIONAL fleet-wide cap across ALL runs, default `0` = UNLIMITED** (was 8) — a queue is
+  bounded only by its own `concurrency`/`maxItems`/grid unless you set a positive value. (Its Swift
+  getter had a latent bug — read into a `UInt32?` so `ghostty_config_get` could never set the
+  Optional tag → always returned the hardcoded 8, silently ignoring the config AND any per-queue
+  `concurrency` above 8; fixed to a non-optional read. See AGENT-QUEUE.md → Implementation notes.)
+  GENERIC by design —
   Ghostty links NO tracker; the template names shell `list`/`status`/`claim` provider commands (item
   fields reach the provider as argv `{key}` and the agent as `GHOSTTY_ITEM_*` env — NEVER
   string-spliced). The engine is a deterministic loop in the shared TS sidecar (no LLM in the

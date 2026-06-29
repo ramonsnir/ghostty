@@ -983,15 +983,19 @@ extension Ghostty {
             return s.isEmpty ? nil : s
         }
 
-        // (ramon fork / Agent Queue Supervisor) Global concurrency cap across ALL queue
-        // runs (the hard fleet-wide ceiling). Default 8.
+        // (ramon fork / Agent Queue Supervisor) Optional global concurrency cap across
+        // ALL queue runs (the fleet-wide ceiling). 0 = UNLIMITED (the default).
+        //
+        // NOTE: `v` MUST be a non-optional UInt32 — `ghostty_config_get` writes the raw
+        // u32 value bytes through the pointer but knows nothing about Swift's Optional
+        // tag, so a `UInt32?` here always reads back `nil` and the getter would silently
+        // return `defaultValue` regardless of the config (the bug that pinned this at 8).
         var agentQueueMaxTotal: UInt32 {
-            let defaultValue: UInt32 = 8
+            let defaultValue: UInt32 = 0
             guard let config = self.config else { return defaultValue }
-            var v: UInt32?
+            var v: UInt32 = defaultValue
             let key = "agent-queue-max-total"
-            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
-            guard let v else { return defaultValue }
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
             return v
         }
 

@@ -66,8 +66,10 @@ shared `~/.config/ghostty/config`, which an official Ghostty also reads):
 agent-queue = true
 # where queue templates live (default shown):
 # agent-queue-templates-dir = ~/.config/ghostty-ramon/agent-manager/queues
-# global cap across ALL running queues (per-queue cap is in the template):
-# agent-queue-max-total = 8
+# OPTIONAL global cap across ALL running queues combined (per-queue cap is in the
+# template). Default 0 = UNLIMITED — a queue is bounded only by its own
+# concurrency/maxItems/grid. Set a positive value only to opt into a fleet ceiling:
+# agent-queue-max-total = 16
 ```
 
 Quit + relaunch the fork, and rebuild the sidecar `dist` if you changed it. Nothing runs
@@ -307,7 +309,8 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   poll (see *Release HELD items* above). This is the recovery path for the limbo where a killed/
   crashed item would otherwise never get rescheduled.
 - **Concurrency** is never exceeded (per-queue `concurrency` — the total across all the run's
-  tabs — and the global `agent-queue-max-total`; `cols×rows` is the per-tab layout, not a cap on
+  tabs — and, *if set*, the optional global `agent-queue-max-total`, which defaults to `0` =
+  unlimited; `cols×rows` is the per-tab layout, not a cap on
   the total, since panes overflow to new tabs).
 - **Tabs stay packed** — as agents finish unevenly and tabs fragment (e.g. 3 + 1 + 1 panes
   spread across three tabs), the queue **continuously consolidates**: when a whole tab's panes
@@ -357,6 +360,31 @@ review ledger:
 
 The load-bearing facts for an agent working on the Agent Queue Supervisor code. The local
 design + review ledger is `scratchpad/agent-queue-design.md` (paths in the iteration worktree).
+
+### `agent-queue-max-total` — optional fleet cap, default 0 = UNLIMITED (and the getter bug)
+
+- **`agent-queue-max-total` defaults to `0` = UNLIMITED** (was `8`). It is an OPTIONAL
+  fleet-wide ceiling across ALL runs; unset/`0` means a queue is bounded only by its own
+  `concurrency`/`maxItems`/grid. A positive value opts into a global cap. Threading:
+  `Config.zig` (`u32 = 0`) → `Ghostty.Config.swift agentQueueMaxTotal` getter →
+  `AgentManagerController.applyAgentQueueEnv` forwards `GHOSTTY_AGENT_QUEUE_MAX_TOTAL`
+  (decimal string, `"0"` when unlimited) → `index.ts` `parsePositiveInt(env, 0) || Infinity`
+  → `QueueDeps.maxTotal` (`Infinity` ⇒ `globalRemaining` is `Infinity`, never binds; the
+  `ConcurrencyBudget(Infinity)` always grants).
+- **⚠️ GETTER BUG (fixed 2026-06-29) — the value was NEVER read.** The Swift getter declared
+  `var v: UInt32?` and passed `&v` to `ghostty_config_get`. The C side writes the raw u32
+  value bytes but knows nothing about Swift's Optional tag, so `v` always read back `nil` and
+  the getter ALWAYS returned its hardcoded `defaultValue` (8) regardless of the config file —
+  the global cap was permanently pinned at 8, ignoring any `agent-queue-max-total` value AND
+  any per-queue `concurrency` above 8. Fix: a NON-optional `var v: UInt32 = defaultValue` +
+  `_ = ghostty_config_get(...)` (the pattern every other numeric getter uses). Any new numeric
+  config getter MUST use a non-optional var for the same reason.
+- Wiring: `src/config/Config.zig` (field default + doc + `agent-queue: parse and default`
+  test), `macos/Sources/Ghostty/Ghostty.Config.swift` (`agentQueueMaxTotal`),
+  `macos/agent-manager/src/index.ts` (`0`/absent ⇒ `Infinity`). Tests:
+  `runner.test.ts` (`maxTotal = Infinity … imposes no fleet cap`). **GUI relaunch + rebuilt
+  lib/xcframework (Zig default changed) + rebuilt sidecar `dist`; no host restart** (the host
+  ignores the key).
 
 ### Generic by design + the provider contract (injection seam)
 
