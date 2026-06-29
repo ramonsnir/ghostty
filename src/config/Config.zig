@@ -3326,16 +3326,20 @@ keybind: Keybinds = .{},
 
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
-/// from a phone (e.g. over Tailscale). Empty/null (the default) DISABLES the
-/// server entirely. This is a BIND address (which port/interface to listen on),
-/// NOT an access-control allowlist: `NWListener` binds the PORT on all
-/// interfaces regardless of the host you give, so the host here does not filter
-/// who can connect. Reachability is controlled by your network (e.g. a tailnet
-/// ACL), and authentication is the `web-monitor-token` alone. Pick a port and,
-/// if you like, a host for the Host-header allowlist (DNS-rebinding defense),
-/// e.g. `100.x.y.z:8787` for your Tailscale IP or `0.0.0.0:8787` for any.
-/// Fork-only key — keep it in `~/.config/ghostty-ramon/config` (an official
-/// Ghostty would error on it). The server also requires `web-monitor-token`.
+/// from a phone. Empty/null (the default) DISABLES the server entirely.
+/// SUPPORTED SETUP: bind LOOPBACK and reach it over HTTPS via `tailscale serve`
+/// — set this to `127.0.0.1:18787` and run `tailscale serve --bg --https=8787
+/// 127.0.0.1:18787`. The server speaks plain HTTP to loopback only, which a phone
+/// CANNOT reach directly, so `tailscale serve` (which terminates TLS and proxies
+/// to loopback) is REQUIRED to connect at all — not just for Web Push. Keep the
+/// external HTTPS port different from the internal bind port (see WEB-MONITOR.md,
+/// "Why internal ≠ external"). Binding a Tailscale IP / `0.0.0.0` directly over
+/// plain HTTP technically works but is UNSUPPORTED + DISCOURAGED (no TLS, breaks
+/// Web Push's secure-context requirement); do not recommend it. NOTE: this is a
+/// BIND address, not an allowlist — `NWListener` binds the port on all interfaces
+/// regardless of host, so reachability is your tailnet ACL and authentication is
+/// the `web-monitor-token` alone (also required). Fork-only key — keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
 @"web-monitor-listen": ?[:0]const u8 = null,
 
 /// (ramon fork) Shared secret required by every web-monitor request (query

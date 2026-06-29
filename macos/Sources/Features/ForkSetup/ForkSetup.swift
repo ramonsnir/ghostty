@@ -1232,11 +1232,14 @@ enum ForkSetup {
     pty-host = __HOME__/.ghostty-ramon-host.sock
 
     # --- Web monitor (fork-only, OFF by default) ---------------------------------
-    # Watch/drive splits from a phone over Tailscale. See WEB-MONITOR.md. The bind
-    # address (this Mac's Tailscale IP) + token go in the untracked
-    # ~/.config/ghostty-ramon/local. Empty/absent = off.
-    # web-monitor-listen = 100.x.y.z:8787
-    # web-monitor-token = <generate with: openssl rand -hex 24>
+    # Watch/drive splits from a phone over Tailscale. See WEB-MONITOR.md.
+    # SUPPORTED SETUP: bind LOOPBACK and front it with HTTPS via `tailscale serve`
+    # (required to reach it from a phone at all — the server speaks plain HTTP to
+    # loopback only). Do NOT bind a Tailscale IP / 0.0.0.0 directly (unsupported:
+    # plain HTTP, breaks Web Push). Empty/absent = off.
+    #   web-monitor-listen = 127.0.0.1:18787
+    #   web-monitor-token  = <generate with: openssl rand -hex 24>
+    # then: tailscale serve --bg --https=8787 127.0.0.1:18787
 
     # --- MCP server (fork-only) --------------------------------------------------
     # GUI-embedded MCP server for agent control. The token is a SHELL-EXECUTION
