@@ -27,6 +27,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "1",
             bundleVersion: "2",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: false,
             spec: spec())
         #expect(p == .skipNoBundledHost)
@@ -41,6 +43,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: nil,
             installedVersion: nil,
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: false,
             spec: s)
         #expect(p == .install(s))
@@ -55,6 +59,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: nil,
             installedVersion: nil,
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: true,   // even if something is running, not ours -> skip
             spec: spec())
         #expect(p == .skipExternallyManaged)
@@ -69,6 +75,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon.debug",
             installedVersion: "100",
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: false,
             spec: spec(bundleID: "com.mitchellh.ghostty-ramon"))
         #expect(p == .skipExternallyManaged)
@@ -81,6 +89,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "100",
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: true,
             spec: spec())
         #expect(p == .upToDate)
@@ -97,6 +107,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "100",
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: false,
             spec: s)
         #expect(p == .revive(s))
@@ -113,6 +125,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: "100",
             bundleVersion: "101",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: true,
             spec: s)
         #expect(p == .reload(s))
@@ -129,6 +143,8 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: nil,
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: true,
             spec: s)
         #expect(p == .adoptRunning(s))
@@ -144,9 +160,98 @@ struct ForkSetupTests {
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
             installedVersion: nil,
             bundleVersion: "100",
+            installedHostHash: nil,
+            currentHostHash: nil,
             agentRunning: false,
             spec: s)
         #expect(p == .reload(s))
+    }
+
+    // MARK: - plan(): host-binary-hash gate (don't restart the host on GUI-only updates)
+
+    @Test func planNoReloadWhenHostHashMatchesDespiteVersionBump() {
+        // THE FIX: a GUI-only update bumps the bundle version but ships a byte-
+        // identical host (same cdhash). The reload would needlessly bootout the host
+        // and kill its RAM-only sessions. With a recorded hash that matches the
+        // bundled binary, we stay .upToDate even though installedVersion != bundleVersion.
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: "100",
+            bundleVersion: "101",            // version changed…
+            installedHostHash: "abc123",
+            currentHostHash: "abc123",       // …but host binary did NOT
+            agentRunning: true,
+            spec: spec())
+        #expect(p == .upToDate)
+    }
+
+    @Test func planRevivesWhenHostHashMatchesButHostDown() {
+        // Host unchanged (hash matches) but not running → non-destructive revive
+        // (no bootout), same as the version-match revive path.
+        let s = spec()
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: "100",
+            bundleVersion: "101",
+            installedHostHash: "abc123",
+            currentHostHash: "abc123",
+            agentRunning: false,
+            spec: s)
+        #expect(p == .revive(s))
+    }
+
+    @Test func planReloadsWhenHostHashChanged() {
+        // The host binary genuinely changed (new cdhash) → reload is mandatory to
+        // re-derive launchd's LWCR, even though the old host is still running.
+        let s = spec()
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: "100",
+            bundleVersion: "101",
+            installedHostHash: "oldhash",
+            currentHostHash: "newhash",
+            agentRunning: true,
+            spec: s)
+        #expect(p == .reload(s))
+    }
+
+    @Test func planHashMatchWinsOverVersionMatchToo() {
+        // Belt-and-suspenders: when the hash matches, the decision is upToDate
+        // regardless of the version values (the hash is the authoritative gate).
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: "100",
+            bundleVersion: "100",
+            installedHostHash: "same",
+            currentHostHash: "same",
+            agentRunning: true,
+            spec: spec())
+        #expect(p == .upToDate)
+    }
+
+    @Test func planFallsBackToVersionWhenNoRecordedHash() {
+        // Transition (first launch under hash-gating): no recorded hash yet, but the
+        // bundled binary hashes fine. With version matching, stay upToDate; the caller
+        // records the hash so later GUI-only updates take the hash path.
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedVersion: "100",
+            bundleVersion: "100",
+            installedHostHash: nil,          // never recorded
+            currentHostHash: "freshlyhashed",
+            agentRunning: true,
+            spec: spec())
+        #expect(p == .upToDate)
     }
 
     // MARK: - LaunchAgentSpec shape

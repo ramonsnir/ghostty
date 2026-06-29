@@ -457,9 +457,18 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   `com.mitchellh.ghostty-ramon.host`): it only acts when a host is actually bundled
   (local/dev builds skip — they don't bundle it), and it writes an ownership marker
   (`GhosttyAppManaged` = bundle id) into any plist it creates, refusing to touch a
-  pre-existing plist that lacks the marker. The version-aware reload (bootout+bootstrap,
-  never kill) re-derives launchd's LWCR after a Sparkle update gives the bundled host a
-  new cdhash — encoding the LWCR gotcha (below) into the app. Pure planner `plan(...)`,
+  pre-existing plist that lacks the marker. **The host reload is gated on the host
+  BINARY's hash, NOT the bundle version** — `plan(...)` compares a recorded SHA-256 of
+  the bundled `ghostty-host` (`kInstalledHostHash`, via `hostBinaryHash`) against the
+  current one; it does the bootout+bootstrap (which re-derives launchd's LWCR for a new
+  cdhash, and KILLS the host's RAM-only sessions) ONLY when the binary actually changed.
+  A GUI-only update bumps `CFBundleVersion` (it's `git rev-list --count`) but ships a
+  byte-identical host → identical cdhash → LWCR still valid → **`.upToDate`, no reload,
+  sessions preserved.** (Before this, the reload keyed off the version and so restarted
+  the host on EVERY update.) Caveats: one last version-heuristic reload on the FIRST
+  launch under hash-gating (no hash recorded yet — then the hash is recorded and future
+  GUI-only updates skip); and a COLD release build re-links the host ad-hoc → new cdhash
+  → still reloads (only warm-incremental GUI-only releases ship an identical host). Pure planner `plan(...)`,
   `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`,
   `planLocalSecretsInstall`, `localHasMCPToken`, `planMCPRegister` are unit-tested. Wiring:
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG;
@@ -467,8 +476,9 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   `AppDelegate.swift` (the synchronous `performHostSetup()` call + the off-main
   `performDeferred()`), `project.pbxproj` (iOS exclusion). Tests:
   `macos/Tests/ForkSetup/ForkSetupTests.swift` (incl. `cli*` plan gates, `welcome*`,
-  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, and the seed-content
-  `configSeed*` assertions for the new onboarding content).
+  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, the host-hash gate
+  `planNoReloadWhenHostHashMatchesDespiteVersionBump`/`planReloadsWhenHostHashChanged`/etc.,
+  and the seed-content `configSeed*` assertions for the new onboarding content).
 
 - **Auto-provisioned MCP secrets (`~/.config/ghostty-ramon/local`, ForkSetup job 2).** On
   first launch the fork writes the untracked machine-local `local` with `mcp-listen =
@@ -600,8 +610,10 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
 
 - **The host is bundled IN the app for colleagues** (vs. Ramon's `~/.local/bin`
   hand-deploy), so Sparkle — which only updates the `.app` — carries new host builds,
-  and notarization covers the host automatically. A colleague's update flow restarts
-  the host (ends live sessions, RAM-only) exactly like Ramon's manual reload.
+  and notarization covers the host automatically. A colleague's update restarts the host
+  (ends live RAM-only sessions) **only when the host binary actually changed** — the
+  ForkSetup reload is hash-gated (see the First-launch-setup bullet), so a GUI-only
+  update leaves the running host (and its sessions) untouched.
 
 - **The `ghostty-mcp` shim is bundled + installed-to-PATH for colleagues too** — same
   pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. **BOTH
@@ -716,6 +728,13 @@ socket → **the GUI shows empty screens**. The binary is fine — it runs perfe
 standalone, even with the exact plist env; only launchd rejects it. (This cost a long
 debug session on 2026-06-17; the symptom "I killed the host and a new window didn't
 relaunch it / empty screens" is THIS.)
+
+> This LWCR reload is why the COLLEAGUE path (`ForkSetup`, which manages the *bundled*
+> host) only reloads when the host binary's cdhash actually changes — it records a
+> SHA-256 of the bundled host and skips the bootout+bootstrap on a GUI-only update
+> whose host is byte-identical, so live sessions survive. See the First-launch-setup
+> bullet under "Distribution / sharing the fork". (Ramon's hand-managed host here is a
+> separate, manual deploy — ForkSetup leaves it alone via the ownership-marker gate.)
 
 **Correct deploy-then-restart of the host** (run from a NON-ramon terminal —
 Terminal.app or the official Ghostty — since it ends every session, including this
