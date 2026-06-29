@@ -46,6 +46,24 @@ enum MCPTools {
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
         [
+            // (ramon fork / Agent Manager — Haiku budget tracking)
+            "name": "get_haiku_usage",
+            "description": "Report Agent Manager Haiku (claude-haiku-4-5) token + cost usage over a recent time window, broken down BY FEATURE and BY ACCOUNT. The Agent Manager sidecar records one entry per Haiku call to an on-disk log, so totals SURVIVE GUI/sidecar restarts. Features: 'summarizer' (the continuous per-tile status pass) and 'bell-classify' (the Bell Attention per-bell promotion). Returns {hours, since, total, byFeature:[{feature,calls,inputTokens,outputTokens,cacheReadTokens,cacheCreationTokens,costUsd}], byAccount:[{account,...}]}; 'costUsd' is the SDK's reported per-call cost summed (note: cost is usually dominated by cache-CREATION tokens on a cold call and is cheap on cache READS). Read-only; never spends a Haiku call itself.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "hours": [
+                        "type": "number",
+                        "default": 3,
+                        "minimum": 0.0167,
+                        "maximum": 720,
+                        "description": "Look-back window in hours (default 3). Clamped to [1 minute, 30 days]; older entries are pruned from the log after 14 days.",
+                    ],
+                ],
+                "additionalProperties": false,
+            ],
+        ],
+        [
             "name": "send_text",
             "description": "Type text into a surface as real key events (NOT a paste). submit:true appends a Return to submit. Does not focus the surface.",
             "inputSchema": [
@@ -317,6 +335,20 @@ enum MCPTools {
                             "required": ["key"],
                         ],
                     ],
+                    "heldCount": ["type": "integer", "description": "Count of HELD items: dispatched once but suppressed by the dispatch latch while still in the backlog (agent crashed/exited or was killed before claiming). Exact count (the 'held' list may be capped)."],
+                    "held": [
+                        "type": "array",
+                        "description": "A few of the HELD items — each releasable in-place (clears the latch so it re-dispatches, no tracker round-trip).",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "key": ["type": "string"],
+                                "title": ["type": "string"],
+                                "url": ["type": "string"],
+                            ],
+                            "required": ["key"],
+                        ],
+                    ],
                 ],
                 "required": ["queueName"],
                 "additionalProperties": false,
@@ -445,6 +477,12 @@ enum MCPTools {
                 ["windows": MCPLayout.layoutTree()]
             }
             return .ok(payload)
+
+        case "get_haiku_usage":
+            // Pure file read + aggregation — no GUI state, so no main-thread hop.
+            let hours = (arguments["hours"] as? NSNumber)?.doubleValue ?? 3
+            let clamped = min(max(hours, 1.0 / 60.0), 720) // [1 minute, 30 days]
+            return .ok(MCPUsage.query(hours: clamped))
 
         case "send_text":
             guard let uuid = uuidArg(arguments) else { return .invalidParams("missing or invalid id") }

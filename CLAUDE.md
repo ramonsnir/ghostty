@@ -208,7 +208,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   a bell→Web-Push "I stepped away" notifier. **SCOPE: phone workflows ONLY — do not build new
   features on it; other work may COPY its patterns but must stand alone.** Load-bearing gotchas:
   input is sent as REAL key/wheel events (`ghostty_surface_key` with the NATIVE macOS virtual
-  keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path; Web
+  keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path;
+  **Scroll ↑/↓ is "smart" (`smartScroll`, page-side)** — KEY FACT: the host's `raw_output` carries
+  only CHILD pty output, so a host-side scroll emits nothing back to the phone; the browser's
+  `xterm.js` holds the only replayable scrollback. It reads the LIVE mode off `xterm.js`
+  (`buffer.active.type` + `modes.mouseTrackingMode`) and routes 3 ways: normal buffer (shell,
+  **Claude Code**) → scroll xterm.js's OWN scrollback LOCALLY (`term.scrollLines`, no host
+  round-trip — the previously-broken common case); alt+mouse (htop/vim+mouse) → real wheel so the
+  app redraws; alt+no-mouse (less/man/vim) → PageUp/PageDown (a wheel is a dead no-op there — the
+  `.client` mirror's alt-screen `active_key` is a documented `src/termio/Client.zig` residual); Web
   Push needs a SECURE CONTEXT (`tailscale serve` in front, external HTTPS port ≠ internal bind
   port or the bind hits `EADDRINUSE`); the raw-tee is a HOST change (host restart loses sessions).
   **See `WEB-MONITOR.md` (→ Implementation notes) for the color/scrollback architecture, HTTP
@@ -216,10 +224,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 
 - **MCP server** (fork-only, OFF by default; config `mcp-listen` / `mcp-token` — the token is a
   SHELL-EXECUTION credential, so bind localhost + always set it) — a GUI-embedded MCP server
-  (HTTP JSON-RPC + a stdio shim `ghostty-mcp`) giving an orchestrating agent **25** registered
-  tools (12 agent-control + the queue internals + the 4 new knowledge tools below) to control
+  (HTTP JSON-RPC + a stdio shim `ghostty-mcp`) giving an orchestrating agent **26** registered
+  tools (12 agent-control + the queue internals + `get_haiku_usage` + the 4 knowledge tools below) to control
   the fork (splits/tabs, open/run) and watch+respond to sessions (read screen, type input,
-  approve prompts). Built entirely on existing libghostty/Swift abstractions — the only Zig
+  approve prompts) — plus `get_haiku_usage` (Agent Manager budget query, see that bullet). Built entirely on existing libghostty/Swift abstractions — the only Zig
   change is two default-null config keys, so enabling/changing it is a GUI relaunch, never a host
   restart. COPIES the web monitor, never depends on it. Load-bearing gotchas: same NATIVE-keycode
   input rule; `processName`/`command` are HOST-GATED (absent until the host is a minor-3 build);
@@ -297,9 +305,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `model.ts` points the SDK at the colleague's ALREADY-INSTALLED `claude` via
   `pathToClaudeCodeExecutable` (the `GHOSTTY_CLAUDE_PATH` env, set by `AgentManagerController` from a
   login-shell `command -v claude` probe), billed to their own Claude subscription; needs `node` +
-  `claude` on PATH, else the summarizer self-disables per-surface while the queue still runs. **See
-  `AGENT-MANAGER.md` (→ Implementation notes) for the loop, cost controls, account routing, the
-  rate-limit attention watchdog, the system-`claude`/esbuild bundle, wiring + tests.**
+  `claude` on PATH, else the summarizer self-disables per-surface while the queue still runs.
+  **Haiku usage/budget tracking (config `agent-manager-usage-tracking`, default ON):** every Haiku
+  call is recorded as one JSONL line to `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` tagged with
+  the FEATURE (`summarizer`/`bell-classify`) + account, so you can ask "how much per feature over the
+  last N hours" — captured at the single chokepoint `model.ts summarize()` (an `onUsage` callback
+  reading the SDK's `usage`+`total_cost_usd`, verified non-zero), tagged at the `index.ts` call site,
+  persisted by `usage.ts` (survives GUI restarts — it's a file; 14-day retention trimmed at startup),
+  and queried by the **`get_haiku_usage` MCP tool** (`{hours?}`, default 3 → total + per-feature +
+  per-account, via the pure `MCPUsage.aggregate`). The Zig bool `agent-manager-usage-tracking`
+  (default true) gates it, forwarded to the sidecar EXPLICITLY as `GHOSTTY_HAIKU_USAGE=1`/`0` by
+  `AgentManagerController` so the config wins over the sidecar's default-on; set it `false` in
+  `~/.config/ghostty-ramon/config` to disable (GUI relaunch; Zig/lib rebuild but NO host restart —
+  the host ignores the key). **See `AGENT-MANAGER.md` (→ Implementation notes) for the loop, cost
+  controls, account routing, the rate-limit attention watchdog, the system-`claude`/esbuild bundle,
+  Haiku usage/budget tracking, wiring + tests.**
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default; config `agent-queue` /
   `agent-queue-templates-dir` / `agent-queue-max-total`, action `start_agent_queue`) — turns the
@@ -322,7 +342,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `closeOnComplete:false`), never force-closed, persisted across restart; toggled via a
   `set_keep{run,key,keep}` command, state carried on the surface annotation (`queueKeep`). Keep is
   RUN-LEVEL state (`QueueRun.keep` map, mirrors the `dispatched` latch — survives reconcile),
-  `effectiveKeep = run.keep[key] ?? template.keepOnComplete`. **See `AGENT-QUEUE.md`
+  `effectiveKeep = run.keep[key] ?? template.keepOnComplete`. A **`release{run,key?}`** command
+  is the in-place escape from the dispatch latch's "needs a tracker status round-trip" rule: an
+  agent that crashed/exited or was killed before claiming leaves its item latched-but-listed
+  ("held"), never rescheduled. The health bar surfaces an orange **`N held`** chip (the sidecar
+  status report now carries `held`/`heldCount` = listed ∩ latched ∩ ¬active) → **Release** (per
+  item or all) clears the latch (+ cooldown) so the queue re-dispatches it on the next `list`
+  poll, NO Linear round-trip. Like `set_keep`, release lives in the per-run store (persisted by
+  the next reconcile sweep, not an active-runs change). **See `AGENT-QUEUE.md`
   (→ Implementation notes) for the full engine, MCP tools, grid/packing, health/backlog, live edits,
   keep, restart hardening, wiring + tests.**
 
@@ -333,7 +360,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

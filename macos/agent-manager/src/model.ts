@@ -36,6 +36,9 @@
 // Agent Queue needs NO npm deps and is unaffected either way. See the COLLEAGUE/DMG
 // note above + CLAUDE.md (Agent Manager).
 import type * as ClaudeAgentSDK from "@anthropic-ai/claude-agent-sdk";
+// TYPE-ONLY: erased at compile, so dist/model.js gains NO runtime require of
+// usage.ts — preserves the "loads with no node_modules" property.
+import type { HaikuUsage } from "./usage.js";
 
 /** The default summarizer model. Free-form string (no SDK enum). */
 export const SUMMARIZER_MODEL = "claude-haiku-4-5";
@@ -65,6 +68,11 @@ export interface SummarizeRequest {
   /** Optional CLAUDE_CONFIG_DIR for the spawned `claude` — routes auth/billing to
    *  a specific account (see account.ts). OMITTED ⇒ inherit the ambient auth. */
   configDir?: string;
+  /** Optional usage sink. Called with the token/cost usage read off the SDK
+   *  SUCCESS result message, BEFORE the text is returned. The caller tags it with
+   *  the feature/account and records it (see usage.ts). Not called on an error
+   *  result (no usage to report). */
+  onUsage?: (usage: HaikuUsage) => void;
 }
 
 /** The query() function signature we depend on — injectable for tests. */
@@ -113,6 +121,30 @@ export async function summarize(
   for await (const message of q) {
     if (message.type === "result") {
       if (message.subtype === "success") {
+        // Report token/cost usage off the SUCCESS result before returning. The
+        // SDK result carries `usage` (input/output/cache tokens) + `total_cost_usd`
+        // (verified non-zero on pool auth). Read defensively (?? 0) so a shape
+        // change can never throw into the loop.
+        if (req.onUsage) {
+          const m = message as unknown as {
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_read_input_tokens?: number;
+              cache_creation_input_tokens?: number;
+            };
+            total_cost_usd?: number;
+          };
+          const u = m.usage ?? {};
+          req.onUsage({
+            model: req.model ?? SUMMARIZER_MODEL,
+            inputTokens: u.input_tokens ?? 0,
+            outputTokens: u.output_tokens ?? 0,
+            cacheReadTokens: u.cache_read_input_tokens ?? 0,
+            cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
+            costUsd: m.total_cost_usd ?? 0,
+          });
+        }
         return message.result;
       }
       // Error subtypes have no .result; surface them so the loop logs + skips.

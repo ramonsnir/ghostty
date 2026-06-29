@@ -122,8 +122,13 @@ is loopback, hence identical; only your `ts.net` hostname differs:
    - **Enter** quick-key — submits (a real Enter keypress).
    - Quick-keys: **Enter · y · n · Esc · Tab · ⌫ Backspace · Clear (Ctrl-U) · Ctrl-C**, the
      **digits 1–4** (numbered agent menus), and **arrows**.
-   - **Scroll ↑ / Scroll ↓** — remote-control scroll (a real mouse wheel to the host), so a TUI
-     (Claude Code / `less` / `vim`) scrolls and the result streams back.
+   - **Scroll ↑ / Scroll ↓** — *smart* scroll. The page reads the **live terminal mode** off
+     `xterm.js` and picks the right gesture per app: on the **normal screen** (a shell, **Claude
+     Code**, anything using terminal scrollback) it scrolls **xterm.js's own scrollback locally**
+     (the history is already in the browser — the host can't re-stream it); for a full-screen TUI
+     that **captures the mouse** (`htop`, `vim` with mouse) it sends a real **mouse wheel** so the
+     app redraws; for one that **doesn't** (`less`, `man`, plain `vim`) it sends **PageUp /
+     PageDown**. So the one pair of buttons "just scrolls" whatever you're looking at.
    - **Press-and-hold to auto-repeat** on **scroll, arrows, and backspace** (a tap still fires
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
    - All input is sent as **real key/wheel events** (`ghostty_surface_key` / `_mouse_scroll`),
@@ -241,8 +246,22 @@ real scrollback can't come from the GUI. Instead:
 - **No live config reload** — changing `web-monitor-listen` / `web-monitor-token` needs a
   relaunch.
 - Scrollback replay on connect is bounded by the host ring buffer; xterm.js then keeps its own
-  scrollback for everything streamed since connecting (and Scroll ↑/↓ drives the host for
-  deeper/alt-screen history).
+  scrollback (10000 lines) for everything streamed since connecting. **Scroll ↑/↓ on the normal
+  screen scrolls that LOCAL xterm.js scrollback** (see below) — it does not reach further history
+  on the host.
+- **Why Scroll is "smart" (and why a host wheel was the wrong default).** The host's raw stream
+  (`raw_output`) carries ONLY child PTY output — the `output_observer` fires on IO reads, so a
+  host-side viewport scroll (`/scroll` → `scroll_viewport`) repins the host's mirror but **emits
+  no bytes back to the phone**. The browser's `xterm.js` is therefore the only thing that holds
+  replayable scrollback (the replayed ring + everything streamed since connect). So `smartScroll`
+  reads the live mode off `xterm.js` (`term.buffer.active.type` + `term.modes.mouseTrackingMode`)
+  and routes three ways: **normal buffer** (shell, **Claude Code**, anything using terminal
+  scrollback) → **`term.scrollLines` LOCALLY** (no host round-trip — this was the silently-broken
+  common case; a wheel POST changed nothing visible); **alt screen + mouse capture** (`htop`,
+  `vim`+mouse) → a real **wheel** so the app redraws and those bytes stream back; **alt screen,
+  no mouse** (`less`/`man`/plain `vim`) → **PageUp/PageDown** (a wheel is a no-op there because the
+  `.client` mirror's alt-screen `active_key` is a documented un-applied residual in
+  `src/termio/Client.zig`). Purely page-side — no Zig/host change.
 
 ---
 
@@ -389,8 +408,32 @@ host routes it per the app's mode: SGR wheel / alternate-scroll arrows / scrollb
 input model: **Send (and Return-in-field) TYPE the text only — they do NOT submit**; the
 **Enter quick-key submits**; quick-keys are
 enter/y/n/esc/tab/backspace/ctrl-u(Clear)/ctrl-c, digits 1–4, arrows, and Scroll ↑/↓.
+`keySpecs(forKey:)` also maps **pageup/pagedown/home/end** (native macOS keycodes 116/121/115/119)
+for the smart-scroll path below.
 **Press-and-hold auto-repeat** (`addRepeat`: 350ms delay → 90ms repeat; `touch-action:none` +
 preventDefault) on scroll/arrows/backspace only; the rest are single-fire.
+
+**Smart scroll (`smartScroll`, page-side).** The Scroll ↑/↓ buttons do NOT blindly POST a wheel
+delta. **Load-bearing fact:** the host's `raw_output` stream carries only CHILD pty output (the
+`output_observer` fires on IO reads), so a host-side `/scroll` (`scroll_viewport`) emits nothing
+back to the phone — driving the host is useless for what the browser sees. The browser's
+`xterm.js` is the only thing holding replayable scrollback. So `smartScroll` reads the LIVE mode
+off the `xterm.js` instance — `term.buffer.active.type` (`normal`/`alternate`) and
+`term.modes.mouseTrackingMode` — exposed to the page by adding `term` to the stream handle
+(`{ dispose, term }`). Decision:
+- **normal buffer** (shell, **Claude Code**, anything using terminal scrollback) ⇒
+  `term.scrollLines(∓3)` — scroll xterm.js's OWN scrollback LOCALLY, no host round-trip. This is
+  the common case and the one that was silently broken (a wheel POST did nothing visible). xterm
+  keeps the user's scroll position when new output streams in while scrolled up, so it stays put.
+- **alt screen + mouse tracking** (`htop`, `vim`+mouse) ⇒ `sendScroll(±3)` — a real wheel so the
+  app itself redraws (no xterm scrollback exists in the alt buffer; the redraw streams back).
+- **alt screen, no mouse** (`less`/`man`/plain `vim`) ⇒ `sendKey("pageup"/"pagedown")` (a wheel is
+  a no-op there because the mirror's alt-screen `active_key` isn't applied under `pty-host` — see
+  Known limits).
+
+With no live `xterm` (plain-text poll fallback) there is no local buffer, so it falls back to the
+plain host wheel. This is the answer to "how do I know dynamically whether to scroll or page" —
+the terminal's own mode tells us, and `xterm.js` already tracks it.
 
 ### Security defense-in-depth
 

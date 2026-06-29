@@ -85,6 +85,23 @@ struct WebMonitorServerTests {
         #expect(spec("right") == WebMonitorServer.KeySpec(keycode: 124))
     }
 
+    @Test func keySpecsPageHomeEndAreNativeKeycodes() {
+        // smartScroll sends PageUp/PageDown for alt-screen TUIs (less/man/vim)
+        // that own the screen with no scrollback to wheel. These ride the native
+        // macOS virtual keycode space (NSEvent.keyCode), NOT GHOSTTY_KEY_*:
+        // PageUp=116, PageDown=121, Home=115, End=119.
+        func spec(_ k: String) -> WebMonitorServer.KeySpec? {
+            WebMonitorServer.keySpecs(forKey: k)?.first
+        }
+        #expect(spec("pageup") == WebMonitorServer.KeySpec(keycode: 116))
+        #expect(spec("pagedown") == WebMonitorServer.KeySpec(keycode: 121))
+        #expect(spec("home") == WebMonitorServer.KeySpec(keycode: 115))
+        #expect(spec("end") == WebMonitorServer.KeySpec(keycode: 119))
+        // Mods-free, like the other navigation keys.
+        #expect(spec("pageup")?.mods == GHOSTTY_MODS_NONE)
+        #expect(spec("pagedown")?.mods == GHOSTTY_MODS_NONE)
+    }
+
     @Test func keySpecsCtrlCSetsCtrlModifier() {
         // ctrl-c is a REAL Ctrl+C key event (GHOSTTY_KEY_C + ctrl modifier),
         // not a pasted 0x03 byte.
@@ -1096,6 +1113,25 @@ struct WebMonitorServerTests {
         // Multi-split tabs badge each pane "split i/n".
         #expect(page.contains("\"badge\""))
         #expect(page.contains("\"split \""))
+    }
+
+    @Test func htmlPageHasSmartScroll() {
+        let page = WebMonitorServer.htmlPage
+        // The scroll buttons drive smartScroll, which reads the LIVE xterm.js
+        // terminal mode to pick the right gesture.
+        #expect(page.contains("function smartScroll"))
+        #expect(page.contains("smartScroll(1)"))
+        #expect(page.contains("smartScroll(-1)"))
+        // Normal buffer: the scrollback lives IN xterm.js, so it scrolls LOCALLY
+        // (term.scrollLines) — a host wheel emits no raw bytes back to the phone.
+        #expect(page.contains("term.scrollLines(dir > 0 ? -3 : 3)"))
+        // It branches on the alternate-screen buffer + mouse-tracking mode, and
+        // sends PageUp/PageDown in the alt-screen-without-mouse case.
+        #expect(page.contains("active.type === \"alternate\""))
+        #expect(page.contains("mouseTrackingMode"))
+        #expect(page.contains("sendKey(dir > 0 ? \"pageup\" : \"pagedown\")"))
+        // The stream handle exposes `term` so smartScroll can read its mode.
+        #expect(page.contains("dispose: teardown, term: term"))
     }
 
     @Test func htmlPageHasJumpToBottomButton() {

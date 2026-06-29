@@ -1330,6 +1330,32 @@ final class AgentDashboardModel: ObservableObject {
                     QueueCommand(action: .setKeep, run: run, key: key, keep: keep),
             ])
     }
+
+    /// (release) Release one HELD item (`key`) — or EVERY held item in `run` (`key` nil) — from
+    /// the §7.1 dispatch latch, so the supervisor re-dispatches it on its next `list` poll
+    /// WITHOUT a tracker status round-trip. A held item was dispatched once but is suppressed by
+    /// the latch (its agent crashed/exited, or was killed before claiming, and the item is still
+    /// in the backlog). OPTIMISTICALLY drops the released key(s) from the run's `held` set so the
+    /// "N held" chip updates instantly; the sidecar's next push reconciles. No-op for the
+    /// `(other)` catch-all. Same FIFO path as the other run controls.
+    func releaseQueueItem(run: String, key: String?) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        // OPTIMISTIC: remove the released key (or all held) from the stored status.
+        if let existing = queueStatuses[run] {
+            if let key, !key.isEmpty {
+                queueStatuses[run] = existing.withHeld(existing.held.filter { $0.key != key })
+            } else {
+                queueStatuses[run] = existing.withHeld([])
+            }
+        }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .release, run: run, key: key),
+            ])
+    }
 }
 
 /// (ramon fork / Agent Dashboard, Layer 3) Owns the panel, the SwiftUI host

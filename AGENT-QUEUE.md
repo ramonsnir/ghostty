@@ -274,6 +274,17 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   tabs** (in the run's own window) — `cols×rows` is the per-tab layout, so e.g. bumping `6 → 9`
   with a 3×2 grid spreads 6 panes in tab 1 + 3 in tab 2. Like the cap, a same-scope re-`start`
   won't change it — this chip is the only in-place way.
+- **Release HELD items (the dispatch-latch escape):** when an agent **crashed / exited**, OR was
+  **killed before it claimed** its item, the item is back in the source `list` but the queue will
+  **not re-dispatch it** — the §7.1 dispatch latch suppresses any key it has dispatched once until
+  a successful `list` no longer reports it (normally a tracker **status round-trip**). When that
+  happens, the health bar shows an orange **`N held`** chip; click it for a popover listing each
+  held item (key · title · Linear link) with a **Release** button, plus a **Release all** button.
+  Release clears that item's latch (and its cooldown) so the queue **re-dispatches it on the next
+  `list` poll — with NO Linear/tracker status round-trip**. This is the in-place way to recover
+  the "stuck in limbo, won't get rescheduled" items without editing statuses in your tracker. The
+  chip appears only when there ARE held items (latched AND still in the backlog AND no longer
+  active); a still-RUNNING agent is never shown as held.
 
 ## What it guarantees
 
@@ -291,6 +302,10 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   latch is **persisted**, so a sidecar/GUI restart won't re-grab a killed-before-claim item.
   Consequence: a **crashed** agent whose item stays in the list is **not** auto-retried either —
   re-queue it with the same round-trip (the queue won't blindly re-run a crash on the same item).
+  **OR release it in-place:** the dashboard's **`N held`** chip → **Release** (per item or all)
+  clears the latch without a tracker round-trip, so the queue re-dispatches it on the next `list`
+  poll (see *Release HELD items* above). This is the recovery path for the limbo where a killed/
+  crashed item would otherwise never get rescheduled.
 - **Concurrency** is never exceeded (per-queue `concurrency` — the total across all the run's
   tabs — and the global `agent-queue-max-total`; `cols×rows` is the per-tab layout, not a cap on
   the total, since panes overflow to new tabs).
@@ -412,6 +427,42 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   (serialize/parse/persist round-trips + tolerance), `supervisor.test.ts` (`selectCandidates`
   latch skip + re-arm), `runner.test.ts` (kill-before-claim NOT re-dispatched w/o a round-trip,
   crashed-EXITED cooled-then-latched, latch persists across restart).
+
+### RELEASE held items — the in-place latch escape (§7.1)
+
+- **RELEASE — clear the latch WITHOUT a tracker round-trip.** The §7.1 latch is deliberately
+  sticky (it needs the item to leave + re-enter the `list`), which leaves a real dead-end: an
+  agent that **crashed/exited** OR was **killed before claiming** leaves its item in the `list`
+  forever-suppressed, "in limbo, won't get rescheduled." A new `release` command is the escape.
+  - **HELD set (what's surfaced):** `status.ts queueStatusReport` now derives `held`/`heldCount`
+    = `listItems ∩ latchedKeys ∩ ¬activeKeys` (runner passes `run.dispatched` as `latchedKeys`
+    and `new Set(run.active.keys())` as `activeKeys`). A latched key NOT in the current list is
+    omitted (the re-arm will clear it); a latched key still ACTIVE (running, or EXITED with its
+    split open) is omitted (it's tracked, not stuck). So the chip shows exactly the items the
+    user means by "dispatched once, agent gone, still in the backlog."
+  - **`release{run, key?}` command** (`commands.ts`, whitelisted in `mcp.ts coerceQueueCommands`,
+    reusing the existing optional `key` field): with a `key`, clears `run.dispatched.delete(key)`
+    + `run.cooldown.delete(key)`; with NO key, clears every HELD item (latched ∩ listed ∩ ¬active,
+    mirroring the surfaced set — a not-listed or still-active latched key is left alone). PURE
+    (mutates only per-run state); the cleared latch is persisted by the run's next reconcile sweep
+    (`persistStore` at the end of `reconcile`, every sweep — like `set_keep`, so `applyCommands`
+    does NOT count `release` as an active-runs change). Once cleared, `selectCandidates` no longer
+    suppresses the key, so the next `dispatchCandidates` (≤`listMs`) re-dispatches it fresh.
+  - **GUI:** `QueueStatus` gains `held`/`heldCount` (parsed by `QueueStatusPayload`, forwarded by
+    `mcp.ts reportQueueStatus`, declared in the `report_queue_status` schema —
+    `additionalProperties:false`, so the fields MUST be declared). `QueueCommand.Action.release`
+    (lowercase wire value). `AgentDashboardController.releaseQueueItem(run:key:)` posts the command
+    + optimistically drops the released key(s) via `QueueStatus.withHeld`. `OriginSectionHeader`
+    renders the orange **`N held`** chip → `heldPopover` (per-item **Release** + **Release all**),
+    shown only when `heldCount > 0`. Wiring: sidecar `status.ts`/`runner.ts`/`commands.ts`/`mcp.ts`;
+    Swift `QueueCommandBridge.swift` (action + `held`/`heldCount` + `withHeld` + parse),
+    `MCPTools.swift` (schema), `AgentDashboardController.swift` (`releaseQueueItem`),
+    `AgentDashboardView.swift` (`N held` chip + `heldPopover` + the two `onRelease*` closures).
+    Tests: sidecar `status.test.ts` (held derivation/dedup/cap/empty), `commands.test.ts` (release
+    single + bulk + tolerant + unknown-run no-op + not-counted), `mcp.test.ts` (coerce release w/
+    optional key; `reportQueueStatus` forwards held); Swift `MCPServerTests`
+    (`queueCommandReleaseSerializes*`, `queueStatusPayloadParsesHeld*`, `queueStatusWithHeld*`).
+    **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 ### On-demand command channel + `take_queue_commands` (§8a)
 

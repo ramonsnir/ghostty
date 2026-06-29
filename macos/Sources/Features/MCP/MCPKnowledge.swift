@@ -65,6 +65,7 @@ enum MCPKnowledge {
         ("agent-dashboard-pin", { String($0.agentDashboardPin) }),
         ("agent-manager", { String($0.agentManagerEnabled) }),
         ("agent-manager-node-path", { $0.agentManagerNodePath ?? "" }),
+        ("agent-manager-usage-tracking", { String($0.agentManagerUsageTracking) }),
         ("agent-queue", { String($0.agentQueueEnabled) }),
         ("agent-queue-templates-dir", { $0.agentQueueTemplatesDir ?? "" }),
         ("agent-queue-max-total", { String($0.agentQueueMaxTotal) }),

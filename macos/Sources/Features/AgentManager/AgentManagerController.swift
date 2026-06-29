@@ -54,6 +54,9 @@ final class AgentManagerController {
     /// sidecar appends its per-bell classify verdict + alert edges to the shared
     /// bell-diagnostics JSONL. Captured on main at init.
     private let bellDiagnostics: Bool
+    /// (ramon fork / Agent Manager) Haiku usage/budget tracking. Forwarded to the
+    /// sidecar as `GHOSTTY_HAIKU_USAGE=1`/`0`; default true. Captured on main at init.
+    private let usageTracking: Bool
     /// (Agent Queue Supervisor §8a/§15) Master enable for the sidecar's queue
     /// supervisor "pass 3". Captured on main at init. When true the controller
     /// arms the sidecar via `GHOSTTY_AGENT_QUEUE=1` (else pass 3 stays a no-op).
@@ -102,6 +105,7 @@ final class AgentManagerController {
         self.configuredNodePath = ghostty.config.agentManagerNodePath
         self.bellFilterEnabled = ghostty.config.agentManagerBellFilter
         self.bellDiagnostics = ghostty.config.bellDiagnostics
+        self.usageTracking = ghostty.config.agentManagerUsageTracking
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
         self.agentQueueTemplatesDir = ghostty.config.agentQueueTemplatesDir
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
@@ -256,6 +260,10 @@ final class AgentManagerController {
         // the feature is on; absent ⇒ the sidecar does no bell-edge work.
         if bellFilterEnabled { env["GHOSTTY_BELL_FILTER"] = "1" }
         if bellDiagnostics { env["GHOSTTY_BELL_DIAG"] = "1" }
+        // (ramon fork / Agent Manager) Haiku usage/budget tracking. Set explicitly
+        // both ways so the config toggle wins over the sidecar's default-on; "0"
+        // disables the per-call JSONL recording (usage.ts `usageEnabled()`).
+        env["GHOSTTY_HAIKU_USAGE"] = usageTracking ? "1" : "0"
         let nodeDir = (nodePath as NSString).deletingLastPathComponent
         if !nodeDir.isEmpty {
             let existing = env["PATH"] ?? ""

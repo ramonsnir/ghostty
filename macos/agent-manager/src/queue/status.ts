@@ -42,6 +42,16 @@ export interface QueueStatusReport {
   /** The currently-RUNNING items (one per slot-occupying agent) — the "M running"
    *  dropdown. `running.length === active`. Each carries its URL. */
   running: QueueItemRef[];
+  /** (release) Count of HELD items — keys still in the §7.1 dispatch latch AND still in the
+   *  actionable list but no longer active. These were dispatched once but the queue won't
+   *  re-dispatch them: the agent crashed/exited, OR was killed before it claimed the item, so
+   *  the item is back in the backlog yet the latch suppresses it (normally only a tracker
+   *  status round-trip clears the latch). The "N held" dropdown exposes them so they can be
+   *  RELEASED in-place. `held.length` may be < `heldCount` (capped at `nextLimit`). */
+  heldCount: number;
+  /** (release) Up to `nextLimit` of those HELD items — each with a per-item Release button
+   *  (clears its latch so it re-dispatches on the next list poll, no tracker round-trip). */
+  held: QueueItemRef[];
 }
 
 /** Inputs for the pure status builder — primitives + the run's in-memory facts. */
@@ -60,6 +70,14 @@ export interface QueueStatusInputs {
   /** Keys NOT eligible to dispatch (active assignments of any state + the §7.1 latch) —
    *  excluded from queued/next so the backlog reflects what would actually dispatch. */
   excludeKeys: ReadonlySet<string>;
+  /** (release) The §7.1 dispatch-latch keys (`run.dispatched`). A listed key in this set
+   *  that is NOT in `activeKeys` is HELD — surfaced as `held`/`heldCount` so it can be
+   *  released. Defaults to empty (legacy build / present:false). */
+  latchedKeys?: ReadonlySet<string>;
+  /** (release) The currently-tracked assignment keys (`run.active`, ANY state). A held key
+   *  that is still active (RUNNING / EXITED-with-split) is NOT shown (it isn't stuck behind
+   *  the latch — it's tracked). Defaults to empty. */
+  activeKeys?: ReadonlySet<string>;
   /** The most recent `list` items, or null if none fetched yet (arm sweep / paused-first). */
   listItems: ReadonlyArray<WorkItem> | null;
   /** Whether the most recent `list` fetch succeeded. */
@@ -96,6 +114,8 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       concurrency: input.concurrency ?? 0,
       next: [],
       running: [],
+      heldCount: 0,
+      held: [],
     };
   }
 
@@ -120,6 +140,22 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
   else if (!input.dispatchArmed || !input.listOk) phase = "starting";
   else phase = "running";
 
+  // (release) HELD items = listed ∩ latched ∩ ¬active, deduped in list order. A latched key
+  // not in the current list is omitted (it left the actionable set — the §7.1 re-arm clears it
+  // on the next successful list); a latched key that is still active is omitted (it's tracked,
+  // not stuck behind the latch).
+  const latched = input.latchedKeys ?? new Set<string>();
+  const activeKeys = input.activeKeys ?? new Set<string>();
+  const heldSeen = new Set<string>();
+  const heldItems: WorkItem[] = [];
+  for (const i of input.listItems ?? []) {
+    if (typeof i.key !== "string" || i.key.length === 0) continue;
+    if (!latched.has(i.key) || activeKeys.has(i.key)) continue;
+    if (heldSeen.has(i.key)) continue;
+    heldSeen.add(i.key);
+    heldItems.push(i);
+  }
+
   // Map a WorkItem/ref → QueueItemRef, including title/url only when non-empty.
   const toRef = (i: { key: string; title?: string; url?: string }): QueueItemRef => {
     const ref: QueueItemRef = { key: i.key };
@@ -140,6 +176,8 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     concurrency: input.concurrency ?? 0,
     next: deduped.slice(0, nextLimit).map(toRef),
     running: input.runningItems.map(toRef),
+    heldCount: heldItems.length,
+    held: heldItems.slice(0, nextLimit).map(toRef),
   };
 }
 

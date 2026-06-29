@@ -115,10 +115,11 @@ committed `.mcp.json` needs. (The shim changes rarely — rebuild only if `main.
 
 ## The tools
 
-The server registers **25** tools total: the 12 agent-control tools documented here,
-`set_attention` (the Bell Attention promotion tool — see BELL-ATTENTION.md), the queue-
-supervisor internals (driven by the Agent Queue sidecar, not meant for hand use — see
-AGENT-QUEUE.md), and the 4 read-only **knowledge** tools at the end of this section.
+The server registers **26** tools total: the 12 agent-control tools documented here,
+`set_attention` (the Bell Attention promotion tool — see BELL-ATTENTION.md), `get_haiku_usage`
+(Agent Manager budget query — see AGENT-MANAGER.md), the queue-supervisor internals (driven by
+the Agent Queue sidecar, not meant for hand use — see AGENT-QUEUE.md), and the 4 read-only
+**knowledge** tools at the end of this section.
 
 Most tools address a surface by its **stable UUID** from `list_surfaces` (window/tab are
 positional encounter-order indices, **not** durable — only `id` is).
@@ -134,6 +135,10 @@ positional encounter-order indices, **not** durable — only `id` is).
   is not exposed* — see Known limits. To see output that scrolled off, `scroll` it into
   view, then read again.
 - **`get_layout`** — the window → tab → split-tree of every window.
+- **`get_haiku_usage {hours?}`** — Agent Manager Haiku token/cost usage over the last
+  `hours` (default 3), broken down **by feature** (`summarizer` vs `bell-classify`) and **by
+  account**, plus a grand total. Read-only; survives GUI restarts (the sidecar logs each
+  call to disk). See [AGENT-MANAGER.md](AGENT-MANAGER.md) → *Haiku usage / budget tracking*.
 
 **Respond** (real key events, not paste)
 - **`send_text {id, text, submit?}`** — types text; `submit:true` appends a real Return.
@@ -359,20 +364,22 @@ hook reads), so the committed JSON needs no token. Dev identities still reachabl
 `macos/mcp-shim/Sources/ghostty-mcp/main.swift` (`tokenFromLocalConfig`); see "Connecting
 an agent" above.
 
-### The registered tools (25)
+### The registered tools (26)
 
 The 12 agent-control tools: `list_surfaces`, `read_surface`, `get_layout`, `send_text`,
 `send_key`, `scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
 `close_surface`, `perform_action` (the keybind-action grammar string). All address a surface
 by **stable UUID**; `wait_for_event`/`watch_for_pattern` are long-poll (idle-watchdog-exempt,
 bounded by a clamped `timeoutMs` 1000–120000). Plus **`set_attention`** (promote a bell to
-the sticky attention state — the Bell Attention v2 loud tier; see BELL-ATTENTION.md), the
-Agent Queue supervisor internals (`spawn_split_command`, `force_close_surface`,
-`signal_attention`, `take_queue_commands`, `report_queue_status`, `report_queue_graph`,
-`move_surface_into_tab`, `set_surface_annotation` — see AGENT-QUEUE.md) and the 4 knowledge
-tools below. So the inventory is **12 agent-control + `set_attention` + 8 queue/supervisor
-+ 4 knowledge = 25**, and `MCPServerTests.toolsListHasAllTools` asserts the total is **25**
-— keep it in sync when a tool is added or removed.
+the sticky attention state — the Bell Attention v2 loud tier; see BELL-ATTENTION.md),
+**`get_haiku_usage`** (Agent Manager Haiku budget query — a pure file read, no surface/GUI hop;
+see AGENT-MANAGER.md), the Agent Queue supervisor internals (`spawn_split_command`,
+`force_close_surface`, `signal_attention`, `take_queue_commands`, `report_queue_status`,
+`report_queue_graph`, `move_surface_into_tab`, `set_surface_annotation` — see AGENT-QUEUE.md)
+and the 4 knowledge tools below. So the inventory is **12 agent-control + `set_attention` +
+`get_haiku_usage` + 8 queue/supervisor + 4 knowledge = 26**, and
+`MCPServerTests.toolsListHasAllTools` asserts the total is **26** — keep it in sync when a tool
+is added or removed.
 
 `list_surfaces` rows carry `id, title, pwd, window/tab/split position, focused, bell,
 exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /

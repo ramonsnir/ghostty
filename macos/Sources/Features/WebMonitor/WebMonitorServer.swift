@@ -1243,6 +1243,13 @@ final class WebMonitorServer {
         case "down": return [KeySpec(keycode: 125)]
         case "left": return [KeySpec(keycode: 123)]
         case "right": return [KeySpec(keycode: 124)]
+        // Page/Home/End — used by smartScroll for alt-screen TUIs (less/man/vim)
+        // that own the screen and have no scrollback to wheel through. Native
+        // macOS virtual keycodes: PageUp=116, PageDown=121, Home=115, End=119.
+        case "pageup": return [KeySpec(keycode: 116)]
+        case "pagedown": return [KeySpec(keycode: 121)]
+        case "home": return [KeySpec(keycode: 115)]
+        case "end": return [KeySpec(keycode: 119)]
         case "y": return keySpecs(forText: "y")
         case "n": return keySpecs(forText: "n")
         // Space is a plain printable 0x20 — same byte a Space keypress sends, and
@@ -1974,17 +1981,18 @@ final class WebMonitorServer {
                 title="Acknowledge/clear the &quot;needs you&quot; state for this split (it can re-promote later)">&#128276; Clear</button>
       </div>
       <!-- Arrows + remote-control scroll on ONE row to save vertical space.
-           Scroll is forwarded to the host as mouse-wheel input, so a TUI (Claude
-           Code/less/vim) scrolls and the result streams back, reaching history
-           beyond the browser buffer. The double-line glyphs (⇑⇓) distinguish
-           scroll from the single-line nav arrows (↑↓). -->
+           Scroll is "smart" (see smartScroll): a mouse wheel to the host for
+           scrollback / mouse-capturing apps (Claude Code), but PageUp/PageDown
+           for a full-screen TUI that owns the screen with no scrollback to wheel
+           (less/man/vim) — chosen live from the xterm.js terminal mode. The
+           double-line glyphs (⇑⇓) distinguish scroll from the nav arrows (↑↓). -->
       <div class="bar">
         <button data-key="up" aria-label="Up">&uarr;</button>
         <button data-key="down" aria-label="Down">&darr;</button>
         <button data-key="left" aria-label="Left">&larr;</button>
         <button data-key="right" aria-label="Right">&rarr;</button>
-        <button id="scrollup" title="Scroll up — mouse wheel to the remote terminal">&#8679; Scroll</button>
-        <button id="scrolldown" title="Scroll down — mouse wheel to the remote terminal">&#8681; Scroll</button>
+        <button id="scrollup" title="Scroll up — mouse wheel, or PageUp in a full-screen TUI (less/man/vim)">&#8679; Scroll</button>
+        <button id="scrolldown" title="Scroll down — mouse wheel, or PageDown in a full-screen TUI (less/man/vim)">&#8681; Scroll</button>
       </div>
       <!-- Compose input is LAST so the on-screen keyboard (which docks below the
            focused field) cannot hide the quick-key rows above it. -->
@@ -2421,7 +2429,9 @@ final class WebMonitorServer {
             if (stream === handle) fallbackToPoll("Connection lost \\u2014 using snapshot.");
           });
 
-        var handle = { dispose: teardown };
+        // Expose `term` so smartScroll can read the live terminal's mode
+        // (alt-screen buffer + mouse-tracking) to decide wheel vs. PageUp/Down.
+        var handle = { dispose: teardown, term: term };
         return handle;
       }
 
@@ -2668,8 +2678,43 @@ final class WebMonitorServer {
           body: JSON.stringify({ dy: dy })
         }).catch(function () {});
       }
-      addRepeat(document.getElementById("scrollup"), function () { sendScroll(3); });
-      addRepeat(document.getElementById("scrolldown"), function () { sendScroll(-3); });
+
+      // Smart scroll: pick the gesture from the LIVE terminal mode, read off
+      // xterm.js (so it tracks the remote app moment-to-moment). KEY FACT: the
+      // host's raw stream only carries CHILD pty output, so a host-side viewport
+      // scroll emits NOTHING back to the phone — scrolling the host is useless
+      // here. The browser's xterm.js holds the real scrollback (the replayed ring
+      // + everything streamed since connect). So:
+      //  (1) Normal buffer (shell, Claude Code, anything using terminal
+      //      scrollback): the history is ALREADY in xterm.js -> scroll IT LOCALLY
+      //      (term.scrollLines), no host round-trip. This is the common case and
+      //      the one that was silently broken (a wheel POST did nothing visible).
+      //  (2) Alt screen + the app captures the mouse (htop, vim with mouse): no
+      //      xterm scrollback exists in the alt buffer, so forward a WHEEL so the
+      //      app itself redraws (those bytes then stream back).
+      //  (3) Alt screen, NO mouse capture (less, man, plain vim): send
+      //      PAGEUP/PAGEDOWN so the app pages and redraws (a wheel is a no-op
+      //      there under pty-host — the mirror's alt-screen state isn't applied).
+      // Without a live xterm (plain-text poll fallback) there is no local buffer,
+      // so fall back to the plain host wheel. dir: +1 = up/back, -1 = down.
+      function smartScroll(dir) {
+        var term = stream && stream.term;
+        if (!term) { sendScroll(dir * 3); return; }
+        var alt = false, mouse = false;
+        try { alt = term.buffer.active.type === "alternate"; } catch (e) {}
+        try { mouse = term.modes && term.modes.mouseTrackingMode !== "none"; } catch (e) {}
+        if (!alt) {
+          // Negative scrolls toward history (up); xterm keeps the user's position
+          // when new output arrives while scrolled up, so this stays put.
+          try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
+        } else if (mouse) {
+          sendScroll(dir * 3);
+        } else {
+          sendKey(dir > 0 ? "pageup" : "pagedown");
+        }
+      }
+      addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });
+      addRepeat(document.getElementById("scrolldown"), function () { smartScroll(-1); });
 
       // Pause the 700ms poll while hidden (wasteful, and mobile throttles it
       // anyway); re-poll / re-list immediately when the page returns to the

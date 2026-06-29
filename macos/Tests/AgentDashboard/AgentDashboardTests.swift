@@ -2134,11 +2134,13 @@ struct AgentQueueHealthTests {
         _ name: String, present: Bool = true, phase: String = "running",
         queued: Int = 0, listOk: Bool = true, active: Int = 0, dispatched: Int = 0,
         maxItems: Int? = nil, concurrency: Int = 0,
-        next: [QueueStatus.Item] = [], running: [QueueStatus.Item] = []
+        next: [QueueStatus.Item] = [], running: [QueueStatus.Item] = [],
+        heldCount: Int = 0, held: [QueueStatus.Item] = []
     ) -> QueueStatus {
         .init(queueName: name, present: present, phase: phase, queued: queued,
               listOk: listOk, active: active, dispatched: dispatched,
-              maxItems: maxItems, concurrency: concurrency, next: next, running: running)
+              maxItems: maxItems, concurrency: concurrency, next: next, running: running,
+              heldCount: heldCount, held: held)
     }
 
     // MARK: - groupByOrigin present-queue injection
