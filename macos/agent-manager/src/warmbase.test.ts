@@ -881,12 +881,16 @@ test("run happy path: fork -> resume -> delete, with the right params", async ()
     dir: "/proj",
     title: FORK_TITLE_PREFIX + cacheKey,
   });
-  // resume query carried resume===forkId, cwd, abortController, NO systemPrompt.
+  // resume query carried resume===forkId, cwd, abortController, and — CRITICALLY — the
+  // SAME systemPrompt the base was created with. `resume` does NOT replay the base's
+  // system into the request, so omitting it ran the model hollow (unparseable replies,
+  // cacheRead=0); re-sending it restores the contract AND the cache READ. Regression
+  // guard for that live bug.
   const r = seam.resumeCalls[0];
   assert.equal(r.resume, "fork-1");
   assert.equal(r.cwd, "/proj");
   assert.ok(r.options.abortController instanceof AbortController);
-  assert.equal(r.options.systemPrompt, undefined);
+  assert.equal(r.options.systemPrompt, "SYS");
   // LOAD-BEARING SAFETY KNOBS (symmetric with the cold path, model.test.ts:187-188):
   // tools:[] disables ALL built-ins (a regression dropping it would silently ARM
   // Bash/Read/Edit inside every warm-base fork), and maxTurns:3 is the headroom over
