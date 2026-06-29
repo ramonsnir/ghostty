@@ -385,11 +385,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`config-file = ?~/.config/ghostty-ramon/local` — the `?` suppresses the
   file-not-found error, and config-file entries load *after* the file that defines
   them, so `local` cleanly supplies/overrides values). What lives in `local` today:
-  `mcp-token` (a shell-execution credential) and `web-monitor-listen` (this Mac's
-  Tailscale IP). When adding a new secret or per-machine key, put it in `local`, not in
-  the tracked config. On a new machine, create `local` by hand (generate a fresh
-  `mcp-token` with `openssl rand -hex 24`, set that Mac's own Tailscale IP); if `local`
-  is absent the fork still launches (web monitor + MCP just disabled / token-less).
+  `mcp-token` and `web-monitor-token` (both shell-execution credentials). NOTE:
+  `web-monitor-listen` is **no longer** a per-machine value — the supported setup binds
+  **loopback** `127.0.0.1:18787` (same on every Mac, fronted by `tailscale serve` for
+  HTTPS — see WEB-MONITOR.md), so it can live in the tracked config; do NOT bind a
+  Tailscale IP / `0.0.0.0` (unsupported: plain HTTP, breaks Web Push). When adding a new
+  secret, put it in `local`, not in the tracked config. On a new machine, create `local`
+  by hand (generate a fresh `mcp-token` with `openssl rand -hex 24`); if `local` is absent
+  the fork still launches (MCP token-less / web monitor disabled until you add a token).
 
 ## Distribution / sharing the fork (colleague builds, CI release, auto-update)
 

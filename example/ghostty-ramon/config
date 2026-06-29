@@ -230,11 +230,14 @@ pty-host = /Users/ramon/.ghostty-ramon-host.sock
 # --- Web monitor (fork-only) -------------------------------------------------
 # GUI-embedded HTTP server: watch/drive splits from a phone over Tailscale.
 # Full notes in WEB-MONITOR.md (repo root). Read at LAUNCH — relaunch the app
-# after changing these. `web-monitor-listen` is the BIND address (this Mac's
-# Tailscale IP), NOT an allowlist; the token is the security boundary — treat it
-# as a shell-execution credential and rotate (+ relaunch) if a device is lost.
-# `web-monitor-listen` (this Mac's Tailscale IP) lives in the untracked
-# ~/.config/ghostty-ramon/local — it differs per machine. Empty/absent = off.
+# after changing these. SUPPORTED SETUP: bind LOOPBACK (127.0.0.1:18787) and
+# front it with HTTPS via `tailscale serve` (REQUIRED to reach it from a phone —
+# the server speaks plain HTTP to loopback only). Do NOT bind a Tailscale IP /
+# 0.0.0.0 directly (unsupported: plain HTTP, breaks Web Push). The token is the
+# security boundary — a shell-execution credential; rotate (+ relaunch) if lost.
+# The loopback listen line is the same on every Mac (can live in tracked config);
+# the token, if set, goes in the untracked ~/.config/ghostty-ramon/local.
+# Then: tailscale serve --bg --https=8787 127.0.0.1:18787 . Empty/absent = off.
 # web-monitor-token =   # removed: running open on the tailnet (Tailscale ACL is the boundary)
 
 # --- MCP server (fork-only) --------------------------------------------------

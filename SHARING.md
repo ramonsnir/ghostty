@@ -110,8 +110,13 @@ Add the web-monitor lines by hand if you want that feature:
 
 ```ini
 # Web monitor (watch/drive splits from your phone over Tailscale).
-# Bind to this Mac's Tailscale IP. The token is a shell-execution credential.
-web-monitor-listen = 100.x.y.z:8787
+# Bind LOOPBACK and reach it over HTTPS via `tailscale serve` — the ONLY
+# supported setup (the server speaks plain HTTP to loopback only, which a phone
+# can't reach directly). Do NOT bind a Tailscale IP/0.0.0.0 (plain HTTP, breaks
+# Web Push). After setting these + relaunching, run:
+#   tailscale serve --bg --https=8787 127.0.0.1:18787
+# then open https://<machine>.<tailnet>.ts.net:8787/  — see WEB-MONITOR.md.
+web-monitor-listen = 127.0.0.1:18787
 web-monitor-token  = <openssl rand -hex 24>
 
 # MCP server — auto-provisioned on first launch (shown for reference). The token
