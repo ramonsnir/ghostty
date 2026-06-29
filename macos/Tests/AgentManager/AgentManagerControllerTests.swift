@@ -303,4 +303,26 @@ struct AgentManagerControllerTests {
             into: ["GHOSTTY_CLAUDE_PATH": "/stale/claude"], claudePath: "")
         #expect(out["GHOSTTY_CLAUDE_PATH"] == nil)
     }
+
+    // MARK: - wellKnownExecutablePaths (robust resolution vs the GUI's pristine PATH)
+
+    /// `claude` candidates lead with the official native installer location (the spot a
+    /// colleague machine had when the login-shell probe whiffed) and include the older
+    /// local layout + Homebrew.
+    @Test func wellKnownClaudePathsCoverCommonInstalls() {
+        let paths = AgentManagerController.wellKnownExecutablePaths(for: "claude", home: "/Users/c")
+        #expect(paths.first == "/Users/c/.local/bin/claude")
+        #expect(paths.contains("/Users/c/.claude/local/claude"))
+        #expect(paths.contains("/opt/homebrew/bin/claude"))
+        #expect(paths.contains("/usr/local/bin/claude"))
+    }
+
+    /// `node` gets the generic locations (no claude-only `.claude/local` entry); nvm's
+    /// versioned path is intentionally absent — the interactive `-il` shell covers it.
+    @Test func wellKnownNodePathsAreGeneric() {
+        let paths = AgentManagerController.wellKnownExecutablePaths(for: "node", home: "/Users/c")
+        #expect(paths.first == "/Users/c/.local/bin/node")
+        #expect(paths.contains("/opt/homebrew/bin/node"))
+        #expect(!paths.contains { $0.contains(".claude/local") })
+    }
 }

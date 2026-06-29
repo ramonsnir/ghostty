@@ -386,30 +386,64 @@ final class AgentManagerController {
         return env
     }
 
-    /// Run the user's login shell to print an executable's resolved path (so the GUI
-    /// sees the same binary the terminal would). Best-effort + bounded; returns nil on
-    /// any failure / non-executable result. Generalizes `probeNodeViaLoginShell` so
-    /// `node` and `claude` share one probe.
-    private static func probeExecutableViaLoginShell(_ name: String) -> String? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: shell)
-        // -l so the login shell sources the user's PATH; `command -v` is POSIX.
-        proc.arguments = ["-l", "-c", "command -v \(name)"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            return nil
+    /// Well-known absolute install locations to check BEFORE any shell probe, so
+    /// resolution is immune to the GUI's pristine launchd PATH (which misses installs
+    /// whose PATH entry lives in `.zshrc`, e.g. `~/.local/bin/claude`). PURE +
+    /// unit-tested. nvm's versioned `node` path isn't enumerable here — the interactive
+    /// `-il` shell fallback (which sources `.zshrc`/nvm) covers that.
+    static func wellKnownExecutablePaths(for name: String, home: String) -> [String] {
+        var paths = [
+            "\(home)/.local/bin/\(name)",
+            "/opt/homebrew/bin/\(name)",
+            "/usr/local/bin/\(name)",
+            "/run/current-system/sw/bin/\(name)",
+        ]
+        if name == "claude" {
+            paths.insert("\(home)/.claude/local/claude", at: 1)  // older local layout
         }
-        guard proc.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let path = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) else { return nil }
-        return path
+        return paths
+    }
+
+    /// Resolve an executable's absolute path the way the user's terminal would, robust
+    /// to the GUI's pristine PATH. Order: (1) well-known absolute locations (no
+    /// subprocess); (2) a LOGIN shell `command -v` (sources .zprofile/.zshenv); (3) an
+    /// INTERACTIVE login shell `command -v` (also sources .zshrc — where nvm `node` and
+    /// `~/.local/bin` `claude` PATH entries usually live). A printf MARKER isolates the
+    /// path from any banner a noisy .zshrc prints; stdin=/dev/null so a prompt EOFs
+    /// instead of hanging. Best-effort; returns nil when nothing resolves.
+    private static func probeExecutableViaLoginShell(_ name: String) -> String? {
+        let home = NSHomeDirectory()
+        let fm = FileManager.default
+        for p in wellKnownExecutablePaths(for: name, home: home) where fm.isExecutableFile(atPath: p) {
+            return p
+        }
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let marker = "__GHOSTTY_PROBE__"
+        for interactive in [false, true] {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: shell)
+            proc.arguments = [interactive ? "-ilc" : "-lc",
+                              "printf '\(marker)%s\\n' \"$(command -v \(name) 2>/dev/null)\""]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = FileHandle.nullDevice
+            proc.standardInput = FileHandle.nullDevice
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+            } catch {
+                continue
+            }
+            guard proc.terminationStatus == 0 else { continue }
+            let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            for line in out.split(separator: "\n") where line.hasPrefix(marker) {
+                let path = line.dropFirst(marker.count).trimmingCharacters(in: .whitespaces)
+                if !path.isEmpty, fm.isExecutableFile(atPath: String(path)) {
+                    return String(path)
+                }
+            }
+        }
+        return nil
     }
 
     /// Where the sidecar lives. In a packaged app it is bundled under

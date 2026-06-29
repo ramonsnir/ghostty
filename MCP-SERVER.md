@@ -65,11 +65,16 @@ mcp-token  = <48-hex secret>                # `openssl rand -hex 24`
 ## Connecting an agent
 
 **DMG colleagues: this is automatic.** On first launch `ForkSetup` (job 7) runs
-`claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp` for you (when `claude` is
-on PATH), so the `ghostty` MCP shows up in EVERY Claude Code session, any directory — nothing
+`claude mcp add ghostty --scope user -- ~/.local/bin/ghostty-mcp` for you (when a `claude` CLI
+is found), so the `ghostty` MCP shows up in EVERY Claude Code session, any directory — nothing
 to run. It records success so it won't re-add, never clobbers a pre-existing `ghostty` server,
-and retries on a later launch if you installed `claude` after Ghostty. (CLAUDE.md → the
-MCP-registration bullet has the planner/idempotency details.)
+and retries on a later launch if you installed `claude` after Ghostty. **Finding `claude` is
+robust to the GUI's pristine launchd PATH** — it checks well-known absolute locations first
+(`~/.local/bin/claude`, `~/.claude/local/claude`, Homebrew, nix) and then a login + interactive
+login shell, so an install whose PATH entry lives only in `.zshrc` (the common
+`~/.local/bin/claude`) is still found. (An early build's `-l`-only probe missed exactly that and
+silently skipped registration — see CLAUDE.md → the MCP-registration bullet for the
+planner/idempotency + resolution details.)
 
 **Repo-clone developers** get it a different way: a Claude Code session opened anywhere in this
 repo gets the `ghostty` MCP server **automatically** — the committed **`.mcp.json`** at the

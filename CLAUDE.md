@@ -304,8 +304,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   dev-only) — the release build inlines ONLY the SDK's JS via esbuild (no 215MB native binary) and
   `model.ts` points the SDK at the colleague's ALREADY-INSTALLED `claude` via
   `pathToClaudeCodeExecutable` (the `GHOSTTY_CLAUDE_PATH` env, set by `AgentManagerController` from a
-  login-shell `command -v claude` probe), billed to their own Claude subscription; needs `node` +
-  `claude` on PATH, else the summarizer self-disables per-surface while the queue still runs.
+  ROBUST `claude`/`node` probe — `probeExecutableViaLoginShell` checks well-known absolute locations
+  FIRST (`wellKnownExecutablePaths`: `~/.local/bin`, `~/.claude/local`, Homebrew, nix) then a LOGIN
+  then an INTERACTIVE login shell `command -v` (`-lc`→`-ilc`), so it finds a `claude`/`node` whose
+  PATH entry lives only in `.zshrc` — which a plain `-l` probe silently missed, the same colleague
+  bug that broke MCP auto-registration), billed to their own Claude subscription; needs `node` +
+  `claude` findable, else the summarizer self-disables per-surface while the queue still runs.
   **Haiku usage/budget tracking (config `agent-manager-usage-tracking`, default ON):** every Haiku
   call is recorded as one JSONL line to `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` tagged with
   the FEATURE (`summarizer`/`bell-classify`) + account, so you can ask "how much per feature over the
@@ -613,11 +617,21 @@ CI on every push to `main`, with in-app Sparkle updates. **User-facing guide:
   `.register`: it records success (persisted `forkSetup.mcpRegisteredWithClaude`) so it stops
   probing, but leaves a transient miss (`claude` or the shim not present yet, or `claude mcp add`
   non-zero) UNrecorded so a later launch retries; it NEVER clobbers a pre-existing `ghostty`
-  server (a hand-managed entry is left strictly alone). Impure `registerMCPWithClaudeIfNeeded`
-  shells out via a login shell (`loginShellStatus`/`claudeOnPath`/`ghosttyMCPRegistered` —
-  `-l` so it sees the user's PATH). If `claude` is never installed, this is a silent no-op (the
-  colleague can still register by hand; ONBOARDING.md documents the command). Wiring/Tests as in
-  the ForkSetup bullet above (`planMCPRegister`, `mcpRegister*`).
+  server (a hand-managed entry is left strictly alone). **`claude` resolution is ROBUST to the
+  GUI's pristine launchd PATH** — `resolveClaude` checks well-known absolute locations FIRST
+  (`~/.local/bin/claude` = the official native installer, `~/.claude/local/claude`, Homebrew,
+  nix — pure `claudeCandidatePaths`/`firstExecutablePath`), then falls back to a LOGIN shell and
+  an INTERACTIVE login shell `command -v` (`-lc` then `-ilc`, the latter sourcing `.zshrc` where
+  most installs put the PATH). **This was a real colleague bug**: a plain `-l` `command -v claude`
+  silently MISSES an install whose PATH entry lives in `.zshrc` (the common `~/.local/bin/claude`
+  case), so job 7 took `.skipNoClaude` and nothing registered — fixed by the absolute-candidate
+  check. `registerMCPWithClaudeIfNeeded` then runs `claude mcp add` via an INTERACTIVE login shell
+  using the RESOLVED ABSOLUTE path (so claude is found deterministically AND gets node/env to run),
+  with a bounded timeout + stdin=/dev/null so a hung/interactive `.zshrc` can't wedge the deferred
+  thread (`runLoginShell`/`loginShellStatus`/`shellQuote`). If `claude` is never installed, this is
+  a silent no-op (the colleague can still register by hand; ONBOARDING.md documents the command).
+  Wiring/Tests as in the ForkSetup bullet above (`planMCPRegister`, `claudeCandidatePaths`,
+  `firstExecutablePath`; `mcpRegister*`, `claudeCandidates*`/`firstExecutable*`).
 
 ## PTY-host runs under a launchd LaunchAgent (deploy + new-machine setup)
 

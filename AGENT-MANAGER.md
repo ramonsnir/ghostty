@@ -491,10 +491,21 @@ build if one ever sneaks in). The trick that makes shipping NO native binary OK:
 `query()` does not make HTTP itself — it SPAWNS the `claude` CLI — and `model.ts` points it at
 the **colleague's ALREADY-INSTALLED `claude`** via the SDK's `pathToClaudeCodeExecutable`
 option (`resolveClaudePath(env)` reads `GHOSTTY_CLAUDE_PATH`, falling back to a bare `claude`
-on the SDK's own PATH lookup when unset). `AgentManagerController` resolves `claude` via a
-login-shell `command -v claude` probe (the generalized `probeExecutableViaLoginShell`, shared
-with the `node` probe) and sets `GHOSTTY_CLAUDE_PATH` in the sidecar env (pure, tested
-`applyClaudePathEnv`).
+on the SDK's own PATH lookup when unset). `AgentManagerController` resolves `claude` via the
+generalized `probeExecutableViaLoginShell` (shared with the `node` probe) and sets
+`GHOSTTY_CLAUDE_PATH` in the sidecar env (pure, tested `applyClaudePathEnv`).
+
+> **The probe is ROBUST to the GUI's pristine launchd PATH.** A GUI app does NOT inherit your
+> terminal PATH, and a plain login shell (`zsh -l`) sources `.zprofile`/`.zshenv` but **NOT**
+> `.zshrc` — so an install whose PATH entry lives in `.zshrc` (the common `~/.local/bin/claude`
+> from the official native installer, or nvm's `node`) was **silently missed**, disabling the
+> summarizer + rate-limit watchdog on a colleague's Mac even though `claude` worked fine in
+> their terminal. (Same root cause as the MCP auto-registration miss — see CLAUDE.md.) Fixed:
+> `probeExecutableViaLoginShell` now checks **well-known absolute locations FIRST** (pure
+> `wellKnownExecutablePaths`: `~/.local/bin`, `~/.claude/local` for claude, Homebrew, nix — no
+> subprocess, immune to PATH), then falls back to a LOGIN shell and an INTERACTIVE login shell
+> `command -v` (`-lc` → `-ilc`; `-i` sources `.zshrc`). A printf marker isolates the path from
+> `.zshrc` banner noise; stdin=/dev/null so a prompt EOFs instead of hanging.
 
 **RUNTIME PREREQS on the colleague's Mac: `node` on PATH (for any sidecar feature) AND
 `claude` on PATH (for the summarizer + the rate-limit watchdog).** The §8 launch gate is
@@ -512,10 +523,12 @@ scripts add sanity greps (the SDK JS is inlined — a "Claude Code executable" m
 and NO bare `@anthropic-ai` import survived bundling). Wiring: `model.ts` (`resolveClaudePath`
 + `pathToClaudeCodeExecutable`), `esbuild.config.mjs` (NEW), `package.json` (`build` =
 tsc+esbuild, esbuild devDep), `AgentManagerController.swift` (`applyClaudePathEnv` +
-`resolveClaudePath`/`probeExecutableViaLoginShell` + `GHOSTTY_CLAUDE_PATH` in
-`childEnvironment`), `dist/macos/release-local.sh` (step 3b), `.github/workflows/fork-release.yml`
+`resolveClaudePath`/`probeExecutableViaLoginShell`/`wellKnownExecutablePaths` +
+`GHOSTTY_CLAUDE_PATH` in `childEnvironment`), `dist/macos/release-local.sh` (step 3b),
+`.github/workflows/fork-release.yml`
 ("Build + bundle agent-manager sidecar (dist only; SDK JS inlined)"). Tests:
-`AgentManagerControllerTests` (`applyClaudePathEnv`), `model.test.ts` (`resolveClaudePath`).
+`AgentManagerControllerTests` (`applyClaudePathEnv`, `wellKnownClaudePaths*`/`wellKnownNodePaths*`),
+`model.test.ts` (`resolveClaudePath`).
 
 ### Account routing (optional) — dev internals
 

@@ -771,29 +771,35 @@ enum ForkSetup {
         }
         let shimPath = "\(home)/.local/bin/ghostty-mcp"
         let shimExists = fileManager.isExecutableFile(atPath: shimPath)
-        let claudeFound = claudeOnPath()
-        let alreadyRegistered = (claudeFound && shimExists) ? ghosttyMCPRegistered() : false
+        // Resolve `claude` robustly — the GUI launches with a pristine launchd PATH,
+        // so a plain login-shell `command -v claude` MISSES installs whose PATH entry
+        // lives in `.zshrc` (e.g. the common `~/.local/bin/claude`). See resolveClaude.
+        let claudePath = resolveClaude(home: home, fileManager: fileManager)
+        let alreadyRegistered = (claudePath != nil && shimExists)
+            ? ghosttyMCPRegistered(claudePath: claudePath!) : false
 
         switch planMCPRegister(
             alreadyRecorded: false,
-            claudeFound: claudeFound,
+            claudeFound: claudePath != nil,
             shimExists: shimExists,
             alreadyRegistered: alreadyRegistered
         ) {
         case .skipAlreadyRecorded:
             break  // unreachable (early-returned above); kept for an exhaustive switch.
         case .skipNoClaude:
-            logger.debug("claude CLI not found on PATH; deferring MCP registration to a later launch")
+            logger.debug("claude CLI not found (PATH or known install locations); deferring MCP registration")
         case .skipNoShim:
             logger.debug("ghostty-mcp shim not yet on PATH; deferring MCP registration to a later launch")
         case .skipAlreadyRegistered:
             defaults.set(true, forKey: kMCPRegistered)
             logger.info("Claude Code already has a 'ghostty' MCP server; leaving it untouched")
         case .register:
-            // Shell-quote the (home-derived) shim path defensively, even though a
-            // macOS home dir doesn't contain quotes.
-            let quoted = "'" + shimPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            let status = loginShellStatus("claude mcp add ghostty --scope user -- \(quoted)")
+            guard let claude = claudePath else { return }  // claudeFound implies non-nil
+            // Run via an INTERACTIVE login shell using the RESOLVED absolute path: the
+            // absolute path means we don't depend on PATH to FIND claude, and `-i`
+            // (sources .zshrc) gives claude the full env (e.g. node) it needs to RUN.
+            let cmd = "\(shellQuote(claude)) mcp add ghostty --scope user -- \(shellQuote(shimPath))"
+            let status = loginShellStatus(cmd, interactive: true)
             if status == 0 {
                 defaults.set(true, forKey: kMCPRegistered)
                 logger.info("registered Ghostty MCP server with Claude Code (user scope)")
@@ -805,34 +811,107 @@ enum ForkSetup {
         }
     }
 
-    /// True iff `claude` resolves on the user's login-shell PATH.
-    private static func claudeOnPath() -> Bool {
-        loginShellStatus("command -v claude >/dev/null 2>&1") == 0
+    /// The well-known absolute install locations for the `claude` CLI, in priority
+    /// order. Checked BEFORE any shell probe so resolution is immune to the GUI's
+    /// pristine PATH — `~/.local/bin/claude` (the official native installer) is by far
+    /// the most common and is exactly what a colleague's machine had when the
+    /// login-shell probe failed. Pure (unit-tested).
+    static func claudeCandidatePaths(home: String) -> [String] {
+        [
+            "\(home)/.local/bin/claude",          // official native installer (most common)
+            "\(home)/.claude/local/claude",       // older "local" install layout
+            "/opt/homebrew/bin/claude",           // Homebrew (Apple Silicon)
+            "/usr/local/bin/claude",              // Homebrew (Intel) / manual
+            "/run/current-system/sw/bin/claude",  // nix
+        ]
     }
 
-    /// True iff Claude Code already has a server named `ghostty` registered.
-    private static func ghosttyMCPRegistered() -> Bool {
-        loginShellStatus("claude mcp get ghostty >/dev/null 2>&1") == 0
+    /// Pure: first path in `paths` for which `isExecutable` is true, or nil. Injectable
+    /// predicate so the selection order is unit-testable without touching the disk.
+    static func firstExecutablePath(_ paths: [String], isExecutable: (String) -> Bool) -> String? {
+        paths.first(where: isExecutable)
     }
 
-    /// Run a command string in the user's login shell, returning its exit status
-    /// (nil if the shell couldn't be launched). `-l` sources the user's PATH (a GUI
-    /// app doesn't inherit the terminal PATH); stdout/stderr are discarded — callers
-    /// only care about the status code.
-    private static func loginShellStatus(_ command: String) -> Int32? {
+    /// Resolve an absolute path to the `claude` CLI, robust to the GUI's pristine
+    /// launchd PATH. Order: (1) well-known absolute locations (no subprocess); (2) a
+    /// LOGIN shell `command -v` (sources .zprofile/.zshenv); (3) an INTERACTIVE login
+    /// shell `command -v` (also sources .zshrc — where many installs put the PATH).
+    /// Returns nil if `claude` genuinely can't be found. A printf MARKER isolates the
+    /// path from any banner text a noisy .zshrc prints on stdout.
+    private static func resolveClaude(home: String, fileManager: FileManager) -> String? {
+        if let p = firstExecutablePath(
+            claudeCandidatePaths(home: home),
+            isExecutable: fileManager.isExecutableFile(atPath:)
+        ) {
+            return p
+        }
+        let marker = "__GHOSTTY_CLAUDE__"
+        for interactive in [false, true] {
+            let (status, output) = runLoginShell(
+                "printf '\(marker)%s\\n' \"$(command -v claude 2>/dev/null)\"",
+                interactive: interactive)
+            guard status == 0 else { continue }
+            for line in output.split(separator: "\n") where line.hasPrefix(marker) {
+                let path = line.dropFirst(marker.count).trimmingCharacters(in: .whitespaces)
+                if !path.isEmpty, fileManager.isExecutableFile(atPath: String(path)) {
+                    return String(path)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// True iff Claude Code already has a server named `ghostty` registered (so we
+    /// never clobber a hand-managed entry). Uses the resolved absolute claude path.
+    private static func ghosttyMCPRegistered(claudePath: String) -> Bool {
+        loginShellStatus("\(shellQuote(claudePath)) mcp get ghostty >/dev/null 2>&1",
+                         interactive: true) == 0
+    }
+
+    /// POSIX single-quote a path so it survives `sh -c` intact (defensive — macOS home
+    /// dirs don't contain quotes, but never string-splice an unquoted path into a shell).
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Run a command in the user's login shell, returning its exit status (nil if the
+    /// shell couldn't launch or it timed out). `-l` sources the user's PATH (a GUI app
+    /// doesn't inherit the terminal PATH); `interactive` adds `-i` so `.zshrc` is also
+    /// sourced (where many tools put PATH). A bounded timeout means a hung/interactive
+    /// `.zshrc` can't wedge the deferred-setup thread; stdin is /dev/null so a prompt
+    /// gets EOF instead of blocking. Output is discarded.
+    private static func loginShellStatus(_ command: String, interactive: Bool) -> Int32? {
+        runLoginShell(command, interactive: interactive).status
+    }
+
+    /// Run a command in the user's login shell and capture stdout (small outputs only).
+    /// Returns (status, stdout); status is nil on launch failure or timeout. Combined
+    /// short flags: `-lc` / `-ilc`. stderr discarded, stdin = /dev/null, 20s timeout.
+    private static func runLoginShell(
+        _ command: String, interactive: Bool, timeout: TimeInterval = 20
+    ) -> (status: Int32?, output: String) {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: shell)
-        proc.arguments = ["-l", "-c", command]
-        proc.standardOutput = FileHandle.nullDevice
+        proc.arguments = [interactive ? "-ilc" : "-lc", command]
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
         proc.standardError = FileHandle.nullDevice
+        proc.standardInput = FileHandle.nullDevice
+        let sem = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in sem.signal() }
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
-            return nil
+            return (nil, "")
         }
-        return proc.terminationStatus
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            proc.terminate()
+            _ = sem.wait(timeout: .now() + 2)
+            return (nil, "")
+        }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        return (proc.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     private static func seedConfigIfNeeded(home: String, fileManager: FileManager) {
