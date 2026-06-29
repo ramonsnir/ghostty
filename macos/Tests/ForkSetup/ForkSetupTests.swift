@@ -416,6 +416,35 @@ struct ForkSetupTests {
             alreadyRegistered: false) == .register)
     }
 
+    // MARK: - resolveClaude(): robust claude-CLI resolution
+
+    @Test func claudeCandidatesIncludeCommonLocations() {
+        let paths = ForkSetup.claudeCandidatePaths(home: "/Users/colleague")
+        // The official native installer's location must be FIRST — that's the spot a
+        // real colleague machine had when the login-shell probe whiffed (PATH only in
+        // .zshrc). Homebrew + nix locations must also be covered.
+        #expect(paths.first == "/Users/colleague/.local/bin/claude")
+        #expect(paths.contains("/opt/homebrew/bin/claude"))
+        #expect(paths.contains("/usr/local/bin/claude"))
+        #expect(paths.contains("/Users/colleague/.claude/local/claude"))
+    }
+
+    @Test func firstExecutablePicksFirstMatchInOrder() {
+        let paths = ForkSetup.claudeCandidatePaths(home: "/Users/c")
+        // Only the Homebrew path "exists" -> it's chosen even though it's not first.
+        let onlyBrew = ForkSetup.firstExecutablePath(paths) { $0 == "/opt/homebrew/bin/claude" }
+        #expect(onlyBrew == "/opt/homebrew/bin/claude")
+        // The native-installer path takes priority when BOTH it and brew "exist".
+        let both = ForkSetup.firstExecutablePath(paths) {
+            $0 == "/Users/c/.local/bin/claude" || $0 == "/opt/homebrew/bin/claude"
+        }
+        #expect(both == "/Users/c/.local/bin/claude")
+    }
+
+    @Test func firstExecutableNilWhenNoneExist() {
+        #expect(ForkSetup.firstExecutablePath(["/a", "/b"]) { _ in false } == nil)
+    }
+
     // MARK: - seed template: new onboarding content
 
     @Test func configSeedHasQuickStartAndCheatSheetPointer() throws {
