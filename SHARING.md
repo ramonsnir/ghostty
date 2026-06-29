@@ -122,17 +122,22 @@ mcp-token  = <random, generated for this machine>
 
 ### Connecting an agent to the MCP server
 
-The app installs the `ghostty-mcp` stdio shim to `~/.local/bin/ghostty-mcp` on first
-launch (and refreshes it on each update). Since `mcp-listen` + `mcp-token` are
-auto-provisioned in `local` (above), just point your local Claude Code at it:
+**This is automatic.** On first launch the app installs the `ghostty-mcp` stdio shim to
+`~/.local/bin/ghostty-mcp` (refreshed on each update) AND — if `claude` is on your PATH —
+registers it with Claude Code for you (`claude mcp add ghostty --scope user`), so a fresh
+`claude` session in any directory just shows the `ghostty` MCP. `mcp-listen` + `mcp-token`
+are auto-provisioned in `local` (above), and the registration carries no secret (the shim
+reads the token from `local`).
+
+If you installed `claude` *after* Ghostty, relaunch Ghostty once and it registers on the
+next launch — or do it by hand:
 
 ```sh
-claude mcp add ghostty -- "$HOME/.local/bin/ghostty-mcp"
+claude mcp add ghostty --scope user -- "$HOME/.local/bin/ghostty-mcp"
 ```
 
-No token in that command — the shim reads `mcp-token` from `~/.config/ghostty-ramon/local`.
 Restart Claude Code afterward. (If `~/.local/bin` is on your `PATH`, `claude mcp add
-ghostty -- ghostty-mcp` works too.) See **MCP-SERVER.md** for the tool list.
+ghostty --scope user -- ghostty-mcp` works too.) See **MCP-SERVER.md** for the tool list.
 
 ### Optional: Agent Dashboard / Queue (needs `node`)
 

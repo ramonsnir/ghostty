@@ -378,6 +378,44 @@ struct ForkSetupTests {
         #expect(ForkSetup.shouldShowWelcome(alreadyShown: true) == false)
     }
 
+    // MARK: - planMCPRegister(): Claude Code MCP registration
+
+    @Test func mcpRegisterSkipsWhenAlreadyRecorded() {
+        // A recorded success short-circuits before any probing — and wins even if
+        // the other inputs would otherwise say "register".
+        #expect(ForkSetup.planMCPRegister(
+            alreadyRecorded: true, claudeFound: true, shimExists: true,
+            alreadyRegistered: false) == .skipAlreadyRecorded)
+    }
+
+    @Test func mcpRegisterSkipsWhenNoClaude() {
+        // No `claude` on PATH yet -> defer WITHOUT recording (retry next launch).
+        #expect(ForkSetup.planMCPRegister(
+            alreadyRecorded: false, claudeFound: false, shimExists: true,
+            alreadyRegistered: false) == .skipNoClaude)
+    }
+
+    @Test func mcpRegisterSkipsWhenNoShim() {
+        // claude present but the shim isn't installed yet -> defer (retry next launch).
+        #expect(ForkSetup.planMCPRegister(
+            alreadyRecorded: false, claudeFound: true, shimExists: false,
+            alreadyRegistered: false) == .skipNoShim)
+    }
+
+    @Test func mcpRegisterSkipsWhenAlreadyRegistered() {
+        // A pre-existing `ghostty` server is left strictly alone (never clobbered).
+        #expect(ForkSetup.planMCPRegister(
+            alreadyRecorded: false, claudeFound: true, shimExists: true,
+            alreadyRegistered: true) == .skipAlreadyRegistered)
+    }
+
+    @Test func mcpRegisterRunsOnCleanMachine() {
+        // claude + shim present, nothing registered yet -> register (user scope).
+        #expect(ForkSetup.planMCPRegister(
+            alreadyRecorded: false, claudeFound: true, shimExists: true,
+            alreadyRegistered: false) == .register)
+    }
+
     // MARK: - seed template: new onboarding content
 
     @Test func configSeedHasQuickStartAndCheatSheetPointer() throws {
