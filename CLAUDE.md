@@ -311,11 +311,19 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (fork-only config `agent-manager-warm-base`, default OFF — forwarded to the sidecar as
   `GHOSTTY_WARMBASE=1`/`0` by `AgentManagerController`, same transport as the other `GHOSTTY_*`
   flags, NOT a hand-set env var; `src/warmbase.ts`): keep ONE system-only base session per
-  `(configDir,model,systemHash)` and `forkSession`→`resume`→`deleteSession` per call so the fork
-  READS the cached ~25–32k system prefix instead of re-CREATING it (~79% of the bill) — measured
-  **$0.0561→$0.0035/call (~94%)**, isolation clean BY CONSTRUCTION (each fork branches from the
-  system-only base, so it's safe for the summarizer AND the fail-open bell-classify); the cold
-  one-shot is the FLOOR (every warm failure → `WarmBaseUnavailable` → cold fallback, gate OFF =
+  `(configDir,model,systemHash)` and `forkSession`→`resume`(**with `systemPrompt` re-sent**)→
+  `deleteSession` per call, so the fork avoids the ~25–32k system-prefix re-CREATION the cold
+  path pays each call (~79% of the bill) — measured LIVE **~$0.056→~$0.011/call median (~81%)**
+  on a healthy account (NOT the ~94%/$0.0035 an isolated probe showed: live `cacheRead=0` — the
+  win is the fork not carrying the CLI's 25k system, not cache reuse — and thinking is ON so
+  output now dominates → disabling thinking is the biggest remaining lever). Isolation is clean
+  BY CONSTRUCTION (each fork branches from the system-only base, safe for the summarizer AND the
+  fail-open bell-classify). **Two shipped bugs the live check caught + fixed:** (1) the resume
+  query had DROPPED `systemPrompt` (resume does NOT replay the base's system → hollow/unparseable
+  → frozen tiles); RE-SENDING it is load-bearing (regression-guarded). (2) an unparseable WARM
+  reply wasn't a `WarmBaseUnavailable` so the cold floor didn't fire — added
+  `SummarizeRequest.isUsable` (=`parseSummary`) so an unusable warm reply falls through to cold.
+  The cold one-shot is the FLOOR (every warm failure OR unusable reply → cold fallback, gate OFF =
   control-flow identical); account/store bound by setting `CLAUDE_CONFIG_DIR` ONCE at construction
   (single sidecar-wide account, race-free) with a `run()` config-mismatch guard; costing is
   token-bucket (NEVER the cumulative `total_cost_usd`); fork GC = `deleteSession` in `finally` +
