@@ -208,6 +208,9 @@ export type SummarizeFn = (
     user: string;
     configDir?: string;
     onUsage?: (usage: HaikuUsage) => void;
+    /** (floor hardening) Validity predicate over a WARM reply; false ⇒ fall back to the
+     *  cold one-shot (see model.ts). Only consulted on the warm path. */
+    isUsable?: (raw: string) => boolean;
   },
 ) => Promise<string>;
 
@@ -475,6 +478,10 @@ async function summarizeOne(
       configDir: deps.summarizerConfigDir,
       onUsage: (u) =>
         recordUsage({ ...u, feature: usageFeature, account: usageAccount, durationMs: durMs() }),
+      // (floor hardening) An unparseable WARM reply falls back to the cold one-shot
+      // (see model.ts). Mirrors the parse check below, so a hollow/garbage warm reply
+      // can't silently skip the surface without the cold floor firing.
+      isUsable: (r) => parseSummary(r) !== null,
     });
     const parsed = parseSummary(raw);
     if (!parsed) {

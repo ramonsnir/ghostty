@@ -345,6 +345,40 @@ test("summarize warm: success => returns warm text; cold queryFn never called; o
   assert.deepEqual(seen, warmUsage);
 });
 
+test("summarize warm: an UNUSABLE warm reply (isUsable=false) => COLD fallback (floor)", async () => {
+  // The resume-systemPrompt bug symptom: warm SUCCEEDS but returns garbage. Without the
+  // floor-hardening this silently skipped the surface; now it falls through to cold.
+  const counter = { calls: 0 };
+  const cold = countingQuery(
+    [{ type: "result", subtype: "success", result: '{"summary":"ok"}' }],
+    counter,
+  );
+  const warm = stubWarm(async () => "not json — hollow fork output");
+  const text = await summarize(
+    { system: "S", user: "U", isUsable: (r) => r.startsWith("{") },
+    cold,
+    warm,
+  );
+  assert.equal(text, '{"summary":"ok"}'); // cold result returned
+  assert.equal(counter.calls, 1); // exactly one cold call (the fallback)
+});
+
+test("summarize warm: a USABLE warm reply (isUsable=true) => returned, no cold call", async () => {
+  const counter = { calls: 0 };
+  const cold = countingQuery(
+    [{ type: "result", subtype: "success", result: "cold-text" }],
+    counter,
+  );
+  const warm = stubWarm(async () => '{"summary":"good"}');
+  const text = await summarize(
+    { system: "S", user: "U", isUsable: (r) => r.startsWith("{") },
+    cold,
+    warm,
+  );
+  assert.equal(text, '{"summary":"good"}');
+  assert.equal(counter.calls, 0); // warm reply accepted; no cold fallback
+});
+
 test("summarize warm: req fields (model/configDir) are threaded into run()", async () => {
   let captured: WarmRunRequest | undefined;
   const warm = stubWarm(async (req) => {

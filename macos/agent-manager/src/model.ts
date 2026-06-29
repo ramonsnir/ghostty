@@ -82,6 +82,14 @@ export interface SummarizeRequest {
    *  the feature/account and records it (see usage.ts). Not called on an error
    *  result (no usage to report). */
   onUsage?: (usage: HaikuUsage) => void;
+  /** (floor hardening) Optional validity predicate over the WARM reply text. The cold
+   *  path's contract is "any text; the caller parses it" — but a WARM call can SUCCEED
+   *  (no throw) yet return an UNUSABLE reply (e.g. unparseable), which would otherwise
+   *  silently skip the surface WITHOUT the cold fallback firing. When provided and it
+   *  returns false for the warm reply, `summarize()` treats the warm call as failed and
+   *  falls THROUGH to the cold one-shot (the floor). Only consulted on the warm path;
+   *  the cold reply is returned verbatim (the caller validates it as before). */
+  isUsable?: (raw: string) => boolean;
 }
 
 /** The query() function signature we depend on — injectable for tests. */
@@ -106,13 +114,25 @@ export async function summarize(
   // it, so the loop logs+skips and we do NOT make a second (cold) call (no double-cost).
   if (warm) {
     try {
-      return await warm.run({
+      const raw = await warm.run({
         system: req.system,
         user: req.user,
         model: req.model ?? SUMMARIZER_MODEL,
         configDir: req.configDir,
         onUsage: req.onUsage,
       });
+      // FLOOR HARDENING: a warm call can SUCCEED yet return an UNUSABLE reply (e.g.
+      // unparseable — the symptom of the resume-systemPrompt bug). That is NOT a
+      // WarmBaseUnavailable, so without this it would silently skip the surface and
+      // never fall back. Treat an unusable warm reply as a warm failure → cold one-shot.
+      // (Costs a wasted warm call + a cold call for THIS surface — acceptable as the
+      // floor; if it happens EVERY call you'll see a steady stream of these logs, which
+      // is the intended signal that warm-base is misbehaving rather than silent breakage.)
+      if (!req.isUsable || req.isUsable(raw)) return raw;
+      console.error(
+        "agent-manager: warm-base reply UNUSABLE (unparseable); falling back to cold",
+      );
+      // fall through to the cold path below
     } catch (e) {
       if (!(e instanceof WarmBaseUnavailable)) throw e; // genuine error -> no cold retry
       // COLD FALLBACK (the floor): warm mechanism unavailable for this call.

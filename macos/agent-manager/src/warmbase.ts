@@ -621,7 +621,15 @@ export class WarmBase {
           tools: [],
           maxTurns: 3,
           model: req.model,
-          // NO systemPrompt — inherited from the base session via resume.
+          // RE-SEND the system prompt on the resumed turn. `resume` does NOT replay the
+          // base session's systemPrompt into the API request (verified live: omitting it
+          // sent only the user message — in≈1.2k, cacheRead=0 — so the model ran WITHOUT
+          // its contract and every reply was unparseable). Passing the SAME system the
+          // base was created with both (a) gives the model its role/contract and (b)
+          // matches the base's cached prefix so it's a cache READ ($0.10/MTok), not a
+          // re-CREATE — which is the entire cost win. (An isolated probe masked this bug
+          // because it spread systemPrompt into the resume; the module had dropped it.)
+          systemPrompt: req.system,
           resume: forkId,
           cwd: this.d.projectDir,
           abortController: ac,
