@@ -2424,6 +2424,80 @@ struct QueueBacklogTests {
         #expect(QueueBacklogLayout.columns([]).isEmpty)
     }
 
+    // MARK: orderedColumns — crossing reduction (Sugiyama median sweep)
+
+    @Test func crossingCountCountsInversions() {
+        // Two roots A,B; C blocked by B, D blocked by A. With input order A,B / C,D the
+        // edges A→D and B→C cross once.
+        let crossed = [[node("A"), node("B")],
+                       [node("C", blockedBy: ["B"]), node("D", blockedBy: ["A"])]]
+        #expect(QueueBacklogLayout.crossingCount(crossed) == 1)
+        // Order the right column D,C so A→D and B→C run parallel — no crossing.
+        let clean = [[node("A"), node("B")],
+                     [node("D", blockedBy: ["A"]), node("C", blockedBy: ["B"])]]
+        #expect(QueueBacklogLayout.crossingCount(clean) == 0)
+    }
+
+    @Test func orderedColumnsRemovesCrossing() {
+        // The classic crossing: roots A,B; C←B, D←A in input order [A,B] / [C,D].
+        let nodes = [node("A"), node("B"),
+                     node("C", blockedBy: ["B"]), node("D", blockedBy: ["A"])]
+        // Sanity: the raw (input-order) layout DOES cross.
+        #expect(QueueBacklogLayout.crossingCount(QueueBacklogLayout.columns(nodes)) == 1)
+        // The reordered layout removes it.
+        let ordered = QueueBacklogLayout.orderedColumns(nodes)
+        #expect(QueueBacklogLayout.crossingCount(ordered) == 0)
+        // Same layering preserved (still 2 columns of 2).
+        #expect(ordered.map(\.count) == [2, 2])
+    }
+
+    @Test func orderedColumnsNeverWorseThanInput() {
+        // A denser tangle: 3 roots, 3 leaves cross-wired so input order is messy.
+        let nodes = [
+            node("R1"), node("R2"), node("R3"),
+            node("L1", blockedBy: ["R3"]),
+            node("L2", blockedBy: ["R1"]),
+            node("L3", blockedBy: ["R2"]),
+        ]
+        let raw = QueueBacklogLayout.crossingCount(QueueBacklogLayout.columns(nodes))
+        let ordered = QueueBacklogLayout.crossingCount(QueueBacklogLayout.orderedColumns(nodes))
+        #expect(ordered <= raw)
+        #expect(ordered == 0)   // a permutation matching wires straight is reachable
+    }
+
+    @Test func orderedColumnsPreservesLayersAndMembership() {
+        // Reordering must not move a node between columns or drop/duplicate any node.
+        let nodes = [
+            node("A"), node("B", blockedBy: ["A"]), node("C", blockedBy: ["B"]),
+            node("D", blockedBy: ["A"]), node("E"),
+        ]
+        let cols = QueueBacklogLayout.orderedColumns(nodes)
+        let layers = QueueBacklogLayout.assignLayers(nodes)
+        for (ci, col) in cols.enumerated() {
+            for n in col { #expect(layers[n.key] == ci) }
+        }
+        let flat = Set(cols.flatMap { $0.map(\.key) })
+        #expect(flat == Set(nodes.map(\.key)))
+        #expect(cols.flatMap { $0 }.count == nodes.count)
+    }
+
+    @Test func orderedColumnsIsDeterministic() {
+        let nodes = [
+            node("A"), node("B"),
+            node("C", blockedBy: ["B"]), node("D", blockedBy: ["A"]),
+        ]
+        let first = QueueBacklogLayout.orderedColumns(nodes).map { $0.map(\.key) }
+        let second = QueueBacklogLayout.orderedColumns(nodes).map { $0.map(\.key) }
+        #expect(first == second)
+    }
+
+    @Test func orderedColumnsHandlesSingleColumnAndEmpty() {
+        #expect(QueueBacklogLayout.orderedColumns([]).isEmpty)
+        let roots = QueueBacklogLayout.orderedColumns([node("A"), node("B")])
+        #expect(roots.count == 1)
+        #expect(Set(roots[0].map(\.key)) == ["A", "B"])
+    }
+
     // MARK: applyQueueGraph store/clear
 
     @Test func applyQueueGraphStoresAndClears() {

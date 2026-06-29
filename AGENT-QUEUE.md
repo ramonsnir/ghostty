@@ -850,7 +850,19 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   tracker; `QueueBacklogColors` is a cosmetic category→color map with a neutral fallback. The
   DAG layout (`QueueBacklogLayout.assignLayers`) is longest-path-from-roots, cycle-safe (a
   blocked-by cycle is broken via a `resolving` guard) and ignores edges to keys outside the
-  scope. The canvas window is one-per-run via `QueueBacklogWindowManager` (MainActor; strong
+  scope. **CROSSING REDUCTION (so a busy 28-item board stays readable):** the within-column
+  ORDER is no longer raw input order — `QueueBacklogLayout.orderedColumns` runs the Sugiyama
+  crossing-reduction step (alternating down/up MEDIAN sweeps over the `blockedBy` edges,
+  pulling each node toward the median row of its left/right neighbors) and KEEPS the ordering
+  with the FEWEST crossings across sweeps, so the result is never worse than the seed; it is
+  pure + deterministic (stable tie-break by current row) and the metric is
+  `QueueBacklogLayout.crossingCount` (adjacent-column bipartite inversions, summed over every
+  column pair so skip-layer edges count). The view also **vertically centers a short column**
+  within the tallest one (`centersByKey`), so a small column's nodes sit beside their
+  neighbors (less arrow slant) instead of pinned to the top; the board height is unchanged
+  (still the tallest column), so the fit-to-content window sizing is unaffected. `columns`
+  (raw, by-layer, input-order) is kept for the geometry sizing (ordering doesn't change a
+  column's row COUNT) and remains separately tested. The canvas window is one-per-run via `QueueBacklogWindowManager` (MainActor; strong
   ref + `willClose` observer that drops both the window and itself — no leak/double-open). Its
   DEFAULT size is fit-to-content (the whole board, no scrolling) floored at a minimum and
   CLAMPED to the display: shared geometry `QueueBacklogGeometry` (the card/gap constants the
@@ -875,7 +887,8 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   (`reportQueueGraph`), `runner.test.ts` (graph fetch throttled + push + present:false-on-abort +
   no-graph-no-fetch); Swift `MCPServerTests` (`queueGraphPayload*`, tool count 19),
   `AgentDashboardTests` (`QueueBacklogTests`: assignLayers chain/diamond/cycle/dangling +
-  columns + applyQueueGraph). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+  columns + applyQueueGraph + `crossingCount`/`orderedColumns` reduces-crossings/
+  never-worse/preserves-layers/deterministic). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
 #### HIGH/URGENT PRIORITY MARK on backlog nodes
 

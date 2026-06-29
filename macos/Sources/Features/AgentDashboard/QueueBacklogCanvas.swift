@@ -63,6 +63,105 @@ enum QueueBacklogLayout {
         for node in nodes { cols[layers[node.key] ?? 0].append(node) }
         return cols
     }
+
+    /// Order nodes WITHIN each layer to minimize edge crossings — the Sugiyama
+    /// crossing-reduction step — so a busy board (dozens of items) has far fewer
+    /// overlapping arrows than the raw `columns(_:)` input order. Seeds from `columns(_:)`,
+    /// then runs alternating DOWN/UP median sweeps: a node is pulled toward the median row
+    /// of its neighbors in the adjacent direction (blockers on the left for a down sweep,
+    /// the items it blocks on the right for an up sweep); a node with no neighbors in that
+    /// direction keeps its place (stable). The ordering with the FEWEST crossings across all
+    /// sweeps is returned, so the result is **never worse** than the seed. PURE and fully
+    /// DETERMINISTIC (no randomness — stable tie-break by current row). Unit-tested.
+    static func orderedColumns(_ nodes: [QueueGraph.Node]) -> [[QueueGraph.Node]] {
+        var cols = columns(nodes)
+        guard cols.count > 1 else { return cols }
+
+        // Upstream (blockers, to the left) and downstream (blocked, to the right) adjacency,
+        // filtered to in-scope keys, so a sweep can look at a node's neighbors either way.
+        let present = Set(nodes.map(\.key))
+        var blockers: [String: [String]] = [:]   // key → its blockers (upstream / left)
+        var blocked: [String: [String]] = [:]     // key → nodes it blocks (downstream / right)
+        for node in nodes {
+            let ups = node.blockedBy.filter { present.contains($0) && $0 != node.key }
+            blockers[node.key] = ups
+            for u in ups { blocked[u, default: []].append(node.key) }
+        }
+
+        func rowIndex(_ cols: [[QueueGraph.Node]]) -> [String: Int] {
+            var idx: [String: Int] = [:]
+            for col in cols { for (r, n) in col.enumerated() { idx[n.key] = r } }
+            return idx
+        }
+
+        // Reorder one column by the MEDIAN row of each node's neighbors (in `neighborsOf`),
+        // keeping no-neighbor nodes in place; stable tie-break preserves the current order.
+        func sweep(_ cols: inout [[QueueGraph.Node]], column c: Int, neighborsOf: [String: [String]]) {
+            let idx = rowIndex(cols)
+            let keyed = cols[c].enumerated().map { (r, node) -> (node: QueueGraph.Node, sort: Double, seed: Int) in
+                let rows = (neighborsOf[node.key] ?? []).compactMap { idx[$0] }.sorted()
+                let m: Double
+                if rows.isEmpty { m = Double(r) }                       // no neighbors → stay put
+                else if rows.count % 2 == 1 { m = Double(rows[rows.count / 2]) }
+                else { m = Double(rows[rows.count / 2 - 1] + rows[rows.count / 2]) / 2 }
+                return (node, m, r)
+            }
+            cols[c] = keyed
+                .sorted { ($0.sort, $0.seed) < ($1.sort, $1.seed) }
+                .map(\.node)
+        }
+
+        var best = cols
+        var bestCrossings = crossingCount(cols)
+        // A handful of alternating sweeps converges for graphs this size (≤ low hundreds).
+        for iteration in 0..<8 {
+            if iteration % 2 == 0 {
+                for c in 1..<cols.count { sweep(&cols, column: c, neighborsOf: blockers) }
+            } else {
+                for c in stride(from: cols.count - 2, through: 0, by: -1) {
+                    sweep(&cols, column: c, neighborsOf: blocked)
+                }
+            }
+            let crossings = crossingCount(cols)
+            if crossings < bestCrossings { bestCrossings = crossings; best = cols }
+            if crossings == 0 { break }
+        }
+        return best
+    }
+
+    /// Count edge crossings for a given column ORDERING: the number of "blocked by" edge
+    /// PAIRS that share the same (left column, right column) but whose endpoints are in
+    /// opposite vertical order (a classic bipartite inversion, summed over every column
+    /// pair so skip-layer edges count too). Lower is a cleaner-reading graph. PURE; used by
+    /// `orderedColumns` to keep the best sweep and unit-tested directly.
+    static func crossingCount(_ cols: [[QueueGraph.Node]]) -> Int {
+        var colOf: [String: Int] = [:]
+        var rowOf: [String: Int] = [:]
+        for (c, col) in cols.enumerated() {
+            for (r, n) in col.enumerated() { colOf[n.key] = c; rowOf[n.key] = r }
+        }
+        let present = Set(colOf.keys)
+        // Each edge as (leftCol, leftRow, rightCol, rightRow) — blocker → blocked.
+        var edges: [(Int, Int, Int, Int)] = []
+        for col in cols {
+            for node in col {
+                guard let vC = colOf[node.key], let vR = rowOf[node.key] else { continue }
+                for b in node.blockedBy where present.contains(b) && b != node.key {
+                    guard let uC = colOf[b], let uR = rowOf[b] else { continue }
+                    edges.append((uC, uR, vC, vR))
+                }
+            }
+        }
+        var count = 0
+        for i in 0..<edges.count {
+            for j in (i + 1)..<edges.count {
+                let a = edges[i], b = edges[j]
+                guard a.0 == b.0, a.2 == b.2 else { continue }   // same column pair
+                if (a.1 - b.1) * (a.3 - b.3) < 0 { count += 1 }
+            }
+        }
+        return count
+    }
 }
 
 // MARK: - Geometry (shared by the view + the window-default sizing; pure, unit-tested)
@@ -155,7 +254,7 @@ struct QueueBacklogCanvas: View {
 
     @ViewBuilder
     private func board(_ graph: QueueGraph) -> some View {
-        let cols = QueueBacklogLayout.columns(graph.nodes)
+        let cols = QueueBacklogLayout.orderedColumns(graph.nodes)
         let centers = centersByKey(cols)
         let size = canvasSize(cols)
         VStack(alignment: .leading, spacing: 0) {
@@ -217,11 +316,17 @@ struct QueueBacklogCanvas: View {
         // Coordinates are RELATIVE TO THE BOARD (the ZStack sized to `boardSize`); the
         // `.padding(pad)` around the ZStack supplies the margin, so DON'T add `pad` here
         // (doing both double-pads and pushes the content past the viewport).
+        let rowPitch = cardH + vGap
+        let maxRows = cols.map(\.count).max() ?? 0
         var out: [String: CGPoint] = [:]
         for (ci, col) in cols.enumerated() {
             let x = CGFloat(ci) * (cardW + hGap) + cardW / 2
+            // Vertically CENTER a short column within the tallest one so its nodes sit
+            // beside their neighbors (less arrow slant) instead of pinned to the top. The
+            // board height is still `maxRows`, so a centered column stays inside the bounds.
+            let topOffset = CGFloat(maxRows - col.count) / 2 * rowPitch
             for (ri, node) in col.enumerated() {
-                let y = CGFloat(ri) * (cardH + vGap) + cardH / 2
+                let y = topOffset + CGFloat(ri) * rowPitch + cardH / 2
                 out[node.key] = CGPoint(x: x, y: y)
             }
         }

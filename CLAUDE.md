@@ -359,7 +359,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   status report now carries `held`/`heldCount` = listed ∩ latched ∩ ¬active) → **Release** (per
   item or all) clears the latch (+ cooldown) so the queue re-dispatches it on the next `list`
   poll, NO Linear round-trip. Like `set_keep`, release lives in the per-run store (persisted by
-  the next reconcile sweep, not an active-runs change). **See `AGENT-QUEUE.md`
+  the next reconcile sweep, not an active-runs change). **The backlog DAG canvas applies
+  Sugiyama CROSSING REDUCTION** so a busy board (dozens of items) reads with far fewer arrow
+  intersections: within-column order comes from `QueueBacklogLayout.orderedColumns` (alternating
+  down/up MEDIAN sweeps over `blockedBy`, keeping the fewest-crossings result — pure,
+  deterministic, never worse than input; metric `QueueBacklogLayout.crossingCount`), and the view
+  vertically CENTERS a short column within the tallest one (`centersByKey`) to cut arrow slant
+  (board height/window sizing unchanged). `columns` (raw input order) is retained for geometry.
+  Wiring: `QueueBacklogCanvas.swift`; tests `QueueBacklogTests` (`crossingCount`/`orderedColumns`).
+  **See `AGENT-QUEUE.md`
   (→ Implementation notes) for the full engine, MCP tools, grid/packing, health/backlog, live edits,
   keep, restart hardening, wiring + tests.**
 
