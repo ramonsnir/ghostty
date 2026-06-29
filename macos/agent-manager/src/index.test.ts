@@ -13,9 +13,15 @@ import {
   classifyBellNow,
   makeCoalescedRunner,
   parseLoopEnablement,
+  shouldEnableWarmBase,
+  makeSummarizeFn,
+  buildWarmBase,
   type LoopDeps,
   type SummarizeFn,
+  type BaseSummarizeFn,
+  type BuildWarmBaseDeps,
 } from "./index.js";
+import type { WarmBase } from "./warmbase.js";
 import type { McpClient, Surface, SurfaceScreen, Annotation } from "./mcp.js";
 import {
   DEFAULT_CONFIG,
@@ -1199,4 +1205,212 @@ test("classifyBellNow: listSurfaces failure falls back to enqueue+wake (never lo
   assert.equal(summarizeCalls.length, 0);
   assert.deepEqual([...deps.pendingBellIds], ["s1"], "enqueued despite the list failure");
   assert.equal(woke, 1);
+});
+
+// --- warm-base gate + summarize wiring (FLOOR: a flipped gate or mis-wired
+// 2-arg/3-arg defaultSummarize must be caught) -------------------------------
+
+test("shouldEnableWarmBase: ON only when GHOSTTY_WARMBASE=1 AND a Haiku feature is armed", () => {
+  // OFF when the env flag is absent/not '1', regardless of features.
+  assert.equal(shouldEnableWarmBase({}, true, true), false);
+  assert.equal(shouldEnableWarmBase({ GHOSTTY_WARMBASE: "0" }, true, true), false);
+  assert.equal(shouldEnableWarmBase({ GHOSTTY_WARMBASE: "true" }, true, true), false);
+  // ON when the flag is '1' AND at least one Haiku feature is on.
+  assert.equal(shouldEnableWarmBase({ GHOSTTY_WARMBASE: "1" }, true, false), true);
+  assert.equal(shouldEnableWarmBase({ GHOSTTY_WARMBASE: "1" }, false, true), true);
+  assert.equal(shouldEnableWarmBase({ GHOSTTY_WARMBASE: "1" }, true, true), true);
+  // OFF in a QUEUE-ONLY process (no Haiku calls) even with the flag on.
+  assert.equal(shouldEnableWarmBase({ GHOSTTY_WARMBASE: "1" }, false, false), false);
+});
+
+test("makeSummarizeFn: gate OFF => the BARE base is returned (1-arg cold call; queryFn+warm UNDEFINED)", async () => {
+  const calls: Array<{ args: unknown[] }> = [];
+  const base: BaseSummarizeFn = async (...args: unknown[]) => {
+    calls.push({ args });
+    return "cold-ok";
+  };
+  const fn = makeSummarizeFn(base, undefined);
+  // Control-flow identical to the pre-feature cold path: it IS the bare base fn.
+  assert.equal(fn, base as unknown as SummarizeFn);
+  const out = await fn({ system: "S", user: "U" });
+  assert.equal(out, "cold-ok");
+  // The loop calls it with ONE arg only — no queryFn, no warm.
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].args.length, 1);
+});
+
+test("makeSummarizeFn: gate ON => routes through WarmBase (3-arg: req, undefined, warmBase)", async () => {
+  const calls: Array<{ args: unknown[] }> = [];
+  const base: BaseSummarizeFn = async (...args: unknown[]) => {
+    calls.push({ args });
+    return "warm-ok";
+  };
+  // A stand-in WarmBase identity — makeSummarizeFn only forwards it as the 3rd arg.
+  const fakeWarm = { __id: "wb" } as unknown as WarmBase;
+  const fn = makeSummarizeFn(base, fakeWarm);
+  assert.notEqual(fn, base as unknown as SummarizeFn); // wrapped, not bare
+  const out = await fn({ system: "S", user: "U", configDir: "/acct" });
+  assert.equal(out, "warm-ok");
+  assert.equal(calls.length, 1);
+  // 3-arg: req passed through, queryFn === undefined, warm === the WarmBase.
+  assert.equal(calls[0].args.length, 3);
+  assert.deepEqual(calls[0].args[0], { system: "S", user: "U", configDir: "/acct" });
+  assert.equal(calls[0].args[1], undefined);
+  assert.equal(calls[0].args[2], fakeWarm);
+});
+
+// --- buildWarmBase: the startup construction FLOOR ---------------------------
+//
+// The most safety-critical "never worse than today even at startup" branch:
+// constructing the WarmBase must NEVER throw out of main() (which runs BEFORE the
+// queue is wired), so a dynamic-SDK-import failure or a sweep failure must leave the
+// result undefined / swallowed and let the COLD path + queue come up. Extracted +
+// injected here so a try/catch typo (rethrow where a swallow was meant) fails a test
+// rather than silently killing the sidecar merely because GHOSTTY_WARMBASE=1.
+
+function buildWarmBaseDeps(
+  over: Partial<BuildWarmBaseDeps> = {},
+): { deps: BuildWarmBaseDeps; logs: string[]; errs: string[]; dirs: string[] } {
+  const logs: string[] = [];
+  const errs: string[] = [];
+  const dirs: string[] = [];
+  const deps: BuildWarmBaseDeps = {
+    projectDir: "/proj",
+    model: "claude-haiku-4-5",
+    ensureDir: (d) => dirs.push(d),
+    log: (m) => logs.push(m),
+    errlog: (m) => errs.push(m),
+    ...over,
+  };
+  return { deps, logs, errs, dirs };
+}
+
+/** A minimal ForkSeam stand-in; listSessions can be made to throw to model a sweep failure.
+ *  `listEnvSeen` records the effective CLAUDE_CONFIG_DIR at each listSessions call so a
+ *  test can prove the startup sweep binds the store root per provided configDir. */
+function fakeSeam(opts: { listThrows?: boolean; listEnvSeen?: Array<string | undefined> } = {}): any {
+  return {
+    query: () =>
+      (async function* () {
+        /* never used by buildWarmBase */
+      })(),
+    forkSession: async () => ({ sessionId: "f" }),
+    deleteSession: async () => {},
+    listSessions: async () => {
+      opts.listEnvSeen?.push(process.env.CLAUDE_CONFIG_DIR);
+      if (opts.listThrows) throw new Error("list boom");
+      return [];
+    },
+  };
+}
+
+test("buildWarmBase: loadSeam THROWS => returns undefined (cold deps still build), errlog'd", async () => {
+  const { deps, errs } = buildWarmBaseDeps();
+  const wb = await buildWarmBase(deps, async () => {
+    throw new Error("no SDK bundle"); // the exact dynamic-import failure the seam survives
+  });
+  assert.equal(wb, undefined);
+  assert.ok(errs.some((m) => /construction failed/.test(m) && /no SDK bundle/.test(m)));
+});
+
+test("buildWarmBase: sweep THROWS => swallowed (count 0) and the WarmBase is STILL constructed", async () => {
+  const { deps, logs } = buildWarmBaseDeps();
+  const wb = await buildWarmBase(deps, async () => fakeSeam({ listThrows: true }));
+  // The sweep threw but was swallowed by `.catch(() => 0)` — warmBase is non-undefined.
+  assert.notEqual(wb, undefined);
+  assert.ok(logs.some((m) => /ENABLED/.test(m) && /swept 0 orphan/.test(m)));
+});
+
+test("buildWarmBase: happy path => mkdir attempted, seam loaded, WarmBase returned", async () => {
+  const { deps, logs, dirs } = buildWarmBaseDeps();
+  const wb = await buildWarmBase(deps, async () => fakeSeam());
+  assert.notEqual(wb, undefined);
+  assert.deepEqual(dirs, ["/proj"]); // ensureDir was called for the projectDir
+  assert.ok(logs.some((m) => /ENABLED/.test(m)));
+});
+
+// The startup sweep must scan EACH provided store root (ambient + the routed account
+// dir) under its OWN bound CLAUDE_CONFIG_DIR, so an account-dir base/fork orphaned by
+// a prior run is reaped (not just ~/.claude leftovers). Proves the sweepConfigDirs
+// wiring binds the store root per dir (the account-routed disk-leak close).
+test("buildWarmBase: sweepConfigDirs scans EACH root under its own bound CLAUDE_CONFIG_DIR", async () => {
+  const listEnvSeen: Array<string | undefined> = [];
+  const ACCOUNT = "/accounts/A/.claude";
+  const prior = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const { deps } = buildWarmBaseDeps({ sweepConfigDirs: [undefined, ACCOUNT] });
+    const wb = await buildWarmBase(deps, async () => fakeSeam({ listEnvSeen }));
+    assert.notEqual(wb, undefined);
+    // One list per distinct root, in order: ambient (env deleted), then the account dir.
+    assert.equal(listEnvSeen.length, 2);
+    assert.equal(listEnvSeen[0], undefined); // ambient ⇒ env deleted for that scan
+    assert.equal(listEnvSeen[1], ACCOUNT); // account scan bound to ACCOUNT
+    // The env is restored after the sweep (withConfigDirEnv finally).
+    assert.equal(process.env.CLAUDE_CONFIG_DIR, prior);
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prior;
+  }
+});
+
+test("buildWarmBase: default sweepConfigDirs scans ONLY ambient (back-compat)", async () => {
+  const listEnvSeen: Array<string | undefined> = [];
+  const prior = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    const { deps } = buildWarmBaseDeps(); // no sweepConfigDirs ⇒ [undefined]
+    await buildWarmBase(deps, async () => fakeSeam({ listEnvSeen }));
+    assert.equal(listEnvSeen.length, 1);
+    assert.equal(listEnvSeen[0], undefined); // ambient only
+    assert.equal(process.env.CLAUDE_CONFIG_DIR, prior);
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prior;
+  }
+});
+
+// SET-ONCE binding wired through buildWarmBase (ROUND-2 #1): when deps carry a
+// `configDir`, the constructed WarmBase binds process.env.CLAUDE_CONFIG_DIR exactly
+// once, so every subsequent SDK op (incl. the startup sweep) resolves that account.
+test("buildWarmBase: deps.configDir binds process.env.CLAUDE_CONFIG_DIR once on the WarmBase", async () => {
+  const prior = process.env.CLAUDE_CONFIG_DIR;
+  const ACCOUNT = "/accounts/A/.claude";
+  try {
+    const { deps } = buildWarmBaseDeps({ configDir: ACCOUNT });
+    const wb = await buildWarmBase(deps, async () => fakeSeam());
+    assert.notEqual(wb, undefined);
+    // The constructor bound the account; the sweep's per-root wrapper restored it.
+    assert.equal(process.env.CLAUDE_CONFIG_DIR, ACCOUNT);
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prior;
+  }
+});
+
+// Per-launch dead-pid run-dir sweep (ROUND-2 #2): buildWarmBase invokes the injected
+// sweepDeadRunDirs once, logs the count, and a throw from it is swallowed (the floor).
+test("buildWarmBase: sweepDeadRunDirs is invoked once + its count logged; a throw is swallowed", async () => {
+  {
+    let calls = 0;
+    const { deps, logs } = buildWarmBaseDeps({
+      sweepDeadRunDirs: () => {
+        calls++;
+        return 3;
+      },
+    });
+    const wb = await buildWarmBase(deps, async () => fakeSeam());
+    assert.notEqual(wb, undefined);
+    assert.equal(calls, 1);
+    assert.ok(logs.some((m) => /reaped 3 dead run dir/.test(m)));
+  }
+  // A throw from the run-dir sweep must NOT kill construction (best-effort).
+  {
+    const { deps, logs } = buildWarmBaseDeps({
+      sweepDeadRunDirs: () => {
+        throw new Error("rm boom");
+      },
+    });
+    const wb = await buildWarmBase(deps, async () => fakeSeam());
+    assert.notEqual(wb, undefined); // still constructed
+    assert.ok(logs.some((m) => /reaped 0 dead run dir/.test(m))); // count fell back to 0
+  }
 });

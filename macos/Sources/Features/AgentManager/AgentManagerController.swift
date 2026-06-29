@@ -57,6 +57,10 @@ final class AgentManagerController {
     /// (ramon fork / Agent Manager) Haiku usage/budget tracking. Forwarded to the
     /// sidecar as `GHOSTTY_HAIKU_USAGE=1`/`0`; default true. Captured on main at init.
     private let usageTracking: Bool
+    /// (ramon fork / Agent Manager) Warm-base fork-per-call Haiku reuse (cost). Forwarded
+    /// to the sidecar as `GHOSTTY_WARMBASE=1`/`0`; default false (the cold path is the
+    /// floor). Captured on main at init.
+    private let warmBase: Bool
     /// (Agent Queue Supervisor §8a/§15) Master enable for the sidecar's queue
     /// supervisor "pass 3". Captured on main at init. When true the controller
     /// arms the sidecar via `GHOSTTY_AGENT_QUEUE=1` (else pass 3 stays a no-op).
@@ -106,6 +110,7 @@ final class AgentManagerController {
         self.bellFilterEnabled = ghostty.config.agentManagerBellFilter
         self.bellDiagnostics = ghostty.config.bellDiagnostics
         self.usageTracking = ghostty.config.agentManagerUsageTracking
+        self.warmBase = ghostty.config.agentManagerWarmBase
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
         self.agentQueueTemplatesDir = ghostty.config.agentQueueTemplatesDir
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
@@ -264,6 +269,10 @@ final class AgentManagerController {
         // both ways so the config toggle wins over the sidecar's default-on; "0"
         // disables the per-call JSONL recording (usage.ts `usageEnabled()`).
         env["GHOSTTY_HAIKU_USAGE"] = usageTracking ? "1" : "0"
+        // (ramon fork / Agent Manager) Warm-base fork-per-call Haiku reuse. Set
+        // explicitly both ways; "1" enables the WarmBase layer in the sidecar (cost
+        // optimization), absent/"0" keeps the cold single-shot path (the floor).
+        env["GHOSTTY_WARMBASE"] = warmBase ? "1" : "0"
         let nodeDir = (nodePath as NSString).deletingLastPathComponent
         if !nodeDir.isEmpty {
             let existing = env["PATH"] ?? ""

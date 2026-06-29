@@ -3324,6 +3324,23 @@ keybind: Keybinds = .{},
 /// up a change. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
 @"agent-manager-usage-tracking": bool = true,
 
+/// (ramon fork / Agent Manager) Warm-base fork-per-call Haiku reuse — a COST
+/// optimization for the per-tile summarizer AND the per-bell classify. When true,
+/// the sidecar keeps ONE system-only "base" Claude session per (account, model,
+/// system-prompt) and, for each call, FORKS it and resumes the fork with just the
+/// surface — so the fork READS the already-cached ~25–32k-token system prefix
+/// (`$0.10/MTok`) instead of RE-CREATING it (`$2/MTok`) on a fresh spawn, which is
+/// ~79% of the Haiku bill. Measured ~$0.056 → ~$0.0035 per call (~94% cheaper);
+/// isolation is clean BY CONSTRUCTION (each fork branches from the system-only base,
+/// never from another surface). The cold single-shot call is the FLOOR: any
+/// warm-mechanism failure (fork / resume / timeout / base-create) silently falls back
+/// to it, so behavior is never worse than with this off. Default FALSE while the live
+/// numbers are being confirmed — set it `true` in `~/.config/ghostty-ramon/config` to
+/// enable; watch `get_haiku_usage` to see per-feature cost drop. The GUI forwards the
+/// resolved value to the sidecar as `GHOSTTY_WARMBASE=1`/`0`; a GUI relaunch (no host
+/// restart) picks up a change. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+@"agent-manager-warm-base": bool = false,
+
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
 /// from a phone. Empty/null (the default) DISABLES the server entirely.
@@ -11463,6 +11480,27 @@ test "agent-manager-usage-tracking: default on and parse" {
         try cfg.loadIter(alloc, &it);
         try cfg.finalize();
         try testing.expectEqual(false, cfg.@"agent-manager-usage-tracking");
+    }
+}
+
+test "agent-manager-warm-base: default off and parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(false, cfg.@"agent-manager-warm-base");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--agent-manager-warm-base=true"} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"agent-manager-warm-base");
     }
 }
 

@@ -39,6 +39,21 @@ test("formatUsageLine: injected ts wins over any ts in the record", () => {
   assert.equal(obj.ts, "2026-06-28T12:00:00.000Z");
 });
 
+test("formatUsageLine: round-trips mode:'warm' (the warm/cold savings signal get_haiku_usage exists to surface)", () => {
+  // A regression that dropped `mode` from the index.ts recordUsage spread (e.g.
+  // switching to an explicit field list) would silently lose the warm/cold signal.
+  // The serializer spreads the whole record, so it must carry `mode` through.
+  const warm: UsageRecord = { ...rec, mode: "warm" };
+  const obj = JSON.parse(formatUsageLine(warm, "2026-06-28T12:00:00.000Z"));
+  assert.equal(obj.mode, "warm");
+  // And a cold record carries mode:'cold' (or omits it) symmetrically.
+  const cold: UsageRecord = { ...rec, mode: "cold" };
+  assert.equal(
+    JSON.parse(formatUsageLine(cold, "2026-06-28T12:00:00.000Z")).mode,
+    "cold",
+  );
+});
+
 test("trimUsageText: keeps lines at/after cutoff, drops older + blank + unparseable", () => {
   const old = formatUsageLine(rec, "2026-06-01T00:00:00.000Z");
   const fresh = formatUsageLine(rec, "2026-06-28T00:00:00.000Z");

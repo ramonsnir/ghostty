@@ -26,8 +26,14 @@ export interface HaikuUsage {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
-  /** The SDK's reported per-call cost (`total_cost_usd`). */
+  /** Per-call cost — a TOKEN-BUCKET estimate (token counts × Haiku-4.5 rates, see
+   *  `costFromUsage` in warmbase.ts), NOT the SDK's cumulative-per-session
+   *  `total_cost_usd`. Computed the same way for both warm and cold so the two are
+   *  directly comparable in `get_haiku_usage`. */
   costUsd: number;
+  /** Whether this call went through the warm-base fork-per-call path ("warm") or
+   *  today's cold one-shot ("cold"). Absent on records from before this field. */
+  mode?: "warm" | "cold";
 }
 
 /** One recorded usage line: a HaikuUsage tagged with the feature + account. */
