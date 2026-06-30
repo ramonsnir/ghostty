@@ -330,7 +330,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   from the mirror's OWN `.client` stream via the NEW `ghostty_surface_mirror_grid_size` C API
   (`Client.render_state` holds the host grid from each `grid_frame`) — fallback chain in
   `resolveGrid` is cache/host → mirror client-stream grid → mirror frame; the C call is gated on
-  `cols==0` and reads under the render mutex. **This one adds a C export → lib/xcframework rebuild,
+  `cols==0` and reads under the render mutex. In that same host-never-seen case the CELL SIZE can
+  only come from the mirror's own `cell_width_px`, which jitters (15↔17) via frame-feedback, so it
+  is LATCHED (first non-zero held, via pure `latchedCell` → `hostGeomBox.fallbackCellW/H`) — without
+  it cols were stable but cellW oscillated and the tile still flickered (live: 1577 re-renders/8s →
+  0). **This one adds a C export → lib/xcframework rebuild,
   but it's GUI-only: the host never makes a `.client` mirror, so `ghostty-host` is NOT
   rebuilt/reloaded (no session loss).** Wiring: core — `src/termio/Client.zig` (`mirrorSourceGrid`
   + named `MirrorGrid`), `src/Surface.zig` (`mirrorSourceGrid` forwarder), `src/apprt/embedded.zig`

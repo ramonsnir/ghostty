@@ -459,8 +459,15 @@ gotchas, not a recap.)
   `resolveGrid` → `ghostty_surface_mirror_grid_size` (NEW C API): the `.client` mirror
   receives the host's real `cols`/`rows` in every `grid_frame` (stored in
   `Client.render_state`), even though the real split isn't on screen. So the fallback chain
-  is **cache/host → mirror client-stream grid → mirror frame size**; cell size stays from
-  the cache or the mirror's own font metrics (display-correct for the tile). The C call is
+  is **cache/host → mirror client-stream grid → mirror frame size**. **Cell SIZE in that
+  same host-never-seen case can only come from the mirror's own `cell_width_px`, which
+  JITTERS (e.g. 15↔17) via the very frame-feedback the host-sourcing fixed — so it is
+  LATCHED: `resolveGrid` records the FIRST non-zero fallback cell size (`hostGeomBox.
+  fallbackCellW`/`fallbackCellH`, via the pure `latchedCell`) and holds it, freezing the
+  scale (font cell size is constant for a thumbnail's life; a real change re-mounts the tile
+  or arrives via the host when the split is shown).** Without the latch, cols/rows were
+  stable but `cellW` oscillated → the tile still flickered (the live repro: 1577 geom
+  re-renders in 8s → 0 after the latch). The C call is
   GATED on `cols == 0`, so it only runs in this rare case (and reads under the render mutex,
   so it can't tear against the read thread). NEW C API: `ghostty_surface_mirror_grid_size`
   → `ghostty_surface_mirror_grid_s {columns, rows, valid}` (`src/apprt/embedded.zig` +
@@ -468,7 +475,7 @@ gotchas, not a recap.)
   (returns the named `Client.MirrorGrid`, null for non-mirror / pre-first-frame). **This is
   a lib/xcframework rebuild (new C export) — GUI-only; the host never instantiates a
   `.client` mirror, so `ghostty-host` is NOT rebuilt/reloaded (no session loss).** Tests:
-  `AgentMirrorGeometryTests` (`mergeHostGeomRemembersThroughZoomHidden`,
+  `AgentMirrorGeometryTests` (`mergeHostGeomRemembersThroughZoomHidden`, `latchedCellHoldsFirstNonZero`,
   `uniformScaleAcrossSplitsOfDifferentWidths`,
   `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
   `zeroBackingDoesNotDivideByZero`).
