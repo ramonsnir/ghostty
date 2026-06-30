@@ -259,14 +259,15 @@ prev_snapshot: ?RenderState.Snapshot = null,
 /// first tick does the full rebuild exactly as before. Freed in destroy().
 render_state: RenderStateCore = .empty,
 
-/// Idle-CPU fix: the previous cursor-state gate (cursor visibility / blink / DECSCUSR
-/// style / password-input). These four `cursorEql` fields change WITHOUT dirtying any
-/// cell and are absent from ModeFrame, so the capture gate must detect them itself —
-/// a cells-dirty-only gate would silently drop a cursor hide/style change on an
-/// otherwise-clean grid (the GUI mirror would keep a stale cursor). Cursor POSITION /
-/// cell / viewport stay covered by cells_dirty / viewport_dirty. A pure VALUE field
-/// (no heap), so it needs no cleanup in destroy(). null until the first tick.
-/// Owner-thread-only under render_mutex.
+/// Idle-CPU fix: the previous cursor-state gate (cursor POSITION x/y + visibility /
+/// blink / DECSCUSR style / password-input — see `CursorGate`). These `cursorEql`
+/// fields change WITHOUT dirtying any cell and are absent from ModeFrame, so the
+/// capture gate must detect them itself — a cells-dirty-only gate would silently drop
+/// a cursor-only move (issue #2) OR a hide/style change on an otherwise-clean grid (the
+/// GUI mirror would keep a stale cursor). The remaining `cursorEql` fields (cursor_cell
+/// / cursor_viewport) stay covered by cells_dirty / viewport_dirty (see `CursorGate`).
+/// A pure VALUE field (no heap), so it needs no cleanup in destroy(). null until the
+/// first tick. Owner-thread-only under render_mutex.
 prev_cursor_gate: ?CursorGate = null,
 
 /// Test instrumentation: number of times projectSnapshotLocked actually projected a
@@ -1280,12 +1281,28 @@ pub fn captureSnapshotLocked(self: *Session, alloc: Allocator) !RenderState.Snap
     return try RenderState.Snapshot.fromRenderState(alloc, &rs);
 }
 
-/// Idle-CPU fix: the four `cursorEql` fields that change WITHOUT dirtying a cell and
-/// are absent from ModeFrame (cursor visibility / blink / DECSCUSR visual style /
-/// password-input). The capture gate compares this across ticks so a DECTCEM/DECSCUSR/
-/// password change on an otherwise-clean grid still forces a capture + push. Pure
-/// value type (no heap), compared with std.meta.eql.
+/// Idle-CPU fix: the `cursorEql` fields that change WITHOUT dirtying a cell and
+/// are absent from ModeFrame — cursor POSITION (x/y) plus visibility / blink /
+/// DECSCUSR visual style / password-input. The capture gate compares this across
+/// ticks so a cursor move (arrow key / setCursorPos / click-to-move) OR a
+/// DECTCEM/DECSCUSR/password change on an otherwise-clean grid still forces a
+/// capture + push. Pure value type (no heap), compared with std.meta.eql.
+///
+/// `x`/`y` are LOAD-BEARING (issue #2): a cursor-only move can dirty no cell — a
+/// same-row move (`cursorLeft`/`cursorRight`, or advancing over pre-existing spaces)
+/// never `cursorMarkDirty`s; only printing a glyph, or a move that relocates the pin to
+/// a different row, dirties cells — and it is not a scroll/mode change, so without
+/// position in this gate `must_capture` stays false on the clean same-row case, no
+/// Snapshot is projected, and the downstream `cursor_changed = !cursorEql` push is
+/// never even evaluated — the GUI cursor freezes until a non-space char dirties a cell.
+/// (A row-changing move dirties rows ⇒ `cells_dirty` would catch it anyway; x/y is what
+/// rescues the clean same-row case.) The remaining `cursorEql` fields
+/// stay covered: `cursor_cell` changes iff the cursor moved (caught here by x/y) or
+/// the cell under a steady cursor was rewritten (caught by `cells_dirty`), and
+/// `cursor_viewport` changes on a scroll (`viewport_dirty`) or a move (x/y).
 pub const CursorGate = struct {
+    x: terminalpkg.size.CellCountInt,
+    y: terminalpkg.size.CellCountInt,
     visible: bool,
     blinking: bool,
     password: bool,
@@ -1293,14 +1310,19 @@ pub const CursorGate = struct {
 };
 
 /// Read the cursor-state gate fields cheaply (O(1), no grid walk) from the live
-/// terminal — the SAME sources `RenderState.update` reads (render.zig:313-316):
-/// the cursor_visible / cursor_blinking modes, t.flags.password_input, and the
+/// terminal — the SAME sources `RenderState.update` reads (render.zig:310-316):
+/// the active screen's cursor x/y (`s.cursor.x`/`.y`, which the Snapshot's
+/// `cursor_x`/`cursor_y` derive from verbatim — render.zig:310 sets
+/// `rs.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y }`), the
+/// cursor_visible / cursor_blinking modes, t.flags.password_input, and the
 /// DECSCUSR visual style `s.cursor.cursor_style`. NOTE: `cursor_style` is the DECSCUSR
 /// visual style (what cursorEql compares as cursor_visual_style), NOT `s.cursor.style`
 /// (the SGR style, which cursorEql does NOT compare). Caller holds render_mutex.
 fn cursorGateLocked(self: *Session) CursorGate {
     const t = &self.io.terminal;
     return .{
+        .x = t.screens.active.cursor.x,
+        .y = t.screens.active.cursor.y,
         .visible = t.modes.get(.cursor_visible),
         .blinking = t.modes.get(.cursor_blinking),
         .password = t.flags.password_input,
@@ -1624,12 +1646,16 @@ pub fn renderTick(self: *Session) !usize {
                 self.prev_mode = mode_now;
             }
         }
-        // Idle-CPU fix — cursor-state gate (Slice 8 superset): cursor visibility
-        // (DECTCEM), blink + visual style (DECSCUSR), and password-input change
-        // `cursorEql` fields WITHOUT dirtying a cell and are absent from ModeFrame, so
-        // cells_dirty / prev_mode would miss them. A cheap O(1) read vs prev_cursor_gate
-        // catches them so the capture+push still fires (cursor POSITION/cell/viewport
-        // stay covered by cells_dirty/viewport_dirty). Runs EVERY tick, ungated.
+        // Idle-CPU fix — cursor-state gate (Slice 8 superset): cursor POSITION (x/y),
+        // visibility (DECTCEM), blink + visual style (DECSCUSR), and password-input
+        // change `cursorEql` fields WITHOUT dirtying a cell and are absent from
+        // ModeFrame, so cells_dirty / prev_mode would miss them. A cheap O(1) read vs
+        // prev_cursor_gate catches them so the capture+push still fires. Position is
+        // LOAD-BEARING (issue #2): a cursor-only move (arrow key / click-to-move /
+        // advancing over pre-existing spaces) dirties no cell, so without x/y here
+        // must_capture stays false and the move never reaches the GUI until a later
+        // cell change. cursor_cell/cursor_viewport remain covered (see CursorGate doc).
+        // Runs EVERY tick, ungated.
         {
             const cur_gate = self.cursorGateLocked();
             cursor_state_changed = self.prev_cursor_gate == null or
