@@ -725,14 +725,14 @@ facts for an agent touching this code:
   manual PATH setup). A Homebrew `create-dmg` already on PATH makes that a no-op. A
   notary keychain profile —
   `xcrun notarytool store-credentials ghostty-ramon-notary --key <AuthKey.p8> --key-id <ID> --issuer <UUID>`.
-  **NOTARY GOTCHA (cost me a real chase):** a freshly-enrolled Apple Developer account's
-  FIRST notarizations can sit `status: In Progress` for HOURS (Apple-side provisioning /
-  service backlog) — NOT a bug in our artifact (it'd be `Invalid`, with a `notarytool log`,
-  if the zip were bad). Don't burn CI on it (that's how the ~$9 evaporated). Check
-  `developer.apple.com/system-status` (Developer ID Notary Service) + that no Program
-  License Agreement is pending in the account, then just re-run the local script once
-  the service is healthy; `xcrun notarytool history --keychain-profile ghostty-ramon-notary`
-  shows whether old submissions ever drained.
+  **Notary note:** in steady state notarization is FAST (sub-minute per submit). The one
+  historical exception was this account's FIRST submissions right after enrollment, which
+  sat `status: In Progress` for a long time (one-time Apple-side provisioning) — long since
+  resolved; don't expect it. If a submit ever DOES stall, it's Apple-side, not our artifact
+  (a bad zip is `Invalid` with a `notarytool log`), so don't burn CI on it (a slow CI run
+  there once cost ~$9 in macOS minutes) — check `developer.apple.com/system-status`
+  (Developer ID Notary Service) and just re-run the local script; `xcrun notarytool history
+  --keychain-profile ghostty-ramon-notary` shows whether old submissions drained.
 - **CI release (`.github/workflows/fork-release.yml`) — MANUAL-ONLY fallback.** Its
   `on:` is `workflow_dispatch` only (NOT `push`) precisely so normal pushes don't burn
   macOS minutes; trigger it by hand only if you can't build locally (and expect
