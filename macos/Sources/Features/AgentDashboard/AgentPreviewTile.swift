@@ -521,16 +521,24 @@ struct AgentMirrorPreview: View {
             let backing = surfaceView.window?.backingScaleFactor
                 ?? NSScreen.main?.backingScaleFactor ?? 2.0
             // HOST grid from the real surface (authoritative; the mirror's own
-            // grid tracks our frame and must not be used). Per-cell pixels come
-            // from the mirror (font metrics, stable), falling back to the real
-            // surface's cell.
+            // grid AND cell size track our frame and must not be used — see below).
             let host = realSurface.surfaceSize
             let rows = Int(host?.rows ?? 0)
-            let cellH = CGFloat(surfaceView.surfaceSize?.cell_height_px ?? host?.cell_height_px ?? 0)
+            // Per-cell pixels come from the HOST (real) surface FIRST, the mirror
+            // only as a fallback — the SAME source as cols/rows. This is
+            // LOAD-BEARING (not a style choice): the mirror's frame is computed
+            // from this cell size, and the mirror's OWN `cell_width_px` jitters by
+            // ±1px (e.g. 17↔16) as that frame re-rounds its framebuffer onto a
+            // sub-pixel boundary — so reading it here closes a feedback loop that
+            // oscillates the scale every frame (a ~160 Hz "font size flicker",
+            // display-dependent because the rounding sits on a half-pixel edge).
+            // The host surface has a fixed real frame, so its cell size is stable
+            // and breaks the loop. (Was: mirror-first, the flicker bug.)
+            let cellH = CGFloat(host?.cell_height_px ?? surfaceView.surfaceSize?.cell_height_px ?? 0)
             let g = AgentMirrorPreview.geometry(
                 cols: Int(host?.columns ?? 0),
                 rows: rows,
-                cellW: CGFloat(surfaceView.surfaceSize?.cell_width_px ?? host?.cell_width_px ?? 0),
+                cellW: CGFloat(host?.cell_width_px ?? surfaceView.surfaceSize?.cell_width_px ?? 0),
                 cellH: cellH,
                 backing: backing,
                 container: geo.size)
@@ -641,14 +649,20 @@ struct AgentMirrorPreview: View {
         // UNIFORM scale: referenceColumns columns fill the container width, so
         // every tile renders at the same cell size. Before the first frame
         // (cellW == 0) fall back to width-fit so the view still fills the row.
-        let scale: CGFloat
+        let rawScale: CGFloat
         if cellW > 0 && referenceColumns > 0 {
-            scale = container.width / (referenceColumns * cellW / bk)
+            rawScale = container.width / (referenceColumns * cellW / bk)
         } else if naturalW > 0 {
-            scale = container.width / naturalW
+            rawScale = container.width / naturalW
         } else {
-            scale = 1.0
+            rawScale = 1.0
         }
+        // DEFENSIVE CLAMP: a thumbnail only ever SHRINKS the host grid — a real
+        // terminal split has >= referenceColumns-ish columns, so the legitimate
+        // scale is always <= 1. Capping at 1 means no transient/degenerate input
+        // (a momentary tiny or zero cell size) can ever blow the preview up into a
+        // few giant native-size cells. Untouched in the normal case (scale < 1).
+        let scale = min(rawScale, 1.0)
         return PreviewGeometry(
             naturalW: naturalW, naturalH: naturalH, scale: scale,
             scaledW: naturalW * scale, scaledH: naturalH * scale)

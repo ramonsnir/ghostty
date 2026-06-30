@@ -418,6 +418,25 @@ gotchas, not a recap.)
   thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
   Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
 
+- **⚠️ Preview-scale inputs come from the HOST surface, never the mirror's own size
+  (feedback-loop fix).** `AgentMirrorPreview.geometry` scales the mirror so
+  `referenceColumns` columns fill the tile width. It MUST take **cols/rows AND
+  cell_width/height** from the *real* (host) surface (`realSurface.surfaceSize`),
+  with the mirror's own `surfaceSize` only as a last-resort fallback. The mirror's
+  frame is computed FROM these cell metrics, and the mirror's own `cell_width_px`
+  **jitters ±1px** (e.g. 17↔16) as that frame re-rounds its framebuffer onto a
+  sub-pixel boundary — so reading the mirror's cell size here closes a feedback loop
+  that oscillates the scale every frame: a ~160 Hz "the preview keeps switching font
+  size" flicker, **display-dependent** (it appears only when the cell lands on a
+  half-pixel edge, e.g. after moving the window between displays of different scale).
+  The host surface has a fixed real frame, so its cell size is stable and breaks the
+  loop. (This was a shipped bug: `cellW`/`cellH` were mirror-first while `cols`/`rows`
+  were already host-first; the fix makes all four host-first.) Belt-and-suspenders:
+  `geometry` also CLAMPS the final scale to ≤ 1.0 — a thumbnail only ever SHRINKS a
+  real terminal grid, so no transient/degenerate input can ever blow the preview up
+  into a few giant native-size cells. Tests: `AgentMirrorGeometryTests`
+  (`scaleNeverUpscalesBeyondNative` + the existing geometry cases, all scale < 1).
+
 ### Smart bottom-anchor — skip empty rows AND the info-less footer
 
 - **Smart bottom-anchor (fork-only, always on, no config, PURE-SWIFT / ZERO Zig).** A

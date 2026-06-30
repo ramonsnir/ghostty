@@ -44,6 +44,24 @@ struct AgentMirrorGeometryTests {
         #expect(g.scale > 0)
     }
 
+    @Test func scaleNeverUpscalesBeyondNative() {
+        // Regression: the preview must only ever SHRINK the host grid. A degenerate
+        // tiny cell size (e.g. a transient mid-flicker frame) would otherwise drive
+        // the uniform scale far above 1, blowing the thumbnail up into a few giant
+        // native-size cells. The clamp pins scale at 1.0.
+        let g = AgentMirrorPreview.geometry(
+            cols: 98, rows: 35, cellW: 1, cellH: 2, backing: 2,
+            container: CGSize(width: 992, height: 220), referenceColumns: 125)
+        #expect(g.scale == 1.0)                       // clamped (raw would be ~15.9)
+        #expect(abs(g.scaledW - g.naturalW) < 0.001)  // scaledW = naturalW * 1
+        // A normal host grid is unaffected by the clamp (scale stays < 1).
+        let normal = AgentMirrorPreview.geometry(
+            cols: 98, rows: 35, cellW: 17, cellH: 36, backing: 2,
+            container: CGSize(width: 992, height: 220), referenceColumns: 125)
+        #expect(normal.scale < 1.0)
+        #expect(abs(normal.scale - 992.0 / (125.0 * 17.0 / 2.0)) < 0.001)
+    }
+
     @Test func uniformScaleAcrossSplitsOfDifferentWidths() {
         // Two splits with DIFFERENT column counts but the same cell/backing must
         // get the SAME scale (uniform cell size), with `referenceColumns` (here
