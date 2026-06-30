@@ -956,7 +956,12 @@ this macOS); `nushell` for `build.nu`.
      rebuilds `macos/agent-manager/dist` (`npm run build`, when node + `node_modules` are
      present — locating nvm's node off the clean PATH) and copies `dist` + `package.json`
      into `…/Ghostty.app/Contents/Resources/agent-manager`, then re-signs. So a normal
-     `build.nu` build is now self-contained. **If node/`node_modules` aren't found it only
+     `build.nu` build is now self-contained. **Test files are pruned from the bundled copy:**
+     `tsc` emits `dist/**/*.test.js` (21 dev-only files, ~458K) alongside the runtime entry
+     `dist/index.js`, so all three copy sites (`build.nu`, `dist/macos/release-local.sh`,
+     `.github/workflows/fork-release.yml`) delete `*.test.js` from the destination `dist`
+     AFTER the copy (never the source — `npm test` runs `dist/**/*.test.js` there); the shell
+     paths additionally assert none survive. **If node/`node_modules` aren't found it only
      COPIES whatever `dist` exists and WARNS** — so for a sidecar change still run
      `npm run build` in `macos/agent-manager` yourself first (or `npm ci` once for deps).
      **The trap this fixes (cost a debug session 2026-06-30):** a `ditto` deploy of an app
