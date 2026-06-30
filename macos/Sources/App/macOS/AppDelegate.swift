@@ -435,8 +435,8 @@ class AppDelegate: NSObject,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(ghosttyToggleDashboardHide(_:)),
-            name: Ghostty.Notification.ghosttyToggleDashboardHide,
+            selector: #selector(ghosttyHideDashboardSplit(_:)),
+            name: Ghostty.Notification.ghosttyHideDashboardSplit,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
@@ -596,13 +596,14 @@ class AppDelegate: NSObject,
         }
     }
 
-    /// (ramon fork / Agent Dashboard) Toggle whether the focused surface is
-    /// hidden from the dashboard (the `toggle_dashboard_hide` keybind). The
-    /// notification's object is the `SurfaceView` to toggle. Lazily creates the
-    /// dashboard controller (like the toggle above) so the hide is recorded +
-    /// persisted even if the panel has never been shown this session; it does
-    /// NOT show the panel.
-    @objc private func ghosttyToggleDashboardHide(_ notification: Notification) {
+    /// (ramon fork / Agent Dashboard) Hide the focused surface from the dashboard
+    /// (the `hide_dashboard_split` keybind). Hide-only — pressing it on an
+    /// already-hidden split keeps it hidden (reveal from the dashboard's Show
+    /// button). The notification's object is the `SurfaceView` to hide. Lazily
+    /// creates the dashboard controller (like the toggle above) so the hide is
+    /// recorded + persisted even if the panel has never been shown this session;
+    /// it does NOT show the panel.
+    @objc private func ghosttyHideDashboardSplit(_ notification: Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         // Posted from the apprt action callback, which arrives on the main
         // thread; the controller is @MainActor-isolated.
@@ -610,7 +611,7 @@ class AppDelegate: NSObject,
             if agentDashboard == nil {
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
-            agentDashboard?.toggleHide(surfaceID: surfaceView.id)
+            agentDashboard?.hide(surfaceID: surfaceView.id)
         }
     }
 

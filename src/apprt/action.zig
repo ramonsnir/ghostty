@@ -399,9 +399,9 @@ pub const Action = union(Key) {
     /// window. Two-deep toggle.
     goto_last_surface,
 
-    /// (ramon fork) Toggle whether the target surface is hidden from the Agent
-    /// Dashboard (macOS). The keyboard equivalent of a tile's Hide button.
-    toggle_dashboard_hide,
+    /// (ramon fork) Hide the target surface from the Agent Dashboard (macOS).
+    /// The keyboard equivalent of a tile's Hide button. Hide-only (idempotent).
+    hide_dashboard_split,
 
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
@@ -484,7 +484,7 @@ pub const Action = union(Key) {
         install_agent_hooks,
         start_agent_queue,
         goto_last_surface,
-        toggle_dashboard_hide,
+        hide_dashboard_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

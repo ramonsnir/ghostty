@@ -424,7 +424,7 @@ extension Ghostty.Notification {
     /// from the Agent Dashboard. The posting `object` is the `SurfaceView` to
     /// toggle (the focused split); observed by the AppDelegate, which owns the
     /// dashboard controller. The keyboard equivalent of a tile's Hide button.
-    static let ghosttyToggleDashboardHide = Notification.Name("com.mitchellh.ghostty.toggleDashboardHide")
+    static let ghosttyHideDashboardSplit = Notification.Name("com.mitchellh.ghostty.hideDashboardSplit")
 
     /// (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks.
     /// App-wide (no object payload); observed by the AppDelegate, which runs the

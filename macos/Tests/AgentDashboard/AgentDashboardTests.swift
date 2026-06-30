@@ -607,10 +607,12 @@ struct AgentDashboardModelTests {
         #expect(!model.entries.map(\.id).contains(a)) // dropped from grid
     }
 
-    @Test func toggleHideTogglesAndPersists() {
-        // The `toggle_dashboard_hide` keybind path: model.toggleHide flips the
-        // hide state for a surface and persists, returning the new state. It
-        // shares the exact UUID-keyed set the eye-slash button uses.
+    @Test func hideIsIdempotentAndPersists() {
+        // The `hide_dashboard_split` keybind path: model.hide hides the surface
+        // and persists. It is HIDE-ONLY (idempotent) — pressing it again on an
+        // already-hidden split keeps it hidden (reveal is via the Show button),
+        // so clicking a hidden split never re-reveals it. It shares the exact
+        // UUID-keyed set the eye-slash button uses.
         let store = InMemoryHideStore()
         let model = AgentDashboardModel(store: store)
         let a = UUID()
@@ -619,16 +621,22 @@ struct AgentDashboardModelTests {
         #expect(!model.hidden.contains(a))
 
         // First press hides.
-        #expect(model.toggleHide(a) == true)
+        model.hide(a)
         #expect(model.hidden.contains(a))
         #expect(store.load().contains(a))            // persisted
         #expect(!model.entries.map(\.id).contains(a)) // dropped from grid
 
-        // Second press reveals.
-        #expect(model.toggleHide(a) == false)
+        // Second press is a no-op — it stays hidden (NOT toggled back).
+        model.hide(a)
+        #expect(model.hidden.contains(a))
+        #expect(store.load().contains(a))            // still persisted
+        #expect(!model.entries.map(\.id).contains(a)) // still out of the grid
+
+        // Reveal only happens via the explicit Show path.
+        model.show(a)
         #expect(!model.hidden.contains(a))
-        #expect(!store.load().contains(a))           // persistence updated
-        #expect(model.entries.map(\.id).contains(a))  // back in the grid
+        #expect(!store.load().contains(a))
+        #expect(model.entries.map(\.id).contains(a))
     }
 
     @Test func nonAgentNeverShown() {

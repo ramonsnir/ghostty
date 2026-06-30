@@ -6274,9 +6274,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .toggle_dashboard_hide => return try self.rt_app.performAction(
+        .hide_dashboard_split => return try self.rt_app.performAction(
             .{ .surface = self },
-            .toggle_dashboard_hide,
+            .hide_dashboard_split,
             {},
         ),
 
