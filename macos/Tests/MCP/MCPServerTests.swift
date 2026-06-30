@@ -512,6 +512,40 @@ struct MCPServerTests {
         #expect((d["sessionID"] as? NSNumber)?.uint64Value == 0)
     }
 
+    // fork / Agent Queue (adopt): the queue tags MUST be emitted when present, so the
+    // supervisor's reconcile orphan-adoption can read queueName/queueKey back off
+    // list_surfaces and fold an ADOPTED surface into run.active (counted + tracked).
+    // Omitted (not null) on a non-queue surface — honest absence.
+    @Test func surfacesJSONDataEmitsQueueTagsWhenPresentOmitsWhenNil() {
+        let tagged = MCPLayout.SurfaceRow(
+            id: "ABC", title: "claude", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: "working", lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 7,
+            queueKey: "EX-1859", queueName: "Acme · Pilot",
+            queueUrl: "https://example.com/EX-1859")
+        let d = MCPLayout.surfacesJSONData([tagged])[0]
+        #expect(d["queueKey"] as? String == "EX-1859")
+        #expect(d["queueName"] as? String == "Acme · Pilot")
+        #expect(d["queueUrl"] as? String == "https://example.com/EX-1859")
+
+        let plain = MCPLayout.SurfaceRow(
+            id: "DEF", title: "vim", pwd: "/tmp",
+            window: 0, tab: 0, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: nil, hidden: false, sessionID: 0)
+        let pd = MCPLayout.surfacesJSONData([plain])[0]
+        #expect(pd["queueKey"] == nil)
+        #expect(pd["queueName"] == nil)
+        #expect(pd["queueUrl"] == nil)
+    }
+
     // MARK: - dispatch (AppKit-free paths only)
 
     @Test func dispatchUnknownToolError() {

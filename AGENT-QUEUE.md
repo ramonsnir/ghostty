@@ -568,6 +568,19 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   real session, and the Adopt button is gated behind the same pty-host HARD DEP the dashboard/queue
   require, so a 0-session target is unreachable through the UI. We add NO 0-session fallback
   (inventing a persistence key reconcile can't match is exactly the divergence we avoid).
+- **⭐ SECOND chokepoint — `list_surfaces` MUST echo the queue tags (shipped + fixed 2026-06-30).**
+  reconcile reads `queueName`/`queueKey` off the `list_surfaces` ROWS (the sidecar's `listSurfaces`
+  passes rows through as `Surface[]`; `store.ts` keys orphan-adoption on `r.queueName`/`r.queueKey`).
+  The Swift row builder `MCPLayout.surfacesJSONData` originally emitted `notes`/`agentKind`/etc. but
+  NOT the queue tags, so reconcile was BLIND to every adopted surface → it was annotated + grouped
+  in the dashboard (which reads its OWN `annotations` model, independent of `list_surfaces`) but
+  NEVER folded into `run.active` → the health bar's `N running` never incremented AND the supervisor
+  never status-polled / auto-closed it. Fix: the tags flow `annotation` → `HookSnapshotEntry`
+  (`queueKey`/`queueName`/`queueUrl`, AgentDashboardController) → `MCPLayout.SurfaceRow` →
+  `surfacesJSONData` (emit when non-nil, omit otherwise). Pure-JSON, tested by
+  `MCPServerTests.surfacesJSONDataEmitsQueueTagsWhenPresentOmitsWhenNil`. (Distinct from the FIRST
+  chokepoint — the `coerceQueueCommands` whitelist that carries the command INTO the sidecar; this
+  one carries the annotation BACK so reconcile can act on it.)
 - **Haiku key inference seam (`queue/infer.ts` + index.ts).** PURE, SDK-free helpers:
   `composeInferPrompt(viewportTail, candidateKeys)` (bespoke "extract a single work-item KEY"
   prompt; hint block OMITTED when no candidates), `parseInferredKey(raw)` (trim/strip fences+quotes,
