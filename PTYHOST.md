@@ -211,6 +211,33 @@ terms cover search, selection, viewport (scroll/jump), and mode changes; cursor 
 have their own `cursorEql` term. A freshly (re)attached GUI bypasses the gate via
 `Server.pushFullFrames`.
 
+**There is a SECOND, easy-to-miss gate in front of this one — the idle-CPU
+`must_capture` capture gate.** To avoid the grid-sized Snapshot projection on idle
+ticks, `renderTick` only PROJECTS a Snapshot when
+`cells_dirty || force_push || cursor_state_changed || first-frame`; if it skips the
+projection, the push gate above is never even reached. `cursor_state_changed` comes
+from a cheap O(1) `cursorGateLocked()` / `CursorGate` read. **Every `cursorEql` field
+that can change without dirtying a cell, without a scroll, and without a mode flip MUST
+be in `CursorGate`, or the move is silently dropped until the next cell change.** This
+bit us as **issue #2**: `CursorGate` originally omitted cursor **position** (x/y), so a
+cursor-only move (arrow key, `setCursorPos`, advancing over pre-existing spaces — any
+move the child app makes that the host cursor already reflects) left
+`must_capture == false` — no Snapshot, so `cursor_changed` never fired and the GUI
+cursor froze "until a non-space char is keyed" (a non-space dirties a cell ⇒ capture ⇒
+the deferred move ships). NOTE: this is the *display* of an already-landed host cursor
+move — distinct from the still-open R1 "Cursor-click-to-move at the prompt" row in the
+Broken/missing table above (that is the GUI *translating* a mouse click into shell
+cursor-movement keystrokes off the unfed local terminal; not fixed here). Fix: x/y are
+now in `CursorGate` (read from
+`t.screens.active.cursor.x/y`, the exact source the Snapshot's `cursor_x/y` derive
+from). `cursor_cell`/`cursor_viewport` stay covered (cell-rewrite-under-steady-cursor ⇒
+`cells_dirty`; scroll ⇒ `viewport_dirty`; a move ⇒ x/y). This was a HOST-ONLY
+regression: a laptop whose deployed `ghostty-host` predated the idle-CPU optimization
+was unaffected, while one with the newer host showed it (the GUI is identical; only the
+host gates pushes). The snapshot-level `cursorEql` test always passed — the gap was that
+nothing drove a cursor-only move through the real `renderTick`/`must_capture` path
+(now covered by a regression test in `src/host/test.zig`).
+
 ### Resize, reattach, protocol
 
 - **Resize** drives off the **authoritative wire `{cols, rows}`** the GUI rendered
