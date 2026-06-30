@@ -598,7 +598,10 @@ ONLY** into `Contents/Resources/agent-manager` — the path `resolveSidecarDir()
 over the dev `#filePath`. **`node_modules` is deliberately NOT bundled** (~271MB and it
 ships a ~215MB native `claude` Mach-O — in `@anthropic-ai/claude-agent-sdk-darwin-arm64` —
 that would break notarization), so the bundle is pure-JS data — notarization-safe, no extra
-signing (the app seal covers `Resources/`).
+signing (the app seal covers `Resources/`). **Test files are also excluded:** `tsc` emits
+`dist/**/*.test.js` (dev-only — `npm test` runs them) next to the runtime entry, so every copy
+site (both release paths **and** `macos/build.nu`) deletes `*.test.js` from the destination
+`dist` after the copy (the shell paths assert none survive); the source `dist` is left intact.
 
 **The summarizer is NO LONGER dev-only** (this supersedes the old "needs un-bundled
 `node_modules`" note). The release `npm run build` is now `tsc` + **esbuild**

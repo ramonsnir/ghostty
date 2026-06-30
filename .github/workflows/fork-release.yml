@@ -191,6 +191,14 @@ jobs:
           rm -rf "$DST"; mkdir -p "$DST"
           cp -R macos/agent-manager/dist "$DST/dist"
           cp macos/agent-manager/package.json "$DST/package.json"
+          # Test files (dist/**/*.test.js, emitted by tsc over src/**/*.test.ts) are dev-only
+          # and must NEVER ship in the notarized bundle — the runtime entry is the
+          # self-contained dist/index.js. Prune them from the COPY (never the source).
+          find "$DST/dist" -name '*.test.js' -delete
+          # Guard via `-print -quit` (stops at the first hit — no pipe, so no
+          # SIGPIPE/pipefail race a `find | grep -q` form would have under `bash -eo pipefail`).
+          test -z "$(find "$DST/dist" -name '*.test.js' -print -quit)" \
+            || { echo "ERROR: *.test.js survived pruning in the bundled sidecar dist"; exit 1; }
           rm -rf "$DST/node_modules"   # never let node_modules into the notarized bundle
           test -f "$DST/dist/index.js" && test -f "$DST/package.json"
 

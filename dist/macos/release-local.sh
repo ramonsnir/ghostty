@@ -149,6 +149,14 @@ rm -rf "$SIDECAR_DST"
 mkdir -p "$SIDECAR_DST"
 cp -R macos/agent-manager/dist "$SIDECAR_DST/dist"
 cp macos/agent-manager/package.json "$SIDECAR_DST/package.json"
+# Test files (dist/**/*.test.js, emitted by tsc over src/**/*.test.ts) are dev-only and
+# must NEVER ship in the notarized bundle — the runtime entry is the self-contained
+# dist/index.js. Prune them from the COPY (never the source: `npm test` runs them there).
+find "$SIDECAR_DST/dist" -name '*.test.js' -delete
+# Guard via `-print -quit` (stops at the first hit — no pipe, so no SIGPIPE/pipefail race
+# that a `find | grep -q` form would have under `set -euo pipefail`).
+test -z "$(find "$SIDECAR_DST/dist" -name '*.test.js' -print -quit)" \
+  || { echo "ERROR: *.test.js survived pruning in the bundled sidecar dist"; exit 1; }
 # Belt-and-suspenders: never let node_modules sneak into the notarized bundle.
 rm -rf "$SIDECAR_DST/node_modules"
 

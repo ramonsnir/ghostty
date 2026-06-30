@@ -79,9 +79,15 @@ def bundle-sidecar [build_dir: string, configuration: string] {
 
     let dst = ([$app, "Contents", "Resources", "agent-manager"] | path join)
     mkdir $dst
-    rm -r -f ($dst | path join "dist")
-    cp -r $dist ($dst | path join "dist")
+    let dst_dist = ($dst | path join "dist")
+    rm -r -f $dst_dist
+    cp -r $dist $dst_dist
     cp ($src | path join "package.json") $dst
+
+    # Test files (dist/**/*.test.js, emitted by tsc over src/**/*.test.ts) are dev-only and
+    # must NEVER ship in the bundled app — the runtime entry is the self-contained
+    # dist/index.js. Prune them from the COPY (never the source: `npm test` runs them there).
+    glob ($dst_dist | path join "**" "*.test.js") | each {|f| rm -f $f }
 
     # Re-sign: xcodebuild already signed the app and we just modified Resources. Match the
     # CLAUDE.md install block's ad-hoc deep sign so the locally-runnable app stays valid.
