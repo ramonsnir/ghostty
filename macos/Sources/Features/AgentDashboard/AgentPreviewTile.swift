@@ -307,9 +307,9 @@ struct AgentPreviewTile: View {
                 .frame(maxWidth: .infinity)
                 .frame(height: Self.previewHeight)
                 // Fill the whole preview rectangle with the THEME terminal
-                // background so a split narrower than `referenceColumns` (which
-                // renders left-aligned with empty space on the right — see
-                // AgentMirrorPreview) blends seamlessly into the mirror instead of
+                // background so any area the bottom-anchored mirror doesn't cover
+                // (e.g. vertical slack when a short pane's scaled height is under the
+                // fixed preview height) blends seamlessly into the mirror instead of
                 // showing the tile's control-background. Read from config (the
                 // `background` color), never hard-coded; the mirror surface paints
                 // the same color under its cells, so the seam is invisible.
@@ -550,12 +550,12 @@ struct AgentMirrorPreview: View {
                 skipRows: skipRows, rows: rows,
                 cellH: cellH, backing: backing, scale: g.scale)
 
-            // Horizontal scroll for splits wider than `referenceColumns`; narrow
-            // splits show left-aligned with empty space on the right. The mirror
-            // is scaled UNIFORMLY (g.scale) so cell size is identical across all
-            // tiles. `.bottomLeading` anchor keeps column 0 at the scroll origin
-            // and the agent's latest (bottom) rows pinned; the top is clipped.
-            ScrollView(.horizontal, showsIndicators: true) {
+            // FIT-TO-WIDTH: the mirror is scaled (g.scale) so the agent pane's own
+            // width fills the tile, so `scaledW == geo.width` and there's no
+            // horizontal overflow — the ScrollView is retained only as a stable
+            // container (indicators off; it never actually scrolls). `.bottomLeading`
+            // pins column 0 + the agent's latest (bottom) rows; the top is clipped.
+            ScrollView(.horizontal, showsIndicators: false) {
                 Ghostty.SurfaceWrapper(surfaceView: surfaceView, isSplit: true)
                     .environmentObject(ghostty)
                     // Make ONLY the mirror NSView inert (so it never grabs the
@@ -612,26 +612,26 @@ struct AgentMirrorPreview: View {
         if n != skipRows { skipRows = n }
     }
 
-    /// The number of columns that fill the preview's WIDTH. This sets a UNIFORM
-    /// cell size across every tile regardless of the split's own width: a split
-    /// with fewer columns shows with empty space on the right; one with more
-    /// columns overflows and is reached via the horizontal scroll bar. Hardcoded
-    /// for now (config knob is a follow-up).
-    static let referenceColumns: CGFloat = 125
-
     /// PURE geometry for the mirror preview, factored out for unit testing (the
     /// view can't render off a headless display). `cellW`/`cellH` are BACKING
     /// pixels; `cols`/`rows` are the HOST grid (from the REAL surface — NOT the
     /// mirror's own frame-tracking `surfaceSize`, which would feed back and
-    /// collapse the view).
+    /// collapse the view; see the body's host-first cell-size reads).
     ///
     /// `naturalW`×`naturalH` is the FULL host grid in points (the SurfaceWrapper
-    /// frame, so every row renders with no internal clip/pad). `scale` is UNIFORM
-    /// — chosen so `referenceColumns` columns span the container width — so text
-    /// size is identical across tiles; `scaledW`×`scaledH` is the on-screen size
-    /// after scaling (the horizontal-scroll content width is `scaledW`). Falls
-    /// back to width-fit (scale so the whole grid fits) when the cell size isn't
-    /// known yet, so the view never collapses.
+    /// frame, so every row renders with no internal clip/pad). **FIT-TO-WIDTH:**
+    /// `scale` makes the agent pane's OWN width fill the tile, so every preview
+    /// uses the whole width regardless of the pane's column count — a narrow split
+    /// scales UP, a wide one DOWN; the caller bottom-anchors + height-clips to show
+    /// the latest rows. `scaledW` therefore equals the container width (no
+    /// horizontal overflow / scroll). The backing factor cancels out of
+    /// `scaledW`/`scaledH`, so the on-screen result is independent of any
+    /// backing-scale mismatch. Falls back to the container size when the grid/cell
+    /// isn't known yet, so the view never collapses.
+    ///
+    /// (Was: a fixed 125-column reference + uniform scale, which left narrower panes
+    /// using only `cols/125` of the tile width — e.g. ~⅓ for a ~40-col split — and
+    /// just rescaled that fraction on a dashboard resize instead of reflowing.)
     struct PreviewGeometry: Equatable {
         let naturalW: CGFloat
         let naturalH: CGFloat
@@ -641,28 +641,14 @@ struct AgentMirrorPreview: View {
     }
     static func geometry(
         cols: Int, rows: Int, cellW: CGFloat, cellH: CGFloat,
-        backing: CGFloat, container: CGSize, referenceColumns: CGFloat = referenceColumns
+        backing: CGFloat, container: CGSize
     ) -> PreviewGeometry {
         let bk = backing > 0 ? backing : 2.0
         let naturalW = (cols > 0 && cellW > 0) ? CGFloat(cols) * cellW / bk : container.width
         let naturalH = (rows > 0 && cellH > 0) ? CGFloat(rows) * cellH / bk : container.height
-        // UNIFORM scale: referenceColumns columns fill the container width, so
-        // every tile renders at the same cell size. Before the first frame
-        // (cellW == 0) fall back to width-fit so the view still fills the row.
-        let rawScale: CGFloat
-        if cellW > 0 && referenceColumns > 0 {
-            rawScale = container.width / (referenceColumns * cellW / bk)
-        } else if naturalW > 0 {
-            rawScale = container.width / naturalW
-        } else {
-            rawScale = 1.0
-        }
-        // DEFENSIVE CLAMP: a thumbnail only ever SHRINKS the host grid — a real
-        // terminal split has >= referenceColumns-ish columns, so the legitimate
-        // scale is always <= 1. Capping at 1 means no transient/degenerate input
-        // (a momentary tiny or zero cell size) can ever blow the preview up into a
-        // few giant native-size cells. Untouched in the normal case (scale < 1).
-        let scale = min(rawScale, 1.0)
+        // FIT-TO-WIDTH: scale the agent pane's own width to fill the tile width.
+        // scaledW == container.width for any column count (narrow → up, wide → down).
+        let scale = naturalW > 0 ? container.width / naturalW : 1.0
         return PreviewGeometry(
             naturalW: naturalW, naturalH: naturalH, scale: scale,
             scaledW: naturalW * scale, scaledH: naturalH * scale)

@@ -12,13 +12,14 @@ struct AgentMirrorGeometryTests {
         // row at 2x backing.
         let g = AgentMirrorPreview.geometry(
             cols: 120, rows: 40, cellW: 14, cellH: 30, backing: 2,
-            container: CGSize(width: 560, height: 220), referenceColumns: 120)
+            container: CGSize(width: 560, height: 220))
         // Natural size is the FULL host grid in points — NOT collapsed (the bug
         // that made the preview empty / one row produced a tiny naturalH here).
         #expect(abs(g.naturalW - 840) < 0.5)   // 120*14/2
         #expect(abs(g.naturalH - 600) < 0.5)   // 40*30/2
-        // With referenceColumns == cols, the full width is filled (scale fits).
+        // Fit-to-width: the pane's own width fills the row (scaledW == container).
         #expect(abs(g.scale - 560.0 / 840.0) < 0.001)
+        #expect(abs(g.scaledW - 560) < 0.5)
         // The scaled content is TALLER than the row, so the top is clipped and
         // the agent's latest (bottom) rows are what's shown.
         #expect(g.naturalH * g.scale > 220)
@@ -44,47 +45,52 @@ struct AgentMirrorGeometryTests {
         #expect(g.scale > 0)
     }
 
-    @Test func scaleNeverUpscalesBeyondNative() {
-        // Regression: the preview must only ever SHRINK the host grid. A degenerate
-        // tiny cell size (e.g. a transient mid-flicker frame) would otherwise drive
-        // the uniform scale far above 1, blowing the thumbnail up into a few giant
-        // native-size cells. The clamp pins scale at 1.0.
-        let g = AgentMirrorPreview.geometry(
-            cols: 98, rows: 35, cellW: 1, cellH: 2, backing: 2,
-            container: CGSize(width: 992, height: 220), referenceColumns: 125)
-        #expect(g.scale == 1.0)                       // clamped (raw would be ~15.9)
-        #expect(abs(g.scaledW - g.naturalW) < 0.001)  // scaledW = naturalW * 1
-        // A normal host grid is unaffected by the clamp (scale stays < 1).
-        let normal = AgentMirrorPreview.geometry(
-            cols: 98, rows: 35, cellW: 17, cellH: 36, backing: 2,
-            container: CGSize(width: 992, height: 220), referenceColumns: 125)
-        #expect(normal.scale < 1.0)
-        #expect(abs(normal.scale - 992.0 / (125.0 * 17.0 / 2.0)) < 0.001)
+    @Test func fitsWidthForEverySplitWidth() {
+        // FIT-TO-WIDTH: every preview fills the tile width regardless of the pane's
+        // own column count — a narrow split scales UP, a wide one DOWN, but both end
+        // up scaledW == container.width (the fix for "narrow panes use ~1/3 width").
+        let container = CGSize(width: 992, height: 220)
+        let narrow = AgentMirrorPreview.geometry(
+            cols: 40, rows: 35, cellW: 17, cellH: 36, backing: 2, container: container)
+        let wide = AgentMirrorPreview.geometry(
+            cols: 200, rows: 50, cellW: 17, cellH: 36, backing: 2, container: container)
+        // Both fill the full width.
+        #expect(abs(narrow.scaledW - container.width) < 0.5)
+        #expect(abs(wide.scaledW - container.width) < 0.5)
+        // Narrow upscales (>1), wide downscales (<1) — opposite of a uniform scale.
+        #expect(narrow.scale > 1.0)
+        #expect(wide.scale < 1.0)
+        // scaledH tracks the same scale so aspect ratio is preserved.
+        #expect(abs(narrow.scaledH - narrow.naturalH * narrow.scale) < 0.001)
     }
 
-    @Test func uniformScaleAcrossSplitsOfDifferentWidths() {
-        // Two splits with DIFFERENT column counts but the same cell/backing must
-        // get the SAME scale (uniform cell size), with `referenceColumns` (here
-        // 120) filling the width. The narrow split's content is narrower than the
-        // row (pads right); the wide split's overflows (horizontal scroll).
-        let container = CGSize(width: 560, height: 220)
-        let narrow = AgentMirrorPreview.geometry(
-            cols: 80, rows: 24, cellW: 14, cellH: 30, backing: 2,
-            container: container, referenceColumns: 120)
-        let wide = AgentMirrorPreview.geometry(
-            cols: 240, rows: 50, cellW: 14, cellH: 30, backing: 2,
-            container: container, referenceColumns: 120)
-        // Same uniform scale regardless of the split's own width.
-        #expect(abs(narrow.scale - wide.scale) < 0.0001)
-        #expect(abs(narrow.scale - 560.0 / (120.0 * 14.0 / 2.0)) < 0.001)
-        // Narrow content fits within the row; wide content overflows → scroll.
-        #expect(narrow.scaledW < container.width)
-        #expect(wide.scaledW > container.width)
-        // Exactly `referenceColumns` columns spans the width.
-        let refWidth = AgentMirrorPreview.geometry(
-            cols: 120, rows: 24, cellW: 14, cellH: 30, backing: 2,
-            container: container, referenceColumns: 120).scaledW
-        #expect(abs(refWidth - container.width) < 0.5)
+    @Test func scaledWidthIsBackingIndependent() {
+        // The backing factor cancels out of the on-screen result: the same grid at
+        // 1x and 2x backing fills the width identically (robust to a backing-scale
+        // mismatch between the dashboard panel and the mirrored window).
+        let container = CGSize(width: 800, height: 220)
+        let at1x = AgentMirrorPreview.geometry(
+            cols: 90, rows: 30, cellW: 9, cellH: 18, backing: 1, container: container)
+        let at2x = AgentMirrorPreview.geometry(
+            cols: 90, rows: 30, cellW: 18, cellH: 36, backing: 2, container: container)
+        #expect(abs(at1x.scaledW - at2x.scaledW) < 0.001)
+        #expect(abs(at1x.scaledH - at2x.scaledH) < 0.001)
+        #expect(abs(at1x.scaledW - container.width) < 0.5)
+    }
+
+    @Test func resizeKeepsFillingWidth() {
+        // Resizing the dashboard (container width) re-fits: the preview keeps filling
+        // the new width instead of staying at a fixed fraction (the resize complaint).
+        let g = AgentMirrorPreview.geometry(
+            cols: 80, rows: 30, cellW: 17, cellH: 36, backing: 2,
+            container: CGSize(width: 600, height: 220))
+        let wider = AgentMirrorPreview.geometry(
+            cols: 80, rows: 30, cellW: 17, cellH: 36, backing: 2,
+            container: CGSize(width: 1200, height: 220))
+        #expect(abs(g.scaledW - 600) < 0.5)
+        #expect(abs(wider.scaledW - 1200) < 0.5)
+        // Twice the width → twice the scale (fills, not a fixed fraction).
+        #expect(abs(wider.scale - g.scale * 2) < 0.001)
     }
 }
 

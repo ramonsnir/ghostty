@@ -418,24 +418,33 @@ gotchas, not a recap.)
   thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
   Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
 
-- **⚠️ Preview-scale inputs come from the HOST surface, never the mirror's own size
-  (feedback-loop fix).** `AgentMirrorPreview.geometry` scales the mirror so
-  `referenceColumns` columns fill the tile width. It MUST take **cols/rows AND
-  cell_width/height** from the *real* (host) surface (`realSurface.surfaceSize`),
-  with the mirror's own `surfaceSize` only as a last-resort fallback. The mirror's
-  frame is computed FROM these cell metrics, and the mirror's own `cell_width_px`
-  **jitters ±1px** (e.g. 17↔16) as that frame re-rounds its framebuffer onto a
-  sub-pixel boundary — so reading the mirror's cell size here closes a feedback loop
-  that oscillates the scale every frame: a ~160 Hz "the preview keeps switching font
-  size" flicker, **display-dependent** (it appears only when the cell lands on a
-  half-pixel edge, e.g. after moving the window between displays of different scale).
-  The host surface has a fixed real frame, so its cell size is stable and breaks the
-  loop. (This was a shipped bug: `cellW`/`cellH` were mirror-first while `cols`/`rows`
-  were already host-first; the fix makes all four host-first.) Belt-and-suspenders:
-  `geometry` also CLAMPS the final scale to ≤ 1.0 — a thumbnail only ever SHRINKS a
-  real terminal grid, so no transient/degenerate input can ever blow the preview up
-  into a few giant native-size cells. Tests: `AgentMirrorGeometryTests`
-  (`scaleNeverUpscalesBeyondNative` + the existing geometry cases, all scale < 1).
+- **⚠️ `AgentMirrorPreview.geometry` is FIT-TO-WIDTH, and its cell-size inputs come
+  from the HOST surface (feedback-loop fix).** Two coupled facts:
+  1. **Fit-to-width, NOT a fixed reference.** `scale = container.width / naturalW`
+     so the agent pane's OWN width fills the tile (`scaledW == container.width`) for
+     any column count — a narrow split scales UP, a wide one DOWN; the caller
+     bottom-anchors + height-clips to show the latest rows. The earlier scheme scaled
+     to a fixed 125-column reference, which left a narrower pane using only `cols/125`
+     of the tile (≈⅓ for a ~40-col split) and just rescaled that fraction on a
+     dashboard resize instead of reflowing. The backing factor **cancels** in
+     `scaledW`/`scaledH`, so the on-screen result is independent of any backing-scale
+     mismatch. There is NO `≤1.0` clamp (a narrow pane legitimately upscales to fill).
+  2. **cols/rows AND cell_width/height all come from the *real* (host) surface**
+     (`realSurface.surfaceSize`), the mirror's own `surfaceSize` only as a last-resort
+     fallback. The mirror's frame is computed FROM the cell size, and the mirror's own
+     `cell_width_px` **jitters ±1px** (e.g. 17↔16) as that frame re-rounds its
+     framebuffer onto a sub-pixel boundary — so reading the *mirror's* cell size closed
+     a feedback loop that oscillated the scale every frame: a ~160 Hz "the preview keeps
+     switching font size" flicker, **display-dependent** (it appears only when the cell
+     lands on a half-pixel edge, e.g. after moving the window between displays of
+     different scale). The host surface has a fixed real frame, so its cell size is
+     stable and breaks the loop. (Shipped bug: `cellW`/`cellH` were once mirror-first
+     while `cols`/`rows` were host-first; all four are now host-first.)
+
+  Tests: `AgentMirrorGeometryTests` (`fitsWidthForEverySplitWidth`,
+  `scaledWidthIsBackingIndependent`, `resizeKeepsFillingWidth`, +
+  `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
+  `zeroBackingDoesNotDivideByZero`).
 
 ### Smart bottom-anchor — skip empty rows AND the info-less footer
 

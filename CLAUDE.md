@@ -297,16 +297,20 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   entry "Hide Split from Agent Dashboard"; its apprt `Action`/`Key`/`ghostty.h` enum entry is
   appended LAST (union order must match the `Key` enum). **See
   `AGENT-DASHBOARD.md` (→ Implementation notes) for the bottom-anchor subsystem, detection, hook
-  plumbing, wiring + tests.** **Preview-scale feedback-loop fix (always on):**
-  `AgentMirrorPreview.geometry` takes the preview's cell size (`cell_width/height_px`) from the
-  HOST surface, NOT the mirror's own `surfaceSize` — the mirror's `cell_width_px` jitters ±1px
-  (17↔16) as its frame re-rounds onto a sub-pixel boundary, and reading it closed a feedback loop
-  that oscillated the scale ~160 Hz (the "preview keeps switching font size" flicker, display-
-  dependent — surfaces after moving the window between displays of different scale). `cols`/`rows`
-  were already host-first; this makes `cellW`/`cellH` match. Plus a defensive `scale ≤ 1.0` clamp
-  (a thumbnail only shrinks) so no degenerate transient can blow a tile up to giant cells. Wiring:
-  `AgentPreviewTile.swift` (`geometry` + the body's host-first cell-size reads). Tests:
-  `AgentMirrorGeometryTests.scaleNeverUpscalesBeyondNative`.
+  plumbing, wiring + tests.** **Preview geometry — FIT-TO-WIDTH + host-sourced cell size
+  (always on):** `AgentMirrorPreview.geometry` scales each preview so the agent pane's OWN width
+  fills the tile (`scale = container.width / naturalW` ⇒ `scaledW == container.width` for any
+  column count: narrow panes scale up, wide ones down), bottom-anchored + height-clipped. Replaces
+  a fixed 125-column reference scale that left narrower panes using only `cols/125` of the width
+  (≈⅓ for ~40-col splits) and rescaled that fraction oddly on a dashboard resize. The backing
+  factor cancels out of `scaledW`/`scaledH` (robust to backing mismatch). Cell size
+  (`cell_width/height_px`) AND cols/rows all come from the HOST surface, NOT the mirror's own
+  `surfaceSize` — the mirror's `cell_width_px` jitters ±1px (17↔16) as its frame re-rounds onto a
+  sub-pixel boundary, which (when it fed the scale) caused a ~160 Hz "preview keeps switching font
+  size" flicker, display-dependent (surfaced after moving the window between displays of different
+  scale); the host's cell size is stable and breaks the loop. Wiring: `AgentPreviewTile.swift`
+  (`geometry` + the body's host-first cell-size reads). Tests: `AgentMirrorGeometryTests`
+  (`fitsWidthForEverySplitWidth`/`scaledWidthIsBackingIndependent`/`resizeKeepsFillingWidth`).
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a
