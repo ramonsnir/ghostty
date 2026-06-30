@@ -121,8 +121,46 @@ const BELL_WAIT_MS = 60000;
  *  a wedged server doesn't spin the loop. */
 const BELL_WAIT_RETRY_MS = 3000;
 
+/** (orphan guard) How often the parent-death watchdog checks `process.ppid`. The sidecar
+ *  is a child of the GUI; when that GUI dies (crash / SIGKILL / a clean-quit teardown that
+ *  loses the race), the OS reparents this process — `process.ppid` flips to launchd (1) or
+ *  another reaper. The watchdog then exits, so an orphaned sidecar can never resume reporting
+ *  to a *new* GUI that rebinds the same loopback MCP port (the split-brain that made the
+ *  Agent Queue health row alternate between two diverged snapshots). 2s is a tight reap with
+ *  negligible cost; the interval is `.unref()`'d so it never keeps an idle process alive. */
+const PARENT_WATCH_INTERVAL_MS = 2000;
+
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * (orphan guard) Parse the parent GUI's pid from `GHOSTTY_PARENT_PID` (set by the Swift
+ * `AgentManagerController`). Returns a positive integer, or `undefined` when the var is
+ * absent / malformed / non-positive (an OLD controller that doesn't set it). PURE +
+ * unit-tested. When undefined, `shouldExitForParentDeath` falls back to the reparent-to-1
+ * heuristic so the watchdog still works against an old GUI.
+ */
+export function parseParentPid(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * (orphan guard) Decide whether the sidecar should exit because its parent GUI is gone.
+ * PURE + unit-tested. When we know the expected parent pid (passed via env), ANY change of
+ * the live `process.ppid` away from it means we've been reparented (the GUI died) → exit.
+ * Without it (old controller), fall back to "reparented to launchd" (`ppid === 1`), the
+ * canonical Unix orphan signal. macOS `process.ppid` re-reads `getppid()` each access, so
+ * it reflects the reparent promptly.
+ */
+export function shouldExitForParentDeath(
+  currentPpid: number,
+  expectedParentPid: number | undefined,
+): boolean {
+  if (expectedParentPid !== undefined) return currentPpid !== expectedParentPid;
+  return currentPpid === 1;
+}
 
 /**
  * (bell-attention v2 slice 4) Wrap an async run so concurrent callers COALESCE instead
@@ -1128,6 +1166,22 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+
+  // (orphan guard) Watch for the parent GUI dying. The controller's `teardown()` is
+  // best-effort — it never runs on a GUI crash / SIGKILL, and can lose the race on a clean
+  // quit — so a sidecar can be orphaned (reparented), keep polling, and then silently resume
+  // reporting to the NEXT GUI that rebinds the same loopback MCP port. That split-brain is
+  // what made the Agent Queue health row alternate between two diverged snapshots. Tie our
+  // life to the parent's: once reparented, exit. `.unref()` so the timer alone never keeps an
+  // otherwise-idle process alive.
+  const parentPid = parseParentPid(process.env.GHOSTTY_PARENT_PID);
+  const parentWatch = setInterval(() => {
+    if (shouldExitForParentDeath(process.ppid, parentPid)) {
+      log(`parent GUI gone (ppid now ${process.ppid}, expected ${parentPid ?? "?"}); exiting`);
+      shutdown("parent-death");
+    }
+  }, PARENT_WATCH_INTERVAL_MS);
+  parentWatch.unref();
 
   // (bell-attention v2 slice 4) Both the 5s timer and the bell-reactive long-poll run
   // sweeps through this COALESCED runner, so a bell event can wake an immediate classify
