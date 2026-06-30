@@ -470,7 +470,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   fires the provider `claim`, and lets `reconcile`'s EXISTING orphan-adoption fold the annotated
   surface in (relying on its non-zero-`sessionID` precondition — guaranteed under the queue's
   pty-host HARD DEP; NOT a parallel adoption path). It occupies a concurrency slot but does NOT bump
-  `lifetimeDispatched` (no new agent launched). **⭐ The chokepoint is the `coerceQueueCommands`
+  `lifetimeDispatched` (no new agent launched). **⭐ A SECOND chokepoint (shipped + fixed
+  2026-06-30): reconcile reads `queueName`/`queueKey` BACK off the `list_surfaces` rows, so the
+  Swift `list_surfaces` row builder (`MCPLayout.surfacesJSONData`) MUST EMIT those tags** — it
+  originally did not, so an adopted split was annotated + grouped in the dashboard (which reads its
+  OWN annotation model) but the sidecar reconcile was BLIND to it → never folded into `run.active`
+  → uncounted in the health bar (`N running` stuck) AND untracked (no status-poll / auto-close).
+  The tags now flow annotation → `HookSnapshotEntry` (queueKey/queueName/queueUrl) → `SurfaceRow`
+  → the `list_surfaces` JSON. (The dashboard grouping is independent of this — that's why the
+  symptom was "shows under the queue but `1 running`".) **⭐ The chokepoint is the `coerceQueueCommands`
   whitelist in `mcp.ts` (NOT index.ts): `adopt`/`infer_key` are added to `QUEUE_ACTIONS` and the
   new `surfaceUUID`/`url` string fields are carried — else the GUI emit is SILENTLY DROPPED and the
   feature is a no-op** (the matched pair: `QueueCommandBridge.swift`'s `jsonObject` emit ⇄ this
@@ -496,8 +504,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `QueueCommandBridge.swift` (`.adopt`/`.inferKey` + `surfaceUUID`/`url`), `AgentStateBridge.swift`
   (`queueKeySuggested` + `clearingSuggestion()`), `MCPAnnotation.swift`/`MCPTools.swift`
   (`set_surface_annotation` parse keeping `""` + schema), `AgentDashboardController.swift`
-  (`adoptSplit`/`requestInferKey`/`runNamesForAdopt`/`graphNodeForAdopt`/`activeKeysForRun`/`jumpToKey`),
-  `AgentPreviewTile.swift` (button + `.sheet` + re-infer-on-run-change), `AgentDashboardView.swift`.
+  (`adoptSplit`/`requestInferKey`/`runNamesForAdopt`/`graphNodeForAdopt`/`activeKeysForRun`/`jumpToKey`
+  + `HookSnapshotEntry` queueKey/queueName/queueUrl so `list_surfaces` carries them),
+  `MCPLayout.swift` (`SurfaceRow` queue tags + `surfacesJSONData` emit — the reconcile-visibility
+  chokepoint above), `AgentPreviewTile.swift` (button + `.sheet` + re-infer-on-run-change),
+  `AgentDashboardView.swift`.
   Tests: sidecar `mcp.test.ts`/`queue/commands.test.ts`/`queue/runner.test.ts`/`queue/infer.test.ts`;
   Swift `QueuePaletteTests.swift`/`MCPAnnotationTests.swift`/`MCPServerTests.swift`. **See
   `AGENT-QUEUE.md` (→ Adopting a free split / Implementation notes). GUI relaunch + rebuilt sidecar

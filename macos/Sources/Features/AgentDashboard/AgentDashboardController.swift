@@ -866,6 +866,16 @@ final class AgentDashboardModel: ObservableObject {
         /// (no point spending a Haiku call on a tile you've decluttered away). The
         /// hidden set is dashboard view-state, persisted per bundle id.
         let hidden: Bool
+        /// (ramon fork / Agent Queue, adopt) The queue tags from this surface's
+        /// annotation, echoed into the MCP `list_surfaces` row so the supervisor's
+        /// reconcile orphan-adoption can fold an ADOPTED split into `run.active`.
+        /// WITHOUT these, an adopted split is annotated + grouped in the dashboard but
+        /// never read back by the sidecar (reconcile keys off `queueName`/`queueKey`
+        /// from `list_surfaces`), so it stays UNCOUNTED in the health bar AND UNTRACKED
+        /// (no status-poll / auto-close). nil when the surface carries no queue tag.
+        let queueKey: String?
+        let queueName: String?
+        let queueUrl: String?
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -884,7 +894,10 @@ final class AgentDashboardModel: ObservableObject {
                 lastTool: lastTool[id],
                 notes: annotations[id]?.summary,
                 agentKind: agents[id]?.command,
-                hidden: hidden.contains(id))
+                hidden: hidden.contains(id),
+                queueKey: annotations[id]?.queueKey,
+                queueName: annotations[id]?.queueName,
+                queueUrl: annotations[id]?.queueUrl)
         }
         return out
     }

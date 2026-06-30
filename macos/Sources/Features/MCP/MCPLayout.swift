@@ -107,6 +107,14 @@ enum MCPLayout {
         /// pty-host) — the supervisor self-disables on a 0 here. A PLAIN integer —
         /// emitted UNCONDITIONALLY in JSON (the sidecar reads it every sweep).
         let sessionID: UInt64
+        /// fork / Agent Queue (adopt): the queue tags from this surface's annotation,
+        /// echoed so the supervisor's reconcile orphan-adoption can fold an ADOPTED
+        /// split into `run.active` (it keys off `queueName`/`queueKey` read back from
+        /// `list_surfaces`). nil when the surface carries no queue tag. Defaulted so the
+        /// (separate) WebMonitor SurfaceRow and test constructors are unaffected.
+        let queueKey: String? = nil
+        let queueName: String? = nil
+        let queueUrl: String? = nil
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
@@ -175,7 +183,10 @@ enum MCPLayout {
                     notes: hook?.notes,
                     agentKind: hook?.agentKind,
                     hidden: hook?.hidden ?? false,
-                    sessionID: sessionID))
+                    sessionID: sessionID,
+                    queueKey: hook?.queueKey,
+                    queueName: hook?.queueName,
+                    queueUrl: hook?.queueUrl))
             }
         }
         return rows
@@ -216,6 +227,12 @@ enum MCPLayout {
             // off list rows and "sessionId" off the spawn result); keep them in sync if
             // either key is renamed.
             d["sessionID"] = NSNumber(value: $0.sessionID)
+            // fork / Agent Queue (adopt): echo the queue tags so the supervisor's
+            // reconcile can fold an adopted surface into run.active. Omit when nil
+            // (honest absence — a non-queue surface carries no tags).
+            if let qk = $0.queueKey { d["queueKey"] = qk }
+            if let qn = $0.queueName { d["queueName"] = qn }
+            if let qu = $0.queueUrl { d["queueUrl"] = qu }
             return d
         }
     }
