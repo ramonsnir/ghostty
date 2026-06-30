@@ -100,6 +100,13 @@ export interface Annotation {
    *  supervisor stamps this each sweep so the dashboard 📌 pin reflects the live state.
    *  Partial-merge, like the rest. */
   keep?: boolean;
+  /** (adopt) A Haiku-inferred work-item KEY suggestion for the adopt modal's prefill. Written
+   *  by the `infer_key` seam (`runInferKey` → `deps.inferKey`); the GUI observes it via the
+   *  annotation path and prefills the key TextField. SENTINEL: a NON-EMPTY string = the inferred
+   *  key; the EMPTY string `""` = "the sidecar tried and found nothing" (a definite negative —
+   *  ALWAYS written on the infer_key path, never omitted, so the GUI can drop its spinner);
+   *  ABSENT (=== undefined) = "no suggestion yet". Partial-merge, like the rest. */
+  queueKeySuggested?: string;
 }
 
 /** Minimal shape of a JSON-RPC response we care about. */
@@ -174,6 +181,10 @@ export class McpClient {
     if (ann.queueName !== undefined) args.queueName = ann.queueName;
     if (ann.queueUrl !== undefined) args.queueUrl = ann.queueUrl;
     if (ann.keep !== undefined) args.keep = ann.keep;
+    // (adopt) Forward EVEN the empty string `""` (it is the load-bearing "inferred nothing"
+    // sentinel, distinct from absent = "no suggestion yet" — §1.3). `!== undefined`, NOT a
+    // truthiness check.
+    if (ann.queueKeySuggested !== undefined) args.queueKeySuggested = ann.queueKeySuggested;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.
     await this.call("set_surface_annotation", args);
   }
@@ -540,6 +551,12 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   "set_concurrency",
   "set_keep",
   "release",
+  // (adopt) adopt a free human-created split into a run (move + latch + annotate); infer_key
+  // triggers an on-demand Haiku key inference whose result returns via the annotation channel.
+  // Both ride this same FIFO; WITHOUT them here the GUI emit is SILENTLY DROPPED below and the
+  // whole adopt feature is a no-op.
+  "adopt",
+  "infer_key",
 ]);
 
 /**
@@ -547,8 +564,8 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
  * PURE + TOLERANT — exported for unit testing. Accepts the `{commands:[...]}` envelope
  * (the wire shape). Anything else — a non-object, a missing/non-array `commands`, a
  * non-object entry, or an entry with an unrecognized `action` — yields `[]` / drops that
- * entry. Only `action`, `template`, `run`, `params`, `maxItems`, `concurrency`, `key`, and
- * `keep` are carried (and only when correctly typed).
+ * entry. Only `action`, `template`, `run`, `params`, `maxItems`, `concurrency`, `key`, `keep`,
+ * `surfaceUUID`, and `url` are carried (and only when correctly typed).
  */
 export function coerceQueueCommands(obj: unknown): QueueCommand[] {
   if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return [];
@@ -578,6 +595,10 @@ export function coerceQueueCommands(obj: unknown): QueueCommand[] {
     // (keep) set_keep carries the work-item key (string) + the keep verdict (boolean).
     if (typeof r.key === "string" && r.key.length > 0) cmd.key = r.key;
     if (typeof r.keep === "boolean") cmd.keep = r.keep;
+    // (adopt / infer_key) the GUI surface UUID of the split to adopt / read.
+    if (typeof r.surfaceUUID === "string" && r.surfaceUUID.length > 0) cmd.surfaceUUID = r.surfaceUUID;
+    // (adopt) the work-item url for the dashboard badge, when the picked graph node had one.
+    if (typeof r.url === "string" && r.url.length > 0) cmd.url = r.url;
     out.push(cmd);
   }
   return out;

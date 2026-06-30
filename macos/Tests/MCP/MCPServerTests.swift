@@ -361,6 +361,10 @@ struct MCPServerTests {
             // Agent Manager: Haiku usage/budget query.
             "get_haiku_usage",
         ]
+        // (adopt) The "Adopt a free split into a queue" feature added NO MCP tool: the
+        // adopt/infer_key queue commands ride the existing `take_queue_commands` tool, and
+        // the `queueKeySuggested` annotation field rides the existing
+        // `set_surface_annotation` tool — so the registered tool count stays 26.
         #expect(names == expected)
         #expect(tools.count == 26)
         for tool in tools {

@@ -52,6 +52,14 @@ struct AgentAnnotation: Equatable, Sendable {
     /// 📌 pin's on/off state. OPTIONAL so a partial update that omits it preserves the prior
     /// value on merge; nil reads as "not kept" at the tile.
     let queueKeep: Bool?
+    /// (ramon fork / Agent Queue, adopt) The Haiku-inferred work-item KEY suggestion for
+    /// the adopt-modal's prefill, written by the sidecar's `infer_key` seam. Three states
+    /// (load-bearing sentinel): nil ⇒ "no suggestion yet" (still inferring / never
+    /// requested); "" (empty) ⇒ "the sidecar tried and inferred nothing" (definite
+    /// negative); non-empty ⇒ the inferred key. Partial-merge like the rest — but BEWARE
+    /// `merging` never NILS a field (see `clearingSuggestion()`), so the GUI clears a stale
+    /// value directly at modal open rather than through `merging`.
+    let queueKeySuggested: String?
 
     init(
         summary: String? = nil,
@@ -60,7 +68,8 @@ struct AgentAnnotation: Equatable, Sendable {
         queueKey: String? = nil,
         queueName: String? = nil,
         queueUrl: String? = nil,
-        queueKeep: Bool? = nil
+        queueKeep: Bool? = nil,
+        queueKeySuggested: String? = nil
     ) {
         self.summary = summary
         self.phase = phase
@@ -69,6 +78,7 @@ struct AgentAnnotation: Equatable, Sendable {
         self.queueName = queueName
         self.queueUrl = queueUrl
         self.queueKeep = queueKeep
+        self.queueKeySuggested = queueKeySuggested
     }
 
     /// Overlay `other`'s PROVIDED (non-nil) fields onto `self`, keeping `self`'s
@@ -84,7 +94,22 @@ struct AgentAnnotation: Equatable, Sendable {
             queueKey: other.queueKey ?? queueKey,
             queueName: other.queueName ?? queueName,
             queueUrl: other.queueUrl ?? queueUrl,
-            queueKeep: other.queueKeep ?? queueKeep)
+            queueKeep: other.queueKeep ?? queueKeep,
+            queueKeySuggested: other.queueKeySuggested ?? queueKeySuggested)
+    }
+
+    /// (ramon fork / Agent Queue, adopt) A copy of `self` with `queueKeySuggested` reset
+    /// to nil and EVERY other field preserved. This is the DELIBERATE bypass for
+    /// `merging`'s never-nils asymmetry: an unrelated summarizer annotation omits
+    /// `queueKeySuggested`, so `merging` would keep a STALE suggestion alive via `?? self`.
+    /// The GUI overwrites `annotations[id]` with this (NOT via `merging`) when the adopt
+    /// modal opens, so the modal starts from a clean nil and the next sidecar `infer_key`
+    /// write is the only thing that can set the prefill. PURE.
+    func clearingSuggestion() -> AgentAnnotation {
+        AgentAnnotation(
+            summary: summary, phase: phase, needsUser: needsUser,
+            queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
+            queueKeep: queueKeep, queueKeySuggested: nil)
     }
 }
 

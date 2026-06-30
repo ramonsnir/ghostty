@@ -28,7 +28,7 @@ import {
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
 import type { QueueStatusReport, QueueGraphReport } from "./status.js";
-import { loadKeep, loadStore, type StoreIO } from "./store.js";
+import { loadKeep, loadStore, loadDispatched, reconcile, type LiveSurface, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
 
@@ -2528,4 +2528,169 @@ test("runQueueSweep: aborting a run with provider.graph pushes report_queue_grap
   const gone = fake.calls.graphReports.at(-1)!;
   assert.equal(gone.present, false, "graph section cleared on abort");
   assert.deepEqual(gone.nodes, []);
+});
+
+// ---------------------------------------------------------------------------
+// (adopt) runAdopt — move the human-created split in, annotate, claim, persist the latch;
+//         roll back the latch on a move failure; no move when the run has no seated anchor;
+//         and the moved+annotated surface is folded in by reconcile next sweep.
+// ---------------------------------------------------------------------------
+
+/** Seat one RUNNING assignment in a run so `firstSeatedUUID` has an anchor pane. */
+function seat(run: QueueRun, key: string, uuid: string, slot = 0): void {
+  run.active.set(key, {
+    queueName: run.runName,
+    key,
+    sessionID: 500 + slot,
+    surfaceUUID: uuid,
+    gridSlot: slot,
+    state: "RUNNING",
+    sinceMs: 0,
+  });
+}
+
+test("runAdopt: moves the split into the run's tab, annotates (keep=template), claims, persists the latch", async () => {
+  const claimArgs: string[][] = [];
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  // Capture claim argv via a custom exec.
+  const exec: Exec = async (argv) => {
+    if (argv[0] === "claim") { claimArgs.push(argv); return { code: 0, stdout: "", stderr: "" }; }
+    if (argv[0] === "list") return { code: 0, stdout: "[]", stderr: "" };
+    return { code: 0, stdout: '{"state":"working"}', stderr: "" };
+  };
+  const store = memStore();
+  const t = tmpl({ keepOnComplete: true, provider: {
+    list: { command: ["list"], keyField: "id" },
+    status: { command: ["status", "{key}"], doneStates: ["done"] },
+    claim: { command: ["claim", "{key}"] },
+  } });
+  const run = makeQueueRun(t, store);
+  seat(run, "SEED", "anchor-uuid", 0);
+  let now = 6_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    exec,
+    takeCommands: commandsOnce([
+      { action: "adopt", run: "backlog", key: "ADOPT-1", surfaceUUID: "free-uuid", url: "http://x/ADOPT-1" },
+    ]),
+  });
+
+  await runQueueSweep(deps);
+
+  // The latch is the crux.
+  assert.ok(run.dispatched.has("ADOPT-1"), "adopt latched the key");
+  // The split was MOVED into the run's tab, anchored on the seated pane.
+  assert.equal(fake.calls.moveIntoTab.length, 1);
+  assert.equal(fake.calls.moveIntoTab[0].sourceUUID, "free-uuid");
+  assert.equal(fake.calls.moveIntoTab[0].targetAnchorUUID, "anchor-uuid");
+  assert.equal(fake.calls.moveIntoTab[0].maxCols, 3);
+  // The annotation stamps queueKey/queueName/queueUrl + keep FOLLOWING the template (true here).
+  const ann = fake.calls.annotate.find((a) => a.id === "free-uuid");
+  assert.ok(ann, "annotated the moved surface");
+  assert.equal(ann!.ann.queueKey, "ADOPT-1");
+  assert.equal(ann!.ann.queueName, "backlog");
+  assert.equal(ann!.ann.queueUrl, "http://x/ADOPT-1");
+  assert.equal(ann!.ann.keep, true, "keep follows template keepOnComplete, NOT a forced true");
+  // The claim fired with the adopted key.
+  assert.deepEqual(claimArgs, [["claim", "ADOPT-1"]]);
+  // The latch is persisted so suppression survives a crash before the adopting reconcile.
+  assert.ok(loadDispatched(store).includes("ADOPT-1"), "latch persisted");
+  // runAdopt NEVER writes run.active for the adopted key (reconcile is its sole owner) and never
+  // spawns — so no new agent was launched (lifetimeDispatched is only ever bumped by dispatch).
+  assert.ok(!run.active.has("ADOPT-1"), "adopt does not insert into active (reconcile owns it)");
+  assert.equal(fake.calls.spawn.length, 0, "adopt launches NO new agent (no spawn)");
+});
+
+test("runAdopt: a MOVE failure rolls back the latch (item stays dispatchable) and persists", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  // Make moveSurfaceIntoTab throw.
+  (fake.client as unknown as { moveSurfaceIntoTab: (a: unknown) => Promise<void> }).moveSurfaceIntoTab =
+    async () => { throw new Error("move boom"); };
+  const store = memStore();
+  const run = makeQueueRun(tmpl(), store);
+  seat(run, "SEED", "anchor-uuid", 0);
+  let now = 6_100_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    takeCommands: commandsOnce([
+      { action: "adopt", run: "backlog", key: "ADOPT-2", surfaceUUID: "free-uuid" },
+    ]),
+  });
+
+  await runQueueSweep(deps);
+
+  assert.ok(!run.dispatched.has("ADOPT-2"), "move failure rolled back the latch");
+  assert.ok(!loadDispatched(store).includes("ADOPT-2"), "rollback persisted");
+});
+
+test("runAdopt: no seated anchor → no move, but annotation is still stamped (seed)", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const run = makeQueueRun(tmpl(), memStore()); // empty run, no seated pane
+  let now = 6_200_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    takeCommands: commandsOnce([
+      { action: "adopt", run: "backlog", key: "SEED-1", surfaceUUID: "free-uuid" },
+    ]),
+  });
+
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.moveIntoTab.length, 0, "no move when the run has no seated anchor");
+  assert.ok(run.dispatched.has("SEED-1"), "still latched");
+  const ann = fake.calls.annotate.find((a) => a.id === "free-uuid");
+  assert.ok(ann, "annotation stamped so reconcile seeds it next sweep");
+  assert.equal(ann!.ann.queueKey, "SEED-1");
+});
+
+test("adopt + reconcile: the annotated surface is folded in as a RUNNING assignment, no lifetime bump", () => {
+  // The pure reconcile path the runner relies on: a live surface (non-zero sessionID) carrying
+  // queueKey+queueName with NO matching record is adopted as RUNNING.
+  const live: LiveSurface[] = [
+    { sessionID: 7777, surfaceUUID: "free-uuid", queueKey: "ADOPT-9", queueName: "backlog", title: "the bug" },
+  ];
+  const plan = reconcile([], live, 9_000_000, DEFAULT_PENDING_GRACE_MS);
+  const adopt = plan.actions.find((a) => a.kind === "adopt");
+  assert.ok(adopt, "reconcile adopts the annotated free surface");
+  assert.equal(adopt!.kind === "adopt" && adopt!.assignment.key, "ADOPT-9");
+  assert.equal(adopt!.kind === "adopt" && adopt!.assignment.state, "RUNNING");
+  assert.ok(adopt!.kind === "adopt" && adopt!.assignment.gridSlot >= 0, "occupies a real grid slot");
+});
+
+test("adopt + reconcile: a sessionID-0 surface is NOT adopted (§2.3 precondition)", () => {
+  const live: LiveSurface[] = [
+    { sessionID: 0, surfaceUUID: "free-uuid", queueKey: "ADOPT-0", queueName: "backlog" },
+  ];
+  const plan = reconcile([], live, 9_000_000, DEFAULT_PENDING_GRACE_MS);
+  assert.equal(plan.actions.find((a) => a.kind === "adopt"), undefined,
+    "a 0-session surface has no persistence key → not adoptable");
+});
+
+// ---------------------------------------------------------------------------
+// (adopt) runInferKey — the side-effect loop calls the inferKey seam; an infer_key with no
+//         seam is a harmless no-op; the seam writes queueKeySuggested.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: infer_key dispatches deps.inferKey with the surface + run", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const run = makeQueueRun(tmpl(), memStore());
+  const calls: Array<{ uuid: string; run: string }> = [];
+  let now = 6_300_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    takeCommands: commandsOnce([{ action: "infer_key", run: "backlog", surfaceUUID: "u-infer" }]),
+    inferKey: async (uuid, runName) => { calls.push({ uuid, run: runName }); },
+  });
+
+  await runQueueSweep(deps);
+
+  assert.deepEqual(calls, [{ uuid: "u-infer", run: "backlog" }]);
+});
+
+test("runQueueSweep: infer_key with NO inferKey seam is a harmless no-op", async () => {
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const run = makeQueueRun(tmpl(), memStore());
+  let now = 6_400_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    takeCommands: commandsOnce([{ action: "infer_key", run: "backlog", surfaceUUID: "u-infer" }]),
+  });
+  // Must not throw.
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.annotate.length, 0);
 });

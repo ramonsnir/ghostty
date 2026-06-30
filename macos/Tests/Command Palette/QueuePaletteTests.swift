@@ -253,4 +253,35 @@ struct QueuePaletteTests {
         #expect(QueueCommand(action: .start, template: "t", params: nil).jsonObject["params"] == nil)
         #expect(QueueCommand(action: .start, template: "t", params: [:]).jsonObject["params"] == nil)
     }
+
+    // MARK: - Adopt a free split into a queue (ramon fork / Agent Queue, adopt)
+
+    @Test func adoptJSONObjectShape() {
+        let cmd = QueueCommand(action: .adopt, run: "R", key: "K",
+                               surfaceUUID: "U", url: "http://x")
+        let json = cmd.jsonObject
+        #expect(json["action"] as? String == "adopt")
+        #expect(json["run"] as? String == "R")
+        #expect(json["key"] as? String == "K")
+        #expect(json["surfaceUUID"] as? String == "U")
+        #expect(json["url"] as? String == "http://x")
+    }
+
+    @Test func adoptJSONObjectOmitsEmptyURL() {
+        // url nil ⇒ omitted; empty url ⇒ omitted (the coercer drops empty strings).
+        #expect(QueueCommand(action: .adopt, run: "R", key: "K", surfaceUUID: "U")
+            .jsonObject["url"] == nil)
+        #expect(QueueCommand(action: .adopt, run: "R", key: "K", surfaceUUID: "U", url: "")
+            .jsonObject["url"] == nil)
+    }
+
+    @Test func inferKeyJSONObjectShape() {
+        let cmd = QueueCommand(action: .inferKey, run: "R", surfaceUUID: "U")
+        let json = cmd.jsonObject
+        #expect(json["action"] as? String == "infer_key")
+        #expect(json["run"] as? String == "R")
+        #expect(json["surfaceUUID"] as? String == "U")
+        #expect(json["key"] == nil)
+        #expect(json["url"] == nil)
+    }
 }

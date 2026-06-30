@@ -577,6 +577,59 @@ test("coerceQueueCommands: parses start-time params (§8b) — string values onl
   ]);
 });
 
+// (adopt) ⭐ The coercer gate — the single most important sidecar test for the feature: an
+// `adopt`/`infer_key` the GUI emits MUST survive coercion (whitelist + carried fields) or the
+// whole feature is a silent no-op.
+test("coerceQueueCommands: carries adopt + run/key/surfaceUUID/url (the ⭐ §1.5 fix)", () => {
+  const out = coerceQueueCommands({
+    commands: [{ action: "adopt", run: "R", key: "K", surfaceUUID: "U", url: "http://x" }],
+  });
+  assert.deepEqual(out, [
+    { action: "adopt", run: "R", key: "K", surfaceUUID: "U", url: "http://x" },
+  ]);
+});
+
+test("coerceQueueCommands: keeps infer_key + run + surfaceUUID (survives coercion)", () => {
+  const out = coerceQueueCommands({
+    commands: [{ action: "infer_key", run: "R", surfaceUUID: "U" }],
+  });
+  assert.deepEqual(out, [{ action: "infer_key", run: "R", surfaceUUID: "U" }]);
+});
+
+test("coerceQueueCommands: an adopt lacking surfaceUUID is still carried (field absent → reducer no-ops)", () => {
+  const out = coerceQueueCommands({
+    commands: [{ action: "adopt", run: "R", key: "K" }],
+  });
+  // action is whitelisted so the command is kept, but surfaceUUID is absent (a non-string/empty
+  // surfaceUUID is dropped) so the reducer/runner degrade it to a no-op.
+  assert.deepEqual(out, [{ action: "adopt", run: "R", key: "K" }]);
+  assert.equal("surfaceUUID" in out[0], false);
+});
+
+test("coerceQueueCommands: a truly unknown action is STILL dropped (whitelist only widened by the two)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "frobnicate", run: "R", surfaceUUID: "U" },
+      { action: "adopt", run: "R", key: "K", surfaceUUID: "U" },
+    ],
+  });
+  assert.deepEqual(out, [{ action: "adopt", run: "R", key: "K", surfaceUUID: "U" }]);
+});
+
+// (adopt) The queueKeySuggested annotation: forwarded even when "" (the load-bearing sentinel).
+test("setAnnotation: forwards queueKeySuggested incl. the empty-string sentinel", async () => {
+  const withKey = await captureSetAnnotationArgs("s1", { queueKeySuggested: "ENG-9" });
+  assert.equal(withKey.queueKeySuggested, "ENG-9");
+  const empty = await captureSetAnnotationArgs("s1", { queueKeySuggested: "" });
+  assert.equal("queueKeySuggested" in empty, true, "the '' sentinel is forwarded, not dropped");
+  assert.equal(empty.queueKeySuggested, "");
+});
+
+test("setAnnotation: omits queueKeySuggested when undefined", async () => {
+  const args = await captureSetAnnotationArgs("s1", { summary: "x" });
+  assert.equal("queueKeySuggested" in args, false);
+});
+
 // (bell-attention v2 slice 4) parseWaitForEvent — the wait_for_event payload parser.
 test("parseWaitForEvent: fired bell event => {id,type}", () => {
   const out = parseWaitForEvent(

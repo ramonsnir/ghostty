@@ -78,6 +78,7 @@ import {
   changeTail,
   backoffDelayMs,
   parseSummary,
+  lastLines,
   shouldSummarize,
   isAgentSurface,
   alertEdge,
@@ -93,6 +94,7 @@ import {
   type QueueDeps,
 } from "./queue/runner.js";
 import { registerRehydratedRuns, type RunRegistry } from "./queue/commands.js";
+import { collectCandidateKeys, runInferKeyWithDeps } from "./queue/infer.js";
 import { ConcurrencyBudget as QueueConcurrencyBudget } from "./queue/supervisor.js";
 import {
   persistActiveRuns as persistActiveRunsToIO,
@@ -1132,6 +1134,39 @@ async function main(): Promise<void> {
         persistActiveRunsToIO(activeRunsIO, records),
       maxTotal,
       pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+      // (adopt) The on-demand Haiku key-inference seam for an `infer_key` queue command. Reads
+      // the surface, calls Haiku with a bespoke "extract the issue key" prompt (warm-base aware
+      // via the shared `deps.summarize`), and writes the result back as the `queueKeySuggested`
+      // annotation so the GUI adopt modal prefills. BEST-EFFORT: any failure (Haiku unavailable
+      // / sidecar disabled / unparseable) writes the `""` sentinel so the modal always drops its
+      // spinner. Usage is tagged with the THIRD feature `issue-key-infer` (alongside
+      // summarizer/bell-classify) — broken out by get_haiku_usage automatically.
+      inferKey: (surfaceUUID: string, runName: string): Promise<void> => {
+        const usageAccount = summarizerConfigDir ? basename(summarizerConfigDir) : "ambient";
+        return runInferKeyWithDeps(surfaceUUID, runName, {
+          readSurface: (id) => client.readSurface(id),
+          setAnnotation: (id, ann) => client.setAnnotation(id, ann),
+          // The shared, warm-base-aware summarize seam (cast through the structural `unknown`
+          // onUsage the infer deps declare; the real callback receives the SDK HaikuUsage).
+          summarize: (req) =>
+            deps.summarize({
+              ...req,
+              onUsage: req.onUsage as ((u: HaikuUsage) => void) | undefined,
+            }),
+          candidates: (name) => collectCandidateKeys(registry, name),
+          tail: (text) => lastLines(text, cfg.promptTailLines),
+          configDir: summarizerConfigDir,
+          recordUsage: (u, durationMs) =>
+            recordUsage({
+              ...(u as HaikuUsage),
+              feature: "issue-key-infer",
+              account: usageAccount,
+              durationMs,
+            }),
+          now: () => Date.now(),
+          errlog,
+        });
+      },
     };
     log(
       `queue: supervisor armed (on-demand); ${registry.size} run(s) rehydrated; ` +

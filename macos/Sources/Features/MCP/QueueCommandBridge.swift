@@ -37,6 +37,18 @@ struct QueueCommand: Equatable, Sendable {
         /// item in the run (`key` nil), so the queue re-dispatches it WITHOUT a tracker status
         /// round-trip. Serializes to the lowercase `"release"` the sidecar whitelists.
         case release
+        /// (adopt) Pull an EXISTING human-created CLI-agent split into a running queue: latch
+        /// `key` in the run's dispatch set, MOVE the `surfaceUUID` split into the run's grid
+        /// tab, and stamp queueKey/queueName(/queueUrl) so reconcile folds it in as a RUNNING
+        /// assignment. Serializes to the lowercase `"adopt"` the sidecar whitelists. Uses
+        /// `run`, `key`, `surfaceUUID` (all required) + `url` (optional).
+        case adopt
+        /// (inferKey) Trigger an on-demand Haiku read of `surfaceUUID` to infer its work-item
+        /// key for the adopt-modal prefill; the result returns via the `queueKeySuggested`
+        /// annotation (NOT a synchronous reply). Serializes to the snake_case `"infer_key"` the
+        /// sidecar whitelists. Uses `run` (tags account/candidate vocabulary; may be empty) +
+        /// `surfaceUUID` (required). Not a registry mutation.
+        case inferKey = "infer_key"
     }
 
     let action: Action
@@ -64,6 +76,13 @@ struct QueueCommand: Equatable, Sendable {
     /// (keep) The new keep verdict for `setKeep` (true = keep open, false = allow
     /// auto-close). nil for other actions (a non-bool is dropped by the sidecar).
     let keep: Bool?
+    /// (adopt / inferKey) The GUI surface UUID of the split to adopt / read (the
+    /// ephemeral per-launch surface id, as a string). REQUIRED for `adopt`/`inferKey`;
+    /// nil for other actions.
+    let surfaceUUID: String?
+    /// (adopt) The work-item URL for the dashboard's clickable origin badge, set ONLY
+    /// when the picked graph node carried one. nil for other actions.
+    let url: String?
 
     init(
         action: Action,
@@ -73,7 +92,9 @@ struct QueueCommand: Equatable, Sendable {
         maxItems: String? = nil,
         concurrency: String? = nil,
         key: String? = nil,
-        keep: Bool? = nil
+        keep: Bool? = nil,
+        surfaceUUID: String? = nil,
+        url: String? = nil
     ) {
         self.action = action
         self.template = template
@@ -83,6 +104,8 @@ struct QueueCommand: Equatable, Sendable {
         self.concurrency = concurrency
         self.key = key
         self.keep = keep
+        self.surfaceUUID = surfaceUUID
+        self.url = url
     }
 
     /// PURE: the wire dict drained by `take_queue_commands`. `action` is always
@@ -101,6 +124,11 @@ struct QueueCommand: Equatable, Sendable {
         // (keep) emit the boolean verbatim (the sidecar requires a real boolean — a string
         // "true" would be dropped); only when present (nil for non-setKeep actions).
         if let keep { d["keep"] = keep }
+        // (adopt / inferKey) the surface to adopt / read; (adopt) the work-item url.
+        // Both emitted only when non-nil + non-empty (the sidecar's coerceQueueCommands
+        // drops empty strings, so an empty value here is equivalent to omitting it).
+        if let surfaceUUID, !surfaceUUID.isEmpty { d["surfaceUUID"] = surfaceUUID }
+        if let url, !url.isEmpty { d["url"] = url }
         return d
     }
 }

@@ -48,6 +48,11 @@ struct AgentAnnotationPayload {
         // (keep) the split's keep verdict — present-as-bool ⇒ that bool; absent/non-bool ⇒
         // nil (so a partial update omitting it preserves the prior value on merge).
         let queueKeep = arguments["keep"] as? Bool
+        // (adopt) the Haiku-inferred key suggestion. UNLIKE the other strings, an EMPTY
+        // string is KEPT (NOT trimmed-to-nil): "" is the load-bearing "inferred nothing"
+        // sentinel distinct from absent ("no suggestion yet"). Present-as-string ⇒ that
+        // value verbatim (incl. ""); absent/non-string ⇒ nil.
+        let queueKeySuggested = arguments["queueKeySuggested"] as? String
 
         // At least one updatable field must be present; otherwise the update is a
         // no-op and we reject it (mirrors the old "blank summary" rejection but for
@@ -56,12 +61,13 @@ struct AgentAnnotationPayload {
             || needsUser != nil
             || queueKey != nil || queueName != nil || queueUrl != nil
             || queueKeep != nil
+            || queueKeySuggested != nil
         else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
             summary: summary, phase: phase, needsUser: needsUser,
             queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
-            queueKeep: queueKeep))
+            queueKeep: queueKeep, queueKeySuggested: queueKeySuggested))
     }
 }
 

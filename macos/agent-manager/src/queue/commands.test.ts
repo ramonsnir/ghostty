@@ -8,13 +8,14 @@ import assert from "node:assert/strict";
 import {
   applyCommand,
   applyCommands,
+  adoptDecision,
   registerRehydratedRuns,
   type RunFactory,
   type RunRegistry,
 } from "./commands.js";
 import { makeQueueRun, type QueueRun } from "./runner.js";
 import type { StoreIO } from "./store.js";
-import type { QueueTemplate } from "./types.js";
+import type { Assignment, QueueTemplate } from "./types.js";
 
 const memStore = (): StoreIO => {
   let text: string | null = null;
@@ -496,4 +497,85 @@ test("registerRehydratedRuns: two parallel scoped runs of one template coexist (
   registerRehydratedRuns(reg, [a, b]);
   assert.equal(reg.size, 2, "both parallel scoped runs survive rehydration");
   assert.ok(reg.has("ExampleOS · Acme") && reg.has("ExampleOS · Globex"));
+});
+
+// ---------------------------------------------------------------------------
+// (adopt) adopt + infer_key reducer cases.
+// ---------------------------------------------------------------------------
+
+/** A registry holding one run named `name` with the given keys pre-seeded into `active`. */
+function regWithRun(name: string, activeKeys: string[] = []): { reg: RunRegistry; run: QueueRun } {
+  const reg: RunRegistry = new Map();
+  const run = makeQueueRun(tmpl(name), memStore());
+  for (const k of activeKeys) {
+    const a: Assignment = {
+      queueName: name,
+      key: k,
+      sessionID: 1,
+      surfaceUUID: `u-${k}`,
+      gridSlot: 0,
+      state: "RUNNING",
+      sinceMs: 0,
+    };
+    run.active.set(k, a);
+  }
+  reg.set(name, run);
+  return { reg, run };
+}
+
+test("adoptDecision: reject-duplicate when the key is already active, else latch", () => {
+  const { run } = regWithRun("R", ["DUP"]);
+  assert.equal(adoptDecision(run, "DUP"), "reject-duplicate");
+  assert.equal(adoptDecision(run, "NEW"), "latch");
+});
+
+test("applyCommand adopt: LATCHES the key (the crux) + returns adopted", () => {
+  const { reg, run } = regWithRun("R");
+  const res = applyCommand(reg, { action: "adopt", run: "R", key: "K", surfaceUUID: "u-1" }, () => null);
+  assert.equal(res.kind, "adopted");
+  assert.equal(res.runName, "R");
+  assert.ok(run.dispatched.has("K"), "adopt latches the key so the supervisor won't double-dispatch");
+});
+
+test("applyCommand adopt: REJECTS a duplicate active key (no latch, jump instead)", () => {
+  const { reg, run } = regWithRun("R", ["DUP"]);
+  const res = applyCommand(reg, { action: "adopt", run: "R", key: "DUP", surfaceUUID: "u-1" }, () => null);
+  assert.equal(res.kind, "noop");
+  assert.equal(res.runName, "R");
+  assert.ok(!run.dispatched.has("DUP"), "a duplicate adopt does NOT add a latch");
+});
+
+test("applyCommand adopt: unknown run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  const res = applyCommand(reg, { action: "adopt", run: "ghost", key: "K", surfaceUUID: "u-1" }, () => null);
+  assert.equal(res.kind, "noop");
+});
+
+test("applyCommand adopt: missing run/key/surfaceUUID each no-op (no latch)", () => {
+  const { reg, run } = regWithRun("R");
+  assert.equal(applyCommand(reg, { action: "adopt", key: "K", surfaceUUID: "u" }, () => null).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "adopt", run: "R", surfaceUUID: "u" }, () => null).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "adopt", run: "R", key: "K" }, () => null).kind, "noop");
+  assert.equal(run.dispatched.size, 0, "no latch added on any malformed adopt");
+});
+
+test("applyCommand infer_key: explicit no-op — mutates neither dispatched nor active", () => {
+  const { reg, run } = regWithRun("R", ["A"]);
+  const before = run.active.size;
+  const res = applyCommand(reg, { action: "infer_key", run: "R", surfaceUUID: "u-1" }, () => null);
+  assert.equal(res.kind, "noop");
+  assert.equal(run.dispatched.size, 0, "infer_key adds no latch");
+  assert.equal(run.active.size, before, "infer_key never touches active");
+});
+
+test("applyCommands: an adopt-only batch is NOT an active-run-set change", () => {
+  const { reg } = regWithRun("R");
+  const changed = applyCommands(reg, [{ action: "adopt", run: "R", key: "K", surfaceUUID: "u-1" }], () => null);
+  assert.equal(changed, false, "adopt lives in the per-run store (latch), not active-runs.json");
+});
+
+test("applyCommands: an infer_key-only batch is NOT an active-run-set change", () => {
+  const { reg } = regWithRun("R");
+  const changed = applyCommands(reg, [{ action: "infer_key", run: "R", surfaceUUID: "u-1" }], () => null);
+  assert.equal(changed, false, "infer_key is a pure noop");
 });

@@ -106,6 +106,13 @@ keybind = ctrl+a>shift+d=toggle_dashboard_hide
   "Hide Split from Agent Dashboard") hides/reveals the **currently focused** split without
   touching the panel, so you can declutter the dashboard from inside the agent you're
   working in. Same persisted hide set + same auto-unhide-on-bell as the eye-slash button.
+- **Adopt… (queue tiles excluded)** — on a tile for a CLI-agent split that is **not** already
+  owned by a queue, an **Adopt…** button (disabled, with a tooltip, when no queue is running)
+  pulls that human-created split into a running Agent Queue: it opens a sheet that infers the
+  work-item key (best-effort Haiku), previews the matching issue title from the queue's backlog
+  graph as you type, and on confirm moves the split into the queue's grid tab and tracks it like
+  a dispatched item. Full behavior + the latch/keep/claim mechanics live in **AGENT-QUEUE.md
+  (→ Adopting a free split)**.
 
 ### Degraded states (never a blank panel)
 
@@ -417,6 +424,26 @@ gotchas, not a recap.)
   `SurfaceWrapper` render it natively (full color, viewport-only — right for a
   thumbnail), scaled aspect-fit-by-width + bottom-anchored so the latest rows show.
   Without pty-host there's no session to mirror ⇒ metadata-only tiles under a banner.
+
+- **⚠️ `AgentMirrorPreview.geometry` cell-size inputs come from the HOST surface, not
+  the mirror (flicker fix).** The scale is the UNIFORM `referenceColumns` (125) scheme —
+  a pane wider than 125 cols fills the width (overflow → horizontal scroll), a narrower
+  one renders proportionally (`cols/125` of the width) at the same cell size as every
+  other tile. **`cellW`/`cellH` MUST be read from the *real* (host) surface**
+  (`realSurface.surfaceSize`), the mirror's own `surfaceSize` only as a fallback — the
+  SAME source as `cols`/`rows`. The mirror's frame is computed FROM the cell size, and the
+  mirror's own `cell_width_px` **jitters ±1px** (e.g. 17↔16) as that frame re-rounds its
+  framebuffer onto a sub-pixel boundary, so reading the *mirror's* cell size closed a
+  feedback loop that oscillated the scale every frame: a ~160 Hz "the preview keeps
+  switching font size" flicker, **display-dependent** (it surfaced after moving the window
+  between displays of different scale). The host surface has a fixed real frame, so its
+  cell size is stable and breaks the loop. (Shipped bug: `cellW`/`cellH` were once
+  mirror-first while `cols`/`rows` were host-first; all four are now host-first. NOTE: a
+  fit-to-width rewrite was tried and reverted — the uniform `referenceColumns` scale is
+  the intended behavior; the host-sourced cell size is the only change.) Tests:
+  `AgentMirrorGeometryTests` (`uniformScaleAcrossSplitsOfDifferentWidths` +
+  `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
+  `zeroBackingDoesNotDivideByZero`).
 
 ### Smart bottom-anchor — skip empty rows AND the info-less footer
 

@@ -1372,6 +1372,98 @@ final class AgentDashboardModel: ObservableObject {
                     QueueCommand(action: .release, run: run, key: key),
             ])
     }
+
+    // MARK: - Adopt a free split into a queue (ramon fork / Agent Queue, adopt)
+
+    /// (adopt) Pull an existing human-created CLI-agent split (`id`) into the running
+    /// queue `run`, tracking it as work-item `key`. Posts an `adopt` command onto the
+    /// SAME FIFO the other run controls use (no MCP tool of its own). The sidecar
+    /// LATCHES the key (blocking a second dispatch), MOVES the split into the run's grid
+    /// tab, stamps queueKey/queueName(/queueUrl), and lets reconcile fold it in as a
+    /// RUNNING assignment. NO optimistic annotation flip — the sidecar's reconcile is the
+    /// single authority on `run.active` (mirrors `setQueueKeep` minus the optimistic
+    /// merge). No-op for `(other)` / a blank run or key.
+    func adoptSplit(id: UUID, run: String, key: String, url: String?) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !key.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .adopt, run: run, key: key,
+                                 surfaceUUID: id.uuidString, url: url),
+            ])
+    }
+
+    /// (adopt) Request an on-demand Haiku inference of the work-item key for split `id`,
+    /// to prefill the adopt modal. First CLEARS any stale `queueKeySuggested` for that
+    /// surface DIRECTLY (the `clearingSuggestion()` bypass — NOT via `merging`, which
+    /// never nils, so a prior suggestion would otherwise linger), then posts an
+    /// `infer_key` command onto the FIFO. The result returns asynchronously as a
+    /// `queueKeySuggested` annotation via the normal annotation path; the modal observes
+    /// it. No-op when `run` is empty (the GUI only requests infer with a chosen run — the
+    /// multi-run "" case is handled by re-firing on the picker's onChange).
+    func requestInferKey(id: UUID, run: String) {
+        guard !run.isEmpty else { return }
+        // DIRECT clear (NOT via applyAnnotation/merging — see clearingSuggestion()).
+        if let prior = annotations[id] {
+            annotations[id] = prior.clearingSuggestion()
+            rebuildEntriesFromCurrentState()
+        }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .inferKey, run: run, surfaceUUID: id.uuidString),
+            ])
+    }
+
+    /// (adopt) The names of the queue runs currently present (the adopt-modal picker's
+    /// options, LOCKED #4). Empty ⇒ the Adopt button is disabled; a single name ⇒ the
+    /// modal auto-selects it and hides the picker. Sorted for a stable picker order.
+    func runNamesForAdopt() -> [String] {
+        queueStatuses.filter { $0.value.present }.keys.sorted()
+    }
+
+    /// (adopt) Look up a work-item node in a run's LOCAL backlog graph (LOCKED #1: the
+    /// instant, round-trip-free title-preview source). Returns nil when the run has no
+    /// graph or the key isn't on its board ("not on this queue's board" — still
+    /// adoptable). Backs the modal's live title preview + the optional queueUrl.
+    func graphNodeForAdopt(run: String, key: String) -> QueueGraph.Node? {
+        queueGraphs[run]?.nodes.first { $0.key == key }
+    }
+
+    /// (adopt) The GUI-visible set of work-item keys currently RUNNING in `run` — the
+    /// modal's duplicate-key guard source. A soft proxy for the sidecar's authoritative
+    /// `run.active.has(key)` check (the `adopt` reducer rejects a true duplicate); the
+    /// GUI guard just blocks Confirm + offers a jump before the command is even sent.
+    func activeKeysForRun(_ run: String) -> Set<String> {
+        Set((queueStatuses[run]?.running ?? []).map(\.key))
+    }
+
+    /// (adopt) Jump to the split currently running work-item `key` in `run` — the
+    /// "Jump to the running one" affordance the adopt modal offers when the user enters a
+    /// DUPLICATE key (one already active in the target run). Resolves the surface via the
+    /// stored annotations (`surfaceID(forQueue:key:)`) and presents it on the SAME path a
+    /// tile tap / the running-dropdown's go-to uses (raise window, select tab, unzoom,
+    /// highlight). Deferred to the next runloop so the present runs after the panel's
+    /// key-window change settles (see `AgentPreviewTile.jump`). No-op when no live surface
+    /// carries that tag.
+    func jumpToKey(run: String, key: String) {
+        guard let id = surfaceID(forQueue: run, key: key) else { return }
+        DispatchQueue.main.async {
+            for controller in TerminalController.all {
+                for v in controller.surfaceTree where v.id == id {
+                    controller.unzoomIfHidden(v)
+                    NotificationCenter.default.post(
+                        name: Ghostty.Notification.ghosttyPresentTerminal,
+                        object: v)
+                    return
+                }
+            }
+        }
+    }
 }
 
 /// (ramon fork / Agent Dashboard, Layer 3) Owns the panel, the SwiftUI host

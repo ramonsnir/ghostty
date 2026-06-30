@@ -393,6 +393,12 @@ export interface QueueDeps {
    *  after sending the exit keys, before force-closing anyway (§10). Optional; defaults
    *  to DEFAULT_AWAIT_EXITED_MS. */
   awaitExitedMs?: number;
+  /** (adopt) The Haiku key-inference seam for an `infer_key` command: read the surface, call
+   *  the model with a bespoke "extract the issue key" prompt, and write the result back as the
+   *  `queueKeySuggested` annotation (so the GUI adopt modal prefills). Wired in index.ts where
+   *  `summarize`+`warmBase` live (keeps the runner SDK-free). OPTIONAL — when omitted (tests),
+   *  the `infer_key` side-effect loop is a no-op. */
+  inferKey?: (surfaceUUID: string, runName: string) => Promise<void>;
 }
 
 /** Snapshot the registry into the persisted active-run record list (§8a). PURE. */
@@ -461,8 +467,26 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
     }
   }
 
+  // (adopt §1.6 step 5) SIDE-EFFECT loop for the two new actions. They flowed HARMLESSLY
+  // through `applyCommands` above (`adopt` latched in the reducer; `infer_key` is a no-op),
+  // and here we re-iterate the SAME drained array to fire their async side effects exactly
+  // once. `runAdopt` does the physical move + annotation + claim (latch already added); it
+  // self-guards on `registry.get(cmd.run)` so a drained run is a no-op. `runInferKey` only
+  // READS a surface + writes an annotation, so it works even with an empty registry (the
+  // empty-run candidate path) — which is why this loop is BEFORE the `registry.size === 0`
+  // early return.
+  for (const cmd of commands) {
+    try {
+      if (cmd.action === "adopt") await runAdopt(cmd, deps);
+      else if (cmd.action === "infer_key") await runInferKey(cmd, deps);
+    } catch (err) {
+      errlog(`${cmd.action} side-effect: ${msg(err)}`);
+    }
+  }
+
   // No runs in the registry (none started / all drained-or-aborted-away) ⇒ nothing to
-  // reconcile or dispatch. We've already drained commands, so a future `start` arms it.
+  // reconcile or dispatch. We've already drained commands + run the adopt/infer side
+  // effects, so a future `start` arms it.
   if (deps.registry.size === 0) return;
 
   // Snapshot the live surfaces ONCE per sweep for reconciliation + state tracking.
@@ -1482,6 +1506,126 @@ function seatedAtSlot(run: QueueRun, slotIndex: number): Assignment | undefined 
     if (a.gridSlot === slotIndex && occupiesSlot(a) && a.surfaceUUID !== undefined) return a;
   }
   return undefined;
+}
+
+/** The first SEATED (has a `surfaceUUID`) anchor pane ANYWHERE in a run — the lowest occupied
+ *  slot's UUID. Used by `runAdopt` to address the run's grid tab for the move. Returns
+ *  `undefined` when the run has no seated pane (empty/all-unseated run). PURE. */
+function firstSeatedUUID(run: QueueRun): string | undefined {
+  let best: { slot: number; uuid: string } | undefined;
+  for (const a of run.active.values()) {
+    if (a.gridSlot >= 0 && occupiesSlot(a) && a.surfaceUUID !== undefined) {
+      if (best === undefined || a.gridSlot < best.slot) best = { slot: a.gridSlot, uuid: a.surfaceUUID };
+    }
+  }
+  return best?.uuid;
+}
+
+/**
+ * (adopt) Perform the SIDE EFFECTS of an `adopt` command: physically MOVE the human-created
+ * split into the run's grid tab, STAMP the queue annotation (so reconcile folds it in next
+ * sweep), FIRE the provider claim, and PERSIST the latch. The reducer (`applyCommand`) already
+ * added the latch SYNCHRONOUSLY (before this `await`) — the crux that blocks a second dispatch.
+ *
+ * Ordering / correctness (LOCKED FORCED CORRECTNESS): the only ROLLBACK is a MOVE failure (the
+ * split never entered the grid → the item must stay dispatchable, so we clear the latch). The
+ * annotation/claim are best-effort; reconcile's existing orphan-adoption (store.ts) folds the
+ * annotated surface in next sweep as a RUNNING assignment — relying on its non-zero-`sessionID`
+ * precondition (guaranteed under the queue's pty-host HARD DEP). NEVER writes `run.active`
+ * (reconcile is its single owner) — this writes only `run.dispatched` + the annotation, so it
+ * occupies a concurrency slot WITHOUT incrementing `lifetimeDispatched` (no new agent launched).
+ */
+async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
+  const name = cmd.run;
+  const key = cmd.key;
+  const uuid = cmd.surfaceUUID;
+  // The reducer already no-op'd (and added NO latch) on any missing arg / unknown run, so
+  // there is nothing to move or roll back here.
+  if (name === undefined || name.length === 0 || key === undefined || key.length === 0 || uuid === undefined || uuid.length === 0) {
+    return;
+  }
+  const run = deps.registry.get(name);
+  if (run === undefined) return;
+
+  // Re-check the dedup against the LIVE active map (a sweep may have advanced state since the
+  // reducer ran): if the key is now an active assignment, do NOT move + do NOT touch the latch
+  // (either the reducer rejected it, or this active-map check now covers it).
+  if (run.active.has(key)) {
+    errlog(`run "${name}": adopt ${key} — already active, skipping move`);
+    return;
+  }
+  // The reducer adds the latch; confirm it (defensive — if somehow absent there's nothing to
+  // roll back, and reconcile would still fold an annotated surface in).
+  const t = run.template;
+
+  // MOVE the split into the run's grid tab, anchored on a seated pane. If the run has NO
+  // seated pane (empty/all-unseated run), DO NOT move — the adopted split becomes the run's
+  // seed (reconcile gives it slot 0 next sweep). Overflow at capacity (LOCKED #5) is handled
+  // by `move_surface_into_tab` honoring maxCols/maxRows (multi-tab overflow packing).
+  const anchorUUID = firstSeatedUUID(run);
+  if (anchorUUID !== undefined) {
+    if (deps.client.moveSurfaceIntoTab === undefined) {
+      errlog(`run "${name}": adopt ${key} — move_surface_into_tab unavailable; leaving split in place (reconcile still adopts)`);
+    } else {
+      try {
+        await deps.client.moveSurfaceIntoTab({
+          sourceUUID: uuid,
+          targetAnchorUUID: anchorUUID,
+          balanced: true,
+          maxCols: t.grid.cols,
+          maxRows: t.grid.rows,
+        });
+      } catch (err) {
+        // MOVE failed → ROLL BACK the latch (the adoption did not happen, so the item must
+        // stay dispatchable), persist, and return.
+        run.dispatched.delete(key);
+        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+        errlog(`run "${name}": adopt ${key} move failed: ${msg(err)} — latch rolled back, item stays free`);
+        return;
+      }
+    }
+  }
+
+  // STAMP the annotation so reconcile adopts the moved-in surface next sweep. keep FOLLOWS the
+  // template `keepOnComplete` (LOCKED #3), NOT a forced true.
+  try {
+    await deps.client.setAnnotation(uuid, {
+      queueKey: key,
+      queueName: run.runName,
+      ...(cmd.url !== undefined && cmd.url.length > 0 ? { queueUrl: cmd.url } : {}),
+      keep: effectiveKeep(run, key),
+    });
+  } catch (err) {
+    errlog(`run "${name}": adopt ${key} annotate: ${msg(err)}`);
+  }
+
+  // FIRE the provider claim (consistent with dispatchOne §g) — a latency optimization, never
+  // correctness. Fire-and-forget.
+  if (t.provider.claim !== undefined) {
+    const argv = renderArgv(t.provider.claim.command, key);
+    void runProvider(argv, deps.exec, {
+      cwd: t.workdir,
+      env: resolveParamsEnv(t, run.params),
+    }).catch(() => {
+      /* claim failure is non-fatal + already logged inside runProvider's result */
+    });
+  }
+
+  // PERSIST the latch NOW (the active map is updated by the NEXT reconcile's adopt; persisting
+  // the latch here ensures suppression survives a crash before that reconcile).
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  log(`run "${run.runName}": ADOPTED ${key} (surface ${uuid}) — latched, moved, annotated`);
+}
+
+/** (adopt) Drive the OPTIONAL `infer_key` side effect: hand off to the `deps.inferKey` seam
+ *  (wired in index.ts to read the surface → Haiku → write `queueKeySuggested`). Gated so a test
+ *  without the seam is a no-op. `cmd.run` may be "" (the multi-run pre-pick case) — the seam
+ *  tolerates it (empty candidate list, still reads the surface). */
+async function runInferKey(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
+  const uuid = cmd.surfaceUUID;
+  if (uuid === undefined || uuid.length === 0) return;
+  if (deps.inferKey === undefined) return;
+  await deps.inferKey(uuid, cmd.run ?? "");
 }
 
 /**

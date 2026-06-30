@@ -49,7 +49,9 @@ export interface QueueCommand {
     | "set_max_items"
     | "set_concurrency"
     | "set_keep"
-    | "release";
+    | "release"
+    | "adopt"
+    | "infer_key";
   /** The template basename to start (start only). */
   template?: string;
   /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency/set_keep. */
@@ -73,6 +75,14 @@ export interface QueueCommand {
   /** (keep) The new keep verdict for `set_keep` (true = keep open, false = allow auto-close).
    *  Absent for other actions. */
   keep?: boolean;
+  /** (adopt / infer_key) The GUI surface UUID of the human-created split to ADOPT into a run
+   *  (move + latch + annotate), or to READ for Haiku key inference. REQUIRED for both `adopt`
+   *  and `infer_key`; populated by the coercer (mcp.ts §1.5). Absent for other actions. */
+  surfaceUUID?: string;
+  /** (adopt) The work-item url for the dashboard's clickable badge, when the picked graph node
+   *  carried one. OPTIONAL even for `adopt` (graph-local title-preview lookups usually have no
+   *  url). Populated by the coercer; absent ⇒ no queueUrl stamped. */
+  url?: string;
 }
 
 /** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME (+ the
@@ -107,9 +117,19 @@ export interface ApplyResult {
     | "concurrencySet"
     | "keepSet"
     | "released"
+    | "adopted"
     | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
+}
+
+/** (adopt) The PURE latch/dedup decision for an `adopt` command, post-args-validation
+ *  (run/key/surfaceUUID all present + the run resolved). Extracted so the crux logic — REJECT
+ *  a key already running in the target run, else LATCH it at adoption time — is unit-testable
+ *  without registry/cmd plumbing. `"reject-duplicate"` when the key is already in `run.active`
+ *  (the authoritative GUI-side dedup is a soft proxy; this is the real guard); else `"latch"`. */
+export function adoptDecision(run: QueueRun, key: string): "reject-duplicate" | "latch" {
+  return run.active.has(key) ? "reject-duplicate" : "latch";
 }
 
 /**
@@ -322,6 +342,57 @@ export function applyCommand(
       log(`run "${name}" RELEASED ${n} held item(s) — eligible next list poll`);
       return { kind: "released", runName: name };
     }
+    case "adopt": {
+      // (adopt) Pull a human-created split into a run. This reducer does the PURE,
+      // SYNCHRONOUS part only — the LATCH + dedup decision; the physical MOVE + annotation +
+      // claim are side effects done in the runner (`runAdopt`). The latch is added BEFORE any
+      // `await` (the runner's move) so even if the sweep is interrupted between latch + move,
+      // `selectCandidates` already suppresses the key — the crux that blocks a SECOND dispatch
+      // for an item still actionable in the provider `list`.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`adopt command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const key = cmd.key;
+      if (key === undefined || key.length === 0) {
+        errlog(`adopt command with no key — ignored`);
+        return { kind: "noop" };
+      }
+      const uuid = cmd.surfaceUUID;
+      if (uuid === undefined || uuid.length === 0) {
+        errlog(`adopt command with no surfaceUUID — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`adopt for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      switch (adoptDecision(run, key)) {
+        case "reject-duplicate":
+          // The key is already an active assignment in this run — block the collision (the GUI
+          // offers "jump to the running one" instead). No latch, no mutation.
+          errlog(`adopt ${key}: already active in run "${name}" — ignored`);
+          return { kind: "noop", runName: name };
+        case "latch":
+          // LATCH at adoption time (the crux): suppress a SECOND dispatch for this still-listed
+          // item. The runner persists this latch (and rolls it back only on a MOVE failure).
+          run.dispatched.add(key);
+          log(`run "${name}" key "${key}" ADOPTED (latched; surface ${uuid}) — runner moves + annotates`);
+          return { kind: "adopted", runName: name };
+      }
+      // Unreachable (the switch above is exhaustive + returns), but keeps the case from
+      // being seen as a fallthrough into `infer_key`.
+      return { kind: "noop", runName: name };
+    }
+    case "infer_key":
+      // (infer_key) A RECOGNIZED action that is NOT a registry mutation. It must SURVIVE
+      // coercion (mcp.ts whitelist) and pass HARMLESSLY through the reducer; the real Haiku
+      // work runs in the sweep's side-effect loop (`runInferKey` → `deps.inferKey`). EXPLICIT
+      // no-op (NOT a `default` fallthrough) so the intent is unambiguous — a reader can't
+      // mistake it for an unhandled action. Mutates nothing (`active`/`dispatched` untouched).
+      return { kind: "noop" };
     default: {
       // Exhaustive guard for an unknown action (tolerant — a malformed drained command).
       errlog(`unknown queue command action "${String((cmd as { action?: unknown }).action)}" — ignored`);
@@ -337,8 +408,11 @@ export function applyCommand(
  *  re-persists after the removal regardless. (keep) `set_keep` is likewise NOT counted: the
  *  keep overrides live in the PER-RUN store (not active-runs.json), which the run's own sweep
  *  (`runOne`) persists + re-stamps to the annotation. (release) `release` is also NOT counted:
- *  it mutates the per-run dispatch latch, which the run's next reconcile sweep persists. PURE
- *  (delegates to applyCommand). */
+ *  it mutates the per-run dispatch latch, which the run's next reconcile sweep persists. (adopt)
+ *  `adopt` is likewise NOT counted: like `set_keep`/`release` it mutates per-run state (the
+ *  `dispatched` latch), persisted by `runAdopt` + the next reconcile sweep, not active-runs.json.
+ *  (infer_key) `infer_key` is a `noop` (no registry change at all). PURE (delegates to
+ *  applyCommand). */
 export function applyCommands(
   registry: RunRegistry,
   cmds: QueueCommand[],
