@@ -718,15 +718,16 @@ struct AgentMirrorPreview: View {
                 hostCols: Int(host?.columns ?? 0), hostRows: Int(host?.rows ?? 0),
                 hostCellW: CGFloat(host?.cell_width_px ?? 0),
                 hostCellH: CGFloat(host?.cell_height_px ?? 0))
-            // Before the FIRST host frame ever (cache still empty — e.g. a split
-            // created while already hidden), fall back to the live mirror so a brand-
-            // new tile isn't blank.
-            let cols = merged.cols > 0 ? merged.cols : Int(surfaceView.surfaceSize?.columns ?? 0)
-            let rows = merged.rows > 0 ? merged.rows : Int(surfaceView.surfaceSize?.rows ?? 0)
-            let cellW = merged.cellW > 0 ? merged.cellW : CGFloat(surfaceView.surfaceSize?.cell_width_px ?? 0)
-            let cellH = merged.cellH > 0 ? merged.cellH : CGFloat(surfaceView.surfaceSize?.cell_height_px ?? 0)
+            // Resolve the grid: cache/host → the mirror's OWN client-stream source
+            // grid → the mirror's frame size (see resolveGrid). The middle fallback
+            // covers a split opened into the dashboard while ALREADY hidden under a
+            // sibling's zoom — the real surface was never laid out so the cache is
+            // empty, but the .client mirror still received the host's real cols/rows.
+            let grid = resolveGrid(merged: merged)
+            let rows = grid.rows
+            let cellH = grid.cellH
             let g = AgentMirrorPreview.geometry(
-                cols: cols, rows: rows, cellW: cellW, cellH: cellH,
+                cols: grid.cols, rows: grid.rows, cellW: grid.cellW, cellH: cellH,
                 backing: backing, container: geo.size)
             // Skip empty trailing rows + the input-box/mode-line footer: shift
             // the bottom-anchored mirror down so the last row of CONTENT lands at
@@ -796,6 +797,34 @@ struct AgentMirrorPreview: View {
         if lines.last == "" { lines.removeLast() }
         let n = AgentMirrorPreview.chromeTrailingSkip(rows: lines)
         if n != skipRows { skipRows = n }
+    }
+
+    /// Resolve the grid fed to `geometry`, preferring the remembered HOST geometry
+    /// (`merged`), then the mirror's OWN client-stream SOURCE grid, then the mirror's
+    /// frame-derived size. The middle step (`ghostty_surface_mirror_grid_size`) is
+    /// what fixes a split that's ALREADY hidden under a sibling's zoom when the
+    /// dashboard opens: its real `SurfaceView` was never laid out (cache empty,
+    /// `realSurface.surfaceSize` nil), but the `.client` mirror still received the
+    /// host's real cols/rows in its `grid_frame`. Cell size stays from the cache or
+    /// the mirror's own font metrics (display-correct for the dashboard tile). The
+    /// C call is GATED on `cols == 0`, so it only runs in that rare fallback.
+    private func resolveGrid(merged: HostGeom) -> (cols: Int, rows: Int, cellW: CGFloat, cellH: CGFloat) {
+        var cols = merged.cols
+        var rows = merged.rows
+        if cols == 0, let s = surfaceView.surface {
+            let mg = ghostty_surface_mirror_grid_size(s)
+            if mg.valid {
+                cols = Int(mg.columns)
+                rows = Int(mg.rows)
+            }
+        }
+        if cols == 0 {
+            cols = Int(surfaceView.surfaceSize?.columns ?? 0)
+            rows = Int(surfaceView.surfaceSize?.rows ?? 0)
+        }
+        let cellW = merged.cellW > 0 ? merged.cellW : CGFloat(surfaceView.surfaceSize?.cell_width_px ?? 0)
+        let cellH = merged.cellH > 0 ? merged.cellH : CGFloat(surfaceView.surfaceSize?.cell_height_px ?? 0)
+        return (cols, rows, cellW, cellH)
     }
 
     /// The number of columns that fill the preview's WIDTH. This sets a UNIFORM

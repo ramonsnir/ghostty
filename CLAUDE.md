@@ -311,8 +311,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   SIBLING's zoom its real `SurfaceView` leaves the hierarchy and `realSurface.surfaceSize` goes nil,
   but the host session's grid didn't change (zoom is GUI-only) — without memory that one tile read
   `cols=0` and fell into the degenerate width-fit branch → rendered HUGE + flickering; the cache
-  holds the last valid grid until the split is shown again. Wiring: `AgentPreviewTile.swift`
-  (host-first cell reads + `hostGeomBox`/`mergeHostGeom`). Tests: `AgentMirrorGeometryTests`
+  holds the last valid grid until the split is shown again. **For the edge where the dashboard is
+  OPENED while the split is ALREADY zoom-hidden** (cache never populated), the tile pulls cols/rows
+  from the mirror's OWN `.client` stream via the NEW `ghostty_surface_mirror_grid_size` C API
+  (`Client.render_state` holds the host grid from each `grid_frame`) — fallback chain in
+  `resolveGrid` is cache/host → mirror client-stream grid → mirror frame; the C call is gated on
+  `cols==0` and reads under the render mutex. **This one adds a C export → lib/xcframework rebuild,
+  but it's GUI-only: the host never makes a `.client` mirror, so `ghostty-host` is NOT
+  rebuilt/reloaded (no session loss).** Wiring: core — `src/termio/Client.zig` (`mirrorSourceGrid`
+  + named `MirrorGrid`), `src/Surface.zig` (`mirrorSourceGrid` forwarder), `src/apprt/embedded.zig`
+  (`ghostty_surface_mirror_grid_size` + `MirrorGridSize`), `include/ghostty.h`
+  (`ghostty_surface_mirror_grid_s` + prototype); macOS — `AgentPreviewTile.swift` (host-first cell
+  reads + `hostGeomBox`/`mergeHostGeom` + `resolveGrid`). Tests: `AgentMirrorGeometryTests`
   (`mergeHostGeomRemembersThroughZoomHidden` + `uniformScaleAcrossSplitsOfDifferentWidths` + the
   existing geometry cases).
 

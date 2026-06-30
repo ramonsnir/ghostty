@@ -494,6 +494,30 @@ pub fn setRenderMutex(self: *Client, m: *std.Thread.Mutex) void {
     self.render_mutex = m;
 }
 
+/// (ramon fork / Agent Dashboard) The SOURCE host grid this mirror is rendering —
+/// the cols/rows last decoded from a `grid_frame` into `render_state`, NOT the
+/// frame-derived `grid_size` (which tracks the dashboard tile, not the host). Used
+/// by the dashboard preview as a last-resort size when the REAL split's surfaceSize
+/// is unavailable (the real split is hidden under a sibling's zoom, so it isn't
+/// laid out). `null` for a non-mirror Client or before the first grid_frame
+/// (render_state still `.empty`, rows/cols == 0). Read under `renderMutex()` (the
+/// renderer-state mutex once reconciled) so it can't tear against the read thread's
+/// `rehydrate`.
+pub fn mirrorSourceGrid(self: *Client) ?MirrorGrid {
+    if (self.config.role != .mirror) return null;
+    const m = self.renderMutex();
+    m.lock();
+    defer m.unlock();
+    const rs = &self.render_state;
+    if (rs.cols == 0 or rs.rows == 0) return null;
+    return .{ .cols = rs.cols, .rows = rs.rows };
+}
+
+/// (ramon fork) The mirror's source host grid — a NAMED struct so the Surface
+/// forwarder and the C export share one type (anonymous structs aren't
+/// cross-signature compatible in Zig).
+pub const MirrorGrid = struct { cols: u16, rows: u16 };
+
 /// Set the local terminal that `handleFrame`'s `.mode_frame` arm applies the
 /// host's real input modes onto (Phase A / audit R2). MUST be called with the
 /// Client at its FINAL address (the backend union slot, after `Termio.init`
