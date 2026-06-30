@@ -112,9 +112,12 @@ enum MCPLayout {
         /// split into `run.active` (it keys off `queueName`/`queueKey` read back from
         /// `list_surfaces`). nil when the surface carries no queue tag. Defaulted so the
         /// (separate) WebMonitor SurfaceRow and test constructors are unaffected.
-        let queueKey: String? = nil
-        let queueName: String? = nil
-        let queueUrl: String? = nil
+        /// `var` (not `let`) so the default makes them OPTIONAL memberwise-init params —
+        /// a `let` with a default is omitted from the synthesized init, which would
+        /// reject the `queueKey:`/`queueName:`/`queueUrl:` args at the construction site.
+        var queueKey: String? = nil
+        var queueName: String? = nil
+        var queueUrl: String? = nil
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
