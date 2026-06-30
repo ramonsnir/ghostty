@@ -506,6 +506,12 @@ struct AgentMirrorPreview: View {
     /// SwiftUI, so an observer wouldn't fire).
     @State private var skipRows: Int = 0
 
+    /// Last-known-good HOST grid geometry, remembered across renders so the preview
+    /// stays correctly sized when the real split is temporarily hidden under a
+    /// sibling's zoom (its `surfaceSize` goes nil — see the body). A reference box so
+    /// it can be updated from inside `body` without tripping SwiftUI state-mutation.
+    @State private var hostGeomBox = HostGeomBox()
+
     init(ghostty: Ghostty.App, sessionID: UInt64, realSurface: Ghostty.SurfaceView) {
         self.ghostty = ghostty
         self.sessionID = sessionID
@@ -520,26 +526,35 @@ struct AgentMirrorPreview: View {
         GeometryReader { geo in
             let backing = surfaceView.window?.backingScaleFactor
                 ?? NSScreen.main?.backingScaleFactor ?? 2.0
-            // HOST grid from the real surface (authoritative; the mirror's own
-            // grid AND cell size track our frame and must not be used). Per-cell
-            // pixels come from the HOST surface FIRST, the mirror only as a fallback
-            // — the SAME source as cols/rows. This is LOAD-BEARING (the only change
-            // from the original): the mirror's own `cell_width_px` jitters ±1px
-            // (e.g. 17↔16) as its frame re-rounds its framebuffer onto a sub-pixel
-            // boundary, so reading it here closed a feedback loop that oscillated the
-            // scale every frame (a ~160 Hz "font size flicker", display-dependent —
-            // surfaced after moving the window between displays of different scale).
-            // The host surface has a fixed real frame, so its cell size is stable.
+            // Grid + cell size come from the HOST (real) surface, REMEMBERED across
+            // frames (`hostGeomBox`). Two reasons this is load-bearing:
+            //  1. Cell-size jitter: the mirror's own `cell_width_px` flips ±1px
+            //     (17↔16) as its frame re-rounds onto a sub-pixel boundary; feeding
+            //     that to the scale caused a ~160 Hz "font size flicker". The host
+            //     surface has a fixed frame, so its cell size is stable.
+            //  2. Zoom-hidden splits: when this agent's split is hidden under a
+            //     SIBLING's zoom, its real `SurfaceView` leaves the view hierarchy and
+            //     `realSurface.surfaceSize` goes NIL — but the HOST session's grid did
+            //     NOT change (zoom is GUI-only). Without memory the geometry would see
+            //     cols=0/cellW=0 and fall into the degenerate width-fit branch (the
+            //     "one tile is huge + flickering" bug). So we cache the last VALID host
+            //     geometry and keep using it whenever the live read is absent; it's
+            //     refreshed the moment the split is shown again.
             let host = realSurface.surfaceSize
-            let rows = Int(host?.rows ?? 0)
-            let cellH = CGFloat(host?.cell_height_px ?? surfaceView.surfaceSize?.cell_height_px ?? 0)
+            let merged = hostGeomBox.fold(
+                hostCols: Int(host?.columns ?? 0), hostRows: Int(host?.rows ?? 0),
+                hostCellW: CGFloat(host?.cell_width_px ?? 0),
+                hostCellH: CGFloat(host?.cell_height_px ?? 0))
+            // Before the FIRST host frame ever (cache still empty — e.g. a split
+            // created while already hidden), fall back to the live mirror so a brand-
+            // new tile isn't blank.
+            let cols = merged.cols > 0 ? merged.cols : Int(surfaceView.surfaceSize?.columns ?? 0)
+            let rows = merged.rows > 0 ? merged.rows : Int(surfaceView.surfaceSize?.rows ?? 0)
+            let cellW = merged.cellW > 0 ? merged.cellW : CGFloat(surfaceView.surfaceSize?.cell_width_px ?? 0)
+            let cellH = merged.cellH > 0 ? merged.cellH : CGFloat(surfaceView.surfaceSize?.cell_height_px ?? 0)
             let g = AgentMirrorPreview.geometry(
-                cols: Int(host?.columns ?? 0),
-                rows: rows,
-                cellW: CGFloat(host?.cell_width_px ?? surfaceView.surfaceSize?.cell_width_px ?? 0),
-                cellH: cellH,
-                backing: backing,
-                container: geo.size)
+                cols: cols, rows: rows, cellW: cellW, cellH: cellH,
+                backing: backing, container: geo.size)
             // Skip empty trailing rows + the input-box/mode-line footer: shift
             // the bottom-anchored mirror down so the last row of CONTENT lands at
             // the bottom of the preview (the skipped rows fall below the clip).
@@ -637,6 +652,42 @@ struct AgentMirrorPreview: View {
         let scaledW: CGFloat
         let scaledH: CGFloat
     }
+
+    /// Remembered HOST grid geometry (see the body's `hostGeomBox`). All-zero means
+    /// "never seen a valid host frame yet".
+    struct HostGeom: Equatable {
+        var cols: Int = 0
+        var rows: Int = 0
+        var cellW: CGFloat = 0
+        var cellH: CGFloat = 0
+    }
+    /// Reference box so `body` can update the cache without mutating SwiftUI @State
+    /// (mutating the object, not the binding — no invalidation). `fold` stores the
+    /// merged result and returns it, so the call site is a `let` (a bare assignment
+    /// is illegal inside a `@ViewBuilder`).
+    final class HostGeomBox {
+        var value = HostGeom()
+        func fold(hostCols: Int, hostRows: Int, hostCellW: CGFloat, hostCellH: CGFloat) -> HostGeom {
+            value = AgentMirrorPreview.mergeHostGeom(
+                prior: value, hostCols: hostCols, hostRows: hostRows,
+                hostCellW: hostCellW, hostCellH: hostCellH)
+            return value
+        }
+    }
+
+    /// PURE: fold a live host-surface read into the remembered geometry. A VALID
+    /// frame (cols>0 AND cellW>0) replaces the cache; an absent/zero read — which is
+    /// what a split hidden under a sibling's zoom reports, since its `SurfaceView`
+    /// left the hierarchy — KEEPS the prior value, because the host session's grid
+    /// did not actually change. This is what stops a zoom-hidden tile from collapsing
+    /// to cols=0 (the degenerate huge/flickering preview).
+    static func mergeHostGeom(
+        prior: HostGeom, hostCols: Int, hostRows: Int, hostCellW: CGFloat, hostCellH: CGFloat
+    ) -> HostGeom {
+        guard hostCols > 0, hostCellW > 0 else { return prior }
+        return HostGeom(cols: hostCols, rows: hostRows, cellW: hostCellW, cellH: hostCellH)
+    }
+
     static func geometry(
         cols: Int, rows: Int, cellW: CGFloat, cellH: CGFloat,
         backing: CGFloat, container: CGSize, referenceColumns: CGFloat = referenceColumns

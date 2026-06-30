@@ -433,8 +433,19 @@ gotchas, not a recap.)
   cell size is stable and breaks the loop. (Shipped bug: `cellW`/`cellH` were once
   mirror-first while `cols`/`rows` were host-first; all four are now host-first. NOTE: a
   fit-to-width rewrite was tried and reverted — the uniform `referenceColumns` scale is
-  the intended behavior; the host-sourced cell size is the only change.) Tests:
-  `AgentMirrorGeometryTests` (`uniformScaleAcrossSplitsOfDifferentWidths` +
+  the intended behavior; the host-sourced cell size is the only change.)
+
+  **The host geometry is also REMEMBERED across frames (`hostGeomBox` + the pure
+  `mergeHostGeom`).** When this agent's split is hidden under a **sibling's zoom**, its
+  real `SurfaceView` leaves the SwiftUI hierarchy (`TerminalSplitTreeView` renders only
+  the zoomed subtree) and `realSurface.surfaceSize` goes **nil** — but the host session's
+  grid did NOT change (zoom is GUI-only). Without memory the geometry would read
+  `cols=0`/`cellW=0` and fall into the degenerate width-fit branch → that ONE tile renders
+  HUGE and flickers (the live symptom). So the tile caches the last VALID host grid
+  (`cols/rows/cellW/cellH`) and keeps using it whenever the live read is absent; the cache
+  refreshes the instant the split is shown again (`mergeHostGeom` rejects a zero/partial
+  read, accepts a real resize). Tests: `AgentMirrorGeometryTests`
+  (`mergeHostGeomRemembersThroughZoomHidden`, `uniformScaleAcrossSplitsOfDifferentWidths`,
   `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
   `zeroBackingDoesNotDivideByZero`).
 

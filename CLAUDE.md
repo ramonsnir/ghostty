@@ -305,10 +305,16 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (17↔16) as its frame re-rounds onto a sub-pixel boundary, and reading it closed a feedback loop
   that oscillated the scale ~160 Hz (the "preview keeps switching font size" flicker, display-
   dependent — surfaced after moving the window between displays of different scale). `cols`/`rows`
-  were already host-first; this makes `cellW`/`cellH` match — the ONLY change (a fit-to-width
-  rewrite was tried and reverted; uniform-125 is the intended layout). Wiring:
-  `AgentPreviewTile.swift` (the body's host-first cell-size reads). Tests: `AgentMirrorGeometryTests`
-  (`uniformScaleAcrossSplitsOfDifferentWidths` + the existing geometry cases).
+  were already host-first; this makes `cellW`/`cellH` match (a fit-to-width rewrite was tried and
+  reverted; uniform-125 is the intended layout). **The host grid (cols/rows/cellW/cellH) is also
+  REMEMBERED across frames** (`hostGeomBox` + pure `mergeHostGeom`): when a split is hidden under a
+  SIBLING's zoom its real `SurfaceView` leaves the hierarchy and `realSurface.surfaceSize` goes nil,
+  but the host session's grid didn't change (zoom is GUI-only) — without memory that one tile read
+  `cols=0` and fell into the degenerate width-fit branch → rendered HUGE + flickering; the cache
+  holds the last valid grid until the split is shown again. Wiring: `AgentPreviewTile.swift`
+  (host-first cell reads + `hostGeomBox`/`mergeHostGeom`). Tests: `AgentMirrorGeometryTests`
+  (`mergeHostGeomRemembersThroughZoomHidden` + `uniformScaleAcrossSplitsOfDifferentWidths` + the
+  existing geometry cases).
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a

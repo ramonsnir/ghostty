@@ -44,6 +44,27 @@ struct AgentMirrorGeometryTests {
         #expect(g.scale > 0)
     }
 
+    @Test func mergeHostGeomRemembersThroughZoomHidden() {
+        // A valid host read populates the cache.
+        let seen = AgentMirrorPreview.mergeHostGeom(
+            prior: .init(), hostCols: 80, hostRows: 30, hostCellW: 17, hostCellH: 36)
+        #expect(seen == AgentMirrorPreview.HostGeom(cols: 80, rows: 30, cellW: 17, cellH: 36))
+        // While the split is hidden under a sibling's zoom the live read is absent
+        // (cols/cellW == 0): the cache MUST keep the last-known grid, not collapse to 0
+        // (which would drop the preview into the degenerate huge/flickering branch).
+        let hidden = AgentMirrorPreview.mergeHostGeom(
+            prior: seen, hostCols: 0, hostRows: 0, hostCellW: 0, hostCellH: 0)
+        #expect(hidden == seen)
+        // A real resize while visible updates the cache.
+        let resized = AgentMirrorPreview.mergeHostGeom(
+            prior: seen, hostCols: 120, hostRows: 40, hostCellW: 17, hostCellH: 36)
+        #expect(resized.cols == 120 && resized.rows == 40)
+        // A partial/garbage read (cols>0 but cellW==0) is also rejected → keep prior.
+        let partial = AgentMirrorPreview.mergeHostGeom(
+            prior: seen, hostCols: 80, hostRows: 30, hostCellW: 0, hostCellH: 0)
+        #expect(partial == seen)
+    }
+
     @Test func uniformScaleAcrossSplitsOfDifferentWidths() {
         // Two splits with DIFFERENT column counts but the same cell/backing must
         // get the SAME scale (uniform cell size), with `referenceColumns` (here
