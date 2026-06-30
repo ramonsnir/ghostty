@@ -822,9 +822,38 @@ struct AgentMirrorPreview: View {
             cols = Int(surfaceView.surfaceSize?.columns ?? 0)
             rows = Int(surfaceView.surfaceSize?.rows ?? 0)
         }
-        let cellW = merged.cellW > 0 ? merged.cellW : CGFloat(surfaceView.surfaceSize?.cell_width_px ?? 0)
-        let cellH = merged.cellH > 0 ? merged.cellH : CGFloat(surfaceView.surfaceSize?.cell_height_px ?? 0)
+        // Cell size: prefer the host-cached value (stable). When host was never seen
+        // (zoom-hidden at open), the only source is the mirror's OWN `cell_width_px`,
+        // which JITTERS (e.g. 15↔17) because the mirror's frame is derived from it and
+        // re-rounds each cycle — the same feedback loop the host-sourcing fixed. Font
+        // cell size is constant for a thumbnail's life, so LATCH the first non-zero
+        // fallback value and hold it; that breaks the loop (a real font/display change
+        // re-mounts the tile or arrives via the host once the split is shown).
+        let cellW: CGFloat
+        let cellH: CGFloat
+        if merged.cellW > 0 {
+            cellW = merged.cellW
+            cellH = merged.cellH
+        } else {
+            hostGeomBox.fallbackCellW = AgentMirrorPreview.latchedCell(
+                prior: hostGeomBox.fallbackCellW,
+                candidate: CGFloat(surfaceView.surfaceSize?.cell_width_px ?? 0))
+            hostGeomBox.fallbackCellH = AgentMirrorPreview.latchedCell(
+                prior: hostGeomBox.fallbackCellH,
+                candidate: CGFloat(surfaceView.surfaceSize?.cell_height_px ?? 0))
+            cellW = hostGeomBox.fallbackCellW
+            cellH = hostGeomBox.fallbackCellH
+        }
         return (cols, rows, cellW, cellH)
+    }
+
+    /// PURE: latch the FIRST non-zero cell size and HOLD it. Once `prior` is set
+    /// (> 0) it wins forever; until then a non-zero `candidate` adopts. This freezes
+    /// the host-never-seen fallback cell size so the mirror's own jittering
+    /// `cell_width_px` (e.g. 15↔17, from its frame-feedback) can't oscillate the
+    /// preview scale. (Font cell size is constant for a thumbnail's life.)
+    static func latchedCell(prior: CGFloat, candidate: CGFloat) -> CGFloat {
+        prior > 0 ? prior : candidate
     }
 
     /// The number of columns that fill the preview's WIDTH. This sets a UNIFORM
@@ -869,6 +898,12 @@ struct AgentMirrorPreview: View {
     /// is illegal inside a `@ViewBuilder`).
     final class HostGeomBox {
         var value = HostGeom()
+        /// Latched-once fallback cell size for the host-never-seen (zoom-hidden-at-open)
+        /// case — held stable so the mirror's own jittering `cell_width_px` can't
+        /// oscillate the preview. Set on first non-zero read in `resolveGrid`, never
+        /// re-written.
+        var fallbackCellW: CGFloat = 0
+        var fallbackCellH: CGFloat = 0
         func fold(hostCols: Int, hostRows: Int, hostCellW: CGFloat, hostCellH: CGFloat) -> HostGeom {
             value = AgentMirrorPreview.mergeHostGeom(
                 prior: value, hostCols: hostCols, hostRows: hostRows,

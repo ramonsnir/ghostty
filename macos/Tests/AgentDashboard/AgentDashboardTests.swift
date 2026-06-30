@@ -65,6 +65,16 @@ struct AgentMirrorGeometryTests {
         #expect(partial == seen)
     }
 
+    @Test func latchedCellHoldsFirstNonZero() {
+        // Until set, a non-zero candidate adopts; a zero candidate stays unset.
+        #expect(AgentMirrorPreview.latchedCell(prior: 0, candidate: 0) == 0)
+        #expect(AgentMirrorPreview.latchedCell(prior: 0, candidate: 15) == 15)
+        // Once set it HOLDS, ignoring the mirror's jittered later values (15↔17) —
+        // this is what stops the zoom-hidden fallback preview from oscillating.
+        #expect(AgentMirrorPreview.latchedCell(prior: 15, candidate: 17) == 15)
+        #expect(AgentMirrorPreview.latchedCell(prior: 15, candidate: 0) == 15)
+    }
+
     @Test func uniformScaleAcrossSplitsOfDifferentWidths() {
         // Two splits with DIFFERENT column counts but the same cell/backing must
         // get the SAME scale (uniform cell size), with `referenceColumns` (here
