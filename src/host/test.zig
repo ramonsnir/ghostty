@@ -547,6 +547,67 @@ test "host cursor-only move pushes (Slice 8): rows identical, cursor differs => 
     try testing.expect(snap_b.cursorEql(snap_b2));
 }
 
+test "host cursor-only move drives a push through the renderTick must_capture gate (issue #2)" {
+    // REGRESSION (issue #2): the idle-CPU `must_capture` gate
+    //   must_capture = cells_dirty or force_push or cursor_state_changed or first
+    // gated snapshot PROJECTION. A cursor-only POSITION move dirties no cell, is no
+    // scroll/mode change, and (before this fix) was absent from the cheap cursor
+    // gate — so must_capture stayed false, no Snapshot was projected, and the
+    // downstream `cursor_changed = !cursorEql` push was never even evaluated. Result:
+    // the GUI cursor froze until a later cell change (the "doesn't move until a
+    // non-space char is keyed" symptom). The snapshot-level test above proves
+    // cursorEql catches the move; THIS test proves the move survives the gate and a
+    // frame actually ships through the real renderTick/onRender path.
+    const alloc = testing.allocator;
+
+    const session = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+    defer session.destroy();
+
+    const Counter = struct {
+        n: usize = 0,
+        fn cb(ctx: *anyopaque, _: *Session, _: *const RenderState.Snapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n += 1;
+        }
+    };
+    var counter: Counter = .{};
+    session.on_render_ctx = &counter;
+    session.on_render = Counter.cb;
+
+    // Seed prev_snapshot + print some content so the cursor has somewhere to move
+    // WITHIN already-rendered cells (the in-place edit case).
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        try session.io.terminal.printString("hello world");
+    }
+    _ = try session.renderTick();
+    try testing.expect(counter.n >= 1);
+
+    // Idle tick: cursor steady, no cells changed -> no push (idle-CPU win intact).
+    counter.n = 0;
+    _ = try session.renderTick();
+    try testing.expectEqual(@as(usize, 0), counter.n);
+
+    // Move the cursor LEFT only (arrow-key / click-to-move case): NO cell content
+    // changes, so this is exactly the regressed condition.
+    {
+        session.render_mutex.lock();
+        defer session.render_mutex.unlock();
+        session.io.terminal.cursorLeft(7);
+    }
+    const changed = try session.renderTick();
+    // No ROW changed ...
+    try testing.expectEqual(@as(usize, 0), changed);
+    // ... yet the frame still ships, because cursor position is now in the gate.
+    try testing.expectEqual(@as(usize, 1), counter.n);
+
+    // And it doesn't spam: another idle tick with the cursor now stable -> no push.
+    counter.n = 0;
+    _ = try session.renderTick();
+    try testing.expectEqual(@as(usize, 0), counter.n);
+}
+
 test "host countChanges equals printDiff's row count (server-mode count must match Phase-1 print)" {
     const alloc = testing.allocator;
 
