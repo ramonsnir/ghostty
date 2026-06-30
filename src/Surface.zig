@@ -1250,6 +1250,16 @@ pub fn isMirror(self: *Surface) bool {
     };
 }
 
+/// (ramon fork / Agent Dashboard) The SOURCE host grid a `.client` mirror is
+/// rendering (cols/rows from the latest `grid_frame`), or null for `.exec` / a
+/// non-mirror / before the first frame. See `Client.mirrorSourceGrid`.
+pub fn mirrorSourceGrid(self: *Surface) ?termio.Client.MirrorGrid {
+    return switch (self.io.backend) {
+        .client => |*c| c.mirrorSourceGrid(),
+        .exec => null,
+    };
+}
+
 /// Layer 2: the decision childExited makes on its FIRST branch — whether this
 /// surface is a read-only mirror (dims, never closes) vs a real attach/exec
 /// surface (runs the normal close/show-exited flow). Extracted as a pure predicate

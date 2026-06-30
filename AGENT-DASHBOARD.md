@@ -451,8 +451,25 @@ gotchas, not a recap.)
   HUGE and flickers (the live symptom). So the tile caches the last VALID host grid
   (`cols/rows/cellW/cellH`) and keeps using it whenever the live read is absent; the cache
   refreshes the instant the split is shown again (`mergeHostGeom` rejects a zero/partial
-  read, accepts a real resize). Tests: `AgentMirrorGeometryTests`
-  (`mergeHostGeomRemembersThroughZoomHidden`, `uniformScaleAcrossSplitsOfDifferentWidths`,
+  read, accepts a real resize).
+
+  **Edge: the dashboard OPENED while a split is already zoom-hidden** — the cache was
+  never populated (the real split was never laid out, so `realSurface.surfaceSize` was
+  never non-nil). The tile then pulls the grid from the mirror's OWN `.client` stream via
+  `resolveGrid` → `ghostty_surface_mirror_grid_size` (NEW C API): the `.client` mirror
+  receives the host's real `cols`/`rows` in every `grid_frame` (stored in
+  `Client.render_state`), even though the real split isn't on screen. So the fallback chain
+  is **cache/host → mirror client-stream grid → mirror frame size**; cell size stays from
+  the cache or the mirror's own font metrics (display-correct for the tile). The C call is
+  GATED on `cols == 0`, so it only runs in this rare case (and reads under the render mutex,
+  so it can't tear against the read thread). NEW C API: `ghostty_surface_mirror_grid_size`
+  → `ghostty_surface_mirror_grid_s {columns, rows, valid}` (`src/apprt/embedded.zig` +
+  `include/ghostty.h`), backed by `Surface.mirrorSourceGrid` → `Client.mirrorSourceGrid`
+  (returns the named `Client.MirrorGrid`, null for non-mirror / pre-first-frame). **This is
+  a lib/xcframework rebuild (new C export) — GUI-only; the host never instantiates a
+  `.client` mirror, so `ghostty-host` is NOT rebuilt/reloaded (no session loss).** Tests:
+  `AgentMirrorGeometryTests` (`mergeHostGeomRemembersThroughZoomHidden`,
+  `uniformScaleAcrossSplitsOfDifferentWidths`,
   `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
   `zeroBackingDoesNotDivideByZero`).
 

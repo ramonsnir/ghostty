@@ -1320,6 +1320,14 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    // ghostty_surface_mirror_grid_s — (ramon fork) the source host grid a `.client`
+    // mirror is rendering; `valid` is false for non-mirror / pre-first-frame.
+    const MirrorGridSize = extern struct {
+        columns: u16,
+        rows: u16,
+        valid: bool,
+    };
+
     // ghostty_clipboard_content_s
     const ClipboardContent = extern struct {
         mime: [*:0]const u8,
@@ -1799,6 +1807,19 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// (ramon fork / Agent Dashboard) The SOURCE host grid a `.client` mirror is
+    /// rendering (cols/rows from the latest grid_frame), distinct from
+    /// `ghostty_surface_size` (which returns the mirror's own frame-derived grid).
+    /// `valid == false` for a non-mirror surface or before the mirror's first frame.
+    /// Lets the dashboard preview keep a correct scale when the real split is hidden
+    /// under a sibling's zoom (its surfaceSize is then unavailable).
+    export fn ghostty_surface_mirror_grid_size(surface: *Surface) MirrorGridSize {
+        if (surface.core_surface.mirrorSourceGrid()) |g| {
+            return .{ .columns = g.cols, .rows = g.rows, .valid = true };
+        }
+        return .{ .columns = 0, .rows = 0, .valid = false };
     }
 
     /// Returns the PID of the foreground process for the surface PTY.
