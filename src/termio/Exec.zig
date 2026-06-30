@@ -1642,6 +1642,22 @@ pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type
     return self.subprocess.getProcessInfo(info);
 }
 
+/// (ramon fork) Diagnostic-only: the direct child pid (the fork/exec leader the
+/// `xev.Process` exit-watcher is attached to), or null if there is no fork/exec
+/// process (flatpak / not yet spawned). Reads STORED state only — no syscalls,
+/// no mutation — so `.exec` runtime behavior is byte-for-byte unchanged. The
+/// host (`Session.renderTick`) uses it to check, at the instant a `child_exited`
+/// is emitted, whether the child is ACTUALLY gone, to catch a SPURIOUS exit
+/// notification (the "GUI shows Process-exited while the session is still live
+/// in the host" symptom).
+pub fn childPidForDiag(self: *const Exec) ?posix.pid_t {
+    const process = self.subprocess.process orelse return null;
+    return switch (process) {
+        .fork_exec => |cmd| cmd.pid,
+        .flatpak => null,
+    };
+}
+
 test "execCommand darwin: shell command" {
     if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
 

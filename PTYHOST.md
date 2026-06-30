@@ -159,6 +159,25 @@ in the remediation doc.
 - **Known scalability caveat (not a correctness bug):** attach/close do blocking
   socket writes under `registry_mutex`, so they serialize behind one slow GUI peer —
   acceptable for a single local GUI.
+- **Spurious-`child_exited` diagnostic (fork-only, always on, host-only).** When the
+  host emits a `child_exited` (driven by the `xev.Process` exit watcher → `processExit`
+  → `processExitCommon`), `Server.onChildExited` first checks whether the watched child
+  pid is *actually* gone via `kill(pid, 0)`: ESRCH (`error.ProcessNotFound`) ⇒ genuine
+  exit (logged `info` "child_exited verified gone"); still alive ⇒ logged **`warn`
+  "SPURIOUS child_exited: pid=… STILL ALIVE at emit"**. This is the proof probe for the
+  reported symptom *"the GUI shows Process-exited but the session is still live in the
+  host"* — if it ever fires `warn`, the `xev.Process` completion fired erroneously
+  (suspected libxev completion corruption; correlate with the `libxev_kqueue: invalid
+  state in submission queue` bursts in the same log). Reads STORED backend state only
+  (`Session.childPidForDiag` → `Exec.childPidForDiag`, the `.exec` fork/exec leader pid);
+  no syscalls beyond the `kill(pid,0)` probe, no mutation — **`.exec` runtime is
+  byte-for-byte unchanged** (the GUI never reaches `onChildExited`; it's host-only).
+  CAVEAT: a tiny pid-reuse window between the IO-thread exit notification and this
+  owner-thread callback could read a reused pid as "alive" — rare for the exact pid
+  within one ~100 ms tick. Wiring: `src/termio/Exec.zig` (`childPidForDiag`),
+  `src/host/Session.zig` (`childPidForDiag` forwarder), `src/host/Server.zig`
+  (`onChildExited` probe). NOTE: this is a temporary diagnostic — remove it once the
+  spurious-exit cause is found (or kept as a cheap permanent guardrail).
 
 ---
 

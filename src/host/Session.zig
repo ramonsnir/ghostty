@@ -1800,6 +1800,20 @@ pub fn renderTick(self: *Session) !usize {
     return changed;
 }
 
+/// (ramon fork) Diagnostic-only: the direct child pid the `xev.Process` exit
+/// watcher is attached to (the `.exec` backend's fork/exec leader), or null.
+/// The host backend is always `.exec`; forwards to `Exec.childPidForDiag`, which
+/// reads STORED state only (no syscalls, no mutation). Used by
+/// `Server.onChildExited` to check whether the child is actually gone when a
+/// `child_exited` is emitted — catching a SPURIOUS exit notification (the symptom
+/// "the GUI shows Process-exited while the session is still live in the host").
+pub fn childPidForDiag(self: *Session) ?std.posix.pid_t {
+    return switch (self.io.backend) {
+        .exec => |*e| e.childPidForDiag(),
+        .client => null,
+    };
+}
+
 /// Stop the session: signal the IO thread + render loop, join the IO thread.
 /// Idempotent.
 pub fn stop(self: *Session) void {

@@ -2058,13 +2058,48 @@ fn onRender(ctx: *anyopaque, session: *Session, snapshot: *const RenderState.Sna
 /// Child-exit callback (runs on the session owning thread). Pushes ChildExited
 /// to subscribers if any, else buffers it for delivery on reattach.
 fn onChildExited(ctx: *anyopaque, session: *Session, exit_code: u32, runtime_ms: u64) void {
-    _ = session;
     const e: *SessionEntry = @ptrCast(@alignCast(ctx));
     const ce: protocol.ChildExited = .{
         .session_id = e.session_id,
         .exit_code = exit_code,
         .runtime_ms = runtime_ms,
     };
+
+    // (ramon fork) DIAGNOSTIC: verify the child is ACTUALLY gone at the instant we
+    // emit child_exited. A genuine exit means the pid was reaped, so kill(pid, 0)
+    // => error.ProcessNotFound (ESRCH). If the pid is STILL ALIVE here, the
+    // `xev.Process` exit notification fired SPURIOUSLY — the root-cause signature
+    // of "the GUI shows Process-exited but the session is still live in the host".
+    // Logged loudly (warn) so the next occurrence is captured as proof and can be
+    // correlated with the `libxev_kqueue: invalid state in submission queue`
+    // bursts. CAVEAT: a tiny pid-reuse window exists between the exit notification
+    // (IO thread) and this callback (owner thread) — a reused pid would read as
+    // "alive", but reuse of the exact pid within one ~100ms tick is rare. Reads
+    // stored backend state only; no behavior change.
+    if (session.childPidForDiag()) |pid| {
+        const alive = if (std.posix.kill(pid, 0)) |_| true else |err| switch (err) {
+            error.ProcessNotFound => false,
+            // EPERM etc.: the pid exists but isn't signalable by us (shouldn't
+            // happen for our own child) — treat as "exists" to err toward flagging.
+            else => true,
+        };
+        if (alive) {
+            log.warn(
+                "SPURIOUS child_exited: pid={d} STILL ALIVE at emit (session_id={d} exit_code={d} runtime_ms={d}) — xev.Process exit fired while child lives",
+                .{ pid, e.session_id, exit_code, runtime_ms },
+            );
+        } else {
+            log.info(
+                "child_exited verified gone: pid={d} (session_id={d} exit_code={d} runtime_ms={d})",
+                .{ pid, e.session_id, exit_code, runtime_ms },
+            );
+        }
+    } else {
+        log.info(
+            "child_exited: no fork/exec pid to verify (session_id={d} exit_code={d})",
+            .{ e.session_id, exit_code },
+        );
+    }
 
     e.mutex.lock();
     defer e.mutex.unlock();
