@@ -12,6 +12,8 @@ import {
   runSweep,
   classifyBellNow,
   makeCoalescedRunner,
+  parseParentPid,
+  shouldExitForParentDeath,
   parseLoopEnablement,
   shouldEnableWarmBase,
   makeSummarizeFn,
@@ -157,6 +159,35 @@ function makeDeps(spec: DepsSpec): {
 }
 
 const okSummary: SummarizeFn = async () => '{"summary":"Doing the thing","phase":"build"}';
+
+// ---------------------------------------------------------------------------
+// (orphan guard) parent-death watchdog pure helpers
+// ---------------------------------------------------------------------------
+
+test("parseParentPid: positive integer parses; absent/blank/zero/negative/garbage => undefined", () => {
+  assert.equal(parseParentPid("17774"), 17774);
+  assert.equal(parseParentPid("  42 "), 42); // trimmed
+  assert.equal(parseParentPid(undefined), undefined);
+  assert.equal(parseParentPid(""), undefined);
+  assert.equal(parseParentPid("0"), undefined);
+  assert.equal(parseParentPid("-5"), undefined);
+  assert.equal(parseParentPid("3.5"), undefined); // non-integer
+  assert.equal(parseParentPid("nope"), undefined);
+});
+
+test("shouldExitForParentDeath: with a known parent pid, exit iff the live ppid differs", () => {
+  // Parent alive (ppid still equals the expected) => stay.
+  assert.equal(shouldExitForParentDeath(17774, 17774), false);
+  // Reparented to launchd (1) => the GUI died => exit.
+  assert.equal(shouldExitForParentDeath(1, 17774), true);
+  // Reparented to ANY other reaper => still exit (not just launchd).
+  assert.equal(shouldExitForParentDeath(500, 17774), true);
+});
+
+test("shouldExitForParentDeath: without a known parent pid, fall back to reparent-to-1", () => {
+  assert.equal(shouldExitForParentDeath(17774, undefined), false); // still has a real parent
+  assert.equal(shouldExitForParentDeath(1, undefined), true); // orphaned to launchd
+});
 
 // ---------------------------------------------------------------------------
 // Happy path: one agent surface => exactly one annotation + recorded LastSummary

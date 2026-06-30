@@ -304,6 +304,24 @@ struct AgentManagerControllerTests {
         #expect(out["GHOSTTY_CLAUDE_PATH"] == nil)
     }
 
+    // MARK: - applyParentPidEnv (orphan guard: tie the sidecar's life to the GUI's)
+
+    /// A positive pid ⇒ GHOSTTY_PARENT_PID is set (the sidecar's watchdog exits when its
+    /// live ppid no longer matches), other keys untouched.
+    @Test func parentPidEnvSetWhenPositive() {
+        let out = AgentManagerController.applyParentPidEnv(into: ["PATH": "/usr/bin"], pid: 17774)
+        #expect(out["GHOSTTY_PARENT_PID"] == "17774")
+        #expect(out["PATH"] == "/usr/bin")
+    }
+
+    /// A non-positive pid ⇒ the key is REMOVED (the sidecar falls back to its reparent-to-1
+    /// heuristic); a stray inherited value must not leak through.
+    @Test func parentPidEnvRemovedWhenNonPositive() {
+        let out = AgentManagerController.applyParentPidEnv(
+            into: ["GHOSTTY_PARENT_PID": "999"], pid: 0)
+        #expect(out["GHOSTTY_PARENT_PID"] == nil)
+    }
+
     // MARK: - wellKnownExecutablePaths (robust resolution vs the GUI's pristine PATH)
 
     /// `claude` candidates lead with the official native installer location (the spot a

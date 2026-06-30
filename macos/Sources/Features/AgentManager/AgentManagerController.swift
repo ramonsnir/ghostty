@@ -278,12 +278,35 @@ final class AgentManagerController {
             let existing = env["PATH"] ?? ""
             env["PATH"] = existing.isEmpty ? nodeDir : "\(nodeDir):\(existing)"
         }
+        // (orphan guard) Tell the sidecar OUR pid so its parent-death watchdog can exit the
+        // instant it's reparented (GUI crash / SIGKILL / a clean-quit teardown that loses the
+        // race), instead of lingering and later resuming reports to the next GUI that rebinds
+        // the same loopback MCP port — the split-brain that made the Agent Queue health row
+        // alternate between two diverged snapshots.
+        env = Self.applyParentPidEnv(into: env, pid: ProcessInfo.processInfo.processIdentifier)
         env = Self.applySummarizerEnv(into: env, enabled: enabled)
         env = Self.applyAgentQueueEnv(
             into: env,
             enabled: agentQueueEnabled,
             templatesDir: agentQueueTemplatesDir,
             maxTotal: agentQueueMaxTotal)
+        return env
+    }
+
+    /// (orphan guard) Layer the parent pid onto the sidecar env as `GHOSTTY_PARENT_PID`.
+    /// PURE + unit-tested. The sidecar's parent-death watchdog (index.ts) compares its live
+    /// `process.ppid` against this value and exits the moment it differs (= it was reparented
+    /// because the GUI died), so an orphaned sidecar can never resume reporting to the next
+    /// GUI that rebinds the same loopback MCP port. A non-positive pid is NOT set (the sidecar
+    /// then falls back to its reparent-to-1 heuristic); any stray inherited value is dropped so
+    /// the controller is the sole authority on this.
+    static func applyParentPidEnv(into env: [String: String], pid: Int32) -> [String: String] {
+        var env = env
+        if pid > 0 {
+            env["GHOSTTY_PARENT_PID"] = String(pid)
+        } else {
+            env.removeValue(forKey: "GHOSTTY_PARENT_PID")
+        }
         return env
     }
 

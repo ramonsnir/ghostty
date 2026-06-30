@@ -383,6 +383,40 @@ Tests: `summarizer.test.ts` (`backoffDelayMs`), `config.test.ts` (parse), `index
 one-probe-recovers, failed-probe-extends, unparseable-is-fail). **Rebuilt sidecar `dist` +
 sidecar restart only; no GUI/host/Zig change.**
 
+### Orphan guard — the sidecar dies with its parent GUI (split-brain fix)
+
+The sidecar is a child `Process` of the GUI, spawned + reaped by `AgentManagerController`.
+Its `teardown()` (SIGTERM on app quit) is BEST-EFFORT: it never runs on a GUI crash /
+SIGKILL, and being `queue.async` from `applicationWillTerminate` it can lose the race on a
+clean quit. A sidecar that outlives its GUI is reparented (`ppid` → launchd, or another
+reaper) and keeps polling. Because the sidecar only makes OUTBOUND HTTP calls to a FIXED
+loopback MCP port (`GHOSTTY_MCP_URL`), the moment a NEW GUI rebinds that same port the
+orphan's next sweep succeeds and it silently RESUMES reporting to it. With two sidecars
+(orphan + the new GUI's own child) pushing `report_queue_status` for the SAME `queueName`,
+the dashboard — which keys `queueStatuses` by `queueName` — alternated between two diverged
+snapshots each poll (the live symptom: the Agent Queue health row flickering between e.g.
+`46/∞` and `47/46`).
+
+The fix ties the child's life to the parent's, covering crash / SIGKILL / clean-quit-race
+UNIFORMLY (in every case the child is reparented): the controller passes its own pid as
+`GHOSTTY_PARENT_PID` (pure `applyParentPidEnv`), and the sidecar runs a `.unref()`'d 2s
+watchdog (`PARENT_WATCH_INTERVAL_MS`) that calls `shouldExitForParentDeath(process.ppid,
+parentPid)` — exit the instant the live `process.ppid` no longer equals the expected parent
+(= reparented). When no parent pid was supplied (an OLD controller respawning a new dist),
+it falls back to the canonical reparent-to-launchd signal (`ppid === 1`). macOS
+`process.ppid` re-reads `getppid()` each access, so the reparent is seen promptly; `.unref()`
+keeps the timer from being the sole thing holding an idle process alive. NOTE: the
+controller's `teardown()` was left as-is (best-effort) — the watchdog makes it sufficient
+(any missed teardown is reaped within ~2s) rather than load-bearing.
+
+Wiring: sidecar — `index.ts` (`parseParentPid` + `shouldExitForParentDeath` pure helpers,
+`PARENT_WATCH_INTERVAL_MS`, the watchdog interval in `main()`); Swift —
+`AgentManagerController.swift` (`applyParentPidEnv` + the `childEnvironment` call passing
+`ProcessInfo.processInfo.processIdentifier`). Tests: `index.test.ts` (`parseParentPid`,
+`shouldExitForParentDeath` with/without a known parent pid), `AgentManagerControllerTests.swift`
+(`parentPidEnvSetWhenPositive`, `parentPidEnvRemovedWhenNonPositive`). **Rebuilt sidecar
+`dist` + GUI relaunch; no host/Zig change.**
+
 ### Warm-base fork-per-call reuse — the cache-CREATION cost fix (config `agent-manager-warm-base`, default OFF)
 
 The user-facing knob is the fork-only config key **`agent-manager-warm-base`** (default `false`)

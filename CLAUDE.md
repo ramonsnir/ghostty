@@ -355,6 +355,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   controls, account routing, the rate-limit attention watchdog, the system-`claude`/esbuild bundle,
   Haiku usage/budget tracking, wiring + tests.**
 
+- **Sidecar orphan guard** (fork-only, macOS; always on) — the Agent Manager sidecar is a child
+  `Process` of the GUI, but its `teardown()` is best-effort (never runs on a GUI crash/SIGKILL,
+  can lose the clean-quit race). An orphaned sidecar gets reparented yet keeps polling, and since
+  it only makes OUTBOUND calls to a FIXED loopback MCP port it silently RESUMES reporting to the
+  NEXT GUI that rebinds that port → two sidecars push `report_queue_status` for the same
+  `queueName` → the dashboard (keyed by `queueName`) ALTERNATES between two diverged snapshots
+  (the live symptom: the Agent Queue health row flickering between e.g. `46/∞` and `47/46`). Fix:
+  tie the child's life to the parent's. The controller passes its own pid as `GHOSTTY_PARENT_PID`
+  (pure `applyParentPidEnv`); the sidecar runs a `.unref()`'d 2s watchdog
+  (`PARENT_WATCH_INTERVAL_MS`) that exits the moment `process.ppid` no longer matches it
+  (`shouldExitForParentDeath`; falls back to reparent-to-1 when no pid was supplied). Covers
+  crash/SIGKILL/clean-quit-race uniformly (all reparent the child); `teardown()` left best-effort
+  (the watchdog makes it sufficient, not load-bearing). Wiring: `agent-manager/src/index.ts`
+  (`parseParentPid`/`shouldExitForParentDeath`/`PARENT_WATCH_INTERVAL_MS` + the watchdog),
+  `AgentManagerController.swift` (`applyParentPidEnv` + the `childEnvironment` call). Tests:
+  `index.test.ts` + `AgentManagerControllerTests.swift` (`parentPidEnv*`). **See `AGENT-MANAGER.md`
+  → "Orphan guard". Rebuilt sidecar `dist` + GUI relaunch; no host/Zig change.**
+
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default; config `agent-queue` /
   `agent-queue-templates-dir` / `agent-queue-max-total`, action `start_agent_queue`) — turns the
   dashboard into an active supervisor: from a user-authored JSON template it opens a tab of splits,
