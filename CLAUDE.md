@@ -935,6 +935,21 @@ this macOS); `nushell` for `build.nu`.
    - **⚠️ Rebuild the lib WITH the xcframework — never pass `-Demit-xcframework=false` here.** The app links the **xcframework**, not the bare lib, so if you skip emitting it (as you correctly do for the *test* command in step 2) the app silently links the **stale** xcframework and your Zig change is invisible to the GUI, even though `zig build` succeeded and the Zig/host tests pass. The default emits it; just `zig build -Demit-macos-app=false -Doptimize=ReleaseFast`. **Symptom of the trap:** host + Zig tests green, the `ghostty-host` binary behaves correctly, but the GUI acts as if the lib change isn't there — e.g. after bumping the host protocol minor, the app kept advertising the OLD minor, so the host withheld the new frame and a whole feature silently no-op'd (this cost most of the Agent Dashboard detection-debug session). Same class of mistake as the LWCR/host-reload gotcha below: the build "succeeds" but ships a stale artifact. After a protocol/lib change, also `rm -rf macos/build/ReleaseLocal` before the app build so Xcode can't reuse a stale embedded framework.
 4. **Swift tests**: `macos/build.nu --action test` (or `xcodebuild … -only-testing:GhosttyTests/SplitTreeTests test`).
 5. **Build the app**: `macos/build.nu --configuration ReleaseLocal --action build` → `macos/build/ReleaseLocal/Ghostty.app` (optimized, no debug banner). This produces "Ghostty (ramon-local)" with bundle id `com.mitchellh.ghostty-ramon.local` — runs side-by-side with the installed Release identity.
+   - **⚠️ Sidecar (agent-manager) changes — the dist must be re-bundled.** The Xcode
+     project does NOT bundle the agent-manager sidecar; only the release script ever did.
+     **`build.nu` now bundles it as a post-build step** (for a macOS `Ghostty` `build`): it
+     rebuilds `macos/agent-manager/dist` (`npm run build`, when node + `node_modules` are
+     present — locating nvm's node off the clean PATH) and copies `dist` + `package.json`
+     into `…/Ghostty.app/Contents/Resources/agent-manager`, then re-signs. So a normal
+     `build.nu` build is now self-contained. **If node/`node_modules` aren't found it only
+     COPIES whatever `dist` exists and WARNS** — so for a sidecar change still run
+     `npm run build` in `macos/agent-manager` yourself first (or `npm ci` once for deps).
+     **The trap this fixes (cost a debug session 2026-06-30):** a `ditto` deploy of an app
+     whose `dist` wasn't refreshed left a STALE `Contents/Resources/agent-manager/dist` in
+     the installed app (ditto never deletes dst-only files), so the running sidecar silently
+     executed OLD code — Agent Queue/Manager/adopt commands were no-ops with zero errors.
+     Symptom: the GUI behaves as if the sidecar change isn't there; `~/Library/Logs/ghostty-ramon-agent-manager.log`
+     shows the old code path and the bundled `dist/index.js` lacks your new strings.
 6. **Install/update the fork** over `/Applications/Ghostty (ramon).app`. Verified to be safe to run while the installed Release fork is still hosting Claude Code's shell — `ditto` and `PlistBuddy` don't disturb the running mmap'd binary, and `codesign` succeeds after stripping Apple's `com.apple.provenance` xattrs. The new binary only takes effect on the next launch, so the user still has to quit + relaunch themselves.
 
    **You MAY run this block WITHOUT asking — but ONLY when BOTH hold: (a) the
@@ -965,6 +980,11 @@ this macOS); `nushell` for `build.nu`.
    name; everything else identity-derived (the MCP/web-monitor port offset and the
    runtime icon swap) keys off the bundle id at launch, so that one re-stamp converts
    the whole identity to Release (`+0`, `chalkboard`). Never touch `/Applications/Ghostty.app`.
+   The `ditto` carries the **bundled agent-manager sidecar** along with the GUI binary —
+   but only if the ReleaseLocal build's `Contents/Resources/agent-manager/dist` was fresh
+   (see step 5's sidecar note). For a sidecar change, confirm the deployed app's
+   `…/Resources/agent-manager/dist/index.js` actually contains your change (e.g. grep a new
+   string) — a stale `dist` deploys silently because ditto won't remove the old one.
 
    **Host code changed too?** The installed app and `ghostty-host` are SEPARATE
    deploys. If your change touched anything the host runs (`src/host/`,
