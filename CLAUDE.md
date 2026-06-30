@@ -25,6 +25,20 @@ action / template knob / MCP tool / protocol field is incomplete until it is doc
 "Implementation notes" section, and the one-line summary here). Treat a docs update as part
 of the definition of done for the work — land it in the same commit, not "later."
 
+## 🔒 No real-world names or concrete personal examples (BLOCKING)
+
+**Never put real company, customer, client, employer, person, or private-project
+names — or any concrete identifier tied to a real-world entity — into tracked
+content.** This covers code, comments, docs, tests, fixtures, sample data,
+illustrative examples, the tracked `example/` configs, and commit messages, and it
+applies to placeholder/sample values exactly as much as to functional code. Always
+use neutral, obviously-fake placeholders instead (`Acme`, `Example`, `foo`/`bar`,
+`project-a` / `~/git/your-project`, `user@example.com`, an `EX-`-style key prefix).
+When a real value genuinely must exist for the fork to run on a given machine, keep
+it ONLY in untracked / machine-local files (e.g. `~/.config/ghostty-ramon/local` or
+the live `~/.config/...` configs), never in anything that gets committed. If you
+notice an existing real-world name slip through, treat removing it as in-scope.
+
 ## Functional changes — new keybind actions (also in the command palette)
 All act on the focused surface. flip/toggle walk **up** to the nearest enclosing
 split of the given orientation (like `resize_split`), so outer splits are
@@ -503,9 +517,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (mirror of the shared `~/.config/ghostty/config`) and `example/ghostty-ramon/config`
   (mirror of the fork-only `~/.config/ghostty-ramon/config`). These are the starting
   point for setting the fork up on a new Mac (clone, build, copy these two into
-  `~/.config/`). **Keep them byte-for-byte identical to the on-disk files** — whenever
-  you change either live config, re-copy it into `example/` in the same commit. **They
-  must contain NO secrets and NO per-machine values.** Secrets + machine-specific
+  `~/.config/`). **Keep them in sync with the on-disk files** — whenever you change
+  either live config, re-copy it into `example/` in the same commit — **EXCEPT first
+  sanitize any real-world names/paths per the "No real-world names" rule above.** The
+  tracked `example/` copies use neutral placeholders (e.g. `~/git/your-project`,
+  `Acme Foods`) and therefore intentionally diverge from the live files on those
+  values; **never re-copy a real customer / personal / private-project name or path
+  from a live config back into `example/`.** **They must also contain NO secrets and
+  NO per-machine values.** Secrets + machine-specific
   values instead live in the **untracked** `~/.config/ghostty-ramon/local`, which the
   tracked fork config pulls in via an optional include
   (`config-file = ?~/.config/ghostty-ramon/local` — the `?` suppresses the
