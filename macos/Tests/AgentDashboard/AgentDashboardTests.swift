@@ -2385,6 +2385,78 @@ struct AgentQueueHealthTests {
         #expect(model.queueStatuses["ExampleOS"]?.next.first?.url == "https://linear.app/x/EX-2")
         #expect(model.queueStatuses["ExampleOS"]?.running.first?.key == "EX-1")
     }
+
+    // MARK: - Adopt UX gating (ramon fork / Agent Queue, adopt)
+    //
+    // The pure, AppKit-free controller helpers that back the adopt modal's
+    // gating (LOCKED #4: empty ⇒ button disabled, single ⇒ auto-select; the
+    // duplicate guard; the live title-preview lookup). All are reachable through
+    // the public `applyQueueStatus`/`applyQueueGraph` ingestion path (the
+    // `queueStatuses`/`queueGraphs` stores are `private(set)`), so these exercise
+    // the same way the sidecar feeds them at runtime.
+
+    /// Local `QueueGraph.Node` constructor (the `node(...)` helper lives in the
+    /// sibling `QueueBacklogTests` suite, not this one).
+    private func graphNode(_ key: String, title: String? = nil, url: String? = nil) -> QueueGraph.Node {
+        .init(key: key, title: title, url: url, state: nil, stateType: nil,
+              done: false, labels: [], blockedBy: [], priorityLabel: nil)
+    }
+
+    @Test func runNamesForAdoptEmptyWhenNoQueuePresent() {
+        // Empty ⇒ the Adopt button is disabled (LOCKED #4).
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        #expect(model.runNamesForAdopt().isEmpty)
+    }
+
+    @Test func runNamesForAdoptSingleRunForAutoSelect() {
+        // Exactly one present run ⇒ the modal auto-selects it + hides the picker.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS"))
+        #expect(model.runNamesForAdopt() == ["ExampleOS"])
+    }
+
+    @Test func runNamesForAdoptSortedAndExcludesAbsent() {
+        // Multiple present runs ⇒ sorted (stable picker order). A present:false
+        // report drops a run, so it never appears as an adopt target.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("Zephyr"))
+        model.applyQueueStatus(status("Alpha"))
+        model.applyQueueStatus(status("Mango"))
+        #expect(model.runNamesForAdopt() == ["Alpha", "Mango", "Zephyr"])
+        // Drain one → it leaves the adopt-target list.
+        model.applyQueueStatus(status("Mango", present: false))
+        #expect(model.runNamesForAdopt() == ["Alpha", "Zephyr"])
+    }
+
+    @Test func activeKeysForRunReflectsRunningSet() {
+        // The duplicate-guard source: the GUI-visible RUNNING keys for a run.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status(
+            "ExampleOS", active: 2,
+            running: [QueueStatus.Item(key: "EX-1", title: nil, url: nil),
+                      QueueStatus.Item(key: "EX-7", title: "Seven", url: nil)]))
+        #expect(model.activeKeysForRun("ExampleOS") == ["EX-1", "EX-7"])
+        // A key not running is NOT in the set (so the modal allows adopting it).
+        #expect(!model.activeKeysForRun("ExampleOS").contains("EX-99"))
+        // An unknown run yields the empty set (no false-positive duplicate block).
+        #expect(model.activeKeysForRun("Ghost").isEmpty)
+    }
+
+    @Test func graphNodeForAdoptLooksUpLocalBoardNode() {
+        // The live title-preview source: a LOCAL backlog-graph node lookup
+        // (instant, round-trip-free). Carries title + url for the modal preview.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueGraph(QueueGraph(
+            queueName: "ExampleOS", present: true, backlog: 1,
+            nodes: [graphNode("EX-1", title: "Fix the bug", url: "https://linear.app/x/EX-1")]))
+        let found = model.graphNodeForAdopt(run: "ExampleOS", key: "EX-1")
+        #expect(found?.title == "Fix the bug")
+        #expect(found?.url == "https://linear.app/x/EX-1")
+        // A key NOT on the board ⇒ nil ("not on this queue's board" — still adoptable).
+        #expect(model.graphNodeForAdopt(run: "ExampleOS", key: "EX-404") == nil)
+        // An unknown run (no graph) ⇒ nil.
+        #expect(model.graphNodeForAdopt(run: "Ghost", key: "EX-1") == nil)
+    }
 }
 
 // MARK: - Backlog graph (the dependency-graph canvas)

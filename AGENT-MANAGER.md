@@ -735,6 +735,18 @@ call is cents on cache READS). Load-bearing details:
   `feature` (`bellRang ? "bell-classify" : "summarizer"`) + `account` (basename of
   `summarizerConfigDir`, else `"ambient"`) and calls `recordUsage` (usage.ts). The
   `SummarizeFn` type was widened with the same optional `onUsage`.
+- **Third feature `issue-key-infer` (Agent Queue adopt)**: the Agent-Queue "adopt a free
+  split" feature adds a THIRD usage feature tag alongside `summarizer`/`bell-classify`. An
+  on-demand `infer_key` queue command (one per adopt-modal open) drives a Haiku call through
+  the SAME `model.ts summarize()` chokepoint via the shared `deps.summarize` (warm-base aware),
+  with `onUsage` recording `feature:"issue-key-infer"` + the routed account. It is wired in the
+  `deps.queue.inferKey` seam (index.ts) → the pure `runInferKeyWithDeps` driver (`queue/infer.ts`,
+  SDK-free — `summarize` is injected, never imported), which reads the surface, composes the
+  bespoke "extract the issue key" prompt, parses the reply, and writes the inferred key back as
+  the new `queueKeySuggested` annotation (best-effort: any failure writes the `""` "inferred
+  nothing" sentinel). **No Swift change to `get_haiku_usage` is needed** — `MCPUsage.aggregate`
+  buckets by an arbitrary feature STRING, so `issue-key-infer` is broken out automatically. See
+  AGENT-QUEUE.md → "Adopting a free split".
 - **Persistence + retention**: `usage.ts` appends one JSONL line per call to
   `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` (best-effort, never throws — mirrors
   diag.ts). `trimUsageLog(14, Date.now())` runs once at sidecar startup (`main()`), dropping

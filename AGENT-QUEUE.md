@@ -287,6 +287,33 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   the "stuck in limbo, won't get rescheduled" items without editing statuses in your tracker. The
   chip appears only when there ARE held items (latched AND still in the backlog AND no longer
   active); a still-RUNNING agent is never shown as held.
+- **Adopt a free split into a queue:** a CLI-agent split you started **by hand** (one the queue
+  did NOT launch — `(other)` section, no origin marker) gets an **Adopt…** button (tray icon) in
+  its dashboard-tile hover controls, next to **Hide**. Click it to pull that existing agent into
+  a running queue so the queue **tracks it like a dispatched item** — physically **moving the
+  split into the queue's grid tab** and folding it into the run. Use it when you hand-started an
+  agent on a backlog item and now want the supervisor to own it (status-track it, auto-close it
+  on done, count it against concurrency). The button is **disabled when no queue is running**.
+  The **Adopt…** modal:
+  - **Queue picker** — pick which running queue to adopt into; **hidden (auto-selected)** when
+    exactly one queue is running, shown as a picker otherwise.
+  - **Work-item key field** — the key the queue will track the split as. It is **prefilled by an
+    on-demand Haiku read of the split's screen** (a spinner shows while it infers; best-effort —
+    if it finds nothing or is unavailable you just type the key). You can always override the
+    prefill. A **live title preview** below the field looks the key up in the queue's own backlog
+    graph (instant, no round-trip): it shows the item's title if the key is on that queue's board,
+    or a soft **"Not on this queue's board — adoptable, but no title"** note if it isn't (you can
+    still adopt — you're asserting the split belongs to this key).
+  - **Duplicate guard** — if that key is **already running** in the target queue, **Adopt** is
+    blocked (no collision) and the modal offers **"Jump to the running one"** instead.
+  - **KEEP note** — adopting **follows the template's `keepOnComplete`** (it does NOT force-keep):
+    on `status=done` the adopted split **auto-closes like any tracked item unless its 📌 KEEP pin
+    is set**, so pin it first (or the template defaults to keep) if you want to keep working in it.
+  Adopt **always succeeds** — at capacity (the queue at concurrency / its grid full) the moved
+  split **overflows into a new grid row / tab** (the same multi-tab packing the queue uses). It
+  occupies a concurrency slot but is **not** counted as a freshly-launched agent (no
+  `lifetimeDispatched` bump — it's an existing agent, not a new one). If the template defines a
+  `claim` step, adopt fires it for the key (same as a normal dispatch).
 
 ## What it guarantees
 
@@ -491,6 +518,121 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
     optional key; `reportQueueStatus` forwards held); Swift `MCPServerTests`
     (`queueCommandReleaseSerializes*`, `queueStatusPayloadParsesHeld*`, `queueStatusWithHeld*`).
     **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
+
+### Adopting a free split into a queue (the `adopt` + `infer_key` commands)
+
+- **WHAT** — a dashboard tile **Adopt…** button (on a non-queue CLI-agent tile) pulls a
+  human-created split into a running Agent Queue so the queue tracks it like a dispatched item:
+  it MOVES the split into the run's grid tab, LATCHES the work-item key, follows the template's
+  `keepOnComplete`, fires the provider `claim`, and lets reconcile's existing orphan-adoption
+  fold the annotated surface in. Title preview is a LOCAL `report_queue_graph` node lookup
+  (instant, no round-trip); the key field is prefilled by an on-demand Haiku call.
+- **⭐ The coercer gate (the chokepoint, `mcp.ts coerceQueueCommands`, NOT index.ts).** Two new
+  actions `adopt` + `infer_key` are added to the `QUEUE_ACTIONS` whitelist and the coercer body
+  carries two new string fields `surfaceUUID` + `url`. WITHOUT this the GUI's emitted commands
+  are SILENTLY DROPPED before the reducer and the whole feature is a no-op. (Regression-guarded
+  by `mcp.test.ts coerceCarriesAdoptFields` / `coerceKeepsInferKey`.)
+- **The latch-at-adoption crux (`commands.ts`).** `applyCommand`'s new `case "adopt"` does the
+  PURE, SYNCHRONOUS part only — the LATCH + dedup decision (the physical move/annotate/claim are
+  runner side effects, below). It validates run/key/surfaceUUID, then `adoptDecision(run, key)`
+  (extracted + unit-tested): **`"reject-duplicate"`** when `run.active.has(key)` (block the
+  collision — the GUI offers "jump to the running one"), else **`"latch"`** ⇒ `run.dispatched.add(key)`
+  **BEFORE any `await`**, so even if the sweep is interrupted between latch and move,
+  `selectCandidates` already suppresses the key — the crux that blocks a SECOND dispatch for an
+  item still actionable in the provider `list`. Returns the new `ApplyResult.kind` `"adopted"`,
+  which (like `keepSet`/`released`) is NOT in `applyCommands`'s `changed` whitelist — the latch
+  lives in the per-run store, not `active-runs.json`.
+- **`infer_key` resolved control flow (no contradiction).** It IS whitelisted (else the coercer
+  drops it) and DOES flow through `applyCommand` as an EXPLICIT `case "infer_key": return {kind:"noop"}`
+  (named, NOT a `default` fallthrough — mutates nothing, naturally excluded from `changed`). The
+  real Haiku work runs in the sweep's post-`applyCommands` SIDE-EFFECT loop.
+- **Runner side effects (`runner.ts runAdopt`).** After `applyCommands` + its persist + the snappy
+  report loop, `runQueueSweep` re-iterates the drained `commands`: `adopt` → `runAdopt`, `infer_key`
+  → `runInferKey`. `runAdopt`: re-checks the dedup against the LIVE `run.active`; resolves the run's
+  first SEATED anchor pane (`firstSeatedUUID`) and `moveSurfaceIntoTab({sourceUUID, targetAnchorUUID,
+  balanced, maxCols, maxRows})` — REUSING the existing cross-window move + grid-cap overflow (LOCKED
+  #5: at capacity the split overflows to a new grid row/tab; adopt always succeeds); if the run has
+  NO seated pane it does NOT move (the adopted split becomes the run's seed). **On a MOVE failure it
+  ROLLS BACK the latch** (`run.dispatched.delete(key)` + persist) so the item stays dispatchable.
+  Then it stamps the annotation (`queueKey`/`queueName`/`queueUrl` + `keep = effectiveKeep(run, key)`
+  — FOLLOWS the template, NOT a forced true), fires the provider `claim` (consistent with
+  `dispatchOne`), and persists the latch. It NEVER writes `run.active` (reconcile is its sole owner)
+  and never spawns, so the adopted pane occupies a concurrency slot WITHOUT bumping
+  `lifetimeDispatched`.
+- **Reuse of reconcile's orphan-adoption (NOT a parallel path).** `store.ts reconcile` already
+  folds a live surface carrying `queueKey`+`queueName` with no matching record into the run as a
+  RUNNING assignment (fresh `sinceMs`, lowest-free grid slot). So "adopt" = stamp the annotation +
+  add the latch; the NEXT reconcile sweep absorbs it. **PRECONDITION (relied upon + documented):**
+  the adopted surface MUST have a NON-ZERO `sessionID` — reconcile skips `sessionID === 0`
+  (store.ts: "can't be persistence-keyed → not adoptable"). A human pty-host split always has a
+  real session, and the Adopt button is gated behind the same pty-host HARD DEP the dashboard/queue
+  require, so a 0-session target is unreachable through the UI. We add NO 0-session fallback
+  (inventing a persistence key reconcile can't match is exactly the divergence we avoid).
+- **Haiku key inference seam (`queue/infer.ts` + index.ts).** PURE, SDK-free helpers:
+  `composeInferPrompt(viewportTail, candidateKeys)` (bespoke "extract a single work-item KEY"
+  prompt; hint block OMITTED when no candidates), `parseInferredKey(raw)` (trim/strip fences+quotes,
+  first non-empty line, first token on interior whitespace, reject >64-char junk → key | null),
+  `collectCandidateKeys(registry, runName)` (graph ∪ list keys, deduped; `[]` for empty/unknown
+  run). The impure DRIVER `runInferKeyWithDeps(surfaceUUID, runName, deps)` (also in `infer.ts`,
+  with the model `summarize` INJECTED — never imported, so the queue module keeps its
+  no-npm-deps property): read the surface → tail → compose → `summarize` (warm-base aware,
+  `isUsable = parseInferredKey !== null`) → write the inferred key (or `""`) as the
+  `queueKeySuggested` annotation. **BEST-EFFORT: ANY failure writes the `""` sentinel** so the GUI
+  modal drops its spinner. Wired in index.ts as `deps.queue.inferKey`, tagging usage
+  `feature:"issue-key-infer"` (the third Haiku feature — see AGENT-MANAGER.md).
+- **The `queueKeySuggested` annotation sentinel (`mcp.ts`).** New optional `Annotation` field
+  forwarded by `setAnnotation` even when `""` (`!== undefined`, NOT truthiness): NON-EMPTY = the
+  inferred key; `""` = "the sidecar tried, found nothing" (a definite negative, ALWAYS written on
+  the infer path); ABSENT = "no suggestion yet". The MCP `set_surface_annotation` tool schema gains
+  the field (additive — **no new tool, count stays 26**; `adopt`/`infer_key` ride the existing
+  `take_queue_commands` tool). The GUI clears any stale value DIRECTLY at modal open (not via the
+  never-nils `merging`) and prefills from the next sidecar write — see the Swift wiring.
+- **Wiring (sidecar):** `mcp.ts` (⭐ `coerceQueueCommands` whitelist + `surfaceUUID`/`url` carry +
+  `queueKeySuggested` `Annotation`/`setAnnotation`), `queue/commands.ts` (`adopt` latch/dedup +
+  `adoptDecision` + `infer_key` no-op + `ApplyResult` `"adopted"`), `queue/runner.ts` (`runAdopt`
+  move/annotate/claim/rollback + `runInferKey` + the `deps.inferKey` seam + the sweep side-effect
+  loop), `queue/infer.ts` (NEW: prompt/parse/candidates + `runInferKeyWithDeps`), `index.ts`
+  (`deps.queue.inferKey` seam + `issue-key-infer` usage tag). **Tests:** `mcp.test.ts`
+  (coerce adopt/infer_key + carried fields + unknown-action-still-dropped + `queueKeySuggested`
+  incl. `""`), `queue/commands.test.ts` (`adoptDecision`, latch, reject-duplicate, missing-args,
+  `infer_key` no-op, not-an-active-run-change for both), `queue/runner.test.ts` (runAdopt
+  moves/annotates/claims/persists, move-failure rollback, no-anchor seed, adopt+reconcile fold,
+  0-session not-folded, infer_key dispatch + no-seam no-op), `queue/infer.test.ts` (parse/compose/
+  candidates + `runInferKeyWithDeps` writes key / `""` / `""`-on-error). **GUI relaunch + rebuilt
+  sidecar `dist`; no host/Zig change.**
+- **Wiring (macOS / Swift):** `QueueCommandBridge.swift` — `QueueCommand.Action` gains `.adopt`
+  (`"adopt"`) + `.inferKey` (`"infer_key"`); new `surfaceUUID: String?` + `url: String?` stored
+  props (defaulted in `init`), emitted by `jsonObject` ONLY when non-nil + non-empty (the matched
+  pair to the ⭐ `mcp.ts` coercer carry — BOTH must land or the commands are dropped and the
+  feature is a no-op). `AgentStateBridge.swift` — `AgentAnnotation.queueKeySuggested: String?`
+  (3-state sentinel: nil = no suggestion yet, `""` = inferred nothing, non-empty = the key) added
+  to `init` + `merging` (`other ?? self`); plus the PURE `clearingSuggestion()` helper that nils
+  ONLY `queueKeySuggested` (preserving every other field) — the deliberate bypass for `merging`'s
+  never-nils asymmetry (an unrelated summarizer write would otherwise keep a stale suggestion alive
+  via `?? self`). `MCPAnnotation.swift` + `MCPTools.swift` — `set_surface_annotation` parser reads
+  `queueKeySuggested` **keeping `""`** (NOT trimmed-to-nil, so the negative sentinel survives) +
+  adds it to the at-least-one-field guard; schema gains the `queueKeySuggested` string property
+  (additive — **NO new tool, `toolsListHasAllTools` count stays 26**). `AgentDashboardController.swift`
+  — `adoptSplit(id:run:key:url:)` (posts `.adopt` on the `.ghosttyQueueCommand` FIFO, NO optimistic
+  flip — reconcile is the sole owner of `run.active`), `requestInferKey(id:run:)` (clears the stale
+  suggestion DIRECTLY via `clearingSuggestion()` — NOT through `merging` — then posts `.inferKey`;
+  early-returns on an empty run), `runNamesForAdopt()` (present runs, sorted; empty ⇒ button
+  disabled, single ⇒ auto-select), `graphNodeForAdopt(run:key:)` (LOCAL `QueueGraph.nodes` lookup
+  — the title-preview source, no round-trip), `activeKeysForRun(_:)` (running-key set, the GUI-side
+  duplicate proxy; the sidecar's `run.active.has(key)` is the authoritative guard), `jumpToKey(run:key:)`
+  (presents on the existing `ghosttyPresentTerminal` path). `AgentPreviewTile.swift` — the hover
+  **Adopt…** button (gated `!isQueueOwned && entry.agent != nil`, disabled when no run) + the real
+  `.sheet` modal (queue picker auto-hidden for one run + re-fires infer on a picker change for the
+  multi-run case; key `TextField` with an "inferring…" spinner overlay bound to `queueKeySuggested`
+  + an ~8s `.task(id:)` timeout fallback; live graph-local title preview / off-board note; duplicate
+  guard + "Jump to the running one" link; the KEEP-pin footnote; Adopt disabled on empty run/key or
+  duplicate). `AgentDashboardView.swift` — passes the 7 closures into the tile. **Tests (Swift):**
+  `QueuePaletteTests.swift` (`adoptJSONObjectShape` / `adoptJSONObjectOmitsEmptyURL` /
+  `inferKeyJSONObjectShape`), `MCPAnnotationTests.swift` (`parseQueueKeySuggestedAloneAndEmptyKept`,
+  `mergingPreservesQueueKeySuggested`, `mergingOverlaysQueueKeySuggested`,
+  `clearingSuggestionNilsItAndPreservesRest`), `MCPServerTests.swift` (comment at
+  `toolsListHasAllTools` noting count stays 26). The single-parameter `.onChange(of:)` form is used
+  throughout (the deployment target is macOS 13; the two-param old/new form needs macOS 14).
 
 ### On-demand command channel + `take_queue_commands` (§8a)
 

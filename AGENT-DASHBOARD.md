@@ -106,6 +106,13 @@ keybind = ctrl+a>shift+d=toggle_dashboard_hide
   "Hide Split from Agent Dashboard") hides/reveals the **currently focused** split without
   touching the panel, so you can declutter the dashboard from inside the agent you're
   working in. Same persisted hide set + same auto-unhide-on-bell as the eye-slash button.
+- **Adopt… (queue tiles excluded)** — on a tile for a CLI-agent split that is **not** already
+  owned by a queue, an **Adopt…** button (disabled, with a tooltip, when no queue is running)
+  pulls that human-created split into a running Agent Queue: it opens a sheet that infers the
+  work-item key (best-effort Haiku), previews the matching issue title from the queue's backlog
+  graph as you type, and on confirm moves the split into the queue's grid tab and tracks it like
+  a dispatched item. Full behavior + the latch/keep/claim mechanics live in **AGENT-QUEUE.md
+  (→ Adopting a free split)**.
 
 ### Degraded states (never a blank panel)
 

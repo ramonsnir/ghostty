@@ -191,6 +191,50 @@ struct MCPAnnotationTests {
         #expect(kept.merging(AgentAnnotation(queueKeep: false)).queueKeep == false) // overwritten
     }
 
+    // MARK: - queueKeySuggested (ramon fork / Agent Queue, adopt)
+
+    @Test func parseQueueKeySuggestedAloneAndEmptyKept() {
+        // Present non-empty ⇒ the inferred key. Present-but-EMPTY ⇒ KEPT as "" (the
+        // "inferred nothing" sentinel, distinct from absent) — NOT trimmed to nil.
+        #expect(AgentAnnotationPayload.fromArguments(["queueKeySuggested": "ENG-9"])?
+            .annotation.queueKeySuggested == "ENG-9")
+        #expect(AgentAnnotationPayload.fromArguments(["queueKeySuggested": ""])?
+            .annotation.queueKeySuggested == "")
+        // A non-string value is treated as absent (nil) + nothing else ⇒ empty body.
+        #expect(AgentAnnotationPayload.fromArguments(["queueKeySuggested": 42]) == nil)
+    }
+
+    @Test func mergingPreservesQueueKeySuggested() {
+        // An unrelated summary-only update omits queueKeySuggested, so merging keeps the
+        // prior value (the never-nils asymmetry the GUI's clearingSuggestion() bypass
+        // exists to handle).
+        let suggested = AgentAnnotation(queueKeySuggested: "ENG-9")
+        #expect(suggested.merging(AgentAnnotation(summary: "x")).queueKeySuggested == "ENG-9")
+    }
+
+    @Test func mergingOverlaysQueueKeySuggested() {
+        // An update that sets the field overlays it — including the "" sentinel.
+        let suggested = AgentAnnotation(queueKeySuggested: "ENG-9")
+        #expect(suggested.merging(AgentAnnotation(queueKeySuggested: "ENG-10")).queueKeySuggested == "ENG-10")
+        #expect(suggested.merging(AgentAnnotation(queueKeySuggested: "")).queueKeySuggested == "")
+    }
+
+    @Test func clearingSuggestionNilsItAndPreservesRest() {
+        let a = AgentAnnotation(
+            summary: "s", phase: "p", needsUser: true,
+            queueKey: "K", queueName: "R", queueUrl: "u", queueKeep: true,
+            queueKeySuggested: "ENG-9")
+        let cleared = a.clearingSuggestion()
+        #expect(cleared.queueKeySuggested == nil)
+        #expect(cleared.summary == "s")
+        #expect(cleared.phase == "p")
+        #expect(cleared.needsUser == true)
+        #expect(cleared.queueKey == "K")
+        #expect(cleared.queueName == "R")
+        #expect(cleared.queueUrl == "u")
+        #expect(cleared.queueKeep == true)
+    }
+
     // MARK: - dispatch (AppKit-free validation paths)
 
     @Test func dispatchMissingIdInvalidParams() {

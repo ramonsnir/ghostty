@@ -359,7 +359,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `claude` findable, else the summarizer self-disables per-surface while the queue still runs.
   **Haiku usage/budget tracking (config `agent-manager-usage-tracking`, default ON):** every Haiku
   call is recorded as one JSONL line to `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` tagged with
-  the FEATURE (`summarizer`/`bell-classify`) + account, so you can ask "how much per feature over the
+  the FEATURE (`summarizer`/`bell-classify`/`issue-key-infer`) + account, so you can ask "how much per feature over the
   last N hours" — captured at the single chokepoint `model.ts summarize()` (an `onUsage` callback
   reading the SDK's `usage`+`total_cost_usd`, verified non-zero), tagged at the `index.ts` call site,
   persisted by `usage.ts` (survives GUI restarts — it's a file; 14-day retention trimmed at startup),
@@ -435,6 +435,49 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   **See `AGENT-QUEUE.md`
   (→ Implementation notes) for the full engine, MCP tools, grid/packing, health/backlog, live edits,
   keep, restart hardening, wiring + tests.**
+
+- **Adopt a free split into a queue** (fork-only, macOS) — a dashboard tile **Adopt…** button (on
+  a NON-queue CLI-agent tile; disabled when no queue is running) pulls a human-created split into a
+  running Agent Queue so the supervisor tracks it like a dispatched item: it MOVES the split into
+  the run's grid tab (reusing `move_surface_into_tab`, overflowing to a new row/tab at capacity —
+  adopt always succeeds), **LATCHES the key at adopt time** (`run.dispatched.add(key)`, the crux
+  that blocks a SECOND dispatch for a still-`list`ed item), follows the template's `keepOnComplete`
+  (the 📌 KEEP pin protects an adopted split from auto-close on `status=done` — NOT a forced keep),
+  fires the provider `claim`, and lets `reconcile`'s EXISTING orphan-adoption fold the annotated
+  surface in (relying on its non-zero-`sessionID` precondition — guaranteed under the queue's
+  pty-host HARD DEP; NOT a parallel adoption path). It occupies a concurrency slot but does NOT bump
+  `lifetimeDispatched` (no new agent launched). **⭐ The chokepoint is the `coerceQueueCommands`
+  whitelist in `mcp.ts` (NOT index.ts): `adopt`/`infer_key` are added to `QUEUE_ACTIONS` and the
+  new `surfaceUUID`/`url` string fields are carried — else the GUI emit is SILENTLY DROPPED and the
+  feature is a no-op** (the matched pair: `QueueCommandBridge.swift`'s `jsonObject` emit ⇄ this
+  coercer carry — both must land). Title preview is a LOCAL `report_queue_graph` node lookup
+  (instant, no round-trip; off-board key ⇒ soft "not on board" note, still adoptable); the key field
+  is prefilled by an ON-DEMAND Haiku call (`infer_key` queue command → `deps.inferKey` → `summarize`
+  with a bespoke extract-the-key prompt → a NEW `queueKeySuggested` annotation → the GUI prefills via
+  the existing annotation observer path), best-effort with an 8s manual fallback and a GUI-local
+  `clearingSuggestion()` bypass for the never-nils `merging`; usage is tagged `issue-key-infer` (a
+  THIRD Haiku feature alongside `summarizer`/`bell-classify`, broken out by `get_haiku_usage`
+  automatically — `MCPUsage.aggregate` buckets by arbitrary feature string). Duplicate keys are
+  blocked (sidecar `run.active.has(key)` authoritative; GUI `activeKeysForRun` proxy) with a "jump to
+  the running one" instead. `infer_key` is a recognized action that flows through `applyCommand` as
+  an EXPLICIT named no-op (excluded from `changed`); the side effect (move/annotate/claim for `adopt`,
+  the Haiku read for `infer_key`) runs in the sweep's post-`applyCommands` loop (`runAdopt`/`runInferKey`),
+  with a move-failure latch ROLLBACK. **No new MCP tool — count stays 26** (`adopt`/`infer_key` ride
+  `take_queue_commands`; `queueKeySuggested` rides `set_surface_annotation`). Wiring: sidecar `mcp.ts`
+  (⭐ `coerceQueueCommands` whitelist + `surfaceUUID`/`url`/`queueKeySuggested`), `queue/commands.ts`
+  (`adopt` latch/dedup + `adoptDecision` + `infer_key` no-op + `ApplyResult` `"adopted"`),
+  `queue/runner.ts` (`runAdopt` move/annotate/claim/rollback + `runInferKey` + `deps.inferKey` seam +
+  sweep loop), `queue/infer.ts` (NEW: `composeInferPrompt`/`parseInferredKey`/`collectCandidateKeys` +
+  `runInferKeyWithDeps`), `index.ts` (`inferKey` seam + `issue-key-infer` usage tag); macOS
+  `QueueCommandBridge.swift` (`.adopt`/`.inferKey` + `surfaceUUID`/`url`), `AgentStateBridge.swift`
+  (`queueKeySuggested` + `clearingSuggestion()`), `MCPAnnotation.swift`/`MCPTools.swift`
+  (`set_surface_annotation` parse keeping `""` + schema), `AgentDashboardController.swift`
+  (`adoptSplit`/`requestInferKey`/`runNamesForAdopt`/`graphNodeForAdopt`/`activeKeysForRun`/`jumpToKey`),
+  `AgentPreviewTile.swift` (button + `.sheet` + re-infer-on-run-change), `AgentDashboardView.swift`.
+  Tests: sidecar `mcp.test.ts`/`queue/commands.test.ts`/`queue/runner.test.ts`/`queue/infer.test.ts`;
+  Swift `QueuePaletteTests.swift`/`MCPAnnotationTests.swift`/`MCPServerTests.swift`. **See
+  `AGENT-QUEUE.md` (→ Adopting a free split / Implementation notes). GUI relaunch + rebuilt sidecar
+  `dist`; no host/Zig change.**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

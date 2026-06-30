@@ -21,8 +21,39 @@ struct AgentPreviewTile: View {
     /// DESIRED new value (true = keep, false = allow auto-close). Queue tiles only.
     let onKeep: (Bool) -> Void
 
+    // MARK: - Adopt-into-a-queue inputs (ramon fork / Agent Queue, adopt)
+
+    /// (adopt) The names of the queue runs currently present. Empty ⇒ the Adopt button is
+    /// DISABLED (LOCKED #4: nothing to adopt into); a single name ⇒ the modal auto-selects
+    /// it + hides the picker.
+    let queueRuns: [String]
+    /// (adopt) LOCAL graph-node lookup (LOCKED #1): for a (run, key) returns the node's
+    /// title + url when the key is on that run's `report_queue_graph` board, else nil
+    /// (off-board: no title, still adoptable). Instant, no round-trip.
+    let nodeForKey: (_ run: String, _ key: String) -> (title: String?, url: String?)?
+    /// (adopt) The GUI-visible running keys for a run — the modal's duplicate-key guard
+    /// source.
+    let activeKeysForRun: (_ run: String) -> Set<String>
+    /// (adopt) The Haiku-inferred key suggestion for THIS surface (entry.annotation?.
+    /// queueKeySuggested): nil ⇒ inferring / unknown; "" ⇒ inferred nothing; non-empty ⇒
+    /// the prefill candidate.
+    let suggestedKey: String?
+    /// (adopt) Request an on-demand Haiku inference of the work-item key for `surfaceUUID`
+    /// against `run`'s candidate vocabulary (posts an infer_key command).
+    let onRequestInfer: (_ surfaceUUID: UUID, _ run: String) -> Void
+    /// (adopt) Confirm adoption: latch + move + annotate (posts an adopt command).
+    let onAdoptConfirm: (_ run: String, _ key: String, _ surfaceUUID: UUID, _ url: String?) -> Void
+    /// (adopt) "Jump to the running one" on a duplicate-key collision.
+    let onJumpToKey: (_ run: String, _ key: String) -> Void
+
     @State private var hovering = false
     @State private var confirmClose = false
+
+    // MARK: - Adopt modal state (ramon fork / Agent Queue, adopt)
+    @State private var showAdopt = false
+    @State private var adoptRun: String = ""
+    @State private var adoptKey: String = ""
+    @State private var inferring = false
 
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
@@ -149,6 +180,21 @@ struct AgentPreviewTile: View {
                     : "Keep this split open (exempt it from the queue's auto-close so you can do manual work).")
             }
             if hovering {
+                // (adopt) Offered ONLY on a NON-queue agent tile (a free, human-created
+                // CLI-agent split): pull it into a running queue. Disabled when no queue is
+                // running (LOCKED #4) so the affordance is discoverable but inert.
+                if !isQueueOwned, entry.agent != nil {
+                    Button { startAdopt() } label: {
+                        Image(systemName: "tray.and.arrow.down")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .disabled(queueRuns.isEmpty)
+                    .help(queueRuns.isEmpty
+                        ? "No running queue to adopt this split into"
+                        : "Adopt this split into a running queue (the queue will track it like a dispatched item)")
+                }
                 // Force-close is offered ONLY for queue-owned tiles: it's the escape hatch
                 // for a wedged queue slot. On a non-queue agent it would be an unscoped
                 // "kill this terminal" sitting next to the harmless Hide — needless risk.
@@ -191,6 +237,133 @@ struct AgentPreviewTile: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Force-closes this split and ends the agent running in it, discarding any in-progress work. If it's a queue agent, this frees its queue slot so the queue can move on.")
+        }
+        .sheet(isPresented: $showAdopt) { adoptSheet }
+    }
+
+    // MARK: - Adopt-into-a-queue modal (ramon fork / Agent Queue, adopt)
+
+    /// Open the adopt modal: auto-select the single run (else leave empty for the
+    /// picker), reset the key field, enter the inferring state, and kick off the
+    /// on-demand Haiku key inference against the chosen run.
+    private func startAdopt() {
+        adoptRun = queueRuns.count == 1 ? queueRuns[0] : ""
+        adoptKey = ""
+        inferring = true
+        showAdopt = true
+        // Infer only with a chosen run; the multi-run "" case re-fires on the picker's
+        // onChange (see the picker below).
+        onRequestInfer(entry.id, adoptRun)
+    }
+
+    /// True iff the entered key is already RUNNING in the target run (GUI-visible proxy
+    /// for the sidecar's authoritative `run.active.has(key)` guard) — blocks Confirm and
+    /// offers a jump instead of creating a key collision.
+    private var adoptIsDuplicate: Bool {
+        !adoptKey.isEmpty && activeKeysForRun(adoptRun).contains(adoptKey)
+    }
+
+    @ViewBuilder
+    private var adoptSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Adopt this split into a queue")
+                .font(.headline)
+
+            // Queue picker — hidden (shown as static text) when exactly one run.
+            if queueRuns.count == 1 {
+                Text("Queue: \(adoptRun)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Queue", selection: $adoptRun) {
+                    Text("Choose a queue…").tag("")
+                    ForEach(queueRuns, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .onChange(of: adoptRun) { newRun in
+                    // Re-infer against the newly-chosen run's candidate vocabulary (the
+                    // initial infer in startAdopt ran with run == "" and early-returned).
+                    guard !newRun.isEmpty else { return }
+                    inferring = true
+                    onRequestInfer(entry.id, newRun)
+                }
+            }
+
+            // Key field — prefilled by the Haiku suggestion, with an inferring spinner.
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("Issue / work-item key", text: $adoptKey)
+                    .textFieldStyle(.roundedBorder)
+                    .overlay(alignment: .trailing) {
+                        if inferring && adoptKey.isEmpty {
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.small)
+                                Text("inferring…")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.trailing, 6)
+                        }
+                    }
+                // Live title preview (LOCAL graph lookup — instant, no round-trip).
+                if let t = nodeForKey(adoptRun, adoptKey)?.title, !t.isEmpty {
+                    Text(t)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                } else if !adoptKey.isEmpty {
+                    Text("Not on this queue's board — adoptable, but no title")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // Duplicate-key guard + jump affordance.
+            if adoptIsDuplicate {
+                HStack(spacing: 8) {
+                    Text("Already running in this queue.")
+                        .font(.caption)
+                        .foregroundStyle(Self.bellAmber)
+                    Button("Jump to the running one") {
+                        onJumpToKey(adoptRun, adoptKey)
+                        showAdopt = false
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+
+            // KEEP-pin protection note (LOCKED #3).
+            Text("On status=done this split auto-closes unless its 📌 KEEP pin is set. The pin protects an adopted split from auto-close.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { showAdopt = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Adopt") {
+                    onAdoptConfirm(adoptRun, adoptKey, entry.id, nodeForKey(adoptRun, adoptKey)?.url)
+                    showAdopt = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(adoptRun.isEmpty || adoptKey.isEmpty || adoptIsDuplicate)
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
+        // Observe the Haiku suggestion arriving via the annotation path: drop the
+        // inferring state, and prefill the field only if the user hasn't typed yet.
+        .onChange(of: suggestedKey) { suggestion in
+            guard let suggestion else { return }   // nil ⇒ still inferring/unknown
+            inferring = false
+            if !suggestion.isEmpty && adoptKey.isEmpty { adoptKey = suggestion }
+        }
+        // Belt-and-suspenders timeout: a never-arriving reply doesn't spin forever.
+        // Tied to `inferring` identity so a re-infer (picker change) restarts it.
+        .task(id: inferring) {
+            guard showAdopt, inferring else { return }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            if !Task.isCancelled { inferring = false }
         }
     }
 

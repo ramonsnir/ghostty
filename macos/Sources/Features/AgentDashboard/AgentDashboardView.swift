@@ -109,6 +109,22 @@ struct AgentDashboardView: View {
                                         run: entry.annotation?.queueName ?? "",
                                         key: entry.annotation?.queueKey ?? "",
                                         keep: newKeep)
+                                },
+                                queueRuns: model.runNamesForAdopt(),
+                                nodeForKey: { run, key in
+                                    model.graphNodeForAdopt(run: run, key: key)
+                                        .map { (title: $0.title, url: $0.url) }
+                                },
+                                activeKeysForRun: { model.activeKeysForRun($0) },
+                                suggestedKey: entry.annotation?.queueKeySuggested,
+                                onRequestInfer: { sid, run in
+                                    model.requestInferKey(id: sid, run: run)
+                                },
+                                onAdoptConfirm: { run, key, sid, url in
+                                    model.adoptSplit(id: sid, run: run, key: key, url: url)
+                                },
+                                onJumpToKey: { run, key in
+                                    model.jumpToKey(run: run, key: key)
                                 }
                             )
                             .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
