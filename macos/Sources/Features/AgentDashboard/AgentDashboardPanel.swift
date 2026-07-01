@@ -91,6 +91,52 @@ final class AgentDashboardPanel: NSPanel {
         return super.makeFirstResponder(responder)
     }
 
+    /// (ramon fork / Agent Dashboard) Route the standard editing key equivalents
+    /// (⌘X/C/V/A, ⌘Z/⇧⌘Z) to the current first responder ourselves.
+    ///
+    /// When UNPINNED the panel is a `.nonactivatingPanel`: clicking into a text
+    /// field in one of the dashboard's SwiftUI modals (e.g. the Adopt sheet's
+    /// issue-key field) makes the panel KEY without ACTIVATING Ghostty, so the
+    /// app never becomes frontmost. AppKit only routes the main-menu Cut/Copy/
+    /// Paste/Select-All key equivalents through the *active* app's menu, so those
+    /// keystrokes never reached the field editor and paste appeared broken. Send
+    /// the matching editing selector up the responder chain (`to: nil`) so the
+    /// field editor handles it; fall back to the default behavior when it's not an
+    /// editing command (or nothing in the chain responds — `sendAction` returns
+    /// false, e.g. no text field is focused). A pinned (activating) panel already
+    /// gets these via the menu, but routing here too is harmless and idempotent.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let selector = AgentDashboardPanel.editingSelector(
+            modifiers: event.modifierFlags,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers),
+           NSApp.sendAction(selector, to: nil, from: self) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// Pure mapping from a key event to the standard editing selector it should
+    /// route (nil for anything that is not one of ⌘X/⌘C/⌘V/⌘A or ⌘Z/⇧⌘Z). Split
+    /// out so the mapping is unit-testable without a live key window.
+    static func editingSelector(
+        modifiers: NSEvent.ModifierFlags,
+        charactersIgnoringModifiers: String?
+    ) -> Selector? {
+        let mods = modifiers.intersection(.deviceIndependentFlagsMask)
+        guard mods == .command || mods == [.command, .shift],
+              let key = charactersIgnoringModifiers?.lowercased()
+        else { return nil }
+        switch (key, mods.contains(.shift)) {
+        case ("x", false): return #selector(NSText.cut(_:))
+        case ("c", false): return #selector(NSText.copy(_:))
+        case ("v", false): return #selector(NSText.paste(_:))
+        case ("a", false): return #selector(NSResponder.selectAll(_:))
+        case ("z", false): return Selector(("undo:"))
+        case ("z", true):  return Selector(("redo:"))
+        default:           return nil
+        }
+    }
+
     private static func containsSurfaceView(_ view: NSView) -> Bool {
         var node: NSView? = view
         while let current = node {

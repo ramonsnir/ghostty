@@ -414,6 +414,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`backoffDoublesThenCapsAt30`, `backoffNeverNegativeOrZero`). (The host's 978 `libxev … invalid
   state in submission queue` bursts are a SEPARATE per-session-loop issue — see PTYHOST.md — not
   the preview-death cause; this self-heals every transient drop regardless.)
+  **Paste (⌘V) + ⌘C/⌘X/⌘A/⌘Z in the panel's modal text fields (always on, GUI-only):**
+  the UNPINNED dashboard is a `.nonactivatingPanel`, so clicking into a `TextField` in a
+  SwiftUI modal (e.g. the **Adopt** sheet's issue-key field) makes the panel KEY without
+  ACTIVATING Ghostty — the app never becomes frontmost, so AppKit's menu-driven Cut/Copy/
+  Paste/Select-All/Undo/Redo key equivalents (routed only through the *active* app's menu)
+  never reach the field editor and paste appeared broken. Fix: `AgentDashboardPanel`
+  overrides `performKeyEquivalent(with:)` to map ⌘X/⌘C/⌘V/⌘A + ⌘Z/⇧⌘Z (pure static
+  `editingSelector(modifiers:charactersIgnoringModifiers:)`) to the matching editing
+  selector and `NSApp.sendAction(_:to: nil, from:)` it up the responder chain; non-editing
+  keys / an unhandled selector fall through to `super`. Harmless+idempotent on a pinned
+  (activating) panel. Wiring: `AgentDashboardPanel.swift`. Tests: `AgentDashboardPanelTests.
+  performKeyEquivalent*` in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a

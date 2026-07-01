@@ -495,6 +495,20 @@ gotchas, not a recap.)
   keeps it on top; it STILL never becomes `main` (`canBecomeMain = false` unchanged), so
   "new window inherits from main" is unaffected. Trade-off: clicking a pinned dashboard
   activates Ghostty (fine — clicking a tile jumps into a terminal anyway).
+- **⌘C/⌘V/⌘X/⌘A/⌘Z work in the panel's modal text fields (always on).** Because the
+  UNPINNED panel is a `.nonactivatingPanel`, clicking into a `TextField` in a SwiftUI
+  modal (e.g. the **Adopt** sheet's issue-key field) makes the panel KEY without
+  ACTIVATING Ghostty — so the app is never frontmost, and AppKit only routes the
+  main-menu Cut/Copy/Paste/Select-All key equivalents through the *active* app's menu.
+  Result: those keystrokes never reached the field editor and **paste appeared broken**.
+  Fix: `AgentDashboardPanel.performKeyEquivalent(with:)` intercepts ⌘X/⌘C/⌘V/⌘A and
+  ⌘Z/⇧⌘Z and `NSApp.sendAction(_:to: nil, from: self)`s the matching editing selector
+  (`cut:`/`copy:`/`paste:`/`selectAll:`/`undo:`/`redo:`) up the responder chain so the
+  field editor handles it; non-editing keys and an unhandled selector (`sendAction`
+  returns false — e.g. no text field focused) fall through to `super`. A pinned
+  (activating) panel already gets these via the menu, but the override is harmless and
+  idempotent there. Tests: `AgentDashboardPanelTests.performKeyEquivalent*` in
+  `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
 
 ### Focus highlight + spotlight (find "the agent I'm looking at")
 
