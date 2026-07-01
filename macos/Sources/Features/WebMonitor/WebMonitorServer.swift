@@ -536,6 +536,7 @@ final class WebMonitorServer {
         case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
         case clearBell(uuid: UUID)               // POST /api/surface/{uuid}/bell (acknowledge bell)
         case clearAttention(uuid: UUID)          // POST /api/surface/{uuid}/attention (acknowledge promotion)
+        case setHidden(uuid: UUID)               // POST /api/surface/{uuid}/hidden {hidden:bool} (dashboard hide set)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
         case serviceWorker                       // GET /sw.js (bootstrap; Web Push SW)
         case pushConfig                          // GET /api/push/config (VAPID pubkey + enabled)
@@ -664,6 +665,9 @@ final class WebMonitorServer {
             case "attention":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .clearAttention(uuid: uuid)
+            case "hidden":
+                guard method == "POST" else { return .methodNotAllowed }
+                return .setHidden(uuid: uuid)
             default:
                 return .notFound
             }
@@ -840,6 +844,29 @@ final class WebMonitorServer {
                 guard let view = self.surface(forUUID: uuid) else { return .status(404, "Not Found") }
                 view.resetAttention()
                 return .json(Data(#"{"ok":true}"#.utf8))
+            }
+
+        case .setHidden(let uuid):
+            clearAuthFailures(peer)
+            // Hide/reveal this split from the phone by toggling the Agent Dashboard's
+            // persisted hide set (the SAME one the tile eye-slash + `hide_dashboard_split`
+            // use), so a phone hide is a desktop hide and the "Hide hidden" list filter
+            // drops it. `hidden` is by UUID and independent of whether the surface is
+            // live, so this succeeds even for a not-currently-resolvable surface — the
+            // only failure is the dashboard being unavailable (503).
+            guard let want = Self.hiddenFlag(body: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            respondFromMain(on: conn) {
+                // The controller is @MainActor; this closure already runs on main
+                // (respondFromMain), so assumeIsolated is the same discipline as
+                // `surfacesJSON()`'s dashboard read.
+                let ok = MainActor.assumeIsolated {
+                    (NSApp.delegate as? AppDelegate)?.setWebMonitorHidden(surfaceID: uuid, hidden: want) ?? false
+                }
+                guard ok else { return .status(503, "Service Unavailable") }
+                return .json(Data(#"{"ok":true,"hidden":\#(want)}"#.utf8))
             }
 
         case .asset(let name, let ext, let contentType):
@@ -1223,6 +1250,24 @@ final class WebMonitorServer {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let dy = (obj["dy"] as? NSNumber)?.doubleValue, dy != 0 else { return nil }
         return max(-30, min(30, dy))
+    }
+
+    /// PURE: decode a hide request body `{"hidden": <bool>}` into the desired hide
+    /// state. Accepts a JSON bool, or `0`/`1` / `"true"`/`"false"` for lenient
+    /// clients; nil on missing/unparseable input.
+    static func hiddenFlag(body: Data) -> Bool? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let raw = obj["hidden"] else { return nil }
+        if let b = raw as? Bool { return b }
+        if let n = raw as? NSNumber { return n.boolValue }
+        if let s = raw as? String {
+            switch s.lowercased() {
+            case "true", "1", "yes": return true
+            case "false", "0", "no": return false
+            default: return nil
+            }
+        }
+        return nil
     }
 
     /// PURE: map a named key command to a single key-event spec. Unknown -> nil.
@@ -1860,9 +1905,15 @@ final class WebMonitorServer {
       .grouphdr .loc { color: #8b93a7; font-size: 11px; font-weight: bold; letter-spacing: .04em;
                        text-transform: uppercase; }
       .grouphdr .ttl { color: #c8cedb; font-size: 13px; margin-top: 2px; word-break: break-word; }
-      .row { padding: 12px; margin: 6px 0 6px 10px; background: #1b1e27; border: 1px solid #2a2e3b;
+      .row { position: relative; padding: 12px; margin: 6px 0 6px 10px; background: #1b1e27; border: 1px solid #2a2e3b;
              border-left: 3px solid #3a4250; border-radius: 8px; }
-      .row .t { color: #d6dae3; font-weight: bold; }
+      .row.ishidden { opacity: 0.55; }
+      .row .t { color: #d6dae3; font-weight: bold; padding-right: 56px; }
+      /* Per-row Hide/Show toggle (mirrors the Agent Dashboard hide set). Absolutely
+         positioned top-right; its own tap must not open the surface (stopPropagation). */
+      .row .hidebtn { position: absolute; top: 10px; right: 10px; padding: 3px 9px; border-radius: 6px;
+                      background: #2a2e3b; border: 1px solid #3a3f4f; color: #b6bccb; font-size: 11px; cursor: pointer; }
+      .row .hidebtn:active { background: #3a3f4f; }
       .row .badge { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 10px;
                     background: #2a2e3b; color: #b6bccb; font-size: 11px; font-weight: normal;
                     vertical-align: middle; }
@@ -1891,6 +1942,10 @@ final class WebMonitorServer {
         width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
         background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }
       #jumpbottom:active { background: #3a3f4f; }
+      #livebtn { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 2;
+        padding: 7px 13px; border-radius: 17px; opacity: 0.92;
+        background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 13px; cursor: pointer; }
+      #livebtn:active { background: #3a3f4f; }
       .bar { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; align-items: center; }
       .bar input[type=text] { flex: 1; min-width: 120px; background: #0c0e13; color: #d6dae3; border: 1px solid #2a2e3b; border-radius: 6px; padding: 8px; }
       .bar label { color: #b6bccb; font-size: 12px; }
@@ -1958,6 +2013,10 @@ final class WebMonitorServer {
         <div id="xterm"></div>
         <pre id="screen"></pre>
         <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
+        <!-- Shown only in host-scrollback "history" mode (a full-screen TUI like
+             Claude Code that keeps no local xterm scrollback — see smartScroll).
+             Tapping it resumes the live color view. -->
+        <button id="livebtn" style="display:none" title="Resume live view">&#x25cf; Live</button>
       </div>
       <div class="bar">
         <button data-key="enter">Enter</button>
@@ -2033,6 +2092,7 @@ final class WebMonitorServer {
       var viewer = document.getElementById("viewer");
       var screenEl = document.getElementById("screen");
       var jumpBtn = document.getElementById("jumpbottom");
+      var liveBtn = document.getElementById("livebtn");
       var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
       var clearBellBtn = document.getElementById("clearbell");
@@ -2254,6 +2314,23 @@ final class WebMonitorServer {
               }
               var p = document.createElement("div"); p.className = "p"; p.textContent = row.pwd || "";
               d.appendChild(t); d.appendChild(p);
+              // Hide/Show toggle: reuses the Agent Dashboard hide set (POST /hidden),
+              // so hiding here == hiding in the dashboard. Only meaningful when the
+              // dashboard is running, so it's shown only then. When a hidden row is
+              // visible (because "Hide hidden" is off) it reads "Show" and dims the row.
+              if (dashboard) {
+                if (row.hidden) d.classList.add("ishidden");
+                var hb = document.createElement("button"); hb.className = "hidebtn";
+                hb.textContent = row.hidden ? "Show" : "Hide";
+                hb.title = row.hidden
+                  ? "Reveal this split (in the dashboard + monitor)"
+                  : "Hide this split from the dashboard + monitor";
+                hb.onclick = function (ev) {
+                  ev.stopPropagation();       // don't also open the surface
+                  setHidden(row.id, !row.hidden);
+                };
+                d.appendChild(hb);
+              }
               d.onclick = function () { showSurface(row.id, row.title, row.bell); };
               frag.appendChild(d);
             });
@@ -2357,6 +2434,8 @@ final class WebMonitorServer {
       // Shows the poll viewer, starts the 700ms poll, and surfaces a banner.
       function fallbackToPoll(msg) {
         disposeStream();
+        historyMode = false;              // no live xterm to return to; the poll loop reads the mirror
+        liveBtn.style.display = "none";
         screenEl.style.display = "block";
         modeToggleEl.style.display = "";  // poll viewer active: the mode toggle applies again
         if (msg) setBanner(msg, false);
@@ -2437,6 +2516,8 @@ final class WebMonitorServer {
 
       function showList() {
         disposeStream();
+        historyMode = false;             // leaving the viewer: reset host-scrollback mode
+        liveBtn.style.display = "none";
         viewer.style.display = "none";
         listEl.style.display = "block";
         filterBar.style.display = "flex";
@@ -2481,6 +2562,8 @@ final class WebMonitorServer {
 
       function showSurface(id, title, bell) {
         current = id;
+        historyMode = false;          // fresh view starts live, not in host-scrollback mode
+        liveBtn.style.display = "none";
         setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
         setClearAttnVisible(false);   // refresh corrects from live state
         refreshBellButton();
@@ -2510,6 +2593,7 @@ final class WebMonitorServer {
       }
 
       backBtn.onclick = function () {
+        exitHistory();   // snap the host viewport back to bottom while `current` is still set
         current = null;
         if (timer) { clearInterval(timer); timer = null; }
         showList();
@@ -2679,34 +2763,108 @@ final class WebMonitorServer {
         }).catch(function () {});
       }
 
+      // Hide/reveal a split from the phone by toggling the Agent Dashboard hide set
+      // (POST /api/surface/{id}/hidden). On success reload the list so the row
+      // updates (it vanishes when "Hide hidden" is on; flips Hide<->Show otherwise).
+      // 503 => the dashboard isn't running (button shouldn't have shown); surface it.
+      function setHidden(id, hidden) {
+        fetch(url("/api/surface/" + id + "/hidden"), {
+          method: "POST",
+          headers: headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ hidden: !!hidden })
+        }).then(function (r) {
+          if (r && r.ok) { loadList(); }
+          else if (r && r.status === 503) { setBanner("Agent Dashboard isn't running.", false, true); }
+          else { setBanner("Hide failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
+        }).catch(function () { setBanner("Hide failed \\u2014 not delivered.", false, true); });
+      }
+
+      // Host-scrollback "history" mode (for a full-screen TUI that keeps NO local
+      // xterm scrollback — Claude Code and the like, which redraw the whole frame
+      // in place with absolute cursor moves and emit no scroll-producing newlines,
+      // so xterm.js accumulates nothing to scroll). The REAL scrollback lives in
+      // the host terminal (same place the Mac desktop scrolls). We reach it exactly
+      // as the desktop does: POST /scroll drives the host's `scroll_viewport`, the
+      // host repins ITS terminal and pushes a scrolled frame into the GUI mirror,
+      // and GET /screen reads that mirror (plain text). So history mode swaps the
+      // live color xterm for the plain-text <pre> and pages the host scrollback
+      // through it; "● Live" (or Back) resumes the live view. Plain text is the
+      // trade-off for reaching real host history (the live view stays full color).
+      var historyMode = false;
+
+      function renderHistory() {
+        if (!current || !historyMode) return;
+        fetch(url("/api/surface/" + current + "/screen", { mode: "scrollback" }), { headers: headers() })
+          .then(function (r) { if (r.status === 404) throw new Error("404"); if (!r.ok) throw new Error("x"); return r.text(); })
+          .then(function (txt) { if (historyMode) screenEl.textContent = txt; })
+          .catch(function (e) { if (String(e.message) === "404") sessionClosedTeardown(); });
+      }
+
+      function enterHistory() {
+        if (historyMode) return;
+        historyMode = true;
+        xtermEl.style.display = "none";
+        screenEl.style.display = "block";
+        jumpBtn.style.display = "none";       // its <pre> scroll affordance is moot here
+        liveBtn.style.display = "block";
+        setBanner("Scrollback \\u2014 tap \\u25cf Live to resume", true);
+      }
+
+      // Leave history mode: snap the host viewport back to the live bottom (so the
+      // shared desktop mirror isn't left parked in scrollback) and restore the live
+      // color view — the stream kept running underneath while we paged plain text.
+      function exitHistory() {
+        if (!historyMode) return;
+        historyMode = false;
+        liveBtn.style.display = "none";
+        sendScroll(-30); sendScroll(-30);     // clamp is ±30/req; a couple snaps to bottom
+        if (stream && stream.term) {
+          screenEl.style.display = "none";
+          xtermEl.style.display = "block";
+        }
+        clearBannerIfNotError();
+      }
+      liveBtn.onclick = exitHistory;
+
+      function historyScroll(dir) {
+        enterHistory();
+        sendScroll(dir * 3);                  // POST /scroll -> host scroll_viewport
+        setTimeout(renderHistory, 130);       // let the scrolled frame land, then read the mirror
+      }
+
       // Smart scroll: pick the gesture from the LIVE terminal mode, read off
-      // xterm.js (so it tracks the remote app moment-to-moment). KEY FACT: the
-      // host's raw stream only carries CHILD pty output, so a host-side viewport
-      // scroll emits NOTHING back to the phone — scrolling the host is useless
-      // here. The browser's xterm.js holds the real scrollback (the replayed ring
-      // + everything streamed since connect). So:
-      //  (1) Normal buffer (shell, Claude Code, anything using terminal
-      //      scrollback): the history is ALREADY in xterm.js -> scroll IT LOCALLY
-      //      (term.scrollLines), no host round-trip. This is the common case and
-      //      the one that was silently broken (a wheel POST did nothing visible).
-      //  (2) Alt screen + the app captures the mouse (htop, vim with mouse): no
-      //      xterm scrollback exists in the alt buffer, so forward a WHEEL so the
-      //      app itself redraws (those bytes then stream back).
-      //  (3) Alt screen, NO mouse capture (less, man, plain vim): send
+      // xterm.js (so it tracks the remote app moment-to-moment). Routes:
+      //  (1) Normal buffer WITH local xterm scrollback (a shell, and any app that
+      //      emits real newlines): the history is ALREADY in xterm.js -> scroll IT
+      //      LOCALLY (term.scrollLines), no host round-trip, in full color.
+      //  (2) Normal buffer with NO local scrollback (Claude Code and other
+      //      full-frame in-place TUIs — they emit no newlines, so xterm.js has
+      //      nothing to scroll and term.scrollLines is a dead no-op): drive the
+      //      HOST scrollback via history mode (the desktop's own scroll path).
+      //  (3) Alt screen + the app captures the mouse (htop, vim with mouse):
+      //      forward a WHEEL so the app itself redraws (those bytes stream back).
+      //  (4) Alt screen, NO mouse capture (less, man, plain vim): send
       //      PAGEUP/PAGEDOWN so the app pages and redraws (a wheel is a no-op
       //      there under pty-host — the mirror's alt-screen state isn't applied).
-      // Without a live xterm (plain-text poll fallback) there is no local buffer,
-      // so fall back to the plain host wheel. dir: +1 = up/back, -1 = down.
+      // Without a live xterm (plain-text poll fallback) the poll loop already reads
+      // the host-scrolled mirror, so a plain host wheel suffices. Already in history
+      // mode -> keep paging the host. dir: +1 = up/back, -1 = down.
       function smartScroll(dir) {
+        if (historyMode) { historyScroll(dir); return; }
         var term = stream && stream.term;
         if (!term) { sendScroll(dir * 3); return; }
-        var alt = false, mouse = false;
+        var alt = false, mouse = false, hasLocal = false;
         try { alt = term.buffer.active.type === "alternate"; } catch (e) {}
         try { mouse = term.modes && term.modes.mouseTrackingMode !== "none"; } catch (e) {}
+        try { hasLocal = term.buffer.active.baseY > 0; } catch (e) {}
         if (!alt) {
-          // Negative scrolls toward history (up); xterm keeps the user's position
-          // when new output arrives while scrolled up, so this stays put.
-          try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
+          if (hasLocal) {
+            // Negative scrolls toward history (up); xterm keeps the user's position
+            // when new output arrives while scrolled up, so this stays put.
+            try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
+          } else {
+            historyScroll(dir);   // no local scrollback (Claude Code) -> host scrollback
+          }
         } else if (mouse) {
           sendScroll(dir * 3);
         } else {

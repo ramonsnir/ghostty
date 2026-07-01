@@ -1669,6 +1669,16 @@ final class AgentDashboardController: NSWindowController {
         model.hide(id)
     }
 
+    /// (ramon fork / Web monitor) Hide or reveal a surface in the SAME persisted,
+    /// UUID-keyed hide set as the tile eye-slash button / `hide_dashboard_split`
+    /// keybind — driven from the phone. `hidden:true` hides, `false` reveals. So a
+    /// phone hide IS a desktop hide (unified), and the web monitor's "Hide hidden"
+    /// list filter then drops it. Auto-unhide-on-bell still applies. MUST be on
+    /// main — the model is.
+    func setHidden(surfaceID id: UUID, hidden: Bool) {
+        if hidden { model.hide(id) } else { model.show(id) }
+    }
+
     /// (ramon fork / Agent Dashboard) TOGGLE the spotlight for the given surface
     /// (driven by the `spotlight_dashboard_split` keybind). Pressing it on the
     /// already-spotlighted split clears it (dismiss early instead of waiting out the

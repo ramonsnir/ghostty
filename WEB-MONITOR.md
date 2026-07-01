@@ -111,6 +111,11 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      non-hidden agents) and are remembered per device. They mirror the dashboard exactly,
      so they're **disabled** (greyed, with a note) when the Agent Dashboard isn't running.
      Turn both off to see every surface again.
+   - Each row has a **Hide / Show** button (shown only when the Agent Dashboard is running). It
+     toggles the **same** hide set as the dashboard's eye-slash button / `hide_dashboard_split`
+     keybind — so hiding a split **from the phone is a hide in the dashboard too** (unified), and
+     the **Hide hidden** filter then drops it. Auto-unhide-on-bell still applies (an agent that
+     rings reappears). This is how you hide an agent split from the phone.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
    (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up),
    in the **same JetBrains Mono Nerd Font Ghostty uses** (vendored as woff2 and served by the
@@ -123,12 +128,19 @@ is loopback, hence identical; only your `ts.net` hostname differs:
    - Quick-keys: **Enter · y · n · Esc · Tab · ⌫ Backspace · Clear (Ctrl-U) · Ctrl-C**, the
      **digits 1–4** (numbered agent menus), and **arrows**.
    - **Scroll ↑ / Scroll ↓** — *smart* scroll. The page reads the **live terminal mode** off
-     `xterm.js` and picks the right gesture per app: on the **normal screen** (a shell, **Claude
-     Code**, anything using terminal scrollback) it scrolls **xterm.js's own scrollback locally**
-     (the history is already in the browser — the host can't re-stream it); for a full-screen TUI
-     that **captures the mouse** (`htop`, `vim` with mouse) it sends a real **mouse wheel** so the
-     app redraws; for one that **doesn't** (`less`, `man`, plain `vim`) it sends **PageUp /
-     PageDown**. So the one pair of buttons "just scrolls" whatever you're looking at.
+     `xterm.js` and picks the right gesture per app:
+     - **normal screen WITH local scrollback** (a shell, and any app that emits real newlines) →
+       scrolls **xterm.js's own scrollback locally**, in full color (no host round-trip).
+     - **normal screen with NO local scrollback** (**Claude Code** and other full-frame TUIs that
+       redraw in place and emit no newlines, so xterm.js has nothing to scroll) → enters a
+       **host-scrollback "history" view**: it drives the **host terminal's scroll** (the same path
+       the Mac desktop wheel uses) and shows the result as plain text; tap **● Live** to resume the
+       live color view. This is the fix for the previously-dead Claude Code case — the buttons now
+       move the view exactly like the desktop wheel (see the Claude Code caveat under **Known limits**).
+     - full-screen TUI that **captures the mouse** (`htop`, `vim` with mouse) → a real **mouse wheel**
+       so the app redraws.
+     - one that **doesn't** (`less`, `man`, plain `vim`) → **PageUp / PageDown**.
+     So the one pair of buttons "just scrolls" whatever you're looking at.
    - **Press-and-hold to auto-repeat** on **scroll, arrows, and backspace** (a tap still fires
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
    - All input is sent as **real key/wheel events** (`ghostty_surface_key` / `_mouse_scroll`),
@@ -230,7 +242,8 @@ real scrollback can't come from the GUI. Instead:
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
-| `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → real mouse wheel to the host |
+| `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → real mouse wheel to the host (drives host `scroll_viewport`) |
+| `POST /api/surface/{uuid}/hidden` | `{"hidden":bool}` → hide/reveal in the Agent Dashboard hide set (503 if the dashboard isn't running) |
 | `GET /sw.js` | the Web Push service worker (bootstrap; `?token=` accepted) |
 | `GET /api/push/config` | JSON `{vapidPublicKey, enabled, subscriptions}` |
 | `POST /api/push/subscribe` | register a browser `PushSubscription` |
@@ -246,21 +259,33 @@ real scrollback can't come from the GUI. Instead:
 - **No live config reload** — changing `web-monitor-listen` / `web-monitor-token` needs a
   relaunch.
 - Scrollback replay on connect is bounded by the host ring buffer; xterm.js then keeps its own
-  scrollback (10000 lines) for everything streamed since connecting. **Scroll ↑/↓ on the normal
-  screen scrolls that LOCAL xterm.js scrollback** (see below) — it does not reach further history
-  on the host.
-- **Why Scroll is "smart" (and why a host wheel was the wrong default).** The host's raw stream
-  (`raw_output`) carries ONLY child PTY output — the `output_observer` fires on IO reads, so a
-  host-side viewport scroll (`/scroll` → `scroll_viewport`) repins the host's mirror but **emits
-  no bytes back to the phone**. The browser's `xterm.js` is therefore the only thing that holds
-  replayable scrollback (the replayed ring + everything streamed since connect). So `smartScroll`
-  reads the live mode off `xterm.js` (`term.buffer.active.type` + `term.modes.mouseTrackingMode`)
-  and routes three ways: **normal buffer** (shell, **Claude Code**, anything using terminal
-  scrollback) → **`term.scrollLines` LOCALLY** (no host round-trip — this was the silently-broken
-  common case; a wheel POST changed nothing visible); **alt screen + mouse capture** (`htop`,
-  `vim`+mouse) → a real **wheel** so the app redraws and those bytes stream back; **alt screen,
-  no mouse** (`less`/`man`/plain `vim`) → **PageUp/PageDown** (a wheel is a no-op there because the
-  `.client` mirror's alt-screen `active_key` is a documented un-applied residual in
+  scrollback (10000 lines) for everything streamed since connecting. For a **normal-screen app with
+  real scrollback**, Scroll ↑/↓ scrolls that LOCAL xterm.js scrollback; for a **full-frame TUI with
+  no local scrollback**, Scroll ↑/↓ drives the **host** viewport instead (history view, see below).
+- **⚠️ Claude Code's conversation history is NOT terminal-scrollable — on the phone OR the desktop.**
+  Claude Code renders its whole UI **in place** using absolute cursor moves inside a **fixed scroll
+  region** (it sets `ESC[2;41r` and scrolls that sub-region with `CSI S`). Ghostty's `scrollUp` only
+  moves scrolled-out lines into scrollback when the region's **top margin is row 0**
+  (`src/terminal/Terminal.zig` `scrollUp` / `index`); a sub-region scroll takes the `deleteLines`
+  path and **DISCARDS** the content (verified: 0 newlines/`IND` in a live capture, only `ESC[2;41r`
+  + `CSI S`). So Claude's scrolled-off transcript never enters **any** terminal scrollback (host or
+  GUI) — it lives only in Claude Code's own process. The desktop wheel can only reveal whatever
+  **real** scrollback exists (e.g. shell output from before `claude` launched), and so can the
+  phone. Scroll ↑/↓ now matches that desktop behavior; it cannot recover the Claude conversation
+  because that history isn't in the terminal.
+- **Why Scroll is "smart".** The host's raw stream (`raw_output`) carries ONLY child PTY output —
+  the `output_observer` fires on IO reads, so a host-side viewport scroll (`/scroll` →
+  `scroll_viewport`) repins the host's mirror but **emits no bytes back on the raw stream**. So to
+  SHOW host scrollback the page reads the mirror as plain text (`/screen`, which under `.client`
+  returns the current mirror viewport — scrolled or not). `smartScroll` reads the live mode off
+  `xterm.js` (`term.buffer.active.type` + `term.modes.mouseTrackingMode` + `term.buffer.active.baseY`)
+  and routes four ways: **normal buffer WITH local scrollback** (`baseY>0`) → **`term.scrollLines`
+  LOCALLY** (color, no round-trip); **normal buffer, NO local scrollback** (Claude Code) → **history
+  view**: `POST /scroll` (host `scroll_viewport`) then render `/screen` in the plain-text `<pre>`,
+  with a **● Live** button to resume — the desktop-parity path; **alt screen + mouse capture**
+  (`htop`, `vim`+mouse) → a real **wheel** so the app redraws and those bytes stream back; **alt
+  screen, no mouse** (`less`/`man`/plain `vim`) → **PageUp/PageDown** (a wheel is a no-op there because
+  the `.client` mirror's alt-screen `active_key` is a documented un-applied residual in
   `src/termio/Client.zig`). Purely page-side — no Zig/host change.
 
 ---
@@ -366,11 +391,13 @@ surfaces:[{id,title,pwd,…,isAgent,hidden}]}` — the response is an OBJECT, no
 see the agent-filters note below); `GET /api/surface/{uuid}/stream` (raw-byte xterm source;
 needs `pty-host`); `GET /api/surface/{uuid}/screen?mode=viewport|scrollback` (plain-text
 fallback, reuses `cachedVisibleContents`/`cachedScreenContents`); `POST
-/api/surface/{uuid}/input`; `POST /api/surface/{uuid}/scroll` (`{"dy":±ticks}`).
+/api/surface/{uuid}/input`; `POST /api/surface/{uuid}/scroll` (`{"dy":±ticks}`); `POST
+/api/surface/{uuid}/hidden` (`{"hidden":bool}` → toggle the Agent Dashboard hide set, see the
+hide note below).
 
 Status codes: Unknown id/path → 404, wrong method → 405, bad/negative/oversized
 Content-Length → 400, chunked → 411, oversized → 413, bad Host → 403, throttled (token mode)
-→ 429.
+→ 429; `/hidden` → 503 when the dashboard isn't running.
 
 ### Agent filters (fork-only, GUI-only) — list-only "Agents only" / "Hide hidden"
 
@@ -392,6 +419,27 @@ to pick up. Wiring: `AgentDashboardController.webMonitorFilterState()`,
 `applyFilterAvailability` + `loadList`/`refreshBellButton` parse `data.surfaces`). Tests:
 `WebMonitorServerTests` (`surfacesJSONCarriesAgentDashboardFlag`,
 `surfacesJSONCarriesAgentAndHiddenFlags`, `htmlPageHasAgentFilters`, updated `surfacesJSON*`).
+
+### Hide a split from the phone (fork-only, GUI-only) — per-row Hide/Show
+
+Each list row has a **Hide/Show** button (shown only when the dashboard is running) that toggles
+the **SAME** persisted, UUID-keyed hide set as the dashboard eye-slash button /
+`hide_dashboard_split` keybind — so hiding from the phone IS a dashboard hide, and the existing
+**Hide hidden** filter then drops it (auto-unhide-on-bell still applies). Route `POST
+/api/surface/{uuid}/hidden` (body `{"hidden":bool}`; lenient — accepts a JSON bool, `0`/`1`, or
+`"true"`/`"false"` via the pure `hiddenFlag(body:)`). The handler hops to main and calls
+`AppDelegate.setWebMonitorHidden(surfaceID:hidden:)` (wrapped in `MainActor.assumeIsolated` like
+`surfacesJSON()`'s dashboard read), which lazily creates the controller (like the keybind handlers,
+so a hide persists even with the panel closed) and calls `AgentDashboardController.setHidden(...)`
+→ `model.hide`/`model.show`. Returns 503 when no dashboard controller exists (the button is hidden
+then anyway). The `hidden` flag is by UUID and independent of whether the surface is live, so it
+succeeds even for a not-currently-resolvable surface. NOTE the `/api/surfaces` response is cached
+~1s (`surfacesCacheTTL`), so a freshly-toggled hide shows up on the next list refresh, not
+instantly. ZERO host/Zig change; GUI relaunch. Wiring: `WebMonitorServer.swift`
+(`.setHidden` route + `hiddenFlag` + handler), `AppDelegate.swift` (`setWebMonitorHidden`),
+`AgentDashboardController.swift` (`setHidden(surfaceID:hidden:)`), page `loadList` row Hide/Show
+button + `setHidden(id,hidden)`. Tests: `WebMonitorServerTests`
+(`decideRouteSetHiddenPost`/`…GetMethodNotAllowed`, `hiddenFlagDecode`).
 
 ### Input = REAL key/wheel events, NOT paste (critical)
 
@@ -416,24 +464,34 @@ preventDefault) on scroll/arrows/backspace only; the rest are single-fire.
 **Smart scroll (`smartScroll`, page-side).** The Scroll ↑/↓ buttons do NOT blindly POST a wheel
 delta. **Load-bearing fact:** the host's `raw_output` stream carries only CHILD pty output (the
 `output_observer` fires on IO reads), so a host-side `/scroll` (`scroll_viewport`) emits nothing
-back to the phone — driving the host is useless for what the browser sees. The browser's
-`xterm.js` is the only thing holding replayable scrollback. So `smartScroll` reads the LIVE mode
-off the `xterm.js` instance — `term.buffer.active.type` (`normal`/`alternate`) and
-`term.modes.mouseTrackingMode` — exposed to the page by adding `term` to the stream handle
-(`{ dispose, term }`). Decision:
-- **normal buffer** (shell, **Claude Code**, anything using terminal scrollback) ⇒
-  `term.scrollLines(∓3)` — scroll xterm.js's OWN scrollback LOCALLY, no host round-trip. This is
-  the common case and the one that was silently broken (a wheel POST did nothing visible). xterm
-  keeps the user's scroll position when new output streams in while scrolled up, so it stays put.
+back on the raw stream. Two things can hold scrollback: the browser's `xterm.js` (for output it
+received), and the HOST terminal (its real scrollback, readable via `/screen`, which under
+`.client` returns the current mirror viewport — scrolled or not). `smartScroll` reads the LIVE mode
+off the `xterm.js` instance — `term.buffer.active.type` (`normal`/`alternate`),
+`term.modes.mouseTrackingMode`, and `term.buffer.active.baseY` (local-scrollback depth) — exposed
+to the page by adding `term` to the stream handle (`{ dispose, term }`). Decision:
+- **normal buffer WITH local scrollback** (`baseY>0` — a shell, and any app that emits real
+  newlines) ⇒ `term.scrollLines(∓3)` — scroll xterm.js's OWN scrollback LOCALLY, in color, no host
+  round-trip. xterm keeps the user's scroll position when new output streams in while scrolled up.
+- **normal buffer with NO local scrollback** (`baseY==0` — **Claude Code** and other full-frame
+  in-place TUIs, which emit no newlines so xterm.js has nothing to scroll and `term.scrollLines`
+  was a dead no-op — the previously-broken case) ⇒ **history view** (`historyScroll` →
+  `enterHistory`): hide xterm, `sendScroll(±3)` to drive the HOST's `scroll_viewport` (the desktop
+  wheel's path), then `renderHistory()` reads `/screen` into the plain-text `<pre>`; a **● Live**
+  button (`exitHistory`, also on Back) snaps the host viewport back to bottom and restores the live
+  color view (the stream kept running underneath). **⚠️ This is desktop parity, NOT a way to see
+  Claude's conversation** — Claude discards its scrolled-off transcript (fixed sub-region scroll,
+  see Known limits), so this reveals only the *real* host scrollback (e.g. pre-`claude` shell
+  output), exactly as the desktop wheel does.
 - **alt screen + mouse tracking** (`htop`, `vim`+mouse) ⇒ `sendScroll(±3)` — a real wheel so the
   app itself redraws (no xterm scrollback exists in the alt buffer; the redraw streams back).
 - **alt screen, no mouse** (`less`/`man`/plain `vim`) ⇒ `sendKey("pageup"/"pagedown")` (a wheel is
   a no-op there because the mirror's alt-screen `active_key` isn't applied under `pty-host` — see
   Known limits).
 
-With no live `xterm` (plain-text poll fallback) there is no local buffer, so it falls back to the
-plain host wheel. This is the answer to "how do I know dynamically whether to scroll or page" —
-the terminal's own mode tells us, and `xterm.js` already tracks it.
+With no live `xterm` (plain-text poll fallback) the poll loop already reads the host-scrolled
+mirror, so a plain host wheel (`sendScroll`) suffices. Already in history mode ⇒ keep paging the
+host. `historyMode` is reset on `showSurface`/`showList`/`fallbackToPoll`.
 
 ### Security defense-in-depth
 
