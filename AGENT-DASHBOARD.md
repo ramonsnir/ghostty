@@ -138,6 +138,15 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   Hide-only (pressing it on an already-hidden split keeps it hidden — reveal from the
   panel's Show button). Same persisted hide set + same auto-unhide-on-bell as the eye-slash
   button.
+- **Dismiss a bell from its tile.** When a tile is ringing it shows an amber **🔔
+  (`bell.badge.fill`)** glyph in its header — now a **click target**. Clicking it
+  acknowledges the bell **and** the promoted "needs you" attention **system-wide**
+  without focusing the split: the amber frame, the 🔔 title prefix, the dock badge,
+  this tile's mark, and the "needs you" pill all drop everywhere they appear. This is
+  the desk-side equivalent of the web monitor's phone clear (same
+  `SurfaceView.resetBell` + `resetAttention`), and it only clears GUI state — the raw
+  bell can ring again and the Agent Manager re-arms on its next clean classify, so a
+  still-live condition re-fires later.
 - **Find the split you're looking at.** The tile for the split you're **currently focused
   on** in the terminal gets a **light "you're here" treatment** — a thin accent border and
   a small accent dot in its header — as long as it isn't hidden. It's cosmetic only (it
@@ -564,6 +573,28 @@ gotchas, not a recap.)
   `macos/Tests/AgentDashboard/AgentDashboardTests.swift`. **GUI-only** (the `spotlight_dashboard_split`
   action is a new apprt enum ⇒ a lib/xcframework rebuild, but the host never sees it — no host
   restart / no session loss); GUI relaunch to pick it up.
+- **Bell dismiss from the tile (`onDismissBell` → `model.dismissBell(_:)`).** The header's
+  amber 🔔 (`bell.badge.fill`) is now a borderless `Button` (was a static `Image`) whose
+  action is the tile input `onDismissBell`, wired in `AgentDashboardView.tile(for:)` to
+  `model.dismissBell(entry.id)`. `dismissBell` resolves the entry's WEAK `realView`
+  (`entries.first { $0.id == id }?.realView`) and calls `SurfaceView.resetBell()` +
+  `resetAttention()` on it — the **exact same acknowledge the web monitor's phone
+  clear-bell / clear-attention routes do** (`WebMonitorServer` `.clearBell`/`.clearAttention`).
+  Because every bell/attention visual (amber frame, 🔔 title prefix, dock badge, this tile's
+  mark, the "needs you"/"needs input" pill) derives from the surface's single
+  `bell`/`attentionNeeded` `@Published` flags, clearing them drops the signal **system-wide**;
+  the dashboard mark clears because the controller observes `\.bell`/`\.attentionNeeded`
+  (`surfaceValuesPublisher`) into its `bells`/`attention` dicts that feed `entry.bell`/`.attention`.
+  It clears **GUI state only** — the raw bell can ring again and the sidecar re-arms on its next
+  clean classify (a still-live condition re-promotes). No-op on an unresolved / nil-`realView`
+  tile (its bell wouldn't be showing anyway). The button lives among the other borderless header
+  controls (up-arrow / keep-pin / hide), so its own hit-testing intercepts the click ahead of the
+  row-level `onTapGesture { jump() }` — clicking 🔔 dismisses without also jumping. Wiring:
+  `AgentDashboardController.swift` (`dismissBell(_:)`), `AgentPreviewTile.swift` (`onDismissBell`
+  input + the 🔔 `Button`), `AgentDashboardView.swift` (`onDismissBell: { model.dismissBell(entry.id) }`).
+  Test: `AgentDashboardModelTests.dismissBellNoOpWhenSurfaceUnresolved` (the nil-`realView` guard;
+  the positive path drives a real SurfaceView, exercised via the already-tested
+  `resetBell`/`resetAttention`). GUI-only, no Zig/host change — live-deployable.
 
 ### Live previews need pty-host (the mirror SurfaceView)
 

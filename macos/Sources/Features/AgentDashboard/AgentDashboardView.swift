@@ -207,6 +207,7 @@ struct AgentDashboardView: View {
             isSpotlighted: entry.id == model.spotlightedSurfaceID,
             onDismissSpotlight: { model.clearSpotlight() },
             onHide: { model.hide(entry.id) },
+            onDismissBell: { model.dismissBell(entry.id) },
             onClose: { model.closeSurface(entry.id) },
             onKeep: { newKeep in
                 model.setQueueKeep(

@@ -343,7 +343,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   clears it early (`model.toggleSpotlight` → `clearSpotlight`), and a click on the tile's up-arrow
   badge (`onDismissSpotlight` → `clearSpotlight`) dismisses it too. **Unlike Hide it OPENS the panel**
   (`spotlight(surfaceID:)` reads pre-toggle state + calls `show()` ONLY when turning on; a toggle-off
-  leaves the panel alone). Separately, the tile for the **currently focused** surface always gets a LIGHT accent
+  leaves the panel alone). **Clicking the tile's amber 🔔 (`bell.badge.fill`, now a
+  borderless `Button` — `onDismissBell` → `model.dismissBell(_:)`) acknowledges the bell +
+  promoted attention SYSTEM-WIDE without focusing the split** — resolves the entry's weak
+  `realView` and calls `SurfaceView.resetBell()` + `resetAttention()` (the SAME acknowledge the
+  web monitor's phone clear routes use), dropping the amber frame / 🔔 title / dock badge / this
+  mark / "needs you" pill everywhere; GUI-state only, so the raw bell can ring again and the
+  sidecar re-arms on its next clean classify (re-fires later). No-op on a nil-`realView` tile.
+  Separately, the tile for the **currently focused** surface always gets a LIGHT accent
   border + header dot (`isFocused`), driven by a NEW `.ghosttyFocusedSurfaceDidChange` posted
   from `Ghostty.App.recordFocusedSurface` (VIEW-only — `model.setFocusedSurface` stores the id
   and does NOT re-sort). NOTE two distinct "pin" keys: `agent-dashboard-pin` floats the whole
@@ -351,10 +358,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   Wiring: `spotlightDashboardSplit` in `Ghostty.App.swift`, `ghosttySpotlightDashboardSplit` +
   `ghosttyFocusedSurfaceDidChange` in `GhosttyPackage.swift`, the AppDelegate observer,
   `AgentDashboardController.swift` (`spotlight(surfaceID:)`/`subscribeFocus` + model
-  `spotlight`/`toggleSpotlight`/`clearSpotlight`/`spotlightedEntry`/`setFocusedSurface`/spotlight-first
+  `spotlight`/`toggleSpotlight`/`clearSpotlight`/`spotlightedEntry`/`setFocusedSurface`/`dismissBell`/spotlight-first
   `sorted`/`sections` lift), `AgentPreviewTile.swift` (`isFocused`/`isSpotlighted` visuals +
-  `onDismissSpotlight` up-arrow button), `AgentDashboardView.swift`
-  (`tile(for:)` + top row), `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`). GUI-only
+  `onDismissSpotlight` up-arrow button + the clickable 🔔 `onDismissBell` button), `AgentDashboardView.swift`
+  (`tile(for:)` + top row + `onDismissBell`), `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`). GUI-only
   (new apprt enum ⇒ lib/xcframework rebuild; host unaffected, no session loss). **See
   `AGENT-DASHBOARD.md` (→ Implementation notes → Focus highlight + spotlight) for the
   bottom-anchor subsystem, detection, hook plumbing, wiring + tests.** **Preview-scale feedback-loop fix (always on):**

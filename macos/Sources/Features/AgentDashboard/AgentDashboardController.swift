@@ -479,6 +479,22 @@ final class AgentDashboardModel: ObservableObject {
         _ = MCPLayout.forceClose(uuid: id)
     }
 
+    /// (ramon fork / Agent Dashboard) Dismiss the bell AND the promoted attention for a
+    /// surface from its tile's 🔔 icon, WITHOUT focusing the surface — the exact same
+    /// acknowledge the web monitor's phone clear does (`SurfaceView.resetBell` +
+    /// `resetAttention`). Because every bell/attention visual (amber frame, 🔔 title
+    /// prefix, dock badge, dashboard mark, "needs you"/"needs input" pill) derives from
+    /// the surface's single `bell`/`attentionNeeded` flags, clearing them drops the
+    /// signal SYSTEM-WIDE, everywhere it's shown. It only clears GUI state, so the raw
+    /// bell can ring again and the sidecar re-arms on its next clean classify — a
+    /// still-live condition promotes again later. No-op on an unresolved / already-freed
+    /// surface (its bell wouldn't be showing then anyway). MUST be on main — the model is.
+    func dismissBell(_ id: UUID) {
+        guard let view = entries.first(where: { $0.id == id })?.realView else { return }
+        view.resetBell()
+        view.resetAttention()
+    }
+
     /// Manually reveal a single hidden surface. Persists.
     func show(_ id: UUID) {
         guard hidden.contains(id) else { return }

@@ -25,6 +25,11 @@ struct AgentPreviewTile: View {
     /// keybind). No-op unless `isSpotlighted`.
     let onDismissSpotlight: () -> Void
     let onHide: () -> Void
+    /// (ramon fork / Agent Dashboard) Acknowledge this split's bell + promoted attention
+    /// from the tile's 🔔 icon WITHOUT focusing it — drops the signal system-wide so it
+    /// can re-fire later. Routes to `AgentDashboardModel.dismissBell`. No-op unless
+    /// `bellRinging`.
+    let onDismissBell: () -> Void
     /// Force-close this split + free its (queue) slot — the escape hatch for a wedged
     /// queue agent. Gated behind a confirmation (no undo: it ends the agent).
     let onClose: () -> Void
@@ -271,10 +276,17 @@ struct AgentPreviewTile: View {
             if bellRinging {
                 // REAL-bell affordance only. Clears on focus (bell-tied); the hook
                 // `.waiting` status uses the "waiting ⚠" chip + "needs input" pill
-                // instead, which persist.
-                Image(systemName: "bell.badge.fill")
-                    .font(.caption2)
-                    .foregroundStyle(Self.bellAmber)
+                // instead, which persist. Now also a CLICK target: acknowledge the bell
+                // + attention across the whole system (drop the amber frame / 🔔 title /
+                // dock badge / this mark / "needs you" pill) without focusing the split,
+                // leaving it free to ring again later.
+                Button(action: onDismissBell) {
+                    Image(systemName: "bell.badge.fill")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(Self.bellAmber)
+                .help("Dismiss this bell — clears the alert everywhere (title, border, badge) without focusing the split, so it can ring again later")
             }
             // (keep) The 📌 pin toggle — queue tiles only. Shown PERSISTENTLY when kept (so
             // a pinned split is obvious without hovering) and on hover otherwise. Filled +

@@ -705,6 +705,20 @@ struct AgentDashboardModelTests {
         #expect(model.spotlightedSurfaceID == nil)
     }
 
+    @Test func dismissBellNoOpWhenSurfaceUnresolved() {
+        // The tile 🔔-click path resolves the entry's weak `realView` to call
+        // resetBell/resetAttention on it. With no matching entry (or a metadata-only
+        // tile whose realView is nil) it must be a safe no-op, never a crash — the
+        // bell wouldn't be showing on such a tile anyway. (The positive path drives a
+        // real SurfaceView, exercised via the already-tested resetBell/resetAttention.)
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))          // realView is nil in the test fixture
+        model.applyAgents(agents([a]))
+        model.dismissBell(a)                     // resolves an entry, realView == nil ⇒ no-op
+        model.dismissBell(UUID())                // no matching entry ⇒ no-op
+    }
+
     @Test func toggleSpotlightOffOnSameID() {
         // The keybind path: pressing it on the already-spotlighted split clears it
         // (early dismiss); on a different/none split it spotlights.
