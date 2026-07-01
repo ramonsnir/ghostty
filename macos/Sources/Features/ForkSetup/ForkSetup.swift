@@ -1337,6 +1337,7 @@ enum ForkSetup {
     # Spotlight the focused split at the top of the dashboard (find "the agent I'm
     # looking at"). shift+p because ctrl+a>p is previous_tab.
     #keybind = ctrl+a>shift+p=spotlight_dashboard_split
+    #keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split
     # One-key project launchers — open a new tab with cwd set to a project:
     #keybind = ctrl+a>g=new_tab:~/git/your-project
     #keybind = ctrl+a>i=new_tab:~/git/another-project

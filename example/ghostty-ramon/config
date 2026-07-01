@@ -97,6 +97,7 @@ keybind = ctrl+a>ctrl+shift+d=hide_dashboard_split
 # ctrl+a>p is previous_tab. (The currently-focused split's tile is also always given
 # a light accent border automatically.)
 keybind = ctrl+a>shift+p=spotlight_dashboard_split
+keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split
 
 # Agent Manager (fork-only): a Haiku summarizer that replaces each dashboard
 # tile's raw working/waiting chip with a live one-line semantic status

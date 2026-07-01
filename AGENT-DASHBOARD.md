@@ -50,6 +50,7 @@ keybind = ctrl+a>shift+d=hide_dashboard_split
 # command palette: "Spotlight Split at Top of Agent Dashboard"). Written `shift+p` because
 # `ctrl+a>p` is previous-tab, and shift-keys must spell `shift+` (see CLAUDE.md).
 keybind = ctrl+a>shift+p=spotlight_dashboard_split
+keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
 ```
 
 - **`agent-dashboard`** — master enable. `true` ⇒ the panel is created at launch and
