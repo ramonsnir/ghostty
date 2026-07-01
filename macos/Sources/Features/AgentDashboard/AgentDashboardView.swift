@@ -79,12 +79,12 @@ struct AgentDashboardView: View {
     @ViewBuilder
     private var sectionedList: some View {
         List {
-            // (ramon fork / Agent Dashboard) The spotlight-pinned split floats to the
+            // (ramon fork / Agent Dashboard) The spotlighted split floats to the
             // VERY top, above the banner and every origin section ("top is top"). It's
             // lifted out of its section (`model.sections` excludes it) so it renders
-            // exactly once. Not reorderable while pinned.
-            if let pinned = model.pinnedEntry {
-                tile(for: pinned)
+            // exactly once. Not reorderable while spotlighted.
+            if let spotlighted = model.spotlightedEntry {
+                tile(for: spotlighted)
                     .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 6, trailing: 0))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
@@ -177,8 +177,8 @@ struct AgentDashboardView: View {
     }
 
     /// (ramon fork / Agent Dashboard) One configured `AgentPreviewTile` — shared by
-    /// the section rows and the spotlight-pinned top row so they stay identical. The
-    /// `isFocused`/`isPinned` cosmetics are derived live from the model (no rebuild
+    /// the section rows and the spotlighted top row so they stay identical. The
+    /// `isFocused`/`isSpotlighted` cosmetics are derived live from the model (no rebuild
     /// needed for focus — the `@Published` change re-renders the tile).
     @ViewBuilder
     private func tile(for entry: AgentEntry) -> some View {
@@ -187,7 +187,7 @@ struct AgentDashboardView: View {
             ghostty: ghostty,
             previewsEnabled: ptyHostEnabled,
             isFocused: entry.id == model.focusedSurfaceID,
-            isPinned: entry.id == model.pinnedSurfaceID,
+            isSpotlighted: entry.id == model.spotlightedSurfaceID,
             onHide: { model.hide(entry.id) },
             onClose: { model.closeSurface(entry.id) },
             onKeep: { newKeep in

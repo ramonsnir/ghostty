@@ -440,8 +440,8 @@ class AppDelegate: NSObject,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(ghosttyPinDashboardSplit(_:)),
-            name: Ghostty.Notification.ghosttyPinDashboardSplit,
+            selector: #selector(ghosttySpotlightDashboardSplit(_:)),
+            name: Ghostty.Notification.ghosttySpotlightDashboardSplit,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
@@ -620,13 +620,13 @@ class AppDelegate: NSObject,
         }
     }
 
-    /// (ramon fork / Agent Dashboard) Pin (spotlight) the focused surface at the top
-    /// of the dashboard (the `pin_dashboard_split` keybind). Unhides the split and
+    /// (ramon fork / Agent Dashboard) Spotlight the focused surface at the top
+    /// of the dashboard (the `spotlight_dashboard_split` keybind). Unhides the split and
     /// floats its tile to the very top for `agent-dashboard-spotlight-seconds`, or
-    /// until another split is pinned. Unlike Hide, this DOES open the panel (the
+    /// until another split is spotlighted. Unlike Hide, this DOES open the panel (the
     /// point is to see the agent), lazily creating the controller if needed. The
-    /// notification's object is the `SurfaceView` to pin.
-    @objc private func ghosttyPinDashboardSplit(_ notification: Notification) {
+    /// notification's object is the `SurfaceView` to spotlight.
+    @objc private func ghosttySpotlightDashboardSplit(_ notification: Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         // Posted from the apprt action callback, which arrives on the main
         // thread; the controller is @MainActor-isolated.
@@ -634,7 +634,7 @@ class AppDelegate: NSObject,
             if agentDashboard == nil {
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
-            agentDashboard?.pin(surfaceID: surfaceView.id)
+            agentDashboard?.spotlight(surfaceID: surfaceView.id)
         }
     }
 

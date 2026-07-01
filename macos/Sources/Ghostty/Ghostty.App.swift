@@ -660,8 +660,8 @@ extension Ghostty {
             case GHOSTTY_ACTION_HIDE_DASHBOARD_SPLIT:
                 return hideDashboardSplit(app, target: target)
 
-            case GHOSTTY_ACTION_PIN_DASHBOARD_SPLIT:
-                return pinDashboardSplit(app, target: target)
+            case GHOSTTY_ACTION_SPOTLIGHT_DASHBOARD_SPLIT:
+                return spotlightDashboardSplit(app, target: target)
 
             case GHOSTTY_ACTION_INSTALL_AGENT_HOOKS:
                 installAgentHooks(app, target: target)
@@ -1257,12 +1257,12 @@ extension Ghostty {
             }
         }
 
-        // (ramon fork / Agent Dashboard) Pin (spotlight) the focused split at the top
+        // (ramon fork / Agent Dashboard) Spotlight the focused split at the top
         // of the Agent Dashboard: unhide it + float its tile to the very top for a
         // configurable duration (and open the panel if it's closed). Surface-scoped,
         // mirroring `hideDashboardSplit`: no-op + false on an APP target; posts the
         // resolved SurfaceView as `object`.
-        private static func pinDashboardSplit(
+        private static func spotlightDashboardSplit(
             _ app: ghostty_app_t,
             target: ghostty_target_s) -> Bool {
             switch target.tag {
@@ -1273,7 +1273,7 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return false }
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
                 NotificationCenter.default.post(
-                    name: Notification.ghosttyPinDashboardSplit,
+                    name: Notification.ghosttySpotlightDashboardSplit,
                     object: surfaceView
                 )
                 return true

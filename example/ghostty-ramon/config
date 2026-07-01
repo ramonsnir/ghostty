@@ -79,7 +79,7 @@ keybind = ctrl+a>f=toggle_project_selector
 # panel above other windows (native always-on-top) — use this instead of an
 # external window manager's pin, which can't tell the panel apart from the
 # terminals (they share one bundle id). `agent-dashboard-spotlight-seconds` is a
-# DIFFERENT pin: how long `pin_dashboard_split` (below) keeps ONE tile at the top
+# DIFFERENT knob: how long `spotlight_dashboard_split` (below) keeps ONE tile on top
 # of the list (0 = until you pin another split).
 agent-dashboard = true
 agent-dashboard-commands = claude,codex
@@ -96,7 +96,7 @@ keybind = ctrl+a>ctrl+shift+d=hide_dashboard_split
 # way to find "the agent I'm looking at". Opens the panel if closed. shift+p because
 # ctrl+a>p is previous_tab. (The currently-focused split's tile is also always given
 # a light accent border automatically.)
-keybind = ctrl+a>shift+p=pin_dashboard_split
+keybind = ctrl+a>shift+p=spotlight_dashboard_split
 
 # Agent Manager (fork-only): a Haiku summarizer that replaces each dashboard
 # tile's raw working/waiting chip with a live one-line semantic status

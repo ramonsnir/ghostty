@@ -266,15 +266,15 @@ final class AgentDashboardModel: ObservableObject {
     @Published private(set) var focusedSurfaceID: UUID?
 
     /// (ramon fork / Agent Dashboard) The surface currently PINNED (spotlighted) to
-    /// the very top of the dashboard by `pin_dashboard_split`, or nil. It sorts
+    /// the very top of the dashboard by `spotlight_dashboard_split`, or nil. It sorts
     /// absolute-first (above attention/queues — "top is top") and is lifted OUT of its
-    /// origin section into a dedicated top row (`pinnedEntry`). Cleared after
-    /// `agent-dashboard-spotlight-seconds` (see `pin`) or when another split is pinned.
-    @Published private(set) var pinnedSurfaceID: UUID?
+    /// origin section into a dedicated top row (`spotlightedEntry`). Cleared after
+    /// `agent-dashboard-spotlight-seconds` (see `spotlight`) or when another split is spotlighted.
+    @Published private(set) var spotlightedSurfaceID: UUID?
 
     /// Monotonic token that invalidates a superseded spotlight-expiry timer: each
-    /// `pin` bumps it, so a still-pending expiry from an earlier pin is a no-op.
-    private var pinGeneration = 0
+    /// `spotlight` bumps it, so a still-pending expiry from an earlier spotlight is a no-op.
+    private var spotlightGeneration = 0
 
     /// Latest merged bell state across all live controllers. Drives bell-first
     /// sort and bell-only auto-unhide.
@@ -495,7 +495,7 @@ final class AgentDashboardModel: ObservableObject {
         rebuildEntriesFromCurrentState()
     }
 
-    // MARK: - Focus highlight + spotlight pin (ramon fork / Agent Dashboard)
+    // MARK: - Focus highlight + spotlight (ramon fork / Agent Dashboard)
 
     /// Record the app-wide focused surface (from `.ghosttyFocusedSurfaceDidChange`).
     /// VIEW-only + cheap: it does NOT re-sort or rebuild entries (focus is not a sort
@@ -507,40 +507,40 @@ final class AgentDashboardModel: ObservableObject {
     }
 
     /// Spotlight `id` at the very top of the dashboard for `duration` seconds
-    /// (`duration <= 0` ⇒ until another split is pinned): unhide it, mark it pinned
-    /// (absolute-top sort + lifted into the dedicated `pinnedEntry` top row), and arm a
-    /// one-shot expiry. Re-pinning ANY split supersedes the previous pin — the earlier
-    /// timer is invalidated via `pinGeneration`, so its fire is a no-op. Persists the
-    /// unhide (shared hide set) and re-sorts. Idempotent-ish: re-pinning the same id
+    /// (`duration <= 0` ⇒ until another split is spotlighted): unhide it, mark it spotlighted
+    /// (absolute-top sort + lifted into the dedicated `spotlightedEntry` top row), and arm a
+    /// one-shot expiry. Re-spotlighting ANY split supersedes the previous spotlight — the earlier
+    /// timer is invalidated via `spotlightGeneration`, so its fire is a no-op. Persists the
+    /// unhide (shared hide set) and re-sorts. Idempotent-ish: re-spotlighting the same id
     /// simply resets the timer.
-    func pin(_ id: UUID, duration: TimeInterval) {
+    func spotlight(_ id: UUID, duration: TimeInterval) {
         // Unhide without a redundant extra rebuild (we rebuild once, below).
         if hidden.contains(id) {
             hidden.remove(id)
             store.save(hidden)
         }
-        pinnedSurfaceID = id
-        pinGeneration += 1
-        let generation = pinGeneration
+        spotlightedSurfaceID = id
+        spotlightGeneration += 1
+        let generation = spotlightGeneration
         rebuildEntriesFromCurrentState()
         guard duration > 0 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             guard let self,
-                  self.pinGeneration == generation,   // not superseded by a later pin
-                  self.pinnedSurfaceID == id
+                  self.spotlightGeneration == generation,   // not superseded by a later spotlight
+                  self.spotlightedSurfaceID == id
             else { return }
-            self.pinnedSurfaceID = nil
+            self.spotlightedSurfaceID = nil
             self.rebuildEntriesFromCurrentState()
         }
     }
 
-    /// The pinned tile, lifted out of its origin section for the dashboard's dedicated
-    /// top row. Nil when nothing is pinned or the pinned surface isn't a live agent
+    /// The spotlighted tile, lifted out of its origin section for the dashboard's dedicated
+    /// top row. Nil when nothing is spotlighted or the spotlighted surface isn't a live agent
     /// tile (closed / not detected). `sections` excludes this entry so it never renders
     /// twice.
-    var pinnedEntry: AgentEntry? {
-        guard let pinnedSurfaceID else { return nil }
-        return entries.first { $0.id == pinnedSurfaceID }
+    var spotlightedEntry: AgentEntry? {
+        guard let spotlightedSurfaceID else { return nil }
+        return entries.first { $0.id == spotlightedSurfaceID }
     }
 
     /// Count of hidden surfaces among the provided live id set (for the
@@ -1010,7 +1010,7 @@ final class AgentDashboardModel: ObservableObject {
             uniquingKeysWith: { first, _ in first })
         entries = AgentDashboardModel.sorted(
             built.filter { !$0.hidden }, lastSeen: lastSeen, manualRank: manualRank,
-            pinnedID: pinnedSurfaceID,
+            spotlightedID: spotlightedSurfaceID,
             bellDashboard: bellDashboard, attnDashboard: attnDashboard)
     }
 
@@ -1062,8 +1062,8 @@ final class AgentDashboardModel: ObservableObject {
         _ entries: [AgentEntry],
         lastSeen: [UUID: Date] = [:],
         manualRank: [UInt64: Int] = [:],
-        // (ramon fork) The spotlight-pinned surface, if any — sorts absolute-first.
-        pinnedID: UUID? = nil,
+        // (ramon fork) The spotlighted surface, if any — sorts absolute-first.
+        spotlightedID: UUID? = nil,
         // Default true to match the config defaults (dashboard routed to both tiers);
         // the model passes its real flags.
         bellDashboard: Bool = true,
@@ -1073,10 +1073,10 @@ final class AgentDashboardModel: ObservableObject {
             e.sessionID == 0 ? nil : manualRank[e.sessionID]
         }
         return entries.sorted { a, b in
-            // (ramon fork) Spotlight pin is the ABSOLUTE top — above attention, manual
+            // (ramon fork) Spotlight is the ABSOLUTE top — above attention, manual
             // order, idle/recency, everything ("top is top"). At most one tile matches.
-            if let pinnedID {
-                let ap = a.id == pinnedID, bp = b.id == pinnedID
+            if let spotlightedID {
+                let ap = a.id == spotlightedID, bp = b.id == spotlightedID
                 if ap != bp { return ap && !bp }
             }
             let aa = needsAttention(a, bellDashboard: bellDashboard, attnDashboard: attnDashboard)
@@ -1234,13 +1234,13 @@ final class AgentDashboardModel: ObservableObject {
     /// the origin filter is applied HERE so the model's attention logic and the
     /// filter-bar toggle list both see the full origin set.
     var sections: [OriginSection] {
-        // (ramon fork) The spotlight-pinned tile is rendered in a dedicated top row
-        // (`pinnedEntry`) ABOVE all origin sections, so drop it here to avoid a
-        // double render. `entries` is already sorted (pinned-first) + non-hidden.
-        let unpinned = pinnedSurfaceID == nil
+        // (ramon fork) The spotlighted tile is rendered in a dedicated top row
+        // (`spotlightedEntry`) ABOVE all origin sections, so drop it here to avoid a
+        // double render. `entries` is already sorted (spotlight-first) + non-hidden.
+        let unspotlighted = spotlightedSurfaceID == nil
             ? entries
-            : entries.filter { $0.id != pinnedSurfaceID }
-        let filtered = AgentDashboardModel.applyOriginFilter(unpinned, excluded: excludedOrigins)
+            : entries.filter { $0.id != spotlightedSurfaceID }
+        let filtered = AgentDashboardModel.applyOriginFilter(unspotlighted, excluded: excludedOrigins)
         // (§11 health) Present queues (minus any the user filtered out) get a section even
         // with no tiles — so the bar stays put while a queue is starting / all hidden.
         let present = Set(queueStatuses.keys).subtracting(excludedOrigins)
@@ -1632,15 +1632,15 @@ final class AgentDashboardController: NSWindowController {
         model.hide(id)
     }
 
-    /// (ramon fork / Agent Dashboard) Pin (spotlight) the given surface at the very top
-    /// of the dashboard (driven by the `pin_dashboard_split` keybind). Unhides it and
+    /// (ramon fork / Agent Dashboard) Spotlight the given surface at the very top
+    /// of the dashboard (driven by the `spotlight_dashboard_split` keybind). Unhides it and
     /// floats its tile to the top for `agent-dashboard-spotlight-seconds` (0 = until
-    /// another split is pinned). Unlike `hide(surfaceID:)`, this OPENS the panel if it's
+    /// another split is spotlighted). Unlike `hide(surfaceID:)`, this OPENS the panel if it's
     /// closed — the whole point is to SEE the agent — showing it first so the surface is
-    /// already in `live` when the pin re-sorts.
-    func pin(surfaceID id: UUID) {
+    /// already in `live` when the spotlight re-sorts.
+    func spotlight(surfaceID id: UUID) {
         if !isShown { show() }
-        model.pin(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
+        model.spotlight(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
     }
 
     func show() {

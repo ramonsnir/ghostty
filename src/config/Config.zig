@@ -2934,12 +2934,12 @@ keybind: Keybinds = .{},
 /// sharing `~/.config/ghostty/config` would error on it).
 @"agent-dashboard-pin": bool = false,
 
-/// (ramon fork) How long (in seconds) the `pin_dashboard_split` action keeps a
+/// (ramon fork) How long (in seconds) the `spotlight_dashboard_split` action keeps a
 /// split "spotlighted" at the very top of the Agent Dashboard. Pressing the
 /// action unhides the focused split and floats its tile above every other tile
 /// (including queue sections and attention/waiting tiles — "top is top") for
-/// this many seconds, or until another split is pinned via the same action.
-/// Default `10`. A value of `0` means pin until another split is pinned (no
+/// this many seconds, or until another split is spotlighted via the same action.
+/// Default `10`. A value of `0` means pin until another split is spotlighted (no
 /// timeout). This is a DIFFERENT "pin" from `agent-dashboard-pin` above: that
 /// one floats the whole PANEL above other windows; this one temporarily raises a
 /// single TILE to the top of the list. Fork-only — keep it in

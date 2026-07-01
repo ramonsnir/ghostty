@@ -16,10 +16,10 @@ struct AgentPreviewTile: View {
     /// currently focused on in the terminal — gets a LIGHT "you're looking at this"
     /// treatment (a thin accent border + a small header dot). Purely cosmetic.
     let isFocused: Bool
-    /// (ramon fork / Agent Dashboard) True when this tile is spotlight-pinned to the
-    /// top via `pin_dashboard_split` — a stronger accent border + a header up-arrow
+    /// (ramon fork / Agent Dashboard) True when this tile is spotlighted to the
+    /// top via `spotlight_dashboard_split` — a stronger accent border + a header up-arrow
     /// badge. (The list also floats it above every section for its duration.)
-    let isPinned: Bool
+    let isSpotlighted: Bool
     let onHide: () -> Void
     /// Force-close this split + free its (queue) slot — the escape hatch for a wedged
     /// queue agent. Gated behind a confirmation (no undo: it ends the agent).
@@ -67,19 +67,19 @@ struct AgentPreviewTile: View {
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
 
     /// (ramon fork / Agent Dashboard) Tile border color, by precedence: a ringing
-    /// bell (amber, the loud transient signal) wins; then a spotlight pin OR the
+    /// bell (amber, the loud transient signal) wins; then a spotlight OR the
     /// focused split (accent — "top" / "you're here"); then hover; else none.
     private var frameColor: Color {
         if bellRinging { return Self.bellAmber }
-        if isPinned || isFocused { return Color.accentColor }
+        if isSpotlighted || isFocused { return Color.accentColor }
         if hovering { return Color.accentColor.opacity(0.6) }
         return .clear
     }
 
-    /// Border width matching `frameColor`: bell + pin are strong (3), the focused
+    /// Border width matching `frameColor`: bell + spotlight are strong (3), the focused
     /// hint is lighter (2), hover/none are 1.
     private var frameWidth: CGFloat {
-        if bellRinging || isPinned { return 3 }
+        if bellRinging || isSpotlighted { return 3 }
         if isFocused { return 2 }
         return 1
     }
@@ -179,13 +179,13 @@ struct AgentPreviewTile: View {
                 .truncationMode(.middle)
             Spacer(minLength: 4)
             // (ramon fork / Agent Dashboard) Light "top" / "you're here" markers.
-            // A spotlight pin (up-arrow) takes precedence over the focused dot when a
+            // A spotlight (up-arrow) takes precedence over the focused dot when a
             // tile is both. Distinct from the queue KEEP pushpin (pin.fill) below.
-            if isPinned {
+            if isSpotlighted {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.caption2)
                     .foregroundStyle(Color.accentColor)
-                    .help("Pinned to the top of the dashboard")
+                    .help("Spotlighted at the top of the dashboard")
             } else if isFocused {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 7))
