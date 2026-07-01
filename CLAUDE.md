@@ -241,19 +241,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   features on it; other work may COPY its patterns but must stand alone.** Load-bearing gotchas:
   input is sent as REAL key/wheel events (`ghostty_surface_key` with the NATIVE macOS virtual
   keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path;
-  **Scroll ↑/↓ is "smart" (`smartScroll`, page-side)** — routes 4 ways off the live `xterm.js` mode
-  (`buffer.active.type` + `modes.mouseTrackingMode` + `buffer.active.baseY`): normal buffer WITH
-  local scrollback (`baseY>0`, a shell) → `term.scrollLines` LOCALLY (color, no round-trip); normal
-  buffer with NO local scrollback (`baseY==0`, **Claude Code** — full-frame in-place TUIs that emit
-  no newlines, so xterm.js has nothing to scroll) → **history view** (`historyScroll`/`enterHistory`):
-  drive the HOST `scroll_viewport` via `/scroll` and render `/screen` in the plain-text `<pre>`, with
-  a **● Live** button (`exitHistory`) to resume — the desktop-wheel path; alt+mouse (htop/vim+mouse)
-  → real wheel; alt+no-mouse (less/man/vim) → PageUp/PageDown (wheel is a dead no-op — `.client`
-  alt-screen `active_key` residual). **⚠️ Claude Code's conversation is NOT terminal-scrollable on
-  EITHER phone or desktop**: it renders in a FIXED sub-region (`ESC[2;41r`) + `CSI S`, and ghostty's
-  `scrollUp` only feeds scrollback when the region top margin is row 0 (else `deleteLines` DISCARDS)
-  — so the transcript never enters host/GUI scrollback (lives only in Claude's process); scroll
-  reveals only REAL scrollback (e.g. pre-`claude` shell output), matching the desktop wheel. **Hide
+  **Scroll ↑/↓ is "smart" (`smartScroll`, page-side) + a server-side POSITION fix** — the fix for the
+  previously-dead Claude Code scroll. Claude Code (and htop/vim+mouse) run on the ALT-SCREEN with
+  MOUSE TRACKING ON; under `.client` the ModeFrame syncs `mouse_event`, so `Surface.scrollCallback`
+  encodes the wheel as an **SGR mouse event AT `getCursorPos()`** → the child scrolls its own
+  transcript + redraws → streams back to the phone IN COLOR (the desktop wheel's exact path). **BUG:**
+  the web monitor never moved a mouse, so `getCursorPos()` was **(0,0)** = Claude's header row → the
+  app ignored the wheel (desktop works only because the pointer is over the transcript). **FIX
+  (server `/scroll`):** `ghostty_surface_mouse_pos` seeds the cursor at the surface CENTER before
+  `ghostty_surface_mouse_scroll` — `mouse_pos` takes LOGICAL points (×`content_scale` internally) and
+  `ghostty_surface_size` returns physical px, so center = `width_px / backingScaleFactor / 2` (scale
+  default 2.0). Verified live (`vim -c 'set mouse=a'` + real Claude Code scroll bidirectionally from
+  the phone). Page `smartScroll` CAN'T trust `xterm.js`'s mode (the phone misses alt-screen/mouse
+  enables sent before connect), so it decides on `term.buffer.active.baseY` (local scrollback depth):
+  `baseY>0` (shell) → `term.scrollLines` LOCALLY (color); `baseY==0` (full-screen TUI) → `sendScroll`
+  a real host wheel (the HOST applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll
+  otherwise). Poll fallback → plain host wheel (the poll reads the host-scrolled mirror). Aside: a
+  host `scroll_viewport` emits nothing back on `raw_output` (repins the mirror, not the child) — so
+  this is NOT viewport scrolling; the wheel goes to the child. **Hide
   a split FROM THE PHONE**: per-row Hide/Show button → `POST /api/surface/{uuid}/hidden`
   {hidden:bool} → `AppDelegate.setWebMonitorHidden` → `AgentDashboardController.setHidden` toggles
   the SAME dashboard hide set (unified; the existing "Hide hidden" filter drops it; 503 if the
