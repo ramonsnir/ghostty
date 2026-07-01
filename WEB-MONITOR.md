@@ -127,19 +127,14 @@ is loopback, hence identical; only your `ts.net` hostname differs:
    - **Enter** quick-key — submits (a real Enter keypress).
    - Quick-keys: **Enter · y · n · Esc · Tab · ⌫ Backspace · Clear (Ctrl-U) · Ctrl-C**, the
      **digits 1–4** (numbered agent menus), and **arrows**.
-   - **Scroll ↑ / Scroll ↓** — *smart* scroll. The page reads the **live terminal mode** off
-     `xterm.js` and picks the right gesture per app:
-     - **normal screen WITH local scrollback** (a shell, and any app that emits real newlines) →
-       scrolls **xterm.js's own scrollback locally**, in full color (no host round-trip).
-     - **normal screen with NO local scrollback** (**Claude Code** and other full-frame TUIs that
-       redraw in place and emit no newlines, so xterm.js has nothing to scroll) → enters a
-       **host-scrollback "history" view**: it drives the **host terminal's scroll** (the same path
-       the Mac desktop wheel uses) and shows the result as plain text; tap **● Live** to resume the
-       live color view. This is the fix for the previously-dead Claude Code case — the buttons now
-       move the view exactly like the desktop wheel (see the Claude Code caveat under **Known limits**).
-     - full-screen TUI that **captures the mouse** (`htop`, `vim` with mouse) → a real **mouse wheel**
-       so the app redraws.
-     - one that **doesn't** (`less`, `man`, plain `vim`) → **PageUp / PageDown**.
+   - **Scroll ↑ / Scroll ↓** — *smart* scroll:
+     - **has local scrollback** (a shell, or anything that emits real newlines) → scrolls
+       **xterm.js's own scrollback locally**, in full color (no host round-trip).
+     - **no local scrollback** (**Claude Code**, `htop`, `less`, `vim`, and other full-screen TUIs) →
+       sends a **real mouse wheel** to the app (over the transcript). A mouse-capturing app like
+       **Claude Code** scrolls its own transcript and redraws, and that redraw streams back **in
+       full color** — exactly what the Mac desktop wheel does. This is the fix for the
+       previously-dead Claude Code scroll (see the note under **Known limits**).
      So the one pair of buttons "just scrolls" whatever you're looking at.
    - **Press-and-hold to auto-repeat** on **scroll, arrows, and backspace** (a tap still fires
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
@@ -242,7 +237,7 @@ real scrollback can't come from the GUI. Instead:
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
-| `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → real mouse wheel to the host (drives host `scroll_viewport`) |
+| `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → seed cursor at surface center, then a real mouse wheel to the app |
 | `POST /api/surface/{uuid}/hidden` | `{"hidden":bool}` → hide/reveal in the Agent Dashboard hide set (503 if the dashboard isn't running) |
 | `GET /sw.js` | the Web Push service worker (bootstrap; `?token=` accepted) |
 | `GET /api/push/config` | JSON `{vapidPublicKey, enabled, subscriptions}` |
@@ -259,34 +254,30 @@ real scrollback can't come from the GUI. Instead:
 - **No live config reload** — changing `web-monitor-listen` / `web-monitor-token` needs a
   relaunch.
 - Scrollback replay on connect is bounded by the host ring buffer; xterm.js then keeps its own
-  scrollback (10000 lines) for everything streamed since connecting. For a **normal-screen app with
-  real scrollback**, Scroll ↑/↓ scrolls that LOCAL xterm.js scrollback; for a **full-frame TUI with
-  no local scrollback**, Scroll ↑/↓ drives the **host** viewport instead (history view, see below).
-- **⚠️ Claude Code's conversation history is NOT terminal-scrollable — on the phone OR the desktop.**
-  Claude Code renders its whole UI **in place** using absolute cursor moves inside a **fixed scroll
-  region** (it sets `ESC[2;41r` and scrolls that sub-region with `CSI S`). Ghostty's `scrollUp` only
-  moves scrolled-out lines into scrollback when the region's **top margin is row 0**
-  (`src/terminal/Terminal.zig` `scrollUp` / `index`); a sub-region scroll takes the `deleteLines`
-  path and **DISCARDS** the content (verified: 0 newlines/`IND` in a live capture, only `ESC[2;41r`
-  + `CSI S`). So Claude's scrolled-off transcript never enters **any** terminal scrollback (host or
-  GUI) — it lives only in Claude Code's own process. The desktop wheel can only reveal whatever
-  **real** scrollback exists (e.g. shell output from before `claude` launched), and so can the
-  phone. Scroll ↑/↓ now matches that desktop behavior; it cannot recover the Claude conversation
-  because that history isn't in the terminal.
-- **Why Scroll is "smart".** The host's raw stream (`raw_output`) carries ONLY child PTY output —
-  the `output_observer` fires on IO reads, so a host-side viewport scroll (`/scroll` →
-  `scroll_viewport`) repins the host's mirror but **emits no bytes back on the raw stream**. So to
-  SHOW host scrollback the page reads the mirror as plain text (`/screen`, which under `.client`
-  returns the current mirror viewport — scrolled or not). `smartScroll` reads the live mode off
-  `xterm.js` (`term.buffer.active.type` + `term.modes.mouseTrackingMode` + `term.buffer.active.baseY`)
-  and routes four ways: **normal buffer WITH local scrollback** (`baseY>0`) → **`term.scrollLines`
-  LOCALLY** (color, no round-trip); **normal buffer, NO local scrollback** (Claude Code) → **history
-  view**: `POST /scroll` (host `scroll_viewport`) then render `/screen` in the plain-text `<pre>`,
-  with a **● Live** button to resume — the desktop-parity path; **alt screen + mouse capture**
-  (`htop`, `vim`+mouse) → a real **wheel** so the app redraws and those bytes stream back; **alt
-  screen, no mouse** (`less`/`man`/plain `vim`) → **PageUp/PageDown** (a wheel is a no-op there because
-  the `.client` mirror's alt-screen `active_key` is a documented un-applied residual in
-  `src/termio/Client.zig`). Purely page-side — no Zig/host change.
+  scrollback (10000 lines) for everything streamed since connecting. For an app with **local
+  scrollback** Scroll ↑/↓ scrolls that; for a **full-screen TUI** it sends a real wheel to the app.
+- **Why Scroll is "smart" — and the Claude Code fix (position matters).** Claude Code (and `htop`,
+  `vim`+mouse, …) render on the **alt-screen with mouse tracking ON**, so the terminal forwards a
+  wheel to the app AS AN SGR MOUSE EVENT and the app scrolls its own view + redraws (that redraw
+  streams back to the phone in color). The catch: `scrollCallback` reports the wheel at the
+  **current cursor position** (`getCursorPos()` in `src/Surface.zig`), and the web monitor never
+  moves a mouse — so it defaulted to **(0,0)**, the top row (Claude's header), which the app ignores.
+  That was the dead-no-op; the desktop "just works" only because the pointer sits over the transcript.
+  **Fix:** `/scroll` seeds the cursor at the surface CENTER (`ghostty_surface_mouse_pos`, logical
+  points = `width_px / backingScaleFactor / 2`) before the wheel, so the SGR report lands in the
+  transcript and the app scrolls — verified live (a `vim -c 'set mouse=a'` and Claude Code both
+  scroll from the phone). The page's `smartScroll` can't trust `xterm.js`'s mode (it misses
+  alt-screen/mouse-enable sequences sent before the phone connected), so it decides on the one
+  reliable local signal — `term.buffer.active.baseY` (local scrollback depth): `baseY>0` →
+  `term.scrollLines` LOCALLY (color, no round-trip); `baseY==0` → `sendScroll` (host wheel; the host
+  applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll arrows otherwise). No
+  live xterm (poll fallback) → the poll loop reads the host-scrolled mirror, so a plain host wheel
+  suffices. Purely GUI/page-side — no host/Zig change.
+  - *Aside:* a host-side viewport `scroll_viewport` emits no bytes back on the raw stream (it repins
+    the mirror, not the child), so scrolling the host viewport is NOT how this works — the wheel goes
+    to the CHILD (Claude), which redraws. Note also that Claude renders its transcript inside a fixed
+    sub-region (`ESC[2;41r` + `CSI S`), so its scrolled-off lines don't enter the terminal's own
+    scrollback; the wheel scrolls Claude's IN-APP transcript, not terminal scrollback.
 
 ---
 
@@ -457,41 +448,39 @@ input model: **Send (and Return-in-field) TYPE the text only — they do NOT sub
 **Enter quick-key submits**; quick-keys are
 enter/y/n/esc/tab/backspace/ctrl-u(Clear)/ctrl-c, digits 1–4, arrows, and Scroll ↑/↓.
 `keySpecs(forKey:)` also maps **pageup/pagedown/home/end** (native macOS keycodes 116/121/115/119)
-for the smart-scroll path below.
+(available as quick-keys; not used by the scroll path anymore).
 **Press-and-hold auto-repeat** (`addRepeat`: 350ms delay → 90ms repeat; `touch-action:none` +
 preventDefault) on scroll/arrows/backspace only; the rest are single-fire.
 
-**Smart scroll (`smartScroll`, page-side).** The Scroll ↑/↓ buttons do NOT blindly POST a wheel
-delta. **Load-bearing fact:** the host's `raw_output` stream carries only CHILD pty output (the
-`output_observer` fires on IO reads), so a host-side `/scroll` (`scroll_viewport`) emits nothing
-back on the raw stream. Two things can hold scrollback: the browser's `xterm.js` (for output it
-received), and the HOST terminal (its real scrollback, readable via `/screen`, which under
-`.client` returns the current mirror viewport — scrolled or not). `smartScroll` reads the LIVE mode
-off the `xterm.js` instance — `term.buffer.active.type` (`normal`/`alternate`),
-`term.modes.mouseTrackingMode`, and `term.buffer.active.baseY` (local-scrollback depth) — exposed
-to the page by adding `term` to the stream handle (`{ dispose, term }`). Decision:
-- **normal buffer WITH local scrollback** (`baseY>0` — a shell, and any app that emits real
-  newlines) ⇒ `term.scrollLines(∓3)` — scroll xterm.js's OWN scrollback LOCALLY, in color, no host
-  round-trip. xterm keeps the user's scroll position when new output streams in while scrolled up.
-- **normal buffer with NO local scrollback** (`baseY==0` — **Claude Code** and other full-frame
-  in-place TUIs, which emit no newlines so xterm.js has nothing to scroll and `term.scrollLines`
-  was a dead no-op — the previously-broken case) ⇒ **history view** (`historyScroll` →
-  `enterHistory`): hide xterm, `sendScroll(±3)` to drive the HOST's `scroll_viewport` (the desktop
-  wheel's path), then `renderHistory()` reads `/screen` into the plain-text `<pre>`; a **● Live**
-  button (`exitHistory`, also on Back) snaps the host viewport back to bottom and restores the live
-  color view (the stream kept running underneath). **⚠️ This is desktop parity, NOT a way to see
-  Claude's conversation** — Claude discards its scrolled-off transcript (fixed sub-region scroll,
-  see Known limits), so this reveals only the *real* host scrollback (e.g. pre-`claude` shell
-  output), exactly as the desktop wheel does.
-- **alt screen + mouse tracking** (`htop`, `vim`+mouse) ⇒ `sendScroll(±3)` — a real wheel so the
-  app itself redraws (no xterm scrollback exists in the alt buffer; the redraw streams back).
-- **alt screen, no mouse** (`less`/`man`/plain `vim`) ⇒ `sendKey("pageup"/"pagedown")` (a wheel is
-  a no-op there because the mirror's alt-screen `active_key` isn't applied under `pty-host` — see
-  Known limits).
-
-With no live `xterm` (plain-text poll fallback) the poll loop already reads the host-scrolled
-mirror, so a plain host wheel (`sendScroll`) suffices. Already in history mode ⇒ keep paging the
-host. `historyMode` is reset on `showSurface`/`showList`/`fallbackToPoll`.
+**Smart scroll (`smartScroll`, page-side) + the position fix (server-side).** The load-bearing
+facts, and the fix for the previously-dead Claude Code scroll:
+- A full-screen TUI (Claude Code, `htop`, `vim`+mouse) runs on the **alt-screen with mouse tracking
+  ON**. Under `.client` the host's ModeFrame syncs `mouse_event` onto the GUI's local terminal, so
+  `Surface.scrollCallback` takes the `isMouseReporting()` branch and encodes the wheel as an **SGR
+  mouse event AT `getCursorPos()`**, forwarded to the child; the child scrolls its own view and
+  redraws, which streams back to the phone **in color**. This is the desktop wheel's exact path.
+- **The bug:** the web monitor never moved a mouse, so `getCursorPos()` was the default **(0,0)** —
+  the top row (Claude's header) — and the app ignored the wheel. The desktop works only because the
+  pointer sits over the transcript. **The fix (server `/scroll`):** call `ghostty_surface_mouse_pos`
+  to seed the cursor at the surface CENTER before `ghostty_surface_mouse_scroll`. `mouse_pos` takes
+  **logical points** and multiplies by `content_scale` internally, and `ghostty_surface_size` returns
+  **physical px**, so center points = `width_px / backingScaleFactor / 2` (default scale 2.0 when the
+  view has no window). Verified live: `vim -c 'set mouse=a'` and a real Claude Code both scroll from
+  the phone, bidirectionally.
+- **The page (`smartScroll`) can't trust `xterm.js`'s mode.** The phone's `xterm.js` only sees bytes
+  since it connected, so an app that enabled alt-screen / mouse tracking BEFORE connect (a
+  long-running Claude Code) looks like a plain normal buffer here (`buffer.active.type` /
+  `modes.mouseTrackingMode` are wrong). The one reliable local signal is `term.buffer.active.baseY`
+  (local scrollback depth), so the decision is: `baseY>0` (a shell, or anything with real newlines) ⇒
+  `term.scrollLines(∓3)` LOCALLY, in color, no round-trip; `baseY==0` (full-screen TUI) ⇒
+  `sendScroll(±3)` — a real host wheel, and the HOST applies the app's REAL mode (SGR wheel for a
+  mouse app, alternate-scroll arrows otherwise). No live `xterm` (poll fallback) ⇒ the poll loop
+  reads the host-scrolled mirror, so a plain host wheel suffices.
+- *Aside:* a host-side `scroll_viewport` emits no bytes back on `raw_output` (it repins the mirror,
+  not the child), so this is NOT viewport scrolling — the wheel goes to the child. And Claude renders
+  its transcript inside a fixed sub-region (`ESC[2;41r` + `CSI S`), so its scrolled-off lines don't
+  enter the terminal's own scrollback; the wheel scrolls Claude's IN-APP transcript. Purely
+  GUI/page-side — no host/Zig change.
 
 ### Security defense-in-depth
 

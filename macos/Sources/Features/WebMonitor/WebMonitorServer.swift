@@ -816,10 +816,29 @@ final class WebMonitorServer {
                 // A zoomed-away split keeps a stale/zero size and ignores scroll;
                 // reveal it so the wheel lands on a properly-sized surface.
                 self.revealIfZoomedAway(controller, view)
+                // Seed a cursor position at the CENTER of the surface before the wheel.
+                // A mouse-reporting TUI (Claude Code, htop, vim+mouse) encodes the wheel
+                // as an SGR mouse event AT THE CURSOR POSITION (`getCursorPos()`), and
+                // scrolls only if that lands in its scrollable region. The web monitor
+                // never moves a mouse, so the position defaulted to (0,0) — the top
+                // (Claude's header) — and the app ignored the wheel (the phone-scroll
+                // dead-no-op). The desktop "just works" because the pointer is over the
+                // transcript. `ghostty_surface_mouse_pos` takes LOGICAL points and scales
+                // by content_scale internally, so convert the physical px size back to
+                // points via the backing scale (default 2.0 Retina when no window).
+                let size = ghostty_surface_size(surface)
+                let scale = view.window?.backingScaleFactor ?? 2.0
+                if size.width_px > 0, size.height_px > 0, scale > 0 {
+                    ghostty_surface_mouse_pos(
+                        surface,
+                        Double(size.width_px) / scale / 2.0,
+                        Double(size.height_px) / scale / 2.0,
+                        GHOSTTY_MODS_NONE)
+                }
                 // Discrete (non-precision) wheel scroll: scroll_mods = 0, y = ticks.
-                // The host routes it per the app's mode (mouse-mode SGR wheel,
-                // alternate-scroll arrows for less/man, or scrollback) exactly like
-                // a real wheel — so a TUI scrolls and the result streams back.
+                // The host routes it per the app's mode (mouse-mode SGR wheel at the
+                // seeded position, alternate-scroll arrows for less/man, or scrollback)
+                // exactly like a real wheel — so a TUI scrolls and the redraw streams back.
                 ghostty_surface_mouse_scroll(surface, 0, dy, 0)
                 return .json(Data(#"{"ok":true}"#.utf8))
             }
@@ -1942,10 +1961,6 @@ final class WebMonitorServer {
         width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
         background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }
       #jumpbottom:active { background: #3a3f4f; }
-      #livebtn { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 2;
-        padding: 7px 13px; border-radius: 17px; opacity: 0.92;
-        background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 13px; cursor: pointer; }
-      #livebtn:active { background: #3a3f4f; }
       .bar { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; align-items: center; }
       .bar input[type=text] { flex: 1; min-width: 120px; background: #0c0e13; color: #d6dae3; border: 1px solid #2a2e3b; border-radius: 6px; padding: 8px; }
       .bar label { color: #b6bccb; font-size: 12px; }
@@ -2013,10 +2028,6 @@ final class WebMonitorServer {
         <div id="xterm"></div>
         <pre id="screen"></pre>
         <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
-        <!-- Shown only in host-scrollback "history" mode (a full-screen TUI like
-             Claude Code that keeps no local xterm scrollback — see smartScroll).
-             Tapping it resumes the live color view. -->
-        <button id="livebtn" style="display:none" title="Resume live view">&#x25cf; Live</button>
       </div>
       <div class="bar">
         <button data-key="enter">Enter</button>
@@ -2040,18 +2051,18 @@ final class WebMonitorServer {
                 title="Acknowledge/clear the &quot;needs you&quot; state for this split (it can re-promote later)">&#128276; Clear</button>
       </div>
       <!-- Arrows + remote-control scroll on ONE row to save vertical space.
-           Scroll is "smart" (see smartScroll): a mouse wheel to the host for
-           scrollback / mouse-capturing apps (Claude Code), but PageUp/PageDown
-           for a full-screen TUI that owns the screen with no scrollback to wheel
-           (less/man/vim) — chosen live from the xterm.js terminal mode. The
+           Scroll is "smart" (see smartScroll): local xterm scrollback when the
+           app has any (a shell), else a real host wheel to the app (Claude Code,
+           htop, less) — which scrolls + redraws in color. Decided on xterm.js's
+           local scrollback depth, since the phone's xterm mode is unreliable. The
            double-line glyphs (⇑⇓) distinguish scroll from the nav arrows (↑↓). -->
       <div class="bar">
         <button data-key="up" aria-label="Up">&uarr;</button>
         <button data-key="down" aria-label="Down">&darr;</button>
         <button data-key="left" aria-label="Left">&larr;</button>
         <button data-key="right" aria-label="Right">&rarr;</button>
-        <button id="scrollup" title="Scroll up — mouse wheel, or PageUp in a full-screen TUI (less/man/vim)">&#8679; Scroll</button>
-        <button id="scrolldown" title="Scroll down — mouse wheel, or PageDown in a full-screen TUI (less/man/vim)">&#8681; Scroll</button>
+        <button id="scrollup" title="Scroll up — local scrollback, or a real wheel to the app (Claude Code, htop, less)">&#8679; Scroll</button>
+        <button id="scrolldown" title="Scroll down — local scrollback, or a real wheel to the app (Claude Code, htop, less)">&#8681; Scroll</button>
       </div>
       <!-- Compose input is LAST so the on-screen keyboard (which docks below the
            focused field) cannot hide the quick-key rows above it. -->
@@ -2092,7 +2103,6 @@ final class WebMonitorServer {
       var viewer = document.getElementById("viewer");
       var screenEl = document.getElementById("screen");
       var jumpBtn = document.getElementById("jumpbottom");
-      var liveBtn = document.getElementById("livebtn");
       var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
       var clearBellBtn = document.getElementById("clearbell");
@@ -2434,8 +2444,6 @@ final class WebMonitorServer {
       // Shows the poll viewer, starts the 700ms poll, and surfaces a banner.
       function fallbackToPoll(msg) {
         disposeStream();
-        historyMode = false;              // no live xterm to return to; the poll loop reads the mirror
-        liveBtn.style.display = "none";
         screenEl.style.display = "block";
         modeToggleEl.style.display = "";  // poll viewer active: the mode toggle applies again
         if (msg) setBanner(msg, false);
@@ -2516,8 +2524,6 @@ final class WebMonitorServer {
 
       function showList() {
         disposeStream();
-        historyMode = false;             // leaving the viewer: reset host-scrollback mode
-        liveBtn.style.display = "none";
         viewer.style.display = "none";
         listEl.style.display = "block";
         filterBar.style.display = "flex";
@@ -2562,8 +2568,6 @@ final class WebMonitorServer {
 
       function showSurface(id, title, bell) {
         current = id;
-        historyMode = false;          // fresh view starts live, not in host-scrollback mode
-        liveBtn.style.display = "none";
         setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
         setClearAttnVisible(false);   // refresh corrects from live state
         refreshBellButton();
@@ -2593,7 +2597,6 @@ final class WebMonitorServer {
       }
 
       backBtn.onclick = function () {
-        exitHistory();   // snap the host viewport back to bottom while `current` is still set
         current = null;
         if (timer) { clearInterval(timer); timer = null; }
         showList();
@@ -2779,96 +2782,32 @@ final class WebMonitorServer {
         }).catch(function () { setBanner("Hide failed \\u2014 not delivered.", false, true); });
       }
 
-      // Host-scrollback "history" mode (for a full-screen TUI that keeps NO local
-      // xterm scrollback — Claude Code and the like, which redraw the whole frame
-      // in place with absolute cursor moves and emit no scroll-producing newlines,
-      // so xterm.js accumulates nothing to scroll). The REAL scrollback lives in
-      // the host terminal (same place the Mac desktop scrolls). We reach it exactly
-      // as the desktop does: POST /scroll drives the host's `scroll_viewport`, the
-      // host repins ITS terminal and pushes a scrolled frame into the GUI mirror,
-      // and GET /screen reads that mirror (plain text). So history mode swaps the
-      // live color xterm for the plain-text <pre> and pages the host scrollback
-      // through it; "● Live" (or Back) resumes the live view. Plain text is the
-      // trade-off for reaching real host history (the live view stays full color).
-      var historyMode = false;
-
-      function renderHistory() {
-        if (!current || !historyMode) return;
-        fetch(url("/api/surface/" + current + "/screen", { mode: "scrollback" }), { headers: headers() })
-          .then(function (r) { if (r.status === 404) throw new Error("404"); if (!r.ok) throw new Error("x"); return r.text(); })
-          .then(function (txt) { if (historyMode) screenEl.textContent = txt; })
-          .catch(function (e) { if (String(e.message) === "404") sessionClosedTeardown(); });
-      }
-
-      function enterHistory() {
-        if (historyMode) return;
-        historyMode = true;
-        xtermEl.style.display = "none";
-        screenEl.style.display = "block";
-        jumpBtn.style.display = "none";       // its <pre> scroll affordance is moot here
-        liveBtn.style.display = "block";
-        setBanner("Scrollback \\u2014 tap \\u25cf Live to resume", true);
-      }
-
-      // Leave history mode: snap the host viewport back to the live bottom (so the
-      // shared desktop mirror isn't left parked in scrollback) and restore the live
-      // color view — the stream kept running underneath while we paged plain text.
-      function exitHistory() {
-        if (!historyMode) return;
-        historyMode = false;
-        liveBtn.style.display = "none";
-        sendScroll(-30); sendScroll(-30);     // clamp is ±30/req; a couple snaps to bottom
-        if (stream && stream.term) {
-          screenEl.style.display = "none";
-          xtermEl.style.display = "block";
-        }
-        clearBannerIfNotError();
-      }
-      liveBtn.onclick = exitHistory;
-
-      function historyScroll(dir) {
-        enterHistory();
-        sendScroll(dir * 3);                  // POST /scroll -> host scroll_viewport
-        setTimeout(renderHistory, 130);       // let the scrolled frame land, then read the mirror
-      }
-
-      // Smart scroll: pick the gesture from the LIVE terminal mode, read off
-      // xterm.js (so it tracks the remote app moment-to-moment). Routes:
-      //  (1) Normal buffer WITH local xterm scrollback (a shell, and any app that
-      //      emits real newlines): the history is ALREADY in xterm.js -> scroll IT
-      //      LOCALLY (term.scrollLines), no host round-trip, in full color.
-      //  (2) Normal buffer with NO local scrollback (Claude Code and other
-      //      full-frame in-place TUIs — they emit no newlines, so xterm.js has
-      //      nothing to scroll and term.scrollLines is a dead no-op): drive the
-      //      HOST scrollback via history mode (the desktop's own scroll path).
-      //  (3) Alt screen + the app captures the mouse (htop, vim with mouse):
-      //      forward a WHEEL so the app itself redraws (those bytes stream back).
-      //  (4) Alt screen, NO mouse capture (less, man, plain vim): send
-      //      PAGEUP/PAGEDOWN so the app pages and redraws (a wheel is a no-op
-      //      there under pty-host — the mirror's alt-screen state isn't applied).
-      // Without a live xterm (plain-text poll fallback) the poll loop already reads
-      // the host-scrolled mirror, so a plain host wheel suffices. Already in history
-      // mode -> keep paging the host. dir: +1 = up/back, -1 = down.
+      // Smart scroll. The phone's xterm.js is an UNRELIABLE source for the terminal
+      // MODE: it only sees bytes since it connected, so an app that turned on
+      // alt-screen / mouse-tracking BEFORE the phone connected (e.g. a long-running
+      // Claude Code) looks like a plain normal buffer here. So we decide on the one
+      // reliable local signal — whether xterm.js has its OWN scrollback (baseY) —
+      // and delegate the rest to the HOST, which knows the REAL mode:
+      //  - baseY > 0 (a shell, or any app that emits real newlines): the history is
+      //    ALREADY in xterm.js -> scroll IT LOCALLY (term.scrollLines), full color,
+      //    no round-trip. xterm keeps the user's position when new output arrives.
+      //  - baseY == 0 (a full-screen TUI: Claude Code, htop, less, vim...): send a
+      //    real HOST wheel. `/scroll` seeds the cursor at the surface center, so a
+      //    mouse-reporting app (Claude Code, htop) receives the wheel over its
+      //    transcript, scrolls, and REDRAWS — and that redraw streams straight back
+      //    to xterm.js IN COLOR. Exactly what the desktop mouse wheel does. (For a
+      //    non-mouse alt-screen app the host applies alternate-scroll instead.)
+      // No live xterm (plain-text poll fallback) -> the poll loop reads the
+      // host-scrolled mirror, so a plain host wheel suffices. dir: +1 = up/back.
       function smartScroll(dir) {
-        if (historyMode) { historyScroll(dir); return; }
         var term = stream && stream.term;
         if (!term) { sendScroll(dir * 3); return; }
-        var alt = false, mouse = false, hasLocal = false;
-        try { alt = term.buffer.active.type === "alternate"; } catch (e) {}
-        try { mouse = term.modes && term.modes.mouseTrackingMode !== "none"; } catch (e) {}
+        var hasLocal = false;
         try { hasLocal = term.buffer.active.baseY > 0; } catch (e) {}
-        if (!alt) {
-          if (hasLocal) {
-            // Negative scrolls toward history (up); xterm keeps the user's position
-            // when new output arrives while scrolled up, so this stays put.
-            try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
-          } else {
-            historyScroll(dir);   // no local scrollback (Claude Code) -> host scrollback
-          }
-        } else if (mouse) {
-          sendScroll(dir * 3);
+        if (hasLocal) {
+          try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
         } else {
-          sendKey(dir > 0 ? "pageup" : "pagedown");
+          sendScroll(dir * 3);   // full-screen TUI: host routes the wheel per its REAL mode
         }
       }
       addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });
