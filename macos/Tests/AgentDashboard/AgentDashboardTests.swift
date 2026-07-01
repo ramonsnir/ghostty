@@ -2046,43 +2046,6 @@ struct AgentDashboardPanelTests {
         #expect(panel.canBecomeKey)
         #expect(!panel.canBecomeMain)
     }
-
-    // MARK: - Editing key-equivalent routing (paste in modal text fields)
-
-    @Test func performKeyEquivalentMapsStandardEditingKeys() {
-        // The non-activating panel doesn't get menu Cut/Copy/Paste/Select-All/
-        // Undo/Redo when Ghostty isn't the active app, so it routes them itself.
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "v") == #selector(NSText.paste(_:)))
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "c") == #selector(NSText.copy(_:)))
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "x") == #selector(NSText.cut(_:)))
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "a") == #selector(NSResponder.selectAll(_:)))
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "z") == Selector(("undo:")))
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: [.command, .shift], charactersIgnoringModifiers: "z") == Selector(("redo:")))
-        // Case-insensitive (⌘V arrives uppercase when caps/shift shift the char).
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "V") == #selector(NSText.paste(_:)))
-    }
-
-    @Test func performKeyEquivalentIgnoresNonEditingKeys() {
-        // Non-editing chords and unmodified keys fall through to super — the
-        // panel must not swallow ⌘W/⌘Q, ⇧⌘C, or a bare "v".
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: "w") == nil)
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: [.command, .shift], charactersIgnoringModifiers: "c") == nil)
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: [], charactersIgnoringModifiers: "v") == nil)
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: [.command, .option], charactersIgnoringModifiers: "v") == nil)
-        #expect(AgentDashboardPanel.editingSelector(
-            modifiers: .command, charactersIgnoringModifiers: nil) == nil)
-    }
 }
 
 // MARK: - Origin grouping + filter (ramon fork / Agent Queue, §11)

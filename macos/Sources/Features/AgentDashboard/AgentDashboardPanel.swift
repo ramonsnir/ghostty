@@ -91,41 +91,6 @@ final class AgentDashboardPanel: NSPanel {
         return super.makeFirstResponder(responder)
     }
 
-    /// Pure mapping from a key event to the standard editing selector it should
-    /// route (nil for anything that is not one of ⌘X/⌘C/⌘V/⌘A or ⌘Z/⇧⌘Z).
-    ///
-    /// When UNPINNED the panel is a `.nonactivatingPanel`, so clicking into a text
-    /// field in one of the dashboard's SwiftUI modals (e.g. the Adopt sheet's
-    /// issue-key field) makes the panel/sheet KEY without ACTIVATING Ghostty — the
-    /// app never becomes frontmost, and AppKit only routes the main-menu Cut/Copy/
-    /// Paste/Select-All key equivalents through the *active* app's menu, so those
-    /// keystrokes never reached the field editor and paste appeared broken. The
-    /// modal is a SwiftUI `.sheet`, which presents as a SEPARATE attached
-    /// `NSWindow`, so a `performKeyEquivalent` override on THIS panel never even
-    /// runs. `AgentDashboardController` therefore installs a local `NSEvent`
-    /// keyDown monitor (fires before menu/window key-equivalent processing,
-    /// regardless of window subclass) that uses this mapping to route the editing
-    /// selector to the key window's first responder. Split out here so the mapping
-    /// is unit-testable without a live key window.
-    static func editingSelector(
-        modifiers: NSEvent.ModifierFlags,
-        charactersIgnoringModifiers: String?
-    ) -> Selector? {
-        let mods = modifiers.intersection(.deviceIndependentFlagsMask)
-        guard mods == .command || mods == [.command, .shift],
-              let key = charactersIgnoringModifiers?.lowercased()
-        else { return nil }
-        switch (key, mods.contains(.shift)) {
-        case ("x", false): return #selector(NSText.cut(_:))
-        case ("c", false): return #selector(NSText.copy(_:))
-        case ("v", false): return #selector(NSText.paste(_:))
-        case ("a", false): return #selector(NSResponder.selectAll(_:))
-        case ("z", false): return Selector(("undo:"))
-        case ("z", true):  return Selector(("redo:"))
-        default:           return nil
-        }
-    }
-
     private static func containsSurfaceView(_ view: NSView) -> Bool {
         var node: NSView? = view
         while let current = node {

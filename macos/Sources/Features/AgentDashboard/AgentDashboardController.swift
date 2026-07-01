@@ -1650,58 +1650,9 @@ final class AgentDashboardController: NSWindowController {
         subscribeQueueGraph()
         subscribeFocus()
         rebuildControllerObservers()
-        installEditingKeyMonitor()
     }
 
     required init?(coder: NSCoder) { fatalError("not implemented") }
-
-    deinit {
-        if let monitor = editingKeyMonitor { NSEvent.removeMonitor(monitor) }
-    }
-
-    // MARK: - Editing key-equivalent routing (paste in the panel's modal fields)
-
-    /// Local keyDown monitor that makes ⌘X/⌘C/⌘V/⌘A + ⌘Z/⇧⌘Z work in the panel's
-    /// SwiftUI modal text fields (e.g. the Adopt sheet's issue-key field). The
-    /// panel is a `.nonactivatingPanel`, so a text field there is key WITHOUT
-    /// Ghostty being the active app — AppKit only routes the menu's editing key
-    /// equivalents through the *active* app's menu, so paste appeared dead. The
-    /// modal is a `.sheet` (a separate attached `NSWindow`), so a panel-level
-    /// `performKeyEquivalent` override wouldn't run either. A local monitor fires
-    /// before menu/window key-equivalent processing and regardless of the key
-    /// window's class, so it covers both cases. We ONLY act when the key window is
-    /// our panel or a window attached to it (its sheet), so a ⌘V in a real
-    /// terminal window is never intercepted (terminals need their own paste path).
-    private var editingKeyMonitor: Any?
-
-    private func installEditingKeyMonitor() {
-        editingKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            guard let self,
-                  let selector = AgentDashboardPanel.editingSelector(
-                    modifiers: event.modifierFlags,
-                    charactersIgnoringModifiers: event.charactersIgnoringModifiers),
-                  self.ownsKeyWindow(event.window)
-            else { return event }
-            // Route to the key window's first responder (the sheet's field
-            // editor). If nothing in the chain handles it (e.g. focus isn't in a
-            // text field), fall through so normal processing continues.
-            if NSApp.sendAction(selector, to: nil, from: nil) { return nil }
-            return event
-        }
-    }
-
-    /// True iff `window` is the dashboard panel or a window attached to it (a
-    /// SwiftUI sheet is presented as a child/sheet `NSWindow` of the panel).
-    private func ownsKeyWindow(_ window: NSWindow?) -> Bool {
-        var current = window
-        var hops = 0
-        while let win = current, hops < 8 {
-            if win === self.window { return true }
-            current = win.sheetParent ?? win.parent
-            hops += 1
-        }
-        return false
-    }
 
     // MARK: - Show / hide
 

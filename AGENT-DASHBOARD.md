@@ -495,30 +495,30 @@ gotchas, not a recap.)
   keeps it on top; it STILL never becomes `main` (`canBecomeMain = false` unchanged), so
   "new window inherits from main" is unaffected. Trade-off: clicking a pinned dashboard
   activates Ghostty (fine — clicking a tile jumps into a terminal anyway).
-- **⌘C/⌘V/⌘X/⌘A/⌘Z work in the panel's modal text fields (always on).** Because the
-  UNPINNED panel is a `.nonactivatingPanel`, clicking into a `TextField` in a SwiftUI
-  modal (e.g. the **Adopt** sheet's issue-key field) makes the panel/sheet KEY without
-  ACTIVATING Ghostty — so the app is never frontmost, and AppKit only routes the
-  main-menu Cut/Copy/Paste/Select-All key equivalents through the *active* app's menu.
-  Result: those keystrokes never reached the field editor and **paste appeared broken**.
-  **Two things defeat the obvious fix:** (1) the app being inactive means the menu
-  never fires those equivalents; (2) a SwiftUI `.sheet` presents as a SEPARATE attached
-  `NSWindow`, so a `performKeyEquivalent` override on `AgentDashboardPanel` never even
-  runs — the sheet window, not the panel, is key. Fix: `AgentDashboardController`
-  installs a **local `NSEvent` keyDown monitor** (`installEditingKeyMonitor`), which
-  fires BEFORE menu/window key-equivalent processing and regardless of the key window's
-  class. For ⌘X/⌘C/⌘V/⌘A + ⌘Z/⇧⌘Z (mapped by the pure static
-  `AgentDashboardPanel.editingSelector(modifiers:charactersIgnoringModifiers:)`) it
-  `NSApp.sendAction(selector, to: nil, from: nil)`s the editing selector
-  (`cut:`/`copy:`/`paste:`/`selectAll:`/`undo:`/`redo:`) to the key window's first
-  responder (the sheet's field editor) and consumes the event (returns nil); anything
-  else, or an unhandled selector (`sendAction` returns false — e.g. focus isn't in a
-  text field), is returned unchanged so normal processing continues. The monitor ONLY
-  acts when the key window IS the panel or a window attached to it (`ownsKeyWindow`
-  walks `sheetParent`/`parent`), so a ⌘V in a real terminal window is never intercepted
-  (terminals need their own paste path). Monitor removed in `deinit`. Tests:
-  `AgentDashboardPanelTests.performKeyEquivalent*` (the pure mapping) in
-  `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
+- **⌘V/⌘C/⌘X/⌘A work in the panel's modal text fields (always on).** Clicking into a
+  `TextField` in a dashboard SwiftUI modal (e.g. the **Adopt** sheet's issue-key field)
+  and pressing **⌘V pasted nothing**. Root cause is NOT activation (the pinned panel is
+  an *activating* window) and NOT the menu (the Edit ▸ Paste/Copy/Cut/Select-All items
+  are correctly wired to the first-responder `paste:`/`copy:`/`cut:`/`selectAll:`
+  selectors in `MainMenu.xib`). It is `AppDelegate.localEventKeyDown` — the app-level
+  local keyDown monitor that lets Ghostty keybinds work with no terminal window open.
+  When the pinned panel is key there is **no main window** (the panel is
+  `canBecomeMain = false`), so that monitor's `guard NSApp.mainWindow == nil` does NOT
+  early-return; it then sees ⌘V matches Ghostty's `paste_from_clipboard` binding, calls
+  `ghostty_app_key` (pastes into a *terminal* surface), and returns nil — **consuming ⌘V
+  before the sheet's field editor ever sees it**. Local monitors run before menu
+  key-equivalent processing, so the Edit menu never got a turn. Fix: `localEventKeyDown`
+  now calls `agentDashboardOwnsKeyWindow()` (walks the key window's `sheetParent`/`parent`
+  up to `agentDashboard.window`, since a `.sheet` is a separate attached `NSWindow`) and,
+  when true, **returns the event immediately** — no Ghostty-binding conversion — so normal
+  AppKit dispatch reaches the Edit menu and `paste:`/`copy:`/… land on the field editor.
+  Scoped strictly to the dashboard panel + its sheet, so a ⌘V in a real terminal is
+  untouched (terminals keep their own paste path). (Earlier attempts — a panel
+  `performKeyEquivalent` override, then a second competing local monitor — both failed:
+  the sheet is a separate window so the panel override never ran, and the AppDelegate
+  monitor consumes ⌘V first regardless of monitor ordering. The fix has to live in the
+  hijacker itself.) Wiring: `AppDelegate.swift` (`agentDashboardOwnsKeyWindow` + the
+  `localEventKeyDown` guard).
 
 ### Focus highlight + spotlight (find "the agent I'm looking at")
 

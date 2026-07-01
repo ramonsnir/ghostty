@@ -424,26 +424,26 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`backoffDoublesThenCapsAt30`, `backoffNeverNegativeOrZero`). (The host's 978 `libxev … invalid
   state in submission queue` bursts are a SEPARATE per-session-loop issue — see PTYHOST.md — not
   the preview-death cause; this self-heals every transient drop regardless.)
-  **Paste (⌘V) + ⌘C/⌘X/⌘A/⌘Z in the panel's modal text fields (always on, GUI-only):**
-  the UNPINNED dashboard is a `.nonactivatingPanel`, so clicking into a `TextField` in a
-  SwiftUI modal (e.g. the **Adopt** sheet's issue-key field) makes the panel/sheet KEY
-  without ACTIVATING Ghostty — the app never becomes frontmost, so AppKit's menu-driven
-  Cut/Copy/Paste/Select-All/Undo/Redo key equivalents (routed only through the *active*
-  app's menu) never reach the field editor and paste appeared broken. **TWO things defeat
-  the obvious fix:** the inactive app never fires the menu equivalents, AND a SwiftUI
-  `.sheet` is a SEPARATE attached `NSWindow` so a panel `performKeyEquivalent` override
-  never runs (the sheet window is key, not the panel). Fix: `AgentDashboardController`
-  installs a **local `NSEvent` keyDown monitor** (`installEditingKeyMonitor`, removed in
-  `deinit`) that fires before menu/window key-equivalent processing regardless of window
-  class; for ⌘X/⌘C/⌘V/⌘A + ⌘Z/⇧⌘Z (pure static `AgentDashboardPanel.editingSelector(
-  modifiers:charactersIgnoringModifiers:)`) it `NSApp.sendAction(sel, to: nil, from: nil)`s
-  the editing selector to the key window's first responder (the sheet's field editor) and
-  consumes it; else returns the event. It ONLY acts when the key window is the panel or a
-  window attached to it (`ownsKeyWindow` walks `sheetParent`/`parent`), so a ⌘V in a real
-  terminal is never intercepted. (An earlier `performKeyEquivalent` override on the panel
-  did NOT work — the sheet-window fact above.) Wiring: `AgentDashboardPanel.swift`
-  (`editingSelector`), `AgentDashboardController.swift` (monitor + `ownsKeyWindow`). Tests:
-  `AgentDashboardPanelTests.performKeyEquivalent*` in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
+  **Paste (⌘V/⌘C/⌘X/⌘A) in the panel's modal text fields (always on, GUI-only):** ⌘V in a
+  dashboard SwiftUI modal (e.g. the **Adopt** sheet's issue-key field) pasted nothing. The
+  cause is NOT activation (the pinned panel is an ACTIVATING window) and NOT the menu (Edit ▸
+  Paste/Copy/Cut/Select-All are correctly wired to the first-responder
+  `paste:`/`copy:`/`cut:`/`selectAll:` in `MainMenu.xib`). It's **`AppDelegate.localEventKeyDown`**,
+  the app-level local keyDown monitor for no-window keybinds: the pinned panel is
+  `canBecomeMain = false`, so with no terminal main window its `guard NSApp.mainWindow == nil`
+  does NOT bail, it matches ⌘V to Ghostty's `paste_from_clipboard` binding, calls
+  `ghostty_app_key` (paste into a *terminal*), and returns nil — CONSUMING ⌘V before the
+  sheet's field editor (and the Edit menu) ever see it (local monitors run before menu
+  key-equivalents). Fix: `localEventKeyDown` calls `agentDashboardOwnsKeyWindow()` (walks the
+  key window's `sheetParent`/`parent` up to `agentDashboard.window` — a `.sheet` is a separate
+  attached `NSWindow`) and, when true, RETURNS THE EVENT immediately so normal AppKit dispatch
+  reaches the Edit menu → `paste:` on the field editor. Scoped to the panel+sheet, so ⌘V in a
+  real terminal is untouched. **Two earlier attempts FAILED and were reverted:** a panel
+  `performKeyEquivalent` override (never runs — the sheet is a separate window, so the sheet
+  window is key, not the panel) and a competing controller-side local monitor (the AppDelegate
+  monitor consumes ⌘V first regardless of monitor order). The fix must live in the hijacker
+  itself. Wiring: `AppDelegate.swift` (`agentDashboardOwnsKeyWindow` + the `localEventKeyDown`
+  guard). No new tests (behavior is the existing menu `paste:` path once the hijack is removed).
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a

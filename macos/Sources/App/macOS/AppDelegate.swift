@@ -938,6 +938,19 @@ class AppDelegate: NSObject,
             return nil
         }
 
+        // (ramon fork / Agent Dashboard) When a dashboard modal's text field is the
+        // key window (e.g. the Adopt sheet's issue-key field), do NOT hijack the
+        // standard editing keys into Ghostty terminal bindings. The pinned dashboard
+        // panel can't become main (`canBecomeMain = false`), so with no terminal main
+        // window the block below would turn ⌘V into `paste_from_clipboard` (paste into
+        // a terminal) and consume it before the sheet's field editor ever sees it —
+        // the "can't paste into the Adopt modal" bug. Returning the event lets normal
+        // AppKit dispatch reach the Edit menu, whose Paste/Copy/Cut/Select-All are
+        // wired to the first-responder `paste:`/`copy:`/`cut:`/`selectAll:` selectors
+        // (see MainMenu.xib), which the field editor handles. Scoped to the dashboard
+        // panel + its attached sheet, so a ⌘V in a real terminal is unaffected.
+        if agentDashboardOwnsKeyWindow() { return event }
+
         // If we have a main window then we don't process any of the keys
         // because we let it capture and propagate.
         guard NSApp.mainWindow == nil else { return event }
@@ -983,6 +996,23 @@ class AppDelegate: NSObject,
         }
 
         return event
+    }
+
+    /// (ramon fork / Agent Dashboard) True iff the current key window is the agent
+    /// dashboard panel or a window attached to it — a SwiftUI `.sheet` (e.g. the
+    /// Adopt modal) presents as a separate sheet/child `NSWindow`, so we walk
+    /// `sheetParent`/`parent` up to the panel. Used to stop `localEventKeyDown` from
+    /// stealing the standard editing keys from the modal's text field.
+    private func agentDashboardOwnsKeyWindow() -> Bool {
+        guard let panel = agentDashboard?.window else { return false }
+        var current = NSApp.keyWindow
+        var hops = 0
+        while let win = current, hops < 8 {
+            if win === panel { return true }
+            current = win.sheetParent ?? win.parent
+            hops += 1
+        }
+        return false
     }
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
