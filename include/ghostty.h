@@ -1267,6 +1267,11 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
+// (ramon fork) Serialize the host render mirror's current frame as a
+// self-contained ANSI string (pty-host .client only; false under .exec).
+// Free the result with ghostty_surface_free_text.
+GHOSTTY_API bool ghostty_surface_read_ansi(ghostty_surface_t,
+                                              ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__

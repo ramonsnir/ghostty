@@ -532,6 +532,7 @@ final class WebMonitorServer {
         case notFound                            // 404
         case screen(uuid: UUID, scrollback: Bool) // GET /api/surface/{uuid}/screen
         case stream(uuid: UUID)                  // GET /api/surface/{uuid}/stream (raw byte stream)
+        case frame(uuid: UUID)                   // GET /api/surface/{uuid}/frame (host authoritative ANSI frame)
         case input(uuid: UUID)                   // POST /api/surface/{uuid}/input
         case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
         case clearBell(uuid: UUID)               // POST /api/surface/{uuid}/bell (acknowledge bell)
@@ -653,6 +654,11 @@ final class WebMonitorServer {
                 // like every other /api/* route (it is NOT a bootstrap path).
                 guard method == "GET" else { return .methodNotAllowed }
                 return .stream(uuid: uuid)
+            case "frame":
+                // One-shot HOST-authoritative ANSI frame (for scrolling a
+                // full-screen app without xterm.js re-emulation drift).
+                guard method == "GET" else { return .methodNotAllowed }
+                return .frame(uuid: uuid)
             case "input":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .input(uuid: uuid)
@@ -761,6 +767,26 @@ final class WebMonitorServer {
                     ? view.cachedScreenContents.get()
                     : view.cachedVisibleContents.get()
                 return .text(text)
+            }
+
+        case .frame(let uuid):
+            clearAuthFailures(peer)
+            // The HOST's authoritative render of the current viewport, serialized
+            // to a self-contained ANSI frame (SGR + text, CUP-addressed, exact
+            // RGB). The page writes this into xterm.js while scrolling a
+            // full-screen app so the phone shows the exact frame the desktop shows
+            // instead of re-emulating the raw stream (which drifts on scroll).
+            // 501 when the surface has no pty-host mirror (read_ansi false).
+            respondFromMain(on: conn) {
+                guard let view = self.surface(forUUID: uuid),
+                      let surface = view.surface else { return .status(404, "Not Found") }
+                var text = ghostty_text_s()
+                guard ghostty_surface_read_ansi(surface, &text) else {
+                    return .status(501, "Not Implemented")
+                }
+                defer { ghostty_surface_free_text(surface, &text) }
+                let data = Data(bytes: text.text, count: Int(text.text_len))
+                return .asset(data, "text/plain; charset=utf-8")
             }
 
         case .stream(let uuid):
@@ -1985,6 +2011,10 @@ final class WebMonitorServer {
         width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
         background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }
       #jumpbottom:active { background: #3a3f4f; }
+      #livebtn { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 2;
+        padding: 7px 13px; border-radius: 17px; opacity: 0.92;
+        background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 13px; cursor: pointer; }
+      #livebtn:active { background: #3a3f4f; }
       .bar { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; align-items: center; }
       .bar input[type=text] { flex: 1; min-width: 120px; background: #0c0e13; color: #d6dae3; border: 1px solid #2a2e3b; border-radius: 6px; padding: 8px; }
       .bar label { color: #b6bccb; font-size: 12px; }
@@ -2052,6 +2082,10 @@ final class WebMonitorServer {
         <div id="xterm"></div>
         <pre id="screen"></pre>
         <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
+        <!-- Shown only while scrolling a full-screen app (frame mode): the phone
+             is showing the host's authoritative frames, not the live stream.
+             Tap to return to the live view. -->
+        <button id="livebtn" style="display:none" title="Return to live view">&#x25cf; Live</button>
       </div>
       <div class="bar">
         <button data-key="enter">Enter</button>
@@ -2127,6 +2161,7 @@ final class WebMonitorServer {
       var viewer = document.getElementById("viewer");
       var screenEl = document.getElementById("screen");
       var jumpBtn = document.getElementById("jumpbottom");
+      var liveBtn = document.getElementById("livebtn");
       var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
       var clearBellBtn = document.getElementById("clearbell");
@@ -2468,6 +2503,7 @@ final class WebMonitorServer {
       // Shows the poll viewer, starts the 700ms poll, and surfaces a banner.
       function fallbackToPoll(msg) {
         disposeStream();
+        frameMode = false; framePending = false; liveBtn.style.display = "none";
         screenEl.style.display = "block";
         modeToggleEl.style.display = "";  // poll viewer active: the mode toggle applies again
         if (msg) setBanner(msg, false);
@@ -2529,7 +2565,11 @@ final class WebMonitorServer {
                   if (stream === handle) fallbackToPoll("Live stream ended \\u2014 using snapshot.");
                   return;
                 }
-                term.write(res.value);  // res.value is a Uint8Array; xterm accepts it
+                // In frame mode we PAINT the host's authoritative frames instead
+                // (see frameScroll); skip the live re-emulated bytes so they don't
+                // fight the painted frame. Keep draining the reader so the socket
+                // doesn't stall; on exit we reconnect to resync cleanly.
+                if (!frameMode) term.write(res.value);  // Uint8Array; xterm accepts it
                 return pump();
               });
             }
@@ -2548,6 +2588,7 @@ final class WebMonitorServer {
 
       function showList() {
         disposeStream();
+        frameMode = false; framePending = false; liveBtn.style.display = "none";
         viewer.style.display = "none";
         listEl.style.display = "block";
         filterBar.style.display = "flex";
@@ -2592,6 +2633,7 @@ final class WebMonitorServer {
 
       function showSurface(id, title, bell) {
         current = id;
+        frameMode = false; framePending = false; liveBtn.style.display = "none";  // fresh view = live
         scrollSeededFor = null;       // re-seed the scroll cursor once for this viewing
         setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
         setClearAttnVisible(false);   // refresh corrects from live state
@@ -2622,9 +2664,12 @@ final class WebMonitorServer {
       }
 
       backBtn.onclick = function () {
+        // If we were paging a full-screen app via frame mode, snap it back to the
+        // live bottom so the desktop mirror isn't left parked in scrollback.
+        if (frameMode) { sendScroll(-30); sendScroll(-30); }
         current = null;
         if (timer) { clearInterval(timer); timer = null; }
-        showList();
+        showList();   // resets frameMode + disposes the stream
         loadList();
       };
 
@@ -2813,25 +2858,78 @@ final class WebMonitorServer {
         }).catch(function () { setBanner("Hide failed \\u2014 not delivered.", false, true); });
       }
 
+      // FRAME MODE (for scrolling a full-screen app like Claude Code). The phone's
+      // xterm.js RE-EMULATES the raw byte stream, and its emulation of the app's
+      // scroll-region redraw DRIFTS from the host's during a multi-step scroll ->
+      // interleaved garble (the desktop never drifts because it shows the host's
+      // authoritative render). So while scrolling such an app we STOP re-emulating
+      // and instead PAINT the host's authoritative frames: drive the host wheel
+      // (/scroll), then fetch the host's exact render (/frame -> ANSI with color)
+      // and write it. The live pump's bytes are skipped while in frame mode (see
+      // openStream). "● Live" (or Back / scroll-to-bottom) exits: snap the app
+      // to the bottom and RECONNECT the stream to resync cleanly.
+      var frameMode = false;
+      var framePending = false;
+
+      // Fetch the host's authoritative frame and paint it into xterm.js. Coalesced
+      // via framePending so a burst of scrolls doesn't queue many fetches.
+      function paintFrame() {
+        if (!frameMode || !current || framePending) return;
+        framePending = true;
+        var want = current;
+        fetch(url("/api/surface/" + want + "/frame"), { headers: headers() })
+          .then(function (r) {
+            if (r && r.status === 404) { if (stream) sessionClosedTeardown(); return null; }
+            return r && r.ok ? r.text() : null;
+          })
+          .then(function (ansi) {
+            framePending = false;
+            if (ansi != null && frameMode && current === want && stream && stream.term) {
+              try { stream.term.write(ansi); } catch (e) {}
+            }
+          })
+          .catch(function () { framePending = false; });
+      }
+
+      function enterFrameMode() {
+        if (frameMode) return;
+        frameMode = true;
+        liveBtn.style.display = "block";
+        setBanner("Scrollback \\u2014 tap \\u25cf Live to resume", true);
+      }
+
+      // Leave frame mode: snap the app back to the live bottom (a big wheel-down)
+      // and RECONNECT the stream so xterm.js resyncs to the current live state.
+      // We reconnect (vs. just resuming the paused pump) because the pump skipped
+      // bytes while painting frames, so xterm.js's internal state (scroll region,
+      // cursor, modes) is stale; the reconnect replays the host ring and rebuilds
+      // it cleanly. The short delay lets the snap-to-bottom land in that ring first.
+      function exitFrameMode() {
+        if (!frameMode) return;
+        frameMode = false;
+        framePending = false;
+        liveBtn.style.display = "none";
+        clearBannerIfNotError();
+        var want = current;
+        sendScroll(-30); sendScroll(-30);   // clamp is ±30/req; snap the app to bottom
+        setTimeout(function () {
+          if (current === want) { showSurface(want, curEl.textContent, false); }  // reconnect -> clean resync
+        }, 250);
+      }
+      liveBtn.onclick = exitFrameMode;
+
       // Smart scroll. The phone's xterm.js is an UNRELIABLE source for the terminal
-      // MODE: it only sees bytes since it connected, so an app that turned on
-      // alt-screen / mouse-tracking BEFORE the phone connected (e.g. a long-running
-      // Claude Code) looks like a plain normal buffer here. So we decide on the one
-      // reliable local signal — whether xterm.js has its OWN scrollback (baseY) —
-      // and delegate the rest to the HOST, which knows the REAL mode:
-      //  - baseY > 0 (a shell, or any app that emits real newlines): the history is
-      //    ALREADY in xterm.js -> scroll IT LOCALLY (term.scrollLines), full color,
-      //    no round-trip. xterm keeps the user's position when new output arrives.
-      //  - baseY == 0 (a full-screen TUI: Claude Code, htop, less, vim...): send a
-      //    real HOST wheel. `/scroll` seeds the cursor at the surface center ONCE (the
-      //    first scroll of this viewing), so a mouse-reporting app (Claude Code, htop)
-      //    receives the wheel over its transcript, scrolls, and REDRAWS — streaming
-      //    back to xterm.js IN COLOR. Seed only ONCE: seeding is a mouse MOVE, and
-      //    Claude resets its scroll on a move, so re-seeding before every wheel would
-      //    stop scrolls accumulating past ~1 screen. The desktop does one move then
-      //    many wheels (which accumulate to the full history) — this matches it.
-      // No live xterm (plain-text poll fallback) -> the poll loop reads the
-      // host-scrolled mirror, so a plain host wheel suffices. dir: +1 = up/back.
+      // MODE (it only sees bytes since connect), so we decide on the one reliable
+      // local signal — whether xterm.js has its OWN scrollback (baseY):
+      //  - baseY > 0 (a shell / anything that emits real newlines): scroll xterm.js's
+      //    OWN scrollback LOCALLY (term.scrollLines), full color, no round-trip.
+      //  - baseY == 0 (a full-screen TUI: Claude Code, htop, vim, less): enter FRAME
+      //    MODE — drive the host wheel (seed the cursor ONCE per viewing so the
+      //    mouse-reporting app's scrolls accumulate; seeding is a move and the app
+      //    resets scroll on a move) and PAINT the host's authoritative /frame, which
+      //    is the exact render the desktop shows (no re-emulation drift), in color.
+      // No live xterm (poll fallback) -> the poll reads the host-scrolled mirror, so
+      // a plain host wheel suffices. dir: +1 = up/back.
       function smartScroll(dir) {
         var term = stream && stream.term;
         if (!term) {
@@ -2840,13 +2938,14 @@ final class WebMonitorServer {
         }
         var hasLocal = false;
         try { hasLocal = term.buffer.active.baseY > 0; } catch (e) {}
-        if (hasLocal) {
+        if (hasLocal && !frameMode) {
           try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
         } else {
-          // full-screen TUI: host routes the wheel per its REAL mode. Seed the cursor
-          // only on the first scroll of this viewing (see sendScroll / the note above).
+          // full-screen TUI: drive the host wheel + paint the authoritative frame.
+          enterFrameMode();
           var seed = scrollSeededFor !== current; scrollSeededFor = current;
           sendScroll(dir * 3, seed);
+          setTimeout(paintFrame, 120);   // let the app's redraw land, then read the host frame
         }
       }
       addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });

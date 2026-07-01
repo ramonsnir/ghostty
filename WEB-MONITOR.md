@@ -131,10 +131,11 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      - **has local scrollback** (a shell, or anything that emits real newlines) → scrolls
        **xterm.js's own scrollback locally**, in full color (no host round-trip).
      - **no local scrollback** (**Claude Code**, `htop`, `less`, `vim`, and other full-screen TUIs) →
-       sends a **real mouse wheel** to the app (over the transcript). A mouse-capturing app like
-       **Claude Code** scrolls its own transcript and redraws, and that redraw streams back **in
-       full color** — exactly what the Mac desktop wheel does. This is the fix for the
-       previously-dead Claude Code scroll (see the note under **Known limits**).
+       **frame mode**: drives a real mouse wheel to the app (which scrolls its own transcript, exactly
+       like the Mac desktop wheel) and shows the **host's authoritative render** of each frame — in
+       **full color**, identical to your desktop, with no garble. A **● Live** button (or Back)
+       returns to the live view. This is the fix for both the previously-dead Claude Code scroll and
+       the garbled re-emulation (see the note under **Known limits**).
      So the one pair of buttons "just scrolls" whatever you're looking at.
    - **Press-and-hold to auto-repeat** on **scroll, arrows, and backspace** (a tap still fires
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
@@ -237,6 +238,7 @@ real scrollback can't come from the GUI. Instead:
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
+| `GET /api/surface/{uuid}/frame` | host's authoritative render as a self-contained ANSI frame (color); for frame-mode scrolling. 501 without pty-host |
 | `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → seed cursor at surface center, then a real mouse wheel to the app |
 | `POST /api/surface/{uuid}/hidden` | `{"hidden":bool}` → hide/reveal in the Agent Dashboard hide set (503 if the dashboard isn't running) |
 | `GET /sw.js` | the Web Push service worker (bootstrap; `?token=` accepted) |
@@ -255,7 +257,8 @@ real scrollback can't come from the GUI. Instead:
   relaunch.
 - Scrollback replay on connect is bounded by the host ring buffer; xterm.js then keeps its own
   scrollback (10000 lines) for everything streamed since connecting. For an app with **local
-  scrollback** Scroll ↑/↓ scrolls that; for a **full-screen TUI** it sends a real wheel to the app.
+  scrollback** Scroll ↑/↓ scrolls that; for a **full-screen TUI** it enters frame mode (drives a real
+  wheel to the app + paints the host's authoritative color frame — see the fix notes below).
 - **Why Scroll is "smart" — and the Claude Code fix (position matters).** Claude Code (and `htop`,
   `vim`+mouse, …) render on the **alt-screen with mouse tracking ON**, so the terminal forwards a
   wheel to the app AS AN SGR MOUSE EVENT and the app scrolls its own view + redraws (that redraw
@@ -305,6 +308,7 @@ Committed on `ramon-fork` (not pushed).
 | Vendored JetBrains Mono Nerd Font (woff2) | `macos/Sources/Features/WebMonitor/vendor/JetBrainsMonoNerdFont-{Regular,Bold}.woff2` |
 | Unit tests | `macos/Tests/WebMonitor/WebMonitorServerTests.swift` |
 | Host raw-output tee + frames + ring buffer | `src/host/{Session,Server,protocol}.zig`, `src/termio/Termio.zig` (output observer) |
+| Authoritative frame serializer (frame-mode scroll) | `src/terminal/render.zig` (`RenderState.dumpAnsi`), `src/apprt/embedded.zig` (`ghostty_surface_read_ansi`), `include/ghostty.h` |
 | Config keys + `pty-host` (`[:0]`-terminated so it's C-gettable) | `src/config/Config.zig` |
 | macOS config getters | `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen` / `webMonitorToken` / `ptyHost`) |
 | Start on launch / stop on quit | `macos/Sources/App/macOS/AppDelegate.swift` |
@@ -386,7 +390,9 @@ relaunch, no host restart.
 the bootstrap); `GET /api/surfaces` (`{agentDashboard:Bool,
 surfaces:[{id,title,pwd,…,isAgent,hidden}]}` — the response is an OBJECT, not a bare array;
 see the agent-filters note below); `GET /api/surface/{uuid}/stream` (raw-byte xterm source;
-needs `pty-host`); `GET /api/surface/{uuid}/screen?mode=viewport|scrollback` (plain-text
+needs `pty-host`); `GET /api/surface/{uuid}/frame` (host authoritative ANSI frame with color, via
+`ghostty_surface_read_ansi`; for frame-mode scrolling; 501 without `pty-host`); `GET
+/api/surface/{uuid}/screen?mode=viewport|scrollback` (plain-text
 fallback, reuses `cachedVisibleContents`/`cachedScreenContents`); `POST
 /api/surface/{uuid}/input`; `POST /api/surface/{uuid}/scroll` (`{"dy":±ticks}`); `POST
 /api/surface/{uuid}/hidden` (`{"hidden":bool}` → toggle the Agent Dashboard hide set, see the
@@ -490,11 +496,29 @@ facts, and the fix for the previously-dead Claude Code scroll:
   `sendScroll(±3)` — a real host wheel, and the HOST applies the app's REAL mode (SGR wheel for a
   mouse app, alternate-scroll arrows otherwise). No live `xterm` (poll fallback) ⇒ the poll loop
   reads the host-scrolled mirror, so a plain host wheel suffices.
+- **Bug 3 (garble — the wheel reaches the app, but the scrolled redraw is interleaved).** The phone's
+  `xterm.js` RE-EMULATES the raw byte stream, and its emulation of the app's scroll-region redraw
+  DRIFTS from the host's during a multi-step scroll (proven by feeding the same captured bytes to a
+  headless xterm.js: idle frames matched the host exactly — so it is NOT a character-WIDTH issue — but
+  a scrolled frame diverged, while the host's own `/screen` render stayed clean). The desktop never
+  drifts because it displays the host's AUTHORITATIVE render, not a re-emulation. **Fix — frame mode:**
+  a `baseY==0` scroll stops trusting xterm.js's emulation and instead PAINTS the host's authoritative
+  frame. `GET /api/surface/{uuid}/frame` → `ghostty_surface_read_ansi` → `RenderState.dumpAnsi`
+  serializes the GUI's render mirror to a self-contained ANSI frame: `ESC[2J`, then per row `CUP` +
+  per-cell SGR (via `Style.formatterVt()` with the palette set, so colors are EXACT RGB — a client
+  with a different default palette matches precisely) + `ESC[K`; never a newline, so it repaints in
+  place without scrolling the client or growing scrollback. The page (`smartScroll` → `enterFrameMode`
+  / `paintFrame`) drives the wheel then writes the frame into xterm.js (full repaint = clean AND
+  color), and PAUSES the live pump (`if (!frameMode) term.write(...)` in `openStream`) so re-emulated
+  bytes don't fight the painted frame. **● Live**/Back (`exitFrameMode`) snaps the app to the bottom
+  and RECONNECTs the stream — the paused pump left xterm.js's internal state (scroll region, cursor,
+  modes) stale, so a full replay-resync is needed rather than just resuming. `dumpAnsi`/`read_ansi`
+  are DEAD CODE in `ghostty-host` (only the GUI's `.client` mirror ever calls them), so this is a
+  lib/xcframework rebuild with **no host restart / no session loss** (same as `mirror_grid_size`).
 - *Aside:* a host-side `scroll_viewport` emits no bytes back on `raw_output` (it repins the mirror,
   not the child), so this is NOT viewport scrolling — the wheel goes to the child. And Claude renders
   its transcript inside a fixed sub-region (`ESC[2;41r` + `CSI S`), so its scrolled-off lines don't
-  enter the terminal's own scrollback; the wheel scrolls Claude's IN-APP transcript. Purely
-  GUI/page-side — no host/Zig change.
+  enter the terminal's own scrollback; the wheel scrolls Claude's IN-APP transcript.
 
 ### Security defense-in-depth
 
