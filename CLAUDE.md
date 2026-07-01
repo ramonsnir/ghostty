@@ -248,11 +248,16 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   transcript + redraws → streams back to the phone IN COLOR (the desktop wheel's exact path). **BUG:**
   the web monitor never moved a mouse, so `getCursorPos()` was **(0,0)** = Claude's header row → the
   app ignored the wheel (desktop works only because the pointer is over the transcript). **FIX
-  (server `/scroll`):** `ghostty_surface_mouse_pos` seeds the cursor at the surface CENTER before
-  `ghostty_surface_mouse_scroll` — `mouse_pos` takes LOGICAL points (×`content_scale` internally) and
-  `ghostty_surface_size` returns physical px, so center = `width_px / backingScaleFactor / 2` (scale
-  default 2.0). Verified live (`vim -c 'set mouse=a'` + real Claude Code scroll bidirectionally from
-  the phone). Page `smartScroll` CAN'T trust `xterm.js`'s mode (the phone misses alt-screen/mouse
+  (server `/scroll`):** `ghostty_surface_mouse_pos` seeds the cursor at the surface CENTER
+  (`width_px / backingScaleFactor / 2`; `mouse_pos` takes LOGICAL points ×`content_scale`, size is
+  physical px) — but ONLY on the FIRST scroll of a viewing (`{seed:true}` in the body; page tracks
+  `scrollSeededFor`, reset in `showSurface`; parsed by pure `scrollSeed`). **⚠️ Seeding is a mouse
+  MOVE, and Claude RESETS its scroll on a move (?1003 any-event), so seeding before EVERY wheel made
+  consecutive scrolls non-cumulative (cap ~1 screen — the "scrolls up 3-4× then stops" report).** The
+  desktop does ONE move then MANY wheels (accumulate to the full history); seeding once + bare wheels
+  after (the position persists on the surface) matches it. Verified: on the seed-every build a single
+  `dy=30` reached deeper than 25×`dy=3`, proving fewer moves = deeper. Page `smartScroll` CAN'T trust
+  `xterm.js`'s mode (the phone misses alt-screen/mouse
   enables sent before connect), so it decides on `term.buffer.active.baseY` (local scrollback depth):
   `baseY>0` (shell) → `term.scrollLines` LOCALLY (color); `baseY==0` (full-screen TUI) → `sendScroll`
   a real host wheel (the HOST applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll

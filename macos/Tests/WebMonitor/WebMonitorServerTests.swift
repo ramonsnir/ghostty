@@ -942,6 +942,16 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.scrollDeltaY(body: Data("not json".utf8)) == nil)
     }
 
+    // (ramon fork / Web monitor) Scroll cursor-seed flag: only the first scroll of a
+    // viewing seeds (positions the cursor), so a mouse-reporting TUI's scrolls accumulate.
+    @Test func scrollSeedDecode() {
+        #expect(WebMonitorServer.scrollSeed(body: Data(#"{"dy":3,"seed":true}"#.utf8)) == true)
+        #expect(WebMonitorServer.scrollSeed(body: Data(#"{"dy":3,"seed":false}"#.utf8)) == false)
+        #expect(WebMonitorServer.scrollSeed(body: Data(#"{"dy":3}"#.utf8)) == false)   // absent ⇒ no seed
+        #expect(WebMonitorServer.scrollSeed(body: Data(#"{"dy":3,"seed":1}"#.utf8)) == true)  // lenient
+        #expect(WebMonitorServer.scrollSeed(body: Data("not json".utf8)) == false)
+    }
+
     // (ramon fork / Web monitor) Hide-a-split-from-the-phone route + body parse.
     @Test func decideRouteSetHiddenPost() {
         let id = UUID()

@@ -810,30 +810,40 @@ final class WebMonitorServer {
                 send(.status(400, "Bad Request"), on: conn)
                 return
             }
+            // Whether to (re)seed the cursor position before this wheel. The page
+            // sends `seed:true` ONLY on the first scroll after opening a surface (see
+            // the load-bearing note below); subsequent scrolls omit it.
+            let seed = Self.scrollSeed(body: req.body)
             respondFromMain(on: conn) {
                 guard let (controller, view) = self.controllerAndView(forUUID: uuid),
                       let surface = view.surface else { return .status(404, "Not Found") }
                 // A zoomed-away split keeps a stale/zero size and ignores scroll;
                 // reveal it so the wheel lands on a properly-sized surface.
                 self.revealIfZoomedAway(controller, view)
-                // Seed a cursor position at the CENTER of the surface before the wheel.
-                // A mouse-reporting TUI (Claude Code, htop, vim+mouse) encodes the wheel
-                // as an SGR mouse event AT THE CURSOR POSITION (`getCursorPos()`), and
-                // scrolls only if that lands in its scrollable region. The web monitor
-                // never moves a mouse, so the position defaulted to (0,0) — the top
-                // (Claude's header) — and the app ignored the wheel (the phone-scroll
-                // dead-no-op). The desktop "just works" because the pointer is over the
-                // transcript. `ghostty_surface_mouse_pos` takes LOGICAL points and scales
-                // by content_scale internally, so convert the physical px size back to
-                // points via the backing scale (default 2.0 Retina when no window).
-                let size = ghostty_surface_size(surface)
-                let scale = view.window?.backingScaleFactor ?? 2.0
-                if size.width_px > 0, size.height_px > 0, scale > 0 {
-                    ghostty_surface_mouse_pos(
-                        surface,
-                        Double(size.width_px) / scale / 2.0,
-                        Double(size.height_px) / scale / 2.0,
-                        GHOSTTY_MODS_NONE)
+                // Seed a cursor position at the CENTER of the surface — but ONLY on the
+                // first scroll of a viewing (seed==true). A mouse-reporting TUI (Claude
+                // Code, htop, vim+mouse) encodes the wheel as an SGR mouse event AT THE
+                // CURSOR POSITION (`getCursorPos()`) and scrolls only if it lands in its
+                // scrollable region. The web monitor never moves a mouse, so the position
+                // defaulted to (0,0) — the top (Claude's header) — and the app ignored
+                // the wheel (the original dead-no-op). But `ghostty_surface_mouse_pos`
+                // also emits a MOUSE-MOVE report (Claude has any-event tracking, ?1003),
+                // and Claude RESETS its scroll on that move — so seeding before EVERY
+                // wheel made consecutive scrolls non-cumulative (they'd never go past ~1
+                // screen). The desktop does ONE move then MANY wheels, which accumulate to
+                // the full history. So we seed ONCE (the position then persists on the
+                // surface) and send bare wheels after — matching the desktop. Logical
+                // points ×content_scale internally; size is physical px → /backingScale.
+                if seed {
+                    let size = ghostty_surface_size(surface)
+                    let scale = view.window?.backingScaleFactor ?? 2.0
+                    if size.width_px > 0, size.height_px > 0, scale > 0 {
+                        ghostty_surface_mouse_pos(
+                            surface,
+                            Double(size.width_px) / scale / 2.0,
+                            Double(size.height_px) / scale / 2.0,
+                            GHOSTTY_MODS_NONE)
+                    }
                 }
                 // Discrete (non-precision) wheel scroll: scroll_mods = 0, y = ticks.
                 // The host routes it per the app's mode (mouse-mode SGR wheel at the
@@ -1269,6 +1279,20 @@ final class WebMonitorServer {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let dy = (obj["dy"] as? NSNumber)?.doubleValue, dy != 0 else { return nil }
         return max(-30, min(30, dy))
+    }
+
+    /// PURE: whether a scroll request body asks to (re)seed the cursor position
+    /// (`{"seed": true}`). The page sends this only on the FIRST scroll after opening
+    /// a surface, so a mouse-reporting TUI's scroll accumulates instead of resetting
+    /// on a move before every wheel (see the `.scroll` handler). Missing/false ⇒ no
+    /// seed. Lenient like `hiddenFlag` (bool, 0/1, "true"/"false").
+    static func scrollSeed(body: Data) -> Bool {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let raw = obj["seed"] else { return false }
+        if let b = raw as? Bool { return b }
+        if let n = raw as? NSNumber { return n.boolValue }
+        if let s = raw as? String { return s.lowercased() == "true" || s == "1" }
+        return false
     }
 
     /// PURE: decode a hide request body `{"hidden": <bool>}` into the desired hide
@@ -2568,6 +2592,7 @@ final class WebMonitorServer {
 
       function showSurface(id, title, bell) {
         current = id;
+        scrollSeededFor = null;       // re-seed the scroll cursor once for this viewing
         setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
         setClearAttnVisible(false);   // refresh corrects from live state
         refreshBellButton();
@@ -2755,16 +2780,22 @@ final class WebMonitorServer {
         }
       });
 
-      // Remote-control scroll: POST a wheel delta to /scroll. The host turns it
-      // into a real mouse-wheel event (positive dy = scroll up/back).
-      function sendScroll(dy) {
+      // Remote-control scroll: POST a wheel delta to /scroll. The host turns it into a
+      // real mouse-wheel event (positive dy = scroll up/back). `seed` asks the server to
+      // (re)position the cursor at the surface center FIRST; we send it only on the first
+      // scroll of a viewing (see smartScroll) so a mouse-reporting TUI's scrolls
+      // accumulate (seeding — a mouse move — before every wheel resets Claude's scroll).
+      function sendScroll(dy, seed) {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/scroll"), {
           method: "POST",
           headers: headers({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ dy: dy })
+          body: JSON.stringify(seed ? { dy: dy, seed: true } : { dy: dy })
         }).catch(function () {});
       }
+      // The surface for which we've already seeded the scroll cursor. Reset on
+      // showSurface so re-opening a surface re-seeds once.
+      var scrollSeededFor = null;
 
       // Hide/reveal a split from the phone by toggling the Agent Dashboard hide set
       // (POST /api/surface/{id}/hidden). On success reload the list so the row
@@ -2792,22 +2823,30 @@ final class WebMonitorServer {
       //    ALREADY in xterm.js -> scroll IT LOCALLY (term.scrollLines), full color,
       //    no round-trip. xterm keeps the user's position when new output arrives.
       //  - baseY == 0 (a full-screen TUI: Claude Code, htop, less, vim...): send a
-      //    real HOST wheel. `/scroll` seeds the cursor at the surface center, so a
-      //    mouse-reporting app (Claude Code, htop) receives the wheel over its
-      //    transcript, scrolls, and REDRAWS — and that redraw streams straight back
-      //    to xterm.js IN COLOR. Exactly what the desktop mouse wheel does. (For a
-      //    non-mouse alt-screen app the host applies alternate-scroll instead.)
+      //    real HOST wheel. `/scroll` seeds the cursor at the surface center ONCE (the
+      //    first scroll of this viewing), so a mouse-reporting app (Claude Code, htop)
+      //    receives the wheel over its transcript, scrolls, and REDRAWS — streaming
+      //    back to xterm.js IN COLOR. Seed only ONCE: seeding is a mouse MOVE, and
+      //    Claude resets its scroll on a move, so re-seeding before every wheel would
+      //    stop scrolls accumulating past ~1 screen. The desktop does one move then
+      //    many wheels (which accumulate to the full history) — this matches it.
       // No live xterm (plain-text poll fallback) -> the poll loop reads the
       // host-scrolled mirror, so a plain host wheel suffices. dir: +1 = up/back.
       function smartScroll(dir) {
         var term = stream && stream.term;
-        if (!term) { sendScroll(dir * 3); return; }
+        if (!term) {
+          var seedP = scrollSeededFor !== current; scrollSeededFor = current;
+          sendScroll(dir * 3, seedP); return;
+        }
         var hasLocal = false;
         try { hasLocal = term.buffer.active.baseY > 0; } catch (e) {}
         if (hasLocal) {
           try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
         } else {
-          sendScroll(dir * 3);   // full-screen TUI: host routes the wheel per its REAL mode
+          // full-screen TUI: host routes the wheel per its REAL mode. Seed the cursor
+          // only on the first scroll of this viewing (see sendScroll / the note above).
+          var seed = scrollSeededFor !== current; scrollSeededFor = current;
+          sendScroll(dir * 3, seed);
         }
       }
       addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });
