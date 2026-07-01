@@ -264,9 +264,15 @@ real scrollback can't come from the GUI. Instead:
   moves a mouse — so it defaulted to **(0,0)**, the top row (Claude's header), which the app ignores.
   That was the dead-no-op; the desktop "just works" only because the pointer sits over the transcript.
   **Fix:** `/scroll` seeds the cursor at the surface CENTER (`ghostty_surface_mouse_pos`, logical
-  points = `width_px / backingScaleFactor / 2`) before the wheel, so the SGR report lands in the
-  transcript and the app scrolls — verified live (a `vim -c 'set mouse=a'` and Claude Code both
-  scroll from the phone). The page's `smartScroll` can't trust `xterm.js`'s mode (it misses
+  points = `width_px / backingScaleFactor / 2`) so the SGR report lands in the transcript and the app
+  scrolls — verified live (`vim -c 'set mouse=a'` and Claude Code both scroll). **But seed ONLY on the
+  FIRST scroll of a viewing** (`{seed:true}`; page tracks `scrollSeededFor`, reset in `showSurface`):
+  seeding is a mouse MOVE, and Claude RESETS its scroll on a move (`?1003` any-event), so seeding
+  before EVERY wheel made consecutive scrolls non-cumulative (they capped ~1 screen — "scrolls up 3-4×
+  then stops"). The desktop does ONE move then MANY wheels (accumulate to the full history); seed-once
+  + bare wheels after (the position persists on the surface) matches it (proven: on the seed-every
+  build a single `dy=30` reached deeper than 25×`dy=3`). The page's `smartScroll` can't trust
+  `xterm.js`'s mode (it misses
   alt-screen/mouse-enable sequences sent before the phone connected), so it decides on the one
   reliable local signal — `term.buffer.active.baseY` (local scrollback depth): `baseY>0` →
   `term.scrollLines` LOCALLY (color, no round-trip); `baseY==0` → `sendScroll` (host wheel; the host
@@ -459,14 +465,22 @@ facts, and the fix for the previously-dead Claude Code scroll:
   `Surface.scrollCallback` takes the `isMouseReporting()` branch and encodes the wheel as an **SGR
   mouse event AT `getCursorPos()`**, forwarded to the child; the child scrolls its own view and
   redraws, which streams back to the phone **in color**. This is the desktop wheel's exact path.
-- **The bug:** the web monitor never moved a mouse, so `getCursorPos()` was the default **(0,0)** —
-  the top row (Claude's header) — and the app ignored the wheel. The desktop works only because the
-  pointer sits over the transcript. **The fix (server `/scroll`):** call `ghostty_surface_mouse_pos`
-  to seed the cursor at the surface CENTER before `ghostty_surface_mouse_scroll`. `mouse_pos` takes
-  **logical points** and multiplies by `content_scale` internally, and `ghostty_surface_size` returns
-  **physical px**, so center points = `width_px / backingScaleFactor / 2` (default scale 2.0 when the
-  view has no window). Verified live: `vim -c 'set mouse=a'` and a real Claude Code both scroll from
-  the phone, bidirectionally.
+- **Bug 1 (wheel ignored):** the web monitor never moved a mouse, so `getCursorPos()` was the default
+  **(0,0)** — the top row (Claude's header) — and the app ignored the wheel. The desktop works only
+  because the pointer sits over the transcript. **Fix:** call `ghostty_surface_mouse_pos` to seed the
+  cursor at the surface CENTER. `mouse_pos` takes **logical points** ×`content_scale`, and
+  `ghostty_surface_size` returns **physical px**, so center = `width_px / backingScaleFactor / 2`
+  (default scale 2.0 when the view has no window).
+- **Bug 2 (scroll capped ~1 screen — "scrolls up 3-4× then stops"):** seeding is a mouse MOVE, and
+  Claude RESETS its scroll on a move (`?1003` any-event tracking). Seeding before EVERY wheel meant
+  each POST reset then scrolled a little — never accumulating (proven: a single `dy=30` reached
+  deeper than 25×`dy=3`, because fewer moves = deeper). **Fix:** seed ONLY on the FIRST scroll of a
+  viewing — server seeds iff the body has `{"seed":true}` (pure `scrollSeed`); the page sends it once
+  per surface (`scrollSeededFor`, reset in `showSurface`) then bare wheels. The cursor position
+  persists on the surface, so later wheels land in the transcript without a move → consecutive scrolls
+  ACCUMULATE, exactly like the desktop's one-move-then-many-wheels (wheels carry a position but Claude
+  resets only on a MOVE, else the desktop wouldn't accumulate either). Verified live: `vim -c 'set
+  mouse=a'` and Claude Code scroll from the phone, bidirectionally.
 - **The page (`smartScroll`) can't trust `xterm.js`'s mode.** The phone's `xterm.js` only sees bytes
   since it connected, so an app that enabled alt-screen / mouse tracking BEFORE connect (a
   long-running Claude Code) looks like a plain normal buffer here (`buffer.active.type` /
