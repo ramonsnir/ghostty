@@ -129,12 +129,33 @@ What re-lights and what doesn't is deliberate:
   `ghosttyAttentionDidChange` paths that drive those effects — so a relaunch never bounces
   the dock or re-pushes to your phone for a bell that rang before the restart.
 
-Focusing a restored surface clears both, exactly as at runtime. Two caveats:
+Focusing a restored surface clears both, exactly as at runtime (but only after a short
+**sustained-focus debounce** — see below). Two caveats:
 
 1. This rides macOS window-state restoration (`window-save-state`) — the same mechanism that
    restores your tree/sessions. With restoration off, nothing persists (unchanged).
 2. The flag is restored even if a session fails to reattach (a RAM-only host restart ⇒ a
    blank surface). Harmless — focusing clears it — and not worth coupling to reattach success.
+
+### Bells don't get dismissed by the restore itself (sustained-focus debounce)
+
+macOS native tabs are **separate NSWindows**, and during window-state restoration each
+tab-window transiently `becomeFirstResponder`s its surface as the tree is rebuilt — a
+`focusDidChange(true)` on a surface that is **not actually the one you're looking at**. The
+old code cleared `bell`/`attentionNeeded` *immediately* in that path (checking only
+`self.focused`), so a restored bell on one of those transiently-touched splits was silently
+dismissed. Symptom: after a restart most bells survive but one — seemingly random — is gone.
+
+Fix: focus no longer clears the bell instantly. `focusDidChange(true)` now **schedules** the
+clear (`scheduleBellClearOnSustainedFocus`) behind a `bellClearFocusDelay` (1.0s) debounce,
+and the debounced closure re-checks the **stricter** `bellIsFocused` (`NSApp.isActive` +
+`window.isKeyWindow` + first responder) before clearing. A transient restore focus has
+resigned / its window is no longer key by the time the timer fires, so it's rejected;
+`focusDidChange(false)` also cancels a pending clear. The delay doubles as a settle window for
+`window.isKeyWindow`, which lags `becomeFirstResponder` after a genuine `becomeKey` (a
+*synchronous* `bellIsFocused` gate would wrongly reject a real click and never clear). A
+genuine, sustained focus still clears — just ~1s later. (The keyDown "any keypress clears the
+bell" path and `resetBell()`/`resetAttention()` are unchanged and still immediate.)
 
 ## Diagnostics (`bell-diagnostics`) — "why did it fire / why didn't it?"
 

@@ -115,6 +115,20 @@ extension Ghostty {
         /// Cleared on focus, exactly like `bell`.
         @Published private(set) var attentionNeeded: Bool = false
 
+        // (ramon fork) Debounce for clearing the sticky bell / attention state on
+        // focus. Scheduled by `focusDidChange(true)`, cancelled by
+        // `focusDidChange(false)`; see `scheduleBellClearOnSustainedFocus()`.
+        private var bellClearWorkItem: DispatchWorkItem?
+
+        /// (ramon fork) How long a surface must stay TRULY focused before a gained
+        /// focus clears its bell / attention. This filters the transient
+        /// `becomeFirstResponder` events macOS fires on background tab-windows while
+        /// restoring window state (each native tab is its own NSWindow), which would
+        /// otherwise wrongly dismiss a restored bell. It also lets `window.isKeyWindow`
+        /// settle after `becomeKey` so a genuine click still clears (a synchronous
+        /// `bellIsFocused` check can miss because isKeyWindow lags becomeFirstResponder).
+        static let bellClearFocusDelay: TimeInterval = 1.0
+
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
         var initialSize: NSSize?
@@ -498,6 +512,15 @@ extension Ghostty {
             // sent to stop things like mouse selection.
             if !focused {
                 suppressNextLeftMouseUp = false
+
+                // (ramon fork) We lost focus before the debounced bell/attention
+                // clear fired — cancel it. This is the common case for the
+                // transient `becomeFirstResponder` events that macOS fires on
+                // background tab-windows during window-state restore; without the
+                // cancel the closure's own `bellIsFocused` re-check would already
+                // reject them, so this is belt-and-suspenders.
+                bellClearWorkItem?.cancel()
+                bellClearWorkItem = nil
             }
 
             // Notify libghostty
@@ -512,35 +535,14 @@ extension Ghostty {
                 // On macOS 13+ we can store our continuous clock...
                 focusInstant = ContinuousClock.now
 
-                // (ramon fork) Diagnostics: record a focus-clear when it actually
-                // dismisses a pending bell/attention — this is "it stopped because I
-                // looked at it". Read the prior state BEFORE clearing below.
-                let hadBell = bell
-                let hadAttention = attentionNeeded
-                if hadBell || hadAttention,
-                   let cfg = Ghostty.App.appState(fromView: self)?.config,
-                   cfg.bellDiagnostics {
-                    BellDiagnostics.record("clear", [
-                        "surface": self.id.uuidString,
-                        "title": self.title,
-                        "cause": "focus",
-                        "hadBell": hadBell,
-                        "hadAttention": hadAttention,
-                    ])
-                }
-
-                // We unset our bell state if we gained focus
-                bell = false
-
-                // (ramon fork / Bell Attention) Focusing the surface means the user
-                // has seen it — clear the sticky "attention needed" state too.
-                attentionNeeded = false
-
-                // (ramon fork) Persist the cleared state: re-encode the window so a
-                // dismissed bell/attention doesn't resurrect on the next restart.
-                if hadBell || hadAttention {
-                    invalidateBellRestorableState()
-                }
+                // (ramon fork) Clear the sticky bell / attention state — but only
+                // after the surface has stayed TRULY focused for a short debounce
+                // (see `scheduleBellClearOnSustainedFocus`). Clearing immediately
+                // here dismissed restored bells on GUI restart, because macOS fires
+                // transient `becomeFirstResponder` on background tab-windows while
+                // restoring, and this path only checked `self.focused` (not the
+                // stricter `bellIsFocused`).
+                scheduleBellClearOnSustainedFocus()
 
                 // Remove any notifications for this surface once we gain focus.
                 if !notificationIdentifiers.isEmpty {
@@ -904,6 +906,54 @@ extension Ghostty {
         /// place.
         func bellFeaturesForCurrentFocus(_ config: Ghostty.Config) -> Ghostty.Config.BellFeatures {
             return bellIsFocused ? config.bellFeaturesFocused : config.bellFeatures
+        }
+
+        /// (ramon fork) Schedule the sticky bell / attention clear for a surface that
+        /// just gained focus, gated on it staying TRULY focused (`bellIsFocused`) for
+        /// `bellClearFocusDelay`. This is the debounce that stops GUI-restart bell loss:
+        /// macOS fires transient `becomeFirstResponder` on background tab-windows while
+        /// restoring window state, which used to clear a restored bell immediately. The
+        /// delay lets that churn settle (and lets `window.isKeyWindow` catch up after a
+        /// genuine `becomeKey`, which lags `becomeFirstResponder`), then the closure
+        /// re-checks `bellIsFocused` so only a real, sustained focus dismisses the bell.
+        private func scheduleBellClearOnSustainedFocus() {
+            // Nothing to clear ⇒ don't arm the timer (keeps the healthy fast path free).
+            guard bell || attentionNeeded else { return }
+
+            bellClearWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.bellClearWorkItem = nil
+
+                // Re-verify TRUE focus (key window + active app + first responder).
+                // A transient restore focus has since resigned / its window is no
+                // longer key, so this rejects it.
+                guard self.bellIsFocused else { return }
+
+                let hadBell = self.bell
+                let hadAttention = self.attentionNeeded
+                guard hadBell || hadAttention else { return }
+
+                // Diagnostics: record the focus-clear only when it actually fires.
+                if let cfg = Ghostty.App.appState(fromView: self)?.config,
+                   cfg.bellDiagnostics {
+                    BellDiagnostics.record("clear", [
+                        "surface": self.id.uuidString,
+                        "title": self.title,
+                        "cause": "focus",
+                        "hadBell": hadBell,
+                        "hadAttention": hadAttention,
+                    ])
+                }
+
+                self.bell = false
+                self.attentionNeeded = false
+                // Persist the cleared state so it doesn't resurrect on next restart.
+                self.invalidateBellRestorableState()
+            }
+            bellClearWorkItem = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Self.bellClearFocusDelay, execute: work)
         }
 
         /// (ramon fork) Explicitly clear the bell from outside the focus/keyDown
