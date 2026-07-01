@@ -993,6 +993,82 @@ pub const RenderState = struct {
         }
     }
 
+    /// (ramon fork) Serialize this render state to a self-contained ANSI frame
+    /// (SGR + text, absolute-cursor-addressed) that repaints a terminal of the
+    /// same grid size IN PLACE. Colors are emitted as EXACT RGB (resolved via
+    /// the palette) so a client with a different default palette — e.g. the web
+    /// monitor's `xterm.js` — matches this render precisely.
+    ///
+    /// This exists so the web monitor can show the HOST's authoritative frame
+    /// instead of re-emulating the raw child byte stream, which drifts from the
+    /// host during a full-screen app's scroll (see WEB-MONITOR.md). It starts
+    /// with ED (clear) and positions every row with CUP (never a newline), so it
+    /// never scrolls the client or grows its scrollback.
+    pub fn dumpAnsi(
+        self: *const RenderState,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        const default_id = @import("style.zig").default_id;
+        const row_slice = self.row_data.slice();
+        const row_cells = row_slice.items(.cells);
+
+        // Clear so no stale content from a prior (re-emulated) frame remains.
+        try writer.writeAll("\x1b[2J");
+
+        for (row_cells, 0..) |cells, y| {
+            // Absolute position to the row start (1-based). CUP per row (never
+            // a newline) means this frame never scrolls the client.
+            try writer.print("\x1b[{d};1H", .{y + 1});
+
+            const cells_slice = cells.slice();
+            const raws = cells_slice.items(.raw);
+            const graphemes = cells_slice.items(.grapheme);
+            const cell_styles = cells_slice.items(.style);
+
+            // Trim trailing DEFAULT-style blanks; the ESC[K below clears the
+            // rest of the row with the default background. A styled trailing
+            // cell (e.g. a colored bg) is kept so it renders.
+            var end: usize = raws.len;
+            while (end > 0) : (end -= 1) {
+                const c = raws[end - 1];
+                if (c.wide == .spacer_tail) continue;
+                if (c.style_id != default_id) break;
+                if (c.codepoint() != 0 and c.codepoint() != ' ') break;
+            }
+
+            // Reset style at the start of every row (self-contained rows).
+            try writer.writeAll("\x1b[0m");
+            var cur_style: Style = .{};
+
+            var x: usize = 0;
+            while (x < end) : (x += 1) {
+                const c = raws[x];
+                // The tail of a wide char is already covered by the wide cell.
+                if (c.wide == .spacer_tail) continue;
+                // `cell_styles[x]` is only valid for a non-default style_id
+                // (see `update`); otherwise the cell is the default style.
+                const st: Style = if (c.style_id != default_id)
+                    cell_styles[x]
+                else
+                    .{};
+                if (!st.eql(cur_style)) {
+                    var vf = st.formatterVt();
+                    vf.palette = &self.colors.palette;
+                    try writer.print("{f}", .{vf});
+                    cur_style = st;
+                }
+                const cp = c.codepoint();
+                try writer.print("{u}", .{if (cp == 0) ' ' else cp});
+                if (c.hasGrapheme()) {
+                    for (graphemes[x]) |g| try writer.print("{u}", .{g});
+                }
+            }
+            // Reset + erase to EOL so a row shorter than the previous frame
+            // leaves no stale tail.
+            try writer.writeAll("\x1b[0m\x1b[K");
+        }
+    }
+
     /// A set of coordinates representing cells.
     pub const CellSet = std.AutoArrayHashMapUnmanaged(point.Coordinate, void);
 
@@ -1647,6 +1723,42 @@ test "dumpText trims trailing blanks and never emits NUL" {
 
     // Trailing blanks trimmed; blank row collapses to just a newline; no NUL.
     try testing.expectEqualStrings("AB\n\n", result);
+}
+
+test "dumpAnsi emits a CUP-addressed, cleared frame with the text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 5,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("AB");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var w = std.Io.Writer.Allocating.init(alloc);
+    defer w.deinit();
+
+    try state.dumpAnsi(&w.writer);
+
+    const result = try w.toOwnedSlice();
+    defer alloc.free(result);
+
+    // Starts with ED (clear), positions row 1 with CUP, resets style, has the
+    // text, and erases each row to EOL. Row 2 (blank) is a CUP + reset + EL.
+    try testing.expectEqualStrings(
+        "\x1b[2J\x1b[1;1H\x1b[0mAB\x1b[0m\x1b[K\x1b[2;1H\x1b[0m\x1b[0m\x1b[K",
+        result,
+    );
+    // Never contains a newline (a newline could scroll the client).
+    try testing.expect(std.mem.indexOfScalar(u8, result, '\n') == null);
 }
 
 test "dumpText preserves interior spaces" {

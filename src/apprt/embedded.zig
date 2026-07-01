@@ -1775,6 +1775,48 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// (ramon fork) Fill `result` with the host render mirror's CURRENT frame
+    /// serialized as a self-contained ANSI string (SGR + text, CUP-addressed,
+    /// exact RGB). This is the HOST's authoritative render — the web monitor
+    /// writes it into `xterm.js` while scrolling a full-screen app so the phone
+    /// shows the exact frame the desktop shows, instead of re-emulating the raw
+    /// child byte stream (which drifts from the host during scroll). Only valid
+    /// under the pty-host `.client` backend (a render mirror is present); returns
+    /// false under `.exec` (no mirror) so the caller falls back. Free with
+    /// `ghostty_surface_free_text` (same ownership as `ghostty_surface_read_text`).
+    /// Must hold the renderer mutex; taken here like the read_text path.
+    export fn ghostty_surface_read_ansi(
+        surface: *Surface,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const mirror = surface.core_surface.renderer_state.mirror orelse return false;
+
+        var buf: std.Io.Writer.Allocating = .init(global.alloc);
+        defer buf.deinit();
+        mirror.dumpAnsi(&buf.writer) catch |err| {
+            log.warn("error reading mirror ansi err={}", .{err});
+            return false;
+        };
+        const text = buf.toOwnedSliceSentinel(0) catch |err| {
+            log.warn("error reading mirror ansi err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = text.ptr,
+            .text_len = text.len,
+        };
+
+        return true;
+    }
+
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
     }

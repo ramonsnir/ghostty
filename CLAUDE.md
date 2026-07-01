@@ -263,7 +263,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   a real host wheel (the HOST applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll
   otherwise). Poll fallback → plain host wheel (the poll reads the host-scrolled mirror). Aside: a
   host `scroll_viewport` emits nothing back on `raw_output` (repins the mirror, not the child) — so
-  this is NOT viewport scrolling; the wheel goes to the child. **Hide
+  this is NOT viewport scrolling; the wheel goes to the child. **⚠️ FRAME MODE (fixes the scroll
+  GARBLE):** the phone's `xterm.js` RE-EMULATES the raw stream, and its scroll-region redraw emulation
+  DRIFTS from the host during a multi-step scroll → interleaved garble (the desktop never drifts — it
+  shows the host's authoritative render; proven: idle frames matched xterm.js exactly, but a scrolled
+  frame diverged, and the host `/screen` render stayed clean). So a `baseY==0` scroll no longer relies
+  on xterm.js: it enters **frame mode** — drive the host wheel (seed-once), then PAINT the host's
+  AUTHORITATIVE frame via the NEW **`ghostty_surface_read_ansi`** C API (→ `RenderState.dumpAnsi`,
+  which serializes the mirror to a self-contained ANSI frame — `ESC[2J` + CUP-per-row + per-cell SGR
+  via `Style.formatterVt(palette:)` for EXACT RGB — over `GET /api/surface/{uuid}/frame`). The page
+  writes that frame into xterm.js (full repaint, no re-emulation → clean AND color) and PAUSES the
+  live pump; **● Live**/Back exits by snapping the app to the bottom and RECONNECTing the stream (the
+  paused pump left xterm.js's region/cursor/mode state stale, so a full replay-resync is needed, not
+  just resuming). `dumpAnsi`/`read_ansi` are dead code in `ghostty-host` (only the GUI mirror calls
+  them) → lib/xcframework rebuild, **no host restart / no session loss** (like `mirror_grid_size`).
+  Wiring: `src/terminal/render.zig` (`RenderState.dumpAnsi`), `src/apprt/embedded.zig`
+  (`ghostty_surface_read_ansi`), `include/ghostty.h`, `WebMonitorServer.swift` (`.frame` route +
+  page `frameMode`/`paintFrame`/`enterFrameMode`/`exitFrameMode`). Tests: `render.zig`
+  (`dumpAnsi emits a CUP-addressed...`), `WebMonitorServerTests` (`decideRouteFrame*`). **Hide
   a split FROM THE PHONE**: per-row Hide/Show button → `POST /api/surface/{uuid}/hidden`
   {hidden:bool} → `AppDelegate.setWebMonitorHidden` → `AgentDashboardController.setHidden` toggles
   the SAME dashboard hide set (unified; the existing "Hide hidden" filter drops it; 503 if the

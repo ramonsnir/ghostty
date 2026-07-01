@@ -942,6 +942,18 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.scrollDeltaY(body: Data("not json".utf8)) == nil)
     }
 
+    // (ramon fork / Web monitor) Host authoritative ANSI frame route (for scrolling
+    // a full-screen app without xterm.js re-emulation drift).
+    @Test func decideRouteFrameGet() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/frame") == .frame(uuid: id))
+    }
+
+    @Test func decideRouteFramePostMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/frame") == .methodNotAllowed)
+    }
+
     // (ramon fork / Web monitor) Scroll cursor-seed flag: only the first scroll of a
     // viewing seeds (positions the cursor), so a mouse-reporting TUI's scrolls accumulate.
     @Test func scrollSeedDecode() {
