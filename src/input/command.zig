@@ -587,10 +587,10 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Hide the focused split in the Agent Dashboard (reveal from the dashboard's Show button).",
         }},
 
-        .pin_dashboard_split => comptime &.{.{
-            .action = .pin_dashboard_split,
-            .title = "Pin Split to Top of Agent Dashboard",
-            .description = "Unhide the focused split and float it to the top of the Agent Dashboard for a few seconds.",
+        .spotlight_dashboard_split => comptime &.{.{
+            .action = .spotlight_dashboard_split,
+            .title = "Spotlight Split at Top of Agent Dashboard",
+            .description = "Spotlight the focused split at the top of the Agent Dashboard for a few seconds (unhides it too).",
         }},
 
         .install_agent_hooks => comptime &.{.{

@@ -6280,9 +6280,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .pin_dashboard_split => return try self.rt_app.performAction(
+        .spotlight_dashboard_split => return try self.rt_app.performAction(
             .{ .surface = self },
-            .pin_dashboard_split,
+            .spotlight_dashboard_split,
             {},
         ),
 

@@ -426,12 +426,12 @@ extension Ghostty.Notification {
     /// dashboard controller. The keyboard equivalent of a tile's Hide button.
     static let ghosttyHideDashboardSplit = Notification.Name("com.mitchellh.ghostty.hideDashboardSplit")
 
-    /// (ramon fork / Agent Dashboard) Pin (spotlight) a single surface at the very
+    /// (ramon fork / Agent Dashboard) Spotlight a single surface at the very
     /// top of the Agent Dashboard: unhide it and float its tile above every other
     /// tile for a configurable duration. The posting `object` is the `SurfaceView`
-    /// to pin (the focused split); observed by the AppDelegate, which owns the
+    /// to spotlight (the focused split); observed by the AppDelegate, which owns the
     /// dashboard controller (and opens the panel if it's closed).
-    static let ghosttyPinDashboardSplit = Notification.Name("com.mitchellh.ghostty.pinDashboardSplit")
+    static let ghosttySpotlightDashboardSplit = Notification.Name("com.mitchellh.ghostty.spotlightDashboardSplit")
 
     /// (ramon fork / Agent Dashboard) The app-wide currently-focused surface
     /// changed. The posting `object` is the newly-focused `SurfaceView` (never a

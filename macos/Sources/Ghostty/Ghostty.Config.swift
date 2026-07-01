@@ -855,9 +855,9 @@ extension Ghostty {
             return v
         }
 
-        // (ramon fork / Agent Dashboard) How long the `pin_dashboard_split` action
+        // (ramon fork / Agent Dashboard) How long the `spotlight_dashboard_split` action
         // keeps a split spotlighted at the top of the dashboard, in seconds.
-        // Default 10; 0 = until another split is pinned (no timeout). Distinct from
+        // Default 10; 0 = until another split is spotlighted (no timeout). Distinct from
         // `agentDashboardPin` (which floats the whole panel above other windows).
         var agentDashboardSpotlightSeconds: UInt32 {
             let defaultValue: UInt32 = 10

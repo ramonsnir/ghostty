@@ -641,7 +641,7 @@ struct AgentDashboardModelTests {
 
     // MARK: - Spotlight pin + focus highlight (ramon fork / Agent Dashboard)
 
-    @Test func pinUnhidesFloatsAndLiftsOutOfSections() {
+    @Test func spotlightUnhidesFloatsAndLiftsOutOfSections() {
         let store = InMemoryHideStore()
         let model = AgentDashboardModel(store: store)
         let a = UUID(), b = UUID()
@@ -650,41 +650,41 @@ struct AgentDashboardModelTests {
         model.hide(a)                                   // a starts hidden
         #expect(model.hidden.contains(a))
 
-        model.pin(a, duration: 0)                       // 0 = pin until replaced (no timer)
-        #expect(model.pinnedSurfaceID == a)
+        model.spotlight(a, duration: 0)                       // 0 = pin until replaced (no timer)
+        #expect(model.spotlightedSurfaceID == a)
         #expect(!model.hidden.contains(a))              // unhidden
         #expect(!store.load().contains(a))              // unhide persisted
         #expect(model.entries.first?.id == a)           // sorts absolute-first
-        #expect(model.pinnedEntry?.id == a)             // lifted into the dedicated top row
+        #expect(model.spotlightedEntry?.id == a)             // lifted into the dedicated top row
         // …and excluded from the origin sections so it renders exactly once.
         let sectionIDs = model.sections.flatMap { $0.entries }.map(\.id)
         #expect(!sectionIDs.contains(a))
         #expect(sectionIDs.contains(b))
     }
 
-    @Test func pinSupersedesPreviousPin() {
+    @Test func spotlightSupersedesPrevious() {
         // "…or until another agent is pinned through the same shortcut."
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID(), b = UUID()
         model.rebuild(live: live([a, b]))
         model.applyAgents(agents([a, b]))
-        model.pin(a, duration: 0)
-        #expect(model.pinnedSurfaceID == a)
-        model.pin(b, duration: 0)                       // pinning b replaces a
-        #expect(model.pinnedSurfaceID == b)
-        #expect(model.pinnedEntry?.id == b)
+        model.spotlight(a, duration: 0)
+        #expect(model.spotlightedSurfaceID == a)
+        model.spotlight(b, duration: 0)                       // pinning b replaces a
+        #expect(model.spotlightedSurfaceID == b)
+        #expect(model.spotlightedEntry?.id == b)
         #expect(model.entries.first?.id == b)
     }
 
-    @Test func pinnedEntryNilWhenSurfaceNotAnAgent() {
-        // Pinning an id with no live agent tile: pinnedSurfaceID is set but there's
-        // nothing to render, so pinnedEntry degrades to nil (no crash / no ghost row).
+    @Test func spotlightedEntryNilWhenSurfaceNotAnAgent() {
+        // Pinning an id with no live agent tile: spotlightedSurfaceID is set but there's
+        // nothing to render, so spotlightedEntry degrades to nil (no crash / no ghost row).
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let ghost = UUID()
         model.rebuild(live: [])                         // no live agents
-        model.pin(ghost, duration: 0)
-        #expect(model.pinnedSurfaceID == ghost)
-        #expect(model.pinnedEntry == nil)
+        model.spotlight(ghost, duration: 0)
+        #expect(model.spotlightedSurfaceID == ghost)
+        #expect(model.spotlightedEntry == nil)
     }
 
     @Test func setFocusedSurfaceIsViewOnly() {
@@ -1188,7 +1188,7 @@ struct AgentDashboardSortTests {
 
     // MARK: - Spotlight pin (ramon fork / Agent Dashboard)
 
-    @Test func pinnedSortsAbsoluteFirst() {
+    @Test func spotlightSortsAbsoluteFirst() {
         // The spotlight-pinned tile floats above EVERYTHING — even a ringing bell and
         // a promoted attention tile ("top is top").
         let pinned = UUID(), ring = UUID(), promoted = UUID()
@@ -1198,25 +1198,25 @@ struct AgentDashboardSortTests {
             entry(pinned, bell: false),
         ]
         let sorted = AgentDashboardModel.sorted(
-            entries, pinnedID: pinned, bellDashboard: true, attnDashboard: true)
+            entries, spotlightedID: pinned, bellDashboard: true, attnDashboard: true)
         #expect(sorted.first?.id == pinned)
     }
 
-    @Test func pinnedOutranksManualOrder() {
+    @Test func spotlightOutranksManualOrder() {
         // A pinned tile placed LAST in the manual order still floats to the top.
         let a = UUID(), b = UUID(), pinned = UUID()
         let entries = [entry(a, session: 1), entry(b, session: 2), entry(pinned, session: 3)]
         let rank: [UInt64: Int] = [1: 0, 2: 1, 3: 2]
-        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank, pinnedID: pinned)
+        let sorted = AgentDashboardModel.sorted(entries, manualRank: rank, spotlightedID: pinned)
         #expect(sorted.first?.id == pinned)
     }
 
-    @Test func noPinnedIDLeavesAttentionFirst() {
-        // pinnedID nil, or one matching no tile, is a no-op: attention still wins.
+    @Test func noSpotlightIDLeavesAttentionFirst() {
+        // spotlightedID nil, or one matching no tile, is a no-op: attention still wins.
         let ring = UUID(), q1 = UUID()
         let entries = [entry(q1, bell: false), entry(ring, bell: true)]
-        #expect(AgentDashboardModel.sorted(entries, pinnedID: nil).first?.id == ring)
-        #expect(AgentDashboardModel.sorted(entries, pinnedID: UUID()).first?.id == ring)
+        #expect(AgentDashboardModel.sorted(entries, spotlightedID: nil).first?.id == ring)
+        #expect(AgentDashboardModel.sorted(entries, spotlightedID: UUID()).first?.id == ring)
     }
 }
 

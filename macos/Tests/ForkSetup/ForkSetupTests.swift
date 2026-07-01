@@ -607,13 +607,13 @@ struct ForkSetupTests {
         #expect(seed.contains("OPTIONAL"))
     }
 
-    @Test func configSeedHasSpotlightSettingAndCommentedPinKeybind() throws {
+    @Test func configSeedHasSpotlightSettingAndCommentedKeybind() throws {
         let seed = try #require(ForkSetup.configSeedContents(fileExists: false, home: "/Users/colleague"))
         // The tile-top-pin duration is an ACTIVE setting (like agent-dashboard itself).
         #expect(seed.contains("agent-dashboard-spotlight-seconds = 10"))
         // The pin keybind is offered COMMENTED (opt-in), and uses shift+p (ctrl+a>p is
         // previous_tab), so it must not be an active `keybind = ` line.
-        #expect(seed.contains("#keybind = ctrl+a>shift+p=pin_dashboard_split"))
+        #expect(seed.contains("#keybind = ctrl+a>shift+p=spotlight_dashboard_split"))
     }
 
     // MARK: - local secrets: planLocalSecretsInstall + token generation

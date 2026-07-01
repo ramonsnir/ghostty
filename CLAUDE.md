@@ -310,7 +310,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 
 - **Agent Dashboard** (fork-only, macOS, OFF by default; config `agent-dashboard` /
   `agent-dashboard-commands` / `agent-dashboard-pin` / `agent-dashboard-spotlight-seconds`,
-  actions `toggle_agent_dashboard` + `hide_dashboard_split` + `pin_dashboard_split`) — a sidebar
+  actions `toggle_agent_dashboard` + `hide_dashboard_split` + `spotlight_dashboard_split`) — a sidebar
   `NSPanel` with a live natively-rendered preview of every split running a CLI agent (Claude/Codex)
   across all tabs/windows; click to jump, Hide to declutter, bell auto-unhides; `agent-dashboard-pin`
   floats + activates the panel (so Rectangle can move it). Live previews need `pty-host` (each tile
@@ -329,27 +329,27 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   on an already-hidden split keeps it hidden rather than re-revealing it — reveal is the panel's
   Show button. Command-palette
   entry "Hide Split from Agent Dashboard"; its apprt `Action`/`Key`/`ghostty.h` enum entry is
-  appended LAST (union order must match the `Key` enum). **`pin_dashboard_split`** (also
+  appended LAST (union order must match the `Key` enum). **`spotlight_dashboard_split`** (also
   surface-scoped, appended AFTER `hide_dashboard_split` in the union/`Key`/`ghostty.h` — order
   is load-bearing) is the "find the agent I'm looking at" action: it UNHIDES the focused split
   and SPOTLIGHTS its tile at the very TOP of the dashboard (absolute-first sort — above queues
   AND attention, "top is top" — AND lifted OUT of its origin section into a dedicated top row,
   so it sits above the section headers too) for `agent-dashboard-spotlight-seconds` (u32, default
-  10; `0` = until another split is pinned), via a `pinGeneration`-guarded one-shot timer that a
-  later pin supersedes. **Unlike Hide it OPENS the panel** (`pin(surfaceID:)` calls `show()`
+  10; `0` = until another split is spotlighted), via a `spotlightGeneration`-guarded one-shot timer that a
+  later spotlight supersedes. **Unlike Hide it OPENS the panel** (`spotlight(surfaceID:)` calls `show()`
   first). Separately, the tile for the **currently focused** surface always gets a LIGHT accent
   border + header dot (`isFocused`), driven by a NEW `.ghosttyFocusedSurfaceDidChange` posted
   from `Ghostty.App.recordFocusedSurface` (VIEW-only — `model.setFocusedSurface` stores the id
   and does NOT re-sort). NOTE two distinct "pin" keys: `agent-dashboard-pin` floats the whole
   PANEL vs. other windows; `agent-dashboard-spotlight-seconds` is the tile-top-pin duration.
-  Wiring: `pinDashboardSplit` in `Ghostty.App.swift`, `ghosttyPinDashboardSplit` +
+  Wiring: `spotlightDashboardSplit` in `Ghostty.App.swift`, `ghosttySpotlightDashboardSplit` +
   `ghosttyFocusedSurfaceDidChange` in `GhosttyPackage.swift`, the AppDelegate observer,
-  `AgentDashboardController.swift` (`pin(surfaceID:)`/`subscribeFocus` + model
-  `pin`/`pinnedEntry`/`setFocusedSurface`/pinned-first `sorted`/`sections` lift),
-  `AgentPreviewTile.swift` (`isFocused`/`isPinned` visuals), `AgentDashboardView.swift`
+  `AgentDashboardController.swift` (`spotlight(surfaceID:)`/`subscribeFocus` + model
+  `spotlight`/`spotlightedEntry`/`setFocusedSurface`/spotlight-first `sorted`/`sections` lift),
+  `AgentPreviewTile.swift` (`isFocused`/`isSpotlighted` visuals), `AgentDashboardView.swift`
   (`tile(for:)` + top row), `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`). GUI-only
   (new apprt enum ⇒ lib/xcframework rebuild; host unaffected, no session loss). **See
-  `AGENT-DASHBOARD.md` (→ Implementation notes → Focus highlight + spotlight pin) for the
+  `AGENT-DASHBOARD.md` (→ Implementation notes → Focus highlight + spotlight) for the
   bottom-anchor subsystem, detection, hook plumbing, wiring + tests.** **Preview-scale feedback-loop fix (always on):**
   `AgentMirrorPreview.geometry` keeps the original UNIFORM `referenceColumns` (125) scale (pane >125
   cols fills the width + horizontal-scrolls; a narrower one renders `cols/125` of the width at the
