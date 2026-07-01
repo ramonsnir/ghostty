@@ -256,19 +256,26 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   consecutive scrolls non-cumulative (cap ~1 screen — the "scrolls up 3-4× then stops" report).** The
   desktop does ONE move then MANY wheels (accumulate to the full history); seeding once + bare wheels
   after (the position persists on the surface) matches it. Verified: on the seed-every build a single
-  `dy=30` reached deeper than 25×`dy=3`, proving fewer moves = deeper. Page `smartScroll` CAN'T trust
-  `xterm.js`'s mode (the phone misses alt-screen/mouse
-  enables sent before connect), so it decides on `term.buffer.active.baseY` (local scrollback depth):
-  `baseY>0` (shell) → `term.scrollLines` LOCALLY (color); `baseY==0` (full-screen TUI) → `sendScroll`
-  a real host wheel (the HOST applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll
-  otherwise). Poll fallback → plain host wheel (the poll reads the host-scrolled mirror). Aside: a
-  host `scroll_viewport` emits nothing back on `raw_output` (repins the mirror, not the child) — so
-  this is NOT viewport scrolling; the wheel goes to the child. **⚠️ FRAME MODE (fixes the scroll
-  GARBLE):** the phone's `xterm.js` RE-EMULATES the raw stream, and its scroll-region redraw emulation
-  DRIFTS from the host during a multi-step scroll → interleaved garble (the desktop never drifts — it
-  shows the host's authoritative render; proven: idle frames matched xterm.js exactly, but a scrolled
-  frame diverged, and the host `/screen` render stayed clean). So a `baseY==0` scroll no longer relies
-  on xterm.js: it enters **frame mode** — drive the host wheel (seed-once), then PAINT the host's
+  `dy=30` reached deeper than 25×`dy=3`, proving fewer moves = deeper. Page `smartScroll` **ALWAYS
+  uses FRAME MODE** when a live xterm is present. An earlier build tried to be "smart" — scroll
+  `xterm.js`'s OWN scrollback locally when `term.buffer.active.baseY>0` (assumed shell) and only enter
+  frame mode when `baseY==0` (assumed full-screen TUI) — but **`baseY` is NOT a reliable
+  shell-vs-TUI discriminator**: a full-screen app (Claude Code) can accumulate stray xterm.js
+  scrollback from the connect-time replay (`baseY>0`), which mis-routed it to LOCAL re-emulation
+  scrolling → the GARBLE came back AND no ● Live button appeared (the "worked on one surface,
+  garbled on another" report). Frame mode is correct for EVERYTHING: `sendScroll` drives a real
+  host wheel (the HOST applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll
+  otherwise, or real scrollback for a shell) and the page paints the host `/frame`. Trade-off
+  accepted: a plain shell no longer gets instant LOCAL scroll, but it scrolls correctly via the host
+  — consistent, colored, never garbled. Poll fallback → plain host wheel (the poll reads the
+  host-scrolled mirror). Aside: a host `scroll_viewport` emits nothing back on `raw_output` (repins
+  the mirror, not the child) — so this is NOT viewport scrolling; the wheel goes to the child.
+  **⚠️ FRAME MODE (fixes the scroll GARBLE):** the phone's `xterm.js` RE-EMULATES the raw stream, and
+  its scroll-region redraw emulation DRIFTS from the host during a multi-step scroll → interleaved
+  garble (the desktop never drifts — it shows the host's authoritative render; proven: idle frames
+  matched xterm.js exactly, but a scrolled frame diverged, and the host `/screen` render stayed
+  clean). So a scroll no longer relies on xterm.js: it enters **frame mode** — drive the host wheel
+  (seed-once), then PAINT the host's
   AUTHORITATIVE frame via the NEW **`ghostty_surface_read_ansi`** C API (→ `RenderState.dumpAnsi`,
   which serializes the mirror to a self-contained ANSI frame — `ESC[2J` + CUP-per-row + per-cell SGR
   via `Style.formatterVt(palette:)` for EXACT RGB — over `GET /api/surface/{uuid}/frame`). The page

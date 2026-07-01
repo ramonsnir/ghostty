@@ -2918,35 +2918,26 @@ final class WebMonitorServer {
       }
       liveBtn.onclick = exitFrameMode;
 
-      // Smart scroll. The phone's xterm.js is an UNRELIABLE source for the terminal
-      // MODE (it only sees bytes since connect), so we decide on the one reliable
-      // local signal — whether xterm.js has its OWN scrollback (baseY):
-      //  - baseY > 0 (a shell / anything that emits real newlines): scroll xterm.js's
-      //    OWN scrollback LOCALLY (term.scrollLines), full color, no round-trip.
-      //  - baseY == 0 (a full-screen TUI: Claude Code, htop, vim, less): enter FRAME
-      //    MODE — drive the host wheel (seed the cursor ONCE per viewing so the
-      //    mouse-reporting app's scrolls accumulate; seeding is a move and the app
-      //    resets scroll on a move) and PAINT the host's authoritative /frame, which
-      //    is the exact render the desktop shows (no re-emulation drift), in color.
-      // No live xterm (poll fallback) -> the poll reads the host-scrolled mirror, so
-      // a plain host wheel suffices. dir: +1 = up/back.
+      // Scroll: ALWAYS use frame mode when we have a live xterm. We deliberately do
+      // NOT try to distinguish "shell (scroll xterm locally)" from "full-screen app
+      // (frame mode)": the only local signal available is `term.buffer.active.baseY`,
+      // and it's UNRELIABLE — a full-screen app (Claude Code) can have stray xterm.js
+      // scrollback (baseY>0) from the replay, which mis-routed it to local
+      // re-emulation scrolling → the garble came back (and no ● Live button). Frame
+      // mode is correct for EVERYTHING: drive the host wheel (which the app — or the
+      // shell's own scrollback — scrolls) and PAINT the host's authoritative render
+      // (`/frame`, exact color, no re-emulation drift). Seed the cursor ONCE per
+      // viewing so a mouse-reporting app's scrolls accumulate (seeding is a move and
+      // such apps reset scroll on a move). Trade-off: a plain shell no longer gets
+      // instant local scroll, but it scrolls correctly via the host — consistent and
+      // never garbled. No live xterm (poll fallback) -> the poll reads the
+      // host-scrolled mirror, so a plain host wheel suffices. dir: +1 = up/back.
       function smartScroll(dir) {
-        var term = stream && stream.term;
-        if (!term) {
-          var seedP = scrollSeededFor !== current; scrollSeededFor = current;
-          sendScroll(dir * 3, seedP); return;
-        }
-        var hasLocal = false;
-        try { hasLocal = term.buffer.active.baseY > 0; } catch (e) {}
-        if (hasLocal && !frameMode) {
-          try { term.scrollLines(dir > 0 ? -3 : 3); } catch (e) {}
-        } else {
-          // full-screen TUI: drive the host wheel + paint the authoritative frame.
-          enterFrameMode();
-          var seed = scrollSeededFor !== current; scrollSeededFor = current;
-          sendScroll(dir * 3, seed);
-          setTimeout(paintFrame, 120);   // let the app's redraw land, then read the host frame
-        }
+        var seed = scrollSeededFor !== current; scrollSeededFor = current;
+        if (!(stream && stream.term)) { sendScroll(dir * 3, seed); return; }
+        enterFrameMode();
+        sendScroll(dir * 3, seed);
+        setTimeout(paintFrame, 120);   // let the app's redraw land, then read the host frame
       }
       addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });
       addRepeat(document.getElementById("scrolldown"), function () { smartScroll(-1); });

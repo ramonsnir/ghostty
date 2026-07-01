@@ -127,16 +127,13 @@ is loopback, hence identical; only your `ts.net` hostname differs:
    - **Enter** quick-key — submits (a real Enter keypress).
    - Quick-keys: **Enter · y · n · Esc · Tab · ⌫ Backspace · Clear (Ctrl-U) · Ctrl-C**, the
      **digits 1–4** (numbered agent menus), and **arrows**.
-   - **Scroll ↑ / Scroll ↓** — *smart* scroll:
-     - **has local scrollback** (a shell, or anything that emits real newlines) → scrolls
-       **xterm.js's own scrollback locally**, in full color (no host round-trip).
-     - **no local scrollback** (**Claude Code**, `htop`, `less`, `vim`, and other full-screen TUIs) →
-       **frame mode**: drives a real mouse wheel to the app (which scrolls its own transcript, exactly
-       like the Mac desktop wheel) and shows the **host's authoritative render** of each frame — in
-       **full color**, identical to your desktop, with no garble. A **● Live** button (or Back)
-       returns to the live view. This is the fix for both the previously-dead Claude Code scroll and
-       the garbled re-emulation (see the note under **Known limits**).
-     So the one pair of buttons "just scrolls" whatever you're looking at.
+   - **Scroll ↑ / Scroll ↓** — always **frame mode** (for anything with a live view): drives a
+     real mouse wheel to the app or shell (which scrolls its own transcript / scrollback, exactly
+     like the Mac desktop wheel) and shows the **host's authoritative render** of each frame — in
+     **full color**, identical to your desktop, with no garble. A **● Live** button (or Back)
+     returns to the live view. This is the fix for both the previously-dead Claude Code scroll and
+     the garbled re-emulation (see the note under **Known limits**). One pair of buttons "just
+     scrolls" whatever you're looking at — shell or full-screen TUI alike.
    - **Press-and-hold to auto-repeat** on **scroll, arrows, and backspace** (a tap still fires
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
    - All input is sent as **real key/wheel events** (`ghostty_surface_key` / `_mouse_scroll`),
@@ -256,9 +253,9 @@ real scrollback can't come from the GUI. Instead:
 - **No live config reload** — changing `web-monitor-listen` / `web-monitor-token` needs a
   relaunch.
 - Scrollback replay on connect is bounded by the host ring buffer; xterm.js then keeps its own
-  scrollback (10000 lines) for everything streamed since connecting. For an app with **local
-  scrollback** Scroll ↑/↓ scrolls that; for a **full-screen TUI** it enters frame mode (drives a real
-  wheel to the app + paints the host's authoritative color frame — see the fix notes below).
+  scrollback (10000 lines) for everything streamed since connecting. Scroll ↑/↓ always uses frame
+  mode: it drives a real wheel to the app/shell and paints the host's authoritative color frame —
+  see the fix notes below.
 - **Why Scroll is "smart" — and the Claude Code fix (position matters).** Claude Code (and `htop`,
   `vim`+mouse, …) render on the **alt-screen with mouse tracking ON**, so the terminal forwards a
   wheel to the app AS AN SGR MOUSE EVENT and the app scrolls its own view + redraws (that redraw
@@ -274,13 +271,18 @@ real scrollback can't come from the GUI. Instead:
   before EVERY wheel made consecutive scrolls non-cumulative (they capped ~1 screen — "scrolls up 3-4×
   then stops"). The desktop does ONE move then MANY wheels (accumulate to the full history); seed-once
   + bare wheels after (the position persists on the surface) matches it (proven: on the seed-every
-  build a single `dy=30` reached deeper than 25×`dy=3`). The page's `smartScroll` can't trust
-  `xterm.js`'s mode (it misses
-  alt-screen/mouse-enable sequences sent before the phone connected), so it decides on the one
-  reliable local signal — `term.buffer.active.baseY` (local scrollback depth): `baseY>0` →
-  `term.scrollLines` LOCALLY (color, no round-trip); `baseY==0` → `sendScroll` (host wheel; the host
-  applies the app's REAL mode — SGR wheel for a mouse app, alternate-scroll arrows otherwise). No
-  live xterm (poll fallback) → the poll loop reads the host-scrolled mirror, so a plain host wheel
+  build a single `dy=30` reached deeper than 25×`dy=3`). The page's `smartScroll` **always uses
+  frame mode** when a live xterm is present. An earlier build tried to be "smart" — scroll
+  `xterm.js`'s OWN scrollback locally when `term.buffer.active.baseY>0` (a shell) and only enter
+  frame mode when `baseY==0` (a full-screen TUI) — but `baseY` is NOT a reliable shell-vs-TUI
+  discriminator: a full-screen app (Claude Code) can accumulate stray xterm.js scrollback from the
+  connect-time replay (`baseY>0`), which mis-routed it to LOCAL re-emulation scrolling → the garble
+  came back AND no ● Live button appeared (inconsistent between two surfaces). Frame mode is correct
+  for EVERYTHING: `sendScroll` drives the host wheel (the host applies the app's REAL mode — SGR
+  wheel for a mouse app, alternate-scroll arrows otherwise, or real scrollback for a shell) and the
+  page paints the host's authoritative `/frame`. Trade-off accepted: a plain shell no longer gets
+  instant local scroll, but it scrolls correctly via the host — consistent, colored, never garbled.
+  No live xterm (poll fallback) → the poll loop reads the host-scrolled mirror, so a plain host wheel
   suffices. Purely GUI/page-side — no host/Zig change.
   - *Aside:* a host-side viewport `scroll_viewport` emits no bytes back on the raw stream (it repins
     the mirror, not the child), so scrolling the host viewport is NOT how this works — the wheel goes
