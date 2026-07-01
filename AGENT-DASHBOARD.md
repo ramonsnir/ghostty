@@ -523,9 +523,7 @@ gotchas, not a recap.)
   override — never ran, the sheet is a separate window; a competing controller-side local
   monitor — the AppDelegate monitor consumes ⌘V first; and a plain `return event` to defer
   to the menu — beeped.) Wiring: `AppDelegate.swift` (`agentDashboardOwnsKeyWindow` +
-  `routeDashboardEditingKey` + the `localEventKeyDown` guard). NOTE: a temporary
-  `dashPasteLog` diagnostic (`~/Library/Logs/ghostty-ramon-paste-debug.log`) is present
-  during bring-up and will be removed once confirmed.
+  `routeDashboardEditingKey` + the `localEventKeyDown` guard).
 
 ### Focus highlight + spotlight (find "the agent I'm looking at")
 

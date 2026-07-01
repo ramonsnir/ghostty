@@ -447,8 +447,6 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   controller-side local monitor (AppDelegate monitor consumes ⌘V first); and a plain
   `return event` to defer to the menu (beeped). Wiring: `AppDelegate.swift`
   (`agentDashboardOwnsKeyWindow` + `routeDashboardEditingKey` + the `localEventKeyDown` guard).
-  A temporary `dashPasteLog` (`~/Library/Logs/ghostty-ramon-paste-debug.log`) is present during
-  bring-up, to be removed once confirmed.
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a

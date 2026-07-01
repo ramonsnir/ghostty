@@ -1004,10 +1004,7 @@ class AppDelegate: NSObject,
     /// `sheetParent`/`parent` up to the panel. Used to stop `localEventKeyDown` from
     /// stealing the standard editing keys from the modal's text field.
     private func agentDashboardOwnsKeyWindow() -> Bool {
-        guard let panel = agentDashboard?.window else {
-            dashPasteLog("owns? NO agentDashboard.window is nil (keyWindow=\(String(describing: NSApp.keyWindow.map { type(of: $0) })))")
-            return false
-        }
+        guard let panel = agentDashboard?.window else { return false }
         var current = NSApp.keyWindow
         var hops = 0
         while let win = current, hops < 8 {
@@ -1015,7 +1012,6 @@ class AppDelegate: NSObject,
             current = win.sheetParent ?? win.parent
             hops += 1
         }
-        dashPasteLog("owns? NO keyWindow=\(String(describing: NSApp.keyWindow.map { type(of: $0) })) not linked to panel")
         return false
     }
 
@@ -1041,10 +1037,7 @@ class AppDelegate: NSObject,
         }
         guard let sel else { return false }
 
-        let responds = responder.responds(to: sel)
-        dashPasteLog("route key=\(key) fr=\(type(of: responder)) responds(\(NSStringFromSelector(sel)))=\(responds)")
-
-        if responds {
+        if responder.responds(to: sel) {
             NSApp.sendAction(sel, to: responder, from: nil)
             return true
         }
@@ -1056,35 +1049,16 @@ class AppDelegate: NSObject,
            let s = NSPasteboard.general.string(forType: .string), !s.isEmpty {
             if let tv = responder as? NSTextView {
                 tv.insertText(s, replacementRange: tv.selectedRange())
-                dashPasteLog("route paste fallback via NSTextView.insertText")
                 return true
             }
             let insertSel = NSSelectorFromString("insertText:")
             if responder.responds(to: insertSel) {
                 responder.perform(insertSel, with: s)
-                dashPasteLog("route paste fallback via perform(insertText:)")
                 return true
             }
-            dashPasteLog("route paste fallback FAILED — responder took neither paste: nor insertText:")
         }
         // Not handled — let it fall through.
         return false
-    }
-
-    /// TEMP diagnostic: append a line to ~/Library/Logs/ghostty-ramon-paste-debug.log.
-    /// Remove once the dashboard-modal paste path is confirmed working.
-    private func dashPasteLog(_ msg: String) {
-        let line = "[paste] \(msg)\n"
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/ghostty-ramon-paste-debug.log")
-        guard let data = line.data(using: .utf8) else { return }
-        if let fh = try? FileHandle(forWritingTo: url) {
-            defer { try? fh.close() }
-            _ = try? fh.seekToEnd()
-            try? fh.write(contentsOf: data)
-        } else {
-            try? data.write(to: url)
-        }
     }
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
