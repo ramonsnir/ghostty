@@ -687,6 +687,41 @@ struct AgentDashboardModelTests {
         #expect(model.spotlightedEntry == nil)
     }
 
+    @Test func clearSpotlightRemovesIt() {
+        // The click-to-dismiss / manual clear path.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([a, b]))
+        model.applyAgents(agents([a, b]))
+        model.spotlight(a, duration: 0)
+        #expect(model.spotlightedSurfaceID == a)
+        model.clearSpotlight()
+        #expect(model.spotlightedSurfaceID == nil)
+        #expect(model.spotlightedEntry == nil)
+        // …and `a` falls back into the normal section list.
+        #expect(model.sections.flatMap { $0.entries }.map(\.id).contains(a))
+        // Idempotent: clearing again is a no-op.
+        model.clearSpotlight()
+        #expect(model.spotlightedSurfaceID == nil)
+    }
+
+    @Test func toggleSpotlightOffOnSameID() {
+        // The keybind path: pressing it on the already-spotlighted split clears it
+        // (early dismiss); on a different/none split it spotlights.
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), b = UUID()
+        model.rebuild(live: live([a, b]))
+        model.applyAgents(agents([a, b]))
+        model.toggleSpotlight(a, duration: 0)           // off → on
+        #expect(model.spotlightedSurfaceID == a)
+        model.toggleSpotlight(a, duration: 0)           // on (same) → off
+        #expect(model.spotlightedSurfaceID == nil)
+        model.toggleSpotlight(a, duration: 0)           // off → on again
+        #expect(model.spotlightedSurfaceID == a)
+        model.toggleSpotlight(b, duration: 0)           // different id → switches, not clears
+        #expect(model.spotlightedSurfaceID == b)
+    }
+
     @Test func setFocusedSurfaceIsViewOnly() {
         // Focus records the id for the light highlight but never reorders / drops it.
         let model = AgentDashboardModel(store: InMemoryHideStore())

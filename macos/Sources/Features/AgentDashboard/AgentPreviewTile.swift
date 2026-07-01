@@ -20,6 +20,10 @@ struct AgentPreviewTile: View {
     /// top via `spotlight_dashboard_split` — a stronger accent border + a header up-arrow
     /// badge. (The list also floats it above every section for its duration.)
     let isSpotlighted: Bool
+    /// (ramon fork / Agent Dashboard) Dismiss this tile's spotlight now — wired to a
+    /// click on the up-arrow badge (the manual early-out, same as re-pressing the
+    /// keybind). No-op unless `isSpotlighted`.
+    let onDismissSpotlight: () -> Void
     let onHide: () -> Void
     /// Force-close this split + free its (queue) slot — the escape hatch for a wedged
     /// queue agent. Gated behind a confirmation (no undo: it ends the agent).
@@ -182,10 +186,13 @@ struct AgentPreviewTile: View {
             // A spotlight (up-arrow) takes precedence over the focused dot when a
             // tile is both. Distinct from the queue KEEP pushpin (pin.fill) below.
             if isSpotlighted {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.caption2)
-                    .foregroundStyle(Color.accentColor)
-                    .help("Spotlighted at the top of the dashboard")
+                Button(action: onDismissSpotlight) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(Color.accentColor)
+                .help("Spotlighted at the top — click to dismiss")
             } else if isFocused {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 7))

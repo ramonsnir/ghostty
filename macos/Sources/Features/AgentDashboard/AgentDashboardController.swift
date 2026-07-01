@@ -534,6 +534,27 @@ final class AgentDashboardModel: ObservableObject {
         }
     }
 
+    /// Clear the spotlight now (the toggle-off / click-to-dismiss path). Bumps
+    /// `spotlightGeneration` so any pending expiry timer is invalidated. No-op when
+    /// nothing is spotlighted.
+    func clearSpotlight() {
+        guard spotlightedSurfaceID != nil else { return }
+        spotlightedSurfaceID = nil
+        spotlightGeneration += 1   // invalidate any pending expiry
+        rebuildEntriesFromCurrentState()
+    }
+
+    /// Toggle the spotlight for `id`: if `id` is already the spotlighted split, clear it
+    /// (so the same keybind dismisses it early instead of waiting out the timer);
+    /// otherwise spotlight it. Drives the `spotlight_dashboard_split` keybind.
+    func toggleSpotlight(_ id: UUID, duration: TimeInterval) {
+        if spotlightedSurfaceID == id {
+            clearSpotlight()
+        } else {
+            spotlight(id, duration: duration)
+        }
+    }
+
     /// The spotlighted tile, lifted out of its origin section for the dashboard's dedicated
     /// top row. Nil when nothing is spotlighted or the spotlighted surface isn't a live agent
     /// tile (closed / not detected). `sections` excludes this entry so it never renders
@@ -1632,15 +1653,18 @@ final class AgentDashboardController: NSWindowController {
         model.hide(id)
     }
 
-    /// (ramon fork / Agent Dashboard) Spotlight the given surface at the very top
-    /// of the dashboard (driven by the `spotlight_dashboard_split` keybind). Unhides it and
-    /// floats its tile to the top for `agent-dashboard-spotlight-seconds` (0 = until
-    /// another split is spotlighted). Unlike `hide(surfaceID:)`, this OPENS the panel if it's
-    /// closed — the whole point is to SEE the agent — showing it first so the surface is
-    /// already in `live` when the spotlight re-sorts.
+    /// (ramon fork / Agent Dashboard) TOGGLE the spotlight for the given surface
+    /// (driven by the `spotlight_dashboard_split` keybind). Pressing it on the
+    /// already-spotlighted split clears it (dismiss early instead of waiting out the
+    /// timer); otherwise it unhides the split and floats its tile to the top for
+    /// `agent-dashboard-spotlight-seconds` (0 = until another split is spotlighted).
+    /// Only the SPOTLIGHT-ON branch OPENS the panel (the whole point is to SEE the
+    /// agent) — a toggle-off leaves panel visibility alone. Reads the pre-toggle state
+    /// to decide, then shows first so the surface is already in `live` when it re-sorts.
     func spotlight(surfaceID id: UUID) {
-        if !isShown { show() }
-        model.spotlight(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
+        let willSpotlight = model.spotlightedSurfaceID != id
+        if willSpotlight, !isShown { show() }
+        model.toggleSpotlight(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
     }
 
     func show() {

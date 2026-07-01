@@ -339,8 +339,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   SCROLLED into view — a top-inserted List row keeps the old scroll offset otherwise, landing
   above the viewport) for `agent-dashboard-spotlight-seconds` (u32, default
   10; `0` = until another split is spotlighted), via a `spotlightGeneration`-guarded one-shot timer that a
-  later spotlight supersedes. **Unlike Hide it OPENS the panel** (`spotlight(surfaceID:)` calls `show()`
-  first). Separately, the tile for the **currently focused** surface always gets a LIGHT accent
+  later spotlight supersedes. It **TOGGLES** — pressing it again on the already-spotlighted split
+  clears it early (`model.toggleSpotlight` → `clearSpotlight`), and a click on the tile's up-arrow
+  badge (`onDismissSpotlight` → `clearSpotlight`) dismisses it too. **Unlike Hide it OPENS the panel**
+  (`spotlight(surfaceID:)` reads pre-toggle state + calls `show()` ONLY when turning on; a toggle-off
+  leaves the panel alone). Separately, the tile for the **currently focused** surface always gets a LIGHT accent
   border + header dot (`isFocused`), driven by a NEW `.ghosttyFocusedSurfaceDidChange` posted
   from `Ghostty.App.recordFocusedSurface` (VIEW-only — `model.setFocusedSurface` stores the id
   and does NOT re-sort). NOTE two distinct "pin" keys: `agent-dashboard-pin` floats the whole
@@ -348,8 +351,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   Wiring: `spotlightDashboardSplit` in `Ghostty.App.swift`, `ghosttySpotlightDashboardSplit` +
   `ghosttyFocusedSurfaceDidChange` in `GhosttyPackage.swift`, the AppDelegate observer,
   `AgentDashboardController.swift` (`spotlight(surfaceID:)`/`subscribeFocus` + model
-  `spotlight`/`spotlightedEntry`/`setFocusedSurface`/spotlight-first `sorted`/`sections` lift),
-  `AgentPreviewTile.swift` (`isFocused`/`isSpotlighted` visuals), `AgentDashboardView.swift`
+  `spotlight`/`toggleSpotlight`/`clearSpotlight`/`spotlightedEntry`/`setFocusedSurface`/spotlight-first
+  `sorted`/`sections` lift), `AgentPreviewTile.swift` (`isFocused`/`isSpotlighted` visuals +
+  `onDismissSpotlight` up-arrow button), `AgentDashboardView.swift`
   (`tile(for:)` + top row), `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`). GUI-only
   (new apprt enum ⇒ lib/xcframework rebuild; host unaffected, no session loss). **See
   `AGENT-DASHBOARD.md` (→ Implementation notes → Focus highlight + spotlight) for the

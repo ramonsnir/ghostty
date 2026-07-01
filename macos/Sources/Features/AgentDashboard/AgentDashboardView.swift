@@ -205,6 +205,7 @@ struct AgentDashboardView: View {
             previewsEnabled: ptyHostEnabled,
             isFocused: entry.id == model.focusedSurfaceID,
             isSpotlighted: entry.id == model.spotlightedSurfaceID,
+            onDismissSpotlight: { model.clearSpotlight() },
             onHide: { model.hide(entry.id) },
             onClose: { model.closeSurface(entry.id) },
             onKeep: { newKeep in

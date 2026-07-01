@@ -100,8 +100,11 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   `agent-dashboard-spotlight-seconds` seconds, or until you spotlight another split with the same
   action. It's the fast way to answer "which tile is the agent I'm looking at?" **Unlike
   Hide, it OPENS the panel** if it's closed (the point is to *see* the agent). The spotlighted
-  tile also gets a distinct up-arrow badge + a strong accent border. Also in the command
-  palette as **"Spotlight Split at Top of Agent Dashboard"**.
+  tile also gets a distinct up-arrow badge + a strong accent border. **It TOGGLES**: pressing it
+  again on the same (already-spotlighted) split dismisses the spotlight immediately, so you don't
+  have to wait out the timer (a toggle-off does NOT open/alter the panel). You can also **click
+  the up-arrow badge** on the tile to dismiss it. Also in the command palette as **"Spotlight
+  Split at Top of Agent Dashboard"**.
 
 > All these keys and actions are fork-only. Keep them in `~/.config/ghostty-ramon/config`
 > — an official Ghostty sharing `~/.config/ghostty/config` would error on them.
@@ -145,7 +148,9 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   ringing/waiting tiles included ("top is top") — for `agent-dashboard-spotlight-seconds`
   seconds (default 10; `0` = until you spotlight another split). The spotlighted tile shows an up-arrow
   badge + a strong accent border. **Unlike Hide, this opens the panel** if it's closed.
-  Spotlighting a second split moves the spotlight to it.
+  Spotlighting a second split moves the spotlight to it. Pressing the action **again on the
+  same split** dismisses the spotlight early (it toggles), and you can also **click the tile's
+  up-arrow badge** to dismiss it — no need to wait out the timer.
 - **Adopt… (queue tiles excluded)** — on a tile for a CLI-agent split that is **not** already
   owned by a queue, an **Adopt…** button (disabled, with a tooltip, when no queue is running)
   pulls that human-created split into a running Agent Queue: it opens a sheet that infers the
@@ -501,14 +506,20 @@ gotchas, not a recap.)
   like `hide_dashboard_split`: `Surface.zig` → apprt `.spotlight_dashboard_split` →
   `Ghostty.App.spotlightDashboardSplit` (no-op + `false` on an APP target) posts
   `.ghosttySpotlightDashboardSplit` with the `SurfaceView`; `AppDelegate` lazily creates the
-  controller and calls `spotlight(surfaceID:)`, which — **unlike Hide — opens the panel first**
-  (`if !isShown { show() }`, so the surface is already in `live` when the spotlight re-sorts),
-  then `model.spotlight(id, duration: agentDashboardSpotlightSeconds)`. `model.spotlight` unhides `id`
-  (shared hide set), sets `spotlightedSurfaceID`, bumps a monotonic `spotlightGeneration`, rebuilds
-  (re-sorts), and — when `duration > 0` — arms a one-shot `DispatchQueue.main.asyncAfter`
-  that clears the spotlight only if `spotlightGeneration` and `spotlightedSurfaceID` still match (so a later
-  spotlight, which bumps the generation, silently supersedes the earlier timer). `duration <= 0`
-  ⇒ no timer (spotlight until replaced).
+  controller and calls `spotlight(surfaceID:)`, which reads the PRE-toggle
+  `model.spotlightedSurfaceID != id` into `willSpotlight`, **opens the panel first ONLY when
+  turning on** (`if willSpotlight, !isShown { show() }`, so the surface is already in `live` when
+  it re-sorts — a toggle-off leaves the panel alone), then `model.toggleSpotlight(id, duration:
+  agentDashboardSpotlightSeconds)`. **`toggleSpotlight`**: if `id` is already spotlighted →
+  `clearSpotlight()` (dismiss early — the same keybind toggles it off without waiting out the
+  timer); else `spotlight(id, duration:)`. `spotlight` unhides `id` (shared hide set), sets
+  `spotlightedSurfaceID`, bumps a monotonic `spotlightGeneration`, rebuilds (re-sorts), and — when
+  `duration > 0` — arms a one-shot `DispatchQueue.main.asyncAfter` that clears the spotlight only
+  if `spotlightGeneration` and `spotlightedSurfaceID` still match (so a later spotlight, which bumps
+  the generation, silently supersedes the earlier timer). `duration <= 0` ⇒ no timer (spotlight
+  until replaced). **`clearSpotlight()`** (also wired to a **click on the tile's up-arrow badge**,
+  via the tile's `onDismissSpotlight` → `model.clearSpotlight()`) nils `spotlightedSurfaceID`, bumps
+  `spotlightGeneration` (invalidating any pending timer), and rebuilds.
 - **"Top is top" (absolute-first sort + section lift).** Two pieces make the spotlighted tile
   sit above **everything**, including the per-queue origin sections: (1) the pure
   `sorted(…, spotlightedID:)` compares `id == spotlightedID` FIRST — above attention, manual order,
@@ -540,14 +551,16 @@ gotchas, not a recap.)
   `ghosttyFocusedSurfaceDidChange`), `AppDelegate.swift` (observer),
   `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`),
   `AgentDashboardController.swift` (model `focusedSurfaceID`/`spotlightedSurfaceID`/`spotlightGeneration`
-  + `setFocusedSurface`/`spotlight`/`spotlightedEntry`, spotlight-first `sorted`, `sections` lift, controller
-  `spotlight(surfaceID:)` + `subscribeFocus`), `AgentPreviewTile.swift` (`isFocused`/`isSpotlighted`
-  border + header glyphs), `AgentDashboardView.swift` (`tile(for:)` builder + the spotlighted
-  top row). Tests: `Binding spotlight_dashboard_split` + `agent-dashboard config` (Zig); the
-  `AgentDashboardSortTests` pin cases (`spotlightSortsAbsoluteFirst`, `spotlightOutranksManualOrder`,
-  `noSpotlightIDLeavesAttentionFirst`) + the `AgentDashboardModelTests` cases
-  (`spotlightUnhidesFloatsAndLiftsOutOfSections`, `spotlightSupersedesPrevious`,
-  `spotlightedEntryNilWhenSurfaceNotAnAgent`, `setFocusedSurfaceIsViewOnly`) in
+  + `setFocusedSurface`/`spotlight`/`toggleSpotlight`/`clearSpotlight`/`spotlightedEntry`,
+  spotlight-first `sorted`, `sections` lift, controller `spotlight(surfaceID:)` [toggle + open-on-on-only]
+  + `subscribeFocus`), `AgentPreviewTile.swift` (`isFocused`/`isSpotlighted` border + header glyphs +
+  the up-arrow dismiss button `onDismissSpotlight`), `AgentDashboardView.swift` (`tile(for:)` builder
+  + the spotlighted top row + `onDismissSpotlight: { model.clearSpotlight() }`). Tests: `Binding
+  spotlight_dashboard_split` + `agent-dashboard config` (Zig); the `AgentDashboardSortTests` cases
+  (`spotlightSortsAbsoluteFirst`, `spotlightOutranksManualOrder`, `noSpotlightIDLeavesAttentionFirst`)
+  + the `AgentDashboardModelTests` cases (`spotlightUnhidesFloatsAndLiftsOutOfSections`,
+  `spotlightSupersedesPrevious`, `spotlightedEntryNilWhenSurfaceNotAnAgent`, `setFocusedSurfaceIsViewOnly`,
+  `clearSpotlightRemovesIt`, `toggleSpotlightOffOnSameID`) in
   `macos/Tests/AgentDashboard/AgentDashboardTests.swift`. **GUI-only** (the `spotlight_dashboard_split`
   action is a new apprt enum ⇒ a lib/xcframework rebuild, but the host never sees it — no host
   restart / no session loss); GUI relaunch to pick it up.
