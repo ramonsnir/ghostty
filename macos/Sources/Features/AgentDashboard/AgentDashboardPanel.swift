@@ -91,33 +91,22 @@ final class AgentDashboardPanel: NSPanel {
         return super.makeFirstResponder(responder)
     }
 
-    /// (ramon fork / Agent Dashboard) Route the standard editing key equivalents
-    /// (⌘X/C/V/A, ⌘Z/⇧⌘Z) to the current first responder ourselves.
-    ///
-    /// When UNPINNED the panel is a `.nonactivatingPanel`: clicking into a text
-    /// field in one of the dashboard's SwiftUI modals (e.g. the Adopt sheet's
-    /// issue-key field) makes the panel KEY without ACTIVATING Ghostty, so the
-    /// app never becomes frontmost. AppKit only routes the main-menu Cut/Copy/
-    /// Paste/Select-All key equivalents through the *active* app's menu, so those
-    /// keystrokes never reached the field editor and paste appeared broken. Send
-    /// the matching editing selector up the responder chain (`to: nil`) so the
-    /// field editor handles it; fall back to the default behavior when it's not an
-    /// editing command (or nothing in the chain responds — `sendAction` returns
-    /// false, e.g. no text field is focused). A pinned (activating) panel already
-    /// gets these via the menu, but routing here too is harmless and idempotent.
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if let selector = AgentDashboardPanel.editingSelector(
-            modifiers: event.modifierFlags,
-            charactersIgnoringModifiers: event.charactersIgnoringModifiers),
-           NSApp.sendAction(selector, to: nil, from: self) {
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-
     /// Pure mapping from a key event to the standard editing selector it should
-    /// route (nil for anything that is not one of ⌘X/⌘C/⌘V/⌘A or ⌘Z/⇧⌘Z). Split
-    /// out so the mapping is unit-testable without a live key window.
+    /// route (nil for anything that is not one of ⌘X/⌘C/⌘V/⌘A or ⌘Z/⇧⌘Z).
+    ///
+    /// When UNPINNED the panel is a `.nonactivatingPanel`, so clicking into a text
+    /// field in one of the dashboard's SwiftUI modals (e.g. the Adopt sheet's
+    /// issue-key field) makes the panel/sheet KEY without ACTIVATING Ghostty — the
+    /// app never becomes frontmost, and AppKit only routes the main-menu Cut/Copy/
+    /// Paste/Select-All key equivalents through the *active* app's menu, so those
+    /// keystrokes never reached the field editor and paste appeared broken. The
+    /// modal is a SwiftUI `.sheet`, which presents as a SEPARATE attached
+    /// `NSWindow`, so a `performKeyEquivalent` override on THIS panel never even
+    /// runs. `AgentDashboardController` therefore installs a local `NSEvent`
+    /// keyDown monitor (fires before menu/window key-equivalent processing,
+    /// regardless of window subclass) that uses this mapping to route the editing
+    /// selector to the key window's first responder. Split out here so the mapping
+    /// is unit-testable without a live key window.
     static func editingSelector(
         modifiers: NSEvent.ModifierFlags,
         charactersIgnoringModifiers: String?

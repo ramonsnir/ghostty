@@ -426,16 +426,24 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   the preview-death cause; this self-heals every transient drop regardless.)
   **Paste (⌘V) + ⌘C/⌘X/⌘A/⌘Z in the panel's modal text fields (always on, GUI-only):**
   the UNPINNED dashboard is a `.nonactivatingPanel`, so clicking into a `TextField` in a
-  SwiftUI modal (e.g. the **Adopt** sheet's issue-key field) makes the panel KEY without
-  ACTIVATING Ghostty — the app never becomes frontmost, so AppKit's menu-driven Cut/Copy/
-  Paste/Select-All/Undo/Redo key equivalents (routed only through the *active* app's menu)
-  never reach the field editor and paste appeared broken. Fix: `AgentDashboardPanel`
-  overrides `performKeyEquivalent(with:)` to map ⌘X/⌘C/⌘V/⌘A + ⌘Z/⇧⌘Z (pure static
-  `editingSelector(modifiers:charactersIgnoringModifiers:)`) to the matching editing
-  selector and `NSApp.sendAction(_:to: nil, from:)` it up the responder chain; non-editing
-  keys / an unhandled selector fall through to `super`. Harmless+idempotent on a pinned
-  (activating) panel. Wiring: `AgentDashboardPanel.swift`. Tests: `AgentDashboardPanelTests.
-  performKeyEquivalent*` in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
+  SwiftUI modal (e.g. the **Adopt** sheet's issue-key field) makes the panel/sheet KEY
+  without ACTIVATING Ghostty — the app never becomes frontmost, so AppKit's menu-driven
+  Cut/Copy/Paste/Select-All/Undo/Redo key equivalents (routed only through the *active*
+  app's menu) never reach the field editor and paste appeared broken. **TWO things defeat
+  the obvious fix:** the inactive app never fires the menu equivalents, AND a SwiftUI
+  `.sheet` is a SEPARATE attached `NSWindow` so a panel `performKeyEquivalent` override
+  never runs (the sheet window is key, not the panel). Fix: `AgentDashboardController`
+  installs a **local `NSEvent` keyDown monitor** (`installEditingKeyMonitor`, removed in
+  `deinit`) that fires before menu/window key-equivalent processing regardless of window
+  class; for ⌘X/⌘C/⌘V/⌘A + ⌘Z/⇧⌘Z (pure static `AgentDashboardPanel.editingSelector(
+  modifiers:charactersIgnoringModifiers:)`) it `NSApp.sendAction(sel, to: nil, from: nil)`s
+  the editing selector to the key window's first responder (the sheet's field editor) and
+  consumes it; else returns the event. It ONLY acts when the key window is the panel or a
+  window attached to it (`ownsKeyWindow` walks `sheetParent`/`parent`), so a ⌘V in a real
+  terminal is never intercepted. (An earlier `performKeyEquivalent` override on the panel
+  did NOT work — the sheet-window fact above.) Wiring: `AgentDashboardPanel.swift`
+  (`editingSelector`), `AgentDashboardController.swift` (monitor + `ownsKeyWindow`). Tests:
+  `AgentDashboardPanelTests.performKeyEquivalent*` in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a
