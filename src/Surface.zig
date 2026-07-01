@@ -6280,6 +6280,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .pin_dashboard_split => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .pin_dashboard_split,
+            {},
+        ),
+
         .install_agent_hooks => return try self.rt_app.performAction(
             .{ .surface = self },
             .install_agent_hooks,

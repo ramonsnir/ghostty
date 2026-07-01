@@ -258,6 +258,24 @@ final class AgentDashboardModel: ObservableObject {
     /// (variant b, LOCKED #1) or the explicit Show/Show-all affordance.
     @Published private(set) var hidden: Set<UUID>
 
+    /// (ramon fork / Agent Dashboard) The app-wide currently-focused surface, or nil.
+    /// Drives a LIGHT "you're looking at this" tile treatment (a subtle accent border
+    /// + a header dot). VIEW-only — it never affects the sort or the hide set, and a
+    /// focused surface that isn't a detected agent simply matches no tile. Updated
+    /// from `.ghosttyFocusedSurfaceDidChange` via `setFocusedSurface`.
+    @Published private(set) var focusedSurfaceID: UUID?
+
+    /// (ramon fork / Agent Dashboard) The surface currently PINNED (spotlighted) to
+    /// the very top of the dashboard by `pin_dashboard_split`, or nil. It sorts
+    /// absolute-first (above attention/queues — "top is top") and is lifted OUT of its
+    /// origin section into a dedicated top row (`pinnedEntry`). Cleared after
+    /// `agent-dashboard-spotlight-seconds` (see `pin`) or when another split is pinned.
+    @Published private(set) var pinnedSurfaceID: UUID?
+
+    /// Monotonic token that invalidates a superseded spotlight-expiry timer: each
+    /// `pin` bumps it, so a still-pending expiry from an earlier pin is a no-op.
+    private var pinGeneration = 0
+
     /// Latest merged bell state across all live controllers. Drives bell-first
     /// sort and bell-only auto-unhide.
     private(set) var bells: [UUID: Bool] = [:]
@@ -475,6 +493,54 @@ final class AgentDashboardModel: ObservableObject {
         hidden.removeAll()
         store.save(hidden)
         rebuildEntriesFromCurrentState()
+    }
+
+    // MARK: - Focus highlight + spotlight pin (ramon fork / Agent Dashboard)
+
+    /// Record the app-wide focused surface (from `.ghosttyFocusedSurfaceDidChange`).
+    /// VIEW-only + cheap: it does NOT re-sort or rebuild entries (focus is not a sort
+    /// key) — the `@Published` change alone re-renders the tiles, which read
+    /// `focusedSurfaceID` to light the focused one. `nil` clears the highlight.
+    func setFocusedSurface(_ id: UUID?) {
+        guard focusedSurfaceID != id else { return }
+        focusedSurfaceID = id
+    }
+
+    /// Spotlight `id` at the very top of the dashboard for `duration` seconds
+    /// (`duration <= 0` ⇒ until another split is pinned): unhide it, mark it pinned
+    /// (absolute-top sort + lifted into the dedicated `pinnedEntry` top row), and arm a
+    /// one-shot expiry. Re-pinning ANY split supersedes the previous pin — the earlier
+    /// timer is invalidated via `pinGeneration`, so its fire is a no-op. Persists the
+    /// unhide (shared hide set) and re-sorts. Idempotent-ish: re-pinning the same id
+    /// simply resets the timer.
+    func pin(_ id: UUID, duration: TimeInterval) {
+        // Unhide without a redundant extra rebuild (we rebuild once, below).
+        if hidden.contains(id) {
+            hidden.remove(id)
+            store.save(hidden)
+        }
+        pinnedSurfaceID = id
+        pinGeneration += 1
+        let generation = pinGeneration
+        rebuildEntriesFromCurrentState()
+        guard duration > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self,
+                  self.pinGeneration == generation,   // not superseded by a later pin
+                  self.pinnedSurfaceID == id
+            else { return }
+            self.pinnedSurfaceID = nil
+            self.rebuildEntriesFromCurrentState()
+        }
+    }
+
+    /// The pinned tile, lifted out of its origin section for the dashboard's dedicated
+    /// top row. Nil when nothing is pinned or the pinned surface isn't a live agent
+    /// tile (closed / not detected). `sections` excludes this entry so it never renders
+    /// twice.
+    var pinnedEntry: AgentEntry? {
+        guard let pinnedSurfaceID else { return nil }
+        return entries.first { $0.id == pinnedSurfaceID }
     }
 
     /// Count of hidden surfaces among the provided live id set (for the
@@ -944,6 +1010,7 @@ final class AgentDashboardModel: ObservableObject {
             uniquingKeysWith: { first, _ in first })
         entries = AgentDashboardModel.sorted(
             built.filter { !$0.hidden }, lastSeen: lastSeen, manualRank: manualRank,
+            pinnedID: pinnedSurfaceID,
             bellDashboard: bellDashboard, attnDashboard: attnDashboard)
     }
 
@@ -995,6 +1062,8 @@ final class AgentDashboardModel: ObservableObject {
         _ entries: [AgentEntry],
         lastSeen: [UUID: Date] = [:],
         manualRank: [UInt64: Int] = [:],
+        // (ramon fork) The spotlight-pinned surface, if any — sorts absolute-first.
+        pinnedID: UUID? = nil,
         // Default true to match the config defaults (dashboard routed to both tiers);
         // the model passes its real flags.
         bellDashboard: Bool = true,
@@ -1004,6 +1073,12 @@ final class AgentDashboardModel: ObservableObject {
             e.sessionID == 0 ? nil : manualRank[e.sessionID]
         }
         return entries.sorted { a, b in
+            // (ramon fork) Spotlight pin is the ABSOLUTE top — above attention, manual
+            // order, idle/recency, everything ("top is top"). At most one tile matches.
+            if let pinnedID {
+                let ap = a.id == pinnedID, bp = b.id == pinnedID
+                if ap != bp { return ap && !bp }
+            }
             let aa = needsAttention(a, bellDashboard: bellDashboard, attnDashboard: attnDashboard)
             let ba = needsAttention(b, bellDashboard: bellDashboard, attnDashboard: attnDashboard)
             if aa != ba { return aa && !ba }
@@ -1159,7 +1234,13 @@ final class AgentDashboardModel: ObservableObject {
     /// the origin filter is applied HERE so the model's attention logic and the
     /// filter-bar toggle list both see the full origin set.
     var sections: [OriginSection] {
-        let filtered = AgentDashboardModel.applyOriginFilter(entries, excluded: excludedOrigins)
+        // (ramon fork) The spotlight-pinned tile is rendered in a dedicated top row
+        // (`pinnedEntry`) ABOVE all origin sections, so drop it here to avoid a
+        // double render. `entries` is already sorted (pinned-first) + non-hidden.
+        let unpinned = pinnedSurfaceID == nil
+            ? entries
+            : entries.filter { $0.id != pinnedSurfaceID }
+        let filtered = AgentDashboardModel.applyOriginFilter(unpinned, excluded: excludedOrigins)
         // (§11 health) Present queues (minus any the user filtered out) get a section even
         // with no tiles — so the bar stays put while a queue is starting / all hidden.
         let present = Set(queueStatuses.keys).subtracting(excludedOrigins)
@@ -1530,6 +1611,7 @@ final class AgentDashboardController: NSWindowController {
         subscribeAnnotation()
         subscribeQueueStatus()
         subscribeQueueGraph()
+        subscribeFocus()
         rebuildControllerObservers()
     }
 
@@ -1548,6 +1630,17 @@ final class AgentDashboardController: NSWindowController {
     /// the panel itself.
     func hide(surfaceID id: UUID) {
         model.hide(id)
+    }
+
+    /// (ramon fork / Agent Dashboard) Pin (spotlight) the given surface at the very top
+    /// of the dashboard (driven by the `pin_dashboard_split` keybind). Unhides it and
+    /// floats its tile to the top for `agent-dashboard-spotlight-seconds` (0 = until
+    /// another split is pinned). Unlike `hide(surfaceID:)`, this OPENS the panel if it's
+    /// closed — the whole point is to SEE the agent — showing it first so the surface is
+    /// already in `live` when the pin re-sorts.
+    func pin(surfaceID id: UUID) {
+        if !isShown { show() }
+        model.pin(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
     }
 
     func show() {
@@ -1722,6 +1815,21 @@ final class AgentDashboardController: NSWindowController {
                       let status = note.userInfo?[QueueCommandUserInfoKey.status] as? QueueStatus
                 else { return }
                 self.model.applyQueueStatus(status)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// (ramon fork / Agent Dashboard) Observe `.ghosttyFocusedSurfaceDidChange` (posted
+    /// by `Ghostty.App.recordFocusedSurface`) and record the focused surface id on the
+    /// model, so the matching tile gets the light "you're looking at this" treatment.
+    /// Registered unconditionally (like the state/annotation subscribers) — the model
+    /// only stores the id; the tiles read it when they render. A nil object clears it.
+    private func subscribeFocus() {
+        NotificationCenter.default.publisher(for: Ghostty.Notification.ghosttyFocusedSurfaceDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self else { return }
+                self.model.setFocusedSurface((note.object as? Ghostty.SurfaceView)?.id)
             }
             .store(in: &cancellables)
     }

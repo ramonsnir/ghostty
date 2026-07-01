@@ -79,6 +79,17 @@ struct AgentDashboardView: View {
     @ViewBuilder
     private var sectionedList: some View {
         List {
+            // (ramon fork / Agent Dashboard) The spotlight-pinned split floats to the
+            // VERY top, above the banner and every origin section ("top is top"). It's
+            // lifted out of its section (`model.sections` excludes it) so it renders
+            // exactly once. Not reorderable while pinned.
+            if let pinned = model.pinnedEntry {
+                tile(for: pinned)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 6, trailing: 0))
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .moveDisabled(true)
+            }
             if !ptyHostEnabled {
                 banner("Live previews require pty-host. Showing metadata-only tiles.")
                     .listRowInsets(EdgeInsets(top: 12, leading: 0, bottom: 0, trailing: 0))
@@ -97,36 +108,7 @@ struct AgentDashboardView: View {
                 Section {
                     if !collapsed {
                         ForEach(section.entries) { entry in
-                            AgentPreviewTile(
-                                entry: entry,
-                                ghostty: ghostty,
-                                previewsEnabled: ptyHostEnabled,
-                                onHide: { model.hide(entry.id) },
-                                onClose: { model.closeSurface(entry.id) },
-                                onKeep: { newKeep in
-                                    model.setQueueKeep(
-                                        id: entry.id,
-                                        run: entry.annotation?.queueName ?? "",
-                                        key: entry.annotation?.queueKey ?? "",
-                                        keep: newKeep)
-                                },
-                                queueRuns: model.runNamesForAdopt(),
-                                nodeForKey: { run, key in
-                                    model.graphNodeForAdopt(run: run, key: key)
-                                        .map { (title: $0.title, url: $0.url) }
-                                },
-                                activeKeysForRun: { model.activeKeysForRun($0) },
-                                suggestedKey: entry.annotation?.queueKeySuggested,
-                                onRequestInfer: { sid, run in
-                                    model.requestInferKey(id: sid, run: run)
-                                },
-                                onAdoptConfirm: { run, key, sid, url in
-                                    model.adoptSplit(id: sid, run: run, key: key, url: url)
-                                },
-                                onJumpToKey: { run, key in
-                                    model.jumpToKey(run: run, key: key)
-                                }
-                            )
+                            tile(for: entry)
                             .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
@@ -192,6 +174,46 @@ struct AgentDashboardView: View {
         .scrollContentBackground(.hidden)
         .zeroHorizontalScrollMargin()
         .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
+    }
+
+    /// (ramon fork / Agent Dashboard) One configured `AgentPreviewTile` — shared by
+    /// the section rows and the spotlight-pinned top row so they stay identical. The
+    /// `isFocused`/`isPinned` cosmetics are derived live from the model (no rebuild
+    /// needed for focus — the `@Published` change re-renders the tile).
+    @ViewBuilder
+    private func tile(for entry: AgentEntry) -> some View {
+        AgentPreviewTile(
+            entry: entry,
+            ghostty: ghostty,
+            previewsEnabled: ptyHostEnabled,
+            isFocused: entry.id == model.focusedSurfaceID,
+            isPinned: entry.id == model.pinnedSurfaceID,
+            onHide: { model.hide(entry.id) },
+            onClose: { model.closeSurface(entry.id) },
+            onKeep: { newKeep in
+                model.setQueueKeep(
+                    id: entry.id,
+                    run: entry.annotation?.queueName ?? "",
+                    key: entry.annotation?.queueKey ?? "",
+                    keep: newKeep)
+            },
+            queueRuns: model.runNamesForAdopt(),
+            nodeForKey: { run, key in
+                model.graphNodeForAdopt(run: run, key: key)
+                    .map { (title: $0.title, url: $0.url) }
+            },
+            activeKeysForRun: { model.activeKeysForRun($0) },
+            suggestedKey: entry.annotation?.queueKeySuggested,
+            onRequestInfer: { sid, run in
+                model.requestInferKey(id: sid, run: run)
+            },
+            onAdoptConfirm: { run, key, sid, url in
+                model.adoptSplit(id: sid, run: run, key: key, url: url)
+            },
+            onJumpToKey: { run, key in
+                model.jumpToKey(run: run, key: key)
+            }
+        )
     }
 
     /// Translate an in-section `.onMove` into a global session-id reorder. The

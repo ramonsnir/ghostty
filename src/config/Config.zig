@@ -2934,6 +2934,19 @@ keybind: Keybinds = .{},
 /// sharing `~/.config/ghostty/config` would error on it).
 @"agent-dashboard-pin": bool = false,
 
+/// (ramon fork) How long (in seconds) the `pin_dashboard_split` action keeps a
+/// split "spotlighted" at the very top of the Agent Dashboard. Pressing the
+/// action unhides the focused split and floats its tile above every other tile
+/// (including queue sections and attention/waiting tiles — "top is top") for
+/// this many seconds, or until another split is pinned via the same action.
+/// Default `10`. A value of `0` means pin until another split is pinned (no
+/// timeout). This is a DIFFERENT "pin" from `agent-dashboard-pin` above: that
+/// one floats the whole PANEL above other windows; this one temporarily raises a
+/// single TILE to the top of the list. Fork-only — keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty sharing
+/// `~/.config/ghostty/config` would error on it).
+@"agent-dashboard-spotlight-seconds": u32 = 10,
+
 /// (ramon fork / Agent Manager) Master enable for the Agent Manager — a
 /// warm TypeScript Agent SDK sidecar (driven via the embedded MCP server)
 /// that summarizes/annotates live agent sessions in the Agent Dashboard.
@@ -4270,6 +4283,7 @@ test "agent-dashboard config" {
         defer cfg.deinit();
         try testing.expectEqual(false, cfg.@"agent-dashboard");
         try testing.expectEqual(false, cfg.@"agent-dashboard-pin");
+        try testing.expectEqual(@as(u32, 10), cfg.@"agent-dashboard-spotlight-seconds");
         try testing.expectEqual(
             @as(usize, 0),
             cfg.@"agent-dashboard-commands".list.items.len,
@@ -4281,6 +4295,7 @@ test "agent-dashboard config" {
         const data =
             "agent-dashboard = true\n" ++
             "agent-dashboard-pin = true\n" ++
+            "agent-dashboard-spotlight-seconds = 25\n" ++
             "agent-dashboard-commands = claude\n" ++
             "agent-dashboard-commands = codex\n";
         var reader: std.Io.Reader = .fixed(data);
@@ -4296,6 +4311,7 @@ test "agent-dashboard config" {
         try testing.expect(cfg._diagnostics.empty());
         try testing.expectEqual(true, cfg.@"agent-dashboard");
         try testing.expectEqual(true, cfg.@"agent-dashboard-pin");
+        try testing.expectEqual(@as(u32, 25), cfg.@"agent-dashboard-spotlight-seconds");
         try testing.expectEqual(
             @as(usize, 2),
             cfg.@"agent-dashboard-commands".list.items.len,

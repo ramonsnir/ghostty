@@ -929,6 +929,14 @@ pub const Action = union(enum) {
     /// rings / needs input. Surface-scoped, payload-less.
     hide_dashboard_split,
 
+    /// (ramon fork) Spotlight the FOCUSED split in the Agent Dashboard (macOS): unhide
+    /// it and float its tile to the very TOP of the dashboard (above every other tile,
+    /// including queue sections and attention/waiting tiles) for
+    /// `agent-dashboard-spotlight-seconds` seconds — or until another split is pinned via
+    /// this same action — so you can find "the agent I'm looking at" at a glance. Opens
+    /// the dashboard panel if it's closed. Surface-scoped, payload-less.
+    pin_dashboard_split,
+
     /// (ramon fork) Install the fork's Claude Code agent-state hooks (macOS): copy
     /// the hook script into `~/.config/ghostty-ramon/claude-hooks/` and merge the
     /// six hook events into `~/.claude/settings.json` (idempotently, with a
@@ -1638,6 +1646,7 @@ pub const Action = union(enum) {
             .toggle_project_selector,
             .toggle_agent_dashboard,
             .hide_dashboard_split,
+            .pin_dashboard_split,
             .install_agent_hooks,
             .start_agent_queue,
             .goto_last_surface,
@@ -3813,6 +3822,21 @@ test "Binding hide_dashboard_split" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("hide_dashboard_split", buf.written());
+}
+
+test "Binding pin_dashboard_split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=pin_dashboard_split");
+    try testing.expect(binding.action == .pin_dashboard_split);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("pin_dashboard_split", buf.written());
 }
 
 test "Binding install_agent_hooks" {

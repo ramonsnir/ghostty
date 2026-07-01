@@ -35,6 +35,7 @@ afterward — config is read at launch.
 agent-dashboard          = true
 agent-dashboard-commands = claude,codex        # exe names that count as "an agent"
 agent-dashboard-pin      = true                # float the panel above other windows
+agent-dashboard-spotlight-seconds = 10         # how long pin_dashboard_split holds a tile on top
 
 # Keybind to toggle the panel (also in the command palette: "Toggle Agent Dashboard").
 keybind = ctrl+a>d=toggle_agent_dashboard
@@ -43,6 +44,12 @@ keybind = ctrl+a>d=toggle_agent_dashboard
 # palette: "Hide Split from Agent Dashboard"). Hide-only — reveal from the
 # dashboard's Show button.
 keybind = ctrl+a>shift+d=hide_dashboard_split
+
+# Keybind to PIN (spotlight) the focused split at the top of the dashboard for a
+# few seconds — the fast way to find "the agent I'm looking at" (also in the
+# command palette: "Pin Split to Top of Agent Dashboard"). Written `shift+p` because
+# `ctrl+a>p` is previous-tab, and shift-keys must spell `shift+` (see CLAUDE.md).
+keybind = ctrl+a>shift+p=pin_dashboard_split
 ```
 
 - **`agent-dashboard`** — master enable. `true` ⇒ the panel is created at launch and
@@ -64,7 +71,14 @@ keybind = ctrl+a>shift+d=hide_dashboard_split
   move/snap shortcuts can still reposition it — those act on the frontmost app's focused
   window, which a non-activating panel never becomes. So you keep it on top *and* can
   still move it with Rectangle; the only side effect is that clicking the dashboard
-  activates Ghostty. Read once at launch — relaunch to change.
+  activates Ghostty. Read once at launch — relaunch to change. **(NOTE: this pins the
+  whole PANEL vs. other windows — a different "pin" from `agent-dashboard-spotlight-seconds`
+  / `pin_dashboard_split`, which raises ONE tile to the top of the list.)**
+- **`agent-dashboard-spotlight-seconds`** — how long (in seconds) the
+  `pin_dashboard_split` action keeps a split "spotlighted" at the very top of the
+  dashboard. Default `10`. `0` means keep it pinned until another split is pinned (no
+  timeout). Read live from config each time the action fires (no relaunch needed to
+  re-read a changed value).
 - **`toggle_agent_dashboard`** — a payload-less keybind action (fork-only). Bind it to
   whatever you like; `ctrl+a>d` is the tmux-flavored default. It's also in the command
   palette as **"Toggle Agent Dashboard"**.
@@ -78,6 +92,15 @@ keybind = ctrl+a>shift+d=hide_dashboard_split
   from its tile. Works even if the panel has never been shown this session (the hide is
   recorded + persisted); it does NOT open the panel. Also in the command palette as
   **"Hide Split from Agent Dashboard"**.
+- **`pin_dashboard_split`** — a payload-less, **surface-scoped** keybind action
+  (fork-only). It **spotlights the FOCUSED split** at the very TOP of the dashboard: it
+  **unhides** the split (if hidden) and floats its tile above every other tile — including
+  queue sections and attention/waiting tiles ("top is top") — for
+  `agent-dashboard-spotlight-seconds` seconds, or until you pin another split with the same
+  action. It's the fast way to answer "which tile is the agent I'm looking at?" **Unlike
+  Hide, it OPENS the panel** if it's closed (the point is to *see* the agent). The pinned
+  tile also gets a distinct up-arrow badge + a strong accent border. Also in the command
+  palette as **"Pin Split to Top of Agent Dashboard"**.
 
 > All these keys and actions are fork-only. Keep them in `~/.config/ghostty-ramon/config`
 > — an official Ghostty sharing `~/.config/ghostty/config` would error on them.
@@ -111,6 +134,17 @@ keybind = ctrl+a>shift+d=hide_dashboard_split
   Hide-only (pressing it on an already-hidden split keeps it hidden — reveal from the
   panel's Show button). Same persisted hide set + same auto-unhide-on-bell as the eye-slash
   button.
+- **Find the split you're looking at.** The tile for the split you're **currently focused
+  on** in the terminal gets a **light "you're here" treatment** — a thin accent border and
+  a small accent dot in its header — as long as it isn't hidden. It's cosmetic only (it
+  never reorders anything), and it updates as you move focus between panes/windows. When a
+  glance isn't enough (a big wall of agents), the **`pin_dashboard_split`** action (command
+  palette: "Pin Split to Top of Agent Dashboard") **spotlights the focused split at the very
+  top**: it unhides it and floats its tile above everything — queue sections and
+  ringing/waiting tiles included ("top is top") — for `agent-dashboard-spotlight-seconds`
+  seconds (default 10; `0` = until you pin another split). The pinned tile shows an up-arrow
+  badge + a strong accent border. **Unlike Hide, this opens the panel** if it's closed.
+  Pinning a second split moves the spotlight to it.
 - **Adopt… (queue tiles excluded)** — on a tile for a CLI-agent split that is **not** already
   owned by a queue, an **Adopt…** button (disabled, with a tooltip, when no queue is running)
   pulls that human-created split into a running Agent Queue: it opens a sheet that infers the
@@ -308,8 +342,27 @@ gains a live state chip.
 ## Where it lives (code map)
 
 - **Config:** `src/config/Config.zig` (`agent-dashboard`, `agent-dashboard-commands`
-  reusing `RepeatableString`, and `agent-dashboard-pin` bool); the `toggle_agent_dashboard`
-  action in `src/input/Binding.zig`, `src/apprt/action.zig`, `src/input/command.zig`.
+  reusing `RepeatableString`, `agent-dashboard-pin` bool, and `agent-dashboard-spotlight-seconds`
+  `u32`); the `toggle_agent_dashboard` action in `src/input/Binding.zig`, `src/apprt/action.zig`,
+  `src/input/command.zig`.
+- **`pin_dashboard_split` action (spotlight the focused split at the top; focus highlight):**
+  core — `src/input/Binding.zig` (action + surface scope + `Binding pin_dashboard_split` test),
+  `src/apprt/action.zig` (union + `Key`, appended LAST after `hide_dashboard_split` — union
+  order MUST match the `Key` enum), `include/ghostty.h`
+  (`GHOSTTY_ACTION_PIN_DASHBOARD_SPLIT`), `src/Surface.zig` (dispatch),
+  `src/input/command.zig` ("Pin Split to Top of Agent Dashboard" palette entry). macOS —
+  `Ghostty.App.swift` `pinDashboardSplit` (resolves the focused `SurfaceView`, posts
+  `ghosttyPinDashboardSplit` with it as `object`) + `recordFocusedSurface` posts
+  `ghosttyFocusedSurfaceDidChange`, `GhosttyPackage.swift` (the two `Notification.Name`s),
+  `AppDelegate.swift` (`ghosttyPinDashboardSplit` observer → lazily creates the controller,
+  then `agentDashboard.pin(surfaceID:)`), `AgentDashboardController.swift`
+  (`pin(surfaceID:)` → opens the panel + model `pin(_:duration:)`; `subscribeFocus` →
+  `model.setFocusedSurface`), `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`).
+  The model (`pinnedSurfaceID`/`focusedSurfaceID`/`pin`/`pinnedEntry`, pinned-first `sorted`,
+  section-lift), the view (`tile(for:)` + the dedicated top row), and the tile
+  (`isFocused`/`isPinned` border + header glyphs) are in the same three
+  `AgentDashboard/*.swift` files. Tests: `Binding pin_dashboard_split` (Zig) +
+  the pin/focus cases in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
 - **`hide_dashboard_split` action (hide focused split from the keyboard; hide-only):** core —
   `src/input/Binding.zig` (action + surface scope + `Binding hide_dashboard_split` test),
   `src/apprt/action.zig` (union + `Key`, in the slot after `goto_last_surface` — the union
@@ -357,8 +410,10 @@ gains a live state chip.
   `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (attention observer →
   `onAttention`/`enqueuePush`). **GUI + hooks only — no Zig/host change** (it reuses the
   existing minor-4 foreground-pid).
-- **Tests:** `src/config/Config.zig` (`agent-dashboard config`),
-  `src/input/Binding.zig` (`Binding toggle_agent_dashboard`, `Binding hide_dashboard_split`),
+- **Tests:** `src/config/Config.zig` (`agent-dashboard config` — now also asserts
+  `agent-dashboard-spotlight-seconds`),
+  `src/input/Binding.zig` (`Binding toggle_agent_dashboard`, `Binding hide_dashboard_split`,
+  `Binding pin_dashboard_split`),
   `src/host/test.zig`
   (minor-4 / `ForegroundPid` round-trip), `src/termio/Client.zig` (`foreground_pid`
   decode), plus the Swift detector/model/sort tests + the `AgentDashboardPanelTests`
@@ -425,6 +480,68 @@ gotchas, not a recap.)
   keeps it on top; it STILL never becomes `main` (`canBecomeMain = false` unchanged), so
   "new window inherits from main" is unaffected. Trade-off: clicking a pinned dashboard
   activates Ghostty (fine — clicking a tile jumps into a terminal anyway).
+
+### Focus highlight + spotlight pin (find "the agent I'm looking at")
+
+- **Focus highlight (VIEW-only, no config, always on).** The tile for the app-wide
+  focused surface gets a light accent border + a small header dot. The single source of
+  truth is `Ghostty.App.recordFocusedSurface` (the settled-focus chokepoint that already
+  drives `goto_last_surface`); it posts `.ghosttyFocusedSurfaceDidChange` with the surface
+  as `object`. The controller's `subscribeFocus` sink calls `model.setFocusedSurface(id)`,
+  which stores `focusedSurfaceID` (`@Published`) and does **NOT** rebuild/re-sort — focus
+  is not a sort key, so the `@Published` change alone re-renders the tiles, which read
+  `entry.id == model.focusedSurfaceID` (passed as the tile's `isFocused`). Because
+  `recordFocusedSurface`'s only caller already filters out dashboard **mirror** surfaces
+  (see `setNeedsFocusHistoryUpdate`), the highlight never chases a mirror. When focus
+  lands on a non-agent split (or none), no tile matches ⇒ no highlight. When the app is
+  inactive the focus path doesn't fire, so the highlight sticks on the last-focused tile
+  (acceptable).
+- **Spotlight pin (`pin_dashboard_split` → `model.pin(_:duration:)`).** Surface-scoped
+  like `hide_dashboard_split`: `Surface.zig` → apprt `.pin_dashboard_split` →
+  `Ghostty.App.pinDashboardSplit` (no-op + `false` on an APP target) posts
+  `.ghosttyPinDashboardSplit` with the `SurfaceView`; `AppDelegate` lazily creates the
+  controller and calls `pin(surfaceID:)`, which — **unlike Hide — opens the panel first**
+  (`if !isShown { show() }`, so the surface is already in `live` when the pin re-sorts),
+  then `model.pin(id, duration: agentDashboardSpotlightSeconds)`. `model.pin` unhides `id`
+  (shared hide set), sets `pinnedSurfaceID`, bumps a monotonic `pinGeneration`, rebuilds
+  (re-sorts), and — when `duration > 0` — arms a one-shot `DispatchQueue.main.asyncAfter`
+  that clears the pin only if `pinGeneration` and `pinnedSurfaceID` still match (so a later
+  pin, which bumps the generation, silently supersedes the earlier timer). `duration <= 0`
+  ⇒ no timer (pin until replaced).
+- **"Top is top" (absolute-first sort + section lift).** Two pieces make the pinned tile
+  sit above **everything**, including the per-queue origin sections: (1) the pure
+  `sorted(…, pinnedID:)` compares `id == pinnedID` FIRST — above attention, manual order,
+  idle/recency — so the pinned entry is `entries.first`; (2) since the dashboard renders
+  **origin sections** (a queue's tiles live under its header), the model exposes
+  `pinnedEntry` (the pinned tile lifted OUT) and the `sections` computed prop EXCLUDES it,
+  and the view renders `pinnedEntry` as a dedicated row at the very top of the `List`
+  (above the banner + every `Section`, `moveDisabled`). Rendering it in exactly one place
+  (top row **or** its section, never both) is why `sections` filters it. The pinned row
+  ignores the origin filter too (it's lifted from the unfiltered `entries`), so a pin
+  always shows even if its origin is filtered out. `pinnedEntry` is nil if the pinned
+  surface isn't a live agent tile (closed / not detected) ⇒ no ghost row.
+- **Two "pin" config keys, deliberately kept apart.** `agent-dashboard-pin` (bool) floats
+  the whole PANEL vs. other windows; `agent-dashboard-spotlight-seconds` (u32) is the
+  duration `pin_dashboard_split` holds ONE tile at the top of the list. Different scope,
+  documented as such in both `Config.zig` docs and above.
+- **Wiring:** core — `Config.zig` (`agent-dashboard-spotlight-seconds`), `Binding.zig` +
+  `apprt/action.zig` + `ghostty.h` + `Surface.zig` + `command.zig` (`pin_dashboard_split`);
+  macOS — `Ghostty.App.swift` (`pinDashboardSplit` + the focus-change post in
+  `recordFocusedSurface`), `GhosttyPackage.swift` (`ghosttyPinDashboardSplit` +
+  `ghosttyFocusedSurfaceDidChange`), `AppDelegate.swift` (observer),
+  `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`),
+  `AgentDashboardController.swift` (model `focusedSurfaceID`/`pinnedSurfaceID`/`pinGeneration`
+  + `setFocusedSurface`/`pin`/`pinnedEntry`, pinned-first `sorted`, `sections` lift, controller
+  `pin(surfaceID:)` + `subscribeFocus`), `AgentPreviewTile.swift` (`isFocused`/`isPinned`
+  border + header glyphs), `AgentDashboardView.swift` (`tile(for:)` builder + the pinned
+  top row). Tests: `Binding pin_dashboard_split` + `agent-dashboard config` (Zig); the
+  `AgentDashboardSortTests` pin cases (`pinnedSortsAbsoluteFirst`, `pinnedOutranksManualOrder`,
+  `noPinnedIDLeavesAttentionFirst`) + the `AgentDashboardModelTests` cases
+  (`pinUnhidesFloatsAndLiftsOutOfSections`, `pinSupersedesPreviousPin`,
+  `pinnedEntryNilWhenSurfaceNotAnAgent`, `setFocusedSurfaceIsViewOnly`) in
+  `macos/Tests/AgentDashboard/AgentDashboardTests.swift`. **GUI-only** (the `pin_dashboard_split`
+  action is a new apprt enum ⇒ a lib/xcframework rebuild, but the host never sees it — no host
+  restart / no session loss); GUI relaunch to pick it up.
 
 ### Live previews need pty-host (the mirror SurfaceView)
 

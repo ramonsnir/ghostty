@@ -855,6 +855,19 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Agent Dashboard) How long the `pin_dashboard_split` action
+        // keeps a split spotlighted at the top of the dashboard, in seconds.
+        // Default 10; 0 = until another split is pinned (no timeout). Distinct from
+        // `agentDashboardPin` (which floats the whole panel above other windows).
+        var agentDashboardSpotlightSeconds: UInt32 {
+            let defaultValue: UInt32 = 10
+            guard let config = self.config else { return defaultValue }
+            var v: UInt32 = defaultValue
+            let key = "agent-dashboard-spotlight-seconds"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Dashboard, Layer 3) Executable basenames treated
         // as CLI agents by the detector. The Zig field defaults empty; the
         // user-facing default `claude,codex` is substituted here when unset.
