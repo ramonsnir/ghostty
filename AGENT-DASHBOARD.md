@@ -628,6 +628,51 @@ gotchas, not a recap.)
   `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
   `zeroBackingDoesNotDivideByZero`).
 
+### Live previews auto-reconnect (never permanently dead until a GUI restart)
+
+- **The problem this fixes.** Each preview is a read-only `.client` **mirror** to
+  `ghostty-host` with a **single-shot** connection and **NO retry** in the Zig client
+  (`src/termio/Client.zig` `connectAndAttach`): on ANY socket blip — EOF, a read error, a
+  decode error, or a host-pushed `child_exited` — the read thread calls `markMirrorEnded()`
+  and **exits** (`Client.zig` `ReadThread.threadMainPosix`). The tile keyed the mirror
+  SurfaceView on `.id(sessionID)`, so a mirror that died on a **still-alive** session was
+  **never rebuilt** — the preview froze on its last frame (or, if it died before the first
+  frame, an empty default surface) until a **full GUI restart**. Over a long session the
+  transient blips accumulate and previews die one-by-one — the "restart to recover them"
+  symptom. **Nothing wrong with the real terminal** (a separate attach connection), which is
+  the key tell: only the mirror's socket dropped.
+
+- **The fix (GUI-only, self-healing).** `AgentMirrorPreview` polls
+  `surfaceView.processExited` in its existing identity-tied `.task` loop — true for a mirror
+  the moment `markMirrorEnded` synthesizes a `child_exited` (`Surface.childExited` sets
+  `child_exited` for a mirror and RETURNS without closing; `ghostty_surface_process_exited`
+  reads exactly that bit, so **no new C accessor was needed**). On that edge it calls
+  `onEnded`; the tile (`AgentPreviewTile`) then **recreates the mirror SurfaceView** — the
+  tile id became `"\(sessionID)-\(mirrorGeneration)"` and `handleMirrorEnded` bumps
+  `mirrorGeneration` after a backoff, tearing down the dead `.client` connection and mounting
+  a fresh one.
+
+- **Backoff + cap + reset.** `mirrorReconnectDelay(attempt:)` is **1, 2, 4, 8, 16, 30, 30…s**
+  (pure/static, unit-tested). After `maxMirrorReconnects` (6) failed attempts it STOPS and sets
+  `mirrorFailed`, which surfaces a small top-trailing **Refresh** button (`mirrorRefreshButton`
+  → `retryMirror` resets the budget + reconnects) — the manual escape valve. A fresh connection
+  that stays up for `mirrorStableSeconds` (15) fires `onStable`, resetting the attempt budget so
+  a LATER transient drop gets a full retry allotment. **Reconnect is gated on the REAL split
+  still being alive** (`entry.realView?.processExited == false`): if the real process ALSO
+  exited the session is genuinely gone (the detector drops the tile shortly), so we do nothing
+  and let it vanish — no churn on a dead endpoint.
+
+- **Scope.** PURE SWIFT in `AgentPreviewTile.swift` — no Zig, no C, no host change; deployable
+  live (GUI relaunch, no session loss). Wiring: `AgentPreviewTile.swift`
+  (`mirrorGeneration`/`mirrorAttempts`/`mirrorFailed` state, `mirrorReconnectDelay`/
+  `handleMirrorEnded`/`handleMirrorStable`/`retryMirror`, `mirrorRefreshButton`, the
+  `"\(sessionID)-\(mirrorGeneration)"` id, and `AgentMirrorPreview`'s `onEnded`/`onStable`
+  closures + the `.task` `processExited` poll). Tests: `AgentMirrorReconnectTests`
+  (`backoffDoublesThenCapsAt30`, `backoffNeverNegativeOrZero`). NOTE the host's 978
+  `libxev … invalid state in submission queue` bursts are a SEPARATE per-session-loop issue
+  (see PTYHOST.md) — they'd freeze the REAL terminal too, so they are not the preview-death
+  cause; this reconnect self-heals every transient drop regardless of source.
+
 ### Smart bottom-anchor — skip empty rows AND the info-less footer
 
 - **Smart bottom-anchor (fork-only, always on, no config, PURE-SWIFT / ZERO Zig).** A

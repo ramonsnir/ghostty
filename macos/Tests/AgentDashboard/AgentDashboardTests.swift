@@ -2814,3 +2814,25 @@ struct QueueBacklogTests {
         #expect(s.width == QueueBacklogGeometry.preferredWindowSize(many).width)
     }
 }
+
+// MARK: - Mirror auto-reconnect backoff (pure)
+
+struct AgentMirrorReconnectTests {
+    @Test func backoffDoublesThenCapsAt30() {
+        // 1, 2, 4, 8, 16, then capped at 30 for all later attempts.
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 0) == 1)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 1) == 2)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 2) == 4)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 3) == 8)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 4) == 16)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 5) == 30)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 6) == 30)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 100) == 30)
+    }
+
+    @Test func backoffNeverNegativeOrZero() {
+        // A defensive negative attempt clamps to the first delay (never divides
+        // wrong / shifts negatively).
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: -1) == 1)
+    }
+}

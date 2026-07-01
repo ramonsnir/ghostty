@@ -67,6 +67,75 @@ struct AgentPreviewTile: View {
     @State private var adoptKey: String = ""
     @State private var inferring = false
 
+    // MARK: - Mirror auto-reconnect state (ramon fork / Agent Dashboard)
+    //
+    // The live preview is a READ-ONLY `.client` mirror to `ghostty-host` with a
+    // SINGLE-SHOT connection and NO retry in the Zig client — any socket blip
+    // (EOF / read error / decode error / a routine host hiccup) makes the read
+    // thread call `markMirrorEnded` and EXIT, freezing the preview forever until a
+    // full GUI restart (`src/termio/Client.zig`). The tile keys the mirror
+    // SurfaceView on `\(sessionID)-\(mirrorGeneration)`, so bumping the generation
+    // recreates it with a fresh connection. `AgentMirrorPreview` polls
+    // `surfaceView.processExited` (set true when `markMirrorEnded` synthesizes a
+    // `child_exited`) and calls back here to drive a backoff-then-cap reconnect —
+    // GUI-only, self-healing, no host restart.
+    @State private var mirrorGeneration = 0
+    /// Reconnect attempts spent since the last time the mirror was healthy. Reset by
+    /// `handleMirrorStable` once a fresh connection stays up, and by `retryMirror`.
+    @State private var mirrorAttempts = 0
+    /// True once the auto-reconnect budget is exhausted — surfaces the manual
+    /// Refresh affordance instead of retrying forever on a truly dead endpoint.
+    @State private var mirrorFailed = false
+
+    /// Give up auto-reconnecting after this many attempts (then show Refresh).
+    private static let maxMirrorReconnects = 6
+    /// Seconds a fresh mirror must stay connected before we consider it healthy and
+    /// reset the backoff budget (so a LATER transient drop gets a full retry budget).
+    static let mirrorStableSeconds: TimeInterval = 15
+
+    /// Backoff delay (seconds) before reconnect attempt `attempt` (0-based):
+    /// 1, 2, 4, 8, 16, 30, 30… capped at 30s. Pure + static for unit testing.
+    static func mirrorReconnectDelay(attempt: Int) -> Double {
+        let capped = min(max(attempt, 0), 5)
+        return min(Double(1 << capped), 30.0)
+    }
+
+    /// The mirror preview reported its socket ended. If the REAL split's process is
+    /// still alive this is a transient drop → schedule a backoff reconnect; if the
+    /// real process ALSO exited, the session is genuinely gone (the detector will
+    /// drop this tile shortly) so we do nothing and let it vanish.
+    private func handleMirrorEnded() {
+        guard let real = entry.realView, !real.processExited else { return }
+        guard !mirrorFailed else { return }
+        if mirrorAttempts >= Self.maxMirrorReconnects {
+            mirrorFailed = true
+            return
+        }
+        let attempt = mirrorAttempts
+        mirrorAttempts += 1
+        let session = entry.sessionID
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.mirrorReconnectDelay(attempt: attempt)) {
+            // Only recreate if we're still the same session and haven't since been
+            // manually reset / given up in the meantime.
+            guard entry.sessionID == session, !mirrorFailed else { return }
+            mirrorGeneration &+= 1
+        }
+    }
+
+    /// A fresh mirror connection has stayed up long enough to be healthy — reset the
+    /// backoff so a future transient drop starts a full retry budget from scratch.
+    private func handleMirrorStable() {
+        mirrorAttempts = 0
+        mirrorFailed = false
+    }
+
+    /// Manual "try again" after the auto-reconnect budget was exhausted.
+    private func retryMirror() {
+        mirrorAttempts = 0
+        mirrorFailed = false
+        mirrorGeneration &+= 1
+    }
+
     /// The fork's bell amber (matches the in-terminal bell border).
     private static let bellAmber = Color(red: 1.0, green: 0.8, blue: 0.0)
 
@@ -520,7 +589,12 @@ struct AgentPreviewTile: View {
             // it to scroll, and the mirror SurfaceView itself is made inert inside
             // AgentMirrorPreview so it never steals the click. Taps still bubble to
             // the card's tap-to-jump.
-            AgentMirrorPreview(ghostty: ghostty, sessionID: entry.sessionID, realSurface: realView)
+            AgentMirrorPreview(
+                ghostty: ghostty,
+                sessionID: entry.sessionID,
+                realSurface: realView,
+                onEnded: { handleMirrorEnded() },
+                onStable: { handleMirrorStable() })
                 .frame(maxWidth: .infinity)
                 .frame(height: Self.previewHeight)
                 // Fill the whole preview rectangle with the THEME terminal
@@ -536,10 +610,15 @@ struct AgentPreviewTile: View {
                 // semi-transparent over the TOP of the live preview so it's readable
                 // at a glance, and FADED OUT on hover to reveal the terminal beneath.
                 .overlay(alignment: .top) { summaryOverlay }
-                // Re-create the mirror SurfaceView if the session id changes for a
-                // stable tile id (the @StateObject is otherwise keyed only by the
-                // ForEach UUID, so it would keep the old session).
-                .id(entry.sessionID)
+                // A manual reconnect affordance, shown ONLY after the auto-reconnect
+                // budget is exhausted (the frozen preview stays visible beneath it).
+                .overlay(alignment: .topTrailing) { if mirrorFailed { mirrorRefreshButton } }
+                // Re-create the mirror SurfaceView when the session id changes OR when
+                // `mirrorGeneration` is bumped by the auto-reconnect / manual Refresh
+                // path — a new id tears down the dead `.client` connection and mounts a
+                // fresh one. (The @StateObject is otherwise keyed only by the ForEach
+                // UUID, so it would keep the old, dead session.)
+                .id("\(entry.sessionID)-\(mirrorGeneration)")
                 .contentShape(Rectangle())
                 .onTapGesture { jump() }
         } else {
@@ -554,6 +633,22 @@ struct AgentPreviewTile: View {
             .contentShape(Rectangle())
             .onTapGesture { jump() }
         }
+    }
+
+    /// (ramon fork / Agent Dashboard) Manual reconnect button, shown over the top-
+    /// trailing corner of a preview whose auto-reconnect budget was exhausted. A
+    /// click resets the backoff and mounts a fresh mirror connection.
+    private var mirrorRefreshButton: some View {
+        Button(action: retryMirror) {
+            Image(systemName: "arrow.clockwise.circle.fill")
+                .font(.title3)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.secondary)
+                .background(Circle().fill(.background).padding(2))
+        }
+        .buttonStyle(.plain)
+        .help("Preview disconnected — click to reconnect")
+        .padding(6)
     }
 
     // MARK: - Summary overlay
@@ -715,6 +810,15 @@ struct AgentMirrorPreview: View {
 
     @StateObject private var surfaceView: Ghostty.SurfaceView
 
+    /// (ramon fork / Agent Dashboard) Called once when this mirror's `.client`
+    /// connection ends (`surfaceView.processExited` flips true via the synthetic
+    /// `child_exited` that `markMirrorEnded` pushes). The parent drives a
+    /// backoff-then-cap reconnect. Default no-op keeps other call sites (tests) valid.
+    var onEnded: () -> Void = {}
+    /// (ramon fork / Agent Dashboard) Called once when a fresh connection has stayed
+    /// up for `mirrorStableSeconds` — the parent resets its reconnect backoff budget.
+    var onStable: () -> Void = {}
+
     /// Number of trailing rows to drop below the bottom-anchored thumbnail —
     /// empty rows PLUS an information-less footer (the agent's input box + its
     /// mode/status lines) — so the preview rises to the last row of actual
@@ -729,10 +833,18 @@ struct AgentMirrorPreview: View {
     /// it can be updated from inside `body` without tripping SwiftUI state-mutation.
     @State private var hostGeomBox = HostGeomBox()
 
-    init(ghostty: Ghostty.App, sessionID: UInt64, realSurface: Ghostty.SurfaceView) {
+    init(
+        ghostty: Ghostty.App,
+        sessionID: UInt64,
+        realSurface: Ghostty.SurfaceView,
+        onEnded: @escaping () -> Void = {},
+        onStable: @escaping () -> Void = {}
+    ) {
         self.ghostty = ghostty
         self.sessionID = sessionID
         self.realSurface = realSurface
+        self.onEnded = onEnded
+        self.onStable = onStable
         var cfg = Ghostty.SurfaceConfiguration()
         cfg.mirror = true
         cfg.sessionID = String(sessionID)
@@ -820,8 +932,23 @@ struct AgentMirrorPreview: View {
                     // per-instance Timer.publish which restarts its countdown on
                     // every re-render.
                     .task {
+                        // Mount time for the stability gate; both edges fire once per
+                        // view identity (a reconnect bumps the tile's .id → fresh task).
+                        let mountedAt = Date()
+                        var reportedEnded = false
+                        var reportedStable = false
                         while !Task.isCancelled {
                             refreshSkipRows()
+                            // The mirror's `.client` connection ended (socket EOF /
+                            // read error / host-pushed child_exited) → tell the parent
+                            // so it can reconnect with backoff. Fire-once per mount.
+                            if surfaceView.processExited {
+                                if !reportedEnded { reportedEnded = true; onEnded() }
+                            } else if !reportedStable,
+                                      Date().timeIntervalSince(mountedAt) >= AgentPreviewTile.mirrorStableSeconds {
+                                reportedStable = true
+                                onStable()
+                            }
                             try? await Task.sleep(nanoseconds: 800_000_000)
                         }
                     }

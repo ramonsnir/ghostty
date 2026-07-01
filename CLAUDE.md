@@ -388,7 +388,25 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`ghostty_surface_mirror_grid_s` + prototype); macOS — `AgentPreviewTile.swift` (host-first cell
   reads + `hostGeomBox`/`mergeHostGeom` + `resolveGrid`). Tests: `AgentMirrorGeometryTests`
   (`mergeHostGeomRemembersThroughZoomHidden` + `uniformScaleAcrossSplitsOfDifferentWidths` + the
-  existing geometry cases).
+  existing geometry cases). **Preview auto-reconnect (always on, GUI-only):** the live preview
+  is a read-only `.client` **mirror** with a SINGLE-SHOT connection + NO retry in the Zig client
+  (`connectAndAttach`), so any socket blip (EOF / read error / decode error / host-pushed
+  `child_exited`) made the read thread `markMirrorEnded()` + EXIT and — because the tile keyed the
+  mirror on `.id(sessionID)` — the preview froze FOREVER on a still-alive session until a full GUI
+  restart (the "previews crash, restart to recover" symptom; the REAL terminal, a separate attach
+  conn, stayed fine — the tell). Fix: `AgentMirrorPreview` polls `surfaceView.processExited` (true
+  for a mirror the instant `markMirrorEnded` synthesizes a `child_exited` — `Surface.childExited`
+  sets the bit and returns WITHOUT closing, `ghostty_surface_process_exited` reads it, so **no new
+  C accessor**) and calls `onEnded`; `AgentPreviewTile` recreates the mirror by bumping
+  `mirrorGeneration` in the id `"\(sessionID)-\(mirrorGeneration)"` after a backoff
+  (`mirrorReconnectDelay` = 1,2,4,8,16,30…s, cap `maxMirrorReconnects`=6 → a top-trailing
+  **Refresh** button `retryMirror`; `onStable` after `mirrorStableSeconds`=15 resets the budget).
+  Reconnect is GATED on the REAL split still alive (`entry.realView?.processExited==false`) so a
+  genuinely-ended session just vanishes (no churn). PURE SWIFT (`AgentPreviewTile.swift`) — no
+  Zig/C/host change, live-deployable. Tests: `AgentMirrorReconnectTests`
+  (`backoffDoublesThenCapsAt30`, `backoffNeverNegativeOrZero`). (The host's 978 `libxev … invalid
+  state in submission queue` bursts are a SEPARATE per-session-loop issue — see PTYHOST.md — not
+  the preview-death cause; this self-heals every transient drop regardless.)
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a
