@@ -638,6 +638,24 @@ class AppDelegate: NSObject,
         }
     }
 
+    /// (ramon fork / Web monitor) Hide or reveal a surface in the Agent Dashboard's
+    /// persisted hide set FROM THE PHONE (the web monitor's per-row Hide/Show
+    /// button → `POST /api/surface/{uuid}/hidden`). Reuses the SAME UUID-keyed hide
+    /// set as the tile eye-slash button + `hide_dashboard_split` keybind, so a phone
+    /// hide == a desktop hide (unified) and the monitor's "Hide hidden" filter drops
+    /// it. Lazily creates the controller (like the keybind handlers) so the hide
+    /// persists even if the panel was never shown; does NOT open the panel. Returns
+    /// true once the dashboard is available to apply it. Called on main, wrapped in
+    /// `MainActor.assumeIsolated` by `WebMonitorServer` (the controller is @MainActor).
+    @MainActor
+    func setWebMonitorHidden(surfaceID id: UUID, hidden: Bool) -> Bool {
+        if agentDashboard == nil {
+            agentDashboard = AgentDashboardController(ghostty: ghostty)
+        }
+        agentDashboard?.setHidden(surfaceID: id, hidden: hidden)
+        return agentDashboard != nil
+    }
+
     /// (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks
     /// (command-palette "Install Claude Agent Hooks"). Runs the filesystem work
     /// off-main, then reports the outcome in an NSAlert on main.

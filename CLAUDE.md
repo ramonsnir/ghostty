@@ -241,18 +241,28 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   features on it; other work may COPY its patterns but must stand alone.** Load-bearing gotchas:
   input is sent as REAL key/wheel events (`ghostty_surface_key` with the NATIVE macOS virtual
   keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path;
-  **Scroll ↑/↓ is "smart" (`smartScroll`, page-side)** — KEY FACT: the host's `raw_output` carries
-  only CHILD pty output, so a host-side scroll emits nothing back to the phone; the browser's
-  `xterm.js` holds the only replayable scrollback. It reads the LIVE mode off `xterm.js`
-  (`buffer.active.type` + `modes.mouseTrackingMode`) and routes 3 ways: normal buffer (shell,
-  **Claude Code**) → scroll xterm.js's OWN scrollback LOCALLY (`term.scrollLines`, no host
-  round-trip — the previously-broken common case); alt+mouse (htop/vim+mouse) → real wheel so the
-  app redraws; alt+no-mouse (less/man/vim) → PageUp/PageDown (a wheel is a dead no-op there — the
-  `.client` mirror's alt-screen `active_key` is a documented `src/termio/Client.zig` residual); Web
-  Push needs a SECURE CONTEXT (`tailscale serve` in front, external HTTPS port ≠ internal bind
-  port or the bind hits `EADDRINUSE`); the raw-tee is a HOST change (host restart loses sessions).
-  **See `WEB-MONITOR.md` (→ Implementation notes) for the color/scrollback architecture, HTTP
-  API, threading, push/VAPID, wiring + tests.**
+  **Scroll ↑/↓ is "smart" (`smartScroll`, page-side)** — routes 4 ways off the live `xterm.js` mode
+  (`buffer.active.type` + `modes.mouseTrackingMode` + `buffer.active.baseY`): normal buffer WITH
+  local scrollback (`baseY>0`, a shell) → `term.scrollLines` LOCALLY (color, no round-trip); normal
+  buffer with NO local scrollback (`baseY==0`, **Claude Code** — full-frame in-place TUIs that emit
+  no newlines, so xterm.js has nothing to scroll) → **history view** (`historyScroll`/`enterHistory`):
+  drive the HOST `scroll_viewport` via `/scroll` and render `/screen` in the plain-text `<pre>`, with
+  a **● Live** button (`exitHistory`) to resume — the desktop-wheel path; alt+mouse (htop/vim+mouse)
+  → real wheel; alt+no-mouse (less/man/vim) → PageUp/PageDown (wheel is a dead no-op — `.client`
+  alt-screen `active_key` residual). **⚠️ Claude Code's conversation is NOT terminal-scrollable on
+  EITHER phone or desktop**: it renders in a FIXED sub-region (`ESC[2;41r`) + `CSI S`, and ghostty's
+  `scrollUp` only feeds scrollback when the region top margin is row 0 (else `deleteLines` DISCARDS)
+  — so the transcript never enters host/GUI scrollback (lives only in Claude's process); scroll
+  reveals only REAL scrollback (e.g. pre-`claude` shell output), matching the desktop wheel. **Hide
+  a split FROM THE PHONE**: per-row Hide/Show button → `POST /api/surface/{uuid}/hidden`
+  {hidden:bool} → `AppDelegate.setWebMonitorHidden` → `AgentDashboardController.setHidden` toggles
+  the SAME dashboard hide set (unified; the existing "Hide hidden" filter drops it; 503 if the
+  dashboard isn't running; `/api/surfaces` is cached ~1s so it shows on the next refresh). Web Push
+  needs a SECURE CONTEXT (`tailscale serve` in front, external HTTPS port ≠ internal bind port or
+  the bind hits `EADDRINUSE`); the raw-tee is a HOST change (host restart loses sessions). The scroll
+  + hide changes are GUI/page-only (no Zig/host change). **See `WEB-MONITOR.md` (→ Implementation
+  notes) for the color/scrollback architecture, the Claude scroll-region finding, HTTP API,
+  threading, push/VAPID, wiring + tests.**
 
 - **MCP server** (fork-only, OFF by default; config `mcp-listen` / `mcp-token` — the token is a
   SHELL-EXECUTION credential, so bind localhost + always set it) — a GUI-embedded MCP server

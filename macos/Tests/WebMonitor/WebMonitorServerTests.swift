@@ -942,6 +942,28 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.scrollDeltaY(body: Data("not json".utf8)) == nil)
     }
 
+    // (ramon fork / Web monitor) Hide-a-split-from-the-phone route + body parse.
+    @Test func decideRouteSetHiddenPost() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/hidden") == .setHidden(uuid: id))
+    }
+
+    @Test func decideRouteSetHiddenGetMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/hidden") == .methodNotAllowed)
+    }
+
+    @Test func hiddenFlagDecode() {
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":true}"#.utf8)) == true)
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":false}"#.utf8)) == false)
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":1}"#.utf8)) == true)   // lenient number
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":0}"#.utf8)) == false)
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":"true"}"#.utf8)) == true)   // lenient string
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":"false"}"#.utf8)) == false)
+        #expect(WebMonitorServer.hiddenFlag(body: Data(#"{}"#.utf8)) == nil)              // missing
+        #expect(WebMonitorServer.hiddenFlag(body: Data("not json".utf8)) == nil)
+    }
+
     @Test func decideRouteUnknownActionIsNotFound() {
         let id = UUID()
         #expect(decide("GET", "/api/surface/\(id.uuidString)/bogus") == .notFound)
