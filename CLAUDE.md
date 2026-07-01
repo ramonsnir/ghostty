@@ -334,7 +334,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   is load-bearing) is the "find the agent I'm looking at" action: it UNHIDES the focused split
   and SPOTLIGHTS its tile at the very TOP of the dashboard (absolute-first sort — above queues
   AND attention, "top is top" — AND lifted OUT of its origin section into a dedicated top row,
-  so it sits above the section headers too) for `agent-dashboard-spotlight-seconds` (u32, default
+  so it sits above the section headers too; the `List` is wrapped in a `ScrollViewReader` and an
+  `onChange(spotlightedSurfaceID)` does `proxy.scrollTo(newID, anchor:.top)` so the new top row is
+  SCROLLED into view — a top-inserted List row keeps the old scroll offset otherwise, landing
+  above the viewport) for `agent-dashboard-spotlight-seconds` (u32, default
   10; `0` = until another split is spotlighted), via a `spotlightGeneration`-guarded one-shot timer that a
   later spotlight supersedes. **Unlike Hide it OPENS the panel** (`spotlight(surfaceID:)` calls `show()`
   first). Separately, the tile for the **currently focused** surface always gets a LIGHT accent

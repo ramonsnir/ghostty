@@ -78,13 +78,16 @@ struct AgentDashboardView: View {
     /// keep `.onMove`.
     @ViewBuilder
     private var sectionedList: some View {
+      ScrollViewReader { proxy in
         List {
             // (ramon fork / Agent Dashboard) The spotlighted split floats to the
             // VERY top, above the banner and every origin section ("top is top"). It's
             // lifted out of its section (`model.sections` excludes it) so it renders
-            // exactly once. Not reorderable while spotlighted.
+            // exactly once. Not reorderable while spotlighted. The `.id` is the
+            // scroll target used by `onChange` below to bring it into view.
             if let spotlighted = model.spotlightedEntry {
                 tile(for: spotlighted)
+                    .id(spotlighted.id)
                     .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 6, trailing: 0))
                     .listRowSeparator(.hidden)
                     .listRowBackground(Color.clear)
@@ -174,6 +177,20 @@ struct AgentDashboardView: View {
         .scrollContentBackground(.hidden)
         .zeroHorizontalScrollMargin()
         .animation(.easeInOut(duration: 0.18), value: model.entries.map(\.id))
+        .onChange(of: model.spotlightedSurfaceID) { newID in
+            // A newly spotlighted split is lifted to the VERY TOP of the list, but a
+            // `List` keeps its current scroll offset — so the new top row can land
+            // ABOVE the visible area ("appears at the top, but out of view; I have to
+            // scroll up to see it"). Scroll it into view. Deferred a runloop so the
+            // row is laid out before we target it.
+            guard let newID else { return }
+            DispatchQueue.main.async {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(newID, anchor: .top)
+                }
+            }
+        }
+      }
     }
 
     /// (ramon fork / Agent Dashboard) One configured `AgentPreviewTile` — shared by

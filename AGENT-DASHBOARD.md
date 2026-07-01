@@ -521,6 +521,14 @@ gotchas, not a recap.)
   ignores the origin filter too (it's lifted from the unfiltered `entries`), so a spotlight
   always shows even if its origin is filtered out. `spotlightedEntry` is nil if the pinned
   surface isn't a live agent tile (closed / not detected) ⇒ no ghost row.
+- **Scroll the new top row into view.** Inserting a row at the top of a `List` does NOT move
+  its scroll offset, so a spotlight while scrolled down would land ABOVE the viewport ("appears
+  at the top, but out of view — I have to scroll up to see it"). The `List` is wrapped in a
+  `ScrollViewReader`; the spotlighted top row carries `.id(spotlighted.id)`, and an
+  `onChange(of: model.spotlightedSurfaceID)` does `proxy.scrollTo(newID, anchor: .top)` (deferred
+  one runloop via `DispatchQueue.main.async` so the row is laid out first, wrapped in a short
+  `withAnimation`). Only a non-nil new id scrolls; expiry (→ nil) doesn't. The top row's id is
+  unique because `sections` excludes it, so `scrollTo` never targets a section copy.
 - **Two "pin" config keys, deliberately kept apart.** `agent-dashboard-pin` (bool) floats
   the whole PANEL vs. other windows; `agent-dashboard-spotlight-seconds` (u32) is the
   duration `spotlight_dashboard_split` holds ONE tile at the top of the list. Different scope,
