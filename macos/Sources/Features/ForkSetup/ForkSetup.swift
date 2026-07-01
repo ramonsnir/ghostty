@@ -1251,6 +1251,9 @@ enum ForkSetup {
     # the panel may open empty/metadata-only until you relaunch.
     agent-dashboard = true
     agent-dashboard-commands = claude,codex
+    # How long "Pin Split to Top of Agent Dashboard" (pin_dashboard_split) keeps a
+    # split spotlighted at the top (seconds; 0 = until you pin another split).
+    agent-dashboard-spotlight-seconds = 10
 
     # Agent Queue (fork-only, OPT-IN — left OFF by default). Turns the dashboard
     # into an active supervisor that launches one CLI agent per work item from a
@@ -1330,6 +1333,10 @@ enum ForkSetup {
     #keybind = ctrl+a>shift+!=move_split_to_new_tab
     #keybind = ctrl+a>f=toggle_project_selector
     #keybind = ctrl+a>d=toggle_agent_dashboard
+    #keybind = ctrl+a>shift+d=hide_dashboard_split
+    # Spotlight the focused split at the top of the dashboard (find "the agent I'm
+    # looking at"). shift+p because ctrl+a>p is previous_tab.
+    #keybind = ctrl+a>shift+p=pin_dashboard_split
     # One-key project launchers — open a new tab with cwd set to a project:
     #keybind = ctrl+a>g=new_tab:~/git/your-project
     #keybind = ctrl+a>i=new_tab:~/git/another-project

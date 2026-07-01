@@ -309,8 +309,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   xcframework rebuild (the 3 C exports are new); no host restart.**
 
 - **Agent Dashboard** (fork-only, macOS, OFF by default; config `agent-dashboard` /
-  `agent-dashboard-commands` / `agent-dashboard-pin`, actions `toggle_agent_dashboard` +
-  `hide_dashboard_split`) — a sidebar
+  `agent-dashboard-commands` / `agent-dashboard-pin` / `agent-dashboard-spotlight-seconds`,
+  actions `toggle_agent_dashboard` + `hide_dashboard_split` + `pin_dashboard_split`) — a sidebar
   `NSPanel` with a live natively-rendered preview of every split running a CLI agent (Claude/Codex)
   across all tabs/windows; click to jump, Hide to declutter, bell auto-unhides; `agent-dashboard-pin`
   floats + activates the panel (so Rectangle can move it). Live previews need `pty-host` (each tile
@@ -329,9 +329,28 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   on an already-hidden split keeps it hidden rather than re-revealing it — reveal is the panel's
   Show button. Command-palette
   entry "Hide Split from Agent Dashboard"; its apprt `Action`/`Key`/`ghostty.h` enum entry is
-  appended LAST (union order must match the `Key` enum). **See
-  `AGENT-DASHBOARD.md` (→ Implementation notes) for the bottom-anchor subsystem, detection, hook
-  plumbing, wiring + tests.** **Preview-scale feedback-loop fix (always on):**
+  appended LAST (union order must match the `Key` enum). **`pin_dashboard_split`** (also
+  surface-scoped, appended AFTER `hide_dashboard_split` in the union/`Key`/`ghostty.h` — order
+  is load-bearing) is the "find the agent I'm looking at" action: it UNHIDES the focused split
+  and SPOTLIGHTS its tile at the very TOP of the dashboard (absolute-first sort — above queues
+  AND attention, "top is top" — AND lifted OUT of its origin section into a dedicated top row,
+  so it sits above the section headers too) for `agent-dashboard-spotlight-seconds` (u32, default
+  10; `0` = until another split is pinned), via a `pinGeneration`-guarded one-shot timer that a
+  later pin supersedes. **Unlike Hide it OPENS the panel** (`pin(surfaceID:)` calls `show()`
+  first). Separately, the tile for the **currently focused** surface always gets a LIGHT accent
+  border + header dot (`isFocused`), driven by a NEW `.ghosttyFocusedSurfaceDidChange` posted
+  from `Ghostty.App.recordFocusedSurface` (VIEW-only — `model.setFocusedSurface` stores the id
+  and does NOT re-sort). NOTE two distinct "pin" keys: `agent-dashboard-pin` floats the whole
+  PANEL vs. other windows; `agent-dashboard-spotlight-seconds` is the tile-top-pin duration.
+  Wiring: `pinDashboardSplit` in `Ghostty.App.swift`, `ghosttyPinDashboardSplit` +
+  `ghosttyFocusedSurfaceDidChange` in `GhosttyPackage.swift`, the AppDelegate observer,
+  `AgentDashboardController.swift` (`pin(surfaceID:)`/`subscribeFocus` + model
+  `pin`/`pinnedEntry`/`setFocusedSurface`/pinned-first `sorted`/`sections` lift),
+  `AgentPreviewTile.swift` (`isFocused`/`isPinned` visuals), `AgentDashboardView.swift`
+  (`tile(for:)` + top row), `Ghostty.Config.swift` (`agentDashboardSpotlightSeconds`). GUI-only
+  (new apprt enum ⇒ lib/xcframework rebuild; host unaffected, no session loss). **See
+  `AGENT-DASHBOARD.md` (→ Implementation notes → Focus highlight + spotlight pin) for the
+  bottom-anchor subsystem, detection, hook plumbing, wiring + tests.** **Preview-scale feedback-loop fix (always on):**
   `AgentMirrorPreview.geometry` keeps the original UNIFORM `referenceColumns` (125) scale (pane >125
   cols fills the width + horizontal-scrolls; a narrower one renders `cols/125` of the width at the
   same cell size as every tile), but reads the preview's cell size (`cell_width/height_px`) from the
@@ -545,7 +564,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

@@ -60,6 +60,16 @@ extension Ghostty {
             guard globalCurrentSurface !== surface else { return }
             globalPreviousSurface = globalCurrentSurface
             globalCurrentSurface = surface
+
+            // (ramon fork / Agent Dashboard) Broadcast the newly-focused surface so
+            // the Agent Dashboard can lightly highlight "the split I'm looking at".
+            // This is the single settled-focus chokepoint (its only caller already
+            // filters out dashboard mirror surfaces), so it fires once per real
+            // focus change.
+            NotificationCenter.default.post(
+                name: Notification.ghosttyFocusedSurfaceDidChange,
+                object: surface
+            )
         }
 
         #if os(macOS)
@@ -650,6 +660,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_HIDE_DASHBOARD_SPLIT:
                 return hideDashboardSplit(app, target: target)
 
+            case GHOSTTY_ACTION_PIN_DASHBOARD_SPLIT:
+                return pinDashboardSplit(app, target: target)
+
             case GHOSTTY_ACTION_INSTALL_AGENT_HOOKS:
                 installAgentHooks(app, target: target)
 
@@ -1234,6 +1247,33 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
                 NotificationCenter.default.post(
                     name: Notification.ghosttyHideDashboardSplit,
+                    object: surfaceView
+                )
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
+        // (ramon fork / Agent Dashboard) Pin (spotlight) the focused split at the top
+        // of the Agent Dashboard: unhide it + float its tile to the very top for a
+        // configurable duration (and open the panel if it's closed). Surface-scoped,
+        // mirroring `hideDashboardSplit`: no-op + false on an APP target; posts the
+        // resolved SurfaceView as `object`.
+        private static func pinDashboardSplit(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                NotificationCenter.default.post(
+                    name: Notification.ghosttyPinDashboardSplit,
                     object: surfaceView
                 )
                 return true

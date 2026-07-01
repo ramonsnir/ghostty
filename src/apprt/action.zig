@@ -403,6 +403,11 @@ pub const Action = union(Key) {
     /// The keyboard equivalent of a tile's Hide button. Hide-only (idempotent).
     hide_dashboard_split,
 
+    /// (ramon fork) Spotlight the target surface at the top of the Agent Dashboard
+    /// (macOS): unhide it + float its tile to the very top for a configurable
+    /// duration (opens the panel if closed). Payload-less, surface-scoped.
+    pin_dashboard_split,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -485,6 +490,7 @@ pub const Action = union(Key) {
         start_agent_queue,
         goto_last_surface,
         hide_dashboard_split,
+        pin_dashboard_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
