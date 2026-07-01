@@ -939,17 +939,17 @@ class AppDelegate: NSObject,
         }
 
         // (ramon fork / Agent Dashboard) When a dashboard modal's text field is the
-        // key window (e.g. the Adopt sheet's issue-key field), do NOT hijack the
-        // standard editing keys into Ghostty terminal bindings. The pinned dashboard
-        // panel can't become main (`canBecomeMain = false`), so with no terminal main
-        // window the block below would turn ⌘V into `paste_from_clipboard` (paste into
-        // a terminal) and consume it before the sheet's field editor ever sees it —
-        // the "can't paste into the Adopt modal" bug. Returning the event lets normal
-        // AppKit dispatch reach the Edit menu, whose Paste/Copy/Cut/Select-All are
-        // wired to the first-responder `paste:`/`copy:`/`cut:`/`selectAll:` selectors
-        // (see MainMenu.xib), which the field editor handles. Scoped to the dashboard
-        // panel + its attached sheet, so a ⌘V in a real terminal is unaffected.
-        if agentDashboardOwnsKeyWindow() { return event }
+        // key window (e.g. the Adopt sheet's issue-key field), route the standard
+        // editing keys straight to the field editor instead of letting Ghostty's
+        // terminal-binding path hijack ⌘V into `paste_from_clipboard`. We send the
+        // editing selector directly to the key window's first responder (bypassing
+        // the Edit menu, whose key equivalent doesn't reliably reach a SwiftUI-hosted
+        // field), with a clipboard-insert fallback for paste. Scoped to the dashboard
+        // panel + its sheet, so a ⌘V in a real terminal is unaffected.
+        if agentDashboardOwnsKeyWindow() {
+            if routeDashboardEditingKey(event) { return nil }
+            return event
+        }
 
         // If we have a main window then we don't process any of the keys
         // because we let it capture and propagate.
@@ -1004,7 +1004,10 @@ class AppDelegate: NSObject,
     /// `sheetParent`/`parent` up to the panel. Used to stop `localEventKeyDown` from
     /// stealing the standard editing keys from the modal's text field.
     private func agentDashboardOwnsKeyWindow() -> Bool {
-        guard let panel = agentDashboard?.window else { return false }
+        guard let panel = agentDashboard?.window else {
+            dashPasteLog("owns? NO agentDashboard.window is nil (keyWindow=\(String(describing: NSApp.keyWindow.map { type(of: $0) })))")
+            return false
+        }
         var current = NSApp.keyWindow
         var hops = 0
         while let win = current, hops < 8 {
@@ -1012,7 +1015,76 @@ class AppDelegate: NSObject,
             current = win.sheetParent ?? win.parent
             hops += 1
         }
+        dashPasteLog("owns? NO keyWindow=\(String(describing: NSApp.keyWindow.map { type(of: $0) })) not linked to panel")
         return false
+    }
+
+    /// (ramon fork / Agent Dashboard) Route a standard editing key (⌘X/⌘C/⌘V/⌘A) to
+    /// the key window's first responder (the modal field editor). Returns true if it
+    /// was an editing key we handled (caller then consumes the event). Sends the
+    /// selector DIRECTLY to the first responder (not via the Edit menu, which for a
+    /// SwiftUI-hosted field can be disabled/unreached and just beeps), with a
+    /// clipboard-insert fallback for paste when the responder doesn't take `paste:`.
+    private func routeDashboardEditingKey(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard mods == .command || mods == [.command, .shift],
+              let key = event.charactersIgnoringModifiers?.lowercased(),
+              let responder = NSApp.keyWindow?.firstResponder
+        else { return false }
+        let sel: Selector?
+        switch (key, mods.contains(.shift)) {
+        case ("x", false): sel = #selector(NSText.cut(_:))
+        case ("c", false): sel = #selector(NSText.copy(_:))
+        case ("v", false): sel = #selector(NSText.paste(_:))
+        case ("a", false): sel = #selector(NSResponder.selectAll(_:))
+        default: sel = nil
+        }
+        guard let sel else { return false }
+
+        let responds = responder.responds(to: sel)
+        dashPasteLog("route key=\(key) fr=\(type(of: responder)) responds(\(NSStringFromSelector(sel)))=\(responds)")
+
+        if responds {
+            NSApp.sendAction(sel, to: responder, from: nil)
+            return true
+        }
+
+        // Fallback for paste: insert the clipboard string via the text-input path
+        // (the responder handles typed characters, so insertText works even when it
+        // doesn't implement paste:).
+        if key == "v",
+           let s = NSPasteboard.general.string(forType: .string), !s.isEmpty {
+            if let tv = responder as? NSTextView {
+                tv.insertText(s, replacementRange: tv.selectedRange())
+                dashPasteLog("route paste fallback via NSTextView.insertText")
+                return true
+            }
+            let insertSel = NSSelectorFromString("insertText:")
+            if responder.responds(to: insertSel) {
+                responder.perform(insertSel, with: s)
+                dashPasteLog("route paste fallback via perform(insertText:)")
+                return true
+            }
+            dashPasteLog("route paste fallback FAILED — responder took neither paste: nor insertText:")
+        }
+        // Not handled — let it fall through.
+        return false
+    }
+
+    /// TEMP diagnostic: append a line to ~/Library/Logs/ghostty-ramon-paste-debug.log.
+    /// Remove once the dashboard-modal paste path is confirmed working.
+    private func dashPasteLog(_ msg: String) {
+        let line = "[paste] \(msg)\n"
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/ghostty-ramon-paste-debug.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if let fh = try? FileHandle(forWritingTo: url) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {

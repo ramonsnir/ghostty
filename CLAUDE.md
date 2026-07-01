@@ -436,14 +436,19 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   sheet's field editor (and the Edit menu) ever see it (local monitors run before menu
   key-equivalents). Fix: `localEventKeyDown` calls `agentDashboardOwnsKeyWindow()` (walks the
   key window's `sheetParent`/`parent` up to `agentDashboard.window` — a `.sheet` is a separate
-  attached `NSWindow`) and, when true, RETURNS THE EVENT immediately so normal AppKit dispatch
-  reaches the Edit menu → `paste:` on the field editor. Scoped to the panel+sheet, so ⌘V in a
-  real terminal is untouched. **Two earlier attempts FAILED and were reverted:** a panel
-  `performKeyEquivalent` override (never runs — the sheet is a separate window, so the sheet
-  window is key, not the panel) and a competing controller-side local monitor (the AppDelegate
-  monitor consumes ⌘V first regardless of monitor order). The fix must live in the hijacker
-  itself. Wiring: `AppDelegate.swift` (`agentDashboardOwnsKeyWindow` + the `localEventKeyDown`
-  guard). No new tests (behavior is the existing menu `paste:` path once the hijack is removed).
+  attached `NSWindow`) and, when true, calls `routeDashboardEditingKey` which sends the editing
+  selector (`cut:`/`copy:`/`paste:`/`selectAll:`) DIRECTLY to the key window's first responder
+  (`NSApp.sendAction(sel, to: firstResponder, from: nil)`), NOT via the Edit menu — deferring
+  to the menu (`return event`) only BEEPED (a SwiftUI-hosted field's menu key-equivalent
+  doesn't reach the field editor). Paste has a fallback: insert the clipboard string via
+  `NSTextView.insertText`/`perform(insertText:)` when the responder rejects `paste:`. Scoped to
+  the panel+sheet, so ⌘V in a real terminal is untouched. **Three earlier attempts FAILED:** a
+  panel `performKeyEquivalent` override (never runs — sheet is a separate window); a competing
+  controller-side local monitor (AppDelegate monitor consumes ⌘V first); and a plain
+  `return event` to defer to the menu (beeped). Wiring: `AppDelegate.swift`
+  (`agentDashboardOwnsKeyWindow` + `routeDashboardEditingKey` + the `localEventKeyDown` guard).
+  A temporary `dashPasteLog` (`~/Library/Logs/ghostty-ramon-paste-debug.log`) is present during
+  bring-up, to be removed once confirmed.
 
 - **Agent Manager** (fork-only, macOS, OFF by default; config `agent-manager` /
   `agent-manager-node-path`) — a Haiku status summarizer that annotates each dashboard tile with a

@@ -508,17 +508,24 @@ gotchas, not a recap.)
   `ghostty_app_key` (pastes into a *terminal* surface), and returns nil — **consuming ⌘V
   before the sheet's field editor ever sees it**. Local monitors run before menu
   key-equivalent processing, so the Edit menu never got a turn. Fix: `localEventKeyDown`
-  now calls `agentDashboardOwnsKeyWindow()` (walks the key window's `sheetParent`/`parent`
+  calls `agentDashboardOwnsKeyWindow()` (walks the key window's `sheetParent`/`parent`
   up to `agentDashboard.window`, since a `.sheet` is a separate attached `NSWindow`) and,
-  when true, **returns the event immediately** — no Ghostty-binding conversion — so normal
-  AppKit dispatch reaches the Edit menu and `paste:`/`copy:`/… land on the field editor.
-  Scoped strictly to the dashboard panel + its sheet, so a ⌘V in a real terminal is
-  untouched (terminals keep their own paste path). (Earlier attempts — a panel
-  `performKeyEquivalent` override, then a second competing local monitor — both failed:
-  the sheet is a separate window so the panel override never ran, and the AppDelegate
-  monitor consumes ⌘V first regardless of monitor ordering. The fix has to live in the
-  hijacker itself.) Wiring: `AppDelegate.swift` (`agentDashboardOwnsKeyWindow` + the
-  `localEventKeyDown` guard).
+  when true, calls `routeDashboardEditingKey(event)` — which sends the editing selector
+  (`cut:`/`copy:`/`paste:`/`selectAll:`) **directly to the key window's first responder**
+  (`NSApp.sendAction(sel, to: firstResponder, from: nil)`), NOT via the Edit menu.
+  **Important:** just returning the event to defer to the menu's `paste:` only produced a
+  BEEP — a SwiftUI-hosted field's menu key-equivalent path doesn't reach the field editor
+  — so we route to the responder directly. For paste there's a fallback: if the responder
+  doesn't take `paste:`, insert the clipboard string via `NSTextView.insertText` /
+  `perform(insertText:)` (typing works, so the input path does). Handled ⇒ consume; else
+  fall through. Scoped strictly to the dashboard panel + its sheet, so a ⌘V in a real
+  terminal is untouched. (Earlier attempts that FAILED: a panel `performKeyEquivalent`
+  override — never ran, the sheet is a separate window; a competing controller-side local
+  monitor — the AppDelegate monitor consumes ⌘V first; and a plain `return event` to defer
+  to the menu — beeped.) Wiring: `AppDelegate.swift` (`agentDashboardOwnsKeyWindow` +
+  `routeDashboardEditingKey` + the `localEventKeyDown` guard). NOTE: a temporary
+  `dashPasteLog` diagnostic (`~/Library/Logs/ghostty-ramon-paste-debug.log`) is present
+  during bring-up and will be removed once confirmed.
 
 ### Focus highlight + spotlight (find "the agent I'm looking at")
 
