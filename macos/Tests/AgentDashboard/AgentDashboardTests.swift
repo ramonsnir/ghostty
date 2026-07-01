@@ -2832,16 +2832,22 @@ struct QueueBacklogTests {
 // MARK: - Mirror auto-reconnect backoff (pure)
 
 struct AgentMirrorReconnectTests {
-    @Test func backoffDoublesThenCapsAt30() {
-        // 1, 2, 4, 8, 16, then capped at 30 for all later attempts.
+    @Test func backoffQuickBurstThenSteadyMinute() {
+        // Quick exponential burst 1, 2, 4, 8, 16, 30 for the first 6 attempts…
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 0) == 1)
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 1) == 2)
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 2) == 4)
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 3) == 8)
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 4) == 16)
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 5) == 30)
-        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 6) == 30)
-        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 100) == 30)
+    }
+
+    @Test func backoffSettlesAtSteadyIntervalForever() {
+        // …then a steady once-a-minute cadence forever — no cap, never gives up.
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 6) == AgentPreviewTile.steadyReconnectDelay)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 7) == 60)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 100) == 60)
+        #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: 10_000) == 60)
     }
 
     @Test func backoffNeverNegativeOrZero() {

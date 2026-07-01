@@ -82,47 +82,62 @@ struct AgentPreviewTile: View {
     // SurfaceView on `\(sessionID)-\(mirrorGeneration)`, so bumping the generation
     // recreates it with a fresh connection. `AgentMirrorPreview` polls
     // `surfaceView.processExited` (set true when `markMirrorEnded` synthesizes a
-    // `child_exited`) and calls back here to drive a backoff-then-cap reconnect —
-    // GUI-only, self-healing, no host restart.
+    // `child_exited`) and calls back here to drive a NEVER-GIVE-UP backoff reconnect
+    // — a few quick attempts, then a steady once-a-minute retry that persists for as
+    // long as the REAL split is alive. GUI-only, self-healing, no host restart.
     @State private var mirrorGeneration = 0
-    /// Reconnect attempts spent since the last time the mirror was healthy. Reset by
-    /// `handleMirrorStable` once a fresh connection stays up, and by `retryMirror`.
+    /// Reconnect attempts spent since the last time the mirror was healthy. Drives the
+    /// backoff curve; reset by `handleMirrorStable` once a fresh connection stays up,
+    /// and by `retryMirror`. It grows unbounded (we never give up) — only the delay
+    /// curve reads it, and it saturates at the steady interval.
     @State private var mirrorAttempts = 0
-    /// True once the auto-reconnect budget is exhausted — surfaces the manual
-    /// Refresh affordance instead of retrying forever on a truly dead endpoint.
-    @State private var mirrorFailed = false
+    /// True while a reconnect timer is ARMED and hasn't fired yet (the preview is
+    /// currently frozen, waiting out the backoff). Drives the "reconnect now" button
+    /// that lets the user skip a long wait; NOT a give-up flag (we always retry).
+    @State private var mirrorReconnectPending = false
+    /// Monotonic token that invalidates a scheduled reconnect timer when the user
+    /// forces an immediate retry or the mirror goes stable, so a stale timer can't
+    /// bump the generation a second time (double-remount).
+    @State private var mirrorReconnectToken = 0
 
-    /// Give up auto-reconnecting after this many attempts (then show Refresh).
-    private static let maxMirrorReconnects = 6
+    /// Number of fast exponential attempts (delays 1,2,4,8,16,30) before the backoff
+    /// settles into the steady once-a-minute interval. Also the point at which the
+    /// manual "reconnect now" affordance appears (waits are now ≥30s).
+    private static let quickReconnectAttempts = 6
+    /// Steady reconnect interval (seconds) once the quick burst is spent — we keep
+    /// retrying at this cadence forever (no cap) while the real split is alive.
+    static let steadyReconnectDelay: TimeInterval = 60
     /// Seconds a fresh mirror must stay connected before we consider it healthy and
     /// reset the backoff budget (so a LATER transient drop gets a full retry budget).
     static let mirrorStableSeconds: TimeInterval = 15
 
-    /// Backoff delay (seconds) before reconnect attempt `attempt` (0-based):
-    /// 1, 2, 4, 8, 16, 30, 30… capped at 30s. Pure + static for unit testing.
+    /// Backoff delay (seconds) before reconnect attempt `attempt` (0-based): a quick
+    /// exponential burst 1, 2, 4, 8, 16, 30 for the first `quickReconnectAttempts`,
+    /// then a STEADY `steadyReconnectDelay` (60s) forever — never give up. Pure +
+    /// static for unit testing.
     static func mirrorReconnectDelay(attempt: Int) -> Double {
-        let capped = min(max(attempt, 0), 5)
-        return min(Double(1 << capped), 30.0)
+        let a = max(attempt, 0)
+        if a >= quickReconnectAttempts { return steadyReconnectDelay }
+        return min(Double(1 << a), 30.0)
     }
 
     /// The mirror preview reported its socket ended. If the REAL split's process is
-    /// still alive this is a transient drop → schedule a backoff reconnect; if the
-    /// real process ALSO exited, the session is genuinely gone (the detector will
-    /// drop this tile shortly) so we do nothing and let it vanish.
+    /// still alive this is a transient drop → schedule a backoff reconnect (forever;
+    /// the steady 60s cadence after the quick burst). If the real process ALSO exited,
+    /// the session is genuinely gone (the detector will drop this tile shortly) so we
+    /// do nothing and let it vanish — that gate is what bounds the infinite retry.
     private func handleMirrorEnded() {
         guard let real = entry.realView, !real.processExited else { return }
-        guard !mirrorFailed else { return }
-        if mirrorAttempts >= Self.maxMirrorReconnects {
-            mirrorFailed = true
-            return
-        }
         let attempt = mirrorAttempts
         mirrorAttempts += 1
+        mirrorReconnectPending = true
         let session = entry.sessionID
+        let token = mirrorReconnectToken
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.mirrorReconnectDelay(attempt: attempt)) {
-            // Only recreate if we're still the same session and haven't since been
-            // manually reset / given up in the meantime.
-            guard entry.sessionID == session, !mirrorFailed else { return }
+            // Only recreate if we're still the same session and this scheduled timer
+            // hasn't been superseded by a manual retry / a stable reset in the meantime.
+            guard entry.sessionID == session, mirrorReconnectToken == token else { return }
+            mirrorReconnectPending = false
             mirrorGeneration &+= 1
         }
     }
@@ -130,15 +145,26 @@ struct AgentPreviewTile: View {
     /// A fresh mirror connection has stayed up long enough to be healthy — reset the
     /// backoff so a future transient drop starts a full retry budget from scratch.
     private func handleMirrorStable() {
+        mirrorReconnectToken &+= 1
         mirrorAttempts = 0
-        mirrorFailed = false
+        mirrorReconnectPending = false
     }
 
-    /// Manual "try again" after the auto-reconnect budget was exhausted.
+    /// Manual "reconnect now" — skip the remaining backoff wait and mount a fresh
+    /// mirror immediately, restarting the quick-attempt burst. Invalidates any pending
+    /// timer so it can't double-bump the generation afterward.
     private func retryMirror() {
+        mirrorReconnectToken &+= 1
         mirrorAttempts = 0
-        mirrorFailed = false
+        mirrorReconnectPending = false
         mirrorGeneration &+= 1
+    }
+
+    /// Whether to surface the manual "reconnect now" button: only while a reconnect is
+    /// pending AND we've entered the slow phase (waits ≥30s), so the user can skip a
+    /// long wait without waiting out the full minute. Hidden during the quick burst.
+    private var showReconnectNow: Bool {
+        mirrorReconnectPending && mirrorAttempts >= Self.quickReconnectAttempts
     }
 
     /// The fork's bell amber (matches the in-terminal bell border).
@@ -622,9 +648,10 @@ struct AgentPreviewTile: View {
                 // semi-transparent over the TOP of the live preview so it's readable
                 // at a glance, and FADED OUT on hover to reveal the terminal beneath.
                 .overlay(alignment: .top) { summaryOverlay }
-                // A manual reconnect affordance, shown ONLY after the auto-reconnect
-                // budget is exhausted (the frozen preview stays visible beneath it).
-                .overlay(alignment: .topTrailing) { if mirrorFailed { mirrorRefreshButton } }
+                // A manual "reconnect now" affordance, shown while a reconnect is
+                // pending in the slow (once-a-minute) phase so the user can skip the
+                // wait — auto-reconnect never gives up, so this is optional.
+                .overlay(alignment: .topTrailing) { if showReconnectNow { mirrorRefreshButton } }
                 // Re-create the mirror SurfaceView when the session id changes OR when
                 // `mirrorGeneration` is bumped by the auto-reconnect / manual Refresh
                 // path — a new id tears down the dead `.client` connection and mounts a
@@ -647,9 +674,10 @@ struct AgentPreviewTile: View {
         }
     }
 
-    /// (ramon fork / Agent Dashboard) Manual reconnect button, shown over the top-
-    /// trailing corner of a preview whose auto-reconnect budget was exhausted. A
-    /// click resets the backoff and mounts a fresh mirror connection.
+    /// (ramon fork / Agent Dashboard) Manual "reconnect now" button, shown over the
+    /// top-trailing corner while a reconnect is pending in the slow (once-a-minute)
+    /// phase. Auto-reconnect keeps trying on its own; a click just skips the wait and
+    /// mounts a fresh mirror connection immediately, restarting the quick burst.
     private var mirrorRefreshButton: some View {
         Button(action: retryMirror) {
             Image(systemName: "arrow.clockwise.circle.fill")
@@ -659,7 +687,7 @@ struct AgentPreviewTile: View {
                 .background(Circle().fill(.background).padding(2))
         }
         .buttonStyle(.plain)
-        .help("Preview disconnected — click to reconnect")
+        .help("Reconnecting… — click to reconnect now")
         .padding(6)
     }
 
@@ -825,7 +853,7 @@ struct AgentMirrorPreview: View {
     /// (ramon fork / Agent Dashboard) Called once when this mirror's `.client`
     /// connection ends (`surfaceView.processExited` flips true via the synthetic
     /// `child_exited` that `markMirrorEnded` pushes). The parent drives a
-    /// backoff-then-cap reconnect. Default no-op keeps other call sites (tests) valid.
+    /// never-give-up backoff reconnect. Default no-op keeps other call sites (tests) valid.
     var onEnded: () -> Void = {}
     /// (ramon fork / Agent Dashboard) Called once when a fresh connection has stayed
     /// up for `mirrorStableSeconds` — the parent resets its reconnect backoff budget.

@@ -688,7 +688,7 @@ gotchas, not a recap.)
   `framesFullHostGridAndPinsBottom`/`fallsBackToContainerWhenGridUnknown`/
   `zeroBackingDoesNotDivideByZero`).
 
-### Live previews auto-reconnect (never permanently dead until a GUI restart)
+### Live previews auto-reconnect (never give up while the split is alive)
 
 - **The problem this fixes.** Each preview is a read-only `.client` **mirror** to
   `ghostty-host` with a **single-shot** connection and **NO retry** in the Zig client
@@ -712,23 +712,32 @@ gotchas, not a recap.)
   `mirrorGeneration` after a backoff, tearing down the dead `.client` connection and mounting
   a fresh one.
 
-- **Backoff + cap + reset.** `mirrorReconnectDelay(attempt:)` is **1, 2, 4, 8, 16, 30, 30…s**
-  (pure/static, unit-tested). After `maxMirrorReconnects` (6) failed attempts it STOPS and sets
-  `mirrorFailed`, which surfaces a small top-trailing **Refresh** button (`mirrorRefreshButton`
-  → `retryMirror` resets the budget + reconnects) — the manual escape valve. A fresh connection
-  that stays up for `mirrorStableSeconds` (15) fires `onStable`, resetting the attempt budget so
-  a LATER transient drop gets a full retry allotment. **Reconnect is gated on the REAL split
-  still being alive** (`entry.realView?.processExited == false`): if the real process ALSO
-  exited the session is genuinely gone (the detector drops the tile shortly), so we do nothing
-  and let it vanish — no churn on a dead endpoint.
+- **Backoff — quick burst, then a steady minute, NEVER give up.** `mirrorReconnectDelay(attempt:)`
+  is a quick exponential burst **1, 2, 4, 8, 16, 30s** for the first `quickReconnectAttempts` (6),
+  then a **steady `steadyReconnectDelay` (60s) cadence FOREVER** (pure/static, unit-tested). It no
+  longer STOPS after a cap — the old `maxMirrorReconnects`/`mirrorFailed` give-up flag (which
+  required a manual Refresh to recover) is GONE, so a preview self-heals on its own without a
+  click, even for a socket that drops repeatedly for minutes. A fresh connection that stays up for
+  `mirrorStableSeconds` (15) fires `onStable`, resetting the attempt count so a LATER transient
+  drop starts a fresh quick burst. The small top-trailing button (`mirrorRefreshButton`) is now a
+  **"reconnect now"** convenience, not a rescue: it appears only while a reconnect is pending in
+  the slow phase (`showReconnectNow` = `mirrorReconnectPending && attempts >= quickReconnectAttempts`,
+  i.e. waits ≥30s) to let you skip the wait; a click (`retryMirror`) restarts the quick burst
+  immediately. A monotonic `mirrorReconnectToken` invalidates a scheduled timer when the user
+  forces a retry (or the mirror goes stable) so a stale timer can't double-bump the generation.
+  **Reconnect is gated on the REAL split still being alive** (`entry.realView?.processExited ==
+  false`): if the real process ALSO exited the session is genuinely gone (the detector drops the
+  tile shortly), so we do nothing and let it vanish — no churn on a dead endpoint, and this gate is
+  what BOUNDS the otherwise-infinite retry.
 
 - **Scope.** PURE SWIFT in `AgentPreviewTile.swift` — no Zig, no C, no host change; deployable
   live (GUI relaunch, no session loss). Wiring: `AgentPreviewTile.swift`
-  (`mirrorGeneration`/`mirrorAttempts`/`mirrorFailed` state, `mirrorReconnectDelay`/
-  `handleMirrorEnded`/`handleMirrorStable`/`retryMirror`, `mirrorRefreshButton`, the
-  `"\(sessionID)-\(mirrorGeneration)"` id, and `AgentMirrorPreview`'s `onEnded`/`onStable`
-  closures + the `.task` `processExited` poll). Tests: `AgentMirrorReconnectTests`
-  (`backoffDoublesThenCapsAt30`, `backoffNeverNegativeOrZero`). NOTE the host's 978
+  (`mirrorGeneration`/`mirrorAttempts`/`mirrorReconnectPending`/`mirrorReconnectToken` state,
+  `mirrorReconnectDelay`/`handleMirrorEnded`/`handleMirrorStable`/`retryMirror`/`showReconnectNow`,
+  `mirrorRefreshButton`, the `"\(sessionID)-\(mirrorGeneration)"` id, and `AgentMirrorPreview`'s
+  `onEnded`/`onStable` closures + the `.task` `processExited` poll). Tests: `AgentMirrorReconnectTests`
+  (`backoffQuickBurstThenSteadyMinute`, `backoffSettlesAtSteadyIntervalForever`,
+  `backoffNeverNegativeOrZero`). NOTE the host's 978
   `libxev … invalid state in submission queue` bursts are a SEPARATE per-session-loop issue
   (see PTYHOST.md) — they'd freeze the REAL terminal too, so they are not the preview-death
   cause; this reconnect self-heals every transient drop regardless of source.

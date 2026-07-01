@@ -425,13 +425,21 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   for a mirror the instant `markMirrorEnded` synthesizes a `child_exited` — `Surface.childExited`
   sets the bit and returns WITHOUT closing, `ghostty_surface_process_exited` reads it, so **no new
   C accessor**) and calls `onEnded`; `AgentPreviewTile` recreates the mirror by bumping
-  `mirrorGeneration` in the id `"\(sessionID)-\(mirrorGeneration)"` after a backoff
-  (`mirrorReconnectDelay` = 1,2,4,8,16,30…s, cap `maxMirrorReconnects`=6 → a top-trailing
-  **Refresh** button `retryMirror`; `onStable` after `mirrorStableSeconds`=15 resets the budget).
-  Reconnect is GATED on the REAL split still alive (`entry.realView?.processExited==false`) so a
-  genuinely-ended session just vanishes (no churn). PURE SWIFT (`AgentPreviewTile.swift`) — no
-  Zig/C/host change, live-deployable. Tests: `AgentMirrorReconnectTests`
-  (`backoffDoublesThenCapsAt30`, `backoffNeverNegativeOrZero`). (The host's 978 `libxev … invalid
+  `mirrorGeneration` in the id `"\(sessionID)-\(mirrorGeneration)"` after a backoff. **The backoff
+  NEVER GIVES UP** (was a 6-attempt cap that then required a manual Refresh): `mirrorReconnectDelay`
+  is a quick exponential burst 1,2,4,8,16,30 for the first `quickReconnectAttempts`=6, then a
+  STEADY `steadyReconnectDelay`=60s cadence FOREVER while the real split is alive — so a preview
+  self-heals without ever needing a click. The old `maxMirrorReconnects`/`mirrorFailed` give-up
+  flag is gone; a stale-timer guard (`mirrorReconnectToken`) prevents a double-remount. The
+  top-trailing **reconnect-now** button (`retryMirror`, gated on `showReconnectNow` =
+  `mirrorReconnectPending && attempts>=quickReconnectAttempts`) is now OPTIONAL — it only appears
+  during the slow (≥30s) waits to let you skip the wait, and a click restarts the quick burst.
+  `onStable` after `mirrorStableSeconds`=15 resets the backoff budget. Reconnect is GATED on the
+  REAL split still alive (`entry.realView?.processExited==false`) so a genuinely-ended session just
+  vanishes (no churn) — that gate is what BOUNDS the otherwise-infinite retry. PURE SWIFT
+  (`AgentPreviewTile.swift`) — no Zig/C/host change, live-deployable. Tests:
+  `AgentMirrorReconnectTests` (`backoffQuickBurstThenSteadyMinute`,
+  `backoffSettlesAtSteadyIntervalForever`, `backoffNeverNegativeOrZero`). (The host's 978 `libxev … invalid
   state in submission queue` bursts are a SEPARATE per-session-loop issue — see PTYHOST.md — not
   the preview-death cause; this self-heals every transient drop regardless.)
   **Paste (⌘V/⌘C/⌘X/⌘A) in the panel's modal text fields (always on, GUI-only):** ⌘V in a
