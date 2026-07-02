@@ -1488,6 +1488,11 @@ final class WebMonitorServer {
         /// Dashboard. Only meaningful when the dashboard is running. Drives the
         /// page's "hide hidden" filter.
         let hidden: Bool
+        /// (ramon fork / Hero Agents) True iff this surface is a HERO (`queueHero`). Only
+        /// meaningful when the dashboard is running. Drives the page's purple-star mark +
+        /// the "Focus on heroes" filter. Defaulted so existing `SurfaceRow(...)` call sites
+        /// (tests) that predate heroes still compile.
+        var hero: Bool = false
     }
 
     /// MUST be called on main. Iterates AppKit surfaces (thin) and defers the
@@ -1503,7 +1508,7 @@ final class WebMonitorServer {
         // @MainActor (the controller is); `surfacesJSON()` is always invoked on the
         // main hop (see the `.surfacesList` handler), so `assumeIsolated` is sound —
         // matching MCPLayout.surfaceRows' on-main contract.
-        let filter: (agents: Set<UUID>, hidden: Set<UUID>)? =
+        let filter: (agents: Set<UUID>, hidden: Set<UUID>, hero: Set<UUID>)? =
             MainActor.assumeIsolated {
                 (NSApp.delegate as? AppDelegate)?.agentDashboard?.webMonitorFilterState()
             }
@@ -1539,7 +1544,8 @@ final class WebMonitorServer {
                     splitIndex: splitIdx, splitCount: leaves.count, bell: view.bell,
                     attentionNeeded: view.attentionNeeded,
                     isAgent: filter?.agents.contains(view.id) ?? false,
-                    hidden: filter?.hidden.contains(view.id) ?? false))
+                    hidden: filter?.hidden.contains(view.id) ?? false,
+                    hero: filter?.hero.contains(view.id) ?? false))
             }
         }
         return Self.surfacesJSONData(
@@ -1571,7 +1577,7 @@ final class WebMonitorServer {
                 "splitIndex": $0.splitIndex, "splitCount": $0.splitCount,
                 "bell": $0.bell, "attentionNeeded": $0.attentionNeeded,
                 "attnIndicator": ($0.bell && monitorBell) || ($0.attentionNeeded && monitorAttn),
-                "isAgent": $0.isAgent, "hidden": $0.hidden,
+                "isAgent": $0.isAgent, "hidden": $0.hidden, "hero": $0.hero,
             ]
         }
         let obj: [String: Any] = ["agentDashboard": agentDashboard, "surfaces": arr]
@@ -1968,6 +1974,11 @@ final class WebMonitorServer {
       #filterbar input[type=checkbox] { width: 16px; height: 16px; accent-color: #f0a35e; }
       #filterbar.disabled { opacity: 0.5; }
       #filterbar.disabled label { color: #8b93a7; }
+      /* (ramon fork / Hero Agents) The hero-focus toggle + the per-row hero star are purple,
+         matching the dashboard tile / backlog / tab marker. */
+      #filterbar label.herofocus { color: #b18cff; font-weight: 600; }
+      #filterbar input#f-heroes { accent-color: #b18cff; }
+      .herostar { color: #b18cff; margin-right: 3px; }
       #filternote { color: #8b93a7; font-size: 11px; flex: 1 1 100%; }
       .grouphdr { padding: 10px 6px 5px; margin-top: 10px; border-bottom: 1px solid #2a2e3b; }
       .grouphdr:first-child { margin-top: 0; }
@@ -2059,6 +2070,7 @@ final class WebMonitorServer {
          dashboard. Both default ON and persist (localStorage). Disabled when the
          dashboard isn't running. -->
     <div id="filterbar">
+      <label class="herofocus"><input type="checkbox" id="f-heroes"> &#9733; Focus on heroes</label>
       <label><input type="checkbox" id="f-agents"> Agents only</label>
       <label><input type="checkbox" id="f-visible"> Hide hidden</label>
       <span id="filternote"></span>
@@ -2155,6 +2167,7 @@ final class WebMonitorServer {
       var banner = document.getElementById("banner");
       var listEl = document.getElementById("list");
       var filterBar = document.getElementById("filterbar");
+      var fHeroes = document.getElementById("f-heroes");
       var fAgents = document.getElementById("f-agents");
       var fVisible = document.getElementById("f-visible");
       var filterNote = document.getElementById("filternote");
@@ -2279,11 +2292,18 @@ final class WebMonitorServer {
       // hidden" only layers on top of "Agents only" (hiding is an agent concept),
       // so it's also disabled — and not applied — whenever "Agents only" is off.
       function applyFilterAvailability(dashboard) {
-        fAgents.disabled = !dashboard;
-        fVisible.disabled = !dashboard || !fAgents.checked;
+        // (Hero Agents) "Focus on heroes" is a full override: when it's on it shows ONLY heroes
+        // and IGNORES agents-only / hide-hidden, so those two are disabled (state kept, not
+        // applied). It needs the dashboard running (the hero set comes from it).
+        var heroFocus = dashboard && fHeroes.checked;
+        fHeroes.disabled = !dashboard;
+        fAgents.disabled = !dashboard || heroFocus;
+        fVisible.disabled = !dashboard || heroFocus || !fAgents.checked;
         if (dashboard) {
           filterBar.classList.remove("disabled");
-          filterNote.textContent = "";
+          filterNote.textContent = heroFocus
+            ? "Focusing on heroes \\u2014 showing all hero splits, ignoring hides."
+            : "";
         } else {
           filterBar.classList.add("disabled");
           filterNote.textContent = "Agent Dashboard not running \\u2014 filters unavailable.";
@@ -2310,9 +2330,14 @@ final class WebMonitorServer {
           // signal would be meaningless otherwise — never silently hide rows).
           // "Hide hidden" only applies on top of "Agents only": with agents-only
           // off, hidden splits are SHOWN (the checkbox is disabled too).
-          var agentsOnly = dashboard && fAgents.checked;
+          // (Hero Agents) "Focus on heroes" OVERRIDES the other filters: show ONLY heroes and
+          // IGNORE hides/agents-only (a hero is load-bearing — you want it regardless of hide
+          // state). When off, regular mode (agents-only + hide-hidden) as before.
+          var heroFocus = dashboard && fHeroes.checked;
+          var agentsOnly = !heroFocus && dashboard && fAgents.checked;
           var hideHidden = agentsOnly && fVisible.checked;
           var rows = allRows.filter(function (row) {
+            if (heroFocus) return !!row.hero;
             if (agentsOnly && !row.isAgent) return false;
             if (hideHidden && row.hidden) return false;
             return true;
@@ -2364,7 +2389,13 @@ final class WebMonitorServer {
               var d = document.createElement("div");
               d.className = "row";
               var t = document.createElement("div"); t.className = "t";
-              t.textContent = row.title || "(untitled)";
+              // (Hero Agents) A purple star marks a hero split (matches the dashboard/tab star).
+              if (row.hero) {
+                var hs = document.createElement("span"); hs.className = "herostar";
+                hs.textContent = "\\u2605"; hs.title = "Hero";
+                t.appendChild(hs);
+              }
+              t.appendChild(document.createTextNode(row.title || "(untitled)"));
               // (Bell Attention v2) The alert flag follows the monitor-tier-routed
               // `attnIndicator`. Both a PROMOTED attention and a raw bell render the
               // SAME 🔔 glyph — the hourglass for "needs you" read as unclear, so the two
@@ -2709,8 +2740,12 @@ final class WebMonitorServer {
 
       // Agent filters: default ON (only non-hidden agents) and persist per device.
       // Toggling re-renders the list immediately against the cached fetch.
+      // (Hero Agents) "Focus on heroes" defaults OFF (regular mode); persisted. Toggling it
+      // re-applies availability (it greys out the other two while on) then reloads the list.
+      fHeroes.checked = prefGet("ghostty_filter_heroes", "0") === "1";
       fAgents.checked = prefGet("ghostty_filter_agents", "1") === "1";
       fVisible.checked = prefGet("ghostty_filter_visible", "1") === "1";
+      fHeroes.onchange = function () { prefSet("ghostty_filter_heroes", fHeroes.checked ? "1" : "0"); applyFilterAvailability(!fHeroes.disabled); loadList(); };
       fAgents.onchange = function () { prefSet("ghostty_filter_agents", fAgents.checked ? "1" : "0"); loadList(); };
       fVisible.onchange = function () { prefSet("ghostty_filter_visible", fVisible.checked ? "1" : "0"); loadList(); };
 

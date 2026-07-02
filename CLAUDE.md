@@ -294,7 +294,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   dashboard isn't running; `/api/surfaces` is cached ~1s so it shows on the next refresh). Web Push
   needs a SECURE CONTEXT (`tailscale serve` in front, external HTTPS port ≠ internal bind port or
   the bind hits `EADDRINUSE`); the raw-tee is a HOST change (host restart loses sessions). The scroll
-  + hide changes are GUI/page-only (no Zig/host change). **See `WEB-MONITOR.md` (→ Implementation
+  + hide changes are GUI/page-only (no Zig/host change). **(Hero Agents) The web monitor marks HERO
+  splits:** `/api/surfaces` carries a per-row `hero` flag (from `webMonitorFilterState()` → the new
+  `model.heroIDs`), the page prepends a **purple ★** to a hero row, and a third filter **★ Focus on
+  heroes** (default OFF, persisted) OVERRIDES agents-only/hide-hidden to show ONLY heroes ignoring
+  hides. Hero web-push notifications lead with **⭐** — `onHero` (loud attention tier) already did;
+  `onBell` now also stars a hero's raw bell (hero looked up on main via
+  `AgentDashboardController.isHeroSurface`). Wiring: `WebMonitorServer.swift` (`SurfaceRow.hero` +
+  emit + filter tuple), `AgentDashboardController.swift` (`heroIDs`/`isHeroSurface` +
+  `webMonitorFilterState` triple), `WebMonitorPush.swift` (`onBell` hero glyph), page JS/CSS
+  (`f-heroes` + `.herostar`). Tests: `WebMonitorServerTests` (`surfacesJSONEmitsHero`). GUI-only.
+  **See `WEB-MONITOR.md` (→ Implementation
   notes) for the color/scrollback architecture, the Claude scroll-region finding, HTTP API,
   threading, push/VAPID, wiring + tests.**
 
