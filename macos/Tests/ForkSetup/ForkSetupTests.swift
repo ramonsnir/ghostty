@@ -25,10 +25,8 @@ struct ForkSetupTests {
             bundledHostExists: false,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "1",
-            bundleVersion: "2",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: "1.3.0",
+            currentReloadIdentity: "1.4.0",
             agentRunning: false,
             spec: spec())
         #expect(p == .skipNoBundledHost)
@@ -41,10 +39,8 @@ struct ForkSetupTests {
             bundledHostExists: true,
             existingPlistFileExists: false,
             existingPlistManagedBy: nil,
-            installedVersion: nil,
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: nil,
+            currentReloadIdentity: "1.4.0",
             agentRunning: false,
             spec: s)
         #expect(p == .install(s))
@@ -57,10 +53,8 @@ struct ForkSetupTests {
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: nil,
-            installedVersion: nil,
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: nil,
+            currentReloadIdentity: "1.4.0",
             agentRunning: true,   // even if something is running, not ours -> skip
             spec: spec())
         #expect(p == .skipExternallyManaged)
@@ -73,185 +67,117 @@ struct ForkSetupTests {
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon.debug",
-            installedVersion: "100",
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: "1.4.0",
+            currentReloadIdentity: "1.4.0",
             agentRunning: false,
             spec: spec(bundleID: "com.mitchellh.ghostty-ramon"))
         #expect(p == .skipExternallyManaged)
     }
 
-    @Test func planUpToDateWhenOursAndVersionMatches() {
+    // MARK: - plan(): reload-identity gate (protocol version + epoch, NOT the binary hash)
+
+    @Test func planUpToDateWhenOursAndIdentityMatches() {
+        // THE FIX: a GUI-only update keeps the reload identity stable (same protocol
+        // version + epoch) even though the host BINARY recompiled to a new cdhash. The
+        // notarized host's LWCR is identity-pinned, so no bootout is needed and the
+        // host's RAM-only sessions are preserved -> .upToDate.
         let p = ForkSetup.plan(
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: "1.4.0",
+            currentReloadIdentity: "1.4.0",
             agentRunning: true,
             spec: spec())
         #expect(p == .upToDate)
     }
 
-    @Test func planRevivesDeadHostWhenVersionMatches() {
-        // Recorded-current but NOT running (booted out / crash-looped / plist
+    @Test func planRevivesDeadHostWhenIdentityMatches() {
+        // Recorded-current identity but NOT running (booted out / crash-looped / plist
         // half-removed): NON-destructively revive on relaunch (no bootout, since the
-        // cdhash is unchanged) instead of being stranded on .upToDate.
+        // LWCR is still satisfied) instead of being stranded on .upToDate.
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: "1.4.0",
+            currentReloadIdentity: "1.4.0",
             agentRunning: false,
             spec: s)
         #expect(p == .revive(s))
     }
 
-    @Test func planReloadsOursWhenVersionChangedEvenIfRunning() {
-        // The LWCR gotcha: a new bundle version means a new host cdhash, so we must
-        // reload (bootout+bootstrap) to re-derive launchd's requirement — even
-        // though the OLD host is still running (that's exactly the update case).
+    @Test func planReloadsWhenProtocolMinorChangedEvenIfRunning() {
+        // A real wire-protocol change (minor bump) means the running old host can't
+        // serve the new GUI -> reload (bootout+bootstrap), even though it's up.
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "101",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: "1.4.0",
+            currentReloadIdentity: "1.5.0",
             agentRunning: true,
             spec: s)
         #expect(p == .reload(s))
     }
 
-    @Test func planAdoptsRunningHostWhenNoRecordedVersion() {
-        // SAFETY: we own the plist, never recorded a version (lost/cleared
-        // UserDefaults), but a healthy host is ALREADY running. We must NOT bootout
-        // (that would kill its RAM-only sessions) — adopt it instead.
+    @Test func planReloadsWhenEpochBumped() {
+        // The manual override: same protocol version, but `host_reload_epoch` bumped
+        // (a host-internal fix colleagues must actually run) -> reload.
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: nil,
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
+            installedReloadIdentity: "1.4.0",
+            currentReloadIdentity: "1.4.1",
+            agentRunning: true,
+            spec: s)
+        #expect(p == .reload(s))
+    }
+
+    @Test func planAdoptsRunningHostWhenNoRecordedIdentity() {
+        // The hash->identity UPGRADE transition (and lost-defaults): we own the plist,
+        // never recorded an identity, but a healthy host is ALREADY running. Because the
+        // LWCR is identity-pinned we must NOT bootout (that would kill its RAM-only
+        // sessions) — adopt it (record the identity, no restart). This is the key
+        // improvement over the old hash gate, which force-reloaded on this transition.
+        let s = spec()
+        let p = ForkSetup.plan(
+            bundledHostExists: true,
+            existingPlistFileExists: true,
+            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
+            installedReloadIdentity: nil,
+            currentReloadIdentity: "1.4.0",
             agentRunning: true,
             spec: s)
         #expect(p == .adoptRunning(s))
     }
 
-    @Test func planReloadsWhenNoRecordedVersionAndNotRunning() {
-        // No recorded version AND the host isn't running -> safe to (re)bootstrap;
-        // there are no live sessions to lose.
+    @Test func planRevivesWhenNoRecordedIdentityAndNotRunning() {
+        // No recorded identity AND the host isn't running -> non-destructive revive
+        // (bootstrap, no bootout); there are no live sessions to lose, and no reload is
+        // warranted (the LWCR is identity-pinned).
         let s = spec()
         let p = ForkSetup.plan(
             bundledHostExists: true,
             existingPlistFileExists: true,
             existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: nil,
-            bundleVersion: "100",
-            installedHostHash: nil,
-            currentHostHash: nil,
-            agentRunning: false,
-            spec: s)
-        #expect(p == .reload(s))
-    }
-
-    // MARK: - plan(): host-binary-hash gate (don't restart the host on GUI-only updates)
-
-    @Test func planNoReloadWhenHostHashMatchesDespiteVersionBump() {
-        // THE FIX: a GUI-only update bumps the bundle version but ships a byte-
-        // identical host (same cdhash). The reload would needlessly bootout the host
-        // and kill its RAM-only sessions. With a recorded hash that matches the
-        // bundled binary, we stay .upToDate even though installedVersion != bundleVersion.
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "101",            // version changed…
-            installedHostHash: "abc123",
-            currentHostHash: "abc123",       // …but host binary did NOT
-            agentRunning: true,
-            spec: spec())
-        #expect(p == .upToDate)
-    }
-
-    @Test func planRevivesWhenHostHashMatchesButHostDown() {
-        // Host unchanged (hash matches) but not running → non-destructive revive
-        // (no bootout), same as the version-match revive path.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "101",
-            installedHostHash: "abc123",
-            currentHostHash: "abc123",
+            installedReloadIdentity: nil,
+            currentReloadIdentity: "1.4.0",
             agentRunning: false,
             spec: s)
         #expect(p == .revive(s))
     }
 
-    @Test func planReloadsWhenHostHashChanged() {
-        // The host binary genuinely changed (new cdhash) → reload is mandatory to
-        // re-derive launchd's LWCR, even though the old host is still running.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "101",
-            installedHostHash: "oldhash",
-            currentHostHash: "newhash",
-            agentRunning: true,
-            spec: s)
-        #expect(p == .reload(s))
-    }
-
-    @Test func planHashMatchWinsOverVersionMatchToo() {
-        // Belt-and-suspenders: when the hash matches, the decision is upToDate
-        // regardless of the version values (the hash is the authoritative gate).
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "100",
-            installedHostHash: "same",
-            currentHostHash: "same",
-            agentRunning: true,
-            spec: spec())
-        #expect(p == .upToDate)
-    }
-
-    @Test func planFallsBackToVersionWhenNoRecordedHash() {
-        // Transition (first launch under hash-gating): no recorded hash yet, but the
-        // bundled binary hashes fine. With version matching, stay upToDate; the caller
-        // records the hash so later GUI-only updates take the hash path.
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedVersion: "100",
-            bundleVersion: "100",
-            installedHostHash: nil,          // never recorded
-            currentHostHash: "freshlyhashed",
-            agentRunning: true,
-            spec: spec())
-        #expect(p == .upToDate)
+    @Test func decodeReloadIdentityUnpacksMajorMinorEpoch() {
+        // (major << 32) | (minor << 16) | epoch, matching embedded.zig's packing.
+        #expect(ForkSetup.decodeReloadIdentity((1 << 32) | (4 << 16) | 0) == "1.4.0")
+        #expect(ForkSetup.decodeReloadIdentity((1 << 32) | (4 << 16) | 1) == "1.4.1")
+        #expect(ForkSetup.decodeReloadIdentity((2 << 32) | (0 << 16) | 0) == "2.0.0")
+        #expect(ForkSetup.decodeReloadIdentity(0) == "0.0.0")
     }
 
     // MARK: - LaunchAgentSpec shape

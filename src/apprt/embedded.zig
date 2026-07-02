@@ -21,8 +21,19 @@ const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
+const host_protocol = @import("../host/protocol.zig");
 
 const log = std.log.scoped(.embedded_window);
+
+/// (ramon fork) Host-reload epoch — the GUI-side lever for forcing a
+/// `ghostty-host` LaunchAgent reload independent of the wire protocol version.
+/// It is combined with `PROTOCOL_VERSION_MAJOR`/`MINOR` into the "reload identity"
+/// that `ghostty_host_reload_identity()` returns; ForkSetup gates the colleague
+/// host's bootout+bootstrap on THAT identity (not the binary hash). Bump this
+/// when a host change needs a reload but does NOT bump the protocol version
+/// (e.g. a host-internal fix that colleagues must actually run). This const is
+/// NOT linked into `ghostty-host`, so bumping it recompiles the lib only.
+const host_reload_epoch: u16 = 0;
 
 pub const resourcesDir = internal_os.resourcesDir;
 
@@ -1438,6 +1449,24 @@ pub const CAPI = struct {
         if (builtin.target.os.tag.isDarwin()) {
             _ = Darwin;
         }
+    }
+
+    /// (ramon fork) A packed identity of the bundled `ghostty-host`'s
+    /// GUI-visible behavior: (protocol_major << 32) | (protocol_minor << 16) |
+    /// host_reload_epoch. ForkSetup gates the host LaunchAgent reload
+    /// (bootout+bootstrap) on THIS value rather than the host binary's hash: a
+    /// GUI-only release that does not change the protocol version or the epoch
+    /// leaves a colleague's running host (and its RAM-only sessions) untouched.
+    /// This is safe because the notarized host's launchd LWCR is pinned to the
+    /// Developer-ID identity (identifier + Team ID), NOT the cdhash — so a new
+    /// same-identity build satisfies the existing requirement with no reload
+    /// and cannot trip the exit-78 crash-loop (verified empirically). Bump the
+    /// protocol version (a real wire change) or `host_reload_epoch` (a
+    /// host-internal change colleagues must run) to force a reload.
+    export fn ghostty_host_reload_identity() u64 {
+        return (@as(u64, host_protocol.PROTOCOL_VERSION_MAJOR) << 32) |
+            (@as(u64, host_protocol.PROTOCOL_VERSION_MINOR) << 16) |
+            @as(u64, host_reload_epoch);
     }
 
     /// Create a new app.

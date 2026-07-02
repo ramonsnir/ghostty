@@ -1,5 +1,5 @@
-import CryptoKit
 import Foundation
+import GhosttyKit
 import OSLog
 import Security
 import UserNotifications
@@ -96,13 +96,20 @@ enum ForkSetup {
     /// (successfully) installed/reloaded for. Drives version-aware reload.
     static let kInstalledHostVersion = "forkSetup.hostLaunchAgentVersion"
 
-    /// UserDefaults key: a SHA-256 of the bundled `ghostty-host` binary the
-    /// LaunchAgent was last (re)loaded for. The RELOAD decision keys off THIS, not
-    /// the bundle version: launchd pins the LWCR to the binary's cdhash, which only
-    /// changes when the binary changes — so a GUI-only update (version bumps, host
-    /// byte-identical) must NOT bootout-restart the host and kill its RAM-only
-    /// sessions. Identical bytes ⇒ identical cdhash ⇒ no reload needed.
-    static let kInstalledHostHash = "forkSetup.hostLaunchAgentBinaryHash"
+    /// UserDefaults key: the host RELOAD IDENTITY the LaunchAgent was last
+    /// (re)loaded for — `ghostty_host_reload_identity()` decoded to "major.minor.epoch"
+    /// (protocol version + the GUI-side `host_reload_epoch`). The RELOAD decision keys
+    /// off THIS, not the bundle version and NOT the binary hash. The notarized host's
+    /// launchd LWCR is pinned to the Developer-ID identity (identifier + Team ID), NOT
+    /// the cdhash (verified empirically), so a new same-identity host build satisfies
+    /// the existing requirement and loads on the next natural restart with no bootout.
+    /// We therefore only bootout-reload (which kills the host's RAM-only sessions) when
+    /// the protocol/epoch actually changed — i.e. the running host can't serve the new
+    /// GUI, or a host-internal fix must run. A GUI-only update keeps the identity
+    /// stable ⇒ no reload ⇒ sessions preserved. (Replaced the former binary-hash key
+    /// `forkSetup.hostLaunchAgentBinaryHash`, which reloaded on any recompile even when
+    /// behavior was unchanged.)
+    static let kInstalledHostReloadIdentity = "forkSetup.hostLaunchAgentReloadIdentity"
 
     /// UserDefaults key: the CFBundleVersion the `ghostty-mcp` shim was last
     /// installed to `~/.local/bin` for. Drives version-aware reinstall.
@@ -315,10 +322,8 @@ enum ForkSetup {
         bundledHostExists: Bool,
         existingPlistFileExists: Bool,
         existingPlistManagedBy: String?,
-        installedVersion: String?,
-        bundleVersion: String,
-        installedHostHash: String?,
-        currentHostHash: String?,
+        installedReloadIdentity: String?,
+        currentReloadIdentity: String,
         agentRunning: Bool,
         spec: LaunchAgentSpec
     ) -> Plan {
@@ -328,35 +333,33 @@ enum ForkSetup {
             guard existingPlistManagedBy == spec.managingBundleID else {
                 return .skipExternallyManaged
             }
-            // PRIMARY gate: the host BINARY's content hash. launchd pins the LWCR to
-            // the binary's cdhash, which changes IFF the binary changes — so the
-            // reload (bootout+bootstrap, which kills the host's RAM-only sessions) is
-            // mandatory ONLY when the bundled host differs from the one we last loaded.
-            // The bundle VERSION bumps on EVERY release (it's `git rev-list --count`),
-            // so keying off it reloaded the host even for GUI-only updates that ship a
-            // byte-identical host — needlessly destroying sessions. Identical bytes ⇒
-            // identical cdhash ⇒ LWCR still valid ⇒ NO reload.
-            if let recordedHash = installedHostHash, let currentHash = currentHostHash {
-                if recordedHash == currentHash {
-                    // Host binary unchanged. Healthy → nothing to do; a recorded-but-
+            // PRIMARY gate: the host RELOAD IDENTITY (protocol version + epoch), NOT
+            // the binary hash and NOT the bundle version. The notarized host's launchd
+            // LWCR is pinned to the Developer-ID identity (identifier + Team ID), not
+            // the cdhash (verified) — so a new same-identity host satisfies the existing
+            // requirement and loads on the next natural restart with no bootout. We
+            // therefore reload (bootout+bootstrap, which KILLS the host's RAM-only
+            // sessions) ONLY when the protocol/epoch changed — i.e. the running old host
+            // can't serve the new GUI, or a host-internal fix must actually run. A
+            // GUI-only release keeps the identity stable ⇒ sessions preserved. Bump the
+            // protocol version or `host_reload_epoch` (embedded.zig) to force a reload.
+            if let recorded = installedReloadIdentity {
+                if recorded == currentReloadIdentity {
+                    // Identity unchanged. Healthy → nothing to do; a recorded-but-
                     // not-running host (booted out / plist half-removed) is revived
-                    // NON-DESTRUCTIVELY (no bootout, since the cdhash is unchanged).
+                    // NON-DESTRUCTIVELY (no bootout — the LWCR is still satisfied).
                     return agentRunning ? .upToDate : .revive(spec)
                 }
-                return .reload(spec)  // binary (cdhash) changed → LWCR re-derive required
+                return .reload(spec)  // protocol/epoch changed → deliver the new host
             }
-            // No usable hash (first launch under hash-gating, lost defaults, or the
-            // bundled binary couldn't be hashed) → fall back to the legacy version
-            // heuristic for this ONE transition. After it records a hash, subsequent
-            // GUI-only updates take the hash path above and never reload.
-            if installedVersion == bundleVersion {
-                return agentRunning ? .upToDate : .revive(spec)
-            }
-            // Version differs/unknown. A healthy host already running with no recorded
-            // version is ADOPTED (record + refresh plist, no bootout) rather than
-            // reloaded, so we don't kill live sessions over lost bookkeeping.
-            if installedVersion == nil && agentRunning { return .adoptRunning(spec) }
-            return .reload(spec)
+            // No recorded identity: first launch under identity-gating (upgrading from
+            // a hash-keyed build — every existing colleague hits this exactly once), or
+            // lost defaults. Because the LWCR is identity-pinned, this transition is
+            // NON-DESTRUCTIVE — record the identity WITHOUT reloading. A running host is
+            // adopted; a not-running one is revived (bootstrap, no bootout). This is a
+            // strict improvement over the old hash gate's one-last-version-reload, which
+            // needlessly killed sessions on the upgrade.
+            return agentRunning ? .adoptRunning(spec) : .revive(spec)
         }
         return .install(spec)
     }
@@ -979,20 +982,17 @@ enum ForkSetup {
         let ours = fileExists && managedBy == spec.managingBundleID
         let agentRunning = ours ? hostRunning(target: target) : false
 
-        // Hash the bundled host binary so the reload decision can key off the cdhash
-        // (which only changes when the binary changes), NOT the always-bumping bundle
-        // version. Cheap (a few ms for a ~MB binary) and only when a host is bundled.
-        let currentHostHash = bundledHostExists
-            ? hostBinaryHash(path: spec.hostBinaryPath, fileManager: fileManager) : nil
+        // The lib-reported reload identity (protocol version + epoch) drives the reload
+        // decision — see kInstalledHostReloadIdentity. Read once here; the same string
+        // is recorded on every acting branch.
+        let currentReloadIdentity = hostReloadIdentityString()
 
         let decision = plan(
             bundledHostExists: bundledHostExists,
             existingPlistFileExists: fileExists,
             existingPlistManagedBy: managedBy,
-            installedVersion: defaults.string(forKey: kInstalledHostVersion),
-            bundleVersion: bundleVersion,
-            installedHostHash: defaults.string(forKey: kInstalledHostHash),
-            currentHostHash: currentHostHash,
+            installedReloadIdentity: defaults.string(forKey: kInstalledHostReloadIdentity),
+            currentReloadIdentity: currentReloadIdentity,
             agentRunning: agentRunning,
             spec: spec)
 
@@ -1002,37 +1002,49 @@ enum ForkSetup {
         case .skipExternallyManaged:
             logger.info("host LaunchAgent at \(plistPath, privacy: .public) is externally managed; not touching it")
         case .upToDate:
-            logger.debug("host LaunchAgent already installed for version \(bundleVersion, privacy: .public)")
+            logger.debug("host LaunchAgent already loaded for reload identity \(currentReloadIdentity, privacy: .public)")
         case .adoptRunning(let spec):
-            // Healthy host already running but no recorded version (lost defaults):
-            // record the version + host hash and refresh the plist on disk — NO
-            // bootout, so the running host's sessions survive. Recording the hash here
-            // means future GUI-only updates take the hash path and never reload.
+            // Healthy host already running but no recorded reload identity (upgrading
+            // from a hash-keyed build, or lost defaults): record the identity + refresh
+            // the plist on disk — NO bootout, so the running host's sessions survive.
+            // Recording it here means future GUI-only updates compare equal and never
+            // reload. (Safe on the hash→identity upgrade because the LWCR is
+            // identity-pinned — the running old host keeps serving.)
             try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
             defaults.set(bundleVersion, forKey: kInstalledHostVersion)
-            if let h = currentHostHash { defaults.set(h, forKey: kInstalledHostHash) }
-            logger.info("adopted already-running host LaunchAgent \(spec.label, privacy: .public); recorded version \(bundleVersion, privacy: .public) without restart")
+            defaults.set(currentReloadIdentity, forKey: kInstalledHostReloadIdentity)
+            logger.info("adopted already-running host LaunchAgent \(spec.label, privacy: .public); recorded reload identity \(currentReloadIdentity, privacy: .public) without restart")
         case .install(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                hostHash: currentHostHash, defaults: defaults, fileManager: fileManager,
+                                reloadIdentity: currentReloadIdentity, defaults: defaults, fileManager: fileManager,
                                 bootout: false, verb: "installed")
         case .reload(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                hostHash: currentHostHash, defaults: defaults, fileManager: fileManager,
+                                reloadIdentity: currentReloadIdentity, defaults: defaults, fileManager: fileManager,
                                 bootout: true, verb: "reloaded")
         case .revive(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                hostHash: currentHostHash, defaults: defaults, fileManager: fileManager,
+                                reloadIdentity: currentReloadIdentity, defaults: defaults, fileManager: fileManager,
                                 bootout: false, verb: "revived")
         }
     }
 
-    /// SHA-256 (lowercase hex) of the file at `path`, or nil if it can't be read. Used
-    /// as a cdhash proxy for the host-reload decision: identical bytes ⇒ identical
-    /// cdhash ⇒ the LWCR is still valid ⇒ no bootout/reload needed.
-    private static func hostBinaryHash(path: String, fileManager: FileManager) -> String? {
-        guard let data = fileManager.contents(atPath: path) else { return nil }
-        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    /// The bundled host's reload identity as "major.minor.epoch", decoded from the
+    /// lib's packed `ghostty_host_reload_identity()` (protocol version + the GUI-side
+    /// `host_reload_epoch`). The value the reload gate compares — see
+    /// kInstalledHostReloadIdentity. Not the host BINARY's identity: it's the lib's,
+    /// which is exactly what we want (the lib and the bundled host are built together).
+    static func hostReloadIdentityString() -> String {
+        decodeReloadIdentity(ghostty_host_reload_identity())
+    }
+
+    /// Pure decode of the packed reload identity → "major.minor.epoch". Split out so
+    /// the bit-unpacking is unit-testable without the lib call.
+    static func decodeReloadIdentity(_ packed: UInt64) -> String {
+        let major = (packed >> 32) & 0xFFFF
+        let minor = (packed >> 16) & 0xFFFF
+        let epoch = packed & 0xFFFF
+        return "\(major).\(minor).\(epoch)"
     }
 
     /// Write the plist and (re)bring-up the agent.
@@ -1043,7 +1055,7 @@ enum ForkSetup {
     ///   then guarantees a loaded-but-stopped job starts (it never restarts a
     ///   running one, lacking `-k`).
     private static func installAndBootstrap(
-        spec: LaunchAgentSpec, plistPath: String, bundleVersion: String, hostHash: String?,
+        spec: LaunchAgentSpec, plistPath: String, bundleVersion: String, reloadIdentity: String,
         defaults: UserDefaults, fileManager: FileManager, bootout: Bool, verb: String
     ) {
         let dir = (plistPath as NSString).deletingLastPathComponent
@@ -1085,10 +1097,10 @@ enum ForkSetup {
         let loaded = hostRunning(target: target)
         if loaded {
             defaults.set(bundleVersion, forKey: kInstalledHostVersion)
-            // Record the host-binary hash so subsequent GUI-only updates (version
-            // bumps with a byte-identical host) compare equal and skip the reload.
-            if let hostHash { defaults.set(hostHash, forKey: kInstalledHostHash) }
-            logger.info("\(verb, privacy: .public) host LaunchAgent \(spec.label, privacy: .public) for version \(bundleVersion, privacy: .public)")
+            // Record the reload identity so subsequent GUI-only updates (protocol/epoch
+            // unchanged) compare equal and skip the reload, preserving live sessions.
+            defaults.set(reloadIdentity, forKey: kInstalledHostReloadIdentity)
+            logger.info("\(verb, privacy: .public) host LaunchAgent \(spec.label, privacy: .public) for reload identity \(reloadIdentity, privacy: .public)")
         } else {
             // The old job was booted out and the new one would not load: the host
             // is OFFLINE (terminals will be empty) until the next relaunch. Leave

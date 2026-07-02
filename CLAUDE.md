@@ -868,17 +868,30 @@ facts for an agent touching this code:
   (local/dev builds skip — they don't bundle it), and it writes an ownership marker
   (`GhosttyAppManaged` = bundle id) into any plist it creates, refusing to touch a
   pre-existing plist that lacks the marker. **The host reload is gated on the host
-  BINARY's hash, NOT the bundle version** — `plan(...)` compares a recorded SHA-256 of
-  the bundled `ghostty-host` (`kInstalledHostHash`, via `hostBinaryHash`) against the
-  current one; it does the bootout+bootstrap (which re-derives launchd's LWCR for a new
-  cdhash, and KILLS the host's RAM-only sessions) ONLY when the binary actually changed.
-  A GUI-only update bumps `CFBundleVersion` (it's `git rev-list --count`) but ships a
-  byte-identical host → identical cdhash → LWCR still valid → **`.upToDate`, no reload,
-  sessions preserved.** (Before this, the reload keyed off the version and so restarted
-  the host on EVERY update.) Caveats: one last version-heuristic reload on the FIRST
-  launch under hash-gating (no hash recorded yet — then the hash is recorded and future
-  GUI-only updates skip); and a COLD release build re-links the host ad-hoc → new cdhash
-  → still reloads (only warm-incremental GUI-only releases ship an identical host). Pure planner `plan(...)`,
+  RELOAD IDENTITY — protocol version + a manual epoch — NOT the binary hash and NOT the
+  bundle version** — `plan(...)` compares a recorded "major.minor.epoch" string
+  (`kInstalledHostReloadIdentity`, from `ghostty_host_reload_identity()` = protocol
+  `PROTOCOL_VERSION_MAJOR`/`MINOR` + the GUI-side `host_reload_epoch` const in
+  `embedded.zig`, decoded by the pure `decodeReloadIdentity`) against the current one; it
+  does the bootout+bootstrap (which re-derives launchd's LWCR and KILLS the host's RAM-only
+  sessions) ONLY when that identity changed — i.e. a real wire-protocol change OR a manual
+  epoch bump (a host-internal fix colleagues must actually run). **Why identity, not the
+  cdhash: the notarized host's launchd LWCR is pinned to the Developer-ID identity
+  (identifier + Team ID `72PSTG4224`), NOT the cdhash** — verified empirically (`codesign
+  -dr -` shows no cdhash clause; a re-signed same-identity binary respawns under the old
+  LWCR with no exit-78). So a new same-identity host build satisfies the existing LWCR and
+  loads fine on the next natural restart with NO reload — the reload the old hash gate did
+  on every recompile was unnecessary. A GUI-only update (host recompiled to a new cdhash but
+  same protocol/epoch) is therefore **`.upToDate`, no reload, sessions preserved.** (This
+  supersedes the former SHA-256 binary-hash gate `kInstalledHostHash`/`hostBinaryHash`, which
+  reloaded on ANY host recompile — e.g. a Config.zig change that links into the host — even
+  when behavior was identical.) Transition: an upgrading colleague has a recorded hash but no
+  recorded identity, so `plan(...)` takes the no-recorded-identity branch ONCE — which is now
+  NON-DESTRUCTIVE (`.adoptRunning` if the host is up, `.revive` if down: record the identity,
+  no bootout), a strict improvement over the old gate's one-last-version-reload. **The
+  cdhash-pinning exit-78 crash-loop gotcha still applies to Ramon's HAND-BUILT ad-hoc dev host
+  (no cert chain → DR falls back to cdhash) — but that host is hand-managed, untouched by
+  ForkSetup.** Pure planner `plan(...)`,
   `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`,
   `planLocalSecretsInstall`, `localHasMCPToken`, `planMCPRegister` are unit-tested. Wiring:
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG;
@@ -886,9 +899,13 @@ facts for an agent touching this code:
   `AppDelegate.swift` (the synchronous `performHostSetup()` call + the off-main
   `performDeferred()`), `project.pbxproj` (iOS exclusion). Tests:
   `macos/Tests/ForkSetup/ForkSetupTests.swift` (incl. `cli*` plan gates, `welcome*`,
-  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, the host-hash gate
-  `planNoReloadWhenHostHashMatchesDespiteVersionBump`/`planReloadsWhenHostHashChanged`/etc.,
-  and the seed-content `configSeed*` assertions for the new onboarding content).
+  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, the host reload-identity
+  gate `planUpToDateWhenOursAndIdentityMatches`/`planReloadsWhenProtocolMinorChanged*`/
+  `planReloadsWhenEpochBumped`/`planAdoptsRunningHostWhenNoRecordedIdentity` (the non-destructive
+  hash→identity transition)/`decodeReloadIdentityUnpacksMajorMinorEpoch`, and the seed-content
+  `configSeed*` assertions for the new onboarding content). The Zig side adds
+  `ghostty_host_reload_identity()` in `src/apprt/embedded.zig` (+ `include/ghostty.h`) — a
+  lib/xcframework rebuild, NO host restart (the export isn't compiled into `ghostty-host`).
 
 - **Auto-provisioned MCP secrets (`~/.config/ghostty-ramon/local`, ForkSetup job 2).** On
   first launch the fork writes the untracked machine-local `local` with `mcp-listen =
@@ -1024,9 +1041,12 @@ facts for an agent touching this code:
 - **The host is bundled IN the app for colleagues** (vs. Ramon's `~/.local/bin`
   hand-deploy), so Sparkle — which only updates the `.app` — carries new host builds,
   and notarization covers the host automatically. A colleague's update restarts the host
-  (ends live RAM-only sessions) **only when the host binary actually changed** — the
-  ForkSetup reload is hash-gated (see the First-launch-setup bullet), so a GUI-only
-  update leaves the running host (and its sessions) untouched.
+  (ends live RAM-only sessions) **only when the host RELOAD IDENTITY changed** (protocol
+  version or the manual `host_reload_epoch`) — the ForkSetup reload is identity-gated (see
+  the First-launch-setup bullet), so a GUI-only update — even one that recompiles the host
+  to a new cdhash — leaves the running host (and its sessions) untouched. This relies on the
+  notarized host's LWCR being Developer-ID-identity-pinned (verified), so the new same-identity
+  binary loads on the next natural restart without a reload.
 
 - **The `ghostty-mcp` shim is bundled + installed-to-PATH for colleagues too** — same
   pattern as the host, so the MCP agent-control feature isn't dropped from the DMG. **BOTH
@@ -1130,9 +1150,15 @@ socket path), so **replace `/Users/ramon` with that machine's home** (and keep
 (RunAtLoad starts it); (4) ensure `pty-host = <that socket>` is in the fork config.
 
 ### ⚠️ After redeploying the host binary, RELOAD the agent — NEVER just `kill` it
-launchd pins a code-signing launch requirement (**LWCR**) to the host binary's
-**code identity (cdhash)**. The fork builds `ghostty-host` **ad-hoc / linker-signed**,
-so **every rebuild has a new cdhash**. If you swap `~/.local/bin/ghostty-host` under a
+launchd pins a code-signing launch requirement (**LWCR**) derived from the host binary's
+Designated Requirement. **For Ramon's hand-built dev host this is the cdhash**: the fork
+builds `ghostty-host` **ad-hoc / linker-signed** (no cert chain → the DR falls back to a
+cdhash requirement), so **every rebuild has a new cdhash** and the old LWCR rejects it.
+(The COLLEAGUE bundled host is different — Developer-ID-signed, so its DR/LWCR is pinned
+to the identity `identifier + Team ID`, NOT the cdhash; that's exactly why the ForkSetup
+reload gate keys off the protocol/epoch reload IDENTITY, not the binary hash — a new
+same-identity host loads under the old LWCR fine. This whole section is about the AD-HOC
+dev host below.) If you swap `~/.local/bin/ghostty-host` under a
 running job and then merely `kill` it, `KeepAlive` respawns the NEW binary under the
 OLD pinned requirement → launchd rejects it → it **exits 78 (`EX_CONFIG`) before it
 can even write a log line** → hot crash loop (`launchctl print …` shows
@@ -1142,12 +1168,16 @@ standalone, even with the exact plist env; only launchd rejects it. (This cost a
 debug session on 2026-06-17; the symptom "I killed the host and a new window didn't
 relaunch it / empty screens" is THIS.)
 
-> This LWCR reload is why the COLLEAGUE path (`ForkSetup`, which manages the *bundled*
-> host) only reloads when the host binary's cdhash actually changes — it records a
-> SHA-256 of the bundled host and skips the bootout+bootstrap on a GUI-only update
-> whose host is byte-identical, so live sessions survive. See the First-launch-setup
-> bullet under "Distribution / sharing the fork". (Ramon's hand-managed host here is a
-> separate, manual deploy — ForkSetup leaves it alone via the ownership-marker gate.)
+> The COLLEAGUE path (`ForkSetup`, which manages the *bundled* Developer-ID host) does
+> NOT face this cdhash trap: that host's LWCR is identity-pinned, so a new same-identity
+> build satisfies it. ForkSetup therefore only bootout-reloads when the host RELOAD
+> IDENTITY (protocol version + `host_reload_epoch`) changes — NOT on every host recompile
+> — and skips the reload on a GUI-only update even if the host's cdhash changed, so live
+> sessions survive. (Older builds keyed off a SHA-256 of the host binary and reloaded on
+> any recompile; superseded — see the First-launch-setup bullet under "Distribution /
+> sharing the fork".) Ramon's hand-managed ad-hoc host here is a separate manual deploy —
+> ForkSetup leaves it alone via the ownership-marker gate, and it still needs the
+> bootout+bootstrap reload above on every rebuild.
 
 **Correct deploy-then-restart of the host** (run from a NON-ramon terminal —
 Terminal.app or the official Ghostty — since it ends every session, including this
