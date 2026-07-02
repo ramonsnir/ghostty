@@ -373,7 +373,7 @@ test("applyCommands: a set_keep is NOT counted as an active-runs change (keep li
 /** A minimal Assignment for seeding `run.active` in the release tests. */
 function asg(run: QueueRun, key: string): void {
   run.active.set(key, {
-    queueName: run.runName, key, sessionID: 1, gridSlot: 0, state: "RUNNING", sinceMs: 0,
+    queueName: run.runName, key, sessionID: 1, gridSlot: 0, state: "RUNNING", sinceMs: 0, hero: false,
   });
 }
 
@@ -516,6 +516,7 @@ function regWithRun(name: string, activeKeys: string[] = []): { reg: RunRegistry
       gridSlot: 0,
       state: "RUNNING",
       sinceMs: 0,
+      hero: false,
     };
     run.active.set(k, a);
   }
@@ -578,4 +579,59 @@ test("applyCommands: an infer_key-only batch is NOT an active-run-set change", (
   const { reg } = regWithRun("R");
   const changed = applyCommands(reg, [{ action: "infer_key", run: "R", surfaceUUID: "u-1" }], () => null);
   assert.equal(changed, false, "infer_key is a pure noop");
+});
+
+// ---------------------------------------------------------------------------
+// (hero) promote / demote reducer cases. The reducer does the PURE part — flip the run-level
+// `hero` bit + mark for an annotation re-stamp; the physical eject/re-stamp is the runner side
+// effect. Shaped like `adopt` ({run, surfaceUUID, key?}); NOT counted as an active-runs change.
+// ---------------------------------------------------------------------------
+
+test("applyCommand promote: flips the run-level hero bit + returns promoted", () => {
+  const { reg, run } = regWithRun("R", ["K"]);
+  const res = applyCommand(reg, { action: "promote", run: "R", surfaceUUID: "u-K", key: "K" }, () => null);
+  assert.equal(res.kind, "promoted");
+  assert.equal(res.runName, "R");
+  assert.ok(run.hero.has("K"), "promote adds the key to the run-level hero set");
+  assert.ok(run.keepDirty.has("K"), "promote marks the key for an annotation re-stamp this sweep");
+});
+
+test("applyCommand demote: clears the run-level hero bit + returns demoted", () => {
+  const { reg, run } = regWithRun("R", ["K"]);
+  run.hero.add("K"); // it is a hero going in
+  const res = applyCommand(reg, { action: "demote", run: "R", surfaceUUID: "u-K", key: "K" }, () => null);
+  assert.equal(res.kind, "demoted");
+  assert.equal(res.runName, "R");
+  assert.ok(!run.hero.has("K"), "demote removes the key from the run-level hero set");
+  assert.ok(run.keepDirty.has("K"), "demote marks the key for an annotation re-stamp this sweep");
+});
+
+test("applyCommand promote/demote: unknown run is a no-op", () => {
+  const reg: RunRegistry = new Map();
+  assert.equal(applyCommand(reg, { action: "promote", run: "ghost", surfaceUUID: "u" }, () => null).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "demote", run: "ghost", surfaceUUID: "u" }, () => null).kind, "noop");
+});
+
+test("applyCommand promote/demote: missing run/surfaceUUID each no-op (no hero mutation)", () => {
+  const { reg, run } = regWithRun("R", ["K"]);
+  assert.equal(applyCommand(reg, { action: "promote", surfaceUUID: "u", key: "K" }, () => null).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "promote", run: "R", key: "K" }, () => null).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "demote", surfaceUUID: "u", key: "K" }, () => null).kind, "noop");
+  assert.equal(applyCommand(reg, { action: "demote", run: "R", key: "K" }, () => null).kind, "noop");
+  assert.equal(run.hero.size, 0, "no hero mutation on any malformed promote/demote");
+});
+
+test("applyCommands: a promote/demote-only batch is NOT an active-run-set change", () => {
+  const { reg } = regWithRun("R", ["K"]);
+  // Both live in the per-run store (the hero set), NOT active-runs.json — like set_keep/adopt.
+  assert.equal(
+    applyCommands(reg, [{ action: "promote", run: "R", surfaceUUID: "u-K", key: "K" }], () => null),
+    false,
+    "promote is a per-run store change, not an active-runs change",
+  );
+  assert.equal(
+    applyCommands(reg, [{ action: "demote", run: "R", surfaceUUID: "u-K", key: "K" }], () => null),
+    false,
+    "demote is a per-run store change, not an active-runs change",
+  );
 });

@@ -38,6 +38,13 @@ export interface ProviderListSpec {
   keyField: string;
   titleField?: string;
   urlField?: string;
+  /** (hero) OPTIONAL JSON field name whose TRUTHY value marks the item a HERO — a
+   *  load-bearing item that competes for YOUR ATTENTION, not a machine slot (see
+   *  HERO-AGENTS.md). Mirrors title/url mapping: sourcing is QUEUE-DEFINED (e.g. a
+   *  provider computes a boolean from a special label). Absent ⇒ no items are heroes
+   *  from the list (promotion still works). Added to the parser's RESERVED set so the
+   *  hero field never leaks into `meta`. */
+  heroField?: string;
 }
 
 /** The `status` provider command: a per-key terminal probe emitting
@@ -226,6 +233,21 @@ export interface QueueTemplate {
   // template JSON is now simply ignored.
 }
 
+/** (hero) The set of dispatch GATES that can currently block a WAITING item, carried
+ *  per-item in the status report (`QueueItemRef.blockReasons`) so the backlog canvas can
+ *  say EXACTLY why an item hasn't dispatched (e.g. a hero stuck on `heroSlots` — nobody
+ *  should waste time bumping `maxItems`). Dependency-blocked is intentionally NOT a reason
+ *  here (the graph edges already show it). See HERO-AGENTS.md → backlog waiting states.
+ *   - "maxItems"          — the run's lifetime dispatch budget is exhausted.
+ *   - "queueConcurrency"  — the run's `concurrency` slots are all occupied.
+ *   - "globalConcurrency" — the fleet-wide `agent-queue-max-total` is exhausted.
+ *   - "heroSlots"         — a HERO item and the fleet-wide `agent-queue-hero-max` is full. */
+export type BlockReason =
+  | "maxItems"
+  | "queueConcurrency"
+  | "globalConcurrency"
+  | "heroSlots";
+
 // ---------------------------------------------------------------------------
 // Work item (§5) — the genericity-boundary unit a provider emits.
 // ---------------------------------------------------------------------------
@@ -238,6 +260,11 @@ export interface WorkItem {
   title?: string;
   url?: string;
   meta?: Record<string, string>;
+  /** (hero) True when the provider `heroField` marked this item load-bearing (see
+   *  HERO-AGENTS.md). Parsed from `heroField`; absent/false ⇒ a regular item. A hero
+   *  dispatches into its OWN tab and is gated by the fleet-wide `agent-queue-hero-max`
+   *  cap, orthogonal to the regular concurrency/maxItems/max-total pools. */
+  hero?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,4 +321,11 @@ export interface Assignment {
   title?: string;
   /** Optional work-item url, display-only / for the dashboard badge. */
   url?: string;
+  /** (hero) Whether this assignment is a HERO (see HERO-AGENTS.md). Rehydrated on
+   *  restart like `keep`/`dispatched` (run-level state), so a promoted split comes back
+   *  a hero after a GUI restart. A hero is counted against the fleet-wide
+   *  `agent-queue-hero-max` cap (orthogonal to the regular concurrency/maxItems/max-total
+   *  pools), is kept-by-default (never auto-closed), and lives in its own dedicated tab.
+   *  Flipped by the `promote`/`demote` commands. */
+  hero: boolean;
 }

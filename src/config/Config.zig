@@ -3013,6 +3013,19 @@ keybind: Keybinds = .{},
 /// opt-in fleet cap. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
 @"agent-queue-max-total": u32 = 0,
 
+/// (ramon fork / Agent Queue Supervisor) Fleet-wide ceiling on how many live
+/// HERO agents the supervisor may have at once, across ALL queue runs. A hero
+/// is a load-bearing item that competes for YOUR ATTENTION rather than a
+/// machine slot, so this cap is ORTHOGONAL to `concurrency`, `maxItems`, and
+/// `agent-queue-max-total`: a hero does not consume a regular slot and is not
+/// counted against `max-total`, and vice-versa. Default **2** (a deliberate
+/// discipline limit — how many heroes you can hold in your head at once, not a
+/// resource limit). **`0` DISABLES hero dispatch** — hero-marked items then
+/// wait visibly on the hero-slot gate (promotion of a running regular still
+/// works and may exceed the cap; no new heroes dispatch until it drains under).
+/// Fork-only — keep it in `~/.config/ghostty-ramon/config`.
+@"agent-queue-hero-max": u32 = 2,
+
 /// (ramon fork / Phase 2b) AF_UNIX socket path of a running `ghostty-host`
 /// (`zig-out/bin/ghostty-host --listen=<sockpath>`). When set, a new surface
 /// connects to that host and runs its terminal emulation ON THE HOST,
@@ -11746,5 +11759,57 @@ test "agent-queue: parse and default" {
             cfg.@"agent-queue-templates-dir".?,
         );
         try testing.expectEqual(@as(u32, 4), cfg.@"agent-queue-max-total");
+    }
+}
+
+test "agent-queue-hero-max: parse and default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default is 2 (a deliberate discipline limit).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(@as(u32, 2), cfg.@"agent-queue-hero-max");
+    }
+
+    // Explicit positive value parses.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-hero-max=5",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(@as(u32, 5), cfg.@"agent-queue-hero-max");
+    }
+
+    // 0 is valid and disables hero dispatch.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-hero-max=0",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(@as(u32, 0), cfg.@"agent-queue-hero-max");
+    }
+
+    // Round-trips through clone (the Config copy path).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-hero-max=3",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+
+        var cfg2 = try cfg.clone(alloc);
+        defer cfg2.deinit();
+        try testing.expectEqual(@as(u32, 3), cfg2.@"agent-queue-hero-max");
     }
 }

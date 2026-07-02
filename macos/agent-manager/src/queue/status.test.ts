@@ -12,6 +12,11 @@ function items(...keys: Array<string | [string, string]>): WorkItem[] {
   );
 }
 
+/** A hero-marked work item (for block-reason tests). */
+function hero(key: string): WorkItem {
+  return { key, hero: true };
+}
+
 /** A baseline "running, armed, list OK" input; override per test. */
 function input(over: Partial<QueueStatusInputs> = {}): QueueStatusInputs {
   return {
@@ -131,6 +136,133 @@ test("null listItems (arm sweep) → 0 queued, no next, starting", () => {
   assert.equal(r.queued, 0);
   assert.deepEqual(r.next, []);
   assert.equal(r.phase, "starting");
+});
+
+// ---------------------------------------------------------------------------
+// (hero) heroMax / heroActive + per-item blockReasons.
+// ---------------------------------------------------------------------------
+
+test("hero: heroMax/heroActive pass through (present + present:false), default 0 when omitted", () => {
+  const r = queueStatusReport(input({ heroMax: 2, heroActive: 1 }));
+  assert.equal(r.heroMax, 2);
+  assert.equal(r.heroActive, 1);
+  // Omitted → 0 (a legacy build that doesn't feed the hero inputs).
+  const bare = queueStatusReport(input());
+  assert.equal(bare.heroMax, 0);
+  assert.equal(bare.heroActive, 0);
+  // present:false still carries the globals (defaulting 0).
+  const gone = queueStatusReport(input({ present: false, heroMax: 3, heroActive: 2 }));
+  assert.equal(gone.heroMax, 3);
+  assert.equal(gone.heroActive, 2);
+});
+
+test("hero: blockReasons is OMITTED on an unblocked waiting item (a free slot exists)", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A", "B"),
+    // Regular room everywhere; hero disabled but the items aren't heroes.
+    regularConcurrencyRemaining: 5,
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    heroMax: 0,
+    heroActive: 0,
+  }));
+  assert.deepEqual(r.next, [{ key: "A" }, { key: "B" }]);
+  assert.equal(r.next[0].blockReasons, undefined);
+});
+
+test("hero: a regular waiting item at concurrency 0 gets queueConcurrency only", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    regularConcurrencyRemaining: 0, // full
+    regularGlobalRemaining: 5,      // fleet has room
+    regularMaxItemsRemaining: 5,    // budget has room
+    heroMax: 2,
+    heroActive: 0,
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["queueConcurrency"]);
+});
+
+test("hero: a regular waiting item blocked by ALL THREE regular gates lists them in canonical order", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    regularConcurrencyRemaining: 0,
+    regularGlobalRemaining: 0,
+    regularMaxItemsRemaining: 0,
+    heroMax: 2,
+    heroActive: 0,
+  }));
+  // Canonical order: maxItems, queueConcurrency, globalConcurrency.
+  assert.deepEqual(r.next[0].blockReasons, ["maxItems", "queueConcurrency", "globalConcurrency"]);
+});
+
+test("hero: an unlimited (Infinity) regular cap never blocks", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    regularConcurrencyRemaining: 3,
+    regularGlobalRemaining: Number.POSITIVE_INFINITY, // max-total unlimited
+    regularMaxItemsRemaining: Number.POSITIVE_INFINITY, // maxItems unlimited
+    heroMax: 2,
+    heroActive: 0,
+  }));
+  assert.equal(r.next[0].blockReasons, undefined);
+});
+
+test("hero: a waiting HERO item over the fleet cap gets heroSlots ONLY (never a regular gate)", () => {
+  const r = queueStatusReport(input({
+    listItems: [hero("H-1")],
+    // Regular gates are ALL full — but a hero doesn't compete for them.
+    regularConcurrencyRemaining: 0,
+    regularGlobalRemaining: 0,
+    regularMaxItemsRemaining: 0,
+    heroMax: 2,
+    heroActive: 2, // heroRemaining = 0 → blocked on hero slots
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["heroSlots"]);
+});
+
+test("hero: a waiting HERO item with a free hero slot is NOT blocked", () => {
+  const r = queueStatusReport(input({
+    listItems: [hero("H-1")],
+    regularConcurrencyRemaining: 0,
+    regularGlobalRemaining: 0,
+    regularMaxItemsRemaining: 0,
+    heroMax: 2,
+    heroActive: 1, // heroRemaining = 1 > 0 → free
+  }));
+  assert.equal(r.next[0].blockReasons, undefined);
+});
+
+test("hero: heroMax=0 (hero dispatch DISABLED) blocks a waiting hero on heroSlots", () => {
+  const r = queueStatusReport(input({
+    listItems: [hero("H-1")],
+    regularConcurrencyRemaining: 5,
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    heroMax: 0,
+    heroActive: 0, // heroRemaining = 0 → disabled → blocked
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["heroSlots"]);
+});
+
+test("hero: a mixed backlog attributes each item by its own pool", () => {
+  const r = queueStatusReport(input({
+    listItems: [{ key: "R-1" }, hero("H-1"), { key: "R-2" }],
+    regularConcurrencyRemaining: 0, // regulars blocked on queue concurrency
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    heroMax: 1,
+    heroActive: 0, // hero has room → NOT blocked
+  }));
+  const byKey = new Map(r.next.map((n) => [n.key, n.blockReasons]));
+  assert.deepEqual(byKey.get("R-1"), ["queueConcurrency"]);
+  assert.deepEqual(byKey.get("R-2"), ["queueConcurrency"]);
+  assert.equal(byKey.get("H-1"), undefined); // hero slot free
+});
+
+test("hero: block-reason inputs OMITTED → no blockReasons anywhere (legacy build)", () => {
+  const r = queueStatusReport(input({ listItems: items("A", "B") }));
+  assert.equal(r.next[0].blockReasons, undefined);
+  assert.equal(r.next[1].blockReasons, undefined);
 });
 
 // ---------------------------------------------------------------------------

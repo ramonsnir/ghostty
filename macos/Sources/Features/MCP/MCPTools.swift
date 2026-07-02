@@ -203,6 +203,10 @@ enum MCPTools {
                     "queueUrl": ["type": "string", "description": "Agent Queue: the work-item URL (clickable in the tile)."],
                     "keep": ["type": "boolean", "description": "Agent Queue: the split's keep verdict — true ⇒ the queue will NOT auto-close this completed split (kept open for manual work); drives the dashboard pin."],
                     "queueKeySuggested": ["type": "string", "description": "Agent Queue (adopt): a Haiku-inferred work-item key suggestion for the adopt modal's prefill. Empty string means 'inferred nothing' (a definite negative, distinct from absent = 'no suggestion yet'). Partial-merge like the other tags."],
+                    // (Hero Agents) the split's hero verdict, written through this same merge
+                    // tool — declared so an additionalProperties:false validator doesn't reject
+                    // the call (the same rationale as the queue tags above).
+                    "hero": ["type": "boolean", "description": "Hero Agents: the split's hero verdict — true ⇒ this queue item is a HERO (own dedicated tab, loud attention tier, never auto-closed, accounted against the fleet-wide agent-queue-hero-max); drives the tab hero glyph + tile promote/demote visual."],
                 ],
                 "required": ["id"],
                 "additionalProperties": false,

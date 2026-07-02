@@ -4,7 +4,7 @@
 // what it's about to do (count + what's next). PURE: `queueStatusReport` derives the report
 // from primitives; runner.ts owns the I/O (caching the last list + the MCP call).
 
-import type { GraphNode, WorkItem } from "./types.js";
+import type { BlockReason, GraphNode, WorkItem } from "./types.js";
 
 /** One item reference for the dashboard header dropdowns (key + optional title + the
  *  Linear/tracker URL, so a "0 waiting"/"N running" click can link out). */
@@ -12,6 +12,13 @@ export interface QueueItemRef {
   key: string;
   title?: string;
   url?: string;
+  /** (hero) The dispatch GATE(s) currently blocking this WAITING item, so the backlog
+   *  canvas can say EXACTLY why it hasn't dispatched (a hero stuck on `heroSlots` vs. a
+   *  regular past `maxItems`). Present ONLY on `next[]` (waiting) refs, and only when at
+   *  least one gate is blocking it (omitted when the item WOULD dispatch — i.e. a free
+   *  slot exists — so an unblocked backlog item carries no reasons). Dependency-blocked is
+   *  intentionally NOT a reason (the graph edges already show it). See HERO-AGENTS.md. */
+  blockReasons?: BlockReason[];
 }
 
 /** The run-level health snapshot the GUI dashboard renders. Mirrors the Swift
@@ -52,6 +59,13 @@ export interface QueueStatusReport {
   /** (release) Up to `nextLimit` of those HELD items — each with a per-item Release button
    *  (clears its latch so it re-dispatches on the next list poll, no tracker round-trip). */
   held: QueueItemRef[];
+  /** (hero) The fleet-wide `agent-queue-hero-max` cap (0 = hero dispatch DISABLED). Global,
+   *  NOT per-run — the same value on every run's report. Mirrors the Swift `QueueStatus`. */
+  heroMax: number;
+  /** (hero) The fleet-wide count of live HERO assignments across ALL runs (`heroActiveGlobal`).
+   *  The hero gate's remaining is `heroMax − heroActive`; when ≥ `heroMax`, a waiting hero
+   *  carries a `heroSlots` block reason. Global, NOT per-run. */
+  heroActive: number;
 }
 
 /** Inputs for the pure status builder — primitives + the run's in-memory facts. */
@@ -90,6 +104,27 @@ export interface QueueStatusInputs {
   concurrency?: number;
   /** How many "next" items to include (default 5). */
   nextLimit?: number;
+  // ----- (hero) block-reason attribution inputs (per-run gate ROOM this sweep) -----
+  // These let the pure builder attribute WHY each waiting item can't dispatch. All are the
+  // room REMAINING (≥ 0); a gate is "blocking" when its room is ≤ 0. They are the SAME
+  // primitives the dispatch gate consults (`dispatchCandidates`), passed in so the report
+  // stays a pure function. Omitted ⇒ no attribution (legacy/present:false ⇒ blockReasons absent).
+  /** (hero) The fleet-wide `agent-queue-hero-max` cap (0 = hero dispatch disabled). Echoed as
+   *  `heroMax`. */
+  heroMax?: number;
+  /** (hero) Fleet-wide live-hero count (`heroActiveGlobal`). Echoed as `heroActive`. A waiting
+   *  HERO item is `heroSlots`-blocked when `heroMax − heroActive ≤ 0`. */
+  heroActive?: number;
+  /** (hero) Remaining REGULAR concurrency room = `effConcurrency − activeRegular` (≤ 0 ⇒ a
+   *  waiting regular item is `queueConcurrency`-blocked). */
+  regularConcurrencyRemaining?: number;
+  /** (hero) Remaining fleet-wide REGULAR global room = `agent-queue-max-total −
+   *  totalRegularActive` (≤ 0 ⇒ a waiting regular item is `globalConcurrency`-blocked).
+   *  POSITIVE_INFINITY when max-total is unlimited. */
+  regularGlobalRemaining?: number;
+  /** (hero) Remaining REGULAR lifetime budget = `maxItemsCap − lifetimeDispatched` (≤ 0 ⇒ a
+   *  waiting regular item is `maxItems`-blocked). POSITIVE_INFINITY when maxItems is unlimited. */
+  regularMaxItemsRemaining?: number;
 }
 
 /**
@@ -116,6 +151,8 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       running: [],
       heldCount: 0,
       held: [],
+      heroMax: input.heroMax ?? 0,
+      heroActive: input.heroActive ?? 0,
     };
   }
 
@@ -164,6 +201,45 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     return ref;
   };
 
+  // (hero) Attribute the dispatch GATE(s) blocking a WAITING item. PURE. A HERO item competes
+  // ONLY for the fleet-wide hero slots (`heroSlots`); a REGULAR item competes for the run's
+  // concurrency (`queueConcurrency`), the fleet-wide `max-total` (`globalConcurrency`), and the
+  // run's lifetime budget (`maxItems`) — and can be blocked by several at once. A gate is
+  // blocking when its remaining room is ≤ 0. Returns `undefined` when no applicable gate blocks
+  // (the item WOULD dispatch — a slot exists; it's just next in line), so `blockReasons` is
+  // OMITTED on an unblocked ref. Dependency-blocked is intentionally NOT a reason here.
+  const heroRemaining =
+    input.heroMax !== undefined && input.heroActive !== undefined
+      ? input.heroMax - input.heroActive
+      : undefined;
+  const blockReasonsFor = (item: WorkItem): BlockReason[] | undefined => {
+    const reasons: BlockReason[] = [];
+    if (item.hero === true) {
+      // A hero-marked item: only the fleet-wide hero-slot gate applies. `heroMax === 0` (hero
+      // dispatch disabled) yields heroRemaining ≤ 0 too, so a disabled build shows `heroSlots`.
+      if (heroRemaining !== undefined && heroRemaining <= 0) reasons.push("heroSlots");
+    } else {
+      // A regular item: the three regular-pool gates, in the report's canonical order.
+      if (input.regularMaxItemsRemaining !== undefined && input.regularMaxItemsRemaining <= 0)
+        reasons.push("maxItems");
+      if (
+        input.regularConcurrencyRemaining !== undefined &&
+        input.regularConcurrencyRemaining <= 0
+      )
+        reasons.push("queueConcurrency");
+      if (input.regularGlobalRemaining !== undefined && input.regularGlobalRemaining <= 0)
+        reasons.push("globalConcurrency");
+    }
+    return reasons.length > 0 ? reasons : undefined;
+  };
+  // A waiting ref carries its block reasons (when blocked). Only `next` (waiting) items get them.
+  const toNextRef = (i: WorkItem): QueueItemRef => {
+    const ref = toRef(i);
+    const reasons = blockReasonsFor(i);
+    if (reasons !== undefined) ref.blockReasons = reasons;
+    return ref;
+  };
+
   return {
     queueName: input.queueName,
     present: true,
@@ -174,10 +250,12 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     dispatched: input.dispatched,
     maxItems: input.maxItemsCap,
     concurrency: input.concurrency ?? 0,
-    next: deduped.slice(0, nextLimit).map(toRef),
+    next: deduped.slice(0, nextLimit).map(toNextRef),
     running: input.runningItems.map(toRef),
     heldCount: heldItems.length,
     held: heldItems.slice(0, nextLimit).map(toRef),
+    heroMax: input.heroMax ?? 0,
+    heroActive: input.heroActive ?? 0,
   };
 }
 

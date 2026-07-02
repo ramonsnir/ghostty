@@ -71,6 +71,9 @@ final class AgentManagerController {
     private let agentQueueTemplatesDir: String?
     /// The global fleet-wide concurrency cap across all queue runs (default 8).
     private let agentQueueMaxTotal: UInt32
+    /// The fleet-wide HERO cap across all queue runs (default 2; `0` disables
+    /// hero dispatch). Orthogonal to `agentQueueMaxTotal`/concurrency/maxItems.
+    private let agentQueueHeroMax: UInt32
 
     /// The directory the sidecar lives in (`<app>/Contents/Resources/agent-manager`
     /// in a bundle; the source tree's `macos/agent-manager` during dev). Resolved
@@ -114,6 +117,7 @@ final class AgentManagerController {
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
         self.agentQueueTemplatesDir = ghostty.config.agentQueueTemplatesDir
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
+        self.agentQueueHeroMax = ghostty.config.agentQueueHeroMax
         self.mcpPortOffset = MCPServer.portOffset(forBundleID: Bundle.main.bundleIdentifier)
         self.sidecarDir = Self.resolveSidecarDir()
     }
@@ -289,7 +293,8 @@ final class AgentManagerController {
             into: env,
             enabled: agentQueueEnabled,
             templatesDir: agentQueueTemplatesDir,
-            maxTotal: agentQueueMaxTotal)
+            maxTotal: agentQueueMaxTotal,
+            heroMax: agentQueueHeroMax)
         return env
     }
 
@@ -341,12 +346,15 @@ final class AgentManagerController {
     ///     `discoverTemplates` uses), so the palette and the sidecar resolve the SAME
     ///     absolute dir — the sidecar does no `~` expansion of its own (Node `path.join`
     ///     would treat `~` as a literal relative segment),
-    ///   - `GHOSTTY_AGENT_QUEUE_MAX_TOTAL` (the global fleet cap, as a decimal string).
+    ///   - `GHOSTTY_AGENT_QUEUE_MAX_TOTAL` (the global fleet cap, as a decimal string),
+    ///   - `GHOSTTY_AGENT_QUEUE_HERO_MAX` (the fleet-wide hero cap, as a decimal string;
+    ///     `0` disables hero dispatch — orthogonal to the regular pools).
     static func applyAgentQueueEnv(
         into env: [String: String],
         enabled: Bool,
         templatesDir: String?,
-        maxTotal: UInt32
+        maxTotal: UInt32,
+        heroMax: UInt32
     ) -> [String: String] {
         var env = env
         guard enabled else {
@@ -355,10 +363,12 @@ final class AgentManagerController {
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE")
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR")
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_MAX_TOTAL")
+            env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_HERO_MAX")
             return env
         }
         env["GHOSTTY_AGENT_QUEUE"] = "1"
         env["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] = String(maxTotal)
+        env["GHOSTTY_AGENT_QUEUE_HERO_MAX"] = String(heroMax)
         if let dir = templatesDir, !dir.isEmpty {
             // Expand `~` to an absolute path so this matches the palette's
             // `discoverTemplates` (which also `expandingTildeInPath`s) and the sidecar —

@@ -150,7 +150,10 @@ is loopback, hence identical; only your `ts.net` hostname differs:
 > hourglass read as unclear), each routed by whether `monitor` is on its tier; each split
 > still offers a **separate** clear for the two states (distinguished by tooltip, not icon).
 > Whether a raw bell *pushes* (vs. only a promotion) likewise follows the `push` flag's tier;
-> both push kinds also share the 🔔 title prefix on the phone.
+> the raw-bell and needs-you push kinds share the 🔔 title prefix on the phone. A **hero**
+> ([**Hero Agents**](HERO-AGENTS.md)) is the exception: an idle hero pushes with a **distinct
+> ⭐ glyph** so you can tell a load-bearing hero apart from routine work at a glance — see
+> **Notify on bell → Hero push** below.
 
 Get a **push notification on your phone when any split rings a bell** — even with the
 browser tab closed and the phone locked. Use it to step away from the laptop and still get
@@ -183,6 +186,28 @@ shows **"🔔 n/a"** and explains it needs HTTPS, rather than failing silently.
 - An expired subscription (push endpoint returns 404/410) is dropped automatically.
 - This is **GUI-only** — no host change, so enabling/changing it is a relaunch, never a
   `ghostty-host` restart.
+
+### Hero push (distinct glyph for an idle hero)
+
+A **hero** ([**Hero Agents**](HERO-AGENTS.md)) is load-bearing queue work that competes for
+*your attention* rather than a machine slot, and lives in its own dedicated tab. When a hero
+surface goes idle / wants your input it fires a **distinct push** so on your phone it's
+immediately clear a **hero** is waiting, not routine throughput:
+
+- **Title glyph: ⭐** (vs. the 🔔 the bell and needs-you pushes share) — so a hero reads apart
+  at a glance in the notification tray. Title is `⭐ <surface title>` (or `⭐ Ghostty` when the
+  title is empty).
+- **Payload carries `"kind":"hero"`** (the routine pushes carry `"kind":"bell"` / `"kind":"attention"`),
+  so the page / service worker can tell a hero push apart from a routine one.
+- **Independent debounce.** A hero push has its own per-surface ~3s debounce, separate from the
+  bell/attention kinds — a chatty bell can never swallow the headline "a hero needs you" push.
+
+There is **no new delivery mechanism** — a hero rides the exact same Web Push + arm/mute toggle
++ VAPID plumbing as every other push (same subscriptions, same secure-context requirement). The
+only difference is the glyph, the payload `kind`, and the independent debounce. A hero **routes
+into the loud attention tier**: it uses the existing `.ghosttyAgentNeedsAttention` path, and the
+observer picks the ⭐ hero push (vs. the 🔔 attention push) off the surface's hero flag — an
+un-flagged surface still gets the plain attention push (back-compat).
 
 ---
 
@@ -593,6 +618,30 @@ every `/api/*`). The page's Notify button is disabled with a "needs HTTPS" note 
 `!window.isSecureContext`. The body parsers (`pushSubscription`/`pushEndpoint`/`pushEnabledFlag`
 `fromBody:`) + the route decisions are `internal` + unit-tested.
 
+### Hero push (fork-only / Hero Agents — distinct glyph + `kind`)
+
+A hero (see `HERO-AGENTS.md`) is queue work that competes for the user's attention and lives in
+its own tab; an idle hero pushes with a DISTINCT ⭐ glyph so the phone shows a *hero* is waiting,
+not routine work. This reuses the EXISTING bell/attention + Web Push plumbing — no new delivery
+mechanism, no new route, no host/Zig change.
+
+- **`PushKind.hero`** joins `.bell`/`.attention` in `WebPushManager`. `PushKind.payloadValue`
+  maps the cases to `"bell"`/`"attention"`/`"hero"`. Because the per-surface debounce key is
+  `(id, kind)`, the hero kind self-debounces INDEPENDENTLY — a chatty bell can't swallow the
+  headline hero push (or vice-versa).
+- **Two pure, unit-tested seams** build the notification: `WebPushManager.pushTitle(glyph:rawTitle:)`
+  → `"<glyph> <title>"` (or `"<glyph> Ghostty"` when the title is empty) — 🔔 for bell/attention,
+  ⭐ for hero — and `WebPushManager.pushPayload(title:body:surface:kind:)` → the payload dict
+  `{title, body, surface, kind}`, where `kind` is the raw `PushKind.payloadValue` so the
+  page/service worker can tell a hero push apart. `onBell`/`onAttention`/`onHero` all fan out
+  through the SAME `enqueuePush`; only the glyph + kind differ (`onHero`'s body prefers the
+  "needs input" message over the pwd, like `onAttention`).
+- **Routing.** The hero verdict rides the EXISTING `.ghosttyAgentNeedsAttention` path. When a
+  surface enters `.waiting`, `AgentDashboardController.postNeedsAttention` reads the stored
+  `queueHero` annotation and adds `AgentStateUserInfoKey.hero: Bool` to the userInfo;
+  `WebPushManager`'s observer calls `onHero` (⭐, `kind:"hero"`) when that flag is true, else
+  `onAttention` (🔔). Absent flag ⇒ regular attention push (back-compat).
+
 ### Liveness/errors
 
 Via `UNUserNotificationCenter` + log (Console.app subsystem = bundle id, category =
@@ -610,7 +659,12 @@ GUI/page parts are GUI-only (a relaunch reattaches).
 - `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen`/`webMonitorToken`/`ptyHost`)
 - `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` (server + xterm page + routes +
   Notify toggle + `/sw.js` + `/api/push/*`)
-- `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`)
+- `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`;
+  Hero Agents: `PushKind.hero`/`payloadValue`, `onHero`, pure `pushTitle`/`pushPayload` seams,
+  the `AgentStateUserInfoKey.hero`→`onHero` route in the attention observer)
+- `macos/Sources/Features/AgentDashboard/AgentDashboardController.swift`
+  (`postNeedsAttention` adds `AgentStateUserInfoKey.hero` off the surface's `queueHero`
+  annotation so the observer routes to `onHero`)
 - `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift` (host-protocol client)
 - `macos/Sources/Features/WebMonitor/vendor/xterm.{js,css}`
 - `src/host/{Session,Server,protocol}.zig` + `src/termio/Termio.zig` (raw-tee + ring + frames
@@ -621,6 +675,7 @@ GUI/page parts are GUI-only (a relaunch reattaches).
 ### Tests
 
 - `macos/Tests/WebMonitor/WebMonitorServerTests.swift` (auto-discovered by the `GhosttyTests`
-  filesystem-synchronized group)
+  filesystem-synchronized group; Hero Agents: `WebPushPayloadTests` — the `pushTitle` ⭐/🔔 glyph
+  + empty-title fallback and the `pushPayload` `kind` field)
 - host frame/ring/integration tests in `src/host/test.zig` (`zig build test
   -Dtest-filter=host`)

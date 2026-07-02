@@ -63,6 +63,21 @@ export interface StoreFile {
    *  which rebuilds the active map from records) so a kept split stays kept across a
    *  sidecar/GUI restart. Additive (absent in a pre-upgrade file → no overrides). */
   keep?: Record<string, boolean>;
+  /** (hero) The HERO key set: every work-item key currently classified as a HERO (see
+   *  HERO-AGENTS.md). RUN-LEVEL state (NOT per-record — like `dispatched`/`keep`) so it
+   *  survives reconcile (which rebuilds the active map from records every sweep) and a
+   *  sidecar/GUI restart; it is ALSO stamped on each kept record's `Assignment.hero` so a
+   *  restored assignment comes back a hero without a separate lookup. `promote`/`demote`
+   *  toggle membership. Additive (absent in a pre-upgrade file → no heroes). */
+  hero?: string[];
+  /** (hero) The MONOTONIC count of total HERO dispatches over the run's lifetime — a
+   *  SEPARATE lifetime counter from `lifetimeDispatched` so a hero dispatch does NOT consume
+   *  the regular `maxItems` budget (the two pools stay orthogonal, HERO-AGENTS.md § Slot
+   *  accounting). Top-level (like `lifetimeDispatched`) so pruned records don't lose the
+   *  count. Additive (absent → 0). NOTE: heroes are gated by the fleet-wide
+   *  `agent-queue-hero-max` cap, NOT `maxItems`, so this counter is informational — but it is
+   *  persisted for symmetry + future budgeting. */
+  heroLifetimeDispatched?: number;
 }
 
 /** The current store schema version. */
@@ -106,6 +121,8 @@ export function serializeStore(
   lifetimeDispatched = 0,
   dispatched: string[] = [],
   keep: Record<string, boolean> = {},
+  hero: string[] = [],
+  heroLifetimeDispatched = 0,
 ): string {
   const lifetime =
     Number.isFinite(lifetimeDispatched) && lifetimeDispatched > 0
@@ -125,6 +142,15 @@ export function serializeStore(
   // when there are none (back-compat: a pre-keep file simply has no `keep` key).
   const keepOut = sanitizeKeep(keep);
   if (Object.keys(keepOut).length > 0) file.keep = keepOut;
+  // (hero) Serialize the hero key set: non-empty strings, deduped, sorted (deterministic for
+  // tests). Omit when empty (back-compat: a pre-hero file has no `hero` key).
+  const heroOut = [...new Set(hero.filter((k) => typeof k === "string" && k.length > 0))].sort();
+  if (heroOut.length > 0) file.hero = heroOut;
+  const heroLifetime =
+    Number.isFinite(heroLifetimeDispatched) && heroLifetimeDispatched > 0
+      ? Math.floor(heroLifetimeDispatched)
+      : 0;
+  if (heroLifetime > 0) file.heroLifetimeDispatched = heroLifetime;
   return JSON.stringify(file, null, 2);
 }
 
@@ -246,6 +272,75 @@ export function loadKeep(io: StoreIO): Record<string, boolean> {
   return parseKeep(text);
 }
 
+/**
+ * (hero) Parse the persisted HERO key set. PURE + TOLERANT. A null/empty input (first run),
+ * unparseable JSON, a wrong-shaped object, or a missing / non-array `hero` all yield `[]` (no
+ * heroes — the safe pre-upgrade default). Non-string / empty entries are dropped; the result is
+ * deduped. Read alongside `parseStore` on the first reconcile to rehydrate the hero set across a
+ * restart so a promoted split comes back a hero (HERO-AGENTS.md § Slot accounting).
+ */
+export function parseHero(text: string | null): string[] {
+  if (text === null || text.trim().length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return [];
+  }
+  const arr = (parsed as { hero?: unknown }).hero;
+  if (!Array.isArray(arr)) return [];
+  return [...new Set(arr.filter((k): k is string => typeof k === "string" && k.length > 0))];
+}
+
+/** Read + parse the persisted hero set via the seam. Returns `[]` on any read/parse
+ *  failure; never throws into the loop. */
+export function loadHero(io: StoreIO): string[] {
+  let text: string | null;
+  try {
+    text = io.read();
+  } catch {
+    return [];
+  }
+  return parseHero(text);
+}
+
+/**
+ * (hero) Parse the persisted monotonic `heroLifetimeDispatched` counter (the SEPARATE hero
+ * lifetime counter, orthogonal to `lifetimeDispatched`). PURE + TOLERANT. A null/empty input,
+ * unparseable JSON, a wrong-shaped object, or a missing / non-numeric / negative value all
+ * yield 0 (pre-upgrade default). Read alongside `parseStore` on the first reconcile.
+ */
+export function parseHeroLifetimeDispatched(text: string | null): number {
+  if (text === null || text.trim().length === 0) return 0;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return 0;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return 0;
+  }
+  const n = (parsed as { heroLifetimeDispatched?: unknown }).heroLifetimeDispatched;
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
+/** Read + parse the persisted hero-lifetime counter via the seam. Returns 0 on any
+ *  read/parse failure; never throws into the loop. */
+export function loadHeroLifetimeDispatched(io: StoreIO): number {
+  let text: string | null;
+  try {
+    text = io.read();
+  } catch {
+    return 0;
+  }
+  return parseHeroLifetimeDispatched(text);
+}
+
 /** Coerce arbitrary parsed JSON into a valid Assignment, or null when it lacks the
  *  required identity fields. PURE. (Defensive against a hand-edited / older file.) */
 function coerceAssignment(raw: unknown): Assignment | null {
@@ -265,6 +360,10 @@ function coerceAssignment(raw: unknown): Assignment | null {
     gridSlot: typeof r.gridSlot === "number" ? r.gridSlot : 0,
     state,
     sinceMs: typeof r.sinceMs === "number" ? r.sinceMs : 0,
+    // (hero) tolerate a missing/non-boolean hero (pre-upgrade file → false); the run-level
+    // `hero` set is the authoritative source rehydrated on the first reconcile, so this
+    // per-record read is belt-and-suspenders (either restores it).
+    hero: r.hero === true,
   };
   if (typeof r.surfaceUUID === "string") a.surfaceUUID = r.surfaceUUID;
   if (typeof r.title === "string") a.title = r.title;
@@ -317,9 +416,13 @@ export function persistStore(
   lifetimeDispatched = 0,
   dispatched: string[] = [],
   keep: Record<string, boolean> = {},
+  hero: string[] = [],
+  heroLifetimeDispatched = 0,
 ): boolean {
   try {
-    io.write(serializeStore(records, lifetimeDispatched, dispatched, keep));
+    io.write(
+      serializeStore(records, lifetimeDispatched, dispatched, keep, hero, heroLifetimeDispatched),
+    );
     return true;
   } catch {
     return false;
@@ -345,7 +448,7 @@ export function makePendingRecord(
   key: string,
   gridSlot: number,
   nowMs: number,
-  extra?: { title?: string; url?: string },
+  extra?: { title?: string; url?: string; hero?: boolean },
 ): Assignment {
   const a: Assignment = {
     queueName,
@@ -354,6 +457,9 @@ export function makePendingRecord(
     gridSlot,
     state: "QUEUED",
     sinceMs: nowMs,
+    // (hero) whether this dispatch is a HERO (from the provider `heroField` — see the
+    // caller in dispatchOne). Persisted on the record + tracked run-level. Default false.
+    hero: extra?.hero === true,
   };
   if (extra?.title !== undefined) a.title = extra.title;
   if (extra?.url !== undefined) a.url = extra.url;
@@ -401,6 +507,11 @@ export interface LiveSurface {
   /** The work-item title/url the surface's annotation carries (orphan adoption). */
   title?: string;
   url?: string;
+  /** (hero) The HERO verdict the surface's annotation carries, if any (visibility read-back).
+   *  NOT the source of truth — reconcile re-derives hero-ness from the run-level `hero` Set —
+   *  but carried so the sidecar can see hero state off the `list_surfaces` rows per the wire
+   *  contract (HERO-AGENTS.md). */
+  hero?: boolean;
 }
 
 /** What to do with one reconciled assignment record. */
@@ -666,6 +777,11 @@ export function reconcile(
       gridSlot,
       state: "RUNNING",
       sinceMs: nowMs,
+      // (hero) reconcile builds an orphan-adopt from the surface annotation, which does NOT
+      // carry the hero bit — so an adopted record starts non-hero here and is RE-STAMPED from
+      // the run-level `hero` set by the caller (runOne rehydrates + re-applies it every sweep,
+      // mirroring how `keep` is threaded). See HERO-AGENTS.md contract-lint #1.
+      hero: false,
     };
     if (typeof s.title === "string") adopted.title = s.title;
     if (typeof s.url === "string") adopted.url = s.url;

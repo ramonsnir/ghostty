@@ -60,6 +60,14 @@ struct AgentAnnotation: Equatable, Sendable {
     /// `merging` never NILS a field (see `clearingSuggestion()`), so the GUI clears a stale
     /// value directly at modal open rather than through `merging`.
     let queueKeySuggested: String?
+    /// (ramon fork / Hero Agents) The split's HERO verdict the supervisor stamps: true ⇒
+    /// this queue item is a hero (load-bearing work competing for the user's attention, in
+    /// its own dedicated tab, loud attention tier, never auto-closed). Drives the tab hero
+    /// glyph + the dashboard promote/demote tile visual, and is echoed back into the MCP
+    /// `list_surfaces` row so the supervisor's reconcile reads the hero state. OPTIONAL so
+    /// a partial update that omits it preserves the prior value on merge; nil reads as
+    /// "not a hero" at the tile. Mirrors `queueKeep`.
+    let queueHero: Bool?
 
     init(
         summary: String? = nil,
@@ -69,7 +77,8 @@ struct AgentAnnotation: Equatable, Sendable {
         queueName: String? = nil,
         queueUrl: String? = nil,
         queueKeep: Bool? = nil,
-        queueKeySuggested: String? = nil
+        queueKeySuggested: String? = nil,
+        queueHero: Bool? = nil
     ) {
         self.summary = summary
         self.phase = phase
@@ -79,6 +88,7 @@ struct AgentAnnotation: Equatable, Sendable {
         self.queueUrl = queueUrl
         self.queueKeep = queueKeep
         self.queueKeySuggested = queueKeySuggested
+        self.queueHero = queueHero
     }
 
     /// Overlay `other`'s PROVIDED (non-nil) fields onto `self`, keeping `self`'s
@@ -95,7 +105,8 @@ struct AgentAnnotation: Equatable, Sendable {
             queueName: other.queueName ?? queueName,
             queueUrl: other.queueUrl ?? queueUrl,
             queueKeep: other.queueKeep ?? queueKeep,
-            queueKeySuggested: other.queueKeySuggested ?? queueKeySuggested)
+            queueKeySuggested: other.queueKeySuggested ?? queueKeySuggested,
+            queueHero: other.queueHero ?? queueHero)
     }
 
     /// (ramon fork / Agent Queue, adopt) A copy of `self` with `queueKeySuggested` reset
@@ -109,7 +120,7 @@ struct AgentAnnotation: Equatable, Sendable {
         AgentAnnotation(
             summary: summary, phase: phase, needsUser: needsUser,
             queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
-            queueKeep: queueKeep, queueKeySuggested: nil)
+            queueKeep: queueKeep, queueKeySuggested: nil, queueHero: queueHero)
     }
 }
 
@@ -127,7 +138,8 @@ extension Notification.Name {
     /// userInfo: [AgentStateUserInfoKey.surfaceID: UUID,
     ///            AgentStateUserInfoKey.title: String,
     ///            AgentStateUserInfoKey.pwd: String,           // may be ""
-    ///            AgentStateUserInfoKey.message: String]       // "" if none
+    ///            AgentStateUserInfoKey.message: String,       // "" if none
+    ///            AgentStateUserInfoKey.hero: Bool]            // (Hero Agents) surface is a hero
     static let ghosttyAgentNeedsAttention =
         Notification.Name("com.mitchellh.ghostty.ghosttyAgentNeedsAttention")
 
@@ -164,4 +176,5 @@ enum AgentStateUserInfoKey {
     static let annotation = "annotation" // AgentAnnotation
     static let attention  = "attention"  // Bool (ramon fork / Bell Attention)
     static let reason     = "reason"     // String (ramon fork / Bell Attention)
+    static let hero       = "hero"       // Bool (ramon fork / Hero Agents)
 }

@@ -23,7 +23,8 @@ command (which prints the actionable work items as JSON), dispatches up to your
 each running the template's **agent command** with the item's fields delivered as
 environment variables, polls the template's **`status`** command per item, and once an
 item reports a terminal state **and** its agent has been quiescent (idle or waiting) a
-few seconds, types the template's exit keys and **force-closes** the split. The whole thing is restart-proof:
+few seconds, types the template's exit keys and **force-closes** the split (unless it's KEPT or a
+[hero](#hero-agents-a-separate-attention-bounded-pool) — those are held open). The whole thing is restart-proof:
 run state is persisted by the sidecar and re-adopted (by stable host session id) after a
 sidecar **or** GUI restart, so it never double-dispatches an item or orphans a live
 agent. Everything else — bells, the dashboard, per-tile summaries, web-push —
@@ -70,6 +71,10 @@ agent-queue = true
 # template). Default 0 = UNLIMITED — a queue is bounded only by its own
 # concurrency/maxItems/grid. Set a positive value only to opt into a fleet ceiling:
 # agent-queue-max-total = 16
+# HERO pool cap — fleet-wide ceiling on live HERO agents (the load-bearing,
+# attention-scarce kind), ORTHOGONAL to everything above. Default 2 (a discipline
+# limit). 0 = DISABLE hero dispatch. See "Hero agents" below:
+# agent-queue-hero-max = 2
 ```
 
 Quit + relaunch the fork, and rebuild the sidecar `dist` if you changed it. Nothing runs
@@ -110,7 +115,13 @@ shell the engine just runs.
     // blocked / claimed / done items (the queue has no dependency graph by design).
     "list": {
       "command": ["sh", "-lc", "linear-queue-list --filter <FILTER_ID>"],
-      "keyField": "identifier", "titleField": "title", "urlField": "url"
+      "keyField": "identifier", "titleField": "title", "urlField": "url",
+      // HERO sourcing (optional): a JSON field whose TRUTHY value marks the item a HERO
+      // (a load-bearing, attention-scarce item — see "Hero agents" below). Mirrors the
+      // title/url mapping — sourcing is YOUR call (e.g. your list script emits `hero:true`
+      // for items with a special label). Absent ⇒ no items are heroes from the list
+      // (you can still PROMOTE a running regular by hand).
+      "heroField": "hero"
     },
     // STATUS: print {"state":"..."} for one item ({key} is a safe argv element).
     "status": {
@@ -199,8 +210,9 @@ run with no file edits:
   size you want to be asked about.
 
 Provider contract (the genericity boundary):
-- **`list`** → stdout is a JSON array; `keyField`/`titleField`/`urlField` map fields onto each
-  item. A non-zero exit or unparseable output **skips that poll** (never dispatches garbage).
+- **`list`** → stdout is a JSON array; `keyField`/`titleField`/`urlField`/`heroField` map fields
+  onto each item (the optional `heroField`'s truthy value marks a [hero](#hero-agents-a-separate-attention-bounded-pool)).
+  A non-zero exit or unparseable output **skips that poll** (never dispatches garbage).
 - **`status {key}`** → `{"state":"…"}`; terminal iff `state` ∈ `doneStates`. A flaky probe is
   treated as "not done" — a split is **never** closed on a bad status. Completion is
   **status-only** (idleness alone never completes an item — no false positives).
@@ -314,6 +326,58 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   occupies a concurrency slot but is **not** counted as a freshly-launched agent (no
   `lifetimeDispatched` bump — it's an existing agent, not a new one). If the template defines a
   `claim` step, adopt fires it for the key (same as a normal dispatch).
+- **Promote a running split to a HERO (and demote back):** any tracked queue split has a
+  **Promote…** control on its dashboard tile that flips it into the [hero pool](#hero-agents-a-separate-attention-bounded-pool)
+  — it moves out of the fungible-throughput accounting into the fleet-wide `agent-queue-hero-max`
+  cap, **ejects into its own dedicated tab** (single terminal, out of the grid), becomes
+  **kept-by-default** (never auto-closed), and lights up with the hero glyph across all tabs.
+  **Promotion never blocks** — it may push you *over* the cap; the only consequence is that no
+  *new* heroes dispatch until live heroes drain back under `agent-queue-hero-max`. A hero tile's
+  **Demote** flips it back to a regular tracked item (accounting + marker only — it does NOT
+  re-pack the split back into a grid tab; it stays in its own tab, like any kept split).
+
+## Hero agents (a separate, attention-bounded pool)
+
+Most queue work is **fungible throughput** — get a predefined task done, packed into a grid,
+auto-closed when done. A **hero** is the opposite: something **load-bearing** that has to be
+*right* (research, deep design taste, many small details). The scarce resource a hero competes
+for is **your attention**, not a machine slot — you can only hold one or two in your head even
+when 10 other agents are running. So a hero is a **per-item property**, not a new subsystem: it
+changes four things — *slot accounting, lifecycle, layout, and notification*. (Phases like
+research → design → build live in the agent definition + the issue description, exactly as for a
+regular item; the engine models none of them.) Full design + wire contract: **`HERO-AGENTS.md`**.
+
+- **Separate, orthogonal cap.** Live heroes are bounded by the fleet-wide
+  **`agent-queue-hero-max`** (default **2**, `0` = hero dispatch disabled), which is INDEPENDENT
+  of `concurrency` / `maxItems` / `agent-queue-max-total`. A hero does **not** consume a regular
+  concurrency slot and is **not** counted against `max-total` (and vice-versa) — this is the
+  literal "2–3 heroes **plus** 10 other agents". The cap is a *discipline* limit (how many you can
+  hold in your head), not a resource limit.
+- **Two entry paths.** Either the provider marks an item hero up front (the template's
+  **`heroField`** — a `list`-output field whose truthy value = hero), or you **promote** a running
+  regular from the dashboard (above). Promotion **never blocks** — it may exceed the cap; no *new*
+  heroes dispatch until live heroes drain back under it.
+- **Kept-by-default lifecycle.** A hero is **never** auto-closed — it is treated as `keep === true`
+  regardless of the template `keepOnComplete` / the 📌 pin, so a completed hero holds in
+  DONE_PENDING for the quick follow-up PR. The 📌 pin still works on top; demoting it restores
+  normal auto-close.
+- **Own dedicated tab.** A hero dispatches (or, on promotion, is ejected) into its **own new tab**
+  — a single terminal, never in the BSP grid, so heroes never participate in grid packing and are
+  easy to find. It carries a distinct **hero glyph** in the tab-accessory slot, visible across all
+  tabs (so a hero is spottable even from another tab).
+- **Backlog waiting states.** In the backlog DAG canvas, a hero WAITING on the hero-slot cap gets
+  a **distinct icon** (a purple star + purple card border, not the plain orange clock) and a **hover
+  tooltip listing the exact gate(s)** blocking it (`hero slots`, and — for a regular item —
+  `maxItems` / `queue concurrency` / `global concurrency`). The whole point: when a hero is stuck
+  on a hero slot, nobody wastes time bumping `maxItems`. (Dependency-blocked is intentionally NOT
+  listed — the graph edges already show it.)
+- **Louder notification.** A hero uses the **loud attention tier** by default and its phone
+  web-push carries a distinct glyph (`kind:"hero"`), so it's immediately clear a *hero* is waiting,
+  not routine work. Reuses the existing bell/attention + push plumbing — no new delivery mechanism.
+
+Hero classification (the run-level `hero` set + `heroLifetimeDispatched` counter) is persisted in
+the per-run store and **rehydrated across a sidecar/GUI restart**, so a promoted split comes back a
+hero. It is cleared on abort.
 
 ## What it guarantees
 
@@ -338,7 +402,11 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 - **Concurrency** is never exceeded (per-queue `concurrency` — the total across all the run's
   tabs — and, *if set*, the optional global `agent-queue-max-total`, which defaults to `0` =
   unlimited; `cols×rows` is the per-tab layout, not a cap on
-  the total, since panes overflow to new tabs).
+  the total, since panes overflow to new tabs). **These bound only the REGULAR (fungible) pool
+  — [hero](#hero-agents-a-separate-attention-bounded-pool) agents are a SEPARATE pool** gated by
+  the fleet-wide `agent-queue-hero-max` (default 2), orthogonal to `concurrency`, `maxItems`, and
+  `agent-queue-max-total`: a hero neither consumes a regular slot nor counts against `max-total`,
+  and vice-versa. "2–3 heroes **plus** 10 other agents" is the literal design.
 - **Tabs stay packed** — as agents finish unevenly and tabs fragment (e.g. 3 + 1 + 1 panes
   spread across three tabs), the queue **continuously consolidates**: when a whole tab's panes
   fit into an earlier tab's free space, it moves them there and closes the emptied tab (over a
@@ -358,6 +426,12 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   sets `keepOnComplete: true`) is exempt from the close gate: when its item completes it is
   held OPEN for manual work (slot kept) until you force-close it. The keep verdict is persisted
   and survives a sidecar/GUI restart.
+- **A HERO split is never auto-closed either** — a hero is treated as `keep === true`
+  UNCONDITIONALLY (independent of the template `keepOnComplete` / the 📌 pin), so a completed hero
+  holds OPEN for the quick follow-up PR that a load-bearing item usually wants. See
+  [Hero agents](#hero-agents-a-separate-attention-bounded-pool) below. So the "closes cleanly on
+  done + quiescent" guarantee above applies to REGULAR splits; a hero (like a kept split) is
+  exempt and stays open until you force-close it.
 - **A crashed agent is never silently lost** — its split stays for you to inspect and the
   bell rings across the dashboard, web monitor, and push (`onAgentExit: leave-and-bell`).
 
@@ -412,6 +486,127 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   `runner.test.ts` (`maxTotal = Infinity … imposes no fleet cap`). **GUI relaunch + rebuilt
   lib/xcframework (Zig default changed) + rebuilt sidecar `dist`; no host restart** (the host
   ignores the key).
+
+### `agent-queue-hero-max` + the HERO pool (a second, orthogonal cap)
+
+- **`agent-queue-hero-max` (`u32`, default `2`, fork-only) is a SECOND, ORTHOGONAL cap** —
+  the fleet-wide ceiling on live HERO agents across ALL runs, INDEPENDENT of `concurrency`/
+  `maxItems`/`agent-queue-max-total`. **NOTE the inversion vs `max-total`:** `0` here means
+  **DISABLED** (no hero dispatch; hero-marked items wait on the `heroSlots` gate), whereas
+  `agent-queue-max-total = 0` means UNLIMITED. Threading: `Config.zig` (`u32 = 2` + doc + parse
+  test) → `Ghostty.Config.swift agentQueueHeroMax` (**non-optional read**, like the
+  `agentQueueMaxTotal` getter-bug fix) → `AgentManagerController.applyAgentQueueEnv` forwards
+  `GHOSTTY_AGENT_QUEUE_HERO_MAX` (decimal) → `index.ts` → `QueueDeps.heroMax`.
+- **Two-pool dispatch accounting (`runner.ts`/`supervisor.ts`).** `dispatchCandidates` →
+  `selectCandidates` splits the actionable list by `item.hero` into a REGULAR pool and a HERO pool.
+  The regular pool is gated EXACTLY as before (`remainingSlots(effConcurrency, activeRegular,
+  globalRegularRemaining)` + the per-run `maxItems` lifetime budget) — but regular accounting now
+  counts **only non-hero** active assignments, and the regular `maxItems` budget is NOT consumed by
+  heroes (a SEPARATE monotonic `QueueRun.heroLifetimeDispatched` counter tracks hero dispatches).
+  The hero pool is gated ONLY by `heroRemaining = heroMax − heroActiveGlobal`, where
+  `heroActiveGlobal` (`totalHeroActiveRegistry`) counts hero assignments **across all runs** (the
+  cap is fleet-wide, threaded per-sweep through `runOne` and decremented as heroes dispatch).
+- **`effectiveHero(run, key) = run.hero.has(key)`** is the AUTHORITATIVE run-level classification
+  (PURE; `heroRecord(run)` snapshots the set for persist). It's re-stamped onto each reconciled
+  `Assignment.hero` at the top of every sweep, so the two-pool accounting + the annotation + the tab
+  marker all agree. The `hero` set is persisted in the per-run store (`StoreFile.hero`) +
+  rehydrated on the first reconcile (`loadHero`/`loadHeroLifetimeDispatched`) + cleared on abort —
+  mirroring the `keep`/`dispatched` latch machinery exactly.
+- **`promote`/`demote` commands (`commands.ts`, shaped like `adopt` — `{run, surfaceUUID, key?}`).**
+  The reducer does the PURE, SYNCHRONOUS part only: `promote` does `run.hero.add(key)` +
+  `run.keepDirty.add(key)` (reusing the per-sweep restamp signal — keep + hero ride ONE annotation);
+  `demote` does `run.hero.delete(key)` + the same restamp mark. Both return a NEW `ApplyResult.kind`
+  (`"promoted"`/`"demoted"`) that is NOT in `applyCommands`'s `changed` whitelist — hero membership
+  lives in the PER-RUN store, not `active-runs.json`. **⭐ Both are whitelisted in `mcp.ts`
+  `coerceQueueCommands` (`QUEUE_ACTIONS`) — omission SILENTLY drops the GUI emit** (the same
+  chokepoint that bit `adopt` twice). They carry the existing `surfaceUUID`/`key` fields (no new
+  wire field).
+- **Promotion NEVER blocks (design decision #2).** `promote` mutates a RUNNING assignment rather
+  than dispatching, so it can push `heroActiveGlobal` past `heroMax`; the hero gate then yields
+  `heroRemaining ≤ 0` and no NEW heroes dispatch until it drains under. The reducer does not consult
+  the cap at all.
+- **The physical side effects run in the sweep's post-`applyCommands` loop (`runner.ts`
+  `runPromote`/`runDemote`, like `runAdopt`).** `runPromote` **ejects** the split into its own new
+  tab via the `move_split_to_new_tab` keybind (out of the BSP grid; the grid slot is reassigned to a
+  `-1` ejected sentinel so the packer + next dispatch's occupied-set ignore it) and re-stamps the
+  hero annotation; `runDemote` drops the hero annotation. Side effects are best-effort (a failed
+  eject is logged; the split stays put but is still a hero — the run-level set is authoritative).
+- **HERO dispatch opens its OWN tab (`dispatchOne`).** A hero-classified dispatch SKIPS `splitPlan`
+  entirely (`const sp = isHero ? undefined : splitPlan(...)`) and spawns with the same `firstTab` +
+  `windowAnchorUUID` shape an overflow tab uses (single terminal, anchored on a live pane so it
+  shares the run's window), so a hero never lands in the grid.
+- **Keep-forces-hero close gate (`runner.ts` builds `ctx.keep`; `supervisor.ts` `nextState` reuses
+  its existing keep branch, no hero-specific state).** At the `runner.ts` call site the stamped
+  `keep` (passed in as `ctx.keep`) is `effectiveKeep(run, a.key) || effectiveHero(run, a.key)` —
+  so a hero is ALWAYS treated as `keep === true` (held in DONE_PENDING forever, never force-closed),
+  INDEPENDENT of the template `keepOnComplete` / the 📌 pin (which still work on top). `nextState`
+  in `supervisor.ts` contains NO hero logic — it just consumes the generic `keep` bool — so this
+  reuses the existing keep close-gate with no new state.
+- **Status report + backlog block-reasons (`status.ts` + `QueueBacklogCanvas.swift`).**
+  `QueueStatusReport` gains fleet-wide `heroMax` + `heroActive` (echoed on EVERY run's report, from
+  the `heroMax`/`heroActive` inputs), and each WAITING `next[]` `QueueItemRef` gains optional
+  `blockReasons: BlockReason[]` (`"maxItems" | "queueConcurrency" | "globalConcurrency" |
+  "heroSlots"`). The pure builder attributes reasons from the per-run gate ROOM inputs
+  (`regularConcurrencyRemaining`/`regularGlobalRemaining`/`regularMaxItemsRemaining` for a regular,
+  `heroMax − heroActive` for a hero; a gate is "blocking" when its room ≤ 0). A reason set is OMITTED
+  when nothing blocks (the item WOULD dispatch). Dependency-blocked is intentionally NOT a reason.
+  Swift `QueueStatus`/`QueueStatusPayload.fromArguments` parse `heroMax`/`heroActive` (default 0
+  when absent) and thread them through every `withX()` optimistic-copy helper; `QueueItemRef`
+  carries `blockReasons`. `QueueBacklogCanvas` renders a hero-slot-waiting item with a purple
+  `star.circle.fill` (+ purple card border) instead of the orange `clock`, and a hover tooltip
+  (`QueueBacklogReasons.tooltipLines` / `isHeroWaiting`, pure + SwiftUI-free) listing each blocking
+  gate. (The globals are wired end-to-end for a future fleet-wide `N/heroMax heroes` health chip;
+  today the canvas discriminates a hero-waiting item off the per-item `heroSlots` reason.)
+- **Web-push (`WebMonitorPush.swift`).** A hero surface's push uses `PushKind.hero` (payload
+  `"kind":"hero"`, a distinct title glyph, built by the pure `pushTitle`/`pushPayload` seams). The
+  hero verdict rides the EXISTING `.ghosttyAgentNeedsAttention` path:
+  `AgentDashboardController.postNeedsAttention` reads the stored `queueHero` annotation and adds
+  `AgentStateUserInfoKey.hero` to the userInfo; `WebPushManager`'s observer calls `onHero` when the
+  flag is true, else `onAttention`. No new notification/delivery mechanism.
+- **The surface annotation is the GUI's view of hero-ness.** `set_surface_annotation` gains a `hero`
+  Bool arg (`MCPAnnotation.swift`/`MCPTools.swift`); the Swift `AgentAnnotation` gains `queueHero`
+  (mirrors `queueKeep`, partial-merge). `list_surfaces` emits `hero: true` on a hero row
+  (`MCPLayout.SurfaceRow.hero` + `surfacesJSONData`) — the **reconcile-visibility chokepoint** (the
+  same class as the `queueKey` echo the adopt path relies on): the sidecar reads hero state back off
+  the rows. The tab marker is a per-tab `surfaceIsHero: Bool` on `TerminalWindow` (parallel to
+  `surfaceIsZoomed`) driving a hero-glyph accessory (parallel to `ResetZoomAccessoryView`), set by
+  `TerminalController` from a `heroSurfaceIDs` set (fed by the annotation-change notification)
+  intersected with the tab's current surface tree — a hero tab is
+  single-terminal so it can never be zoomed, so the two accessories never collide.
+- **NO new MCP tool — count stays 26** (`promote`/`demote` ride `take_queue_commands`; `hero`
+  rides `set_surface_annotation`). **NO host/Zig protocol change** beyond the one additive default-on
+  config key `agent-queue-hero-max` (so the fork-only agent-queue config keys are now 4:
+  `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total` (all default-off) plus the
+  default-on `agent-queue-hero-max`).
+- **Wiring.** Core: `src/config/Config.zig` (`agent-queue-hero-max` + doc + parse test),
+  `Ghostty.Config.swift` (`agentQueueHeroMax`), `AgentManagerController.swift`
+  (`GHOSTTY_AGENT_QUEUE_HERO_MAX` forward). Sidecar: `queue/types.ts` (`WorkItem.hero`,
+  `Assignment.hero`, `ProviderListSpec.heroField`, `BlockReason`), `queue/provider.ts` (parse
+  `heroField`), `queue/runner.ts` (two-pool accounting, `QueueRun.hero`/`heroLifetimeDispatched`,
+  `effectiveHero`/`heroRecord`, `runPromote`/`runDemote`, own-tab dispatch, keep-forces-hero stamp,
+  rehydrate/persist), `queue/supervisor.ts` (`selectCandidates` two-pool split + `nextState`
+  keep-forces-hero), `queue/commands.ts` (`promote`/`demote` reducer + `ApplyResult`),
+  `queue/status.ts` (`heroMax`/`heroActive` + per-item `blockReasons`), `queue/store.ts`
+  (`StoreFile.hero`/`heroLifetimeDispatched` serialize/parse/load + `persistStore` args), `mcp.ts`
+  (`coerceQueueCommands` `promote`/`demote` whitelist; `Annotation.hero`/`setAnnotation`;
+  `list_surfaces` hero read-back), `index.ts` (`heroMax` dep + fleet-wide hero-active bookkeeping).
+  macOS: `QueueCommandBridge.swift` (`.promote`/`.demote` + `QueueStatus.heroMax`/`heroActive` +
+  `QueueStatus.Item.blockReasons` + `withX` threading), `MCPAnnotation.swift`/`MCPTools.swift`
+  (`hero` parse + schema), `AgentStateBridge.swift` (`AgentAnnotation.queueHero` + merge),
+  `MCPLayout.swift` (`SurfaceRow.hero` + emit), `AgentDashboardController.swift`
+  (`promoteToHero`/`demoteFromHero`, `HookSnapshotEntry.queueHero`, `postNeedsAttention` hero
+  userInfo), `AgentPreviewTile.swift`/`AgentDashboardView.swift` (Promote/Demote buttons + hero tile
+  visual), `QueueBacklogCanvas.swift` (hero-waiting icon + tooltip + `QueueBacklogReasons`),
+  `TerminalWindow.swift`/`TitlebarTabsVenturaTerminalWindow.swift`/`TerminalController.swift`
+  (`surfaceIsHero` + hero accessory), `WebMonitorPush.swift` (`PushKind.hero` + `onHero` +
+  `pushTitle`/`pushPayload`). Tests: Zig `agent-queue-hero-max` parse/default/round-trip; sidecar
+  two-pool accounting / promotion-over-cap-never-blocks + drain / demote re-enters regular pool /
+  keep-forces-hero / `heroField` parse / `promote`/`demote` apply + coerce / `blockReasons`+
+  `heroMax`/`heroActive` in the report / persist+rehydrate; Swift `QueueCommandBridge` promote/demote
+  round-trip, `MCPAnnotation` `hero` parse + merge, `SurfaceRow`→`surfacesJSONData` hero emit, backlog
+  hero-waiting icon/tooltip reason set, `surfaceIsHero`→accessory visibility. **GUI relaunch +
+  rebuilt lib/xcframework (Zig default changed) + rebuilt sidecar `dist`; no host restart.** See
+  **`HERO-AGENTS.md`** for the full design + the locked wire contract.
 
 ### Generic by design + the provider contract (injection seam)
 
@@ -887,8 +1082,9 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   as VALUE types on the main hop), `force_close_surface`, `signal_attention`,
   `take_queue_commands`, plus `sessionID` added to `list_surfaces` rows and queue annotation
   fields (`queueKey`/`queueName`/`queueUrl`, partial-merge like summary/suggestion). No host/
-  Zig protocol change — only 3 additive default-off config keys (`agent-queue`,
-  `agent-queue-templates-dir`, `agent-queue-max-total`) + the `start_agent_queue` action.
+  Zig protocol change — only 4 additive config keys (`agent-queue`, `agent-queue-templates-dir`,
+  `agent-queue-max-total` — all default-off — plus the default-*on* `agent-queue-hero-max`,
+  see the hero section above) + the `start_agent_queue` action.
 
 ### Dashboard — grouping / filtering / controls (§11)
 

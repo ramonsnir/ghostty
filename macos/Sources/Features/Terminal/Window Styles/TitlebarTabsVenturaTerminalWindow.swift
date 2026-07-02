@@ -258,6 +258,31 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
 		return button
 	}
 
+    // MARK: - Hero Marker Button
+
+    /// (ramon fork / Hero Agents) The hero marker toolbar button, mirroring
+    /// `resetZoomToolbarButton`. Non-interactive (a marker, not a button); its
+    /// visibility is driven by the base window's `surfaceIsHero`, which shows the hero
+    /// glyph across all tabs.
+    private lazy var heroToolbarButton: NSButton = generateHeroToolbarButton()
+
+    private func generateHeroToolbarButton() -> NSButton {
+        let button = NSButton()
+        button.target = nil
+        button.isBordered = false
+        button.allowsExpansionToolTips = true
+        button.toolTip = "Hero"
+        button.contentTintColor = .systemYellow
+        button.state = .on
+        button.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Hero")
+        button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+        return button
+    }
+
 	@objc private func selectTabAndZoom(_ sender: NSButton) {
 		guard let tabGroup else { return }
 
@@ -326,6 +351,14 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
             resetZoomItem.view!.removeConstraints(resetZoomItem.view!.constraints)
             resetZoomItem.view!.widthAnchor.constraint(equalToConstant: 22).isActive = true
             resetZoomItem.view!.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        }
+        // (ramon fork / Hero Agents) Wire the hero marker toolbar item, mirroring
+        // the reset-zoom item above.
+        if let heroItem = terminalToolbar.items.first(where: { $0.itemIdentifier == .hero }) {
+            heroItem.view = heroToolbarButton
+            heroItem.view!.removeConstraints(heroItem.view!.constraints)
+            heroItem.view!.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            heroItem.view!.heightAnchor.constraint(equalToConstant: 20).isActive = true
         }
     }
 
@@ -650,6 +683,9 @@ private class TerminalToolbar: NSToolbar, NSToolbarDelegate {
             item.isEnabled = true
         case .resetZoom:
             item = NSToolbarItem(itemIdentifier: .resetZoom)
+        case .hero:
+            // (ramon fork / Hero Agents) Mirrors `.resetZoom`.
+            item = NSToolbarItem(itemIdentifier: .hero)
         default:
             item = NSToolbarItem(itemIdentifier: itemIdentifier)
         }
@@ -658,7 +694,7 @@ private class TerminalToolbar: NSToolbar, NSToolbarDelegate {
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        return [.titleText, .flexibleSpace, .space, .resetZoom]
+        return [.titleText, .flexibleSpace, .space, .resetZoom, .hero]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -714,5 +750,6 @@ private class CenteredDynamicLabel: NSTextField {
 
 extension NSToolbarItem.Identifier {
     static let resetZoom = NSToolbarItem.Identifier("ResetZoom")
+    static let hero = NSToolbarItem.Identifier("Hero")  // (ramon fork / Hero Agents)
     static let titleText = NSToolbarItem.Identifier("TitleText")
 }

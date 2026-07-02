@@ -200,13 +200,15 @@ struct AgentManagerControllerTests {
             "GHOSTTY_AGENT_QUEUE": "1",                 // stray inherited value
             "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/x",
             "GHOSTTY_AGENT_QUEUE_MAX_TOTAL": "99",
+            "GHOSTTY_AGENT_QUEUE_HERO_MAX": "7",       // stray inherited value
         ]
         let out = AgentManagerController.applyAgentQueueEnv(
-            into: base, enabled: false, templatesDir: "/should/not/appear", maxTotal: 8)
+            into: base, enabled: false, templatesDir: "/should/not/appear", maxTotal: 8, heroMax: 2)
         #expect(out["PATH"] == "/usr/bin")
         #expect(out["GHOSTTY_AGENT_QUEUE"] == nil)
         #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
         #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == nil)
+        #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == nil)
     }
 
     /// Enabled ⇒ arms the master enable + the fleet cap; an ABSOLUTE templates dir is
@@ -216,12 +218,22 @@ struct AgentManagerControllerTests {
             into: ["PATH": "/usr/bin"],
             enabled: true,
             templatesDir: "/Users/me/.config/ghostty-ramon/agent-manager/queues",
-            maxTotal: 12)
+            maxTotal: 12,
+            heroMax: 3)
         #expect(out["GHOSTTY_AGENT_QUEUE"] == "1")
         #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == "12")
+        #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == "3")
         #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"]
             == "/Users/me/.config/ghostty-ramon/agent-manager/queues")
         #expect(out["PATH"] == "/usr/bin")  // untouched
+    }
+
+    /// The hero cap is forwarded verbatim, INCLUDING `0` (which disables hero
+    /// dispatch) — it must be an explicit "0", never absent.
+    @Test func agentQueueEnvForwardsHeroMaxIncludingZero() {
+        let out = AgentManagerController.applyAgentQueueEnv(
+            into: [:], enabled: true, templatesDir: nil, maxTotal: 0, heroMax: 0)
+        #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == "0")
     }
 
     /// Enabled with a `~`-prefixed templates dir ⇒ the dir is TILDE-EXPANDED to an
@@ -233,7 +245,8 @@ struct AgentManagerControllerTests {
             into: [:],
             enabled: true,
             templatesDir: "~/git/queues",
-            maxTotal: 8)
+            maxTotal: 8,
+            heroMax: 2)
         let expected = ("~/git/queues" as NSString).expandingTildeInPath
         #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == expected)
         // It must actually have expanded (no leading `~` survives).
@@ -247,9 +260,10 @@ struct AgentManagerControllerTests {
         for dir in [nil, ""] as [String?] {
             let out = AgentManagerController.applyAgentQueueEnv(
                 into: ["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/stale"],
-                enabled: true, templatesDir: dir, maxTotal: 8)
+                enabled: true, templatesDir: dir, maxTotal: 8, heroMax: 2)
             #expect(out["GHOSTTY_AGENT_QUEUE"] == "1")
             #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == "8")
+            #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == "2")
             // A stale inherited dir must NOT survive — the sidecar default wins.
             #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
         }

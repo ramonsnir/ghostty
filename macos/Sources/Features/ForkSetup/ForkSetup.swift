@@ -1261,6 +1261,14 @@ enum ForkSetup {
     # installed, and a queue template (see AGENT-QUEUE.md). Uncomment to enable:
     #agent-queue = true
 
+    # Hero agents (fork-only): a HERO is a load-bearing queue item that competes
+    # for YOUR ATTENTION, not a machine slot — it lives in its own tab, is never
+    # auto-closed, and pushes a distinct glyph when it needs you. This is a
+    # FLEET-WIDE ceiling on live heroes across ALL queue runs, orthogonal to
+    # concurrency / maxItems / agent-queue-max-total. Default 2 (a discipline
+    # limit); 0 disables hero dispatch. See HERO-AGENTS.md. Uncomment to override:
+    #agent-queue-hero-max = 2
+
     # (My tmux-style `ctrl+a` keybindings live at the BOTTOM of this file, commented
     # out. None are required — the same actions are all in the Command Palette.)
 

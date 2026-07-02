@@ -120,6 +120,17 @@ agent-manager = false
 # ("Start Agent Queue…") or bind start_agent_queue. See AGENT-QUEUE.md.
 agent-queue = true
 
+# Hero agents (fork-only): a HERO is a load-bearing queue item that competes for
+# YOUR ATTENTION rather than a machine slot — it lives in its own dedicated tab,
+# is never auto-closed, and pushes a distinct "hero" push glyph when it needs
+# you. `agent-queue-hero-max` is a FLEET-WIDE ceiling on live heroes across ALL
+# queue runs, ORTHOGONAL to `concurrency` / `maxItems` / `agent-queue-max-total`
+# (a hero neither consumes a regular slot nor counts against max-total). Default
+# 2 (a discipline limit — how many heroes you can hold in your head at once, not
+# a resource limit); `0` disables hero dispatch (hero-marked items then wait
+# visibly on the hero-slot gate). See HERO-AGENTS.md. Uncomment to override:
+#agent-queue-hero-max = 2
+
 # --- tmux pane/split bindings --------------------------------------------
 # %  / "   split right / split down   (shift required to type both symbols)
 # @ is also accepted as a personal alias for %.

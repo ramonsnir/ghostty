@@ -135,15 +135,20 @@ export function sanitizeEnvSuffix(key: string): string {
 
 /**
  * Parse the `list` provider stdout into WorkItems. PURE + TOLERANT. Expects a JSON
- * ARRAY of objects; maps `keyField`/`titleField`/`urlField` → WorkItem. Items with
- * no usable (non-empty string) key are DROPPED (never dispatched). Any unmapped
- * scalar/string fields on each object are collected into `meta` (so a template can
- * surface extra fields to the agent without a code change). Unparseable / non-array
- * / wrong-shaped stdout yields `[]` (the caller skips the tick — never throws).
+ * ARRAY of objects; maps `keyField`/`titleField`/`urlField` → WorkItem, and (hero)
+ * `heroField`'s TRUTHY value → `WorkItem.hero`. Items with no usable (non-empty string)
+ * key are DROPPED (never dispatched). Any unmapped scalar/string fields on each object
+ * are collected into `meta` (so a template can surface extra fields to the agent without
+ * a code change) — the mapped fields, INCLUDING `heroField`, are RESERVED and never leak
+ * into meta. Unparseable / non-array / wrong-shaped stdout yields `[]` (the caller skips
+ * the tick — never throws).
  */
 export function parseListOutput(
   stdout: string,
-  fields: Pick<ProviderListSpec, "keyField" | "titleField" | "urlField">,
+  fields: Pick<
+    ProviderListSpec,
+    "keyField" | "titleField" | "urlField" | "heroField"
+  >,
 ): WorkItem[] {
   let parsed: unknown;
   try {
@@ -170,13 +175,23 @@ export function parseListOutput(
       const u = asString(rec[fields.urlField]);
       if (u !== undefined) item.url = u;
     }
+    // (hero) A truthy heroField marks the item load-bearing. Read the RAW value (not the
+    // meta-stringified one — `false` stringifies to the truthy string "false"), coerced
+    // conservatively (see asHero): boolean true, or "true"/"1", or a non-zero number.
+    if (fields.heroField !== undefined && asHero(rec[fields.heroField])) {
+      item.hero = true;
+    }
 
     // Collect any OTHER string/number/bool fields as meta (excluding the mapped
-    // fields), so a template's extra columns reach the agent as env vars.
+    // fields), so a template's extra columns reach the agent as env vars. `heroField`
+    // is RESERVED too, so a hero flag never leaks into a GHOSTTY_ITEM_META_* var.
     const reserved = new Set(
-      [fields.keyField, fields.titleField, fields.urlField].filter(
-        (f): f is string => typeof f === "string",
-      ),
+      [
+        fields.keyField,
+        fields.titleField,
+        fields.urlField,
+        fields.heroField,
+      ].filter((f): f is string => typeof f === "string"),
     );
     const meta: Record<string, string> = {};
     for (const [k, v] of Object.entries(rec)) {
@@ -423,4 +438,21 @@ function asScalarString(v: unknown): string | undefined {
   if (typeof v === "number" && Number.isFinite(v)) return String(v);
   if (typeof v === "boolean") return String(v);
   return undefined;
+}
+
+/** (hero) Coerce a raw JSON value to a hero flag. PURE + CONSERVATIVE — mirrors the
+ *  `parseStatusOutput` style (no false positives): a hero iff the value is boolean
+ *  `true`, a non-zero finite number, or a string that (trimmed, case-insensitively)
+ *  reads `"true"` / `"1"`. Everything else (including `false`, `0`, `"false"`, `"0"`,
+ *  the empty string, null/undefined, objects/arrays) is NOT a hero. Reading the RAW
+ *  value here is why `heroField` must be parsed BEFORE the meta collection stringifies
+ *  scalars (`false` → the truthy string "false"). */
+function asHero(v: unknown): boolean {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return Number.isFinite(v) && v !== 0;
+  if (typeof v === "string") {
+    const norm = v.trim().toLowerCase();
+    return norm === "true" || norm === "1";
+  }
+  return false;
 }

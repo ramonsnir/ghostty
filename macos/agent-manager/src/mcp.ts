@@ -67,6 +67,12 @@ export interface Surface {
    *  absent so a pre-upgrade host that doesn't yet emit it still typechecks. Under
    *  the `.exec` backend / no pty-host it is 0, which the supervisor self-disables on. */
   sessionID?: number;
+  /** (hero) The HERO verdict echoed back off the surface's `queueHero` annotation (the wire
+   *  arg `"hero"`). OMITTED (=== undefined) when not a hero / unknown — mirrors the queueKey
+   *  read-back. The sidecar's AUTHORITATIVE source of hero-ness is its own run-level `hero`
+   *  Set (re-stamped every sweep), so this is a visibility field for the reconcile-visibility
+   *  chokepoint (HERO-AGENTS.md wire contract), not the source of truth. */
+  hero?: boolean;
 }
 
 /** read_surface return: the viewport screen text + its grid dimensions. */
@@ -100,6 +106,11 @@ export interface Annotation {
    *  supervisor stamps this each sweep so the dashboard 📌 pin reflects the live state.
    *  Partial-merge, like the rest. */
   keep?: boolean;
+  /** (hero) The split's HERO verdict: true ⇒ this split is a load-bearing HERO (see
+   *  HERO-AGENTS.md). The supervisor stamps it at dispatch + each sweep so the GUI drives the
+   *  across-tabs hero-glyph tab marker + tile visual from it (Swift model field `queueHero`).
+   *  The wire arg key is `"hero"` (Bool) on `set_surface_annotation`. Partial-merge, like the rest. */
+  hero?: boolean;
   /** (adopt) A Haiku-inferred work-item KEY suggestion for the adopt modal's prefill. Written
    *  by the `infer_key` seam (`runInferKey` → `deps.inferKey`); the GUI observes it via the
    *  annotation path and prefills the key TextField. SENTINEL: a NON-EMPTY string = the inferred
@@ -181,6 +192,9 @@ export class McpClient {
     if (ann.queueName !== undefined) args.queueName = ann.queueName;
     if (ann.queueUrl !== undefined) args.queueUrl = ann.queueUrl;
     if (ann.keep !== undefined) args.keep = ann.keep;
+    // (hero) Forward the hero verdict under the wire arg `"hero"` (Bool). The Swift
+    // `set_surface_annotation` parse maps it to the `queueHero` model field.
+    if (ann.hero !== undefined) args.hero = ann.hero;
     // (adopt) Forward EVEN the empty string `""` (it is the load-bearing "inferred nothing"
     // sentinel, distinct from absent = "no suggestion yet" — §1.3). `!== undefined`, NOT a
     // truthiness check.
@@ -206,10 +220,12 @@ export class McpClient {
       dispatched: status.dispatched,
       maxItems: status.maxItems,
       concurrency: status.concurrency,
-      next: status.next,      // each carries key/title?/url?
+      next: status.next,      // each carries key/title?/url? + (hero) blockReasons? when blocked
       running: status.running, // key/title?/url? per running agent
       heldCount: status.heldCount, // (release) exact count of latch-held items
       held: status.held,           // (release) a few held items, each releasable in-place
+      heroMax: status.heroMax,     // (hero) fleet-wide agent-queue-hero-max (0 = disabled)
+      heroActive: status.heroActive, // (hero) fleet-wide live-hero count (heroActiveGlobal)
     });
   }
 
@@ -323,6 +339,18 @@ export class McpClient {
       ...(args.maxCols !== undefined && args.maxCols > 0 ? { maxCols: args.maxCols } : {}),
       ...(args.maxRows !== undefined && args.maxRows > 0 ? { maxRows: args.maxRows } : {}),
     });
+  }
+
+  /**
+   * (Agent Queue, hero) perform_action — run a Ghostty keybind-action grammar string against
+   * a surface (focus-then-act, GUI-side). Used to EJECT a promoted split into its OWN new tab
+   * via `move_split_to_new_tab` (the same machinery the keybind uses) — a single-terminal hero
+   * tab, out of the BSP grid (HERO-AGENTS.md § Layout). The Swift `perform_action` handler
+   * focuses the surface first so the relative action targets it. Throws McpError on failure
+   * (the caller logs; the annotation still drives reconcile even if the eject didn't land).
+   */
+  async performAction(id: string, action: string): Promise<void> {
+    await this.call("perform_action", { id, action });
   }
 
   /**
@@ -557,6 +585,12 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   // whole adopt feature is a no-op.
   "adopt",
   "infer_key",
+  // (hero) promote a running regular split to a HERO (flip the hero bit + eject to its own tab +
+  // re-stamp the hero annotation); demote reverses it. Both carry `{run, surfaceUUID, key?}` (the
+  // adopt shape) and ride this SAME FIFO — WITHOUT them here the GUI emit is SILENTLY DROPPED and
+  // promote/demote are a no-op (the adopt-chokepoint lesson, HERO-AGENTS.md wire contract).
+  "promote",
+  "demote",
 ]);
 
 /**

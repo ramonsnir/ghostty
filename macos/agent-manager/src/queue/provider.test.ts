@@ -226,6 +226,73 @@ test("parseListOutput: title/url absent when fields not configured", () => {
 });
 
 // ---------------------------------------------------------------------------
+// (hero) parseListOutput: heroField — truthy marks a hero; reserved from meta.
+// ---------------------------------------------------------------------------
+
+const heroFields: Pick<
+  ProviderListSpec,
+  "keyField" | "titleField" | "heroField"
+> = {
+  keyField: "identifier",
+  titleField: "title",
+  heroField: "isHero",
+};
+
+test("parseListOutput: heroField truthy values mark a hero", () => {
+  const stdout = JSON.stringify([
+    { identifier: "A-1", title: "bool", isHero: true },
+    { identifier: "A-2", title: "str-true", isHero: "true" },
+    { identifier: "A-3", title: "str-TRUE-padded", isHero: "  TRUE  " },
+    { identifier: "A-4", title: "str-1", isHero: "1" },
+    { identifier: "A-5", title: "num", isHero: 1 },
+  ]);
+  const items = parseListOutput(stdout, heroFields);
+  assert.deepEqual(
+    items.map((i) => i.hero),
+    [true, true, true, true, true],
+  );
+});
+
+test("parseListOutput: heroField falsy values are NOT heroes (no false positives)", () => {
+  const stdout = JSON.stringify([
+    { identifier: "A-1", isHero: false },
+    { identifier: "A-2", isHero: "false" },
+    { identifier: "A-3", isHero: "0" },
+    { identifier: "A-4", isHero: 0 },
+    { identifier: "A-5", isHero: "" },
+    { identifier: "A-6", isHero: null },
+    { identifier: "A-7" }, // field absent entirely
+    { identifier: "A-8", isHero: "yes" }, // arbitrary truthy string is NOT a hero
+  ]);
+  const items = parseListOutput(stdout, heroFields);
+  // `hero` is left undefined for a non-hero (never explicitly set false).
+  for (const item of items) assert.equal(item.hero, undefined);
+});
+
+test("parseListOutput: heroField is reserved from meta", () => {
+  // `false` would otherwise stringify to the truthy meta string "false" — the
+  // reserved-set + raw read must keep it out of meta entirely.
+  const stdout = JSON.stringify([
+    { identifier: "A-1", isHero: true, extra: "kept" },
+    { identifier: "A-2", isHero: false },
+  ]);
+  const items = parseListOutput(stdout, heroFields);
+  assert.deepEqual(items[0].meta, { extra: "kept" });
+  assert.equal(items[1].meta, undefined);
+});
+
+test("parseListOutput: no heroField configured => no hero flag, field falls to meta", () => {
+  const stdout = JSON.stringify([{ identifier: "A-1", isHero: true }]);
+  const items = parseListOutput(stdout, {
+    keyField: "identifier",
+    titleField: "title",
+  });
+  assert.equal(items[0].hero, undefined);
+  // With heroField unset the column is just another scalar → collected into meta.
+  assert.deepEqual(items[0].meta, { isHero: "true" });
+});
+
+// ---------------------------------------------------------------------------
 // parseStatusOutput — done / not-done / garbage => not terminal.
 // ---------------------------------------------------------------------------
 

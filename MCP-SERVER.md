@@ -390,8 +390,11 @@ see AGENT-MANAGER.md), the Agent Queue supervisor internals (`spawn_split_comman
 `force_close_surface`, `signal_attention`, `take_queue_commands`, `report_queue_status`,
 `report_queue_graph`, `move_surface_into_tab`, `set_surface_annotation` — see AGENT-QUEUE.md;
 `set_surface_annotation` also carries the `queueKeySuggested` field that the queue's "adopt a
-split" Haiku key-inference writes back for the GUI to prefill, and `take_queue_commands` carries
-the `adopt`/`infer_key` queue commands — neither is a NEW tool, so the count below is unchanged)
+split" Haiku key-inference writes back for the GUI to prefill, plus the Hero-Agents `hero`
+(Bool) verdict field; `take_queue_commands` carries the `adopt`/`infer_key` queue commands and
+the Hero-Agents `promote`/`demote` commands, and `list_surfaces` rows echo an optional `hero`
+flag (the reconcile-visibility read-back) — none of these adds a NEW tool, so the count below
+is unchanged. See HERO-AGENTS.md for the hero wire contract)
 and the 4 knowledge tools below. So the inventory is **12 agent-control + `set_attention` +
 `get_haiku_usage` + 8 queue/supervisor + 4 knowledge = 26**, and
 `MCPServerTests.toolsListHasAllTools` asserts the total is **26** — keep it in sync when a tool

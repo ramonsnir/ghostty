@@ -49,6 +49,21 @@ struct QueueCommand: Equatable, Sendable {
         /// sidecar whitelists. Uses `run` (tags account/candidate vocabulary; may be empty) +
         /// `surfaceUUID` (required). Not a registry mutation.
         case inferKey = "infer_key"
+        /// (promote) Flip a RUNNING regular assignment into a HERO: the sidecar sets its
+        /// `hero` bit (accounted against the fleet-wide `agent-queue-hero-max`, orthogonal to
+        /// concurrency/maxItems/max-total), the split is ejected into its own dedicated tab,
+        /// and it becomes keep-by-default. Promotion NEVER blocks — it may push over the cap;
+        /// no NEW heroes dispatch until live heroes drain back under. Serializes to the
+        /// lowercase `"promote"` the sidecar whitelists. Shaped like `adopt`: uses `run` +
+        /// `surfaceUUID` (required) + `key` (optional).
+        case promote
+        /// (demote) Flip a hero back into a regular tracked item: the sidecar clears its
+        /// `hero` bit so it re-enters the regular pool for future accounting + drops the hero
+        /// marker. Demotion does NOT re-pack the split back into a grid tab (it stays in its
+        /// own tab, like any kept split). Serializes to the lowercase `"demote"` the sidecar
+        /// whitelists. Shaped like `promote`/`adopt`: uses `run` + `surfaceUUID` (required) +
+        /// `key` (optional).
+        case demote
     }
 
     let action: Action
@@ -76,9 +91,9 @@ struct QueueCommand: Equatable, Sendable {
     /// (keep) The new keep verdict for `setKeep` (true = keep open, false = allow
     /// auto-close). nil for other actions (a non-bool is dropped by the sidecar).
     let keep: Bool?
-    /// (adopt / inferKey) The GUI surface UUID of the split to adopt / read (the
-    /// ephemeral per-launch surface id, as a string). REQUIRED for `adopt`/`inferKey`;
-    /// nil for other actions.
+    /// (adopt / inferKey / promote / demote) The GUI surface UUID of the split to
+    /// adopt / read / (de)hero (the ephemeral per-launch surface id, as a string).
+    /// REQUIRED for `adopt`/`inferKey`/`promote`/`demote`; nil for other actions.
     let surfaceUUID: String?
     /// (adopt) The work-item URL for the dashboard's clickable origin badge, set ONLY
     /// when the picked graph node carried one. nil for other actions.
@@ -124,9 +139,10 @@ struct QueueCommand: Equatable, Sendable {
         // (keep) emit the boolean verbatim (the sidecar requires a real boolean — a string
         // "true" would be dropped); only when present (nil for non-setKeep actions).
         if let keep { d["keep"] = keep }
-        // (adopt / inferKey) the surface to adopt / read; (adopt) the work-item url.
-        // Both emitted only when non-nil + non-empty (the sidecar's coerceQueueCommands
-        // drops empty strings, so an empty value here is equivalent to omitting it).
+        // (adopt / inferKey / promote / demote) the surface to adopt / read / (de)hero;
+        // (adopt) the work-item url. Both emitted only when non-nil + non-empty (the
+        // sidecar's coerceQueueCommands drops empty strings, so an empty value here is
+        // equivalent to omitting it).
         if let surfaceUUID, !surfaceUUID.isEmpty { d["surfaceUUID"] = surfaceUUID }
         if let url, !url.isEmpty { d["url"] = url }
         return d
@@ -163,7 +179,22 @@ struct QueueStatus: Equatable, Sendable {
         let key: String
         let title: String?
         let url: String?
+        /// (ramon fork / Hero Agents) The dispatch GATE(s) currently blocking this WAITING
+        /// item, so the backlog canvas can say EXACTLY why it hasn't dispatched (a hero stuck
+        /// on `heroSlots` vs. a regular past `maxItems`). Present ONLY on `next[]` (waiting)
+        /// refs, and only when ≥ 1 gate blocks it (omitted/[] when the item WOULD dispatch —
+        /// a free slot exists). Raw sidecar `BlockReason` strings ∈ {"maxItems",
+        /// "queueConcurrency", "globalConcurrency", "heroSlots"}; dependency-blocked is NOT a
+        /// reason (the graph edges already show it). See HERO-AGENTS.md.
+        let blockReasons: [String]
         var id: String { key }
+
+        init(key: String, title: String?, url: String?, blockReasons: [String] = []) {
+            self.key = key
+            self.title = title
+            self.url = url
+            self.blockReasons = blockReasons
+        }
     }
 
     /// The run NAME (= dashboard origin) this status is for.
@@ -199,6 +230,44 @@ struct QueueStatus: Equatable, Sendable {
     /// (release) Up to ~25 of those HELD items — the "N held" dropdown, each with a Release
     /// button (clears its latch so the queue re-dispatches it, no tracker round-trip).
     let held: [Item]
+    /// (ramon fork / Hero Agents) The fleet-wide hero cap = `agent-queue-hero-max` (`0` =
+    /// hero dispatch DISABLED). GLOBAL across ALL runs, so every run's status carries the
+    /// same value. Orthogonal to `concurrency`/`maxItems`/`max-total`. 0 when unknown
+    /// (legacy/missing) — see `heroActive`. Emitted by the sidecar's `report_queue_status`
+    /// (mcp.ts) from `QueueStatusReport.heroMax` (status.ts). See HERO-AGENTS.md.
+    let heroMax: Int
+    /// (ramon fork / Hero Agents) The fleet-wide count of LIVE hero assignments across ALL
+    /// runs (`heroActiveGlobal`). The hero gate's remaining is `heroMax − heroActive`; when
+    /// `≤ 0` a waiting hero item is `heroSlots`-blocked (surfaced per-item via
+    /// `Item.blockReasons`). 0 when unknown (legacy/missing). Mirrors `heroMax`.
+    let heroActive: Int
+
+    /// Memberwise init with `heroMax`/`heroActive` DEFAULTED to 0, so legacy/partial payloads
+    /// and older call sites that predate Hero Agents still construct (an explicit init is needed
+    /// because Swift's synthesized memberwise init won't give a stored `let` a default). Every
+    /// other field is required, exactly as the synthesized init required them.
+    init(
+        queueName: String, present: Bool, phase: String, queued: Int, listOk: Bool,
+        active: Int, dispatched: Int, maxItems: Int?, concurrency: Int,
+        next: [Item], running: [Item], heldCount: Int, held: [Item],
+        heroMax: Int = 0, heroActive: Int = 0
+    ) {
+        self.queueName = queueName
+        self.present = present
+        self.phase = phase
+        self.queued = queued
+        self.listOk = listOk
+        self.active = active
+        self.dispatched = dispatched
+        self.maxItems = maxItems
+        self.concurrency = concurrency
+        self.next = next
+        self.running = running
+        self.heldCount = heldCount
+        self.held = held
+        self.heroMax = heroMax
+        self.heroActive = heroActive
+    }
 
     // MARK: - Optimistic edits (instant dashboard feedback before the sidecar confirms)
 
@@ -209,7 +278,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: newMax,
             concurrency: concurrency, next: next, running: running,
-            heldCount: heldCount, held: held)
+            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive)
     }
 
     /// A copy with `phase` replaced — optimistic pause/resume/stop feedback.
@@ -218,7 +287,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: newPhase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
             concurrency: concurrency, next: next, running: running,
-            heldCount: heldCount, held: held)
+            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive)
     }
 
     /// A copy with `concurrency` replaced — optimistic parallel-edit feedback (the
@@ -228,7 +297,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
             concurrency: newConcurrency, next: next, running: running,
-            heldCount: heldCount, held: held)
+            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive)
     }
 
     /// (release) A copy with the HELD set replaced — optimistic release feedback. Dropping a
@@ -240,7 +309,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
             concurrency: concurrency, next: next, running: running,
-            heldCount: newHeld.count, held: newHeld)
+            heldCount: newHeld.count, held: newHeld, heroMax: heroMax, heroActive: heroActive)
     }
 
     /// (pure, testable) Parse the concurrency-editor's raw string the SAME way the sidecar's
@@ -294,7 +363,12 @@ struct QueueStatusPayload {
                 guard let key = (entry["key"] as? String), !key.isEmpty else { continue }
                 let title = (entry["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 let url = (entry["url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                out.append(QueueStatus.Item(key: key, title: title, url: url))
+                // (hero) Per-item dispatch gate(s) — carried only on waiting `next[]` refs
+                // (absent/[] elsewhere). Non-empty strings only.
+                let reasons = (entry["blockReasons"] as? [Any])?
+                    .compactMap { ($0 as? String).flatMap { $0.isEmpty ? nil : $0 } } ?? []
+                out.append(QueueStatus.Item(
+                    key: key, title: title, url: url, blockReasons: reasons))
             }
             return out
         }
@@ -310,7 +384,9 @@ struct QueueStatusPayload {
             dispatched: int("dispatched"), maxItems: maxItems,
             concurrency: int("concurrency"),
             next: items("next"), running: items("running"),
-            heldCount: heldCount, held: heldItems))
+            heldCount: heldCount, held: heldItems,
+            // (hero) Fleet-wide hero cap + live-hero count. Absent (legacy) ⇒ 0.
+            heroMax: int("heroMax"), heroActive: int("heroActive")))
     }
 }
 

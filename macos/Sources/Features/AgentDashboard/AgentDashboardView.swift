@@ -231,6 +231,18 @@ struct AgentDashboardView: View {
             },
             onJumpToKey: { run, key in
                 model.jumpToKey(run: run, key: key)
+            },
+            onPromoteToHero: {
+                model.promoteToHero(
+                    id: entry.id,
+                    run: entry.annotation?.queueName ?? "",
+                    key: entry.annotation?.queueKey ?? "")
+            },
+            onDemoteFromHero: {
+                model.demoteFromHero(
+                    id: entry.id,
+                    run: entry.annotation?.queueName ?? "",
+                    key: entry.annotation?.queueKey ?? "")
             }
         )
     }

@@ -58,6 +58,7 @@ function asgn(over: Partial<Assignment> = {}): Assignment {
     gridSlot: 0,
     state: "RUNNING",
     sinceMs: 0,
+    hero: false,
     ...over,
   };
 }
@@ -316,6 +317,32 @@ test("nextState: keep=true PINS DONE_PENDING — a stably-idle KEPT split is NOT
   assert.equal(
     nextState(
       a,
+      ctx({ agentState: "idle", idleStableSinceMs: now - 60000, nowMs: now, closeStableSeconds: 5, keep: false }),
+    ),
+    "CLOSING",
+  );
+});
+
+test("hero: the close gate treats a hero as keep=true — a stably-idle hero HOLDS in DONE_PENDING", () => {
+  // (hero) The runner maps a hero to `keep = effectiveKeep || effectiveHero` before calling
+  // nextState (HERO-AGENTS.md § Lifecycle: a hero is always kept). This pins that a hero
+  // (keep:true here) holds even when the template would otherwise auto-close (closeOnComplete
+  // defaults to true, no per-split keep). It is the SAME hold the 📌 pin uses.
+  const heroAssignment = asgn({ state: "DONE_PENDING", hero: true });
+  const now = 100000;
+  assert.equal(
+    nextState(
+      heroAssignment,
+      ctx({ agentState: "idle", idleStableSinceMs: now - 60000, nowMs: now, closeStableSeconds: 5, keep: true }),
+    ),
+    "DONE_PENDING",
+    "a hero (keep:true) is never auto-closed",
+  );
+  // The SAME assignment WITHOUT the keep-forces-hero mapping (keep:false) would auto-close —
+  // proving it is the keep flag, not some other property, that pins the hero open.
+  assert.equal(
+    nextState(
+      heroAssignment,
       ctx({ agentState: "idle", idleStableSinceMs: now - 60000, nowMs: now, closeStableSeconds: 5, keep: false }),
     ),
     "CLOSING",

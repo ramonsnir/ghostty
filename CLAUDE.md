@@ -565,12 +565,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   → "Orphan guard". Rebuilt sidecar `dist` + GUI relaunch; no host/Zig change.**
 
 - **Agent Queue Supervisor** (fork-only, macOS, OFF by default; config `agent-queue` /
-  `agent-queue-templates-dir` / `agent-queue-max-total`, action `start_agent_queue`) — turns the
+  `agent-queue-templates-dir` / `agent-queue-max-total` / `agent-queue-hero-max`, action
+  `start_agent_queue`) — turns the
   dashboard into an active supervisor: from a user-authored JSON template it opens a tab of splits,
   launches one CLI agent per work item, caps concurrency, never doubles up on an item key, tracks
-  each to completion via status, force-closes a done+idle split, and re-polls. **`agent-queue-max-total`
-  is an OPTIONAL fleet-wide cap across ALL runs, default `0` = UNLIMITED** (was 8) — a queue is
-  bounded only by its own `concurrency`/`maxItems`/grid unless you set a positive value. (Its Swift
+  each to completion via status, force-closes a done+idle split (**unless it is kept — 📌-pinned,
+  `keepOnComplete`, or a HERO, which are keep-by-default; see the Hero-agents bullet below**), and
+  re-polls. **`agent-queue-max-total`
+  is an OPTIONAL fleet-wide cap across ALL runs, default `0` = UNLIMITED** (was 8) — a REGULAR queue
+  item is bounded only by its own `concurrency`/`maxItems`/grid unless you set a positive value.
+  (**HEROES are ORTHOGONAL to all of these** — they consume no `concurrency`/`maxItems`/`max-total`
+  slot; they are capped only by their own fleet-wide `agent-queue-hero-max`. See the Hero-agents
+  bullet below.) (Its Swift
   getter had a latent bug — read into a `UInt32?` so `ghostty_config_get` could never set the
   Optional tag → always returned the hardcoded 8, silently ignoring the config AND any per-queue
   `concurrency` above 8; fixed to a non-optional read. See AGENT-QUEUE.md → Implementation notes.)
@@ -591,7 +597,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `closeOnComplete:false`), never force-closed, persisted across restart; toggled via a
   `set_keep{run,key,keep}` command, state carried on the surface annotation (`queueKeep`). Keep is
   RUN-LEVEL state (`QueueRun.keep` map, mirrors the `dispatched` latch — survives reconcile),
-  `effectiveKeep = run.keep[key] ?? template.keepOnComplete`. A **`release{run,key?}`** command
+  `effectiveKeep = run.keep[key] ?? template.keepOnComplete` (**a HERO forces this true regardless
+  of pin/template** — see the Hero-agents bullet). A **`release{run,key?}`** command
   is the in-place escape from the dispatch latch's "needs a tracker status round-trip" rule: an
   agent that crashed/exited or was killed before claiming leaves its item latched-but-listed
   ("held"), never rescheduled. The health bar surfaces an orange **`N held`** chip (the sidecar
@@ -664,6 +671,83 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `AGENT-QUEUE.md` (→ Adopting a free split / Implementation notes). GUI relaunch + rebuilt sidecar
   `dist`; no host/Zig change.**
 
+- **Hero agents** (fork-only, macOS; config `agent-queue-hero-max`, default **2**) — a **per-item
+  property** on an Agent Queue item, NOT a new subsystem: a *hero* is **load-bearing** work that
+  has to be RIGHT (research / deep design / many small details), so the scarce resource it competes
+  for is **YOUR ATTENTION**, not a machine slot. That one fact drives four differences from a
+  regular item — *slot accounting, lifecycle, layout, notification*. **Slot accounting is
+  ORTHOGONAL:** a hero is capped ONLY by the fleet-wide `agent-queue-hero-max` (across ALL runs),
+  never against `concurrency`/`maxItems`/`agent-queue-max-total` — and vice-versa (the literal
+  "2–3 heroes PLUS 10 other agents"). The sidecar dispatch gate splits the list into two pools by
+  `item.hero`: the regular pool gated as today (counting only NON-hero actives; a separate
+  `heroLifetimeDispatched` counter keeps the regular `maxItems` budget untouched by heroes) and the
+  hero pool gated only by `heroRemaining = heroMax − heroActiveGlobal` (fleet-wide). `agent-queue-hero-max
+  = 0` DISABLES hero dispatch (⚠️ INVERSION vs `agent-queue-max-total`, where `0` = UNLIMITED — a
+  hero-marked item then waits VISIBLY on the hero-slot gate). **Two entry paths:** the provider marks
+  an item up front via the template list-spec `heroField?: string` (a truthy JSON field in `list`
+  output, mirrors `keyField`), OR you **`promote`** a running regular from the dashboard tile.
+  **Promotion NEVER blocks** — it may push `heroActiveGlobal` PAST the cap (only consequence: no NEW
+  heroes dispatch until it drains under); it HANDS the regular slot over (decrements the regular
+  `lifetimeDispatched`, floored at 0, and bumps `heroLifetimeDispatched`), so a promoted item stops
+  permanently consuming a regular budget it no longer belongs to. **`demote`** flips it back (re-enters
+  the regular pool for future accounting) but does NOT re-pack the split into a grid (stays in its own
+  tab, like any kept split). **Lifecycle — keep-by-default:** a hero is NEVER auto-closed — the close
+  gate (`nextState`) treats it as `keep===true` REGARDLESS of the 📌 pin / template `keepOnComplete`,
+  so it holds in `DONE_PENDING` forever (a follow-up PR wants the context). **Layout — own dedicated
+  tab:** a hero dispatches into its OWN new single-terminal tab (never in the BSP grid — `largestLeafSplit`
+  packing ignores heroes); `promote` EJECTS a running regular into its own tab via the SAME
+  `move_split_to_new_tab` / `perform_action` machinery, done GUI-side immediately for responsiveness.
+  **Across-tabs tab marker:** a per-tab `TerminalWindow.surfaceIsHero: Bool` (parallel to
+  `surfaceIsZoomed`) drives a hero-glyph titlebar accessory (`HeroAccessoryView`, a tinted yellow
+  `star.fill`, distinct from the purple tile border)
+  visible on non-focused tabs — free because a single-terminal hero tab can never be zoomed, so hero +
+  reset-zoom accessories are mutually exclusive. **Notification — loud tier + distinct glyph:** a hero
+  waiting on you routes into the LOUD attention tier via the EXISTING `.ghosttyAgentNeedsAttention`
+  path — `postNeedsAttention` reads the stored `queueHero` and adds `AgentStateUserInfoKey.hero: Bool`;
+  `WebPushManager` calls `onHero` (`PushKind.hero`, `"kind":"hero"`, distinct title glyph, independent
+  debounce) instead of `onAttention`. NO new notification/delivery mechanism. **Backlog:** a waiting
+  hero blocked on the hero-slot cap gets a DISTINCT icon (purple `star.circle.fill`, not the orange
+  clock) + a tooltip listing every gate (`blockReasons ∈ {maxItems, queueConcurrency, globalConcurrency,
+  heroSlots}`; dependency-blocked is OMITTED — the graph edges already show it), so nobody wastes time
+  bumping `maxItems` for a hero stuck on `heroSlots`. **Wire contract (both sides MUST match — the
+  `adopt`-chokepoint lesson):** config `agent-queue-hero-max` (u32, forwarded as env
+  `GHOSTTY_AGENT_QUEUE_HERO_MAX`, parsed with a NON-negative-honoring `parseNonNegativeInt` so `0`
+  survives); template `heroField`; `WorkItem.hero?`/`Assignment.hero` (persisted, rehydrated like
+  `keep`); queue commands `promote`/`demote` carrying `{run, surfaceUUID, key?}` (**added to the
+  `coerceQueueCommands` `QUEUE_ACTIONS` whitelist in `mcp.ts` — omission silently drops the command**);
+  surface-annotation arg `"hero"` (Bool) ⇄ Swift model field `queueHero` (mirrors `queueKeep`);
+  `list_surfaces` emits `hero:true` (the reconcile-visibility chokepoint — `MCPLayout.surfacesJSONData`);
+  status report `heroMax`/`heroActive` (fleet-wide globals) + per-item `blockReasons?`. **NO new MCP
+  tool — count stays 26** (`promote`/`demote` ride `take_queue_commands`; `hero` rides
+  `set_surface_annotation`). Fork-only — keep `agent-queue-hero-max` in `~/.config/ghostty-ramon/config`.
+  Wiring: core `src/config/Config.zig` (field + doc + parse test), `Ghostty.Config.swift`
+  (`agentQueueHeroMax` non-optional getter), `AgentManagerController.swift`
+  (`GHOSTTY_AGENT_QUEUE_HERO_MAX` forward); sidecar `queue/types.ts` (`WorkItem.hero`,
+  `Assignment.hero`, `heroField`, `BlockReason`), `queue/provider.ts` (`heroField` parse),
+  `queue/runner.ts` + `queue/supervisor.ts` (two-pool accounting, `heroActiveGlobal`, keep-forces-hero
+  close gate, hero dispatch into own tab, `runPromote`/`runDemote`), `queue/commands.ts`
+  (`promote`/`demote` + `ApplyResult` `"promoted"`/`"demoted"`), `queue/status.ts`
+  (`heroMax`/`heroActive` + `blockReasons`), `mcp.ts` (whitelist + `hero` read-back), `index.ts`
+  (`heroMax` cap + `parseNonNegativeInt`); macOS `QueueCommandBridge.swift` (`.promote`/`.demote` +
+  `surfaceUUID`), `MCPAnnotation.swift`/`MCPTools.swift` (`hero` arg parse + schema),
+  `AgentStateBridge.swift` (`AgentAnnotation.queueHero` + `merging` + `AgentStateUserInfoKey.hero`),
+  `MCPLayout.swift` (`SurfaceRow.hero` + emit), `AgentDashboardController.swift`
+  (`promoteToHero`/`demoteFromHero`, `HookSnapshotEntry.queueHero`, `postNeedsAttention` hero flag),
+  `AgentPreviewTile.swift` + `AgentDashboardView.swift` (Promote/Demote button + hero tile
+  border/glyph), `QueueBacklogCanvas.swift` (hero-waiting icon + tooltip), `TerminalWindow.swift` +
+  `TitlebarTabsVenturaTerminalWindow.swift` + `TerminalController.swift` (`surfaceIsHero` +
+  `HeroAccessoryView`), `WebMonitorPush.swift` (`PushKind.hero` + `onHero` + `pushTitle`/`pushPayload`
+  seams). Tests: Zig `agent-queue-hero-max` parse/default/round-trip (`Config.zig`); sidecar two-pool
+  accounting / promote-over-cap-never-blocks + drain / demote re-enters / keep-forces-hero / `heroField`
+  parse / `promote`/`demote` `applyCommand` + coerce / `blockReasons`/`heroMax`/`heroActive` / persist
+  rehydrate (`queue/*.test.ts`, `mcp.test.ts`, `index.test.ts`); Swift `QueueCommandBridge`
+  promote/demote round-trip (`QueuePaletteTests`), `MCPAnnotation` `hero` parse + `merging`
+  (`MCPAnnotationTests`), `SurfaceRow`→`surfacesJSONData` emit (`MCPServerTests`), backlog hero-waiting
+  icon + reason set + `surfaceIsHero`→accessory (`AgentDashboardTests`), `PushKind.hero`
+  (`WebMonitorServerTests`). **See `HERO-AGENTS.md` for the full design (attention-as-scarce-resource,
+  the two-pool model, wire contract) + `AGENT-QUEUE.md`/`AGENT-DASHBOARD.md`. GUI relaunch + Zig/lib
+  rebuild (new config key) + rebuilt sidecar `dist`; NO host restart.**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
@@ -671,7 +755,7 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir`, `agent-queue-max-total`, `agent-queue-hero-max`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

@@ -21,6 +21,13 @@ class TerminalWindow: NSWindow {
     /// Reset split zoom button in titlebar
     private let resetZoomAccessory = NSTitlebarAccessoryViewController()
 
+    /// (ramon fork / Hero Agents) Hero marker in titlebar. Mirrors `resetZoomAccessory`:
+    /// a titlebar accessory whose visibility is driven by the per-tab `surfaceIsHero`
+    /// bool, so it shows across ALL tabs (a non-focused tab still shows the marker). A
+    /// hero tab is single-terminal and so can never be zoomed, so this and the reset-zoom
+    /// accessory are mutually exclusive and never collide.
+    private let heroAccessory = NSTitlebarAccessoryViewController()
+
     /// Update notification UI in titlebar
     private let updateAccessory = NSTitlebarAccessoryViewController()
 
@@ -143,6 +150,13 @@ class TerminalWindow: NSWindow {
             addTitlebarAccessoryViewController(resetZoomAccessory)
             resetZoomAccessory.view.translatesAutoresizingMaskIntoConstraints = false
 
+            // (ramon fork / Hero Agents) Create our hero marker titlebar accessory,
+            // parallel to the reset-zoom accessory above.
+            heroAccessory.layoutAttribute = .right
+            heroAccessory.view = NSHostingView(rootView: HeroAccessoryView(viewModel: viewModel))
+            addTitlebarAccessoryViewController(heroAccessory)
+            heroAccessory.view.translatesAutoresizingMaskIntoConstraints = false
+
             // Create update notification accessory
             if supportsUpdateAccessory {
                 updateAccessory.layoutAttribute = .right
@@ -167,6 +181,7 @@ class TerminalWindow: NSWindow {
         stackView.alignment = .centerY
         stackView.addArrangedSubview(tabColorIndicator)
         stackView.addArrangedSubview(keyEquivalentLabel)
+        stackView.addArrangedSubview(heroTabButton)
         stackView.addArrangedSubview(resetZoomTabButton)
         tab.accessoryView = stackView
 
@@ -315,6 +330,12 @@ class TerminalWindow: NSWindow {
             removeTitlebarAccessoryViewController(at: idx)
         }
 
+        // (ramon fork / Hero Agents) Same treatment for the hero accessory, for the
+        // same content-view-scaling reason as the reset-zoom accessory above.
+        if let idx = titlebarAccessoryViewControllers.firstIndex(of: heroAccessory) {
+            removeTitlebarAccessoryViewController(at: idx)
+        }
+
         // We don't need to do this with the update accessory. I don't know why but
         // everything works fine.
     }
@@ -323,6 +344,10 @@ class TerminalWindow: NSWindow {
         if styleMask.contains(.titled) {
             if titlebarAccessoryViewControllers.firstIndex(of: resetZoomAccessory) == nil {
                 addTitlebarAccessoryViewController(resetZoomAccessory)
+            }
+            // (ramon fork / Hero Agents) Re-add the hero accessory, like reset-zoom.
+            if titlebarAccessoryViewControllers.firstIndex(of: heroAccessory) == nil {
+                addTitlebarAccessoryViewController(heroAccessory)
             }
         }
     }
@@ -382,6 +407,43 @@ class TerminalWindow: NSWindow {
         button.contentTintColor = isMainWindow ? .controlAccentColor : .secondaryLabelColor
         button.state = .on
         button.image = NSImage(named: "ResetZoom")
+        button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        return button
+    }
+
+    // MARK: Hero Marker
+
+    /// (ramon fork / Hero Agents) Set to true when this tab's surface is a hero (its
+    /// `queueHero` annotation is true) to show the hero marker. Mirrors
+    /// `surfaceIsZoomed`: a per-tab bool driving a titlebar accessory that shows across
+    /// all tabs, plus the in-tab-accessory button.
+    var surfaceIsHero: Bool = false {
+        didSet {
+            heroTabButton.isHidden = !surfaceIsHero
+
+            DispatchQueue.main.async {
+                self.viewModel.isSurfaceHero = self.surfaceIsHero
+            }
+        }
+    }
+
+    private lazy var heroTabButton: NSButton = generateHeroButton()
+
+    private func generateHeroButton() -> NSButton {
+        let button = NSButton()
+        button.isHidden = true
+        button.isBordered = false
+        // A marker, not a button: no target/action, but left enabled so the tint shows
+        // at full strength (a disabled button would grey the glyph out).
+        button.target = nil
+        button.allowsExpansionToolTips = true
+        button.toolTip = "Hero"
+        button.contentTintColor = .systemYellow
+        button.state = .on
+        button.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Hero")
         button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: 20).isActive = true
@@ -626,6 +688,8 @@ class TerminalWindow: NSWindow {
 extension TerminalWindow {
     class ViewModel: ObservableObject {
         @Published var isSurfaceZoomed: Bool = false
+        /// (ramon fork / Hero Agents) Drives the `HeroAccessoryView`'s visibility.
+        @Published var isSurfaceHero: Bool = false
         @Published var hasToolbar: Bool = false
         @Published var isMainWindow: Bool = true
 
@@ -653,6 +717,31 @@ extension TerminalWindow {
                     .buttonStyle(.plain)
                     .help("Reset Split Zoom")
                     .frame(width: 20, height: 20)
+                    Spacer()
+                }
+                // With a toolbar, the window title is taller, so we need more padding
+                // to properly align.
+                .padding(.top, viewModel.accessoryTopPadding)
+                // We always need space at the end of the titlebar
+                .padding(.trailing, 10)
+            }
+        }
+    }
+
+    /// (ramon fork / Hero Agents) A hero marker shown in the titlebar accessory slot,
+    /// parallel to `ResetZoomAccessoryView`. A distinct tinted `star.fill` glyph so it
+    /// reads apart from the 🔔 bell title-prefix and the orange marked-pane inset. It is
+    /// non-interactive (a marker, not a button) and visible across all tabs.
+    struct HeroAccessoryView: View {
+        @ObservedObject var viewModel: ViewModel
+
+        var body: some View {
+            if viewModel.isSurfaceHero {
+                VStack {
+                    Image(systemName: "star.fill")
+                        .foregroundColor(.yellow)
+                        .help("Hero")
+                        .frame(width: 20, height: 20)
                     Spacer()
                 }
                 // With a toolbar, the window title is taller, so we need more padding
