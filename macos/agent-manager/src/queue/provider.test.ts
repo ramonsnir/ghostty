@@ -513,6 +513,23 @@ test("parseGraphOutput: priorityLabel kept only when a non-empty string", () => 
   assert.equal(out[3].priorityLabel, undefined);
 });
 
+test("parseGraphOutput: hero is set only when the node's hero === true", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({
+      nodes: [
+        { key: "A-1", hero: true }, // → hero: true
+        { key: "A-2", hero: false }, // explicit false → undefined (absent)
+        { key: "A-3", hero: "true" }, // non-bool truthy → NOT a hero (strict === true)
+        { key: "A-4" }, // absent → undefined
+      ],
+    }),
+  );
+  assert.equal(out[0].hero, true);
+  assert.equal(out[1].hero, undefined);
+  assert.equal(out[2].hero, undefined);
+  assert.equal(out[3].hero, undefined);
+});
+
 test("parseGraphOutput: accepts a BARE array too", () => {
   const out = parseGraphOutput(JSON.stringify([{ key: "A-1", done: true }]));
   assert.deepEqual(out, [{ key: "A-1", done: true, labels: [], blockedBy: [] }]);

@@ -187,13 +187,18 @@ struct QueueStatus: Equatable, Sendable {
         /// "queueConcurrency", "globalConcurrency", "heroSlots"}; dependency-blocked is NOT a
         /// reason (the graph edges already show it). See HERO-AGENTS.md.
         let blockReasons: [String]
+        /// (ramon fork / Hero Agents) True when this item is a HERO — set on waiting / running /
+        /// held refs so the "N waiting/running/held" dropdowns mark heroes with a star. Sidecar-
+        /// sourced (promoted `run.hero` ∪ active hero assignments ∪ list `heroField`). Defaults false.
+        let hero: Bool
         var id: String { key }
 
-        init(key: String, title: String?, url: String?, blockReasons: [String] = []) {
+        init(key: String, title: String?, url: String?, blockReasons: [String] = [], hero: Bool = false) {
             self.key = key
             self.title = title
             self.url = url
             self.blockReasons = blockReasons
+            self.hero = hero
         }
     }
 
@@ -367,8 +372,10 @@ struct QueueStatusPayload {
                 // (absent/[] elsewhere). Non-empty strings only.
                 let reasons = (entry["blockReasons"] as? [Any])?
                     .compactMap { ($0 as? String).flatMap { $0.isEmpty ? nil : $0 } } ?? []
+                // (hero) Marks a hero on ANY dropdown (waiting/running/held) — see QueueStatus.Item.
+                let hero = (entry["hero"] as? Bool) ?? false
                 out.append(QueueStatus.Item(
-                    key: key, title: title, url: url, blockReasons: reasons))
+                    key: key, title: title, url: url, blockReasons: reasons, hero: hero))
             }
             return out
         }
@@ -444,6 +451,11 @@ struct QueueGraph: Equatable, Sendable {
         /// GENERIC priority MARK (e.g. "Urgent", "High") the canvas renders as a prominent
         /// badge + tinted border. Provider-decided (like `done`/`stateType`); nil → no mark.
         let priorityLabel: String?
+        /// (ramon fork / Hero Agents) True when this backlog item is a HERO (own tab, capped by
+        /// `agent-queue-hero-max`). The canvas shows the hero glyph on ANY hero node, independent
+        /// of whether it is currently blocked on the hero-slot gate. Sidecar-sourced (list
+        /// `heroField` ∪ promoted `run.hero` ∪ a provider-set graph `hero`). Defaults false.
+        var hero: Bool = false
         var id: String { key }
     }
 
@@ -487,7 +499,8 @@ struct QueueGraphPayload {
                     state: opt("state"), stateType: opt("stateType"),
                     done: (entry["done"] as? Bool) ?? false,
                     labels: strings("labels"), blockedBy: strings("blockedBy"),
-                    priorityLabel: opt("priorityLabel")))
+                    priorityLabel: opt("priorityLabel"),
+                    hero: (entry["hero"] as? Bool) ?? false))
             }
         }
 

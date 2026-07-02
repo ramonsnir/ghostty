@@ -115,6 +115,15 @@ export interface GraphNode {
    *  int. Absent ⇒ no mark. The canvas colors it from a generic English-priority vocabulary
    *  (urgent/high/medium/low) with a neutral fallback, so an unknown label still renders. */
   priorityLabel?: string;
+  /** (ramon fork / Hero Agents) True when this backlog item is a HERO — a load-bearing item
+   *  that runs in its own tab, capped by the fleet-wide `agent-queue-hero-max` (see HERO-AGENTS.md).
+   *  Sourced two ways, OR'd together (`refreshGraph`): the provider `graph` output may set it
+   *  directly (queue-defined, like `done`/`priorityLabel`), AND the sidecar marks any node whose
+   *  key is a known hero — a `list` item with a truthy `heroField`, or a PROMOTED key in the
+   *  run-level `hero` set. So a hero reads as a hero in the backlog REGARDLESS of whether it is
+   *  currently blocked on the hero-slot gate (the `heroSlots` blockReason drives only the extra
+   *  "why is it waiting" tooltip). Absent ⇒ regular item. */
+  hero?: boolean;
 }
 
 /** (backlog graph) The board snapshot the sidecar caches + pushes via `report_queue_graph`. */

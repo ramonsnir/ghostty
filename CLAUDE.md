@@ -705,11 +705,22 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   waiting on you routes into the LOUD attention tier via the EXISTING `.ghosttyAgentNeedsAttention`
   path — `postNeedsAttention` reads the stored `queueHero` and adds `AgentStateUserInfoKey.hero: Bool`;
   `WebPushManager` calls `onHero` (`PushKind.hero`, `"kind":"hero"`, distinct title glyph, independent
-  debounce) instead of `onAttention`. NO new notification/delivery mechanism. **Backlog:** a waiting
-  hero blocked on the hero-slot cap gets a DISTINCT icon (purple `star.circle.fill`, not the orange
-  clock) + a tooltip listing every gate (`blockReasons ∈ {maxItems, queueConcurrency, globalConcurrency,
-  heroSlots}`; dependency-blocked is OMITTED — the graph edges already show it), so nobody wastes time
-  bumping `maxItems` for a hero stuck on `heroSlots`. **Wire contract (both sides MUST match — the
+  debounce) instead of `onAttention`. NO new notification/delivery mechanism. **Heroes are marked
+  EVERYWHERE a queue item shows, independent of block state** (not only when stuck on the hero slot):
+  (a) the **backlog canvas** shows a purple `star.circle.fill` + purple card border on ANY hero node
+  — driven by a `GraphNode.hero`/`QueueGraph.Node.hero` flag the sidecar `refreshGraph` OR's from a
+  provider-set graph `hero`, a `list` `heroField` item, and a promoted `run.hero` key; (b) the **"N
+  waiting / M running / N held" health dropdowns** show a purple `star.fill` per hero row — driven by
+  a per-item `QueueItemRef.hero`/`QueueStatus.Item.hero` the sidecar sets from `heroKeys` (promoted ∪
+  active hero assignments ∪ `list` `heroField`). The whole-card tooltip still explains WHY a hero is
+  waiting (`blockReasons ∈ {maxItems, queueConcurrency, globalConcurrency, heroSlots}`; dependency-
+  blocked OMITTED — the graph edges show it), so nobody bumps `maxItems` for a hero stuck on
+  `heroSlots`. **⚠️ Tooltips in the dashboard use a CUSTOM `dashboardTooltip` (`DashboardTooltip`
+  modifier in `QueueBacklogCanvas.swift`), NOT AppKit `.help()`** — the dashboard is a non-activating
+  `NSPanel` and native tooltips render ONLY for the KEY window, so `.help()` never fired while
+  hovering the (non-key) panel. `dashboardTooltip` drives a bubble off `.onHover` (which DOES fire in
+  the panel — it's what reveals the tile hover-buttons) and also sets `.help()` for key windows; every
+  tile-icon + backlog tooltip uses it (short 1–2 word labels). **Wire contract (both sides MUST match — the
   `adopt`-chokepoint lesson):** config `agent-queue-hero-max` (u32, forwarded as env
   `GHOSTTY_AGENT_QUEUE_HERO_MAX`, parsed with a NON-negative-honoring `parseNonNegativeInt` so `0`
   survives); template `heroField`; `WorkItem.hero?`/`Assignment.hero` (persisted, rehydrated like

@@ -948,7 +948,19 @@ async function refreshGraph(run: QueueRun, deps: QueueDeps, nowMs: number): Prom
   }
   if (!res.ok) return; // keep last-known board on a failed fetch
 
-  run.lastGraph = { nodes: res.nodes };
+  // (hero) Mark backlog nodes that are known heroes so the canvas shows the hero glyph on ANY
+  // hero, not just one blocked on the hero-slot cap. Two sources OR'd with a provider-set
+  // `node.hero`: a `list` item carrying a truthy `heroField`, and a PROMOTED key (run.hero set).
+  const heroKeys = new Set<string>([
+    ...(run.lastListItems ?? []).filter((i) => i.hero === true).map((i) => i.key),
+    ...run.hero,
+  ]);
+  const nodes: GraphNode[] =
+    heroKeys.size === 0
+      ? res.nodes
+      : res.nodes.map((n) => (n.hero === true || heroKeys.has(n.key) ? { ...n, hero: true } : n));
+
+  run.lastGraph = { nodes };
   const exclude = new Set<string>([
     ...(run.lastListItems ?? []).map((i) => i.key),
     ...run.active.keys(),
@@ -956,8 +968,8 @@ async function refreshGraph(run: QueueRun, deps: QueueDeps, nowMs: number): Prom
   const report: QueueGraphReport = {
     queueName: run.runName,
     present: true,
-    backlog: backlogCount(res.nodes, exclude),
-    nodes: res.nodes,
+    backlog: backlogCount(nodes, exclude),
+    nodes,
   };
   try {
     await deps.client.reportQueueGraph(report);
@@ -990,7 +1002,15 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
   const occupying = [...run.active.values()].filter(occupiesSlot);
   // The RUNNING items (key/title/url) for the "M running" dropdown — from the
   // slot-occupying assignments (title/url were captured at dispatch from the work item).
-  const runningItems = occupying.map((a) => ({ key: a.key, title: a.title, url: a.url }));
+  // (hero) Carry each assignment's `hero` bit so the "M running" dropdown marks heroes.
+  const runningItems = occupying.map((a) => ({ key: a.key, title: a.title, url: a.url, hero: a.hero }));
+  // (hero) The keys that are heroes right now — promoted (run.hero) ∪ active hero assignments ∪
+  // `list` items with a truthy `heroField` — so `next`/`running`/`held` refs all get marked.
+  const heroKeys = new Set<string>([
+    ...run.hero,
+    ...[...run.active.values()].filter((a) => a.hero === true).map((a) => a.key),
+    ...(run.lastListItems ?? []).filter((i) => i.hero === true).map((i) => i.key),
+  ]);
   // Exclude from the backlog/next: everything currently tracked (active map, any state)
   // PLUS the §7.1 dispatch latch — those keys are NOT eligible to dispatch, so showing
   // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
@@ -1009,6 +1029,7 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     dispatchArmed: run.dispatchArmed,
     runningItems,
     excludeKeys: exclude,
+    heroKeys,
     heroMax: deps.heroMax,
     heroActive: totalHeroActiveRegistry(deps.registry),
     regularConcurrencyRemaining: effectiveConcurrency(run) - regularOccupancy(run),

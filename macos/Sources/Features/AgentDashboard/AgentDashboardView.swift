@@ -852,6 +852,11 @@ private struct OriginSectionHeader: View {
             } else {
                 ForEach(items) { item in
                     HStack(spacing: 6) {
+                        // (hero) Mark a hero item so the waiting/running dropdown reads it at a glance.
+                        if item.hero {
+                            Image(systemName: "star.fill").font(.caption2).foregroundStyle(.purple)
+                                .help("Hero issue")
+                        }
                         Text(item.key)
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 5).padding(.vertical, 1)
@@ -904,6 +909,11 @@ private struct OriginSectionHeader: View {
             } else {
                 ForEach(status.held) { item in
                     HStack(spacing: 6) {
+                        // (hero) Mark a held hero item so the "N held" dropdown reads it at a glance.
+                        if item.hero {
+                            Image(systemName: "star.fill").font(.caption2).foregroundStyle(.purple)
+                                .help("Hero issue")
+                        }
                         Text(item.key)
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 5).padding(.vertical, 1)

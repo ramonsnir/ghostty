@@ -19,6 +19,12 @@ export interface QueueItemRef {
    *  slot exists — so an unblocked backlog item carries no reasons). Dependency-blocked is
    *  intentionally NOT a reason (the graph edges already show it). See HERO-AGENTS.md. */
   blockReasons?: BlockReason[];
+  /** (ramon fork / Hero Agents) True when this item is a HERO — set on `next` (waiting),
+   *  `running`, AND `held` refs so the dashboard's "N waiting/running/held" dropdowns mark
+   *  heroes at a glance (a load-bearing item in its own tab, capped by `agent-queue-hero-max`).
+   *  Sourced from the caller's `heroKeys` (run-level `hero` set ∪ active hero assignments ∪
+   *  `list` items with a truthy `heroField`) plus a WorkItem's own `hero`. Absent ⇒ regular. */
+  hero?: boolean;
 }
 
 /** The run-level health snapshot the GUI dashboard renders. Mirrors the Swift
@@ -125,6 +131,10 @@ export interface QueueStatusInputs {
   /** (hero) Remaining REGULAR lifetime budget = `maxItemsCap − lifetimeDispatched` (≤ 0 ⇒ a
    *  waiting regular item is `maxItems`-blocked). POSITIVE_INFINITY when maxItems is unlimited. */
   regularMaxItemsRemaining?: number;
+  /** (hero) Keys that are HEROES right now — the run-level `hero` set (promotions) ∪ active hero
+   *  assignments ∪ `list` items with a truthy `heroField`. Used to mark `next`/`running`/`held`
+   *  refs so the dashboard dropdowns show a hero glyph. Defaults empty (legacy/present:false). */
+  heroKeys?: ReadonlySet<string>;
 }
 
 /**
@@ -193,11 +203,16 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     heldItems.push(i);
   }
 
-  // Map a WorkItem/ref → QueueItemRef, including title/url only when non-empty.
-  const toRef = (i: { key: string; title?: string; url?: string }): QueueItemRef => {
+  // Map a WorkItem/ref → QueueItemRef, including title/url only when non-empty. (hero) Marks the
+  // ref a hero when the caller's `heroKeys` contains its key OR the item carries its own `hero`
+  // (a `list` WorkItem with a truthy `heroField`) — so every dropdown (waiting/running/held) shows
+  // the hero glyph, not just the backlog canvas.
+  const heroKeys = input.heroKeys ?? new Set<string>();
+  const toRef = (i: { key: string; title?: string; url?: string; hero?: boolean }): QueueItemRef => {
     const ref: QueueItemRef = { key: i.key };
     if (i.title !== undefined && i.title.length > 0) ref.title = i.title;
     if (i.url !== undefined && i.url.length > 0) ref.url = i.url;
+    if (i.hero === true || heroKeys.has(i.key)) ref.hero = true;
     return ref;
   };
 

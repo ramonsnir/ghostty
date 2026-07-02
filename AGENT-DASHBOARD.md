@@ -187,16 +187,19 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   slot (the slot the reset-zoom button uses — free because a single-terminal hero tab can never be
   zoomed), visible even on non-focused tabs, so you can spot the hero's tab at a glance across a
   window full of tabs.
-- **Hero-waiting in the backlog DAG.** In a queue's backlog dependency canvas, a hero item that is
-  **stuck on a hero slot** (the fleet-wide `agent-queue-hero-max` is full, including
-  `agent-queue-hero-max = 0` which disables hero dispatch) is drawn with a **distinct purple star
-  icon** (`star.circle.fill`) and a **purple card border** instead of the routine orange clock, and
-  its **hover tooltip lists every gate blocking it** ("Hero slots full", and any additional cap like
-  the queue lifetime `maxItems` or concurrency). This is the whole point of the distinct icon: when a
-  hero is stuck on a *hero* slot, nobody wastes time bumping `maxItems`. A regular waiting item that
-  carries block reasons gets the same tooltip on its clock icon. (Dependency-blocked items are not
-  listed — the graph edges already show that.) See **AGENT-QUEUE.md (→ Hero agents / backlog)** for
-  the block-reason wire contract.
+- **Heroes are marked everywhere in the dashboard.** Any hero item shows a **purple star** wherever
+  it appears, independent of whether it's blocked: in the backlog dependency canvas a hero node gets a
+  **`star.circle.fill` + a purple card border** (alongside its normal running/clock state icon), and
+  each row of the **"N waiting / M running / N held" health dropdowns** gets a **`star.fill`**. A
+  waiting item's **hover tooltip** (on the whole backlog card) still lists every gate blocking it
+  ("Hero slots full", plus any additional cap like the queue lifetime `maxItems` or concurrency), so
+  when a hero is stuck on a *hero* slot nobody wastes time bumping `maxItems`. (Dependency-blocked is
+  not listed — the graph edges show it.) See **AGENT-QUEUE.md (→ Hero agents / backlog)** for the wire
+  contract.
+- **Tooltips are panel-safe.** The dashboard is a non-activating `NSPanel`, so AppKit `.help()`
+  tooltips (which render only for the KEY window) never appeared while hovering it. Every tile-icon
+  and backlog tooltip therefore uses a custom **`dashboardTooltip`** modifier (a bubble driven by
+  `.onHover`, which does fire in the panel), with short 1–2 word labels.
 
 ### Degraded states (never a blank panel)
 
@@ -725,17 +728,26 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   `syncSurfaceIsHero()` — called both on the annotation change and on every surface-tree change (so a
   hero that moved to another tab stops marking the old one), exactly how `surfaceIsZoomed` is
   re-derived from `to.zoomed`.
-- **Backlog hero-waiting icon + tooltip (`QueueBacklogCanvas.swift`).** A waiting `NodeCard` gets a
-  DISTINCT icon when it's a hero blocked on a hero slot: `blockReasonsByKey` reads the per-item
-  `blockReasons` off `model.queueStatuses[run].next[]` (the sidecar carries them), and the pure,
-  unit-tested `QueueBacklogReasons` maps the raw `BlockReason` tokens to presentation.
-  `isHeroWaiting(_:) = reasons.contains("heroSlots")` → a purple **`star.circle.fill`** (not the
-  orange `clock`) + a purple card border + the `heroWaitingHelp` tooltip; a regular waiting item with
-  block reasons keeps the clock but gains the `waitingHelp` tooltip. `tooltipLines(_:)` emits ORDERED
-  human-readable lines regardless of the sidecar's array order (hero slots → `maxItems` → queue
-  concurrency → global concurrency), passing an **unknown future token through verbatim** rather than
-  dropping it. Matching by the raw wire string (no parallel Swift enum) keeps the block-reason
+- **Hero marks in the backlog + dropdowns (any hero, not just slot-blocked).** A `GraphNode.hero`
+  flag (⇄ Swift `QueueGraph.Node.hero`) marks a backlog node a hero: the sidecar `refreshGraph` OR's
+  a provider-set graph `hero`, a `list` `heroField` item, and a promoted `run.hero` key. `NodeCard`
+  then shows a purple **`star.circle.fill`** + purple card border on **any** hero node (alongside the
+  normal running/`clock` state icon) — no longer gated on being blocked on the hero slot. The
+  **health dropdowns** ("N waiting / M running / N held") mark heroes with a `star.fill` per row via a
+  per-item `QueueItemRef.hero` (⇄ `QueueStatus.Item.hero`) the sidecar sets from `heroKeys` (promoted
+  ∪ active hero assignments ∪ `list` `heroField`) plus the assignment's own bit for running items.
+  The whole backlog **card** tooltip (`cardHelp`) still lists WHY a waiting item is stuck: the pure,
+  unit-tested `QueueBacklogReasons.tooltipLines(_:)` maps the raw `BlockReason` tokens to ORDERED
+  human lines (hero slots → `maxItems` → queue concurrency → global concurrency), passing an unknown
+  future token through verbatim. Matching by the raw wire string (no parallel Swift enum) keeps the
   contract single-sourced with the TS `BlockReason` union.
+- **Panel-safe tooltips (`DashboardTooltip` in `QueueBacklogCanvas.swift`).** The dashboard is a
+  non-activating `NSPanel`; AppKit `.help()` renders tooltips only for the KEY window, so native
+  tooltips never fired while hovering the (non-key) panel — the reason the tile-icon and backlog
+  tooltips "didn't show". The `dashboardTooltip(_:)` view modifier drives a bubble off `.onHover`
+  (which DOES fire in the panel — it's the same signal that reveals the tile hover-buttons) and also
+  sets `.help()` for a key window. Every tile-icon tooltip (`AgentPreviewTile.swift`) and the backlog
+  card tooltip use it, with short 1–2 word labels.
 - **Notification routing (`postNeedsAttention`, `WebMonitorPush.swift`).** When a hero surface enters
   `.waiting`, `postNeedsAttention` reads the stored `queueHero` off the annotation and adds
   `AgentStateUserInfoKey.hero` to the `.ghosttyAgentNeedsAttention` userInfo, so the `WebPushManager`
@@ -748,7 +760,11 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   `AgentDashboardController.swift` (`AgentDashboardModel.promoteToHero`/`demoteFromHero`,
   `HookSnapshotEntry.queueHero` → the `list_surfaces` `SurfaceRow.hero` emit, the `hero` userInfo in
   `postNeedsAttention`), `QueueBacklogCanvas.swift` (`blockReasonsByKey` + `NodeCard.blockReasons` +
-  `QueueBacklogReasons`), `TerminalWindow.swift` (`surfaceIsHero` + `heroAccessory`/`heroTabButton` +
+  `NodeCard` hero glyph off `node.hero` + `cardHelp` + `QueueBacklogReasons` + the `DashboardTooltip`
+  modifier), `AgentDashboardView.swift` (per-row `star.fill` in the waiting/running/held dropdowns),
+  `QueueCommandBridge.swift` (`QueueGraph.Node.hero` + `QueueStatus.Item.hero` parse), sidecar
+  `queue/{types,provider,runner,status}.ts` (`GraphNode.hero` / `QueueItemRef.hero` +
+  `refreshGraph`/`reportQueueStatus` heroKeys), `TerminalWindow.swift` (`surfaceIsHero` + `heroAccessory`/`heroTabButton` +
   `HeroAccessoryView` + `ViewModel.isSurfaceHero`), `TerminalController.swift` (`heroSurfaceIDs` +
   `syncSurfaceIsHero` + `onAgentAnnotationDidChange`). The `queueHero` annotation arg parse + the
   `AgentAnnotation.queueHero` field / `merging` are in `MCPAnnotation.swift`; the `SurfaceRow.hero`
