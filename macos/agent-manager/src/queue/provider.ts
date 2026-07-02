@@ -287,6 +287,9 @@ export function parseGraphOutput(stdout: string): GraphNode[] {
     if (priorityLabel !== undefined && priorityLabel.length > 0) {
       node.priorityLabel = priorityLabel;
     }
+    // (hero) The provider graph script MAY mark a node a hero directly (queue-defined, like
+    // `done`). The sidecar additionally OR's in list-/promotion-known heroes in refreshGraph.
+    if (rec.hero === true) node.hero = true;
     out.push(node);
   }
   return out;

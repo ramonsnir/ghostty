@@ -365,12 +365,14 @@ regular item; the engine models none of them.) Full design + wire contract: **`H
   — a single terminal, never in the BSP grid, so heroes never participate in grid packing and are
   easy to find. It carries a distinct **hero glyph** in the tab-accessory slot, visible across all
   tabs (so a hero is spottable even from another tab).
-- **Backlog waiting states.** In the backlog DAG canvas, a hero WAITING on the hero-slot cap gets
-  a **distinct icon** (a purple star + purple card border, not the plain orange clock) and a **hover
-  tooltip listing the exact gate(s)** blocking it (`hero slots`, and — for a regular item —
-  `maxItems` / `queue concurrency` / `global concurrency`). The whole point: when a hero is stuck
-  on a hero slot, nobody wastes time bumping `maxItems`. (Dependency-blocked is intentionally NOT
-  listed — the graph edges already show it.)
+- **Heroes are marked everywhere; waiting states are explained.** In the backlog DAG canvas, **any**
+  hero node gets a **purple star + purple card border** (not gated on being blocked), and each row of
+  the **"N waiting / M running / N held" health dropdowns** gets a purple star — so a hero is
+  spottable wherever a queue item appears. A waiting item's whole-card **hover tooltip lists the exact
+  gate(s)** blocking it (`hero slots`, and — for a regular item — `maxItems` / `queue concurrency` /
+  `global concurrency`), so when a hero is stuck on a hero slot nobody wastes time bumping `maxItems`.
+  (Dependency-blocked is NOT listed — the graph edges show it.) Tooltips use the panel-safe
+  `dashboardTooltip` (native `.help()` doesn't fire in the non-key dashboard panel).
 - **Louder notification.** A hero uses the **loud attention tier** by default and its phone
   web-push carries a distinct glyph (`kind:"hero"`), so it's immediately clear a *hero* is waiting,
   not routine work. Reuses the existing bell/attention + push plumbing — no new delivery mechanism.
@@ -552,11 +554,15 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   when nothing blocks (the item WOULD dispatch). Dependency-blocked is intentionally NOT a reason.
   Swift `QueueStatus`/`QueueStatusPayload.fromArguments` parse `heroMax`/`heroActive` (default 0
   when absent) and thread them through every `withX()` optimistic-copy helper; `QueueItemRef`
-  carries `blockReasons`. `QueueBacklogCanvas` renders a hero-slot-waiting item with a purple
-  `star.circle.fill` (+ purple card border) instead of the orange `clock`, and a hover tooltip
-  (`QueueBacklogReasons.tooltipLines` / `isHeroWaiting`, pure + SwiftUI-free) listing each blocking
-  gate. (The globals are wired end-to-end for a future fleet-wide `N/heroMax heroes` health chip;
-  today the canvas discriminates a hero-waiting item off the per-item `heroSlots` reason.)
+  carries `blockReasons`. **Heroes are marked independent of block state:** each `QueueItemRef` also
+  carries `hero?` (sidecar sets it from `heroKeys` = promoted `run.hero` ∪ active hero assignments ∪
+  `list` `heroField`, plus the assignment bit for running items), and each `GraphNode` carries `hero`
+  (`refreshGraph` OR's a provider graph `hero` + `heroField` + `run.hero`). `QueueBacklogCanvas`
+  renders a purple `star.circle.fill` + purple border on ANY hero node, and the health dropdowns show
+  a `star.fill` per hero row (`AgentDashboardView`). The whole-card tooltip
+  (`QueueBacklogReasons.tooltipLines`, pure + SwiftUI-free) lists each blocking gate. (The
+  `heroMax`/`heroActive` globals are wired end-to-end for a future fleet-wide `N/heroMax heroes`
+  health chip.)
 - **Web-push (`WebMonitorPush.swift`).** A hero surface's push uses `PushKind.hero` (payload
   `"kind":"hero"`, a distinct title glyph, built by the pure `pushTitle`/`pushPayload` seams). The
   hero verdict rides the EXISTING `.ghosttyAgentNeedsAttention` path:

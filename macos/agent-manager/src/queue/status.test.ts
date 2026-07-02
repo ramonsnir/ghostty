@@ -265,6 +265,27 @@ test("hero: block-reason inputs OMITTED → no blockReasons anywhere (legacy bui
   assert.equal(r.next[1].blockReasons, undefined);
 });
 
+test("hero: next/running/held refs are marked hero (heroKeys ∪ item.hero)", () => {
+  const r = queueStatusReport(input({
+    // B is a hero via its own heroField; D is regular. C is held + a hero via heroKeys (promoted).
+    listItems: [hero("B"), { key: "C" }, { key: "D" }],
+    runningItems: [{ key: "A", hero: true }, { key: "E" }],
+    latchedKeys: new Set(["C"]),
+    activeKeys: new Set(["A", "E"]),
+    excludeKeys: new Set(["A", "E", "C"]),
+    heroKeys: new Set(["C"]),
+    nextLimit: 25,
+  }));
+  // waiting: B hero via own field; D regular. (C is held, excluded from next.)
+  assert.equal(r.next.find((i) => i.key === "B")?.hero, true);
+  assert.equal(r.next.find((i) => i.key === "D")?.hero, undefined);
+  // running: A hero via the assignment bit (runningItems.hero); E regular.
+  assert.equal(r.running.find((i) => i.key === "A")?.hero, true);
+  assert.equal(r.running.find((i) => i.key === "E")?.hero, undefined);
+  // held: C hero via heroKeys (a promoted item that fell back to held).
+  assert.equal(r.held.find((i) => i.key === "C")?.hero, true);
+});
+
 // ---------------------------------------------------------------------------
 // backlogCount — the header-badge number (non-terminal, not waiting/running).
 // ---------------------------------------------------------------------------

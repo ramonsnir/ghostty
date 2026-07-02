@@ -409,9 +409,6 @@ private struct NodeCard: View {
     /// [] ⇒ not gate-blocked (a plain waiting/backlog item).
     var blockReasons: [String] = []
 
-    /// True when this waiting item is a hero blocked on the fleet-wide hero-slot gate.
-    private var isHeroWaiting: Bool { QueueBacklogReasons.isHeroWaiting(blockReasons) }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
@@ -426,16 +423,15 @@ private struct NodeCard: View {
                 }
                 if running {
                     Image(systemName: "play.circle.fill").font(.caption2).foregroundStyle(.green)
-                } else if isHeroWaiting {
-                    // (hero) DISTINCT waiting icon: a hero waiting on the hero-slot cap is
-                    // NOT the same as a routine backlog item — a purple star (matching the
-                    // hero tile/tab glyph) reads apart from the orange clock.
-                    Image(systemName: "star.circle.fill")
-                        .font(.caption2).foregroundStyle(.purple)
-                        .help(heroWaitingHelp)
                 } else if waiting {
                     Image(systemName: "clock").font(.caption2).foregroundStyle(.orange)
-                        .help(waitingHelp)
+                }
+                // (hero) ANY hero backlog item shows the hero glyph — a purple star matching the
+                // hero tile/tab marker — INDEPENDENT of why it's waiting, so a hero reads as a
+                // hero at a glance (not only when it happens to be blocked on the hero-slot cap).
+                // The "why is it waiting" detail (incl. `heroSlots`) rides the whole-card tooltip.
+                if node.hero {
+                    Image(systemName: "star.circle.fill").font(.caption2).foregroundStyle(.purple)
                 }
                 Spacer(minLength: 0)
             }
@@ -460,10 +456,13 @@ private struct NodeCard: View {
         .background(stateColor.opacity(node.done ? 0.07 : 0.16))
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(borderColor, lineWidth: running || isMarked || isHeroWaiting ? 2 : 1))
+                .strokeBorder(borderColor, lineWidth: running || isMarked || node.hero ? 2 : 1))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(node.done ? 0.55 : 1.0)
-        .help(helpText)
+        // Panel-safe tooltip on the WHOLE card (native `.help` never fires in the non-key panel).
+        // Attached AFTER `.clipShape` so the bubble is not clipped by the card. Covers the clock /
+        // hero glyph too, so hovering anywhere on the card explains state + hero + why it's waiting.
+        .dashboardTooltip(cardHelp)
     }
 
     /// A non-done item carrying a priority mark gets a louder, tinted border (running wins).
@@ -471,9 +470,9 @@ private struct NodeCard: View {
 
     private var borderColor: Color {
         if running { return .green }
-        // (hero) A hero blocked on the hero-slot cap gets the hero purple border, so the whole
-        // card (not just the star) reads apart from a routine backlog/priority item.
-        if isHeroWaiting { return .purple }
+        // (hero) A hero gets the hero purple border, so the whole card (not just the star) reads
+        // apart from a routine backlog/priority item — for ANY hero, not only a slot-blocked one.
+        if node.hero { return .purple }
         if isMarked, let pc = priorityColor { return pc }
         return stateColor.opacity(0.6)
     }
@@ -484,25 +483,27 @@ private struct NodeCard: View {
     /// Map the coarse workflow-state category to a color; unknown / nil → neutral.
     private var stateColor: Color { QueueBacklogColors.color(forStateType: node.stateType) }
 
-    private var helpText: String {
+    private var headline: String {
         var s = node.state.map { "\(node.key) — \($0)" } ?? node.key
         if let label = node.priorityLabel { s += " · \(label) priority" }
         return s
     }
 
-    /// (hero) Tooltip for a hero item stuck on the hero-slot gate: a headline plus one line per
-    /// blocking gate (so the user sees whether it's ALSO past another cap, not just hero slots).
-    private var heroWaitingHelp: String {
-        let lines = QueueBacklogReasons.tooltipLines(blockReasons)
-        return (["Hero waiting — blocked on:"] + lines.map { "• \($0)" }).joined(separator: "\n")
-    }
-
-    /// (hero) Tooltip for a regular waiting item that carries block reasons (e.g. past
-    /// `maxItems` or concurrency-full). No lines ⇒ a plain "waiting" hint.
-    private var waitingHelp: String {
-        let lines = QueueBacklogReasons.tooltipLines(blockReasons)
-        guard !lines.isEmpty else { return "Waiting to dispatch" }
-        return (["Waiting — blocked on:"] + lines.map { "• \($0)" }).joined(separator: "\n")
+    /// (hero) The whole-card hover tooltip: the headline, a HERO line for any hero node, and —
+    /// for a waiting item — WHY it hasn't dispatched (one line per blocking gate, so a hero stuck
+    /// on the hero-slot cap is distinguishable from one past `maxItems`, and nobody bumps the wrong
+    /// knob). Shown via the panel-safe `dashboardTooltip` since native `.help` never fires here.
+    private var cardHelp: String {
+        var lines: [String] = [headline]
+        if node.hero { lines.append("★ Hero — runs in its own tab (agent-queue-hero-max)") }
+        let reasons = QueueBacklogReasons.tooltipLines(blockReasons)
+        if !reasons.isEmpty {
+            lines.append("Blocked on:")
+            lines.append(contentsOf: reasons.map { "• \($0)" })
+        } else if waiting {
+            lines.append("Waiting to dispatch")
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -548,6 +549,83 @@ enum QueueBacklogReasons {
             out.append(r)
         }
         return out
+    }
+}
+
+/// (ramon fork / Agent Dashboard) A hover tooltip that WORKS inside the dashboard's
+/// non-activating `AgentDashboardPanel` (an `NSPanel`), where AppKit `.help()` tooltips
+/// NEVER appear — native tooltips are shown only for the KEY window, and the panel is
+/// deliberately non-key so you can keep typing in your terminal while hovering it. This is
+/// driven by `.onHover` (which DOES fire in the panel — it's the same signal that reveals the
+/// tile's hover buttons), showing a small text bubble after a short delay. It ALSO sets the
+/// native `.help()` so a normal (key) window still gets the OS tooltip. The bubble is drawn as
+/// an overlay with `allowsHitTesting(false)` + a high `zIndex`, positioned by `edge` so it
+/// lands INSIDE the enclosing (clipped) card rather than being clipped away.
+struct DashboardTooltip: ViewModifier {
+    let text: String
+    var edge: Edge = .bottom
+    @State private var hovering = false
+    @State private var visible = false
+
+    func body(content: Content) -> some View {
+        content
+            .help(text)
+            .onHover { inside in
+                hovering = inside
+                if inside {
+                    // Small delay so a quick pass-over doesn't flash a bubble.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        if hovering { visible = true }
+                    }
+                } else {
+                    visible = false
+                }
+            }
+            .overlay(alignment: bubbleAlignment) {
+                if visible {
+                    Text(text)
+                        .font(.caption2)
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
+                        .overlay(RoundedRectangle(cornerRadius: 5)
+                            .strokeBorder(Color.secondary.opacity(0.35)))
+                        .shadow(radius: 4, y: 1)
+                        .offset(bubbleOffset)
+                        .allowsHitTesting(false)
+                        .zIndex(1000)
+                        .transition(.opacity)
+                }
+            }
+    }
+
+    private var bubbleAlignment: Alignment {
+        switch edge {
+        case .top: return .top
+        case .bottom: return .bottom
+        case .leading: return .leading
+        case .trailing: return .trailing
+        }
+    }
+    private var bubbleOffset: CGSize {
+        switch edge {
+        case .top: return CGSize(width: 0, height: -18)
+        case .bottom: return CGSize(width: 0, height: 20)
+        case .leading: return CGSize(width: -8, height: 0)
+        case .trailing: return CGSize(width: 8, height: 0)
+        }
+    }
+}
+
+extension View {
+    /// Attach a panel-safe hover tooltip (see `DashboardTooltip`). `edge` places the bubble
+    /// relative to the view; default below it (lands over the tile preview / card body, which
+    /// is inside the card's clip region, so it isn't clipped away).
+    func dashboardTooltip(_ text: String, edge: Edge = .bottom) -> some View {
+        modifier(DashboardTooltip(text: text, edge: edge))
     }
 }
 

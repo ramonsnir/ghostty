@@ -1089,9 +1089,9 @@ struct MCPServerTests {
             "queueName": "ExampleOS", "present": true, "phase": "running",
             "queued": 7, "listOk": true, "active": 2, "dispatched": 2, "maxItems": 3,
             "concurrency": 9,
-            "next": [["key": "EX-1", "title": "Fix seed", "url": "https://linear.app/x/EX-1"],
+            "next": [["key": "EX-1", "title": "Fix seed", "url": "https://linear.app/x/EX-1", "hero": true],
                      ["key": "EX-2"]],
-            "running": [["key": "EX-9", "title": "Running", "url": "https://linear.app/x/EX-9"]],
+            "running": [["key": "EX-9", "title": "Running", "url": "https://linear.app/x/EX-9", "hero": true]],
         ])
         let s = p?.status
         #expect(s?.queueName == "ExampleOS")
@@ -1107,8 +1107,11 @@ struct MCPServerTests {
         #expect(s?.next.first?.url == "https://linear.app/x/EX-1")
         #expect(s?.next.last?.title == nil)
         #expect(s?.next.last?.url == nil)
+        #expect(s?.next.first?.hero == true)   // (hero) marked on the waiting dropdown
+        #expect(s?.next.last?.hero == false)   // absent hero → false
         #expect(s?.running.first?.key == "EX-9")
         #expect(s?.running.first?.url == "https://linear.app/x/EX-9")
+        #expect(s?.running.first?.hero == true) // (hero) marked on the running dropdown
     }
 
     @Test func queueStatusPayloadParsesHeld() {
@@ -1116,7 +1119,7 @@ struct MCPServerTests {
         let s = QueueStatusPayload.fromArguments([
             "queueName": "ExampleOS",
             "heldCount": 3,
-            "held": [["key": "EX-4", "title": "Held", "url": "https://linear.app/x/EX-4"],
+            "held": [["key": "EX-4", "title": "Held", "url": "https://linear.app/x/EX-4", "hero": true],
                      ["key": "EX-5"]],
         ])?.status
         #expect(s?.heldCount == 3)
@@ -1124,6 +1127,8 @@ struct MCPServerTests {
         #expect(s?.held.first?.key == "EX-4")
         #expect(s?.held.first?.title == "Held")
         #expect(s?.held.last?.title == nil)
+        #expect(s?.held.first?.hero == true)   // (hero) marked on the held dropdown
+        #expect(s?.held.last?.hero == false)
     }
 
     @Test func queueStatusPayloadHeldDefaultsAndCountFallback() {
@@ -1179,7 +1184,7 @@ struct MCPServerTests {
                 ["key": "EX-1", "title": "do x", "url": "https://t/EX-1",
                  "state": "In Progress", "stateType": "started", "done": false,
                  "labels": ["Design needed", "Customer"], "blockedBy": ["EX-9"],
-                 "priorityLabel": "High"],
+                 "priorityLabel": "High", "hero": true],
                 ["key": "EX-2", "done": true],
             ],
         ])
@@ -1197,11 +1202,13 @@ struct MCPServerTests {
         #expect(n?.labels == ["Design needed", "Customer"])
         #expect(n?.blockedBy == ["EX-9"])
         #expect(n?.priorityLabel == "High")
-        // Second node: done true, missing arrays default [], no priority mark.
+        #expect(n?.hero == true)
+        // Second node: done true, missing arrays default [], no priority mark, hero defaults false.
         #expect(g?.nodes.last?.done == true)
         #expect(g?.nodes.last?.labels.isEmpty == true)
         #expect(g?.nodes.last?.blockedBy.isEmpty == true)
         #expect(g?.nodes.last?.priorityLabel == nil)
+        #expect(g?.nodes.last?.hero == false)
     }
 
     @Test func queueGraphPayloadRejectsMissingNameAndDropsKeylessNodes() {

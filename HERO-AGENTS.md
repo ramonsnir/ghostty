@@ -94,15 +94,17 @@ by tests on both sides.
 - **`list_surfaces` JSON:** emit `hero: true` on a hero surface row (mirrors `queueKey`). This is
   the **reconcile-visibility chokepoint** — the sidecar reads hero state back off the rows, so
   `MCPLayout.surfacesJSONData` must emit it.
-- **Status report:** add `heroMax: number` + `heroActive: number` (global), and per-item
+- **Status report:** add `heroMax: number` + `heroActive: number` (global); per-item
   `blockReasons?: BlockReason[]` on `QueueItemRef`, where
-  `BlockReason ∈ {"maxItems","queueConcurrency","globalConcurrency","heroSlots"}`. Dependency-
-  blocked is **omitted** (the graph edges already show it). The Swift `QueueStatus` /
-  `QueueStatusPayload.fromArguments` parse `heroMax`/`heroActive` (default 0 when absent) and
-  thread them through every `withX()` optimistic-copy helper, so the fleet-wide globals survive
-  an optimistic dashboard edit. (Today the backlog canvas discriminates a hero-waiting item off
-  the per-item `heroSlots` `blockReason`; the globals are wired end-to-end for a future
-  fleet-wide `N/heroMax heroes` health chip.)
+  `BlockReason ∈ {"maxItems","queueConcurrency","globalConcurrency","heroSlots"}` (dependency-
+  blocked is **omitted** — the graph edges show it); and a per-item **`hero?: boolean`** on every
+  `QueueItemRef` (`next`/`running`/`held`), sidecar-set from `heroKeys` (promoted `run.hero` ∪ active
+  hero assignments ∪ `list` `heroField`) so the health dropdowns mark heroes. The Swift `QueueStatus`
+  / `QueueStatusPayload.fromArguments` parse `heroMax`/`heroActive` (default 0 when absent) and the
+  per-item `hero`.
+- **Backlog graph node:** `GraphNode.hero?: boolean` (sidecar `refreshGraph` OR's a provider-set
+  `hero`, a `list` `heroField` item, and a promoted `run.hero` key) ⇄ Swift `QueueGraph.Node.hero`,
+  so the canvas marks **any** hero node, not just one blocked on the hero-slot gate.
 - **Web-push payload:** `PushKind.hero`; payload dict gains `"kind":"hero"`; the hero
   notification title uses a distinct glyph.
 
@@ -162,14 +164,29 @@ single-terminal so it can never be zoomed — the two accessories are mutually e
 collide. Glyph: a distinct hero SF Symbol (e.g. `star.fill`), tinted so it reads apart from the
 🔔 bell title-prefix and the orange marked-pane inset.
 
-### Backlog waiting states (sidecar report + Swift canvas)
+### Backlog + dropdowns: heroes are marked everywhere (sidecar report + Swift canvas)
 
-The status report carries, per waiting `QueueItemRef`, the set of gates currently blocking it
-(`blockReasons`), and the global `heroMax`/`heroActive`. `QueueBacklogCanvas` renders a hero-
-marked waiting item with a **distinct icon** (not the plain clock) and a **hover tooltip listing
-the reasons** (`maxItems`, `queue concurrency`, `global concurrency`, `hero slots`). This is the
-whole point of the distinct icon: when a hero is stuck on a hero slot, nobody wastes time bumping
-`maxItems`. Dependency-blocked is intentionally not listed (obvious from the graph edges).
+Heroes must read as heroes wherever a queue item is shown, **independent of whether they're
+currently blocked** — not only when stuck on the hero-slot gate.
+
+- **Backlog canvas.** Each `GraphNode` carries a `hero` flag (sidecar `refreshGraph` OR's it from
+  three sources: a provider `graph` script may set `hero` directly, a `list` item with a truthy
+  `heroField`, and a PROMOTED key in the run-level `hero` set). `QueueBacklogCanvas` shows the hero
+  glyph (a purple `star.circle.fill`) + a purple card border on **any** hero node, alongside the
+  normal running/`clock` state icon. The whole-card **`dashboardTooltip`** (see below) explains
+  state + hero + WHY it's waiting (one line per gate: `maxItems` / `queue concurrency` / `global
+  concurrency` / `hero slots`), so a hero stuck on a hero slot is obvious and nobody wastes time
+  bumping `maxItems`. Dependency-blocked is not listed (the graph edges show it).
+- **"N waiting / M running / N held" dropdowns.** Each `QueueItemRef` carries a `hero` flag (sidecar
+  sets it from `heroKeys` = promoted `run.hero` ∪ active hero assignments ∪ `list` `heroField`, plus
+  the assignment's own bit for running items), and every dropdown row shows a purple `star.fill` for
+  a hero — so heroes stand out in the health-bar dropdowns too.
+
+**Panel-safe tooltips (`dashboardTooltip`).** The dashboard is a **non-activating `NSPanel`**, and
+AppKit `.help()` tooltips only render for the KEY window — so native tooltips never appeared on the
+tile icons or backlog nodes while hovering the (non-key) panel. The `DashboardTooltip` view modifier
+drives a small bubble off `.onHover` (which DOES fire in the panel — it's what reveals the tile's
+hover buttons) and also sets `.help()` for key windows. All tile-icon and backlog tooltips use it.
 
 ### Notification (Swift)
 

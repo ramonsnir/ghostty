@@ -318,12 +318,12 @@ struct AgentPreviewTile: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(Color.accentColor)
-                .help("Spotlighted at the top — click to dismiss")
+                .dashboardTooltip("Dismiss spotlight")
             } else if isFocused {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 7))
                     .foregroundStyle(Color.accentColor)
-                    .help("The split you're currently focused on")
+                    .dashboardTooltip("Focused split")
             }
             if bellRinging {
                 // REAL-bell affordance only. Clears on focus (bell-tied); the hook
@@ -338,7 +338,7 @@ struct AgentPreviewTile: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(Self.bellAmber)
-                .help("Dismiss this bell — clears the alert everywhere (title, border, badge) without focusing the split, so it can ring again later")
+                .dashboardTooltip("Dismiss bell")
             }
             // (hero) A persistent HERO glyph — shown whenever this split is a hero (queue
             // tiles only), so a load-bearing hero is obvious without hovering. Distinct from
@@ -349,7 +349,7 @@ struct AgentPreviewTile: View {
                 Image(systemName: "star.fill")
                     .font(.caption2)
                     .foregroundStyle(Self.heroPurple)
-                    .help("Hero — a load-bearing split in its own tab, counted against agent-queue-hero-max (never auto-closed).")
+                    .dashboardTooltip("Hero split")
             }
             // (keep) The 📌 pin toggle — queue tiles only. Shown PERSISTENTLY when kept (so
             // a pinned split is obvious without hovering) and on hover otherwise. Filled +
@@ -363,9 +363,7 @@ struct AgentPreviewTile: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(isKept ? Color.accentColor : Color.secondary)
-                .help(isKept
-                    ? "Kept — the queue won't auto-close this split. Click to allow auto-close."
-                    : "Keep this split open (exempt it from the queue's auto-close so you can do manual work).")
+                .dashboardTooltip(isKept ? "Kept — click to unpin" : "Keep open")
             }
             if hovering {
                 // (adopt) Offered ONLY on a NON-queue agent tile (a free, human-created
@@ -379,9 +377,7 @@ struct AgentPreviewTile: View {
                     .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
                     .disabled(queueRuns.isEmpty)
-                    .help(queueRuns.isEmpty
-                        ? "No running queue to adopt this split into"
-                        : "Adopt this split into a running queue (the queue will track it like a dispatched item)")
+                    .dashboardTooltip(queueRuns.isEmpty ? "Adopt (no queue running)" : "Adopt into queue")
                 }
                 // (hero) Promote / demote — queue-owned agent tiles only (a hero is tracked by
                 // a queue). "Promote to Hero" ejects the split into its own tab + flips the
@@ -395,9 +391,7 @@ struct AgentPreviewTile: View {
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(isHero ? Color.secondary : Self.heroPurple)
-                    .help(isHero
-                        ? "Demote from Hero (back to a regular tracked item; the split stays in its tab)"
-                        : "Promote to Hero (eject into its own tab; count it against agent-queue-hero-max, keep-by-default)")
+                    .dashboardTooltip(isHero ? "Demote from hero" : "Promote to hero")
                 }
                 // Force-close is offered ONLY for queue-owned tiles: it's the escape hatch
                 // for a wedged queue slot. On a non-queue agent it would be an unscoped
@@ -413,7 +407,7 @@ struct AgentPreviewTile: View {
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(.red)
-                    .help("Close this split (ends the agent; frees its queue slot)")
+                    .dashboardTooltip("Close split")
                 }
                 // SOFT / reversible: declutter the dashboard — the split keeps running and
                 // re-surfaces on a bell / waiting. `eye.slash` (the canonical "hide from
@@ -425,7 +419,7 @@ struct AgentPreviewTile: View {
                 }
                 .foregroundStyle(.secondary)
                 .buttonStyle(.borderless)
-                .help("Hide this tile (declutter — the split keeps running and re-surfaces on a bell)")
+                .dashboardTooltip("Hide tile")
             }
         }
         .padding(.horizontal, 8)
@@ -602,7 +596,7 @@ struct AgentPreviewTile: View {
                 .foregroundStyle(Color.white)
                 .background(Color.accentColor)
                 .clipShape(Capsule())
-                .help("Queue: \(name)" + (key.map { " · \($0)" } ?? ""))
+                .dashboardTooltip("Queue: \(name)" + (key.map { " · \($0)" } ?? ""))
         )
     }
 
@@ -740,7 +734,7 @@ struct AgentPreviewTile: View {
                 .background(Circle().fill(.background).padding(2))
         }
         .buttonStyle(.plain)
-        .help("Reconnecting… — click to reconnect now")
+        .dashboardTooltip("Reconnect preview")
         .padding(6)
     }
 
