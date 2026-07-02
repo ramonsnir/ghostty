@@ -494,7 +494,7 @@ private struct NodeCard: View {
     /// knob). Shown via the panel-safe `dashboardTooltip` since native `.help` never fires here.
     private var cardHelp: String {
         var lines: [String] = [headline]
-        if node.hero { lines.append("★ Hero — runs in its own tab (agent-queue-hero-max)") }
+        if node.hero { lines.append("★ Hero — runs in its own tab") }
         // "Blocked on" reasons: the graph's workflow LABELS (e.g. "Inputs needed", "Design
         // needed") — the human reasons the item isn't actionable — one line each, PLUS any
         // dispatch-gate reasons for an actionable item stuck behind the queue's caps (maxItems /
