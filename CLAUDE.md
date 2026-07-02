@@ -220,14 +220,14 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `becomeFirstResponder`s its surface → a `focusDidChange(true)` on a split you're NOT actually
   looking at. The old focus path cleared `bell`/`attentionNeeded` IMMEDIATELY (checking only
   `self.focused`), silently dismissing a restored bell on one seemingly-random split. Fix:
-  focus now SCHEDULES the clear behind a `bellClearFocusDelay` (1.0s) debounce
+  focus now SCHEDULES the clear behind a `bellClearFocusDelay` (0.5s) debounce
   (`scheduleBellClearOnSustainedFocus`), and the debounced closure re-checks the stricter
   `bellIsFocused` (`NSApp.isActive` + `window.isKeyWindow` + first responder) before clearing —
   a transient restore focus has resigned / its window is no longer key by the time the timer
   fires, so it's rejected (`focusDidChange(false)` also cancels a pending clear). The delay
   doubles as a settle window for `window.isKeyWindow`, which lags `becomeFirstResponder` after a
   genuine `becomeKey` (a synchronous `bellIsFocused` gate would wrongly reject a real click and
-  never clear). Genuine sustained focus still clears, ~1s later; the keyDown "any keypress
+  never clear). Genuine sustained focus still clears, ~0.5s later; the keyDown "any keypress
   clears the bell" path and `resetBell()`/`resetAttention()` stay immediate. The diagnostics
   `clear`/`cause:"focus"` record moved into the debounced closure (fires only on a real clear).
   Wiring: `SurfaceView_AppKit.swift` (`bellClearWorkItem` + `bellClearFocusDelay` +

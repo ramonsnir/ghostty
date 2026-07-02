@@ -147,14 +147,14 @@ old code cleared `bell`/`attentionNeeded` *immediately* in that path (checking o
 dismissed. Symptom: after a restart most bells survive but one — seemingly random — is gone.
 
 Fix: focus no longer clears the bell instantly. `focusDidChange(true)` now **schedules** the
-clear (`scheduleBellClearOnSustainedFocus`) behind a `bellClearFocusDelay` (1.0s) debounce,
+clear (`scheduleBellClearOnSustainedFocus`) behind a `bellClearFocusDelay` (0.5s) debounce,
 and the debounced closure re-checks the **stricter** `bellIsFocused` (`NSApp.isActive` +
 `window.isKeyWindow` + first responder) before clearing. A transient restore focus has
 resigned / its window is no longer key by the time the timer fires, so it's rejected;
 `focusDidChange(false)` also cancels a pending clear. The delay doubles as a settle window for
 `window.isKeyWindow`, which lags `becomeFirstResponder` after a genuine `becomeKey` (a
 *synchronous* `bellIsFocused` gate would wrongly reject a real click and never clear). A
-genuine, sustained focus still clears — just ~1s later. (The keyDown "any keypress clears the
+genuine, sustained focus still clears — just ~0.5s later. (The keyDown "any keypress clears the
 bell" path and `resetBell()`/`resetAttention()` are unchanged and still immediate.)
 
 ## Diagnostics (`bell-diagnostics`) — "why did it fire / why didn't it?"
