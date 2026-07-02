@@ -176,10 +176,14 @@ currently blocked** — not only when stuck on the hero-slot gate.
   three sources: a provider `graph` script may set `hero` directly, a `list` item with a truthy
   `heroField`, and a PROMOTED key in the run-level `hero` set). `QueueBacklogCanvas` shows the hero
   glyph (a purple `star.circle.fill`) + a purple card border on **any** hero node, alongside the
-  normal running/`clock` state icon. The whole-card **`dashboardTooltip`** (see below) explains
-  state + hero + WHY it's waiting (one line per gate: `maxItems` / `queue concurrency` / `global
-  concurrency` / `hero slots`), so a hero stuck on a hero slot is obvious and nobody wastes time
-  bumping `maxItems`. Dependency-blocked is not listed (the graph edges show it).
+  normal running/`clock` state icon. The whole-card **`dashboardTooltip`** (see below) lists WHY a
+  non-running item isn't moving, one line each: the graph's **workflow labels** (`node.labels`, e.g.
+  "Inputs needed", "Design needed" — the human reason it's not actionable) followed by any
+  **dispatch-gate** reason (`maxItems` / `queue concurrency` / `global concurrency` / `hero slots`),
+  under a "Blocked on:" header — so a hero stuck on a hero slot is obvious and nobody wastes time
+  bumping `maxItems`. (Dependency-blocked is not listed — the graph edges show it. The provider's
+  `graph` script excludes the "Hero issue" label from `node.labels` since that's surfaced as the
+  ★ star, not a blocked-on line.)
 - **"N waiting / M running / N held" dropdowns.** Each `QueueItemRef` carries a `hero` flag (sidecar
   sets it from `heroKeys` = promoted `run.hero` ∪ active hero assignments ∪ `list` `heroField`, plus
   the assignment's own bit for running items), and every dropdown row shows a purple `star.fill` for
