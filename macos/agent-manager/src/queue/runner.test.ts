@@ -3258,9 +3258,11 @@ test("hero: PROMOTION never blocks (may exceed heroMax); no NEW hero dispatches 
 });
 
 test("hero: DEMOTE flips the bit false + drops the hero annotation; the item re-enters the regular pool", async () => {
-  // A live hero H-1. A `demote` command clears the run-level hero bit, drops the hero annotation
-  // (hero:false), and does NOT re-pack (no move_split_to_new_tab / moveSurfaceIntoTab). After the
-  // demote the split counts as a REGULAR for accounting (heroActiveGlobal drops).
+  // A live hero H-1 that is the run's ONLY pane. A `demote` command clears the run-level hero bit,
+  // drops the hero annotation (hero:false), and — because there is NO other grid pane to anchor a
+  // re-pack on — leaves the split in its own tab (no moveSurfaceIntoTab). After the demote the
+  // split counts as a REGULAR for accounting (heroActiveGlobal drops). (The re-pack WHEN a grid
+  // anchor exists is covered by the next test.)
   const fake = makeQueueFake({
     surfaces: [queueSurface({ id: "u-h1", sessionID: 920, agentState: "working", queueKey: "H-1", queueName: "backlog" })],
     listJson: "[]",
@@ -3290,9 +3292,48 @@ test("hero: DEMOTE flips the bit false + drops the hero annotation; the item re-
   // The annotation was dropped (hero:false written).
   const ann = fake.calls.annotate.find((a) => a.id === "u-h1" && a.ann.hero === false);
   assert.ok(ann, "demote annotated hero:false (drops the GUI marker)");
-  // DEMOTE does NOT re-pack: no eject, no move-into-tab.
+  // DEMOTE never ejects (no perform), and with no grid anchor it does not move-into-tab either.
   assert.equal(fake.calls.perform.length, performBefore, "demote does not eject/perform any action");
-  assert.equal(fake.calls.moveIntoTab.length, moveBefore, "demote does not re-pack the split into a grid");
+  assert.equal(fake.calls.moveIntoTab.length, moveBefore, "no anchor → no re-pack (stays in own tab)");
+});
+
+test("hero: DEMOTE re-packs the split back into the run's grid when a regular anchor exists", async () => {
+  // A run with a seated REGULAR R-1 (grid slot 0) beside a hero H-1 (ejected to its own tab,
+  // gridSlot -1). Demoting H-1 clears the hero bit AND re-packs it into R-1's grid tab via a
+  // balanced moveSurfaceIntoTab (the same proven cross-tab move the packer/adopt use), resetting
+  // H-1's gridSlot to the lowest free slot (1) so it re-enters occupancy accounting.
+  const fake = makeQueueFake({
+    surfaces: [
+      queueSurface({ id: "u-r1", sessionID: 921, agentState: "working", queueKey: "R-1", queueName: "backlog" }),
+      queueSurface({ id: "u-h1", sessionID: 920, agentState: "working", queueKey: "H-1", queueName: "backlog" }),
+    ],
+    listJson: "[]",
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  run.active.set("R-1", seatedAsgn("R-1", "u-r1", 0)); // regular, occupies grid slot 0
+  run.active.set("H-1", { ...seatedAsgn("H-1", "u-h1", -1), hero: true }); // hero, ejected (slot -1)
+  run.hero.add("H-1");
+  let now = 9_300_000;
+
+  const moveBefore = fake.calls.moveIntoTab.length;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "demote", run: "backlog", surfaceUUID: "u-h1", key: "H-1" }]),
+  });
+  await runQueueSweep(deps); // drains the demote command + fires runDemote
+
+  assert.ok(!run.hero.has("H-1"), "H-1 removed from the run-level hero set");
+  assert.equal(run.active.get("H-1")!.hero, false, "H-1 record re-classified regular");
+  // RE-PACK: moved into R-1's tab, anchored on R-1, balanced, with the template grid caps.
+  const move = fake.calls.moveIntoTab.find((m) => m.sourceUUID === "u-h1");
+  assert.ok(move, "demote re-packed H-1 into the grid (moveSurfaceIntoTab called)");
+  assert.equal(move!.targetAnchorUUID, "u-r1", "anchored on the seated regular R-1");
+  assert.equal(move!.balanced, true, "balanced move (the packer's tiling)");
+  assert.equal(move!.maxCols, 3, "forwards template grid.cols");
+  assert.equal(move!.maxRows, 3, "forwards template grid.rows");
+  // H-1's grid slot is reset so it rejoins occupancy (R-1 holds 0 → lowest free is 1).
+  assert.equal(run.active.get("H-1")!.gridSlot, 1, "H-1 re-assigned the lowest free grid slot");
+  assert.ok(fake.calls.moveIntoTab.length > moveBefore, "a re-pack move happened");
 });
 
 // (hero) The `list_surfaces` hero read-back — the wire-contract visibility chokepoint

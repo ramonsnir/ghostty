@@ -334,8 +334,10 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   **kept-by-default** (never auto-closed), and lights up with the hero glyph across all tabs.
   **Promotion never blocks** — it may push you *over* the cap; the only consequence is that no
   *new* heroes dispatch until live heroes drain back under `agent-queue-hero-max`. A hero tile's
-  **Demote** flips it back to a regular tracked item (accounting + marker only — it does NOT
-  re-pack the split back into a grid tab; it stays in its own tab, like any kept split).
+  **Demote** flips it back to a regular tracked item (accounting + marker) AND re-packs the split
+  back into the run's BSP grid (symmetric with promote's eject), so a promote→demote round-trip
+  doesn't strand a plain regular in the hero's dedicated tab. With no seated regular anchor (the
+  run's only pane) there's nothing to pack into, so it stays in its own tab.
 
 ## Hero agents (a separate, attention-bounded pool)
 

@@ -58,9 +58,13 @@ property** that changes four things: *slot accounting, lifecycle, layout, and no
    that no *new* heroes are pulled until live heroes drain back under the cap.
 
 3. **Demotion exists.** `demote` flips a hero back to a regular tracked item (for when the
-   scope turned out smaller than feared). Demotion only reclassifies accounting + drops the
-   marker; it does **not** forcibly re-pack the split back into a grid tab (it stays in its own
-   tab, like any `keepOnComplete` split).
+   scope turned out smaller than feared). Demotion reclassifies accounting, drops the marker,
+   **and re-packs the split back into the run's BSP grid** — symmetric with promote's eject, so
+   a promote→demote round-trip returns the split to the grid rather than stranding a plain
+   regular in the hero's dedicated tab. It packs into a seated regular anchor's tab (multi-tab
+   overflow honored); with no anchor (the run's only pane) there's nothing to pack into, so it
+   stays put. (This re-pack was originally a non-goal; reversed once "a normal agent in a
+   dedicated tab" turned out to be the stranded-demote state.)
 
 4. **Keep-by-default.** A hero is **never** auto-closed — `effectiveKeep` is forced true for a
    hero regardless of template/📌, so it holds in `DONE_PENDING` forever. Heroes often want a
@@ -218,7 +222,9 @@ glyph + payload `kind` are built by the pure, unit-tested `WebPushManager.pushTi
 - **No engine-modeled phases.** Research → design → build → review structure lives in the agent
   definition + issue description, not the supervisor.
 - **No new push/notification transport** — reuse bell/attention + Web Push.
-- **Demote does not re-pack** a split into a grid.
+- ~~**Demote does not re-pack** a split into a grid.~~ **Reversed:** demote now DOES re-pack the
+  split back into the run's grid (see Interaction §3) — leaving it in the hero's dedicated tab
+  stranded a plain regular there.
 
 ## Implementation wiring (by layer)
 

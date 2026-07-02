@@ -713,8 +713,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   in the single `lifetimeDispatched` at dispatch and STAYS counted, so promotion neither refunds a
   `maxItems` slot (which would let the queue over-launch — a shipped bug, now fixed) nor double-counts;
   marking it a hero frees only its regular CONCURRENCY slot. **`demote`** flips it back (re-enters the
-  regular pool for future accounting, also counter-neutral) but does NOT re-pack the split into a grid
-  (stays in its own tab, like any kept split). **Lifecycle — keep-by-default:** a hero is NEVER auto-closed — the close
+  regular pool for future accounting, also counter-neutral) AND **RE-PACKS the split back into the run's
+  BSP grid** (symmetric with promote's eject — `runDemote` finds a seated regular anchor + the lowest
+  free slot and MOVES the split into that grid tab via the same balanced `moveSurfaceIntoTab` the
+  packer/adopt use, resetting `gridSlot` so it re-enters occupancy). Best-effort: with NO grid anchor
+  (the demoted split is the run's only pane) there's nothing to pack into, so it stays in its own tab.
+  **This closes the "a normal agent in a dedicated tab" gap** — a promote→demote round-trip previously
+  left the (now-regular) split stranded in the hero's dedicated tab with `gridSlot -1`; it now returns
+  to the grid. (Earlier this re-pack was a documented non-goal; that is reversed.) NOTE: the promote
+  eject itself was verified working — `move_split_to_new_tab` via `perform_action` ejects a
+  programmatically-targeted grid split, and `runPromote` persists `gridSlot -1` + re-ejects each sweep
+  (self-correcting against a packRun race), so promote lands in its own tab. **Lifecycle — keep-by-default:** a hero is NEVER auto-closed — the close
   gate (`nextState`) treats it as `keep===true` REGARDLESS of the 📌 pin / template `keepOnComplete`,
   so it holds in `DONE_PENDING` forever (a follow-up PR wants the context). **Layout — own dedicated
   tab:** a hero dispatches into its OWN new single-terminal tab (never in the BSP grid — `largestLeafSplit`
