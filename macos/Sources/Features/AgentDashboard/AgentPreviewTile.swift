@@ -185,19 +185,17 @@ struct AgentPreviewTile: View {
     private var frameColor: Color {
         if bellRinging { return Self.bellAmber }
         if isSpotlighted || isFocused { return Color.accentColor }
-        // (hero) A HERO reads apart with a persistent purple border (below the loud bell +
-        // the "you're here"/"top" accent, above plain hover) — a standing "this is
-        // load-bearing" marker, matching the header glyph + backlog star.
-        if isHero { return Self.heroPurple }
+        // (hero) A hero is marked ONLY by the purple header star (below) — NOT a purple frame,
+        // which would fight the amber bell/attention border. The star is the standing marker.
         if hovering { return Color.accentColor.opacity(0.6) }
         return .clear
     }
 
-    /// Border width matching `frameColor`: bell + spotlight are strong (3), a hero + the
-    /// focused hint are medium (2), hover/none are 1.
+    /// Border width matching `frameColor`: bell + spotlight are strong (3), the focused hint is
+    /// medium (2), hover/none are 1. (No hero border — heroes are marked by the header star.)
     private var frameWidth: CGFloat {
         if bellRinging || isSpotlighted { return 3 }
-        if isFocused || isHero { return 2 }
+        if isFocused { return 2 }
         return 1
     }
 
@@ -266,10 +264,9 @@ struct AgentPreviewTile: View {
         entry.annotation?.queueHero ?? false
     }
 
-    /// (hero) The hero accent color — a purple that reads apart from the amber bell frame and
-    /// the accent focus/spotlight border, and matches the backlog hero-waiting star. (The
-    /// across-tabs titlebar tab marker uses a yellow `star.fill` instead — an intentionally
-    /// distinct tint so the hero reads apart in the chrome as well as in the dashboard.)
+    /// (hero) The hero marker color — a purple `star.fill` glyph (NOT a border, which would fight
+    /// the amber bell frame). Matches the backlog hero star AND the across-tabs titlebar tab
+    /// marker (all purple `star.fill`), so a hero reads consistently in the chrome + the dashboard.
     private static let heroPurple = Color.purple
 
     var body: some View {
@@ -343,8 +340,8 @@ struct AgentPreviewTile: View {
             // (hero) A persistent HERO glyph — shown whenever this split is a hero (queue
             // tiles only), so a load-bearing hero is obvious without hovering. Distinct from
             // the keep 📌 pin (a hero is keep-by-default, but keep is a separate control) and
-            // the amber bell: a purple filled star, matching the tile border + backlog star
-            // (the titlebar tab marker uses a distinct yellow star — see `heroPurple`).
+            // the amber bell: a purple filled star, matching the backlog star + the titlebar tab
+            // marker (all purple `star.fill`; the hero is marked by the star, not a border).
             if isQueueOwned && isHero {
                 Image(systemName: "star.fill")
                     .font(.caption2)

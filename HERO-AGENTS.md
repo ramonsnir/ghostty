@@ -27,7 +27,7 @@ property** that changes four things: *slot accounting, lifecycle, layout, and no
 | Dimension | Hero | Regular |
 |---|---|---|
 | Scarce resource | **your attention** | machine slots |
-| Slot accounting | **separate global cap** (`agent-queue-hero-max`), orthogonal to concurrency/maxItems/max-total | queue `concurrency` + global `agent-queue-max-total` + per-run `maxItems` |
+| Slot accounting | **fleet-wide `agent-queue-hero-max`** for concurrent heroes; off the per-queue `concurrency` grid + `max-total`; but **counts against the queue's `maxItems`** (shared lifetime budget) | queue `concurrency` + global `agent-queue-max-total` + per-run `maxItems` |
 | Entry | provider `heroField` (queue-defined) **or** promote a running regular | `list` poll |
 | Over-cap | **promotion never blocks** (may exceed); no *new* hero dispatches until it drains under | n/a |
 | Reverse | **demote** hero → regular | n/a |
@@ -40,13 +40,16 @@ property** that changes four things: *slot accounting, lifecycle, layout, and no
 
 ## Design decisions (locked)
 
-1. **Global, orthogonal cap.** `agent-queue-hero-max` is a **fleet-wide** ceiling on live
-   heroes across *all* queue runs, and it is **independent** of `concurrency`, `maxItems`, and
-   `agent-queue-max-total`: a hero does **not** consume a regular concurrency slot and is
-   **not** counted against `max-total`, and vice-versa. This is the literal reading of
-   "2–3 heroes **plus** 10 other agents". Default **2** (deliberately small — a discipline
-   limit, not a resource limit). `0` disables hero dispatch (hero-marked items then wait on the
-   hero-slot gate, visibly — see backlog below).
+1. **Fleet-wide concurrency cap, off the grid, but inside `maxItems`.** `agent-queue-hero-max` is
+   a **fleet-wide** ceiling on live heroes across *all* queue runs. A hero runs in its own tab, so
+   it does **not** consume a per-queue `concurrency` slot and is **not** counted against
+   `agent-queue-max-total` (the regular-grid fleet cap) — this is the "2–3 heroes **plus** 10 other
+   agents" reading, for the *concurrent* dimension. **BUT `maxItems` (the queue's lifetime dispatch
+   budget) DOES apply to heroes:** a single total `lifetimeDispatched` counter spends `maxItems`
+   across BOTH pools, so a hero can't be scheduled once the queue's lifetime cap is hit (you can't
+   blow past `maxItems` just because the work is load-bearing). Default `agent-queue-hero-max` **2**
+   (a discipline limit). `0` disables hero *concurrency* (hero-marked items then wait on the
+   hero-slot gate, visibly — see backlog).
 
 2. **Two entry paths.** Either the provider marks an item hero up front (queue-defined
    sourcing — see the wire contract), or you **promote** a running regular agent whose scope
@@ -113,29 +116,29 @@ by tests on both sides.
 ### Slot accounting (sidecar)
 
 The dispatch gate (`dispatchCandidates` → `selectCandidates`) splits the list into two pools by
-`item.hero`:
+`item.hero`, sharing **one total lifetime counter** `run.lifetimeDispatched` (regular + hero):
 
-- **Regular pool** — gated exactly as today: `remainingSlots(effConcurrency, activeRegular,
-  globalRegularRemaining)` and the per-run `maxItems` lifetime budget. Regular accounting counts
-  **only non-hero** active assignments; the regular `maxItems` budget is **not** consumed by
-  hero dispatches (track hero dispatches with a separate lifetime counter so the two pools stay
-  orthogonal).
-- **Hero pool** — gated **only** by `heroRemaining = heroMax − heroActiveGlobal`, where
-  `heroActiveGlobal` counts hero assignments **across all runs** (the cap is fleet-wide). No
-  per-run concurrency, no `maxItems`, no `max-total`.
+- **Regular pool** — gated by `remainingSlots(effConcurrency, activeRegular, globalRegularRemaining)`
+  (`activeRegular` = non-hero slot-occupiers only; heroes run off-grid so they don't hold a regular
+  concurrency slot) **plus** the shared `maxItems` budget.
+- **Hero pool** — gated by `heroRemaining = heroMax − heroActiveGlobal` (fleet-wide concurrent-hero
+  cap; `heroActiveGlobal` counts hero assignments **across all runs**) **plus the SAME `maxItems`
+  budget** — the queue's lifetime cap applies to heroes too, so a hero can't dispatch once `maxItems`
+  is hit. No per-run `concurrency` / `max-total` gate a hero.
+
+`maxItems` is spent by the **single** `run.lifetimeDispatched` (every dispatch of either pool bumps
+it). Within one sweep heroes are picked first, then regulars get the remainder, so a sweep never
+dispatches more than the budget total across both pools.
 
 `promote` flips a live assignment's `hero` bit to true (and ejects it — see layout). Because it
-mutates a *running* assignment rather than dispatching, it can push `heroActiveGlobal` past
-`heroMax`; the hero gate then yields `heroRemaining ≤ 0` and no new heroes dispatch until it
-drains. If the promoted item was a *regular* (its record's `hero` bit is false), it had spent one regular
-`maxItems` slot — either from `dispatchOne`'s `lifetimeDispatched += 1`, or from the reconcile
-`regularOccupancy` floor that raises the counter to at least the live regular fleet (so an
-*adopted*, never-dispatched regular is counted too). Promotion **hands that slot over**: it
-decrements the regular `lifetimeDispatched` (floored at 0, never negative) and bumps the separate
-`heroLifetimeDispatched`, the symmetric counterpart to the dispatch bump — so a promoted item stops
-permanently consuming a finite regular budget it no longer belongs to, keeping the two pools
-orthogonal. `demote` flips the bit false; the item re-enters the regular pool for future accounting
-(the next reconcile floor re-counts it as a regular occupant).
+mutates a *running* assignment rather than dispatching, it can push `heroActiveGlobal` past `heroMax`;
+the hero gate then yields `heroRemaining ≤ 0` and no new heroes dispatch until it drains.
+**Promotion is counter-NEUTRAL:** the item was already counted once in `lifetimeDispatched` at its
+dispatch and stays counted — so promotion neither refunds a `maxItems` slot (which would let the
+queue over-launch — a real bug that was fixed) nor double-counts. Marking it a hero frees only its
+regular *concurrency* slot (it leaves `regularOccupancy`). `demote` flips the bit false; the item
+re-enters the regular pool for future accounting. Both are counter-neutral — a single counter means
+an item counts once, forever, regardless of which pool it currently occupies.
 
 ### Lifecycle (sidecar)
 
@@ -243,7 +246,7 @@ routes to `onHero`).
 ## Tests
 
 - **Zig:** `agent-queue-hero-max` parse/default/round-trip in `src/config/Config.zig`.
-- **Sidecar:** two-pool dispatch accounting (hero cap orthogonal to concurrency/maxItems),
+- **Sidecar:** two-pool dispatch accounting (hero concurrency off the grid; `maxItems` shared),
   promotion-over-cap-never-blocks + drain, demote re-enters regular pool, keep-forces-hero close
   gate, `heroField` parse, `promote`/`demote` `applyCommand` + coerce whitelist,
   `blockReasons`/`heroMax`/`heroActive` in the report, persistence/rehydrate of the hero bit.

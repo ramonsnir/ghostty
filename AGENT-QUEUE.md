@@ -71,9 +71,10 @@ agent-queue = true
 # template). Default 0 = UNLIMITED — a queue is bounded only by its own
 # concurrency/maxItems/grid. Set a positive value only to opt into a fleet ceiling:
 # agent-queue-max-total = 16
-# HERO pool cap — fleet-wide ceiling on live HERO agents (the load-bearing,
-# attention-scarce kind), ORTHOGONAL to everything above. Default 2 (a discipline
-# limit). 0 = DISABLE hero dispatch. See "Hero agents" below:
+# HERO pool cap — fleet-wide CONCURRENCY ceiling on live HERO agents (the load-bearing,
+# attention-scarce kind). Heroes run off the grid (no concurrency slot / max-total), but
+# maxItems still caps them. Default 2 (a discipline limit). 0 = DISABLE hero concurrency.
+# See "Hero agents" below:
 # agent-queue-hero-max = 2
 ```
 
@@ -347,12 +348,14 @@ changes four things — *slot accounting, lifecycle, layout, and notification*. 
 research → design → build live in the agent definition + the issue description, exactly as for a
 regular item; the engine models none of them.) Full design + wire contract: **`HERO-AGENTS.md`**.
 
-- **Separate, orthogonal cap.** Live heroes are bounded by the fleet-wide
-  **`agent-queue-hero-max`** (default **2**, `0` = hero dispatch disabled), which is INDEPENDENT
-  of `concurrency` / `maxItems` / `agent-queue-max-total`. A hero does **not** consume a regular
-  concurrency slot and is **not** counted against `max-total` (and vice-versa) — this is the
-  literal "2–3 heroes **plus** 10 other agents". The cap is a *discipline* limit (how many you can
-  hold in your head), not a resource limit.
+- **Fleet-wide concurrency cap, off the grid, but inside `maxItems`.** Live heroes are bounded for
+  CONCURRENCY by the fleet-wide **`agent-queue-hero-max`** (default **2**, `0` = hero concurrency
+  disabled) and run OFF the grid — a hero does **not** consume a per-queue `concurrency` slot and is
+  **not** counted against `agent-queue-max-total` (the "2–3 heroes **plus** 10 other agents"
+  reading, for the concurrent dimension). **But `maxItems` (the queue's lifetime dispatch budget)
+  DOES apply to heroes:** a single total `lifetimeDispatched` counter spends `maxItems` across both
+  pools, so a hero can't be scheduled once the queue's lifetime cap is hit. The `agent-queue-hero-max`
+  cap is a *discipline* limit (how many heroes you can hold in your head), not a resource limit.
 - **Two entry paths.** Either the provider marks an item hero up front (the template's
   **`heroField`** — a `list`-output field whose truthy value = hero), or you **promote** a running
   regular from the dashboard (above). Promotion **never blocks** — it may exceed the cap; no *new*
@@ -366,9 +369,9 @@ regular item; the engine models none of them.) Full design + wire contract: **`H
   easy to find. It carries a distinct **hero glyph** in the tab-accessory slot, visible across all
   tabs (so a hero is spottable even from another tab).
 - **Heroes are marked everywhere; waiting states are explained.** In the backlog DAG canvas, **any**
-  hero node gets a **purple star + purple card border** (not gated on being blocked), and each row of
-  the **"N waiting / M running / N held" health dropdowns** gets a purple star — so a hero is
-  spottable wherever a queue item appears. A waiting item's whole-card **hover tooltip lists the exact
+  hero node gets a **purple star** (not gated on being blocked; the star is the marker — no border,
+  which would fight the bell frame), and each row of the **"N waiting / M running / N held" health
+  dropdowns** gets a purple star — so a hero is spottable wherever a queue item appears. A waiting item's whole-card **hover tooltip lists the exact
   gate(s)** blocking it (`hero slots`, and — for a regular item — `maxItems` / `queue concurrency` /
   `global concurrency`), so when a hero is stuck on a hero slot nobody wastes time bumping `maxItems`.
   (Dependency-blocked is NOT listed — the graph edges show it.) Tooltips use the panel-safe
@@ -377,9 +380,9 @@ regular item; the engine models none of them.) Full design + wire contract: **`H
   web-push carries a distinct glyph (`kind:"hero"`), so it's immediately clear a *hero* is waiting,
   not routine work. Reuses the existing bell/attention + push plumbing — no new delivery mechanism.
 
-Hero classification (the run-level `hero` set + `heroLifetimeDispatched` counter) is persisted in
-the per-run store and **rehydrated across a sidecar/GUI restart**, so a promoted split comes back a
-hero. It is cleared on abort.
+Hero classification (the run-level `hero` set) is persisted in the per-run store and **rehydrated
+across a sidecar/GUI restart**, so a promoted split comes back a hero. `maxItems` accounting rides
+the single total `lifetimeDispatched` counter (regular + hero), also persisted. Cleared on abort.
 
 ## What it guarantees
 
@@ -404,11 +407,12 @@ hero. It is cleared on abort.
 - **Concurrency** is never exceeded (per-queue `concurrency` — the total across all the run's
   tabs — and, *if set*, the optional global `agent-queue-max-total`, which defaults to `0` =
   unlimited; `cols×rows` is the per-tab layout, not a cap on
-  the total, since panes overflow to new tabs). **These bound only the REGULAR (fungible) pool
-  — [hero](#hero-agents-a-separate-attention-bounded-pool) agents are a SEPARATE pool** gated by
-  the fleet-wide `agent-queue-hero-max` (default 2), orthogonal to `concurrency`, `maxItems`, and
-  `agent-queue-max-total`: a hero neither consumes a regular slot nor counts against `max-total`,
-  and vice-versa. "2–3 heroes **plus** 10 other agents" is the literal design.
+  the total, since panes overflow to new tabs). **Concurrency + `max-total` bound only the REGULAR
+  (fungible) pool — [hero](#hero-agents-a-separate-attention-bounded-pool) agents run OFF the grid**,
+  capped for concurrency by the fleet-wide `agent-queue-hero-max` (default 2): a hero neither
+  consumes a regular concurrency slot nor counts against `max-total` ("2–3 heroes **plus** 10 other
+  agents"). **`maxItems`, however, DOES bound heroes** — the queue's lifetime dispatch budget is a
+  single total counter spent by both pools, so heroes can't push total launches past `maxItems`.
 - **Tabs stay packed** — as agents finish unevenly and tabs fragment (e.g. 3 + 1 + 1 panes
   spread across three tabs), the queue **continuously consolidates**: when a whole tab's panes
   fit into an earlier tab's free space, it moves them there and closes the emptied tab (over a
@@ -489,31 +493,36 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   lib/xcframework (Zig default changed) + rebuilt sidecar `dist`; no host restart** (the host
   ignores the key).
 
-### `agent-queue-hero-max` + the HERO pool (a second, orthogonal cap)
+### `agent-queue-hero-max` + the HERO pool (concurrency cap off the grid, `maxItems` shared)
 
-- **`agent-queue-hero-max` (`u32`, default `2`, fork-only) is a SECOND, ORTHOGONAL cap** —
-  the fleet-wide ceiling on live HERO agents across ALL runs, INDEPENDENT of `concurrency`/
-  `maxItems`/`agent-queue-max-total`. **NOTE the inversion vs `max-total`:** `0` here means
-  **DISABLED** (no hero dispatch; hero-marked items wait on the `heroSlots` gate), whereas
-  `agent-queue-max-total = 0` means UNLIMITED. Threading: `Config.zig` (`u32 = 2` + doc + parse
-  test) → `Ghostty.Config.swift agentQueueHeroMax` (**non-optional read**, like the
-  `agentQueueMaxTotal` getter-bug fix) → `AgentManagerController.applyAgentQueueEnv` forwards
-  `GHOSTTY_AGENT_QUEUE_HERO_MAX` (decimal) → `index.ts` → `QueueDeps.heroMax`.
-- **Two-pool dispatch accounting (`runner.ts`/`supervisor.ts`).** `dispatchCandidates` →
-  `selectCandidates` splits the actionable list by `item.hero` into a REGULAR pool and a HERO pool.
-  The regular pool is gated EXACTLY as before (`remainingSlots(effConcurrency, activeRegular,
-  globalRegularRemaining)` + the per-run `maxItems` lifetime budget) — but regular accounting now
-  counts **only non-hero** active assignments, and the regular `maxItems` budget is NOT consumed by
-  heroes (a SEPARATE monotonic `QueueRun.heroLifetimeDispatched` counter tracks hero dispatches).
-  The hero pool is gated ONLY by `heroRemaining = heroMax − heroActiveGlobal`, where
-  `heroActiveGlobal` (`totalHeroActiveRegistry`) counts hero assignments **across all runs** (the
-  cap is fleet-wide, threaded per-sweep through `runOne` and decremented as heroes dispatch).
+- **`agent-queue-hero-max` (`u32`, default `2`, fork-only) is the fleet-wide CONCURRENCY cap** on
+  live HERO agents across ALL runs. Heroes run OFF the grid — no per-queue `concurrency` slot, not
+  counted against `agent-queue-max-total`. **NOTE the inversion vs `max-total`:** `0` here means hero
+  concurrency **DISABLED** (hero-marked items wait on the `heroSlots` gate), whereas
+  `agent-queue-max-total = 0` means UNLIMITED. **`maxItems` is NOT bypassed — it caps heroes too**
+  (see the next bullet). Threading: `Config.zig` (`u32 = 2` + doc + parse test) →
+  `Ghostty.Config.swift agentQueueHeroMax` (**non-optional read**, like the `agentQueueMaxTotal`
+  getter-bug fix) → `AgentManagerController.applyAgentQueueEnv` forwards `GHOSTTY_AGENT_QUEUE_HERO_MAX`
+  (decimal) → `index.ts` → `QueueDeps.heroMax`.
+- **Two-pool dispatch accounting, ONE shared lifetime counter (`runner.ts`/`supervisor.ts`).**
+  `dispatchCandidates` → `selectCandidates` splits the actionable list by `item.hero`. The regular
+  pool is gated by `remainingSlots(effConcurrency, activeRegular, globalRegularRemaining)` (counting
+  **only non-hero** actives for concurrency) **plus** the `maxItems` budget. The hero pool is gated
+  by `heroRemaining = heroMax − heroActiveGlobal` (`totalHeroActiveRegistry` counts heroes across ALL
+  runs; fleet-wide) **plus the SAME `maxItems` budget**. **`maxItems` is spent by a SINGLE total
+  `run.lifetimeDispatched` counter (regular + hero)** — every dispatch of either pool bumps it — so
+  the queue's lifetime cap applies to heroes too. Within a sweep heroes are picked first, then
+  regulars get the remaining budget (`maxItemsRemaining − heroCandidates.length`), so a sweep never
+  dispatches more than the budget total across both pools. **A single counter makes promote/demote
+  counter-NEUTRAL** (no separate hero counter to hand off, no reconcile double-count): an item counts
+  once, forever, regardless of pool — so promotion can neither refund a `maxItems` slot (the shipped
+  over-launch bug) nor double-count. The reconcile floor raises `lifetimeDispatched` to the WHOLE
+  live fleet (`regularOccupancy + heroOccupancy`).
 - **`effectiveHero(run, key) = run.hero.has(key)`** is the AUTHORITATIVE run-level classification
   (PURE; `heroRecord(run)` snapshots the set for persist). It's re-stamped onto each reconciled
-  `Assignment.hero` at the top of every sweep, so the two-pool accounting + the annotation + the tab
-  marker all agree. The `hero` set is persisted in the per-run store (`StoreFile.hero`) +
-  rehydrated on the first reconcile (`loadHero`/`loadHeroLifetimeDispatched`) + cleared on abort —
-  mirroring the `keep`/`dispatched` latch machinery exactly.
+  `Assignment.hero` at the top of every sweep, so the accounting + the annotation + the tab marker
+  all agree. The `hero` set is persisted in the per-run store (`StoreFile.hero`) + rehydrated on the
+  first reconcile (`loadHero`) + cleared on abort — mirroring the `keep`/`dispatched` latch machinery.
 - **`promote`/`demote` commands (`commands.ts`, shaped like `adopt` — `{run, surfaceUUID, key?}`).**
   The reducer does the PURE, SYNCHRONOUS part only: `promote` does `run.hero.add(key)` +
   `run.keepDirty.add(key)` (reusing the per-sweep restamp signal — keep + hero ride ONE annotation);
@@ -588,12 +597,12 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   `Ghostty.Config.swift` (`agentQueueHeroMax`), `AgentManagerController.swift`
   (`GHOSTTY_AGENT_QUEUE_HERO_MAX` forward). Sidecar: `queue/types.ts` (`WorkItem.hero`,
   `Assignment.hero`, `ProviderListSpec.heroField`, `BlockReason`), `queue/provider.ts` (parse
-  `heroField`), `queue/runner.ts` (two-pool accounting, `QueueRun.hero`/`heroLifetimeDispatched`,
-  `effectiveHero`/`heroRecord`, `runPromote`/`runDemote`, own-tab dispatch, keep-forces-hero stamp,
-  rehydrate/persist), `queue/supervisor.ts` (`selectCandidates` two-pool split + `nextState`
-  keep-forces-hero), `queue/commands.ts` (`promote`/`demote` reducer + `ApplyResult`),
-  `queue/status.ts` (`heroMax`/`heroActive` + per-item `blockReasons`), `queue/store.ts`
-  (`StoreFile.hero`/`heroLifetimeDispatched` serialize/parse/load + `persistStore` args), `mcp.ts`
+  `heroField`), `queue/runner.ts` (two-pool accounting sharing ONE total `lifetimeDispatched`,
+  `QueueRun.hero`, `effectiveHero`/`heroRecord`, `runPromote`/`runDemote` (counter-neutral), own-tab
+  dispatch, keep-forces-hero stamp, rehydrate/persist), `queue/supervisor.ts` (`selectCandidates`
+  two-pool split + `nextState` keep-forces-hero), `queue/commands.ts` (`promote`/`demote` reducer +
+  `ApplyResult`), `queue/status.ts` (`heroMax`/`heroActive` + per-item `blockReasons` + `hero`),
+  `queue/store.ts` (`StoreFile.hero` serialize/parse/load + `persistStore` args), `mcp.ts`
   (`coerceQueueCommands` `promote`/`demote` whitelist; `Annotation.hero`/`setAnnotation`;
   `list_surfaces` hero read-back), `index.ts` (`heroMax` dep + fleet-wide hero-active bookkeeping).
   macOS: `QueueCommandBridge.swift` (`.promote`/`.demote` + `QueueStatus.heroMax`/`heroActive` +

@@ -272,7 +272,7 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
         button.isBordered = false
         button.allowsExpansionToolTips = true
         button.toolTip = "Hero"
-        button.contentTintColor = .systemYellow
+        button.contentTintColor = .systemPurple
         button.state = .on
         button.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Hero")
         button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)

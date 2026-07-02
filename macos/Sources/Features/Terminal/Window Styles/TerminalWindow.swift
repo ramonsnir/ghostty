@@ -441,7 +441,7 @@ class TerminalWindow: NSWindow {
         button.target = nil
         button.allowsExpansionToolTips = true
         button.toolTip = "Hero"
-        button.contentTintColor = .systemYellow
+        button.contentTintColor = .systemPurple
         button.state = .on
         button.image = NSImage(systemSymbolName: "star.fill", accessibilityDescription: "Hero")
         button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
@@ -739,7 +739,7 @@ extension TerminalWindow {
             if viewModel.isSurfaceHero {
                 VStack {
                     Image(systemName: "star.fill")
-                        .foregroundColor(.yellow)
+                        .foregroundColor(.purple)
                         .help("Hero")
                         .frame(width: 20, height: 20)
                     Spacer()
