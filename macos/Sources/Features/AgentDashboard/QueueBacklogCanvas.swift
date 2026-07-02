@@ -456,7 +456,7 @@ private struct NodeCard: View {
         .background(stateColor.opacity(node.done ? 0.07 : 0.16))
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(borderColor, lineWidth: running || isMarked || node.hero ? 2 : 1))
+                .strokeBorder(borderColor, lineWidth: running || isMarked ? 2 : 1))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(node.done ? 0.55 : 1.0)
         // Panel-safe tooltip on the WHOLE card (native `.help` never fires in the non-key panel).
@@ -470,9 +470,8 @@ private struct NodeCard: View {
 
     private var borderColor: Color {
         if running { return .green }
-        // (hero) A hero gets the hero purple border, so the whole card (not just the star) reads
-        // apart from a routine backlog/priority item — for ANY hero, not only a slot-blocked one.
-        if node.hero { return .purple }
+        // (hero) A hero is marked by the purple star glyph only — NOT a purple border (kept
+        // consistent with the dashboard tile, where a hero frame would fight the bell border).
         if isMarked, let pc = priorityColor { return pc }
         return stateColor.opacity(0.6)
     }
@@ -555,15 +554,17 @@ enum QueueBacklogReasons {
 /// (ramon fork / Agent Dashboard) A hover tooltip that WORKS inside the dashboard's
 /// non-activating `AgentDashboardPanel` (an `NSPanel`), where AppKit `.help()` tooltips
 /// NEVER appear — native tooltips are shown only for the KEY window, and the panel is
-/// deliberately non-key so you can keep typing in your terminal while hovering it. This is
-/// driven by `.onHover` (which DOES fire in the panel — it's the same signal that reveals the
-/// tile's hover buttons), showing a small text bubble after a short delay. It ALSO sets the
-/// native `.help()` so a normal (key) window still gets the OS tooltip. The bubble is drawn as
-/// an overlay with `allowsHitTesting(false)` + a high `zIndex`, positioned by `edge` so it
-/// lands INSIDE the enclosing (clipped) card rather than being clipped away.
+/// deliberately non-key so you can keep typing in your terminal while hovering it.
+///
+/// It's driven by `.onHover` (which DOES fire in the panel — the same signal that reveals the
+/// tile's hover buttons) and, after a short delay, presents the label as a **`.popover`**. A
+/// popover renders in its OWN window, so — unlike an in-hierarchy overlay bubble — it can NOT be
+/// clipped by an ancestor's `.clipShape`/`.clipped()` (the tile card's rounded clip, the panel
+/// bounds): the earlier overlay approach was clipped under the terminal preview and by the tile's
+/// right edge. `.help(text)` is also set so a normal (key) window still gets the OS tooltip.
 struct DashboardTooltip: ViewModifier {
     let text: String
-    var edge: Edge = .bottom
+    var edge: Edge = .top
     @State private var hovering = false
     @State private var visible = false
 
@@ -573,58 +574,29 @@ struct DashboardTooltip: ViewModifier {
             .onHover { inside in
                 hovering = inside
                 if inside {
-                    // Small delay so a quick pass-over doesn't flash a bubble.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    // Small delay so a quick pass-over doesn't flash a popover.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
                         if hovering { visible = true }
                     }
                 } else {
                     visible = false
                 }
             }
-            .overlay(alignment: bubbleAlignment) {
-                if visible {
-                    Text(text)
-                        .font(.caption2)
-                        .foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize()
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
-                        .overlay(RoundedRectangle(cornerRadius: 5)
-                            .strokeBorder(Color.secondary.opacity(0.35)))
-                        .shadow(radius: 4, y: 1)
-                        .offset(bubbleOffset)
-                        .allowsHitTesting(false)
-                        .zIndex(1000)
-                        .transition(.opacity)
-                }
+            .popover(isPresented: $visible, arrowEdge: edge) {
+                Text(text)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 260, alignment: .leading)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
             }
-    }
-
-    private var bubbleAlignment: Alignment {
-        switch edge {
-        case .top: return .top
-        case .bottom: return .bottom
-        case .leading: return .leading
-        case .trailing: return .trailing
-        }
-    }
-    private var bubbleOffset: CGSize {
-        switch edge {
-        case .top: return CGSize(width: 0, height: -18)
-        case .bottom: return CGSize(width: 0, height: 20)
-        case .leading: return CGSize(width: -8, height: 0)
-        case .trailing: return CGSize(width: 8, height: 0)
-        }
     }
 }
 
 extension View {
-    /// Attach a panel-safe hover tooltip (see `DashboardTooltip`). `edge` places the bubble
-    /// relative to the view; default below it (lands over the tile preview / card body, which
-    /// is inside the card's clip region, so it isn't clipped away).
-    func dashboardTooltip(_ text: String, edge: Edge = .bottom) -> some View {
+    /// Attach a panel-safe hover tooltip (see `DashboardTooltip`). `edge` is the popover's arrow
+    /// edge (default `.top`, so the bubble sits ABOVE the icon). Clip-proof (own window).
+    func dashboardTooltip(_ text: String, edge: Edge = .top) -> some View {
         modifier(DashboardTooltip(text: text, edge: edge))
     }
 }

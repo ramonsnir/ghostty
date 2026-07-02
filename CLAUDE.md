@@ -574,9 +574,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   re-polls. **`agent-queue-max-total`
   is an OPTIONAL fleet-wide cap across ALL runs, default `0` = UNLIMITED** (was 8) — a REGULAR queue
   item is bounded only by its own `concurrency`/`maxItems`/grid unless you set a positive value.
-  (**HEROES are ORTHOGONAL to all of these** — they consume no `concurrency`/`maxItems`/`max-total`
-  slot; they are capped only by their own fleet-wide `agent-queue-hero-max`. See the Hero-agents
-  bullet below.) (Its Swift
+  (**HEROES run off the grid** — no per-queue `concurrency` slot, not counted against `max-total`;
+  capped for concurrency by the fleet-wide `agent-queue-hero-max`. But they **DO count against the
+  queue's `maxItems`** lifetime budget (shared single counter) — you can't blow past `maxItems` with
+  heroes. See the Hero-agents bullet below.) (Its Swift
   getter had a latent bug — read into a `UInt32?` so `ghostty_config_get` could never set the
   Optional tag → always returned the hardcoded 8, silently ignoring the config AND any per-queue
   `concurrency` above 8; fixed to a non-optional read. See AGENT-QUEUE.md → Implementation notes.)
@@ -675,31 +676,36 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   property** on an Agent Queue item, NOT a new subsystem: a *hero* is **load-bearing** work that
   has to be RIGHT (research / deep design / many small details), so the scarce resource it competes
   for is **YOUR ATTENTION**, not a machine slot. That one fact drives four differences from a
-  regular item — *slot accounting, lifecycle, layout, notification*. **Slot accounting is
-  ORTHOGONAL:** a hero is capped ONLY by the fleet-wide `agent-queue-hero-max` (across ALL runs),
-  never against `concurrency`/`maxItems`/`agent-queue-max-total` — and vice-versa (the literal
-  "2–3 heroes PLUS 10 other agents"). The sidecar dispatch gate splits the list into two pools by
-  `item.hero`: the regular pool gated as today (counting only NON-hero actives; a separate
-  `heroLifetimeDispatched` counter keeps the regular `maxItems` budget untouched by heroes) and the
-  hero pool gated only by `heroRemaining = heroMax − heroActiveGlobal` (fleet-wide). `agent-queue-hero-max
-  = 0` DISABLES hero dispatch (⚠️ INVERSION vs `agent-queue-max-total`, where `0` = UNLIMITED — a
+  regular item — *slot accounting, lifecycle, layout, notification*. **Slot accounting:** a hero is
+  capped for CONCURRENCY by the fleet-wide `agent-queue-hero-max` (across ALL runs) and runs OFF the
+  grid — no per-queue `concurrency` slot, not counted against `agent-queue-max-total` (the "2–3 heroes
+  PLUS 10 other agents" reading). **BUT `maxItems` (the queue's lifetime dispatch budget) DOES apply
+  to heroes** — a SINGLE total `run.lifetimeDispatched` counter (regular + hero) spends `maxItems`
+  across both pools, so a hero can't be scheduled once the queue's lifetime cap is hit. The sidecar
+  dispatch gate splits the list into two pools by `item.hero`: the regular pool gated by
+  concurrency/`max-total` + the shared `maxItems` budget (counting only NON-hero actives for
+  concurrency); the hero pool gated by `heroRemaining = heroMax − heroActiveGlobal` (fleet-wide) + the
+  SAME `maxItems` budget (heroes picked first each sweep, regulars get the remainder). `agent-queue-hero-max
+  = 0` DISABLES hero CONCURRENCY (⚠️ INVERSION vs `agent-queue-max-total`, where `0` = UNLIMITED — a
   hero-marked item then waits VISIBLY on the hero-slot gate). **Two entry paths:** the provider marks
   an item up front via the template list-spec `heroField?: string` (a truthy JSON field in `list`
   output, mirrors `keyField`), OR you **`promote`** a running regular from the dashboard tile.
   **Promotion NEVER blocks** — it may push `heroActiveGlobal` PAST the cap (only consequence: no NEW
-  heroes dispatch until it drains under); it HANDS the regular slot over (decrements the regular
-  `lifetimeDispatched`, floored at 0, and bumps `heroLifetimeDispatched`), so a promoted item stops
-  permanently consuming a regular budget it no longer belongs to. **`demote`** flips it back (re-enters
-  the regular pool for future accounting) but does NOT re-pack the split into a grid (stays in its own
-  tab, like any kept split). **Lifecycle — keep-by-default:** a hero is NEVER auto-closed — the close
+  heroes dispatch until it drains under). **Promotion is COUNTER-NEUTRAL** — the item was counted once
+  in the single `lifetimeDispatched` at dispatch and STAYS counted, so promotion neither refunds a
+  `maxItems` slot (which would let the queue over-launch — a shipped bug, now fixed) nor double-counts;
+  marking it a hero frees only its regular CONCURRENCY slot. **`demote`** flips it back (re-enters the
+  regular pool for future accounting, also counter-neutral) but does NOT re-pack the split into a grid
+  (stays in its own tab, like any kept split). **Lifecycle — keep-by-default:** a hero is NEVER auto-closed — the close
   gate (`nextState`) treats it as `keep===true` REGARDLESS of the 📌 pin / template `keepOnComplete`,
   so it holds in `DONE_PENDING` forever (a follow-up PR wants the context). **Layout — own dedicated
   tab:** a hero dispatches into its OWN new single-terminal tab (never in the BSP grid — `largestLeafSplit`
   packing ignores heroes); `promote` EJECTS a running regular into its own tab via the SAME
   `move_split_to_new_tab` / `perform_action` machinery, done GUI-side immediately for responsiveness.
   **Across-tabs tab marker:** a per-tab `TerminalWindow.surfaceIsHero: Bool` (parallel to
-  `surfaceIsZoomed`) drives a hero-glyph titlebar accessory (`HeroAccessoryView`, a tinted yellow
-  `star.fill`, distinct from the purple tile border)
+  `surfaceIsZoomed`) drives a hero-glyph titlebar accessory (`HeroAccessoryView`, a **purple**
+  `star.fill` — same tint as the dashboard tile + backlog star; a hero is marked by the star, NOT a
+  border, which would fight the amber bell frame)
   visible on non-focused tabs — free because a single-terminal hero tab can never be zoomed, so hero +
   reset-zoom accessories are mutually exclusive. **Notification — loud tier + distinct glyph:** a hero
   waiting on you routes into the LOUD attention tier via the EXISTING `.ghosttyAgentNeedsAttention`

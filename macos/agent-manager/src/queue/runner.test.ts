@@ -2767,9 +2767,10 @@ test("hero: the hero cap is ORTHOGONAL to concurrency — a hero dispatches even
   assert.equal(run.active.get("R-1")!.hero, false, "regular record is not a hero");
 });
 
-test("hero: the hero cap is ORTHOGONAL to maxItems — a hero dispatches even at the regular maxItems cap", async () => {
-  // maxItems 1 → the regular lifetime budget allows ONE regular ever. Dispatch a regular first,
-  // exhausting the regular budget; a hero appearing next must STILL dispatch (separate counter).
+test("hero: maxItems caps HEROES too — a hero does NOT dispatch once the queue's lifetime cap is hit", async () => {
+  // maxItems 1 → exactly ONE dispatch EVER, regular or hero (heroes share the single total
+  // lifetime budget — HERO-AGENTS.md § Slot accounting). Dispatch a regular first
+  // (lifetimeDispatched → 1 = cap); a hero appearing next must NOT dispatch.
   const fake = makeQueueFake({
     surfaces: [],
     listJson: '[{"id":"R-1","hero":false}]',
@@ -2781,27 +2782,24 @@ test("hero: the hero cap is ORTHOGONAL to maxItems — a hero dispatches even at
 
   await arm(deps);
   now += 5000;
-  await runQueueSweep(deps); // dispatch the one regular → regular maxItems budget now spent
-  assert.equal(run.lifetimeDispatched, 1, "regular lifetime counter bumped");
-  assert.equal(run.heroLifetimeDispatched, 0, "hero counter untouched");
+  await runQueueSweep(deps); // dispatch the one regular → the SINGLE lifetime budget is now spent
+  assert.equal(run.lifetimeDispatched, 1, "total lifetime counter bumped by the regular dispatch");
 
-  // Now the list additionally surfaces a hero; the regular budget is spent (R-1 latched + at
-  // cap), but the hero dispatches from its OWN pool. Re-point the list to include the hero.
+  // The list now also surfaces a hero; the shared maxItems budget is spent (cap 1), so the hero
+  // must NOT dispatch — the queue's lifetime cap applies to heroes too.
   const fake2 = makeQueueFake({
     surfaces: [queueSurface({ id: "s-r1", sessionID: 611, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
     listJson: '[{"id":"R-1","hero":false},{"id":"H-1","hero":true}]',
     spawns: [{ id: "s-h1", sessionId: 612 }],
   });
-  // Swap the client/exec on the same deps so run state carries over.
   const deps2 = makeQueueDeps(fake2, [run], () => now, 8, { heroMax: 2 });
   now += 5000;
-  await runQueueSweep(deps2); // reconcile R-1 as active; dispatch H-1 (hero pool)
+  await runQueueSweep(deps2); // reconcile R-1 as active; H-1 must NOT dispatch (cap hit)
   now += 5000;
   await runQueueSweep(deps2);
 
-  assert.ok(run.active.has("H-1"), "hero dispatched despite regular maxItems=1 being exhausted");
-  assert.equal(run.heroLifetimeDispatched, 1, "hero counter bumped, not the regular one");
-  assert.equal(run.lifetimeDispatched, 1, "regular lifetime budget stayed at its cap (no over-dispatch)");
+  assert.ok(!run.active.has("H-1"), "hero blocked — maxItems=1 already spent by the regular");
+  assert.equal(run.lifetimeDispatched, 1, "no dispatch beyond the maxItems cap (heroes included)");
 });
 
 test("hero: the REGULAR pool is unaffected by heroes — heroes don't consume regular slots", async () => {
@@ -2846,7 +2844,7 @@ test("hero: the fleet-wide heroMax caps NEW hero dispatches (2 heroes listed, he
   await runQueueSweep(deps);
 
   assert.equal(fake.calls.spawn.length, 1, "heroMax 1 caps to a single hero dispatch");
-  assert.equal(run.heroLifetimeDispatched, 1);
+  assert.equal(run.lifetimeDispatched, 1, "the single total counter bumped by the one hero dispatch");
 });
 
 test("hero: heroMax=0 DISABLES hero dispatch — hero-marked items never spawn", async () => {
@@ -3062,13 +3060,11 @@ test("hero: PROMOTE ejects the split into its own tab + annotates hero:true (the
   assert.ok(ann, "promoted surface annotated hero:true");
 });
 
-test("hero: PROMOTE of a REGULAR DISPATCH hands its maxItems slot over to the hero counter", async () => {
-  // A regular R-1 is DISPATCHED (spawned), bumping run.lifetimeDispatched to 1 (one regular
-  // maxItems slot spent). Promoting it must REFUND that regular slot (lifetimeDispatched → 0) and
-  // account the hero on the separate heroLifetimeDispatched (→ 1) — so the promoted item stops
-  // permanently consuming the regular budget it no longer belongs to (HERO-AGENTS.md § Slot
-  // accounting). The reconcile floor must NOT re-raise lifetimeDispatched (R-1 is now a hero, so
-  // it's excluded from regularOccupancy).
+test("hero: PROMOTE is counter-neutral — it does NOT refund the maxItems lifetime slot", async () => {
+  // A regular R-1 is DISPATCHED, bumping the single total lifetimeDispatched to 1 (one lifetime
+  // slot spent). Promoting it must NOT decrement that counter: an item launched as a regular
+  // counts against maxItems FOREVER, so promotion can't refund a slot (which would let the queue
+  // over-launch). Marking it a hero frees only its CONCURRENCY slot (heroes run off-grid).
   const fake = makeQueueFake({
     surfaces: [],
     listJson: '[{"id":"R-1","hero":false}]',
@@ -3081,8 +3077,7 @@ test("hero: PROMOTE of a REGULAR DISPATCH hands its maxItems slot over to the he
   now += 5000;
   await runQueueSweep(deps); // DISPATCH R-1 as a regular
   assert.ok(run.active.has("R-1"), "regular R-1 dispatched");
-  assert.equal(run.lifetimeDispatched, 1, "regular lifetime counter bumped by the dispatch");
-  assert.equal(run.heroLifetimeDispatched, 0, "hero counter untouched by a regular dispatch");
+  assert.equal(run.lifetimeDispatched, 1, "total lifetime counter bumped by the dispatch");
 
   // R-1's spawned surface is now live; promote it. Swap the client on the same run so state carries.
   const fake2 = makeQueueFake({
@@ -3097,38 +3092,46 @@ test("hero: PROMOTE of a REGULAR DISPATCH hands its maxItems slot over to the he
   await runQueueSweep(deps2); // promote R-1
 
   assert.ok(run.hero.has("R-1"), "R-1 promoted to a hero");
-  assert.equal(run.lifetimeDispatched, 0, "the regular maxItems slot was refunded on promotion");
-  assert.equal(run.heroLifetimeDispatched, 1, "the hero was accounted on the separate hero counter");
+  assert.equal(run.active.get("R-1")?.hero, true, "the assignment is now a hero (off the regular pool)");
+  assert.equal(run.lifetimeDispatched, 1, "the lifetime counter is UNCHANGED — no maxItems refund");
 });
 
-test("hero: PROMOTE refund is floored — the regular counter never goes negative", async () => {
-  // A live regular whose lifetimeDispatched has been floored to 0 (no dispatch, and reconcile's
-  // regularOccupancy floor is applied AFTER the promote drops it out of the regular pool). Promoting
-  // it must still bump the hero counter and NEVER drive lifetimeDispatched below 0. Drive it by
-  // adopting then IMMEDIATELY hand-zeroing the counter to simulate an already-drained regular budget.
+test("hero: PROMOTE frees a concurrency slot but the queue never dispatches beyond maxItems", async () => {
+  // The reported bug. maxItems 1 → only ONE agent may EVER launch. Dispatch R-1
+  // (lifetimeDispatched → 1 = cap). Promoting R-1 → hero frees its CONCURRENCY slot, but the
+  // historical maxItems count stands — so even though a second regular R-2 is now listed and
+  // there's plenty of concurrency room (5), R-2 must NOT launch. (Under the earlier buggy refund
+  // lifetimeDispatched dropped to 0 and R-2 over-launched past the cap.)
   const fake = makeQueueFake({
-    surfaces: [queueSurface({ id: "u-r1", sessionID: 960, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
-    listJson: "[]",
+    surfaces: [],
+    listJson: '[{"id":"R-1","hero":false}]',
+    spawns: [{ id: "s-r1", sessionId: 970 }],
   });
-  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  const run = makeQueueRun(heroTmpl({ concurrency: 5, maxItems: 1 }), memStore());
   let now = 9_070_000;
-  const armDeps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
-  await arm(armDeps); // reconcile adopts R-1 as a regular
-  assert.ok(run.active.has("R-1"), "regular R-1 adopted");
-  // Force the regular counter to 0 to exercise the floor guard (a hero adopted-from-a-fresh-run
-  // edge, or a store rehydrate that under-counts): the refund must clamp, not go negative.
-  run.lifetimeDispatched = 0;
-
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(deps);
   now += 5000;
-  const deps = makeQueueDeps(fake, [run], () => now, 8, {
-    heroMax: 2,
-    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "u-r1", key: "R-1" }]),
+  await runQueueSweep(deps); // dispatch R-1 → the single lifetime budget (cap 1) is spent
+  assert.equal(run.lifetimeDispatched, 1);
+
+  const fake2 = makeQueueFake({
+    surfaces: [queueSurface({ id: "s-r1", sessionID: 970, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: '[{"id":"R-1","hero":false},{"id":"R-2","hero":false}]',
+    spawns: [{ id: "s-r2", sessionId: 971 }],
   });
-  await runQueueSweep(deps); // promote the regular whose counter is already 0
+  now += 5000;
+  const deps2 = makeQueueDeps(fake2, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "s-r1", key: "R-1" }]),
+  });
+  await runQueueSweep(deps2); // promote R-1 + attempt R-2
+  now += 5000;
+  await runQueueSweep(deps2);
 
   assert.ok(run.hero.has("R-1"), "R-1 promoted");
-  assert.equal(run.lifetimeDispatched, 0, "the refund is floored at 0 — never negative");
-  assert.equal(run.heroLifetimeDispatched, 1, "the hero is still accounted");
+  assert.equal(run.lifetimeDispatched, 1, "historical maxItems count unchanged (no refund)");
+  assert.ok(!run.active.has("R-2"), "R-2 NOT launched — the maxItems cap of 1 stands despite the freed concurrency slot");
 });
 
 test("hero: PROMOTION never blocks (may exceed heroMax); no NEW hero dispatches until it drains under", async () => {
