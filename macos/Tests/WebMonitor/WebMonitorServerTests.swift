@@ -638,6 +638,22 @@ struct WebMonitorServerTests {
         #expect(arr?[1]["bell"] as? Bool == true)
     }
 
+    // (Hero Agents) The row's `hero` flag is emitted so the page can purple-star a hero split
+    // and drive the "Focus on heroes" filter.
+    @Test func surfacesJSONEmitsHero() throws {
+        let d = WebMonitorServer.surfacesJSONData([
+            .init(id: "h-1", title: "Hero", pwd: "", window: 0, tab: 0, tabTitle: "T",
+                  splitIndex: 0, splitCount: 1, bell: false, attentionNeeded: false,
+                  isAgent: true, hidden: false, hero: true),
+            .init(id: "r-1", title: "Regular", pwd: "", window: 0, tab: 0, tabTitle: "T",
+                  splitIndex: 0, splitCount: 1, bell: false, attentionNeeded: false,
+                  isAgent: true, hidden: false),
+        ], agentDashboard: true)
+        let arr = try surfacesArray(d)
+        #expect(arr?[0]["hero"] as? Bool == true)
+        #expect(arr?[1]["hero"] as? Bool == false)  // default when omitted
+    }
+
     // (Bell Attention v2) Each row carries the raw bell + attentionNeeded (truthful)
     // and a monitor-tier-routed `attnIndicator` = (bell && monitorBell) ||
     // (attentionNeeded && monitorAttn). Default flags (both true) ⇒ bell || attention.

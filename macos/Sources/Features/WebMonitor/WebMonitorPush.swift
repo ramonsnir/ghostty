@@ -315,7 +315,12 @@ final class WebPushManager {
                 // (ramon fork / Bell Attention v2) The raw bell pushes iff the `push`
                 // effect is routed to the bell tier (bell-features.push).
                 if !self.bellPush { return }
-                self.onBell(id: view.id, title: view.title, pwd: view.pwd)
+                // (ramon fork / Hero Agents) On main here (queue: .main) — cheap annotation read
+                // to lead a hero's bell push with ⭐.
+                let hero = MainActor.assumeIsolated {
+                    (NSApp.delegate as? AppDelegate)?.agentDashboard?.isHeroSurface(view.id) ?? false
+                }
+                self.onBell(id: view.id, title: view.title, pwd: view.pwd, hero: hero)
             }
             // (ramon fork / Bell Attention v2) A promoted attention state pushes iff the
             // `push` effect is routed to the attention tier (attention-features.push).
@@ -397,11 +402,14 @@ final class WebPushManager {
 
     /// Called on main from the bell observer. Hops to `queue` to check the enable
     /// flag + debounce and fan out. The bell body is the surface's pwd.
-    private func onBell(id: UUID, title: String, pwd: String?) {
+    private func onBell(id: UUID, title: String, pwd: String?, hero: Bool = false) {
+        // (ramon fork / Hero Agents) A bell from a HERO surface leads with the ⭐ glyph so it's
+        // clear on the phone that a load-bearing split rang (the loud attention tier already
+        // stars via onHero); a regular bell keeps the 🔔.
         enqueuePush(
             id: id,
             kind: .bell,
-            title: Self.pushTitle(glyph: "🔔", rawTitle: title),
+            title: Self.pushTitle(glyph: hero ? "⭐" : "🔔", rawTitle: title),
             body: pwd ?? "")
     }
 

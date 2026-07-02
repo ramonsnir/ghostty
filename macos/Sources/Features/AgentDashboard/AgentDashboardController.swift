@@ -933,6 +933,11 @@ final class AgentDashboardModel: ObservableObject {
     /// the Show popover are all derived from this, never from `liveIDs`.
     var liveAgentIDs: Set<UUID> { Set(live.map(\.id).filter { agents[$0] != nil }) }
 
+    /// (ramon fork / Hero Agents) The set of currently-live surface ids annotated as HEROES
+    /// (`queueHero`). Drives the web monitor's purple-star mark + "Focus on heroes" filter,
+    /// mirroring `liveAgentIDs`/`hidden`. A hero that isn't currently live is dropped.
+    var heroIDs: Set<UUID> { Set(live.map(\.id).filter { annotations[$0]?.queueHero == true }) }
+
     /// (ramon fork / Agent Manager) Per-surface hook/annotation snapshot for the
     /// MCP `list_surfaces` enrichment. Value types only, so the MCP layer can read
     /// it on the existing main hop and never touch the @MainActor model off-main.
@@ -1979,8 +1984,15 @@ final class AgentDashboardController: NSWindowController {
     /// `hidden` is the user's hide set (keyed by surface UUID). The mere existence
     /// of this controller is what the web monitor reads as "the dashboard is
     /// running" — so when it's nil the filters are offered disabled.
-    func webMonitorFilterState() -> (agents: Set<UUID>, hidden: Set<UUID>) {
-        (model.liveAgentIDs, model.hidden)
+    func webMonitorFilterState() -> (agents: Set<UUID>, hidden: Set<UUID>, hero: Set<UUID>) {
+        (model.liveAgentIDs, model.hidden, model.heroIDs)
+    }
+
+    /// (ramon fork / Hero Agents) True iff `id` is annotated a hero (`queueHero`). Used by the
+    /// web-monitor push path to prefix a hero surface's BELL notification with the ⭐ glyph
+    /// (the loud attention tier already stars via `onHero`). Cheap annotation read.
+    func isHeroSurface(_ id: UUID) -> Bool {
+        model.annotations[id]?.queueHero == true
     }
 
     /// (ramon fork / Agent hooks) Post `.ghosttyAgentNeedsAttention` for `id`,

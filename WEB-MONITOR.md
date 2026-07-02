@@ -111,6 +111,12 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      non-hidden agents) and are remembered per device. They mirror the dashboard exactly,
      so they're **disabled** (greyed, with a note) when the Agent Dashboard isn't running.
      Turn both off to see every surface again.
+   - **★ Focus on heroes** (a third toggle, default OFF) is an OVERRIDE: while on it shows ONLY
+     [hero](HERO-AGENTS.md) splits and **ignores** Agents-only / Hide-hidden (a hero is
+     load-bearing — you want it regardless of hide state), greying those two out; turn it off to
+     return to regular mode. Each **hero split is marked with a purple ★** at the start of its row
+     (matching the dashboard tile / tab marker). Hero-ness comes from the Agent Dashboard, so this
+     toggle is disabled when the dashboard isn't running.
    - Each row has a **Hide / Show** button (shown only when the Agent Dashboard is running). It
      toggles the **same** hide set as the dashboard's eye-slash button / `hide_dashboard_split`
      keybind — so hiding a split **from the phone is a hide in the dashboard too** (unified), and
@@ -256,7 +262,7 @@ real scrollback can't come from the GUI. Instead:
 | `GET /` | the embedded mobile page (`?token=` accepted here when a token is set) |
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
-| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,isAgent,hidden}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden` drive the list filters and are only meaningful when it is) |
+| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,isAgent,hidden,hero}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is) |
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
