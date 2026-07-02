@@ -495,7 +495,14 @@ private struct NodeCard: View {
     private var cardHelp: String {
         var lines: [String] = [headline]
         if node.hero { lines.append("★ Hero — runs in its own tab (agent-queue-hero-max)") }
-        let reasons = QueueBacklogReasons.tooltipLines(blockReasons)
+        // "Blocked on" reasons: the graph's workflow LABELS (e.g. "Inputs needed", "Design
+        // needed") — the human reasons the item isn't actionable — one line each, PLUS any
+        // dispatch-gate reasons for an actionable item stuck behind the queue's caps (maxItems /
+        // concurrency / hero slots). Labels are shown for a non-running node (a running item
+        // isn't "blocked on" its labels). The graph excludes the "Hero issue" label (that's the
+        // ★ line / star), so only genuine workflow labels appear here.
+        var reasons: [String] = running ? [] : node.labels
+        reasons.append(contentsOf: QueueBacklogReasons.tooltipLines(blockReasons))
         if !reasons.isEmpty {
             lines.append("Blocked on:")
             lines.append(contentsOf: reasons.map { "• \($0)" })
