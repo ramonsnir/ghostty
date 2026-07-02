@@ -127,7 +127,7 @@ extension Ghostty {
         /// otherwise wrongly dismiss a restored bell. It also lets `window.isKeyWindow`
         /// settle after `becomeKey` so a genuine click still clears (a synchronous
         /// `bellIsFocused` check can miss because isKeyWindow lags becomeFirstResponder).
-        static let bellClearFocusDelay: TimeInterval = 1.0
+        static let bellClearFocusDelay: TimeInterval = 0.5
 
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
