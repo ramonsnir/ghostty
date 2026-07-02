@@ -384,6 +384,24 @@ test("validateTemplate: missing provider.list.keyField => error", () => {
   if (!r.ok) assert.ok(r.errors.some((e) => e.includes("keyField")));
 });
 
+test("validateTemplate: provider.list.heroField is CARRIED (not dropped on load)", () => {
+  // Regression: the validator once dropped heroField, so the live parse never set WorkItem.hero
+  // → list-marked heroes went unmarked in the waiting/held dropdowns + hero-pool dispatch.
+  const obj = goodTemplateObj();
+  (obj.provider as Record<string, Record<string, unknown>>).list.heroField = "hero";
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.provider.list.heroField, "hero");
+});
+
+test("validateTemplate: provider.list.heroField absent => undefined (no hero flag)", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.provider.list.heroField, undefined);
+});
+
 test("validateTemplate: empty provider.status.doneStates => error", () => {
   const obj = goodTemplateObj();
   obj.provider = {

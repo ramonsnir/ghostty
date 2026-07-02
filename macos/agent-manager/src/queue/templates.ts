@@ -391,10 +391,16 @@ function validateProviderList(
   );
   const titleField = optString(rec.titleField, "provider.list.titleField", errors);
   const urlField = optString(rec.urlField, "provider.list.urlField", errors);
+  // (hero) The list-spec `heroField` names the JSON field whose truthy value marks a hero.
+  // MUST be carried here — omitting it silently drops heroField on template load, so the live
+  // `parseListOutput` never sets `WorkItem.hero` and list-marked heroes go UNmarked everywhere
+  // that reads the list (waiting/held dropdowns, hero-pool dispatch). Mirrors keyField/… above.
+  const heroField = optString(rec.heroField, "provider.list.heroField", errors);
   if (command === undefined || keyField === undefined) return undefined;
   const spec: ProviderListSpec = { command, keyField };
   if (titleField !== undefined) spec.titleField = titleField;
   if (urlField !== undefined) spec.urlField = urlField;
+  if (heroField !== undefined) spec.heroField = heroField;
   return spec;
 }
 

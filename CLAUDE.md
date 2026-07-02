@@ -743,6 +743,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (`agentQueueHeroMax` non-optional getter), `AgentManagerController.swift`
   (`GHOSTTY_AGENT_QUEUE_HERO_MAX` forward); sidecar `queue/types.ts` (`WorkItem.hero`,
   `Assignment.hero`, `heroField`, `BlockReason`), `queue/provider.ts` (`heroField` parse),
+  **`queue/templates.ts` (`validateProviderList` MUST carry `heroField` into the list spec — a
+  THIRD chokepoint, the `coerceQueueCommands` lesson again: the validator whitelists list-spec
+  fields, so omitting `heroField` silently DROPS it on template load → the live `parseListOutput`
+  never sets `WorkItem.hero` → list-marked heroes go UNmarked in the waiting/held dropdowns + hero
+  pool, while promoted/graph heroes still show; shipped-then-fixed 2026-07-02)**,
   `queue/runner.ts` + `queue/supervisor.ts` (two-pool accounting, `heroActiveGlobal`, keep-forces-hero
   close gate, hero dispatch into own tab, `runPromote`/`runDemote`), `queue/commands.ts`
   (`promote`/`demote` + `ApplyResult` `"promoted"`/`"demoted"`), `queue/status.ts`
