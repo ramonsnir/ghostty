@@ -885,10 +885,25 @@ facts for an agent touching this code:
   same protocol/epoch) is therefore **`.upToDate`, no reload, sessions preserved.** (This
   supersedes the former SHA-256 binary-hash gate `kInstalledHostHash`/`hostBinaryHash`, which
   reloaded on ANY host recompile — e.g. a Config.zig change that links into the host — even
-  when behavior was identical.) Transition: an upgrading colleague has a recorded hash but no
-  recorded identity, so `plan(...)` takes the no-recorded-identity branch ONCE — which is now
-  NON-DESTRUCTIVE (`.adoptRunning` if the host is up, `.revive` if down: record the identity,
-  no bootout), a strict improvement over the old gate's one-last-version-reload. **The
+  when behavior was identical.) **⭐ THE TRANSITION IS NON-DESTRUCTIVE — the release that FIRST
+  ships this gate does NOT restart a colleague's host** (a common wrong assumption — "surely
+  ONE last restart to switch mechanisms"; NO). An upgrading colleague has a recorded hash but
+  NO recorded identity, so `plan(...)` takes the no-recorded-identity branch ONCE: `.adoptRunning`
+  if the host is up, `.revive` if down — **both `bootout: false`**, so it records the identity
+  and refreshes the plist WITHOUT killing the running host's RAM-only sessions. This is the whole
+  difference from the OLD hash gate, whose own hash→(pre-hash) transition DID do a one-last
+  version-reload. The adopted host keeps running the OLD binary; the NEW bundled host only starts
+  on the colleague's next NATURAL restart (reboot / manual), which is fine because the running
+  old host still satisfies the identity-pinned LWCR and speaks a compatible protocol.
+  **⚠️ THE ONE RULE THAT MAKES THE NON-DESTRUCTIVE TRANSITION SAFE: do NOT bump the protocol
+  MAJOR in the same release that a colleague first adopts under (i.e. any release while some
+  colleagues still have no recorded identity).** Because `.adoptRunning` leaves the OLD host
+  running without a reload, a simultaneous MAJOR bump would leave a major-N GUI talking to a
+  major-(N−1) host → the host REJECTS the handshake → empty surfaces until a manual host restart.
+  A protocol MINOR bump is safe (negotiated down; features gate on `negotiated_minor`), and a
+  MAJOR bump is safe once every colleague has a recorded identity (then `plan` takes the normal
+  `.reload` path). If you must bump the major, prefer bumping `host_reload_epoch` in a PRIOR
+  release first so colleagues record an identity, THEN bump the major in a later release. **The
   cdhash-pinning exit-78 crash-loop gotcha still applies to Ramon's HAND-BUILT ad-hoc dev host
   (no cert chain → DR falls back to cdhash) — but that host is hand-managed, untouched by
   ForkSetup.** Pure planner `plan(...)`,
