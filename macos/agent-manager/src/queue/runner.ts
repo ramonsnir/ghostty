@@ -1164,8 +1164,47 @@ async function advanceStates(
   // advanced) ONLY if a probe actually fired, so a due sweep with no live SPAWNED/RUNNING
   // agent doesn't burn the interval (the next sweep with an agent probes immediately).
   const statusDue = nowMs - run.lastStatusAtMs >= run.template.intervals.statusMs;
-  let probed = false;
-  for (const a of [...run.active.values()]) {
+  const activeList = [...run.active.values()];
+
+  // (parallel probes) Fire this run's due provider `status` probes CONCURRENTLY rather than
+  // one-`await`-at-a-time. Each probe is a provider CLI call bounded by DEFAULT_PROVIDER_TIMEOUT_MS
+  // (5s, provider.ts); run sequentially, N agents ballooned a single sweep to ~N×5s — the dominant
+  // command-latency source (a queued adopt/promote must wait out the whole in-flight sweep before it
+  // is drained). The probe TARGETS are exactly the old inline condition — SPAWNED/RUNNING with a
+  // LIVE surface, and only when the throttle window is due — so `probed` ("at least one probe fired",
+  // which gates the `lastStatusAtMs` window burn) and the no-live-agent behavior are unchanged. Only
+  // the I/O is parallelized: the anchor fold + nextState stamping below stay SEQUENTIAL over the same
+  // `activeList` (they mutate `run` state), so ordering/determinism is preserved.
+  const probeTargets = statusDue
+    ? activeList.filter(
+        (a) =>
+          (a.state === "SPAWNED" || a.state === "RUNNING") &&
+          a.surfaceUUID !== undefined &&
+          liveByUUID.has(a.surfaceUUID),
+      )
+    : [];
+  const statusByKey = new Map<string, boolean>();
+  if (probeTargets.length > 0) {
+    const env = resolveParamsEnv(run.template, run.params);
+    const results = await Promise.all(
+      probeTargets.map((a) =>
+        probeStatus(run.template.provider.status, a.key, deps.exec, {
+          cwd: run.template.workdir,
+          env,
+        }).then(
+          (probe) => ({ key: a.key, terminal: probe.terminal }),
+          // probeStatus already swallows exec failures (→ {terminal:false}); this rejection
+          // guard is belt-and-suspenders so one unexpected throw can't fail the WHOLE batch
+          // (Promise.all rejects on the first rejection) and strand the other agents' verdicts.
+          () => ({ key: a.key, terminal: false }),
+        ),
+      ),
+    );
+    for (const r of results) statusByKey.set(r.key, r.terminal);
+  }
+  const probed = probeTargets.length > 0;
+
+  for (const a of activeList) {
     // Terminal/transitional states are owned by the close loop / cooldown logic.
     if (
       a.state === "CLOSING" ||
@@ -1187,17 +1226,10 @@ async function advanceStates(
     const anchor = foldIdleAnchor(priorAnchor, agentState, nowMs);
     run.idleAnchor.set(a.key, anchor);
 
-    // Probe provider status ONLY for states that can complete (SPAWNED/RUNNING) and
-    // only when the surface is still live (no point probing a gone surface).
-    let statusTerminal: boolean | undefined = undefined;
-    if (statusDue && surfaceLive && (a.state === "SPAWNED" || a.state === "RUNNING")) {
-      const probe = await probeStatus(run.template.provider.status, a.key, deps.exec, {
-        cwd: run.template.workdir,
-        env: resolveParamsEnv(run.template, run.params),
-      });
-      statusTerminal = probe.terminal;
-      probed = true;
-    }
+    // The provider `status` verdict for this key from the parallel probe batch above —
+    // `undefined` when not probed this sweep (throttled, surface not live, or a terminal
+    // state), exactly matching the old inline `statusTerminal = undefined` default.
+    const statusTerminal: boolean | undefined = statusByKey.get(a.key);
 
     const ctx: NextStateContext = {
       statusTerminal,

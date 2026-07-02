@@ -787,6 +787,42 @@ struct MCPServerTests {
         }
     }
 
+    // (ramon fork / Agent Queue latency) The queue-command wake type is an accepted
+    // wait_for_event filter type, so the sidecar's queue-reactive long-poll can park on it.
+    @Test func dispatchWaitForEventQueueCommandType() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["filter": ["types": ["queue_command"]]]
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: args, server: server) {
+        case .waitForEvent(let spec):
+            #expect(spec.types == ["queue_command"])
+        default:
+            Issue.record("expected .waitForEvent for queue_command")
+        }
+    }
+
+    // An unknown filter type still fails fast (guards the whitelist that the wake type joined).
+    @Test func dispatchWaitForEventUnknownTypeRejected() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["filter": ["types": ["not_a_real_event"]]]
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: args, server: server) {
+        case .invalidParams: break
+        default: Issue.record("expected .invalidParams for an unknown event type")
+        }
+    }
+
+    // The wake event's wire value is the snake_case `queue_command` (what the tool whitelist and
+    // the sidecar's `types:["queue_command"]` long-poll match), and a surface-less wake carrying
+    // the sentinel id matches a waiter with an EMPTY ids filter (match any).
+    @Test func queueCommandEventTypeWireValueAndSentinel() {
+        #expect(MCPEventBus.EventType.queueCommand.rawValue == "queue_command")
+        let sentinel = MCPEventBus.queueCommandSentinelID.uuidString
+        #expect(MCPEventBus.eventMatches(ids: [], types: ["queue_command"],
+                                         eventId: sentinel, eventType: "queue_command"))
+        // A bell waiter must NOT be woken by a queue-command event.
+        #expect(!MCPEventBus.eventMatches(ids: [], types: ["bell"],
+                                          eventId: sentinel, eventType: "queue_command"))
+    }
+
     @Test func eventMatchesPure() {
         let upper = UUID().uuidString          // Foundation: uppercase
         let lower = upper.lowercased()

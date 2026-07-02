@@ -123,6 +123,12 @@ const BELL_WAIT_MS = 60000;
  *  a wedged server doesn't spin the loop. */
 const BELL_WAIT_RETRY_MS = 3000;
 
+/** (Agent Queue latency) The queue-command reactive long-poll park window. Same shape as the
+ *  bell loop: below the MCP tool's 120s ceiling, on timeout the loop just re-parks. */
+const QUEUE_WAIT_MS = 60000;
+/** Backoff before re-parking after a failed queue-command `wait_for_event`. */
+const QUEUE_WAIT_RETRY_MS = 3000;
+
 /** (orphan guard) How often the parent-death watchdog checks `process.ppid`. The sidecar
  *  is a child of the GUI; when that GUI dies (crash / SIGKILL / a clean-quit teardown that
  *  loses the race), the OS reparents this process — `process.ppid` flips to launchd (1) or
@@ -1301,10 +1307,50 @@ async function main(): Promise<void> {
   // with many agents a single `runSweep` can take tens of seconds, which would otherwise
   // starve the queue. Only armed when a queue is configured. Same non-overlapping
   // self-pace as `tick`.
+  // (Agent Queue latency) Coalesced queue-sweep runner shared by the 5s `queueTick` timer AND
+  // the queue-reactive wake below, so the two NEVER overlap (both mutate the shared run store):
+  // a trigger arriving mid-sweep sets the coalescer's re-run flag instead of starting a second
+  // concurrent sweep. This makes the reactive wake safe to add alongside the self-paced timer.
+  const runQueueSweepCoalesced = makeCoalescedRunner(
+    async () => {
+      await runQueueSweepSafe(deps); // self-isolating; no-op when no queue configured
+    },
+    () => stopped,
+  );
   const queueTick = async (): Promise<void> => {
     if (stopped) return;
-    await runQueueSweepSafe(deps); // self-isolating; no-op when no queue configured
+    await runQueueSweepCoalesced();
     if (!stopped) queueTimer = setTimeout(() => void queueTick(), QUEUE_POLL_INTERVAL_MS);
+  };
+
+  // (Agent Queue latency) QUEUE-REACTIVE loop: long-poll wait_for_event(queue_command) and wake
+  // an immediate supervisor sweep so a dashboard adopt/promote/pause/stop lands in ~1 round-trip
+  // instead of waiting out the in-flight sweep + the QUEUE_POLL_INTERVAL_MS gap. The 5s queueTick
+  // stays as the BACKSTOP (and catches any event missed while a sweep was mid-flight). Only armed
+  // when a queue is configured + the server supports wait_for_event. NEVER exits on error
+  // (fail-open: a recovered MCP re-arms after a short backoff). The sweep is DETACHED + coalesced
+  // (shared with queueTick), so the loop re-parks IMMEDIATELY and a command enqueued DURING a sweep
+  // is caught on the next park (or the server's 0.5s event-ring coalesce) — never overlapping the
+  // timer sweep, never lost.
+  const queueReactiveLoop = async (): Promise<void> => {
+    while (!stopped) {
+      let ev: { id: string; type: string } | null;
+      try {
+        ev = await deps.client.waitForEvent({ types: ["queue_command"], timeoutMs: QUEUE_WAIT_MS });
+      } catch (err) {
+        errlog(`queue-command wait failed: ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(QUEUE_WAIT_RETRY_MS);
+        continue;
+      }
+      if (stopped) return;
+      if (ev) {
+        log("queue command event -> immediate sweep");
+        void runQueueSweepCoalesced().catch((err) =>
+          errlog(`queue reactive sweep failed: ${err instanceof Error ? err.message : String(err)}`),
+        );
+      }
+      // ev === null ⇒ park timeout; just loop and re-park.
+    }
   };
 
   // Start the INDEPENDENT queue loop FIRST, so it is never delayed (or blocked
@@ -1312,6 +1358,13 @@ async function main(): Promise<void> {
   // `tick`. Each loop runs only when its feature is armed; whichever are on run
   // concurrently on the event loop, and their pending timers keep the process alive.
   if (deps.queue !== undefined) void queueTick();
+  // (Agent Queue latency) Arm the queue-reactive command wake alongside the timer, so a GUI
+  // adopt/promote/pause/stop drains in ~1 round-trip instead of on the next 5s tick. Independent
+  // of the summarizer/bell loops; needs only a queue + the wait_for_event capability.
+  if (deps.queue !== undefined && typeof deps.client.waitForEvent === "function") {
+    log("agent-queue: event-driven command wake ENABLED (wait_for_event)");
+    void queueReactiveLoop();
+  }
   // (bell-attention) The bell-reactive loop is INDEPENDENT of the continuous summarizer:
   // it runs whenever bell promotion is on (+ the waitForEvent capability exists), so a bell
   // still promotes (cheap, per-bell, fail-open) even with agent-manager OFF (queue-only or

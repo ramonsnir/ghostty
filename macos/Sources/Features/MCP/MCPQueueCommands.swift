@@ -54,6 +54,12 @@ extension MCPServer {
         queue.async { [weak self] in
             guard let self else { return }
             self.queueCommandFIFO.append(cmd)
+            // (Agent Queue latency) Wake the sidecar's queue-reactive long-poll so this
+            // command is drained ~immediately instead of waiting out the in-flight sweep +
+            // the sidecar's 5s timer gap. Fired AFTER the append (same serial queue) so the
+            // woken drain always sees this command. No-op if no waiter is parked — the timer
+            // sweep + the event ring are the fallbacks.
+            self.bus.recordQueueCommand()
         }
     }
 
