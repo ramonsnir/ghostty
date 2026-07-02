@@ -745,9 +745,11 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   non-activating `NSPanel`; AppKit `.help()` renders tooltips only for the KEY window, so native
   tooltips never fired while hovering the (non-key) panel — the reason the tile-icon and backlog
   tooltips "didn't show". The `dashboardTooltip(_:)` view modifier drives a bubble off `.onHover`
-  (which DOES fire in the panel — it's the same signal that reveals the tile hover-buttons) and also
-  sets `.help()` for a key window. Every tile-icon tooltip (`AgentPreviewTile.swift`) and the backlog
-  card tooltip use it, with short 1–2 word labels.
+  (which DOES fire in the panel — it's the same signal that reveals the tile hover-buttons). It does
+  NOT also set `.help()`: the backlog board is its own normal (key-able) window where native
+  `.help()` DOES fire, so setting both rendered TWO tooltips at once; the popover works in every
+  window and is the single source. Every tile-icon tooltip (`AgentPreviewTile.swift`) and the
+  backlog card tooltip use it, with short 1–2 word labels.
 - **Notification routing (`postNeedsAttention`, `WebMonitorPush.swift`).** When a hero surface enters
   `.waiting`, `postNeedsAttention` reads the stored `queueHero` off the annotation and adds
   `AgentStateUserInfoKey.hero` to the `.ghosttyAgentNeedsAttention` userInfo, so the `WebPushManager`

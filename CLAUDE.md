@@ -725,8 +725,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   modifier in `QueueBacklogCanvas.swift`), NOT AppKit `.help()`** — the dashboard is a non-activating
   `NSPanel` and native tooltips render ONLY for the KEY window, so `.help()` never fired while
   hovering the (non-key) panel. `dashboardTooltip` drives a bubble off `.onHover` (which DOES fire in
-  the panel — it's what reveals the tile hover-buttons) and also sets `.help()` for key windows; every
-  tile-icon + backlog tooltip uses it (short 1–2 word labels). **Wire contract (both sides MUST match — the
+  the panel — it's what reveals the tile hover-buttons). It does NOT also set `.help()` — the backlog
+  board is its own normal (key-able) window where native `.help()` fires, so setting both showed TWO
+  tooltips; the popover is the single source, used by every tile-icon + backlog tooltip (short 1–2
+  word labels). **Wire contract (both sides MUST match — the
   `adopt`-chokepoint lesson):** config `agent-queue-hero-max` (u32, forwarded as env
   `GHOSTTY_AGENT_QUEUE_HERO_MAX`, parsed with a NON-negative-honoring `parseNonNegativeInt` so `0`
   survives); template `heroField`; `WorkItem.hero?`/`Assignment.hero` (persisted, rehydrated like
