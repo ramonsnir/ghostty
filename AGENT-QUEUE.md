@@ -597,7 +597,10 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   `Ghostty.Config.swift` (`agentQueueHeroMax`), `AgentManagerController.swift`
   (`GHOSTTY_AGENT_QUEUE_HERO_MAX` forward). Sidecar: `queue/types.ts` (`WorkItem.hero`,
   `Assignment.hero`, `ProviderListSpec.heroField`, `BlockReason`), `queue/provider.ts` (parse
-  `heroField`), `queue/runner.ts` (two-pool accounting sharing ONE total `lifetimeDispatched`,
+  `heroField`), **`queue/templates.ts` (`validateProviderList` MUST carry `heroField` — the
+  validator whitelists list-spec fields, so omitting it silently drops `heroField` on template
+  load and the live parse never marks list heroes; the `coerceQueueCommands` chokepoint lesson,
+  shipped-then-fixed 2026-07-02)**, `queue/runner.ts` (two-pool accounting sharing ONE total `lifetimeDispatched`,
   `QueueRun.hero`, `effectiveHero`/`heroRecord`, `runPromote`/`runDemote` (counter-neutral), own-tab
   dispatch, keep-forces-hero stamp, rehydrate/persist), `queue/supervisor.ts` (`selectCandidates`
   two-pool split + `nextState` keep-forces-hero), `queue/commands.ts` (`promote`/`demote` reducer +
