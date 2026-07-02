@@ -13,6 +13,7 @@ import {
   classifyBellNow,
   makeCoalescedRunner,
   parseParentPid,
+  parseNonNegativeInt,
   shouldExitForParentDeath,
   parseLoopEnablement,
   shouldEnableWarmBase,
@@ -173,6 +174,21 @@ test("parseParentPid: positive integer parses; absent/blank/zero/negative/garbag
   assert.equal(parseParentPid("-5"), undefined);
   assert.equal(parseParentPid("3.5"), undefined); // non-integer
   assert.equal(parseParentPid("nope"), undefined);
+});
+
+// (hero) parseNonNegativeInt is the ONLY guard on the load-bearing
+// `agent-queue-hero-max` semantics on the env-parse side: an explicit "0" DISABLES
+// hero dispatch (must survive, unlike parsePositiveInt which clamps 0 to the
+// default), while absent/blank/negative/garbage falls back to the default.
+test("parseNonNegativeInt: explicit 0 survives; absent/negative/garbage => default", () => {
+  assert.equal(parseNonNegativeInt(undefined, 2), 2); // absent => default
+  assert.equal(parseNonNegativeInt("", 2), 2); // blank => default
+  assert.equal(parseNonNegativeInt("0", 2), 0); // explicit 0 (DISABLE) is honored, NOT clamped
+  assert.equal(parseNonNegativeInt("5", 2), 5);
+  assert.equal(parseNonNegativeInt("-1", 2), 2); // negative => default
+  assert.equal(parseNonNegativeInt("x", 2), 2); // garbage => default
+  assert.equal(parseNonNegativeInt("3.9", 2), 3); // parseInt truncates to 3 (integer, >= 0)
+  assert.equal(parseNonNegativeInt(" 4 ", 2), 4); // trimmed
 });
 
 test("shouldExitForParentDeath: with a known parent pid, exit iff the live ppid differs", () => {

@@ -13,10 +13,14 @@ import {
   loadLifetimeDispatched,
   loadDispatched,
   loadKeep,
+  loadHero,
+  loadHeroLifetimeDispatched,
   loadStore,
   makePendingRecord,
   parseDispatched,
   parseKeep,
+  parseHero,
+  parseHeroLifetimeDispatched,
   parseLifetimeDispatched,
   parseStore,
   persistStore,
@@ -59,6 +63,7 @@ function asgn(over: Partial<Assignment> = {}): Assignment {
     gridSlot: 0,
     state: "RUNNING",
     sinceMs: 1000,
+    hero: false,
     ...over,
   };
 }
@@ -601,4 +606,56 @@ test("persistActiveRuns: a write failure is swallowed (returns false, never thro
     },
   };
   assert.equal(persistActiveRuns(io, [{ template: "f", name: "r", paused: false, draining: false }]), false);
+});
+
+// ---------------------------------------------------------------------------
+// (hero) Persistence of the hero key set + the separate hero lifetime counter, and the
+// per-record hero bit (HERO-AGENTS.md § Slot accounting / contract-lint #1).
+// ---------------------------------------------------------------------------
+
+test("serializeStore persists the hero set + heroLifetimeDispatched; parse round-trips them", () => {
+  const text = serializeStore([asgn({ key: "H-1", hero: true })], 2, ["H-1"], {}, ["H-1", "H-2", "H-1"], 3);
+  assert.deepEqual(parseHero(text), ["H-1", "H-2"], "hero set round-trips, deduped + sorted");
+  assert.equal(parseHeroLifetimeDispatched(text), 3, "hero lifetime counter round-trips");
+  // The record's hero bit round-trips via coerceAssignment.
+  const recs = parseStore(text);
+  assert.equal(recs.find((r) => r.key === "H-1")!.hero, true, "record hero bit round-trips");
+});
+
+test("serializeStore omits the hero fields when empty (back-compat; a pre-hero file has neither)", () => {
+  const text = serializeStore([asgn({ hero: false })]);
+  const obj = JSON.parse(text) as Record<string, unknown>;
+  assert.equal("hero" in obj, false, "no `hero` key when the set is empty");
+  assert.equal("heroLifetimeDispatched" in obj, false, "no `heroLifetimeDispatched` when 0");
+});
+
+test("parseHero / parseHeroLifetimeDispatched are TOLERANT of a pre-upgrade / corrupt file", () => {
+  assert.deepEqual(parseHero(null), []);
+  assert.deepEqual(parseHero("{}"), []); // no `hero` key
+  assert.deepEqual(parseHero('{"hero":"nope"}'), []); // wrong shape
+  assert.deepEqual(parseHero('{"hero":["A","",null,"A","B"]}'), ["A", "B"]); // drops empties, dedups
+  assert.equal(parseHeroLifetimeDispatched(null), 0);
+  assert.equal(parseHeroLifetimeDispatched('{"heroLifetimeDispatched":-3}'), 0);
+  assert.equal(parseHeroLifetimeDispatched('{"heroLifetimeDispatched":4.9}'), 4); // floored
+});
+
+test("coerceAssignment reads a missing hero as false (pre-upgrade record)", () => {
+  // A pre-hero record has no `hero` field → coerced to false, never dropped.
+  const text = JSON.stringify({
+    version: 1,
+    records: [{ queueName: "q", key: "K-1", state: "RUNNING", sessionID: 5, gridSlot: 0, sinceMs: 1 }],
+  });
+  const recs = parseStore(text);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].hero, false, "missing hero → false");
+});
+
+test("makePendingRecord carries the hero flag; loadHero/loadHeroLifetimeDispatched read via the seam", () => {
+  const pending = makePendingRecord("q", "H-1", 0, 1000, { hero: true });
+  assert.equal(pending.hero, true, "pending record is a hero");
+  const regular = makePendingRecord("q", "R-1", 0, 1000);
+  assert.equal(regular.hero, false, "absent hero extra → false");
+  const io = memIO(serializeStore([pending], 0, [], {}, ["H-1"], 1));
+  assert.deepEqual(loadHero(io), ["H-1"]);
+  assert.equal(loadHeroLifetimeDispatched(io), 1);
 });

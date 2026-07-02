@@ -546,7 +546,17 @@ inside it is decided SEPARATELY by per-feature env flags, so each works with the
 `AgentManagerController.applySummarizerEnv(into:enabled:)` (→ `GHOSTTY_SUMMARIZER`) and the
 existing `applyAgentQueueEnv` (→ `GHOSTTY_AGENT_QUEUE`) arm the two; sidecar
 `parseLoopEnablement(env)` reads them in `index.ts main()` and gates the `tick`/`queueTick`
-loops.
+loops. When the queue is enabled, `applyAgentQueueEnv` ALSO forwards the queue's fleet-wide
+caps by the SAME Swift→sidecar env-flag transport (each stripped when the queue is off):
+`GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR`, `GHOSTTY_AGENT_QUEUE_MAX_TOTAL` (the global run cap),
+and — for Hero Agents — **`GHOSTTY_AGENT_QUEUE_HERO_MAX`** (the fork-only `agent-queue-hero-max`
+config, `u32`, default `2`; forwarded as a decimal string via `String(heroMax)`). It is
+ORTHOGONAL to `max-total`/concurrency/`maxItems`, and — unlike `max-total` — `0` means DISABLE
+hero dispatch, not "unlimited"; the sidecar's `parseNonNegativeInt` honors an explicit `0`
+(see `HERO-AGENTS.md` § Wire contract). GUI relaunch + rebuilt sidecar `dist`; Zig/lib rebuild
+for the new config key, but NO host restart (the host ignores it). Tests:
+`AgentManagerControllerTests` (`agentQueueEnvForwardsHeroMaxIncludingZero` + the
+`applyAgentQueueEnv` truth-table cases thread `heroMax`).
 
 **BACK-COMPAT asymmetry:** `GHOSTTY_SUMMARIZER` is set EXPLICITLY both ways (`1`/`0`, NOT
 stripped when off) and the sidecar treats an ABSENT flag as ON — because the summarizer

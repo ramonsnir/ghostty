@@ -223,7 +223,7 @@ struct MCPAnnotationTests {
         let a = AgentAnnotation(
             summary: "s", phase: "p", needsUser: true,
             queueKey: "K", queueName: "R", queueUrl: "u", queueKeep: true,
-            queueKeySuggested: "ENG-9")
+            queueKeySuggested: "ENG-9", queueHero: true)
         let cleared = a.clearingSuggestion()
         #expect(cleared.queueKeySuggested == nil)
         #expect(cleared.summary == "s")
@@ -233,6 +233,33 @@ struct MCPAnnotationTests {
         #expect(cleared.queueName == "R")
         #expect(cleared.queueUrl == "u")
         #expect(cleared.queueKeep == true)
+        #expect(cleared.queueHero == true)
+    }
+
+    // MARK: - (hero) the hero verdict (ramon fork / Hero Agents)
+
+    @Test func parseHeroTrueAndFalse() {
+        // The supervisor stamps the hero verdict (a real boolean) — present-as-bool ⇒ that
+        // bool; it is a valid update on its own. Same semantics as `keep`.
+        let on = AgentAnnotationPayload.fromArguments(["id": UUID().uuidString, "hero": true])
+        #expect(on?.annotation.queueHero == true)
+        let off = AgentAnnotationPayload.fromArguments(["id": UUID().uuidString, "hero": false])
+        #expect(off?.annotation.queueHero == false)
+    }
+
+    @Test func heroOnlyAcceptedAndNonBoolBecomesNil() {
+        // hero alone is a valid partial update; a non-bool hero ⇒ nil (and, with no other
+        // field, the whole body is rejected as empty).
+        #expect(AgentAnnotationPayload.fromArguments(["hero": true])?.annotation.queueHero == true)
+        #expect(AgentAnnotationPayload.fromArguments(["summary": "ok", "hero": "yes"])?.annotation.queueHero == nil)
+        #expect(AgentAnnotationPayload.fromArguments(["hero": "yes"]) == nil) // non-bool + nothing else ⇒ empty
+    }
+
+    @Test func mergeHeroNilPreservesPriorElseOverwrites() {
+        // A summary-only update (hero nil) preserves a prior hero; an explicit hero overwrites.
+        let hero = AgentAnnotation(queueKey: "K-1", queueHero: true)
+        #expect(hero.merging(AgentAnnotation(summary: "x")).queueHero == true) // preserved
+        #expect(hero.merging(AgentAnnotation(queueHero: false)).queueHero == false) // overwritten
     }
 
     // MARK: - dispatch (AppKit-free validation paths)

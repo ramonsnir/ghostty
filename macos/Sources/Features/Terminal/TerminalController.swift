@@ -138,6 +138,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             name: .ghosttyCloseWindow,
             object: nil
         )
+        // (ramon fork / Hero Agents) Observe the annotation change so we can drive the
+        // window's `surfaceIsHero` marker when this tab's surface becomes/stops being a
+        // hero (the annotation arrives async via the MCP `set_surface_annotation` path,
+        // not on a surface-tree change).
+        center.addObserver(
+            self,
+            selector: #selector(onAgentAnnotationDidChange(_:)),
+            name: .ghosttyAgentAnnotationDidChange,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) {
@@ -185,10 +195,48 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             window.surfaceIsZoomed = to.zoomed != nil
         }
 
+        // (ramon fork / Hero Agents) Re-derive the hero marker: a surface may have left
+        // (or been ejected into) this tab, changing whether the tab holds a hero.
+        syncSurfaceIsHero()
+
         // If our surface tree is now nil then we close our window.
         if to.isEmpty {
             self.window?.close()
         }
+    }
+
+    // MARK: Hero Marker (ramon fork / Hero Agents)
+
+    /// The set of surface UUIDs in this window currently marked as a hero (their
+    /// `queueHero` annotation is true). Updated from the async annotation-change
+    /// notification; the window's `surfaceIsHero` marker is true iff this holds at least
+    /// one surface still in our tree. Mirrors how `surfaceIsZoomed` reflects `to.zoomed`.
+    private var heroSurfaceIDs: Set<UUID> = []
+
+    /// Recompute the window's `surfaceIsHero` marker from `heroSurfaceIDs` intersected
+    /// with the surfaces actually in this tab's tree (so a hero that moved to another tab
+    /// no longer marks this one).
+    private func syncSurfaceIsHero() {
+        guard let window = window as? TerminalWindow else { return }
+        let treeIDs = Set(surfaceTree.map { $0.id })
+        window.surfaceIsHero = !heroSurfaceIDs.isDisjoint(with: treeIDs)
+    }
+
+    /// Observe `.ghosttyAgentAnnotationDidChange`. The notification's `AgentAnnotation` is
+    /// PARTIAL — a `queueHero == nil` means "unchanged", so we only act when it is
+    /// explicitly true/false, mirroring `AgentAnnotation.merging`.
+    @objc private func onAgentAnnotationDidChange(_ notification: Notification) {
+        guard let id = notification.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,
+              let annotation = notification.userInfo?[AgentStateUserInfoKey.annotation] as? AgentAnnotation,
+              let hero = annotation.queueHero
+        else { return }
+
+        if hero {
+            heroSurfaceIDs.insert(id)
+        } else {
+            heroSurfaceIDs.remove(id)
+        }
+        syncSurfaceIsHero()
     }
 
     override func replaceSurfaceTree(

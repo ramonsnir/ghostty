@@ -350,6 +350,8 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       running: [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }],
       heldCount: 1,
       held: [{ key: "EX-4", title: "Held one", url: "https://linear.app/x/EX-4" }],
+      heroMax: 2,
+      heroActive: 1,
     }),
   );
   assert.equal(method, "tools/call");
@@ -365,6 +367,9 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   assert.deepEqual(args.running, [{ key: "EX-3", title: "Running", url: "https://linear.app/x/EX-3" }]);
   assert.equal(args.heldCount, 1);
   assert.deepEqual(args.held, [{ key: "EX-4", title: "Held one", url: "https://linear.app/x/EX-4" }]);
+  // (hero) the fleet-wide globals are forwarded on the wire.
+  assert.equal(args.heroMax, 2);
+  assert.equal(args.heroActive, 1);
 });
 
 test("reportQueueGraph: encodes report_queue_graph + forwards backlog + nodes", async () => {
@@ -614,6 +619,43 @@ test("coerceQueueCommands: a truly unknown action is STILL dropped (whitelist on
     ],
   });
   assert.deepEqual(out, [{ action: "adopt", run: "R", key: "K", surfaceUUID: "U" }]);
+});
+
+// (hero) ⭐ The promote/demote coercer gate — the same chokepoint that made `adopt` a silent
+// no-op twice. A promote/demote the GUI emits MUST survive coercion (whitelist + carried
+// {run, surfaceUUID, key}) or the whole feature is a no-op.
+test("coerceQueueCommands: carries promote/demote + run/surfaceUUID/key (the hero wire chokepoint)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "promote", run: "R", surfaceUUID: "U", key: "K" },
+      { action: "demote", run: "R", surfaceUUID: "U2", key: "K2" },
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "promote", run: "R", surfaceUUID: "U", key: "K" },
+    { action: "demote", run: "R", surfaceUUID: "U2", key: "K2" },
+  ]);
+});
+
+test("coerceQueueCommands: a promote carries even when key is absent (eject keys off surfaceUUID)", () => {
+  const out = coerceQueueCommands({ commands: [{ action: "promote", run: "R", surfaceUUID: "U" }] });
+  assert.deepEqual(out, [{ action: "promote", run: "R", surfaceUUID: "U" }]);
+  assert.equal("key" in out[0], false);
+});
+
+// (hero) setAnnotation forwards the hero verdict under the wire arg "hero" (Bool) — the write
+// side of the annotation contract that drives the GUI `queueHero` tab marker / tile.
+test("setAnnotation: forwards the hero Bool (both true and false)", async () => {
+  const on = await captureSetAnnotationArgs("s1", { queueKey: "K", hero: true });
+  assert.equal(on.hero, true, "hero:true forwarded under the 'hero' wire arg");
+  const off = await captureSetAnnotationArgs("s1", { queueKey: "K", hero: false });
+  assert.equal("hero" in off, true, "hero:false is forwarded (drops the marker), not dropped");
+  assert.equal(off.hero, false);
+});
+
+test("setAnnotation: omits hero when undefined", async () => {
+  const args = await captureSetAnnotationArgs("s1", { summary: "x" });
+  assert.equal("hero" in args, false);
 });
 
 // (adopt) The queueKeySuggested annotation: forwarded even when "" (the load-bearing sentinel).

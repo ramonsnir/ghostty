@@ -118,6 +118,13 @@ enum MCPLayout {
         var queueKey: String? = nil
         var queueName: String? = nil
         var queueUrl: String? = nil
+        /// fork / Hero Agents: whether this surface is a HERO (its annotation's
+        /// `queueHero`), echoed into the `list_surfaces` row so the supervisor's reconcile
+        /// reads the hero state back (the reconcile-visibility chokepoint — mirrors
+        /// `queueKey`). false when the surface is not a hero / carries no annotation.
+        /// Defaulted so the (separate) WebMonitor SurfaceRow + test constructors are
+        /// unaffected, same `var`-with-default reasoning as the queue tags above.
+        var hero: Bool = false
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
@@ -189,7 +196,8 @@ enum MCPLayout {
                     sessionID: sessionID,
                     queueKey: hook?.queueKey,
                     queueName: hook?.queueName,
-                    queueUrl: hook?.queueUrl))
+                    queueUrl: hook?.queueUrl,
+                    hero: hook?.queueHero ?? false))
             }
         }
         return rows
@@ -236,6 +244,10 @@ enum MCPLayout {
             if let qk = $0.queueKey { d["queueKey"] = qk }
             if let qn = $0.queueName { d["queueName"] = qn }
             if let qu = $0.queueUrl { d["queueUrl"] = qu }
+            // fork / Hero Agents: emit `hero` only when true (absent ⇒ not a hero),
+            // mirroring the omit-when-default style of `hidden` + the queue tags. The
+            // reconcile-visibility chokepoint — the supervisor reads it back off the row.
+            if $0.hero { d["hero"] = true }
             return d
         }
     }

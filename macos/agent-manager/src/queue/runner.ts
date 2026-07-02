@@ -59,6 +59,8 @@ import {
   loadLifetimeDispatched,
   loadDispatched,
   loadKeep,
+  loadHero,
+  loadHeroLifetimeDispatched,
   loadStore,
   makePendingRecord,
   persistStore,
@@ -257,6 +259,21 @@ export interface QueueRun {
    *  assignment only because `list_surfaces` does not echo the queueKey, making
    *  `needsAnnotationRestamp` always true) — so the pin stays correct even if that ever changes. */
   keepDirty: Set<string>;
+  /** (hero) The HERO key set: every work-item key currently classified as a HERO (see
+   *  HERO-AGENTS.md). RUN-LEVEL state (NOT per-record — like `keep`/`dispatched`) so reconcile,
+   *  which rebuilds the active map from records every sweep, never wipes it; it is the
+   *  AUTHORITATIVE source of a split's hero-ness and is re-stamped onto each reconciled
+   *  assignment's `Assignment.hero` at the top of every sweep. A hero is gated by the fleet-wide
+   *  `agent-queue-hero-max` cap (orthogonal to the regular concurrency/maxItems/max-total pools),
+   *  is kept-by-default (never auto-closed), and lives in its own dedicated tab. `promote`/`demote`
+   *  toggle membership. Persisted in the per-run store (`StoreFile.hero`) + rehydrated on the first
+   *  reconcile so a promoted split stays a hero across a sidecar/GUI restart. Cleared on abort. */
+  hero: Set<string>;
+  /** (hero) The MONOTONIC lifetime count of HERO dispatches — a SEPARATE counter from
+   *  `lifetimeDispatched` so a hero dispatch never consumes the regular `maxItems` budget (the
+   *  two pools stay orthogonal, HERO-AGENTS.md § Slot accounting). Rehydrated from the persisted
+   *  store on the first reconcile. Never decremented (except a spawn-failure rollback). */
+  heroLifetimeDispatched: number;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -291,6 +308,8 @@ export function makeQueueRun(
     dispatched: new Set<string>(),
     keep: new Map<string, boolean>(),
     keepDirty: new Set<string>(),
+    hero: new Set<string>(),
+    heroLifetimeDispatched: 0,
     idleAnchor: new Map<string, number | undefined>(),
     closeAwait: new Map<string, { exitKeysSent: boolean; sinceMs: number }>(),
     lifetimeDispatched: 0,
@@ -341,6 +360,21 @@ export function keepRecord(run: QueueRun): Record<string, boolean> {
   return out;
 }
 
+/** (hero) Whether an item's split is a HERO — the AUTHORITATIVE run-level classification. PURE.
+ *  Consulted by the two-pool dispatch accounting (heroes are gated by the fleet-wide
+ *  `agent-queue-hero-max`, orthogonal to the regular pools), by the keep-forces-hero close gate
+ *  (a hero is treated as `keep === true`), and stamped onto the surface annotation + record so the
+ *  GUI + a restart both see it. */
+export function effectiveHero(run: QueueRun, key: string): boolean {
+  return run.hero.has(key);
+}
+
+/** (hero) Snapshot the run's hero key set as a plain string[] for `persistStore` (the durable
+ *  store holds an array, not a Set). PURE. */
+export function heroRecord(run: QueueRun): string[] {
+  return [...run.hero];
+}
+
 /** The run's EFFECTIVE max simultaneous agents (the TOTAL pane budget across all its tabs):
  *  the LIVE `set_concurrency` edit if set, else the template `concurrency`. PURE. CLAMPED to
  *  `[1, capPerTab * MAX_QUEUE_TABS]` so a fat-fingered live edit can't open hundreds of
@@ -387,6 +421,16 @@ export interface QueueDeps {
    *  global REMAINING is derived from this minus the current global active count — so
    *  the cap is always honored regardless of how active counts drift between sweeps. */
   maxTotal: number;
+  /** (hero) The fleet-wide HERO ceiling (`agent-queue-hero-max`; env
+   *  `GHOSTTY_AGENT_QUEUE_HERO_MAX`, default 2). ORTHOGONAL to `maxTotal`/concurrency/maxItems:
+   *  a hero neither consumes nor is bounded by any of them — the ONLY gate on a NEW hero
+   *  dispatch is `heroRemaining = heroMax − heroActiveGlobal`, where `heroActiveGlobal` counts
+   *  live heroes across ALL runs. `0` DISABLES hero dispatch entirely (hero-marked items then
+   *  wait on the `heroSlots` gate, visibly). NOTE the inversion vs `maxTotal`, where `0` means
+   *  UNLIMITED — for heroes `0` means DISABLED (a discipline limit, not a resource limit).
+   *  Promotion of a RUNNING regular is NOT gated by this (it may push over the cap; only NEW
+   *  dispatches wait until it drains under). See HERO-AGENTS.md § Slot accounting. */
+  heroMax: number;
   /** Grace window for pruning un-finalized pending records (§9). */
   pendingGraceMs: number;
   /** Bounded window the close sequence waits for the child to EXIT (poll across sweeps)
@@ -479,6 +523,11 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
     try {
       if (cmd.action === "adopt") await runAdopt(cmd, deps);
       else if (cmd.action === "infer_key") await runInferKey(cmd, deps);
+      // (hero) promote ejects the split into its own tab + re-stamps the hero annotation;
+      // demote drops the hero annotation. The reducer already flipped the run-level `hero` bit
+      // synchronously (so the two-pool accounting sees it this sweep); these fire the effects.
+      else if (cmd.action === "promote") await runPromote(cmd, deps);
+      else if (cmd.action === "demote") await runDemote(cmd, deps);
     } catch (err) {
       errlog(`${cmd.action} side-effect: ${msg(err)}`);
     }
@@ -502,7 +551,16 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
   // across every run. Derived fresh each sweep (after reconcile rebuilds active sets,
   // active counts are accurate), then decremented as each run dispatches so the
   // `agent-queue-max-total` cap holds across runs within a single sweep.
-  let globalRemaining = Math.max(0, deps.maxTotal - totalActiveRegistry(deps.registry));
+  // (hero) The REGULAR pool's global cap counts ONLY non-hero active assignments — a hero
+  // does not consume the fleet-wide `max-total` budget (HERO-AGENTS.md § Slot accounting).
+  let globalRemaining = Math.max(0, deps.maxTotal - totalRegularActiveRegistry(deps.registry));
+  // (hero) The HERO pool's fleet-wide REMAINING = `heroMax − heroActiveGlobal`. ORTHOGONAL to
+  // `globalRemaining`: derived from its OWN cap + its OWN (fleet-wide) hero occupancy, and
+  // decremented independently as each run dispatches a hero this sweep. `heroMax === 0` DISABLES
+  // hero dispatch (heroRemaining stays ≤ 0 forever); promotion (which mutates a running
+  // assignment) can push heroActiveGlobal past heroMax, driving this negative → clamped to 0 →
+  // no NEW hero dispatches until it drains under the cap.
+  let heroRemaining = Math.max(0, deps.heroMax - totalHeroActiveRegistry(deps.registry));
 
   let registryChanged = false;
   // Iterate a SNAPSHOT of the entries so we can safely delete from the registry mid-loop.
@@ -518,8 +576,9 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         log(`run "${name}" ABORTED — all assignments force-closed, run removed`);
         continue;
       }
-      const dispatched = await runOne(run, surfaces, deps, globalRemaining);
-      globalRemaining = Math.max(0, globalRemaining - dispatched);
+      const disp = await runOne(run, surfaces, deps, globalRemaining, heroRemaining);
+      globalRemaining = Math.max(0, globalRemaining - disp.regular);
+      heroRemaining = Math.max(0, heroRemaining - disp.hero);
       // DRAIN removal: a stopping run with nothing left OCCUPYING a slot is removed
       // (§8a). EXITED (leave-and-bell) review-held splits do NOT block the drain — see
       // `drainComplete` — so a `stop` on a run with a crashed split still completes.
@@ -606,8 +665,12 @@ async function abortRun(run: QueueRun, surfaces: Surface[], deps: QueueDeps): Pr
   // begins with no keeps.
   run.keep.clear();
   run.keepDirty.clear();
+  // (hero) Drop the hero classification too — an aborted run is gone; a fresh start begins
+  // with no heroes (the hero lifetime counter is left as-is / irrelevant once the run is
+  // dropped from the registry).
+  run.hero.clear();
   // Clear the durable assignment store so a restart won't re-adopt the closed panes.
-  persistStore(run.storeIO, [], run.lifetimeDispatched, [], {});
+  persistStore(run.storeIO, [], run.lifetimeDispatched, [], {}, [], run.heroLifetimeDispatched);
 }
 
 /** Whether an assignment OCCUPIES a concurrency + grid slot. PURE. An EXITED
@@ -620,10 +683,32 @@ export function occupiesSlot(a: Assignment): boolean {
   return a.state !== "EXITED" && a.state !== "FINISHED" && a.state !== "FAILED" && a.state !== "COOLDOWN";
 }
 
-/** Count the slot-occupying assignments in a run (EXITED excluded). PURE. */
+/** Count the slot-occupying assignments in a run (EXITED excluded). PURE. Counts BOTH pools
+ *  (hero + regular); used for grid-slot placement (a hero still holds a grid slot in its own
+ *  tab) and the drain check. The two-pool DISPATCH accounting uses the split variants below. */
 function slotOccupancy(run: QueueRun): number {
   let n = 0;
   for (const a of run.active.values()) if (occupiesSlot(a)) n += 1;
+  return n;
+}
+
+/** (hero) Count the slot-occupying HERO assignments in a run. PURE. `heroActiveGlobal` is the
+ *  sum of this across the registry (`totalHeroActiveRegistry`). A hero is identified by the
+ *  AUTHORITATIVE run-level `hero` set (re-stamped onto `Assignment.hero` each sweep), read here
+ *  off the record so the count is a pure function of `run.active`. */
+function heroOccupancy(run: QueueRun): number {
+  let n = 0;
+  for (const a of run.active.values()) if (occupiesSlot(a) && a.hero === true) n += 1;
+  return n;
+}
+
+/** (hero) Count the slot-occupying REGULAR (non-hero) assignments in a run. PURE. This is the
+ *  count the regular pool's concurrency + global max-total gates use — a hero neither consumes
+ *  a regular concurrency slot nor is counted against `max-total` (HERO-AGENTS.md § Slot
+ *  accounting). = `slotOccupancy − heroOccupancy`. */
+function regularOccupancy(run: QueueRun): number {
+  let n = 0;
+  for (const a of run.active.values()) if (occupiesSlot(a) && a.hero !== true) n += 1;
   return n;
 }
 
@@ -639,10 +724,31 @@ export function drainComplete(run: QueueRun): boolean {
   return slotOccupancy(run) === 0;
 }
 
-/** Sum the slot occupancy across all runs in the registry (the global fleet occupancy). PURE. */
+/** Sum the slot occupancy across all runs in the registry (the global fleet occupancy). PURE.
+ *  Counts BOTH pools; used only for the global drain / diagnostics. The REGULAR-pool global
+ *  cap uses `totalRegularActiveRegistry`, and the hero cap uses `totalHeroActiveRegistry`. */
 function totalActiveRegistry(registry: RunRegistry): number {
   let n = 0;
   for (const r of registry.values()) n += slotOccupancy(r);
+  return n;
+}
+
+/** (hero) Sum the REGULAR (non-hero) slot occupancy across all runs — the fleet count the
+ *  `agent-queue-max-total` global cap gates against (heroes are NOT counted against max-total).
+ *  PURE. */
+function totalRegularActiveRegistry(registry: RunRegistry): number {
+  let n = 0;
+  for (const r of registry.values()) n += regularOccupancy(r);
+  return n;
+}
+
+/** (hero) `heroActiveGlobal` — the fleet-wide count of live HERO assignments across ALL runs.
+ *  PURE. The ONLY quantity the hero gate consults: `heroRemaining = heroMax − heroActiveGlobal`.
+ *  Fleet-wide because `agent-queue-hero-max` is a discipline limit on YOUR ATTENTION, not a
+ *  per-run resource (HERO-AGENTS.md design decision #1). */
+export function totalHeroActiveRegistry(registry: RunRegistry): number {
+  let n = 0;
+  for (const r of registry.values()) n += heroOccupancy(r);
   return n;
 }
 
@@ -657,7 +763,8 @@ async function runOne(
   surfaces: Surface[],
   deps: QueueDeps,
   globalRemaining: number,
-): Promise<number> {
+  heroRemaining: number,
+): Promise<{ regular: number; hero: number }> {
   const nowMs = deps.now();
   const t = run.template;
   // --- 1) RECONCILE (always first; §9) --------------------------------------------
@@ -695,13 +802,33 @@ async function runOne(
     for (const [k, v] of Object.entries(loadKeep(run.storeIO))) {
       if (!run.keep.has(k)) run.keep.set(k, v);
     }
+    // (hero) Rehydrate the HERO key set + the separate hero lifetime counter so a promoted
+    // split stays a hero across a sidecar/GUI restart (mirrors the keep/dispatched rehydrate).
+    for (const k of loadHero(run.storeIO)) run.hero.add(k);
+    const persistedHero = loadHeroLifetimeDispatched(run.storeIO);
+    if (persistedHero > run.heroLifetimeDispatched) run.heroLifetimeDispatched = persistedHero;
   }
 
   // Rebuild the in-memory active set from the kept records BEFORE any dispatch.
   run.active = activeSetFromKept(plan.kept);
+  // (hero) RE-STAMP each reconciled assignment's `Assignment.hero` from the AUTHORITATIVE
+  // run-level `hero` set. Reconcile rebuilds `active` from records/annotations every sweep and
+  // an orphan-adopt carries hero=false (the annotation doesn't yet round-trip it — contract-lint
+  // #1/#7), so without this the per-record bit would drift from the run-level truth and the
+  // two-pool accounting (which reads `a.hero`) would miscount a promoted-then-restarted hero as
+  // regular. The run-level set is the single source of truth; this projects it onto the records.
+  for (const [key, a] of run.active) {
+    const isHero = run.hero.has(key);
+    if (a.hero !== isHero) run.active.set(key, { ...a, hero: isHero });
+  }
   // Keep the lifetime dispatch floor at least the size of the live fleet (a restart
-  // must not let the cap drop below what is already running).
-  if (run.active.size > run.lifetimeDispatched) run.lifetimeDispatched = run.active.size;
+  // must not let the cap drop below what is already running). (hero) Count ONLY the regular
+  // fleet — a hero dispatch never consumed the regular `maxItems` budget, so it must not floor
+  // it either (the hero counter is floored separately below).
+  const regularActive = regularOccupancy(run);
+  if (regularActive > run.lifetimeDispatched) run.lifetimeDispatched = regularActive;
+  const heroActive = heroOccupancy(run);
+  if (heroActive > run.heroLifetimeDispatched) run.heroLifetimeDispatched = heroActive;
 
   // Re-stamp the queueKey annotation on any surface that lost it (GUI restart dropped
   // the in-memory map; the store is truth — §9). Adopt/active both persisted below.
@@ -731,7 +858,7 @@ async function runOne(
       );
     }
   }
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
   run.reconciledOnce = true;
 
   // (keep) Re-stamp the annotation for any split whose keep was just toggled (a `set_keep`
@@ -765,7 +892,7 @@ async function runOne(
   // below so the run-level HEALTH report fires EVERY sweep (incl. the arm sweep) — that
   // is the "queue is present, here's what's next" signal the dashboard shows before any
   // split spawns.
-  let dispatched = 0;
+  let dispatched = { regular: 0, hero: 0 };
   if (!run.dispatchArmed) {
     run.dispatchArmed = true; // arm for the NEXT sweep; suppress dispatch THIS sweep
   } else if (run.disabled) {
@@ -778,7 +905,7 @@ async function runOne(
     // new dispatch fills the packed layout's low tabs rather than a stray fragment. One merge
     // per sweep; a no-op once the layout is minimal. Best-effort (never throws into the sweep).
     await packRun(run, deps);
-    dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining);
+    dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining, heroRemaining);
   }
 
   // --- 4.5) REFRESH the backlog GRAPH (optional `provider.graph`), throttled to listMs.
@@ -868,6 +995,11 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
   // PLUS the §7.1 dispatch latch — those keys are NOT eligible to dispatch, so showing
   // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
   const exclude = new Set<string>([...run.active.keys(), ...run.dispatched]);
+  // (hero) The per-sweep gate ROOM feeding `blockReasons` — the SAME primitives
+  // `dispatchCandidates` gates on, so the report attributes exactly why a waiting item is
+  // stuck. `heroMax`/`heroActive` are fleet-wide globals; the three regular-pool remainders
+  // are this run's own room. `Number.POSITIVE_INFINITY` for an unlimited cap ⇒ never blocking.
+  const cap = effectiveMaxItemsCap(run);
   const report: QueueStatusReport = queueStatusReport({
     queueName: run.runName,
     present: true,
@@ -877,6 +1009,13 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     dispatchArmed: run.dispatchArmed,
     runningItems,
     excludeKeys: exclude,
+    heroMax: deps.heroMax,
+    heroActive: totalHeroActiveRegistry(deps.registry),
+    regularConcurrencyRemaining: effectiveConcurrency(run) - regularOccupancy(run),
+    regularGlobalRemaining:
+      deps.maxTotal - totalRegularActiveRegistry(deps.registry),
+    regularMaxItemsRemaining:
+      cap === null ? Number.POSITIVE_INFINITY : cap - run.lifetimeDispatched,
     // (release) HELD items are derived from these two: latched keys that are still listed but
     // no longer active. `activeKeys` is the full active map (any state), distinct from `exclude`
     // (which also carries the latch) so the builder can compute listed ∩ latched ∩ ¬active.
@@ -952,6 +1091,11 @@ export function projectLiveSurfaces(
     const url = (s as { queueUrl?: string }).queueUrl;
     if (typeof url === "string") live.url = url;
     if (typeof s.title === "string") live.title = s.title;
+    // (hero) Echo the hero bit back off the row (mirrors the queueKey read-back). The
+    // run-level `hero` Set is still authoritative — this is the wire-contract visibility
+    // field (HERO-AGENTS.md), not the source of truth.
+    const heroBit = (s as { hero?: boolean }).hero;
+    if (typeof heroBit === "boolean") live.hero = heroBit;
     out.push(live);
   }
   return out;
@@ -975,6 +1119,9 @@ async function restampAnnotation(
       queueName: run.runName,
       ...(a.url !== undefined ? { queueUrl: a.url } : {}),
       keep: effectiveKeep(run, a.key),
+      // (hero) keep the tab marker / tile in sync with the run-level hero verdict after a GUI
+      // restart dropped the annotation map (mirrors the keep re-stamp).
+      hero: effectiveHero(run, a.key),
     });
   } catch (err) {
     errlog(`restamp ${a.key}: ${msg(err)}`);
@@ -1053,7 +1200,10 @@ async function advanceStates(
       closeOnComplete: run.template.closeOnComplete,
       // (keep) the per-split keep verdict (dashboard 📌 pin / keepOnComplete default) — a
       // kept split holds in DONE_PENDING and is never auto-torn-down.
-      keep: effectiveKeep(run, a.key),
+      // (hero) a HERO is ALWAYS treated as keep===true (never auto-closed, independent of the
+      // 📌 pin / template keepOnComplete) so its follow-up-PR context survives — HERO-AGENTS.md
+      // § Lifecycle. `|| effectiveHero(...)` forces the hold; the pin still works on top.
+      keep: effectiveKeep(run, a.key) || effectiveHero(run, a.key),
     };
     const next = nextState(a, ctx);
     if (next !== a.state) {
@@ -1081,7 +1231,7 @@ async function advanceStates(
   // Consume the status-probe window only when a probe actually fired this sweep (see the
   // `statusDue`/`probed` note above).
   if (probed) run.lastStatusAtMs = nowMs;
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,7 +1322,7 @@ async function runCloseSequences(
     }
     // else: still within the await window and not yet exited → keep polling next sweep.
   }
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
 }
 
 /** Move a closed assignment to FINISHED and start its key's COOLDOWN, freeing the
@@ -1190,24 +1340,39 @@ function finishAndCooldown(run: QueueRun, a: Assignment, nowMs: number): void {
 // ---------------------------------------------------------------------------
 
 /** Fetch the provider list, select candidates under every cap, and dispatch each — with
- *  a SYNCHRONOUS active-set insert before the spawn await (§7 within-tick dedup). */
+ *  a SYNCHRONOUS active-set insert before the spawn await (§7 within-tick dedup).
+ *
+ *  (hero) TWO-POOL accounting (HERO-AGENTS.md § Slot accounting). The list is split by
+ *  `item.hero` into a REGULAR pool and a HERO pool, dispatched ORTHOGONALLY:
+ *   - REGULAR pool — gated exactly as before: `remainingSlots(effConcurrency, activeRegular,
+ *     globalRegularRemaining)` + the per-run `maxItems` lifetime budget. `activeRegular` counts
+ *     ONLY non-hero slot-occupiers, and the `maxItems` budget spends only `run.lifetimeDispatched`
+ *     (the regular counter) — a hero neither consumes a concurrency slot nor the maxItems budget.
+ *   - HERO pool — gated ONLY by `heroRemaining = heroMax − heroActiveGlobal` (fleet-wide, passed
+ *     in). No per-run concurrency, no `maxItems`, no `max-total`. A separate `heroLifetimeDispatched`
+ *     counter tracks hero dispatches so the two pools never cross-contaminate.
+ *  Returns `{ regular, hero }` so the sweep can decrement each fleet-wide budget independently. */
 async function dispatchCandidates(
   run: QueueRun,
   deps: QueueDeps,
   nowMs: number,
   globalRemaining: number,
-): Promise<number> {
+  heroRemaining: number,
+): Promise<{ regular: number; hero: number }> {
   const t = run.template;
 
-  // Remaining slots = min(EFFECTIVE concurrency room, global remaining). The active count
-  // is every assignment currently OCCUPYING a slot (EXITED kept-but-freed ones excluded,
-  // §6). The per-tab `cols*rows` is NOT a global cap — concurrency is the total pane budget
-  // and panes overflow to additional tabs (§12), so it does not bound this.
-  const activeCount = slotOccupancy(run);
-  const slots = remainingSlots(t, activeCount, globalRemaining, effectiveConcurrency(run));
+  // Remaining REGULAR slots = min(EFFECTIVE concurrency room, global remaining). The active
+  // count is every NON-HERO assignment currently OCCUPYING a slot (EXITED kept-but-freed ones
+  // excluded, §6; heroes excluded — they don't consume a regular concurrency slot). The per-tab
+  // `cols*rows` is NOT a global cap — concurrency is the total pane budget and panes overflow to
+  // additional tabs (§12), so it does not bound this.
+  const activeRegular = regularOccupancy(run);
+  const slots = remainingSlots(t, activeRegular, globalRemaining, effectiveConcurrency(run));
   // §8b maxItems OVERRIDE: a start-time "maxItems" param can override the template cap
   // (null = unlimited ⇒ Infinity remaining; selectCandidates' Math.min(slots, Infinity) =
   // slots). The global `agent-queue-max-total` + grid/concurrency still bound an unlimited run.
+  // (hero) The maxItems budget is spent by `run.lifetimeDispatched` — the REGULAR lifetime
+  // counter (hero dispatches bump the separate `heroLifetimeDispatched`), so heroes never eat it.
   const cap = effectiveMaxItemsCap(run);
   const maxItemsRemaining =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - run.lifetimeDispatched);
@@ -1226,7 +1391,7 @@ async function dispatchCandidates(
   // window is consumed on the ATTEMPT (set before the fetch), so even a FAILED list waits a
   // full interval before retrying — a hard cap of one provider `list` call per `listMs`,
   // regardless of outcome (the point: stop hammering the provider every 5s).
-  if (nowMs - run.lastListAtMs < t.intervals.listMs) return 0;
+  if (nowMs - run.lastListAtMs < t.intervals.listMs) return { regular: 0, hero: 0 };
   run.lastListAtMs = nowMs;
 
   // Fetch the provider list (skip the tick on any failure — never throws). Use the
@@ -1262,48 +1427,78 @@ async function dispatchCandidates(
         }
       }
       if (rearmed) {
-        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
       }
     }
   } catch (err) {
     errlog(`run "${run.runName}": list provider failed: ${msg(err)}`);
-    return 0;
+    return { regular: 0, hero: 0 };
   }
-  // Dispatch gate (applied AFTER the fetch+cache+re-arm above): nothing to dispatch when
-  // the slots/cap are exhausted (e.g. at maxItems) or the actionable list is empty.
-  if (slots <= 0 || maxItemsRemaining <= 0) return 0;
-  if (items.length === 0) return 0;
+  if (items.length === 0) return { regular: 0, hero: 0 };
 
-  const candidates = selectCandidates(
-    items,
-    run.active,
-    run.cooldown,
-    run.dispatched,
-    nowMs,
-    slots,
-    maxItemsRemaining,
-  );
+  // (hero) Split the list into the two pools by `item.hero`. The dispatch classification is
+  // the ITEM's `hero` bit (from the provider `heroField`); the resulting assignment records
+  // it + the run-level `hero` set is updated at dispatch (see dispatchOne). Regular + hero are
+  // then selected under their OWN caps — orthogonal by construction.
+  const heroItems = items.filter((i) => i.hero === true);
+  const regularItems = items.filter((i) => i.hero !== true);
 
-  let dispatched = 0;
+  // REGULAR selection: gated by the regular slots + the regular maxItems budget.
+  const regularCandidates =
+    slots <= 0 || maxItemsRemaining <= 0
+      ? []
+      : selectCandidates(
+          regularItems,
+          run.active,
+          run.cooldown,
+          run.dispatched,
+          nowMs,
+          slots,
+          maxItemsRemaining,
+        );
+  // HERO selection: gated ONLY by `heroRemaining` (fleet-wide `heroMax − heroActiveGlobal`).
+  // No concurrency / maxItems / max-total apply — heroRemaining is BOTH the slot cap and the
+  // maxItems cap (POSITIVE_INFINITY for the latter so `min(heroRemaining, ∞) = heroRemaining`).
+  const heroCandidates =
+    heroRemaining <= 0
+      ? []
+      : selectCandidates(
+          heroItems,
+          run.active,
+          run.cooldown,
+          run.dispatched,
+          nowMs,
+          heroRemaining,
+          Number.POSITIVE_INFINITY,
+        );
+
+  let regular = 0;
+  let hero = 0;
   let acquired = 0;
   try {
-    for (const item of candidates) {
-      // The supervisor's OWN budget genuinely BOUNDS this sweep's batch: acquire a slot
-      // per candidate and HOLD it for the whole batch (release only at the end, in the
-      // finally). So a budget of N caps the batch to N dispatches in one sweep even
-      // though dispatchOne is awaited sequentially — the budget is a real per-batch
-      // bound, not decorative. (The slot/grid/global/lifetime caps already bound
-      // concurrency; this is the starvation-lesson budget the spec requires the queue
-      // pass to OWN separately from the summarizer/manager — §13.)
+    // Dispatch heroes FIRST (they compete for your scarce attention, so surface them promptly),
+    // then regulars. Each `dispatchOne` gets its pool classification so it records the hero bit
+    // + bumps the correct lifetime counter. The supervisor's OWN budget genuinely BOUNDS this
+    // sweep's batch across BOTH pools: acquire a slot per candidate and HOLD it for the whole
+    // batch (release only at the end, in the finally) — the starvation-lesson budget the queue
+    // pass OWNs separately from the summarizer/manager (§13). The per-pool caps above already
+    // bound concurrency/hero-slots; this is the extra per-sweep-batch bound.
+    for (const item of heroCandidates) {
       if (!deps.budget.tryAcquire()) break;
       acquired += 1;
-      const ok = await dispatchOne(run, item, deps, deps.now());
-      if (ok) dispatched += 1;
+      const ok = await dispatchOne(run, item, deps, deps.now(), true);
+      if (ok) hero += 1;
+    }
+    for (const item of regularCandidates) {
+      if (!deps.budget.tryAcquire()) break;
+      acquired += 1;
+      const ok = await dispatchOne(run, item, deps, deps.now(), false);
+      if (ok) regular += 1;
     }
   } finally {
     for (let i = 0; i < acquired; i++) deps.budget.release();
   }
-  return dispatched;
+  return { regular, hero };
 }
 
 /**
@@ -1328,11 +1523,16 @@ async function dispatchOne(
   item: WorkItem,
   deps: QueueDeps,
   nowMs: number,
+  isHero: boolean,
 ): Promise<boolean> {
   const t = run.template;
 
   // (a) Grid slot + split plan from the currently-occupied slots (EXITED freed ones
   // excluded so a hole left by a crashed agent is refilled).
+  // (hero) A HERO gets its OWN dedicated tab (single terminal) and NEVER participates in the
+  // BSP grid packing (HERO-AGENTS.md § Layout). It is assigned grid slot -1 (a sentinel that
+  // `occupiesSlot`/the occupied-set scan below EXCLUDE via `gridSlot >= 0`), so it doesn't
+  // shift the regular grid's slot indices, and it is spawned as a fresh first-tab below.
   const occupied = new Set<number>();
   for (const a of run.active.values()) {
     if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
@@ -1341,12 +1541,15 @@ async function dispatchOne(
   // lowest free slot fills the lowest tab first, then overflows (§12). A slot exists for
   // every agent the (gated) concurrency allows.
   const cap = effectiveConcurrency(run);
-  const slot = lowestFreeSlot(occupied, cap);
+  const slot = isHero ? -1 : lowestFreeSlot(occupied, cap);
   if (slot === null) return false; // full — shouldn't happen (remainingSlots gated)
   // Plan how to materialize this slot's pane (§12): the run's first tab, an OVERFLOW tab
   // (slot is the first of a fresh tab), or a BALANCED split within the slot's existing tab.
   // `slot`'s only geometry is which tab it belongs to (floor(slot / cols*rows)).
-  const sp = splitPlan(occupied, slot, gridCap(t.grid.cols, t.grid.rows));
+  // (hero) A HERO ALWAYS opens its OWN new tab (single terminal, never in the grid) — the same
+  // "firstTab on the run's window" shape as an overflow tab, anchored on a live pane so it
+  // shares the run's window. It never calls `splitPlan` (which would place it in the BSP grid).
+  const sp = isHero ? undefined : splitPlan(occupied, slot, gridCap(t.grid.cols, t.grid.rows));
 
   // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
   // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
@@ -1354,20 +1557,29 @@ async function dispatchOne(
   const pending = makePendingRecord(run.runName, item.key, slot, nowMs, {
     title: item.title,
     url: item.url,
+    hero: isHero,
   });
   // (c) SYNCHRONOUS active-set insert BEFORE the spawn await (within-tick dedup, §7).
   // The monotonic lifetime counter increments HERE (at the intent), so even a crash
   // between the pending-write and the finalize still counts the dispatch against the
   // §7 lifetime cap — and it is persisted as a top-level field, surviving a restart.
+  // (hero) A hero bumps the SEPARATE `heroLifetimeDispatched` counter (never the regular
+  // `maxItems` budget) and joins the AUTHORITATIVE run-level `hero` set so subsequent sweeps
+  // classify it as a hero (the record already carries the bit via makePendingRecord).
   run.active.set(item.key, pending);
-  run.lifetimeDispatched += 1;
+  if (isHero) {
+    run.hero.add(item.key);
+    run.heroLifetimeDispatched += 1;
+  } else {
+    run.lifetimeDispatched += 1;
+  }
   // LATCH the key (§7.1): once dispatched it is SUPPRESSED from re-dispatch until a
   // successful `list` no longer reports it (it left the actionable set) and it later
   // returns — so a kill BEFORE the agent claims (the item still in the list) is never
   // re-grabbed. Stamped at the intent (alongside the lifetime counter) + persisted, so it
   // holds across a crash/restart; rolled back below only if the spawn itself fails.
   run.dispatched.add(item.key);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
 
   // (d) Spawn the split, DELIVERING item context to the agent (§13, the #1 requirement).
   // Item fields ride as GHOSTTY_ITEM_* env, NEVER spliced as bare shell text. They are
@@ -1395,7 +1607,14 @@ async function dispatchOne(
   try {
     let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
     const base = { command: commandWithItemEnv, cwd: t.workdir, env: itemEnv };
-    if (sp.firstTab === true) {
+    if (sp === undefined) {
+      // (hero) HERO tab: open a NEW dedicated single-terminal tab (never a grid split),
+      // anchored on the run's window (any seated grid pane) so it shares the run's window like
+      // an overflow tab. `firstTab:true` opens a fresh tab; a `windowAnchorUUID` keeps it in the
+      // run's existing window when one exists (else it opens frontmost). HERO-AGENTS.md § Layout.
+      const windowAnchorUUID = firstSeatedUUID(run);
+      spawnArgs = { ...base, firstTab: true, ...(windowAnchorUUID !== undefined ? { windowAnchorUUID } : {}) };
+    } else if (sp.firstTab === true) {
       spawnArgs = { ...base, firstTab: true };
     } else if (sp.newTab === true) {
       // Overflow tab: open a new tab anchored on the run's window (any live pane).
@@ -1421,12 +1640,19 @@ async function dispatchOne(
     // failed spawn; drop the pending record. The key is NOT cooled (it can retry next
     // list, since nothing ran), and the lifetime counter is ROLLED BACK — nothing
     // actually launched, so the failed attempt must not consume the §7 lifetime budget.
+    // (hero) Roll back the SAME pool the dispatch bumped: a hero spawn-failure un-does the
+    // hero counter + drops the run-level hero membership; a regular un-does the regular counter.
     run.active.delete(item.key);
-    if (run.lifetimeDispatched > 0) run.lifetimeDispatched -= 1;
+    if (isHero) {
+      if (run.heroLifetimeDispatched > 0) run.heroLifetimeDispatched -= 1;
+      run.hero.delete(item.key);
+    } else if (run.lifetimeDispatched > 0) {
+      run.lifetimeDispatched -= 1;
+    }
     // Roll back the §7.1 latch too: nothing actually launched, so the key must stay
     // eligible to retry on the next list (mirrors the lifetime-counter rollback).
     run.dispatched.delete(item.key);
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
     errlog(`run "${run.runName}": spawn ${item.key} failed: ${msg(err)}`);
     return false;
   }
@@ -1456,7 +1682,7 @@ async function dispatchOne(
   // a pending session id reconcile will backfill (see above).
   const finalized = finalizeRecord(pending, spawned.sessionId, spawned.id, deps.now());
   run.active.set(item.key, finalized);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
 
   // (f) Stamp the {queueKey} annotation so the dashboard groups it + reconcile can
   // adopt it after a crash (§8.5/§9). Best-effort.
@@ -1468,6 +1694,9 @@ async function dispatchOne(
       // (keep) stamp the initial keep verdict (template keepOnComplete default, or any
       // pre-existing override for this key — e.g. a re-dispatch after a round-trip).
       keep: effectiveKeep(run, item.key),
+      // (hero) stamp the hero verdict so the GUI's across-tabs hero-glyph tab marker + tile
+      // visual light up immediately (§ Tab marker / Notification). Reads the run-level set.
+      hero: effectiveHero(run, item.key),
     });
   } catch (err) {
     errlog(`run "${run.runName}": annotate ${item.key}: ${msg(err)}`);
@@ -1579,7 +1808,7 @@ async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
         // MOVE failed → ROLL BACK the latch (the adoption did not happen, so the item must
         // stay dispatchable), persist, and return.
         run.dispatched.delete(key);
-        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
         errlog(`run "${name}": adopt ${key} move failed: ${msg(err)} — latch rolled back, item stays free`);
         return;
       }
@@ -1613,7 +1842,7 @@ async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
 
   // PERSIST the latch NOW (the active map is updated by the NEXT reconcile's adopt; persisting
   // the latch here ensures suppression survives a crash before that reconcile).
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
   log(`run "${run.runName}": ADOPTED ${key} (surface ${uuid}) — latched, moved, annotated`);
 }
 
@@ -1626,6 +1855,135 @@ async function runInferKey(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   if (uuid === undefined || uuid.length === 0) return;
   if (deps.inferKey === undefined) return;
   await deps.inferKey(uuid, cmd.run ?? "");
+}
+
+/**
+ * (hero) Perform the SIDE EFFECTS of a `promote` command: EJECT the running regular split into
+ * its OWN new tab (single terminal, out of the BSP grid) via the `move_split_to_new_tab` keybind
+ * action, then RE-STAMP the surface annotation with the hero verdict so the GUI's across-tabs
+ * hero-glyph tab marker + tile visual light up (HERO-AGENTS.md § Layout / § Tab marker). The
+ * reducer (`applyCommand`) already flipped the run-level `hero` bit SYNCHRONOUSLY — so the
+ * two-pool accounting classifies the split as a hero THIS sweep (and `runOne` re-stamps
+ * `Assignment.hero` from the set); this only does the physical eject + annotation.
+ *
+ * Promotion NEVER BLOCKS on the hero cap: it mutates a RUNNING assignment (does not dispatch), so
+ * it may push `heroActiveGlobal` PAST `agent-queue-hero-max` — the only consequence is that no NEW
+ * heroes dispatch until it drains under (the hero gate in dispatchCandidates handles that). Both
+ * effects are best-effort: a failed eject is logged (the split stays in place but is still a hero
+ * by accounting); reconcile keeps `run.active` current regardless. It makes a single narrow write
+ * to `run.active` (grid slot -1 + hero:true on the promoted record) so THIS sweep's accounting is
+ * immediately correct — the run-level `run.hero` set the reducer flipped remains the AUTHORITATIVE
+ * source reconcile re-derives from every sweep (mirrors the wording in `runDemote`). The grid slot
+ * is reassigned to the ejected-out sentinel (-1) so the packer + the next dispatch's occupied-set
+ * scan (`gridSlot >= 0`) exclude the hero from BSP packing. If the promoted split was a regular
+ * dispatch it also hands its regular `lifetimeDispatched` slot over to `heroLifetimeDispatched` so
+ * a promoted item stops consuming the regular `maxItems` budget (see the inline note).
+ */
+async function runPromote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
+  const name = cmd.run;
+  const uuid = cmd.surfaceUUID;
+  // The reducer already no-op'd on any missing arg / unknown run, so there's nothing to do here.
+  if (name === undefined || name.length === 0 || uuid === undefined || uuid.length === 0) return;
+  const run = deps.registry.get(name);
+  if (run === undefined) return;
+  const key = cmd.key;
+
+  // EJECT the split into its own new tab (single terminal). Reuses the `move_split_to_new_tab`
+  // keybind action via perform_action (focus-then-act, GUI-side). Best-effort: on failure the
+  // split stays where it is but is still a hero for accounting/marker purposes.
+  if (deps.client.performAction === undefined) {
+    errlog(`run "${name}": promote — perform_action unavailable; hero stays in place (still accounted as hero)`);
+  } else {
+    try {
+      await deps.client.performAction(uuid, "move_split_to_new_tab");
+    } catch (err) {
+      errlog(`run "${name}": promote eject ${key ?? uuid} failed: ${msg(err)} — hero stays in place`);
+    }
+  }
+
+  // Reassign the assignment's grid slot to the ejected-out sentinel (-1) so it no longer
+  // participates in the BSP grid occupancy (mirrors a hero dispatch's slot -1). Best-effort:
+  // reconcile rebuilds `active` each sweep, but the run-level hero set is what drives accounting.
+  //
+  // (hero) COUNTER HANDOFF: if the promoted split was a REGULAR (its per-record `hero` bit is
+  // false), it had consumed one regular `maxItems` slot — either from `dispatchOne`'s
+  // `run.lifetimeDispatched += 1`, or from the reconcile `regularOccupancy` floor that raises the
+  // counter to at least the live regular fleet (so an adopted-live regular is counted too). REFUND
+  // that slot and account the hero on the separate `heroLifetimeDispatched` — the symmetric
+  // counterpart to the dispatch bump, so a promoted item stops permanently eating a finite
+  // `maxItems` budget it no longer belongs to (keeps the two pools orthogonal, HERO-AGENTS.md
+  // § Slot accounting). Read `a.hero` BEFORE the re-stamp below — the reducer only flipped the
+  // run-level `run.hero` set, so the per-record bit here still reflects the PRE-promote (regular)
+  // state. Floored at 0 (never negative, for a run whose regular counter was already drained). The
+  // reconcile floor at runOne (`regularActive`/`heroActive`) won't undo either move: the promoted
+  // item is now excluded from `regularOccupancy` (won't re-raise `lifetimeDispatched`) and counted
+  // in `heroOccupancy` (holds `heroLifetimeDispatched` at least at the live hero fleet).
+  if (key !== undefined && key.length > 0) {
+    const a = run.active.get(key);
+    if (a !== undefined && !a.hero) {
+      if (run.lifetimeDispatched > 0) run.lifetimeDispatched -= 1;
+      run.heroLifetimeDispatched += 1;
+    }
+    if (a !== undefined && a.gridSlot >= 0) run.active.set(key, { ...a, gridSlot: -1, hero: true });
+  }
+
+  // RE-STAMP the annotation so the GUI hero marker/tile light up immediately (independent of the
+  // per-sweep restamp). keep FOLLOWS the run-level verdict (a hero is kept-by-default in the close
+  // gate, but the annotation `keep` still reflects effectiveKeep for the pin display).
+  try {
+    await deps.client.setAnnotation(uuid, {
+      queueName: run.runName,
+      ...(key !== undefined && key.length > 0 ? { queueKey: key, keep: effectiveKeep(run, key) } : {}),
+      hero: true,
+    });
+  } catch (err) {
+    errlog(`run "${name}": promote annotate ${key ?? uuid}: ${msg(err)}`);
+  }
+
+  // PERSIST the run-level hero set now (the reducer flipped it; persisting here ensures the
+  // promotion survives a crash before the next reconcile sweep, like runAdopt persists the latch).
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
+  log(`run "${run.runName}": PROMOTED ${key ?? uuid} to HERO — ejected to own tab, annotated`);
+}
+
+/**
+ * (hero) Perform the SIDE EFFECTS of a `demote` command: DROP the hero annotation so the GUI
+ * clears the hero glyph tab marker + tile visual; the split RE-ENTERS the regular pool for
+ * future accounting (the reducer already cleared the run-level `hero` bit synchronously). It does
+ * NOT re-pack the split into a grid — the (now-regular) split stays in its own tab, like any
+ * kept split (HERO-AGENTS.md design decision #3 / non-goals). Best-effort. NEVER writes
+ * `run.active` (reconcile owns it), except to re-stamp the per-record `hero` bit false so the
+ * two-pool accounting reflects it this sweep before the next reconcile re-derives it.
+ */
+async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
+  const name = cmd.run;
+  const uuid = cmd.surfaceUUID;
+  if (name === undefined || name.length === 0 || uuid === undefined || uuid.length === 0) return;
+  const run = deps.registry.get(name);
+  if (run === undefined) return;
+  const key = cmd.key;
+
+  // Reflect the demotion on the per-record bit at once (reconcile also re-derives it from the
+  // now-cleared run-level set every sweep). Leave the grid slot as-is — demote does NOT re-pack.
+  if (key !== undefined && key.length > 0) {
+    const a = run.active.get(key);
+    if (a !== undefined && a.hero) run.active.set(key, { ...a, hero: false });
+  }
+
+  // DROP the hero annotation so the GUI clears the marker. keep FOLLOWS effectiveKeep now that
+  // the hero-forced hold is gone (a demoted split without a 📌 pin resumes normal auto-close).
+  try {
+    await deps.client.setAnnotation(uuid, {
+      queueName: run.runName,
+      ...(key !== undefined && key.length > 0 ? { queueKey: key, keep: effectiveKeep(run, key) } : {}),
+      hero: false,
+    });
+  } catch (err) {
+    errlog(`run "${name}": demote annotate ${key ?? uuid}: ${msg(err)}`);
+  }
+
+  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
+  log(`run "${run.runName}": DEMOTED ${key ?? uuid} to regular — hero annotation dropped (not re-packed)`);
 }
 
 /**
@@ -1691,7 +2049,7 @@ export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
     moved += 1;
   }
   if (moved > 0) {
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run));
+    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run), run.heroLifetimeDispatched);
     log(`run "${run.runName}": packed ${moved} pane(s) into tab ${plan.targetTab} (continuous packing)`);
   }
   return moved;

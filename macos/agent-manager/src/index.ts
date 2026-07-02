@@ -206,6 +206,16 @@ function parsePositiveInt(v: string | undefined, def: number): number {
   return Number.isInteger(n) && n > 0 ? n : def;
 }
 
+/** (hero) Parse a NON-NEGATIVE integer env, honoring an explicit `0` (unlike `parsePositiveInt`,
+ *  which clamps 0 back to the default). Used for `agent-queue-hero-max`, where `0` is a
+ *  meaningful value (DISABLE hero dispatch), not "use the default". An absent / blank / negative /
+ *  non-integer value falls back to `def`. */
+export function parseNonNegativeInt(v: string | undefined, def: number): number {
+  if (v === undefined) return def;
+  const n = Number.parseInt(v.trim(), 10);
+  return Number.isInteger(n) && n >= 0 ? n : def;
+}
+
 /** Which INDEPENDENT loops the shared sidecar should run, from its env. PURE.
  *  The Swift controller (AgentManagerController) sets GHOSTTY_SUMMARIZER per the
  *  `agent-manager` key and GHOSTTY_AGENT_QUEUE per `agent-queue`; either alone (or
@@ -1105,6 +1115,13 @@ async function main(): Promise<void> {
     // forwards the config value, defaulting to 0 = unlimited.)
     const maxTotal =
       parsePositiveInt(process.env.GHOSTTY_AGENT_QUEUE_MAX_TOTAL, 0) || Infinity;
+    // (hero) agent-queue-hero-max: the FLEET-WIDE ceiling on live HEROES across ALL runs,
+    // ORTHOGONAL to maxTotal/concurrency/maxItems (HERO-AGENTS.md § Slot accounting). Default 2.
+    // ⚠️ INVERSION vs maxTotal: for HEROES `0` means DISABLED (no new hero dispatches — a
+    // discipline limit, not a resource one), NOT unlimited. So an EXPLICIT "0" must survive as 0
+    // (`parsePositiveInt` would clamp 0 back to the default), while an absent/blank/invalid env
+    // falls back to the default 2. `parseNonNegativeInt` honors 0.
+    const heroMax = parseNonNegativeInt(process.env.GHOSTTY_AGENT_QUEUE_HERO_MAX, 2);
 
     // ON-DEMAND run lifecycle (§8a): runs are NOT auto-started from every template.
     // Build a DYNAMIC registry, REHYDRATE any previously-started runs from the persisted
@@ -1133,6 +1150,8 @@ async function main(): Promise<void> {
       persistActiveRuns: (records: ActiveRunRecord[]) =>
         persistActiveRunsToIO(activeRunsIO, records),
       maxTotal,
+      // (hero) the fleet-wide hero ceiling (0 = disabled; see the parse above).
+      heroMax,
       pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
       // (adopt) The on-demand Haiku key-inference seam for an `infer_key` queue command. Reads
       // the surface, calls Haiku with a bespoke "extract the issue key" prompt (warm-base aware
@@ -1170,7 +1189,7 @@ async function main(): Promise<void> {
     };
     log(
       `queue: supervisor armed (on-demand); ${registry.size} run(s) rehydrated; ` +
-        `templatesDir=${templatesDir}; maxTotal=${maxTotal}`,
+        `templatesDir=${templatesDir}; maxTotal=${maxTotal}; heroMax=${heroMax}`,
     );
   }
 

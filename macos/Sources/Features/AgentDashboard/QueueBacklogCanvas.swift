@@ -226,6 +226,16 @@ struct QueueBacklogCanvas: View {
     private var waitingKeys: Set<String> {
         Set(model.queueStatuses[runName]?.next.map(\.key) ?? [])
     }
+    /// (ramon fork / Hero Agents) Per-key dispatch block reasons for waiting items (the
+    /// sidecar carries them on `next[]`), so the node card can show a distinct hero-waiting
+    /// icon + a tooltip listing exactly why an item hasn't dispatched.
+    private var blockReasonsByKey: [String: [String]] {
+        var out: [String: [String]] = [:]
+        for item in model.queueStatuses[runName]?.next ?? [] where !item.blockReasons.isEmpty {
+            out[item.key] = item.blockReasons
+        }
+        return out
+    }
 
     var body: some View {
         Group {
@@ -257,6 +267,7 @@ struct QueueBacklogCanvas: View {
         let cols = QueueBacklogLayout.orderedColumns(graph.nodes)
         let centers = centersByKey(cols)
         let size = canvasSize(cols)
+        let reasons = blockReasonsByKey
         VStack(alignment: .leading, spacing: 0) {
             header(graph)
             ScrollView([.horizontal, .vertical]) {
@@ -269,7 +280,8 @@ struct QueueBacklogCanvas: View {
                             NodeCard(
                                 node: node,
                                 running: runningKeys.contains(node.key),
-                                waiting: waitingKeys.contains(node.key)
+                                waiting: waitingKeys.contains(node.key),
+                                blockReasons: reasons[node.key] ?? []
                             )
                             .frame(width: cardW, height: cardH)
                             .position(x: c.x, y: c.y)
@@ -390,6 +402,15 @@ private struct NodeCard: View {
     let node: QueueGraph.Node
     let running: Bool
     let waiting: Bool
+    /// (ramon fork / Hero Agents) The dispatch gate(s) blocking this waiting item (raw sidecar
+    /// `BlockReason` strings). A HERO blocked on a hero SLOT (`heroSlots`) gets a DISTINCT icon
+    /// (a star, not the plain clock) + a tooltip listing every gate, so a hero stuck on the
+    /// fleet-wide hero cap is instantly distinguishable from a regular item past `maxItems`.
+    /// [] ⇒ not gate-blocked (a plain waiting/backlog item).
+    var blockReasons: [String] = []
+
+    /// True when this waiting item is a hero blocked on the fleet-wide hero-slot gate.
+    private var isHeroWaiting: Bool { QueueBacklogReasons.isHeroWaiting(blockReasons) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -405,8 +426,16 @@ private struct NodeCard: View {
                 }
                 if running {
                     Image(systemName: "play.circle.fill").font(.caption2).foregroundStyle(.green)
+                } else if isHeroWaiting {
+                    // (hero) DISTINCT waiting icon: a hero waiting on the hero-slot cap is
+                    // NOT the same as a routine backlog item — a purple star (matching the
+                    // hero tile/tab glyph) reads apart from the orange clock.
+                    Image(systemName: "star.circle.fill")
+                        .font(.caption2).foregroundStyle(.purple)
+                        .help(heroWaitingHelp)
                 } else if waiting {
                     Image(systemName: "clock").font(.caption2).foregroundStyle(.orange)
+                        .help(waitingHelp)
                 }
                 Spacer(minLength: 0)
             }
@@ -431,7 +460,7 @@ private struct NodeCard: View {
         .background(stateColor.opacity(node.done ? 0.07 : 0.16))
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(borderColor, lineWidth: running || isMarked ? 2 : 1))
+                .strokeBorder(borderColor, lineWidth: running || isMarked || isHeroWaiting ? 2 : 1))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(node.done ? 0.55 : 1.0)
         .help(helpText)
@@ -442,6 +471,9 @@ private struct NodeCard: View {
 
     private var borderColor: Color {
         if running { return .green }
+        // (hero) A hero blocked on the hero-slot cap gets the hero purple border, so the whole
+        // card (not just the star) reads apart from a routine backlog/priority item.
+        if isHeroWaiting { return .purple }
         if isMarked, let pc = priorityColor { return pc }
         return stateColor.opacity(0.6)
     }
@@ -456,6 +488,66 @@ private struct NodeCard: View {
         var s = node.state.map { "\(node.key) — \($0)" } ?? node.key
         if let label = node.priorityLabel { s += " · \(label) priority" }
         return s
+    }
+
+    /// (hero) Tooltip for a hero item stuck on the hero-slot gate: a headline plus one line per
+    /// blocking gate (so the user sees whether it's ALSO past another cap, not just hero slots).
+    private var heroWaitingHelp: String {
+        let lines = QueueBacklogReasons.tooltipLines(blockReasons)
+        return (["Hero waiting — blocked on:"] + lines.map { "• \($0)" }).joined(separator: "\n")
+    }
+
+    /// (hero) Tooltip for a regular waiting item that carries block reasons (e.g. past
+    /// `maxItems` or concurrency-full). No lines ⇒ a plain "waiting" hint.
+    private var waitingHelp: String {
+        let lines = QueueBacklogReasons.tooltipLines(blockReasons)
+        guard !lines.isEmpty else { return "Waiting to dispatch" }
+        return (["Waiting — blocked on:"] + lines.map { "• \($0)" }).joined(separator: "\n")
+    }
+}
+
+/// (ramon fork / Hero Agents) Pure mapping from a waiting item's raw sidecar `BlockReason`
+/// strings to the backlog canvas's presentation, so the node card can show EXACTLY why a
+/// waiting item hasn't dispatched (the whole point of the distinct icon: when a HERO is stuck
+/// on a hero SLOT, nobody wastes time bumping `maxItems`). Kept free of SwiftUI/AppKit so it is
+/// unit-testable. Dependency-blocked is intentionally NOT a reason here (the graph edges show it).
+enum QueueBacklogReasons {
+    /// The raw sidecar block-reason tokens (mirrors the TS `BlockReason` union). Matching by the
+    /// raw string keeps the wire contract single-sourced (no parallel Swift enum to drift).
+    static let heroSlots = "heroSlots"
+    static let maxItems = "maxItems"
+    static let queueConcurrency = "queueConcurrency"
+    static let globalConcurrency = "globalConcurrency"
+
+    /// True iff this waiting item is a HERO blocked on the fleet-wide hero-slot gate — the ONLY
+    /// gate a hero item competes for (the sidecar emits `heroSlots` for a hero item exactly when
+    /// `heroMax − heroActive ≤ 0`, INCLUDING `heroMax == 0` = hero dispatch disabled). Drives the
+    /// distinct hero-waiting icon (a star instead of the plain clock). PURE.
+    static func isHeroWaiting(_ reasons: [String]) -> Bool {
+        reasons.contains(heroSlots)
+    }
+
+    /// Human-readable, ORDERED reason lines for the hover tooltip (stable order regardless of the
+    /// sidecar's array order): hero slots, then the regular gates. An unknown token is passed
+    /// through verbatim so a future sidecar reason still reads. Empty ⇒ [] (no tooltip lines).
+    /// PURE and unit-tested.
+    static func tooltipLines(_ reasons: [String]) -> [String] {
+        guard !reasons.isEmpty else { return [] }
+        let set = Set(reasons)
+        var out: [String] = []
+        if set.contains(heroSlots) { out.append("Hero slots full (agent-queue-hero-max)") }
+        if set.contains(maxItems) { out.append("Queue lifetime cap reached (maxItems)") }
+        if set.contains(queueConcurrency) { out.append("Queue concurrency full") }
+        if set.contains(globalConcurrency) { out.append("Global concurrency full (agent-queue-max-total)") }
+        // Any unrecognized future reason: surface it verbatim rather than silently drop it,
+        // deduped in first-seen order (mirrors the set-based dedup of the recognized gates
+        // above, so a repeated token from a flaky sidecar can't double a tooltip line).
+        var seenUnknown = Set<String>()
+        let known: Set<String> = [heroSlots, maxItems, queueConcurrency, globalConcurrency]
+        for r in reasons where !known.contains(r) && seenUnknown.insert(r).inserted {
+            out.append(r)
+        }
+        return out
     }
 }
 

@@ -51,7 +51,9 @@ export interface QueueCommand {
     | "set_keep"
     | "release"
     | "adopt"
-    | "infer_key";
+    | "infer_key"
+    | "promote"
+    | "demote";
   /** The template basename to start (start only). */
   template?: string;
   /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency/set_keep. */
@@ -69,15 +71,19 @@ export interface QueueCommand {
   concurrency?: string;
   /** (keep) The work-item KEY whose split's keep state `set_keep` toggles (the dashboard 📌
    *  pin). Required for `set_keep`. (release) ALSO the key to RELEASE from the dispatch latch
-   *  for `release` — OPTIONAL there (absent ⇒ release every HELD item in the run). Absent for
-   *  other actions. */
+   *  for `release` — OPTIONAL there (absent ⇒ release every HELD item in the run). (hero) ALSO
+   *  the work-item key to `promote`/`demote` — OPTIONAL there (the physical eject/re-stamp keys
+   *  off `surfaceUUID`; `key` names the run-level `hero`-set member to flip when known, so a
+   *  restart re-classifies it). Absent for other actions. */
   key?: string;
   /** (keep) The new keep verdict for `set_keep` (true = keep open, false = allow auto-close).
    *  Absent for other actions. */
   keep?: boolean;
   /** (adopt / infer_key) The GUI surface UUID of the human-created split to ADOPT into a run
    *  (move + latch + annotate), or to READ for Haiku key inference. REQUIRED for both `adopt`
-   *  and `infer_key`; populated by the coercer (mcp.ts §1.5). Absent for other actions. */
+   *  and `infer_key`; populated by the coercer (mcp.ts §1.5). (hero) ALSO the surface to
+   *  `promote`/`demote` — REQUIRED there (the eject + annotation re-stamp key off it). Absent
+   *  for other actions. */
   surfaceUUID?: string;
   /** (adopt) The work-item url for the dashboard's clickable badge, when the picked graph node
    *  carried one. OPTIONAL even for `adopt` (graph-local title-preview lookups usually have no
@@ -118,6 +124,8 @@ export interface ApplyResult {
     | "keepSet"
     | "released"
     | "adopted"
+    | "promoted"
+    | "demoted"
     | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
@@ -383,8 +391,75 @@ export function applyCommand(
           return { kind: "adopted", runName: name };
       }
       // Unreachable (the switch above is exhaustive + returns), but keeps the case from
-      // being seen as a fallthrough into `infer_key`.
+      // being seen as a fallthrough into `promote`.
       return { kind: "noop", runName: name };
+    }
+    case "promote": {
+      // (hero) PROMOTE a running regular assignment to a HERO. This reducer does the PURE,
+      // SYNCHRONOUS part only — flip the run-level `hero` bit + mark it for an annotation
+      // re-stamp; the physical EJECT into its own tab + the annotation write are side effects
+      // done in the runner (`runPromote`). Promotion NEVER blocks on the hero cap (HERO-AGENTS.md
+      // design decision #2): it may push `heroActiveGlobal` PAST `agent-queue-hero-max`, whose
+      // only consequence is that no NEW hero dispatches until it drains under. Shaped like `adopt`
+      // (`{run, surfaceUUID, key?}`); `key` names the run-level `hero`-set member so a restart
+      // re-classifies it (the eject/annotation itself keys off `surfaceUUID`). NOT counted as an
+      // active-runs change — hero membership lives in the PER-RUN store, persisted by the run's
+      // next reconcile sweep (like `set_keep`/`adopt`).
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`promote command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const uuid = cmd.surfaceUUID;
+      if (uuid === undefined || uuid.length === 0) {
+        errlog(`promote command with no surfaceUUID — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`promote for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      const key = cmd.key;
+      if (key !== undefined && key.length > 0) {
+        // Flip the AUTHORITATIVE run-level hero membership + mark for an immediate annotation
+        // re-stamp (so the tab marker / tile light up this sweep). runOne re-stamps `Assignment.hero`
+        // from this set every sweep, so the two-pool accounting sees it as a hero at once.
+        run.hero.add(key);
+        run.keepDirty.add(key); // reuse the per-sweep restamp signal (keep + hero ride one annotation)
+      }
+      log(`run "${name}" PROMOTE (surface ${uuid}${key !== undefined ? `, key ${key}` : ""}) — runner ejects + annotates`);
+      return { kind: "promoted", runName: name };
+    }
+    case "demote": {
+      // (hero) DEMOTE a hero back to a regular tracked item (HERO-AGENTS.md design decision #3).
+      // PURE, SYNCHRONOUS part: clear the run-level `hero` bit + mark for an annotation re-stamp;
+      // the runner (`runDemote`) drops the hero annotation. Demotion ONLY reclassifies accounting
+      // + drops the marker — it does NOT re-pack the split into a grid (it stays in its own tab,
+      // like any kept split — HERO-AGENTS.md non-goals). Shaped like `promote`. NOT counted as an
+      // active-runs change (per-run store, persisted by the next reconcile sweep).
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`demote command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const uuid = cmd.surfaceUUID;
+      if (uuid === undefined || uuid.length === 0) {
+        errlog(`demote command with no surfaceUUID — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`demote for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      const key = cmd.key;
+      if (key !== undefined && key.length > 0) {
+        run.hero.delete(key);
+        run.keepDirty.add(key); // re-stamp so the tab marker / tile drop the hero glyph this sweep
+      }
+      log(`run "${name}" DEMOTE (surface ${uuid}${key !== undefined ? `, key ${key}` : ""}) — runner drops hero annotation`);
+      return { kind: "demoted", runName: name };
     }
     case "infer_key":
       // (infer_key) A RECOGNIZED action that is NOT a registry mutation. It must SURVIVE
@@ -411,8 +486,9 @@ export function applyCommand(
  *  it mutates the per-run dispatch latch, which the run's next reconcile sweep persists. (adopt)
  *  `adopt` is likewise NOT counted: like `set_keep`/`release` it mutates per-run state (the
  *  `dispatched` latch), persisted by `runAdopt` + the next reconcile sweep, not active-runs.json.
- *  (infer_key) `infer_key` is a `noop` (no registry change at all). PURE (delegates to
- *  applyCommand). */
+ *  (hero) `promote`/`demote` are likewise NOT counted: they flip the per-run `hero` set, persisted
+ *  by the next reconcile sweep (like `set_keep`), not active-runs.json. (infer_key) `infer_key` is
+ *  a `noop` (no registry change at all). PURE (delegates to applyCommand). */
 export function applyCommands(
   registry: RunRegistry,
   cmds: QueueCommand[],

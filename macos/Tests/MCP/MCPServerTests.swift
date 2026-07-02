@@ -544,6 +544,38 @@ struct MCPServerTests {
         #expect(pd["queueKey"] == nil)
         #expect(pd["queueName"] == nil)
         #expect(pd["queueUrl"] == nil)
+        // fork / Hero Agents: a non-hero row omits `hero` (default false ⇒ absent).
+        #expect(pd["hero"] == nil)
+    }
+
+    // fork / Hero Agents: a hero surface MUST emit `hero:true` so the supervisor's
+    // reconcile reads the hero state back off list_surfaces (the reconcile-visibility
+    // chokepoint, mirroring queueKey). Omitted (not null/false) on a non-hero surface.
+    @Test func surfacesJSONDataEmitsHeroWhenTrueOmitsWhenFalse() {
+        let hero = MCPLayout.SurfaceRow(
+            id: "ABC", title: "claude", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: "working", lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 7,
+            queueKey: "EX-1859", queueName: "Acme · Pilot",
+            queueUrl: "https://example.com/EX-1859", hero: true)
+        let hd = MCPLayout.surfacesJSONData([hero])[0]
+        #expect(hd["hero"] as? Bool == true)
+
+        let regular = MCPLayout.SurfaceRow(
+            id: "DEF", title: "claude", pwd: "/tmp",
+            window: 0, tab: 0, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: "working", lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 8,
+            queueKey: "EX-2", queueName: "Acme · Pilot", queueUrl: nil, hero: false)
+        let rd = MCPLayout.surfacesJSONData([regular])[0]
+        #expect(rd["hero"] == nil)
     }
 
     // MARK: - dispatch (AppKit-free paths only)

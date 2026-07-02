@@ -1024,6 +1024,19 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Agent Queue Supervisor) Fleet-wide hero cap. Same
+        // non-optional-UInt32 rule as `agentQueueMaxTotal` above — a `UInt32?`
+        // reads back nil and silently returns the default. `0` disables hero
+        // dispatch; the fork default is 2.
+        var agentQueueHeroMax: UInt32 {
+            let defaultValue: UInt32 = 2
+            guard let config = self.config else { return defaultValue }
+            var v: UInt32 = defaultValue
+            let key = "agent-queue-hero-max"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // MARK: - Config knowledge (fork: MCP "knowledge" tools)
 
         /// One config key's documentation, used by the MCP `describe_config_key`

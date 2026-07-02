@@ -2648,6 +2648,95 @@ struct QueueBacklogTests {
         #expect(QueueBacklogColors.priorityColor(for: "P0") == .accentColor)
     }
 
+    // MARK: (hero) blockReasons → hero-waiting discriminator + tooltip lines
+
+    @Test func heroWaitingDetectedOnlyOnHeroSlots() {
+        // heroSlots present → hero-waiting (the distinct star icon).
+        #expect(QueueBacklogReasons.isHeroWaiting(["heroSlots"]))
+        #expect(QueueBacklogReasons.isHeroWaiting(["maxItems", "heroSlots"]))
+        // Regular gates alone → NOT hero-waiting (the plain clock icon).
+        #expect(!QueueBacklogReasons.isHeroWaiting(["maxItems"]))
+        #expect(!QueueBacklogReasons.isHeroWaiting(["queueConcurrency", "globalConcurrency"]))
+        #expect(!QueueBacklogReasons.isHeroWaiting([]))
+    }
+
+    @Test func tooltipLinesAreStableOrderedAndComplete() {
+        // Empty → no lines.
+        #expect(QueueBacklogReasons.tooltipLines([]).isEmpty)
+        // A single hero-slot gate.
+        #expect(QueueBacklogReasons.tooltipLines(["heroSlots"])
+            == ["Hero slots full (agent-queue-hero-max)"])
+        // All four gates, given OUT OF ORDER → stable canonical order (hero, maxItems,
+        // queueConcurrency, globalConcurrency), one line each.
+        let all = QueueBacklogReasons.tooltipLines(
+            ["globalConcurrency", "heroSlots", "queueConcurrency", "maxItems"])
+        #expect(all == [
+            "Hero slots full (agent-queue-hero-max)",
+            "Queue lifetime cap reached (maxItems)",
+            "Queue concurrency full",
+            "Global concurrency full (agent-queue-max-total)",
+        ])
+    }
+
+    @Test func tooltipLinesPassThroughUnknownReason() {
+        // A future/unknown sidecar reason is surfaced verbatim (never silently dropped),
+        // after the recognized ones.
+        let lines = QueueBacklogReasons.tooltipLines(["heroSlots", "someFutureGate"])
+        #expect(lines == ["Hero slots full (agent-queue-hero-max)", "someFutureGate"])
+        // A repeated unknown token is deduped in first-seen order (like the recognized gates),
+        // so a flaky sidecar can't double a tooltip line.
+        #expect(QueueBacklogReasons.tooltipLines(["futureA", "futureA", "futureB"])
+            == ["futureA", "futureB"])
+    }
+
+    @Test func statusPayloadParsesPerItemBlockReasons() {
+        // The report_queue_status `next[]` items carry per-item blockReasons (waiting refs);
+        // running/held items have none.
+        let payload = QueueStatusPayload.fromArguments([
+            "queueName": "Q",
+            "next": [
+                ["key": "EX-1", "blockReasons": ["heroSlots"]],
+                ["key": "EX-2", "blockReasons": ["maxItems", "queueConcurrency"]],
+                ["key": "EX-3"],   // no reasons → []
+            ],
+        ])
+        let next = payload?.status.next ?? []
+        #expect(next.count == 3)
+        #expect(next.first { $0.key == "EX-1" }?.blockReasons == ["heroSlots"])
+        #expect(next.first { $0.key == "EX-2" }?.blockReasons == ["maxItems", "queueConcurrency"])
+        #expect(next.first { $0.key == "EX-3" }?.blockReasons == [])
+    }
+
+    @Test func statusPayloadParsesHeroMaxAndActive() {
+        // The report_queue_status carries the fleet-wide hero globals; they round-trip.
+        let payload = QueueStatusPayload.fromArguments([
+            "queueName": "Q", "heroMax": 2, "heroActive": 3,
+        ])
+        #expect(payload?.status.heroMax == 2)
+        #expect(payload?.status.heroActive == 3)
+    }
+
+    @Test func statusPayloadDefaultsHeroGlobalsToZeroWhenAbsent() {
+        // A legacy/partial payload without the hero globals defaults them to 0.
+        let payload = QueueStatusPayload.fromArguments(["queueName": "Q"])
+        #expect(payload?.status.heroMax == 0)
+        #expect(payload?.status.heroActive == 0)
+    }
+
+    @Test func optimisticEditsPreserveHeroGlobals() {
+        // An optimistic withX() copy must NOT zero the hero globals (contract-lint #10).
+        let base = QueueStatusPayload.fromArguments([
+            "queueName": "Q", "heroMax": 2, "heroActive": 1, "concurrency": 4,
+        ])!.status
+        for edited in [
+            base.withMaxItems(9), base.withPhase("paused"),
+            base.withConcurrency(7), base.withHeld([]),
+        ] {
+            #expect(edited.heroMax == 2)
+            #expect(edited.heroActive == 1)
+        }
+    }
+
     // MARK: assignLayers — longest-path-from-roots over blockedBy edges
 
     @Test func rootsAreLayerZero() {

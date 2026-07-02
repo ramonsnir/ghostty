@@ -19,7 +19,7 @@ import AppKit
 /// without clobbering — see `AgentDashboardModel.applyAnnotation`).
 ///
 /// AT LEAST ONE updatable field (summary, phase, needsUser, queueKey, queueName,
-/// queueUrl, or keep) must be present, else the call is rejected (a fully-empty body is
+/// queueUrl, keep, or hero) must be present, else the call is rejected (a fully-empty body is
 /// invalid). The summarizer (summary-only) and the Agent Queue supervisor
 /// (queueKey/queueName/queueUrl + the keep verdict at dispatch/restamp) both write
 /// through this same parser.
@@ -48,6 +48,10 @@ struct AgentAnnotationPayload {
         // (keep) the split's keep verdict — present-as-bool ⇒ that bool; absent/non-bool ⇒
         // nil (so a partial update omitting it preserves the prior value on merge).
         let queueKeep = arguments["keep"] as? Bool
+        // (ramon fork / Hero Agents) the split's hero verdict — present-as-bool ⇒ that bool;
+        // absent/non-bool ⇒ nil (so a partial update omitting it preserves the prior value on
+        // merge). Same partial-merge Bool semantics as `keep`.
+        let queueHero = arguments["hero"] as? Bool
         // (adopt) the Haiku-inferred key suggestion. UNLIKE the other strings, an EMPTY
         // string is KEPT (NOT trimmed-to-nil): "" is the load-bearing "inferred nothing"
         // sentinel distinct from absent ("no suggestion yet"). Present-as-string ⇒ that
@@ -62,12 +66,14 @@ struct AgentAnnotationPayload {
             || queueKey != nil || queueName != nil || queueUrl != nil
             || queueKeep != nil
             || queueKeySuggested != nil
+            || queueHero != nil
         else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
             summary: summary, phase: phase, needsUser: needsUser,
             queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
-            queueKeep: queueKeep, queueKeySuggested: queueKeySuggested))
+            queueKeep: queueKeep, queueKeySuggested: queueKeySuggested,
+            queueHero: queueHero))
     }
 }
 

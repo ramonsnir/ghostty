@@ -284,4 +284,33 @@ struct QueuePaletteTests {
         #expect(json["key"] == nil)
         #expect(json["url"] == nil)
     }
+
+    // MARK: - Hero promote / demote (ramon fork / Hero Agents)
+
+    @Test func promoteJSONObjectShape() {
+        // Shaped like adopt: run + surfaceUUID + optional key. Serializes to "promote".
+        let cmd = QueueCommand(action: .promote, run: "R", key: "K", surfaceUUID: "U")
+        let json = cmd.jsonObject
+        #expect(json["action"] as? String == "promote")
+        #expect(json["run"] as? String == "R")
+        #expect(json["key"] as? String == "K")
+        #expect(json["surfaceUUID"] as? String == "U")
+    }
+
+    @Test func demoteJSONObjectShape() {
+        let cmd = QueueCommand(action: .demote, run: "R", key: "K", surfaceUUID: "U")
+        let json = cmd.jsonObject
+        #expect(json["action"] as? String == "demote")
+        #expect(json["run"] as? String == "R")
+        #expect(json["key"] as? String == "K")
+        #expect(json["surfaceUUID"] as? String == "U")
+    }
+
+    @Test func promoteDemoteOmitOptionalKey() {
+        // key nil ⇒ omitted (promotion/demotion may target the surface without a key).
+        #expect(QueueCommand(action: .promote, run: "R", surfaceUUID: "U")
+            .jsonObject["key"] == nil)
+        #expect(QueueCommand(action: .demote, run: "R", surfaceUUID: "U")
+            .jsonObject["key"] == nil)
+    }
 }

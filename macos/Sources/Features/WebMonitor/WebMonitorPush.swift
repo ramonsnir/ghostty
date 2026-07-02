@@ -197,7 +197,23 @@ final class WebPushManager {
     /// INDEPENDENTLY — a chatty bell within 3s must never silently swallow the
     /// headline "agent needs input" push (or vice-versa). Each kind still self-
     /// debounces its own repeats at ~3s/surface.
-    private enum PushKind: Hashable { case bell, attention }
+    /// (ramon fork / Hero Agents) `.hero` is a hero surface waiting on you — the loud
+    /// attention tier with a distinct glyph in the title + `"kind":"hero"` in the payload,
+    /// so the phone shows a HERO is waiting, not routine work. Debounced independently of
+    /// `.bell`/`.attention`.
+    private enum PushKind: Hashable {
+        case bell, attention, hero
+
+        /// The `"kind"` string emitted in the push payload so the page/service worker can
+        /// distinguish a hero push from a routine bell/attention push.
+        var payloadValue: String {
+            switch self {
+            case .bell: return "bell"
+            case .attention: return "attention"
+            case .hero: return "hero"
+            }
+        }
+    }
     /// Per-(surface, kind) last-push time so a chatty signal does not spam the phone.
     private var lastSent: [PushKey: Date] = [:]
     private struct PushKey: Hashable { let id: UUID; let kind: PushKind }
@@ -327,7 +343,14 @@ final class WebPushManager {
                 let title = note.userInfo?[AgentStateUserInfoKey.title] as? String ?? ""
                 let pwd = note.userInfo?[AgentStateUserInfoKey.pwd] as? String
                 let msg = note.userInfo?[AgentStateUserInfoKey.message] as? String ?? ""
-                self.onAttention(id: id, title: title, pwd: pwd, message: msg)
+                // (ramon fork / Hero Agents) A hero surface entering `.waiting` uses the
+                // DISTINCT ⭐ hero push (kind: .hero, independent debounce); a regular one
+                // uses the 🔔 attention push. Absent flag ⇒ regular (back-compat).
+                if (note.userInfo?[AgentStateUserInfoKey.hero] as? Bool) == true {
+                    self.onHero(id: id, title: title, pwd: pwd, message: msg)
+                } else {
+                    self.onAttention(id: id, title: title, pwd: pwd, message: msg)
+                }
             }
         }
     }
@@ -358,13 +381,27 @@ final class WebPushManager {
         }
     }
 
+    /// (pure, testable) The push-notification TITLE for a given glyph + raw surface title:
+    /// `"<glyph> <title>"`, falling back to `"<glyph> Ghostty"` when the title is empty. The
+    /// bell/attention pushes use "🔔"; a hero push uses "⭐" so it reads apart on the phone.
+    static func pushTitle(glyph: String, rawTitle: String) -> String {
+        glyph + " " + (rawTitle.isEmpty ? "Ghostty" : rawTitle)
+    }
+
+    /// (pure, testable) The push payload dict sent to a subscription. `kind` is the raw
+    /// `PushKind.payloadValue` ("bell"/"attention"/"hero") so the page/service worker can tell
+    /// a hero push apart from a routine bell/attention push.
+    static func pushPayload(title: String, body: String, surface: UUID, kind: String) -> [String: String] {
+        ["title": title, "body": body, "surface": surface.uuidString, "kind": kind]
+    }
+
     /// Called on main from the bell observer. Hops to `queue` to check the enable
     /// flag + debounce and fan out. The bell body is the surface's pwd.
     private func onBell(id: UUID, title: String, pwd: String?) {
         enqueuePush(
             id: id,
             kind: .bell,
-            title: "🔔 " + (title.isEmpty ? "Ghostty" : title),
+            title: Self.pushTitle(glyph: "🔔", rawTitle: title),
             body: pwd ?? "")
     }
 
@@ -380,7 +417,22 @@ final class WebPushManager {
         enqueuePush(
             id: id,
             kind: .attention,
-            title: "🔔 " + (title.isEmpty ? "Ghostty" : title),
+            title: Self.pushTitle(glyph: "🔔", rawTitle: title),
+            body: body)
+    }
+
+    /// (ramon fork / Hero Agents) Called on main when a HERO surface wants your
+    /// attention. Reuses the SAME fan-out as `onBell`/`onAttention` (enable flag,
+    /// per-surface debounce, send), but with a DISTINCT ⭐ glyph in the title (so a hero
+    /// reads apart from the 🔔 bell/attention pushes on the phone) and `kind: .hero`
+    /// (which stamps `"kind":"hero"` into the payload and keeps the debounce independent).
+    /// The body prefers the "needs input" `message` over the pwd, like `onAttention`.
+    func onHero(id: UUID, title: String, pwd: String?, message: String) {
+        let body = message.isEmpty ? (pwd ?? "") : message
+        enqueuePush(
+            id: id,
+            kind: .hero,
+            title: Self.pushTitle(glyph: "⭐", rawTitle: title),
             body: body)
     }
 
@@ -406,11 +458,10 @@ final class WebPushManager {
             self.lastSent = self.lastSent.filter { now.timeIntervalSince($0.value) < pruneAge }
             self.lastSent[key] = now
 
-            let payload: [String: String] = [
-                "title": title,
-                "body": body,
-                "surface": id.uuidString,
-            ]
+            // (ramon fork / Hero Agents) `kind` lets the phone tell a hero push apart from a
+            // routine bell/attention push. Built via the pure `pushPayload` seam (unit-tested).
+            let payload = Self.pushPayload(
+                title: title, body: body, surface: id, kind: kind.payloadValue)
             guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else { return }
             for sub in self.subscriptions { self.send(payloadData, to: sub) }
         }

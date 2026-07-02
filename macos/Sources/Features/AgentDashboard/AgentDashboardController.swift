@@ -963,6 +963,12 @@ final class AgentDashboardModel: ObservableObject {
         let queueKey: String?
         let queueName: String?
         let queueUrl: String?
+        /// (ramon fork / Hero Agents) The split's HERO verdict from its annotation's
+        /// `queueHero`, echoed into the MCP `list_surfaces` row (`SurfaceRow.hero`) so the
+        /// supervisor's reconcile reads hero-ness back — the reconcile-visibility chokepoint,
+        /// mirroring `queueKey`/`queueName`. nil when the surface carries no annotation / is
+        /// not a hero (the row emits `hero:false` then).
+        let queueHero: Bool?
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -984,7 +990,8 @@ final class AgentDashboardModel: ObservableObject {
                 hidden: hidden.contains(id),
                 queueKey: annotations[id]?.queueKey,
                 queueName: annotations[id]?.queueName,
-                queueUrl: annotations[id]?.queueUrl)
+                queueUrl: annotations[id]?.queueUrl,
+                queueHero: annotations[id]?.queueHero)
         }
         return out
     }
@@ -1510,6 +1517,65 @@ final class AgentDashboardModel: ObservableObject {
             ])
     }
 
+    // MARK: - Promote / demote a split to/from HERO (ramon fork / Hero Agents)
+
+    /// (promote) Flip a RUNNING regular split (`id`) into a HERO in queue `run` (tracking
+    /// work-item `key`, optional). Ejects the split into its OWN new tab (single terminal,
+    /// out of the BSP grid) via the SAME `move_split_to_new_tab` machinery the keybind
+    /// uses — done GUI-side IMMEDIATELY so the hero visibly pops out of the grid — then posts
+    /// a `promote` command onto the SAME FIFO the other run controls use. OPTIMISTICALLY flips
+    /// the stored annotation's `queueHero` so the tile's hero visual + across-tabs tab marker
+    /// update instantly; the sidecar is authoritative (it sets the run-level `hero` bit for
+    /// the two-pool accounting, re-ejects — a no-op on the now-solitary tab — and re-stamps
+    /// the annotation, reconciling this). Promotion NEVER blocks: it may push over the
+    /// fleet-wide `agent-queue-hero-max`; no NEW heroes dispatch until live heroes drain back
+    /// under. No-op for the `(other)` catch-all / a blank run. MUST be on main — the model is.
+    func promoteToHero(id: UUID, run: String, key: String) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        // EJECT into its own tab immediately (GUI-side, responsive). A no-op on a
+        // single-surface tab (move_split_to_new_tab guards on `surfaceTree.isSplit`), so a
+        // later sidecar re-eject on the now-solitary tab is harmless.
+        _ = MCPLayout.performAction(uuid: id, action: "move_split_to_new_tab")
+        // OPTIMISTIC: merge the hero verdict onto the stored annotation so the tile flips
+        // (the sidecar's next restamp confirms / corrects it).
+        let prior = annotations[id] ?? AgentAnnotation()
+        annotations[id] = prior.merging(AgentAnnotation(queueHero: true))
+        rebuildEntriesFromCurrentState()
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .promote, run: run,
+                                 key: key.isEmpty ? nil : key,
+                                 surfaceUUID: id.uuidString),
+            ])
+    }
+
+    /// (demote) Flip a HERO split (`id`) back into a regular tracked item in queue `run`
+    /// (work-item `key`, optional): the sidecar clears its run-level `hero` bit so it
+    /// re-enters the regular pool for future accounting and drops the hero marker. Demotion
+    /// does NOT re-pack the split back into a grid tab (it stays in its own tab, like any kept
+    /// split — HERO-AGENTS.md non-goal), so there is NO move here. OPTIMISTICALLY flips the
+    /// stored annotation's `queueHero` false so the tile's hero visual + tab marker clear
+    /// instantly; the sidecar's next restamp reconciles. No-op for the `(other)` catch-all /
+    /// a blank run. MUST be on main — the model is.
+    func demoteFromHero(id: UUID, run: String, key: String) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        let prior = annotations[id] ?? AgentAnnotation()
+        annotations[id] = prior.merging(AgentAnnotation(queueHero: false))
+        rebuildEntriesFromCurrentState()
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .demote, run: run,
+                                 key: key.isEmpty ? nil : key,
+                                 surfaceUUID: id.uuidString),
+            ])
+    }
+
     /// (adopt) Request an on-demand Haiku inference of the work-item key for split `id`,
     /// to prefill the adopt modal. First CLEARS any stale `queueKeySuggested` for that
     /// surface DIRECTLY (the `clearingSuggestion()` bypass — NOT via `merging`, which
@@ -1931,6 +1997,10 @@ final class AgentDashboardController: NSWindowController {
                 break outer
             }
         }
+        // (ramon fork / Hero Agents) A hero surface routes into the LOUD attention tier + a
+        // DISTINCT push glyph. We carry the hero verdict off the stored annotation
+        // (`queueHero`) so the WebPush observer can call `onHero` instead of `onAttention`.
+        let hero = model.annotations[id]?.queueHero ?? false
         NotificationCenter.default.post(
             name: .ghosttyAgentNeedsAttention, object: nil,
             userInfo: [
@@ -1938,6 +2008,7 @@ final class AgentDashboardController: NSWindowController {
                 AgentStateUserInfoKey.title: title,
                 AgentStateUserInfoKey.pwd: pwd,
                 AgentStateUserInfoKey.message: message,
+                AgentStateUserInfoKey.hero: hero,
             ])
     }
 

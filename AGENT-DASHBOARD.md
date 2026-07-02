@@ -167,6 +167,36 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   graph as you type, and on confirm moves the split into the queue's grid tab and tracks it like
   a dispatched item. Full behavior + the latch/keep/claim mechanics live in **AGENT-QUEUE.md
   (→ Adopting a free split)**.
+- **Promote to Hero / Demote (queue tiles only)** — a **hero** is a load-bearing queue item that
+  competes for *your attention* rather than a machine slot: it lives in its **own dedicated tab**
+  (never packed into the grid), is **never auto-closed**, and is counted against a separate
+  fleet-wide cap (`agent-queue-hero-max`) instead of the queue's concurrency. On a **queue-owned
+  agent tile** the header controls gain a purple **star** button: on a regular tile it reads
+  **"Promote to Hero"** and, on click, **ejects the split into its own new tab** and flips it to a
+  hero; on a tile that already IS a hero it reads **"Demote"** (a `star.slash`) and flips it back to
+  a regular tracked item (the split **stays in its own tab** — demote does not re-pack it into the
+  grid). A hero tile carries a **persistent purple `star.fill` glyph** in its header (shown without
+  hovering, distinct from the keep 📌 pin and the amber bell) and a **purple tile border** — a
+  standing "this is load-bearing" marker that reads apart from the amber bell frame and the accent
+  focus/spotlight border. Promotion **never blocks**: it may push you *over* the hero cap; the only
+  consequence is that no *new* heroes dispatch until live heroes drain back under. Full accounting
+  + the two entry paths + the wire contract live in **AGENT-QUEUE.md (→ Hero agents)** and
+  **HERO-AGENTS.md**.
+
+  A hero also gets an **across-tabs tab marker**: a tinted **star** glyph in the tab's accessory
+  slot (the slot the reset-zoom button uses — free because a single-terminal hero tab can never be
+  zoomed), visible even on non-focused tabs, so you can spot the hero's tab at a glance across a
+  window full of tabs.
+- **Hero-waiting in the backlog DAG.** In a queue's backlog dependency canvas, a hero item that is
+  **stuck on a hero slot** (the fleet-wide `agent-queue-hero-max` is full, including
+  `agent-queue-hero-max = 0` which disables hero dispatch) is drawn with a **distinct purple star
+  icon** (`star.circle.fill`) and a **purple card border** instead of the routine orange clock, and
+  its **hover tooltip lists every gate blocking it** ("Hero slots full", and any additional cap like
+  the queue lifetime `maxItems` or concurrency). This is the whole point of the distinct icon: when a
+  hero is stuck on a *hero* slot, nobody wastes time bumping `maxItems`. A regular waiting item that
+  carries block reasons gets the same tooltip on its clock icon. (Dependency-blocked items are not
+  listed — the graph edges already show that.) See **AGENT-QUEUE.md (→ Hero agents / backlog)** for
+  the block-reason wire contract.
 
 ### Degraded states (never a blank panel)
 
@@ -378,6 +408,18 @@ gains a live state chip.
   (`isFocused`/`isSpotlighted` border + header glyphs) are in the same three
   `AgentDashboard/*.swift` files. Tests: `Binding spotlight_dashboard_split` (Zig) +
   the spotlight/focus cases in `macos/Tests/AgentDashboard/AgentDashboardTests.swift`.
+- **Hero splits (Hero Agents; NO keybind action — promote/demote are dashboard buttons):** the
+  tile hero visual + Promote/Demote buttons in `AgentPreviewTile.swift`
+  (`isHero`/`heroPurple`/`onPromoteToHero`/`onDemoteFromHero`) + `AgentDashboardView.swift`, the
+  `promoteToHero`/`demoteFromHero` model methods + the `hero` userInfo in `postNeedsAttention` +
+  the `HookSnapshotEntry.queueHero`→`list_surfaces` emit in `AgentDashboardController.swift`, the
+  backlog hero-waiting icon/tooltip in `QueueBacklogCanvas.swift` (`QueueBacklogReasons`), and the
+  across-tabs tab marker in `TerminalWindow.swift` (`surfaceIsHero` + `HeroAccessoryView`) +
+  `TerminalController.swift` (`heroSurfaceIDs`/`syncSurfaceIsHero`). The `queueHero` annotation +
+  `SurfaceRow.hero` emit live in `MCP/MCPAnnotation.swift` + `MCP/MCPLayout.swift`; the sidecar
+  engine + wire contract are in **HERO-AGENTS.md** / **AGENT-QUEUE.md**. Full mechanism in
+  Implementation notes → "Hero splits". Tests: the hero cases in
+  `macos/Tests/AgentDashboard/AgentDashboardTests.swift` + `macos/Tests/MCP/MCPAnnotationTests.swift`.
 - **`hide_dashboard_split` action (hide focused split from the keyboard; hide-only):** core —
   `src/input/Binding.zig` (action + surface scope + `Binding hide_dashboard_split` test),
   `src/apprt/action.zig` (union + `Key`, in the slot after `goto_last_surface` — the union
@@ -624,6 +666,96 @@ gotchas, not a recap.)
   Test: `AgentDashboardModelTests.dismissBellNoOpWhenSurfaceUnresolved` (the nil-`realView` guard;
   the positive path drives a real SurfaceView, exercised via the already-tested
   `resetBell`/`resetAttention`). GUI-only, no Zig/host change — live-deployable.
+
+### Hero splits — tile visual, promote/demote, tab marker, backlog icon (ramon fork / Hero Agents)
+
+The dashboard is where a **hero** (a load-bearing queue item — its own dedicated tab, never
+auto-closed, counted against the fleet-wide `agent-queue-hero-max` instead of concurrency) is
+surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** and
+**AGENT-QUEUE.md**; this section is the dashboard-side mechanism only.
+
+- **Hero-ness rides the `queueHero` annotation.** The supervisor stamps `queueHero` (Bool) onto a
+  hero surface via `set_surface_annotation` each sweep; the tile reads it as
+  `isHero = entry.annotation?.queueHero ?? false`. It is the single source of truth for every hero
+  visual below, so the sidecar remains authoritative — the GUI only ever *optimistically* flips it
+  and lets the next restamp reconcile.
+- **Tile visual (`AgentPreviewTile.swift`).** A hero tile shows a **persistent purple `star.fill`**
+  glyph in its header (only on a queue-owned tile — `isQueueOwned && isHero`), shown without
+  hovering so a load-bearing hero is obvious. Distinct from the keep 📌 pin (a hero is
+  keep-by-default, but keep is a separate control) and the amber bell. The tile also takes a
+  **purple border** (`heroPurple = Color.purple`), slotted in `frameColor`/`frameWidth` **below**
+  the loud bell (amber, width 3) and the spotlight/focus accent (accent, width 3/2) but **above**
+  plain hover — so a ringing/spotlighted hero still shows its louder state, and an idle hero reads
+  apart from everything at width 2.
+- **Promote / Demote buttons (queue-owned agent tiles only, `isQueueOwned && entry.agent != nil`).**
+  A borderless header button: on a non-hero it's a purple `star` labeled **"Promote to Hero"**; on a
+  hero it's a secondary `star.slash` labeled **"Demote"**. The action inputs are `onPromoteToHero` /
+  `onDemoteFromHero`, wired in `AgentDashboardView.tile(for:)` to
+  `model.promoteToHero(id:run:key:)` / `demoteFromHero(id:run:key:)` (run/key read off the tile's
+  `annotation.queueName`/`queueKey`). Like the other borderless header controls (🔔 / up-arrow /
+  keep-pin / hide), its own hit-testing intercepts the click ahead of the row-level
+  `onTapGesture { jump() }`.
+- **`model.promoteToHero` (the dedicated-tab eject).** Guards out the `(other)` catch-all / a blank
+  run, then **ejects the split into its own new tab GUI-side IMMEDIATELY** —
+  `MCPLayout.performAction(uuid:action:"move_split_to_new_tab")`, the SAME machinery the keybind
+  uses — so the hero visibly pops out of the grid without waiting for a round-trip (a no-op on an
+  already-solitary tab, so a later sidecar re-eject is harmless). It then **optimistically merges**
+  `AgentAnnotation(queueHero: true)` onto the stored annotation (so the star + border + tab marker
+  flip instantly), rebuilds entries, and posts a `promote` `QueueCommand` (`run`, optional `key`,
+  `surfaceUUID`) onto the shared `.ghosttyQueueCommand` FIFO. The sidecar is authoritative: it sets
+  the run-level `hero` bit for the two-pool accounting, re-ejects (the no-op), and re-stamps the
+  annotation.
+- **`model.demoteFromHero` (no re-pack).** Same guard + optimistic
+  `AgentAnnotation(queueHero: false)` merge + rebuild, then posts a `demote` `QueueCommand`. There is
+  **no move** — demotion does NOT re-pack the split back into a grid (a HERO-AGENTS.md non-goal); the
+  split stays in its own tab like any kept split. The sidecar clears the run-level `hero` bit so the
+  item re-enters the regular pool for future accounting.
+- **Across-tabs tab marker (`TerminalWindow.swift` + `TerminalController.swift`).** A per-tab
+  `surfaceIsHero: Bool` on `TerminalWindow` (parallel to `surfaceIsZoomed`) drives a **titlebar
+  accessory** (`heroAccessory` → `HeroAccessoryView`, parallel to the reset-zoom accessory) plus an
+  in-tab-accessory `heroTabButton` — a tinted **`star.fill`** glyph (systemYellow / yellow, so it
+  reads apart from the purple *tile* border and the amber bell title-prefix). Because the accessory's
+  visibility is a per-tab bool, the marker shows across **all** tabs, even non-focused ones — that is
+  the across-tabs marker. A hero tab is single-terminal and can never be zoomed, so the hero accessory
+  and the reset-zoom accessory are mutually exclusive and never collide (they share the accessory
+  slot). `TerminalController` keeps a `heroSurfaceIDs` set fed by the async
+  `.ghosttyAgentAnnotationDidChange` notification (the annotation is PARTIAL — a `queueHero == nil`
+  means "unchanged", so it only acts on an explicit true/false, mirroring `AgentAnnotation.merging`)
+  and re-derives `window.surfaceIsHero` from that set ∩ the tab's current surface tree in
+  `syncSurfaceIsHero()` — called both on the annotation change and on every surface-tree change (so a
+  hero that moved to another tab stops marking the old one), exactly how `surfaceIsZoomed` is
+  re-derived from `to.zoomed`.
+- **Backlog hero-waiting icon + tooltip (`QueueBacklogCanvas.swift`).** A waiting `NodeCard` gets a
+  DISTINCT icon when it's a hero blocked on a hero slot: `blockReasonsByKey` reads the per-item
+  `blockReasons` off `model.queueStatuses[run].next[]` (the sidecar carries them), and the pure,
+  unit-tested `QueueBacklogReasons` maps the raw `BlockReason` tokens to presentation.
+  `isHeroWaiting(_:) = reasons.contains("heroSlots")` → a purple **`star.circle.fill`** (not the
+  orange `clock`) + a purple card border + the `heroWaitingHelp` tooltip; a regular waiting item with
+  block reasons keeps the clock but gains the `waitingHelp` tooltip. `tooltipLines(_:)` emits ORDERED
+  human-readable lines regardless of the sidecar's array order (hero slots → `maxItems` → queue
+  concurrency → global concurrency), passing an **unknown future token through verbatim** rather than
+  dropping it. Matching by the raw wire string (no parallel Swift enum) keeps the block-reason
+  contract single-sourced with the TS `BlockReason` union.
+- **Notification routing (`postNeedsAttention`, `WebMonitorPush.swift`).** When a hero surface enters
+  `.waiting`, `postNeedsAttention` reads the stored `queueHero` off the annotation and adds
+  `AgentStateUserInfoKey.hero` to the `.ghosttyAgentNeedsAttention` userInfo, so the `WebPushManager`
+  observer routes to `onHero` (the loud attention tier + a distinct push glyph) instead of
+  `onAttention`. Reuses the existing bell/attention + push plumbing — no new delivery mechanism (see
+  WEB-MONITOR.md for the push glyph).
+- **Wiring:** `AgentPreviewTile.swift` (`isHero`/`heroPurple`, the header `star.fill` glyph, the
+  Promote/Demote button + `onPromoteToHero`/`onDemoteFromHero` inputs, the `frameColor`/`frameWidth`
+  hero slot), `AgentDashboardView.swift` (`onPromoteToHero`/`onDemoteFromHero` wiring in `tile(for:)`),
+  `AgentDashboardController.swift` (`AgentDashboardModel.promoteToHero`/`demoteFromHero`,
+  `HookSnapshotEntry.queueHero` → the `list_surfaces` `SurfaceRow.hero` emit, the `hero` userInfo in
+  `postNeedsAttention`), `QueueBacklogCanvas.swift` (`blockReasonsByKey` + `NodeCard.blockReasons` +
+  `QueueBacklogReasons`), `TerminalWindow.swift` (`surfaceIsHero` + `heroAccessory`/`heroTabButton` +
+  `HeroAccessoryView` + `ViewModel.isSurfaceHero`), `TerminalController.swift` (`heroSurfaceIDs` +
+  `syncSurfaceIsHero` + `onAgentAnnotationDidChange`). The `queueHero` annotation arg parse + the
+  `AgentAnnotation.queueHero` field / `merging` are in `MCPAnnotation.swift`; the `SurfaceRow.hero`
+  emit is in `MCPLayout.swift` (both the reconcile-visibility chokepoint — see AGENT-QUEUE.md).
+  **GUI-only, no Zig/host change** — live-deployable (GUI relaunch + rebuilt sidecar `dist`). Tests:
+  `AgentDashboardTests.swift` (hero promote/demote + `QueueBacklogReasons` icon/tooltip cases) +
+  `MCPAnnotationTests.swift` (`queueHero` parse + `merging`).
 
 ### Live previews need pty-host (the mirror SurfaceView)
 

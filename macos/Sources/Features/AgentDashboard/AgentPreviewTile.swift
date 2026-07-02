@@ -63,6 +63,15 @@ struct AgentPreviewTile: View {
     /// (adopt) "Jump to the running one" on a duplicate-key collision.
     let onJumpToKey: (_ run: String, _ key: String) -> Void
 
+    // MARK: - Promote / demote to HERO inputs (ramon fork / Hero Agents)
+
+    /// (hero) Promote this QUEUE split into a HERO — eject to its own tab + flip the hero bit
+    /// (posts a `promote` command). Offered only on a queue-owned, non-hero tile.
+    let onPromoteToHero: () -> Void
+    /// (hero) Demote this HERO split back to a regular tracked item (posts a `demote`
+    /// command). Offered only on a queue-owned tile that IS a hero.
+    let onDemoteFromHero: () -> Void
+
     @State private var hovering = false
     @State private var confirmClose = false
 
@@ -176,15 +185,19 @@ struct AgentPreviewTile: View {
     private var frameColor: Color {
         if bellRinging { return Self.bellAmber }
         if isSpotlighted || isFocused { return Color.accentColor }
+        // (hero) A HERO reads apart with a persistent purple border (below the loud bell +
+        // the "you're here"/"top" accent, above plain hover) — a standing "this is
+        // load-bearing" marker, matching the header glyph + backlog star.
+        if isHero { return Self.heroPurple }
         if hovering { return Color.accentColor.opacity(0.6) }
         return .clear
     }
 
-    /// Border width matching `frameColor`: bell + spotlight are strong (3), the focused
-    /// hint is lighter (2), hover/none are 1.
+    /// Border width matching `frameColor`: bell + spotlight are strong (3), a hero + the
+    /// focused hint are medium (2), hover/none are 1.
     private var frameWidth: CGFloat {
         if bellRinging || isSpotlighted { return 3 }
-        if isFocused { return 2 }
+        if isFocused || isHero { return 2 }
         return 1
     }
 
@@ -245,6 +258,19 @@ struct AgentPreviewTile: View {
     private var isKept: Bool {
         entry.annotation?.queueKeep ?? false
     }
+
+    /// (ramon fork / Hero Agents) Whether this split is a HERO (the supervisor stamps
+    /// `queueHero` each sweep; the GUI optimistically flips it on promote/demote). Drives the
+    /// hero glyph badge + a distinct tile border, and gates the Promote/Demote button label.
+    private var isHero: Bool {
+        entry.annotation?.queueHero ?? false
+    }
+
+    /// (hero) The hero accent color — a purple that reads apart from the amber bell frame and
+    /// the accent focus/spotlight border, and matches the backlog hero-waiting star. (The
+    /// across-tabs titlebar tab marker uses a yellow `star.fill` instead — an intentionally
+    /// distinct tint so the hero reads apart in the chrome as well as in the dashboard.)
+    private static let heroPurple = Color.purple
 
     var body: some View {
         VStack(spacing: 0) {
@@ -314,6 +340,17 @@ struct AgentPreviewTile: View {
                 .foregroundStyle(Self.bellAmber)
                 .help("Dismiss this bell — clears the alert everywhere (title, border, badge) without focusing the split, so it can ring again later")
             }
+            // (hero) A persistent HERO glyph — shown whenever this split is a hero (queue
+            // tiles only), so a load-bearing hero is obvious without hovering. Distinct from
+            // the keep 📌 pin (a hero is keep-by-default, but keep is a separate control) and
+            // the amber bell: a purple filled star, matching the tile border + backlog star
+            // (the titlebar tab marker uses a distinct yellow star — see `heroPurple`).
+            if isQueueOwned && isHero {
+                Image(systemName: "star.fill")
+                    .font(.caption2)
+                    .foregroundStyle(Self.heroPurple)
+                    .help("Hero — a load-bearing split in its own tab, counted against agent-queue-hero-max (never auto-closed).")
+            }
             // (keep) The 📌 pin toggle — queue tiles only. Shown PERSISTENTLY when kept (so
             // a pinned split is obvious without hovering) and on hover otherwise. Filled +
             // accent when kept; outline + secondary when not. Clicking flips the keep state
@@ -345,6 +382,22 @@ struct AgentPreviewTile: View {
                     .help(queueRuns.isEmpty
                         ? "No running queue to adopt this split into"
                         : "Adopt this split into a running queue (the queue will track it like a dispatched item)")
+                }
+                // (hero) Promote / demote — queue-owned agent tiles only (a hero is tracked by
+                // a queue). "Promote to Hero" ejects the split into its own tab + flips the
+                // hero bit; on a hero it's "Demote" (back to a regular tracked item, stays in
+                // its tab). A purple star(.slash) reads as the hero identity, distinct from the
+                // red destructive Close and the keep 📌 pin.
+                if isQueueOwned, entry.agent != nil {
+                    Button { isHero ? onDemoteFromHero() : onPromoteToHero() } label: {
+                        Image(systemName: isHero ? "star.slash" : "star")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(isHero ? Color.secondary : Self.heroPurple)
+                    .help(isHero
+                        ? "Demote from Hero (back to a regular tracked item; the split stays in its tab)"
+                        : "Promote to Hero (eject into its own tab; count it against agent-queue-hero-max, keep-by-default)")
                 }
                 // Force-close is offered ONLY for queue-owned tiles: it's the escape hatch
                 // for a wedged queue slot. On a non-queue agent it would be an unscoped

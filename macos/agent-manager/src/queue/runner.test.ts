@@ -21,6 +21,8 @@ import {
   effectiveMaxItemsCap,
   effectiveConcurrency,
   packRun,
+  projectLiveSurfaces,
+  totalHeroActiveRegistry,
   DEFAULT_PENDING_GRACE_MS,
   type QueueDeps,
   type QueueRun,
@@ -28,7 +30,7 @@ import {
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
 import type { QueueStatusReport, QueueGraphReport } from "./status.js";
-import { loadKeep, loadStore, loadDispatched, reconcile, type LiveSurface, type StoreIO } from "./store.js";
+import { loadKeep, loadStore, loadDispatched, loadHero, reconcile, type LiveSurface, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
 
@@ -102,6 +104,8 @@ interface QueueFake {
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
     moveIntoTab: Array<{ sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }>;
+    /** (hero) perform_action calls — the promote eject uses `move_split_to_new_tab`. */
+    perform: Array<{ id: string; action: string }>;
     list: number;
     graph: number;
     status: string[];
@@ -118,6 +122,7 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     signal: [],
     sendKey: [],
     moveIntoTab: [],
+    perform: [],
     list: 0,
     graph: 0,
     status: [],
@@ -161,6 +166,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     },
     async moveSurfaceIntoTab(args: { sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }): Promise<void> {
       calls.moveIntoTab.push(args);
+    },
+    async performAction(id: string, action: string): Promise<void> {
+      calls.perform.push({ id, action });
     },
     async reportQueueStatus(status: QueueStatusReport): Promise<void> {
       calls.reports.push(status);
@@ -231,6 +239,9 @@ function makeQueueDeps(
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal,
+    // (hero) default the hero cap to 0 (DISABLED) in the shared builder so pre-hero regular-pool
+    // tests are unaffected; hero tests pass `over: { heroMax }`.
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
     ...over,
   };
@@ -668,7 +679,7 @@ test("runQueueSweep: concurrency ABOVE the per-tab grid OVERFLOWS to a new tab (
 
 /** A seated RUNNING assignment at a given grid slot, for packing tests. */
 function seatedAsgn(key: string, uuid: string, slot: number): import("./types.js").Assignment {
-  return { queueName: "Q", key, sessionID: slot + 1, surfaceUUID: uuid, gridSlot: slot, state: "RUNNING", sinceMs: 0 };
+  return { queueName: "Q", key, sessionID: slot + 1, surfaceUUID: uuid, gridSlot: slot, state: "RUNNING", sinceMs: 0, hero: false };
 }
 
 test("packRun: merges a fragmented run (moves the survivor into the lower tab + reassigns its slot)", async () => {
@@ -834,6 +845,7 @@ test("runQueueSweep: end-to-end dispatch → running → done → close → cool
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -958,6 +970,7 @@ test("runQueueSweep: closeOnComplete=false leaves a done+stably-idle split OPEN 
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1037,6 +1050,7 @@ test("runQueueSweep: a set_keep PIN holds a done+idle split OPEN and stamps keep
       return c;
     },
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1107,6 +1121,7 @@ test("runQueueSweep: keepOnComplete=true template default keeps a done+idle spli
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1155,6 +1170,7 @@ test("runQueueSweep: a keep override rehydrates from the per-run store on a fres
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1198,6 +1214,7 @@ test("runQueueSweep: awaitExited is bounded — force-closes after the timeout e
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
     awaitExitedMs: 10_000, // explicit bound for the test
   };
@@ -1560,6 +1577,7 @@ test("runQueueSweep: a too-small queue budget bounds the dispatch batch within a
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1729,6 +1747,7 @@ test("occupiesSlot: only the live, pre/in-flight states occupy a slot", () => {
     gridSlot: 0,
     state: "RUNNING",
     sinceMs: 0,
+    hero: false,
   };
   const expected: Record<AssignmentState, boolean> = {
     QUEUED: true,
@@ -1789,6 +1808,7 @@ test("runQueueSweep: a configured claim command fires after dispatch and is non-
     factory: noFactory,
     takeCommands: async () => [],
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1924,6 +1944,7 @@ test("runQueueSweep: a start command creates a run on demand and then dispatches
     takeCommands: commandsOnce([{ action: "start", template: "backlog-file" }]),
     persistActiveRuns: rec.persist,
     maxTotal: 8,
+    heroMax: 0,
     pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
@@ -1974,7 +1995,7 @@ test("runQueueSweep: a paused run halts dispatch but still closes a done item", 
   const deps: QueueDeps = {
     client: fake.client, exec, budget: new QueueBudget(8), now: () => now,
     registry, factory: noFactory, takeCommands: async () => [],
-    maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    maxTotal: 8, heroMax: 0, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
   await runQueueSweep(deps); // arm
@@ -2043,7 +2064,7 @@ test("runQueueSweep: a stop command drains the run, then removes it once the act
   const deps: QueueDeps = {
     client: fake.client, exec, budget: new QueueBudget(8), now: () => now,
     registry, factory: noFactory, takeCommands: async () => [],
-    persistActiveRuns: rec.persist, maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    persistActiveRuns: rec.persist, maxTotal: 8, heroMax: 0, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
   await runQueueSweep(deps); // arm
@@ -2100,7 +2121,7 @@ test("runQueueSweep: a stop command drains a run even when its only remaining as
   const deps: QueueDeps = {
     client: fake.client, exec: fake.exec, budget: new QueueBudget(8), now: () => now,
     registry, factory: noFactory, takeCommands: async () => [],
-    persistActiveRuns: rec.persist, maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    persistActiveRuns: rec.persist, maxTotal: 8, heroMax: 0, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
   await runQueueSweep(deps); // arm
@@ -2146,7 +2167,7 @@ test("runQueueSweep: an abort command exit+force-closes all assignments and remo
   const deps: QueueDeps = {
     client: fake.client, exec: fake.exec, budget: new QueueBudget(8), now: () => now,
     registry, factory: noFactory, takeCommands: async () => [],
-    persistActiveRuns: rec.persist, maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    persistActiveRuns: rec.persist, maxTotal: 8, heroMax: 0, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
   await runQueueSweep(deps); // arm
@@ -2197,6 +2218,7 @@ test("runQueueSweep: a rehydrated active run re-adopts its in-flight item and do
     gridSlot: 0,
     state: "RUNNING",
     sinceMs: 0, // long ago → past grace, but its session IS live so it stays active
+    hero: false,
   };
   const store = memStore(
     JSON.stringify({ version: 1, records: [priorRecord], lifetimeDispatched: 1 }),
@@ -2223,7 +2245,7 @@ test("runQueueSweep: a rehydrated active run re-adopts its in-flight item and do
   const deps: QueueDeps = {
     client: fake.client, exec: fake.exec, budget: new QueueBudget(8), now: () => now,
     registry, factory: noFactory, takeCommands: async () => [],
-    maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    maxTotal: 8, heroMax: 0, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
 
   // Sweep 1: reconcile re-adopts K-1 (matched by sessionID 900); dispatch suppressed.
@@ -2518,7 +2540,7 @@ test("runQueueSweep: aborting a run with provider.graph pushes report_queue_grap
   const deps: QueueDeps = {
     client: fake.client, exec: fake.exec, budget: new QueueBudget(8), now: () => now,
     registry, factory: noFactory, takeCommands: async () => [],
-    maxTotal: 8, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
+    maxTotal: 8, heroMax: 0, pendingGraceMs: DEFAULT_PENDING_GRACE_MS,
   };
   await runQueueSweep(deps); // arm
   run.aborting = true;
@@ -2546,6 +2568,7 @@ function seat(run: QueueRun, key: string, uuid: string, slot = 0): void {
     gridSlot: slot,
     state: "RUNNING",
     sinceMs: 0,
+    hero: false,
   });
 }
 
@@ -2693,4 +2716,587 @@ test("runQueueSweep: infer_key with NO inferKey seam is a harmless no-op", async
   // Must not throw.
   await runQueueSweep(deps);
   assert.equal(fake.calls.annotate.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// (hero) Two-pool dispatch accounting (HERO-AGENTS.md § Slot accounting). The list is
+// split by item.hero: the REGULAR pool is gated by concurrency + max-total + maxItems
+// (counting ONLY non-hero); the HERO pool is gated ONLY by the fleet-wide
+// `agent-queue-hero-max`. The two pools are ORTHOGONAL.
+// ---------------------------------------------------------------------------
+
+/** A template whose list provider maps a `hero` boolean field (mirrors keyField/titleField). */
+function heroTmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
+  const base = tmpl(over);
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      list: { ...base.provider.list, heroField: "hero" },
+    },
+  };
+}
+
+/** Arm a run (its first sweep only reconciles — dispatch is suppressed) so the NEXT sweep
+ *  dispatches. Uses an empty list for the arm so nothing is chosen. */
+async function arm(deps: QueueDeps): Promise<void> {
+  await runQueueSweep(deps);
+}
+
+test("hero: the hero cap is ORTHOGONAL to concurrency — a hero dispatches even when the regular pool is full", async () => {
+  // concurrency 1 → the regular pool can seat exactly ONE regular. The list has ONE regular
+  // AND one hero. The regular fills the single concurrency slot; the hero must STILL dispatch
+  // (its own pool, gated only by heroMax=2), so BOTH spawn.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"R-1","hero":false},{"id":"H-1","hero":true}]',
+    spawns: [{ id: "s-r1", sessionId: 601 }, { id: "s-h1", sessionId: 602 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 1 }), memStore());
+  let now = 7_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.spawn.length, 2, "regular (concurrency 1) + hero (own pool) both dispatch");
+  assert.ok(run.active.has("R-1"), "regular dispatched");
+  assert.ok(run.active.has("H-1"), "hero dispatched despite concurrency 1");
+  assert.equal(run.active.get("H-1")!.hero, true, "hero record carries the hero bit");
+  assert.equal(run.active.get("R-1")!.hero, false, "regular record is not a hero");
+});
+
+test("hero: the hero cap is ORTHOGONAL to maxItems — a hero dispatches even at the regular maxItems cap", async () => {
+  // maxItems 1 → the regular lifetime budget allows ONE regular ever. Dispatch a regular first,
+  // exhausting the regular budget; a hero appearing next must STILL dispatch (separate counter).
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"R-1","hero":false}]',
+    spawns: [{ id: "s-r1", sessionId: 611 }, { id: "s-h1", sessionId: 612 }],
+  });
+  const run = makeQueueRun(heroTmpl({ maxItems: 1 }), memStore());
+  let now = 7_100_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps); // dispatch the one regular → regular maxItems budget now spent
+  assert.equal(run.lifetimeDispatched, 1, "regular lifetime counter bumped");
+  assert.equal(run.heroLifetimeDispatched, 0, "hero counter untouched");
+
+  // Now the list additionally surfaces a hero; the regular budget is spent (R-1 latched + at
+  // cap), but the hero dispatches from its OWN pool. Re-point the list to include the hero.
+  const fake2 = makeQueueFake({
+    surfaces: [queueSurface({ id: "s-r1", sessionID: 611, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: '[{"id":"R-1","hero":false},{"id":"H-1","hero":true}]',
+    spawns: [{ id: "s-h1", sessionId: 612 }],
+  });
+  // Swap the client/exec on the same deps so run state carries over.
+  const deps2 = makeQueueDeps(fake2, [run], () => now, 8, { heroMax: 2 });
+  now += 5000;
+  await runQueueSweep(deps2); // reconcile R-1 as active; dispatch H-1 (hero pool)
+  now += 5000;
+  await runQueueSweep(deps2);
+
+  assert.ok(run.active.has("H-1"), "hero dispatched despite regular maxItems=1 being exhausted");
+  assert.equal(run.heroLifetimeDispatched, 1, "hero counter bumped, not the regular one");
+  assert.equal(run.lifetimeDispatched, 1, "regular lifetime budget stayed at its cap (no over-dispatch)");
+});
+
+test("hero: the REGULAR pool is unaffected by heroes — heroes don't consume regular slots", async () => {
+  // concurrency 2, list = 2 regulars + 2 heroes, heroMax 2. All FOUR should dispatch: the two
+  // regulars fill both concurrency slots, the two heroes fill both hero slots — no cross-eat.
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson:
+      '[{"id":"R-1","hero":false},{"id":"R-2","hero":false},{"id":"H-1","hero":true},{"id":"H-2","hero":true}]',
+    spawns: [
+      { id: "s1", sessionId: 621 },
+      { id: "s2", sessionId: 622 },
+      { id: "s3", sessionId: 623 },
+      { id: "s4", sessionId: 624 },
+    ],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 2 }), memStore());
+  let now = 7_200_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.spawn.length, 4, "2 regulars + 2 heroes all dispatch (orthogonal pools)");
+  assert.ok(run.active.has("R-1") && run.active.has("R-2"), "both regulars dispatched (concurrency 2)");
+  assert.ok(run.active.has("H-1") && run.active.has("H-2"), "both heroes dispatched (heroMax 2)");
+});
+
+test("hero: the fleet-wide heroMax caps NEW hero dispatches (2 heroes listed, heroMax 1 → only 1)", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"H-1","hero":true},{"id":"H-2","hero":true}]',
+    spawns: [{ id: "s-h1", sessionId: 631 }, { id: "s-h2", sessionId: 632 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  let now = 7_300_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 1 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.spawn.length, 1, "heroMax 1 caps to a single hero dispatch");
+  assert.equal(run.heroLifetimeDispatched, 1);
+});
+
+test("hero: heroMax=0 DISABLES hero dispatch — hero-marked items never spawn", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"H-1","hero":true},{"id":"R-1","hero":false}]',
+    spawns: [{ id: "s-r1", sessionId: 641 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  let now = 7_400_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 0 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.spawn.length, 1, "only the regular dispatches; the hero is disabled");
+  assert.ok(run.active.has("R-1"), "regular still dispatches with heroMax 0");
+  assert.ok(!run.active.has("H-1"), "hero is NOT dispatched when heroMax=0");
+});
+
+test("hero: heroActiveGlobal is FLEET-WIDE — a live hero in run A blocks a new hero in run B (heroMax 1)", async () => {
+  const fakeA = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"HA-1","hero":true}]',
+    spawns: [{ id: "s-ha1", sessionId: 651 }],
+  });
+  const runA = makeQueueRun(heroTmpl({ name: "A", concurrency: 5 }), memStore());
+  const runB = makeQueueRun(heroTmpl({ name: "B", concurrency: 5 }), memStore());
+  let now = 7_500_000;
+  const registry: RunRegistry = new Map([["A", runA], ["B", runB]]);
+  const depsA = makeQueueDeps(fakeA, [], () => now, 8, { heroMax: 1, registry });
+
+  // Arm both, then dispatch A's hero (fills the single fleet hero slot).
+  await runQueueSweep(depsA);
+  now += 5000;
+  await runQueueSweep(depsA);
+  assert.ok(runA.active.has("HA-1"), "run A's hero dispatched");
+  assert.equal(totalHeroActiveRegistry(registry), 1, "one hero live fleet-wide");
+
+  // Now run B lists a hero; heroActiveGlobal=1 == heroMax → heroRemaining 0 → B's hero waits.
+  const fakeB = makeQueueFake({
+    surfaces: [queueSurface({ id: "s-ha1", sessionID: 651, agentState: "working", queueKey: "HA-1", queueName: "A" })],
+    listJson: '[{"id":"HB-1","hero":true}]',
+    spawns: [{ id: "s-hb1", sessionId: 652 }],
+  });
+  const depsB = makeQueueDeps(fakeB, [], () => now, 8, { heroMax: 1, registry });
+  now += 5000;
+  await runQueueSweep(depsB);
+  assert.ok(!runB.active.has("HB-1"), "run B's hero is blocked — fleet-wide hero cap is full");
+});
+
+test("hero: a hero dispatches into its OWN dedicated tab (firstTab, no grid caps, slot -1)", async () => {
+  // Seed a regular already seated so the run has a grid tab; the hero must open a SEPARATE
+  // tab anchored on the run's window, NOT a balanced grid split.
+  const fake = makeQueueFake({
+    surfaces: [queueSurface({ id: "u-r1", sessionID: 700, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: '[{"id":"R-1","hero":false},{"id":"H-1","hero":true}]',
+    spawns: [{ id: "s-h1", sessionId: 701 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  // Pre-seat the regular (adopted from the live surface on the arm sweep's reconcile).
+  let now = 7_600_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+
+  await arm(deps); // reconcile adopts R-1 (orphan) + arms
+  assert.ok(run.active.has("R-1"), "regular adopted from the live surface");
+  now += 5000;
+  await runQueueSweep(deps); // dispatch the hero into its own tab
+
+  const heroSpawn = fake.calls.spawn.find((s) => (s.command as string).includes("H-1"));
+  assert.ok(heroSpawn, "hero spawned");
+  assert.equal(heroSpawn!.firstTab, true, "hero opens a NEW tab (firstTab)");
+  assert.equal(heroSpawn!.balanced, undefined, "hero is NOT a balanced grid split");
+  assert.equal(heroSpawn!.maxCols, undefined, "hero sends no grid caps (not in the grid)");
+  assert.equal(heroSpawn!.maxRows, undefined, "hero sends no grid caps");
+  assert.equal(heroSpawn!.windowAnchorUUID, "u-r1", "hero anchored on the run's existing window");
+  assert.equal(run.active.get("H-1")!.gridSlot, -1, "hero record uses the -1 (no-grid) slot sentinel");
+});
+
+test("hero: a hero surface is annotated with hero:true", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"H-1","hero":true}]',
+    spawns: [{ id: "s-h1", sessionId: 711 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  let now = 7_700_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+
+  const ann = fake.calls.annotate.find((a) => a.ann.queueKey === "H-1");
+  assert.ok(ann, "hero surface annotated");
+  assert.equal(ann!.ann.hero, true, "annotation carries hero:true (drives the tab marker)");
+});
+
+test("hero: the close gate treats a hero as keep=true — a done+idle hero HOLDS in DONE_PENDING even with keepOnComplete:false + closeOnComplete:true", async () => {
+  // A hero must NEVER be auto-closed (HERO-AGENTS.md § Lifecycle) regardless of the template's
+  // keep/close settings. Dispatch a hero, drive it to done + stably idle, and assert it stays
+  // DONE_PENDING and is NEVER force-closed (unlike a regular, which would auto-close).
+  const surfaces: Surface[] = [];
+  const fake = makeQueueFake({
+    surfaces,
+    listJson: '[{"id":"H-1","hero":true}]',
+    spawns: [{ id: "s-h1", sessionId: 800 }],
+    statusByKey: { "H-1": '{"state":"done"}' },
+  });
+  const run = makeQueueRun(
+    heroTmpl({ concurrency: 5, keepOnComplete: false, closeOnComplete: true, closeStableSeconds: 5 }),
+    memStore(),
+  );
+  let now = 8_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps); // dispatch the hero
+  assert.ok(run.active.has("H-1"), "hero dispatched");
+
+  // Make it live + idle; provider says done.
+  surfaces.push(queueSurface({ id: "s-h1", sessionID: 800, agentState: "idle", queueKey: "H-1", queueName: "backlog" }));
+  now += 5000;
+  await runQueueSweep(deps); // SPAWNED→RUNNING→DONE_PENDING (status done), idle anchor starts
+  now += 20_000; // well past closeStableSeconds
+  await runQueueSweep(deps); // a REGULAR would advance to CLOSING here; a hero must HOLD
+
+  assert.equal(run.active.get("H-1")!.state, "DONE_PENDING", "hero holds in DONE_PENDING (never auto-closed)");
+  assert.equal(fake.calls.forceClose.length, 0, "hero is never force-closed by the supervisor");
+});
+
+test("hero: persistence — a promoted/hero split rehydrates as a hero across a sidecar restart", async () => {
+  // Dispatch a hero, then simulate a restart by building a FRESH run on the SAME store and
+  // reconciling: the run-level hero set + the record's hero bit must both come back.
+  const store = memStore();
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"H-1","hero":true}]',
+    spawns: [{ id: "s-h1", sessionId: 810 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), store);
+  let now = 8_100_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.ok(run.hero.has("H-1"), "hero in the live run's hero set");
+
+  // The store persisted the hero set + the record's hero bit.
+  const persisted = loadStore(store);
+  const rec = persisted.find((a) => a.key === "H-1");
+  assert.ok(rec, "hero record persisted");
+  assert.equal(rec!.hero, true, "persisted record carries hero:true");
+  assert.deepEqual(loadHero(store), ["H-1"], "run-level hero set persisted");
+
+  // RESTART: a fresh run on the same store, with the surface now live (so reconcile keeps it).
+  const fake2 = makeQueueFake({
+    surfaces: [queueSurface({ id: "s-h1", sessionID: 810, agentState: "working", queueKey: "H-1", queueName: "backlog" })],
+    listJson: '[{"id":"H-1","hero":true}]',
+  });
+  const run2 = makeQueueRun(heroTmpl({ concurrency: 5 }), store);
+  const deps2 = makeQueueDeps(fake2, [run2], () => now, 8, { heroMax: 2 });
+  now += 5000;
+  await runQueueSweep(deps2); // first sweep reconciles + rehydrates the hero set
+
+  assert.ok(run2.hero.has("H-1"), "hero set rehydrated after restart");
+  assert.equal(run2.active.get("H-1")!.hero, true, "reconciled record re-stamped as a hero");
+  assert.equal(totalHeroActiveRegistry(new Map([["backlog", run2]])), 1, "the restored hero counts against heroActiveGlobal");
+});
+
+// ---------------------------------------------------------------------------
+// (hero) promote / demote command SIDE EFFECTS (Stage 3). promote flips the hero bit +
+// EJECTS the split into its own tab (move_split_to_new_tab) + re-stamps the hero annotation;
+// demote flips it false + drops the hero annotation (never re-packs into a grid). Promotion
+// NEVER blocks on the hero cap (may exceed); no NEW hero dispatches until it drains under.
+// ---------------------------------------------------------------------------
+
+test("hero: PROMOTE ejects the split into its own tab + annotates hero:true (the side effect)", async () => {
+  // A running regular R-1 (adopted from a live surface). A `promote` command must eject it via
+  // move_split_to_new_tab, flip the run-level hero bit, and re-stamp the annotation hero:true.
+  const fake = makeQueueFake({
+    surfaces: [queueSurface({ id: "u-r1", sessionID: 900, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: "[]", // nothing new to dispatch — focus on the promote side effect
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  let now = 9_000_000;
+  // Arm WITHOUT the command so the adopt lands as a regular before the promote sweep.
+  const armDeps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(armDeps); // reconcile adopts R-1 (regular)
+  assert.ok(run.active.has("R-1"), "regular adopted");
+  assert.equal(run.active.get("R-1")!.hero, false, "starts as a regular");
+
+  now += 5000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "u-r1", key: "R-1" }]),
+  });
+  await runQueueSweep(deps); // drains the promote command + fires runPromote
+
+  // EJECT: the promote used the move_split_to_new_tab keybind action on the surface.
+  assert.ok(
+    fake.calls.perform.some((p) => p.id === "u-r1" && p.action === "move_split_to_new_tab"),
+    "promote ejected the split into its own tab via move_split_to_new_tab",
+  );
+  // The run-level hero set + the per-record bit both flipped, and the grid slot is the -1 sentinel.
+  assert.ok(run.hero.has("R-1"), "R-1 added to the run-level hero set");
+  assert.equal(run.active.get("R-1")!.hero, true, "R-1 record re-stamped as a hero");
+  assert.equal(run.active.get("R-1")!.gridSlot, -1, "promoted hero uses the -1 (no-grid) slot sentinel");
+  // The annotation carries hero:true (drives the GUI tab marker / tile).
+  const ann = fake.calls.annotate.find((a) => a.id === "u-r1" && a.ann.hero === true);
+  assert.ok(ann, "promoted surface annotated hero:true");
+});
+
+test("hero: PROMOTE of a REGULAR DISPATCH hands its maxItems slot over to the hero counter", async () => {
+  // A regular R-1 is DISPATCHED (spawned), bumping run.lifetimeDispatched to 1 (one regular
+  // maxItems slot spent). Promoting it must REFUND that regular slot (lifetimeDispatched → 0) and
+  // account the hero on the separate heroLifetimeDispatched (→ 1) — so the promoted item stops
+  // permanently consuming the regular budget it no longer belongs to (HERO-AGENTS.md § Slot
+  // accounting). The reconcile floor must NOT re-raise lifetimeDispatched (R-1 is now a hero, so
+  // it's excluded from regularOccupancy).
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"R-1","hero":false}]',
+    spawns: [{ id: "s-r1", sessionId: 950 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  let now = 9_050_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(deps);
+  now += 5000;
+  await runQueueSweep(deps); // DISPATCH R-1 as a regular
+  assert.ok(run.active.has("R-1"), "regular R-1 dispatched");
+  assert.equal(run.lifetimeDispatched, 1, "regular lifetime counter bumped by the dispatch");
+  assert.equal(run.heroLifetimeDispatched, 0, "hero counter untouched by a regular dispatch");
+
+  // R-1's spawned surface is now live; promote it. Swap the client on the same run so state carries.
+  const fake2 = makeQueueFake({
+    surfaces: [queueSurface({ id: "s-r1", sessionID: 950, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: '[{"id":"R-1","hero":false}]',
+  });
+  now += 5000;
+  const deps2 = makeQueueDeps(fake2, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "s-r1", key: "R-1" }]),
+  });
+  await runQueueSweep(deps2); // promote R-1
+
+  assert.ok(run.hero.has("R-1"), "R-1 promoted to a hero");
+  assert.equal(run.lifetimeDispatched, 0, "the regular maxItems slot was refunded on promotion");
+  assert.equal(run.heroLifetimeDispatched, 1, "the hero was accounted on the separate hero counter");
+});
+
+test("hero: PROMOTE refund is floored — the regular counter never goes negative", async () => {
+  // A live regular whose lifetimeDispatched has been floored to 0 (no dispatch, and reconcile's
+  // regularOccupancy floor is applied AFTER the promote drops it out of the regular pool). Promoting
+  // it must still bump the hero counter and NEVER drive lifetimeDispatched below 0. Drive it by
+  // adopting then IMMEDIATELY hand-zeroing the counter to simulate an already-drained regular budget.
+  const fake = makeQueueFake({
+    surfaces: [queueSurface({ id: "u-r1", sessionID: 960, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: "[]",
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  let now = 9_070_000;
+  const armDeps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(armDeps); // reconcile adopts R-1 as a regular
+  assert.ok(run.active.has("R-1"), "regular R-1 adopted");
+  // Force the regular counter to 0 to exercise the floor guard (a hero adopted-from-a-fresh-run
+  // edge, or a store rehydrate that under-counts): the refund must clamp, not go negative.
+  run.lifetimeDispatched = 0;
+
+  now += 5000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "u-r1", key: "R-1" }]),
+  });
+  await runQueueSweep(deps); // promote the regular whose counter is already 0
+
+  assert.ok(run.hero.has("R-1"), "R-1 promoted");
+  assert.equal(run.lifetimeDispatched, 0, "the refund is floored at 0 — never negative");
+  assert.equal(run.heroLifetimeDispatched, 1, "the hero is still accounted");
+});
+
+test("hero: PROMOTION never blocks (may exceed heroMax); no NEW hero dispatches until it drains under", async () => {
+  // heroMax 1. One live hero H-1 already fills the fleet slot. Promoting a running regular R-1
+  // pushes heroActiveGlobal to 2 (OVER the cap of 1) — promotion must SUCCEED anyway. While over
+  // cap, a newly-listed hero H-3 must NOT dispatch. Once the heroes DRAIN back under the cap, the
+  // waiting hero dispatches.
+  const surfaces: Surface[] = [
+    queueSurface({ id: "u-h1", sessionID: 910, agentState: "working", queueKey: "H-1", queueName: "backlog" }),
+    queueSurface({ id: "u-r1", sessionID: 911, agentState: "working", queueKey: "R-1", queueName: "backlog" }),
+  ];
+  const fake = makeQueueFake({
+    surfaces,
+    // H-1 is already a hero (persisted below via the run-level set); R-1 regular; H-3 a NEW hero.
+    listJson: '[{"id":"H-1","hero":true},{"id":"R-1","hero":false},{"id":"H-3","hero":true}]',
+    spawns: [{ id: "s-h3", sessionId: 913 }],
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  // Pre-seed H-1 as an existing hero so heroActiveGlobal starts at 1 (== heroMax).
+  run.hero.add("H-1");
+  let now = 9_100_000;
+  // Arm WITHOUT the command so the promote fires on a real dispatch sweep (arm suppresses dispatch).
+  const armDeps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 1 });
+  await arm(armDeps); // reconcile adopts H-1 + R-1
+  assert.ok(run.active.has("H-1") && run.active.has("R-1"), "both live surfaces adopted");
+
+  now += 5000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 1,
+    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "u-r1", key: "R-1" }]),
+  });
+  await runQueueSweep(deps); // promote R-1 (over-cap) + attempt to dispatch H-3
+
+  // Promotion SUCCEEDED even though it pushes heroActiveGlobal to 2 > heroMax 1.
+  assert.ok(run.hero.has("R-1"), "R-1 promoted despite being over the hero cap");
+  assert.equal(totalHeroActiveRegistry(new Map([["backlog", run]])), 2, "heroActiveGlobal exceeds heroMax after promotion");
+  // The NEW hero H-3 is BLOCKED while over cap (heroRemaining = 1 - 2 = clamped 0).
+  assert.ok(!run.active.has("H-3"), "no NEW hero dispatches while over the cap");
+  assert.equal(fake.calls.spawn.length, 0, "nothing spawned while over cap");
+
+  // DRAIN: both heroes' surfaces go away (a human closed them) → reconcile prunes them →
+  // heroActiveGlobal drops to 0 (< heroMax 1). Now the waiting hero H-3 must dispatch.
+  surfaces.length = 0;
+  const fake2 = makeQueueFake({
+    surfaces,
+    listJson: '[{"id":"H-3","hero":true}]',
+    spawns: [{ id: "s-h3", sessionId: 913 }],
+  });
+  const deps2 = makeQueueDeps(fake2, [run], () => now, 8, { heroMax: 1 });
+  now += 60_000; // past the pending/session-gone grace so the two vanished heroes prune
+  await runQueueSweep(deps2); // reconcile prunes H-1/R-1; first sweep on fake2 re-arms dispatch
+  now += 5000;
+  await runQueueSweep(deps2); // now under cap → H-3 dispatches
+
+  assert.ok(run.active.has("H-3"), "the waiting hero dispatches once live heroes drain under the cap");
+  assert.equal(run.active.get("H-3")!.hero, true, "H-3 is a hero");
+});
+
+test("hero: DEMOTE flips the bit false + drops the hero annotation; the item re-enters the regular pool", async () => {
+  // A live hero H-1. A `demote` command clears the run-level hero bit, drops the hero annotation
+  // (hero:false), and does NOT re-pack (no move_split_to_new_tab / moveSurfaceIntoTab). After the
+  // demote the split counts as a REGULAR for accounting (heroActiveGlobal drops).
+  const fake = makeQueueFake({
+    surfaces: [queueSurface({ id: "u-h1", sessionID: 920, agentState: "working", queueKey: "H-1", queueName: "backlog" })],
+    listJson: "[]",
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), memStore());
+  run.hero.add("H-1"); // it is a hero going in
+  let now = 9_200_000;
+  // Arm WITHOUT the command so H-1 is adopted + re-stamped a hero before the demote sweep.
+  const armDeps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(armDeps); // reconcile adopts H-1, re-stamped as a hero
+  assert.equal(run.active.get("H-1")!.hero, true, "H-1 starts a hero");
+  assert.equal(totalHeroActiveRegistry(new Map([["backlog", run]])), 1, "counts as a hero before demote");
+
+  const performBefore = fake.calls.perform.length;
+  const moveBefore = fake.calls.moveIntoTab.length;
+  now += 5000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "demote", run: "backlog", surfaceUUID: "u-h1", key: "H-1" }]),
+  });
+  await runQueueSweep(deps); // drains the demote command + fires runDemote
+
+  // The hero bit is cleared and it re-enters the REGULAR pool for accounting.
+  assert.ok(!run.hero.has("H-1"), "H-1 removed from the run-level hero set");
+  assert.equal(run.active.get("H-1")!.hero, false, "H-1 record re-classified regular");
+  assert.equal(totalHeroActiveRegistry(new Map([["backlog", run]])), 0, "no longer counts against heroActiveGlobal");
+  // The annotation was dropped (hero:false written).
+  const ann = fake.calls.annotate.find((a) => a.id === "u-h1" && a.ann.hero === false);
+  assert.ok(ann, "demote annotated hero:false (drops the GUI marker)");
+  // DEMOTE does NOT re-pack: no eject, no move-into-tab.
+  assert.equal(fake.calls.perform.length, performBefore, "demote does not eject/perform any action");
+  assert.equal(fake.calls.moveIntoTab.length, moveBefore, "demote does not re-pack the split into a grid");
+});
+
+// (hero) The `list_surfaces` hero read-back — the wire-contract visibility chokepoint
+// (HERO-AGENTS.md): `MCPLayout.surfacesJSONData` emits `hero` on a hero row, and the sidecar
+// reads it back off the `Surface` row into `LiveSurface.hero` (mirroring the queueKey read-back).
+// The run-level `hero` Set stays authoritative; this only proves the bit survives the round-trip.
+test("hero: projectLiveSurfaces echoes the hero bit back off the list_surfaces row", () => {
+  const surfaces: Surface[] = [
+    Object.assign(surface({ id: "u-h1", sessionID: 920 }), {
+      queueKey: "H-1",
+      queueName: "backlog",
+      hero: true,
+    }),
+    Object.assign(surface({ id: "u-r1", sessionID: 921 }), {
+      queueKey: "R-1",
+      queueName: "backlog",
+      hero: false,
+    }),
+    // A row with no hero field at all (pre-upgrade GUI / regular tile) → hero omitted.
+    Object.assign(surface({ id: "u-r2", sessionID: 922 }), {
+      queueKey: "R-2",
+      queueName: "backlog",
+    }),
+    // A foreign run's row is filtered out entirely (queueName mismatch).
+    Object.assign(surface({ id: "u-x", sessionID: 923 }), {
+      queueKey: "X-1",
+      queueName: "other-run",
+      hero: true,
+    }),
+  ];
+  const live = projectLiveSurfaces(surfaces, "backlog");
+  const byUUID = new Map(live.map((l) => [l.surfaceUUID, l]));
+  assert.equal(byUUID.size, 3, "the foreign-run row is skipped");
+  assert.equal(byUUID.get("u-h1")!.hero, true, "hero:true echoed back");
+  assert.equal(byUUID.get("u-r1")!.hero, false, "hero:false echoed back");
+  assert.equal("hero" in byUUID.get("u-r2")!, false, "an absent hero field stays omitted");
+});
+
+test("hero: promote persistence round-trip — a promoted split rehydrates a hero across a restart", async () => {
+  // Promote a running regular via a command, confirm the hero bit is PERSISTED, then simulate a
+  // sidecar restart (fresh run on the same store) and confirm the promoted split comes back a hero.
+  const store = memStore();
+  const fake = makeQueueFake({
+    surfaces: [queueSurface({ id: "u-r1", sessionID: 930, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: "[]",
+  });
+  const run = makeQueueRun(heroTmpl({ concurrency: 5 }), store);
+  let now = 9_300_000;
+  const armDeps = makeQueueDeps(fake, [run], () => now, 8, { heroMax: 2 });
+  await arm(armDeps); // adopt R-1
+  now += 5000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "promote", run: "backlog", surfaceUUID: "u-r1", key: "R-1" }]),
+  });
+  await runQueueSweep(deps); // promote R-1
+  assert.ok(run.hero.has("R-1"), "R-1 promoted");
+
+  // The run-level hero set + the record's hero bit are persisted to the store.
+  assert.deepEqual(loadHero(store), ["R-1"], "promoted key persisted in the run-level hero set");
+  const rec = loadStore(store).find((a) => a.key === "R-1");
+  assert.ok(rec, "record persisted");
+  assert.equal(rec!.hero, true, "persisted record carries hero:true");
+
+  // RESTART: a fresh run on the same store; the surface is still live.
+  const fake2 = makeQueueFake({
+    surfaces: [queueSurface({ id: "u-r1", sessionID: 930, agentState: "working", queueKey: "R-1", queueName: "backlog" })],
+    listJson: "[]",
+  });
+  const run2 = makeQueueRun(heroTmpl({ concurrency: 5 }), store);
+  const deps2 = makeQueueDeps(fake2, [run2], () => now, 8, { heroMax: 2 });
+  now += 5000;
+  await runQueueSweep(deps2); // first sweep reconciles + rehydrates the hero set
+
+  assert.ok(run2.hero.has("R-1"), "hero set rehydrated after restart");
+  assert.equal(run2.active.get("R-1")!.hero, true, "reconciled record re-stamped as a hero after restart");
 });

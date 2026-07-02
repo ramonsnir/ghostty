@@ -1999,3 +1999,45 @@ struct WebMonitorHostClientTests {
         #expect(C.readU64LE(d, at: d.startIndex) == 0x1122334455667788)
     }
 }
+
+/// (ramon fork / Hero Agents) The pure push-payload seams that decide the notification
+/// title glyph + the `"kind"` field, so a hero push reads apart from a bell/attention push.
+struct WebPushPayloadTests {
+
+    // MARK: - pushTitle glyph + fallback
+
+    @Test func heroTitleUsesStarGlyph() {
+        #expect(WebPushManager.pushTitle(glyph: "⭐", rawTitle: "build things")
+            == "⭐ build things")
+    }
+
+    @Test func bellAndAttentionTitlesUseBellGlyph() {
+        #expect(WebPushManager.pushTitle(glyph: "🔔", rawTitle: "acme repo")
+            == "🔔 acme repo")
+    }
+
+    @Test func emptyTitleFallsBackToGhostty() {
+        #expect(WebPushManager.pushTitle(glyph: "⭐", rawTitle: "") == "⭐ Ghostty")
+        #expect(WebPushManager.pushTitle(glyph: "🔔", rawTitle: "") == "🔔 Ghostty")
+    }
+
+    // MARK: - pushPayload "kind" field
+
+    @Test func payloadCarriesHeroKind() {
+        let id = UUID()
+        let p = WebPushManager.pushPayload(
+            title: "⭐ Ghostty", body: "needs you", surface: id, kind: "hero")
+        #expect(p["kind"] == "hero")
+        #expect(p["title"] == "⭐ Ghostty")
+        #expect(p["body"] == "needs you")
+        #expect(p["surface"] == id.uuidString)
+    }
+
+    @Test func payloadCarriesBellAndAttentionKind() {
+        let id = UUID()
+        #expect(WebPushManager.pushPayload(
+            title: "🔔 x", body: "", surface: id, kind: "bell")["kind"] == "bell")
+        #expect(WebPushManager.pushPayload(
+            title: "🔔 x", body: "", surface: id, kind: "attention")["kind"] == "attention")
+    }
+}
