@@ -1987,11 +1987,15 @@ async function runPromote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
 /**
  * (hero) Perform the SIDE EFFECTS of a `demote` command: DROP the hero annotation so the GUI
  * clears the hero glyph tab marker + tile visual; the split RE-ENTERS the regular pool for
- * future accounting (the reducer already cleared the run-level `hero` bit synchronously). It does
- * NOT re-pack the split into a grid — the (now-regular) split stays in its own tab, like any
- * kept split (HERO-AGENTS.md design decision #3 / non-goals). Best-effort. NEVER writes
- * `run.active` (reconcile owns it), except to re-stamp the per-record `hero` bit false so the
- * two-pool accounting reflects it this sweep before the next reconcile re-derives it.
+ * future accounting (the reducer already cleared the run-level `hero` bit synchronously); AND
+ * RE-PACK the split back into the run's BSP grid — symmetric with promote's eject. A promoted
+ * split lives in its OWN tab with gridSlot -1; leaving it there on demote stranded a plain
+ * regular in a dedicated tab (the "normal agent in a dedicated tab" report). We now move it into
+ * a seated regular anchor's grid tab via the SAME balanced `moveSurfaceIntoTab` the packer/adopt
+ * use (multi-tab overflow honored) and reset its gridSlot so it re-enters occupancy. Best-effort:
+ * with no grid anchor (the run's only pane) there's nothing to pack into, so it stays put; a
+ * failed move logs and leaves it in place. Mutates `run.active` in place (hero bit + gridSlot) —
+ * the established pattern (see packRun) — then persists.
  */
 async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   const name = cmd.run;
@@ -2001,11 +2005,50 @@ async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   if (run === undefined) return;
   const key = cmd.key;
 
+  // Resolve the demoted assignment — by key when we have one, else by surface UUID (demote may
+  // carry only the surface). Mutated in place (the established pattern — see packRun).
+  const asgn = (key !== undefined && key.length > 0)
+    ? run.active.get(key)
+    : [...run.active.values()].find((a) => a.surfaceUUID === uuid);
+
   // Reflect the demotion on the per-record bit at once (reconcile also re-derives it from the
-  // now-cleared run-level set every sweep). Leave the grid slot as-is — demote does NOT re-pack.
-  if (key !== undefined && key.length > 0) {
-    const a = run.active.get(key);
-    if (a !== undefined && a.hero) run.active.set(key, { ...a, hero: false });
+  // now-cleared run-level set every sweep).
+  if (asgn !== undefined && asgn.hero) asgn.hero = false;
+
+  // RE-PACK the split back into the run's BSP grid — symmetric with promote's eject (the split
+  // was ejected to its OWN tab on promote and given gridSlot -1). Find a SEATED regular anchor
+  // already in the grid + the lowest free slot, then MOVE it there via the SAME balanced
+  // cross-tab move the packer/adopt use (multi-tab overflow honored by maxCols/maxRows). On a
+  // successful move, reset gridSlot so the item re-enters occupancy accounting. Best-effort:
+  // with NO anchor (the demoted split is the run's only pane) there is no grid to pack into, so
+  // it just stays in its own tab; a failed move logs and leaves it in place (still demoted).
+  let repacked = false;
+  if (asgn !== undefined && asgn.surfaceUUID !== undefined && deps.client.moveSurfaceIntoTab !== undefined) {
+    const occupied = new Set<number>();
+    let anchor: string | undefined;
+    for (const a of run.active.values()) {
+      if (a.surfaceUUID === asgn.surfaceUUID) continue;
+      if (a.gridSlot >= 0 && occupiesSlot(a)) {
+        occupied.add(a.gridSlot);
+        if (anchor === undefined && a.surfaceUUID !== undefined) anchor = a.surfaceUUID;
+      }
+    }
+    const slot = anchor !== undefined ? lowestFreeSlot(occupied, effectiveConcurrency(run)) : null;
+    if (anchor !== undefined && slot !== null) {
+      try {
+        await deps.client.moveSurfaceIntoTab({
+          sourceUUID: asgn.surfaceUUID,
+          targetAnchorUUID: anchor,
+          balanced: true,
+          maxCols: run.template.grid.cols,
+          maxRows: run.template.grid.rows,
+        });
+        asgn.gridSlot = slot;
+        repacked = true;
+      } catch (err) {
+        errlog(`run "${name}": demote re-pack ${key ?? uuid} failed: ${msg(err)} — split stays in its own tab`);
+      }
+    }
   }
 
   // DROP the hero annotation so the GUI clears the marker. keep FOLLOWS effectiveKeep now that
@@ -2021,7 +2064,7 @@ async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   }
 
   persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
-  log(`run "${run.runName}": DEMOTED ${key ?? uuid} to regular — hero annotation dropped (not re-packed)`);
+  log(`run "${run.runName}": DEMOTED ${key ?? uuid} to regular — hero annotation dropped${repacked ? ` (re-packed into grid slot ${asgn?.gridSlot})` : " (no grid anchor — stays in own tab)"}`);
 }
 
 /**
