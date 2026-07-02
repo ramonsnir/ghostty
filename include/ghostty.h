@@ -1185,6 +1185,11 @@ GHOSTTY_API ghostty_config_key_doc_s ghostty_config_describe_key(const char*, ui
 GHOSTTY_API uint32_t ghostty_config_key_count(void);
 GHOSTTY_API ghostty_config_key_info_s ghostty_config_key_at(uint32_t);
 
+// (ramon fork) Packed identity of the bundled ghostty-host's GUI-visible
+// behavior: (protocol_major << 32) | (protocol_minor << 16) | host_reload_epoch.
+// ForkSetup gates the host LaunchAgent reload on this instead of the binary hash.
+GHOSTTY_API uint64_t ghostty_host_reload_identity(void);
+
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
 GHOSTTY_API void ghostty_app_free(ghostty_app_t);
