@@ -193,7 +193,9 @@ currently blocked** — not only when stuck on the hero-slot gate.
 AppKit `.help()` tooltips only render for the KEY window — so native tooltips never appeared on the
 tile icons or backlog nodes while hovering the (non-key) panel. The `DashboardTooltip` view modifier
 drives a small bubble off `.onHover` (which DOES fire in the panel — it's what reveals the tile's
-hover buttons) and also sets `.help()` for key windows. All tile-icon and backlog tooltips use it.
+hover buttons). It does NOT also set `.help()` — the backlog board is its own normal (key-able)
+window where native `.help()` DOES fire, so setting both showed TWO tooltips; the popover works in
+every window and is the single source. All tile-icon and backlog tooltips use it.
 
 ### Notification (Swift)
 

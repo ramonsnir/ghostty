@@ -568,7 +568,11 @@ enum QueueBacklogReasons {
 /// popover renders in its OWN window, so — unlike an in-hierarchy overlay bubble — it can NOT be
 /// clipped by an ancestor's `.clipShape`/`.clipped()` (the tile card's rounded clip, the panel
 /// bounds): the earlier overlay approach was clipped under the terminal preview and by the tile's
-/// right edge. `.help(text)` is also set so a normal (key) window still gets the OS tooltip.
+/// right edge.
+///
+/// ⚠️ Do NOT ALSO set `.help(text)`: the backlog board is its OWN normal window (not the non-key
+/// panel), where AppKit `.help()` DOES fire — so setting both showed TWO tooltips at once (the
+/// native bubble + this popover). The popover works in every window, so it is the single source.
 struct DashboardTooltip: ViewModifier {
     let text: String
     var edge: Edge = .top
@@ -577,7 +581,6 @@ struct DashboardTooltip: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .help(text)
             .onHover { inside in
                 hovering = inside
                 if inside {
