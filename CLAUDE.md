@@ -480,9 +480,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   vanishes (no churn) — that gate is what BOUNDS the otherwise-infinite retry. PURE SWIFT
   (`AgentPreviewTile.swift`) — no Zig/C/host change, live-deployable. Tests:
   `AgentMirrorReconnectTests` (`backoffQuickBurstThenSteadyMinute`,
-  `backoffSettlesAtSteadyIntervalForever`, `backoffNeverNegativeOrZero`). (The host's 978 `libxev … invalid
-  state in submission queue` bursts are a SEPARATE per-session-loop issue — see PTYHOST.md — not
-  the preview-death cause; this self-heals every transient drop regardless.)
+  `backoffSettlesAtSteadyIntervalForever`, `backoffNeverNegativeOrZero`). (The host's `libxev … invalid
+  state in submission queue` bursts were a SEPARATE per-session-loop issue — NOT the preview-death
+  cause; this self-heals every transient drop regardless. Those bursts are now ROOT-CAUSED + FIXED —
+  the `SegmentedPool` write-pool grow bug that permanently wedged one session's INPUT; see the
+  bullet below and PTYHOST.md.)
   **Paste (⌘V/⌘C/⌘X/⌘A) in the panel's modal text fields (always on, GUI-only):** ⌘V in a
   dashboard SwiftUI modal (e.g. the **Adopt** sheet's issue-key field) pasted nothing. The
   cause is NOT activation (the pinned panel is an ACTIVATING window) and NOT the menu (Edit ▸
@@ -913,6 +915,32 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `.test.ts`; Swift `MCPAnnotationTests`/`MCPServerTests`/`QueuePaletteTests`. Fork-only, template-only
   — keep the `schedules[]` in your queue JSON under `~/.config/ghostty-ramon/agent-manager/queues/`.
   **See `AGENT-QUEUE.md` (→ Schedules / Implementation notes) + `AGENT-DASHBOARD.md`.**
+
+- **PTY-host per-session input-freeze FIX (`SegmentedPool` write-pool grow corruption).** THE
+  cause of the recurring "one tab's INPUT wedges forever; session stays alive; the last frame
+  renders; survives a GUI quit/relaunch/reattach; only a HOST restart clears it" bug — and of the
+  `libxev_kqueue: invalid state in submission queue state=.active` log bursts. The PTY write path
+  vends stable-pointer `xev.WriteRequest`/`[64]u8` slots from `SegmentedPool`
+  (`src/datastruct/segmented_pool.zig`; `write_req_pool`/`write_buf_pool` in `Exec.zig` AND
+  `Client.zig`). The pool was a RING whose `grow()` reset the cursor against a **doubled modulus**
+  while writes were outstanding, so once >`prealloc`(=32) writes were in flight at once (a >2 KB
+  paste chunked into 64-byte writes, an output/DA/DSR burst, or a reattach flood) a later `get()`
+  handed back a slot whose `xev.Completion` was **still armed** → double-`add` to `loop.submissions`
+  (the logged error, ~9%) or, more often (~91%, **SILENT**), a clobbered WriteQueue `next` pointer
+  that **severed the write chain and dropped every later keystroke to that session permanently**.
+  Fix: `SegmentedPool` now tracks slot liveness with an EXPLICIT free-list (parallel index ring +
+  `head`/`available`), vending only genuinely-free slots and renormalizing `head=0` on grow, so a
+  live slot can never be re-vended regardless of grow timing; a `put()` runtime guard makes a
+  (caller-verified-impossible) over-put a safe no-op in ReleaseFast, not corruption. Public API
+  (`get`/`getGrow`/argument-less FIFO `put`/`deinit`, default `.{}`) is byte-compatible → BOTH
+  callers unchanged, and the GUI `.client` write pool is fixed by the same one-file change. Proven by
+  a 220k-iter fuzz test + a deterministic grow-while-outstanding repro that FAIL on the old ring and
+  PASS on the fix (full Zig suite green). **This is a core `src/` change that links into BOTH
+  `ghostty-host` and the GUI lib, so it takes effect only after a host redeploy + LaunchAgent
+  bootout+bootstrap (ENDS all live RAM-only sessions) AND a GUI lib/xcframework rebuild — schedule
+  the host restart deliberately.** Wiring: `src/datastruct/segmented_pool.zig` (free-list rewrite +
+  `SegmentedPool fuzz` / `SegmentedPool deterministic grow-while-outstanding repro` tests). Callers
+  unchanged. **See `PTYHOST.md` → "Write-request pool grow corruption".**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

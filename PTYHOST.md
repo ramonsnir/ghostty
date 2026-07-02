@@ -156,6 +156,38 @@ in the remediation doc.
   render-affecting host state change is silently dropped. Selection text is extracted
   in the same locked critical section as the snapshot, so highlight and copy text
   share one point-in-time read (no torn/stale copy).
+- **Write-request pool grow corruption — the permanent per-session input freeze (FIXED).**
+  This was THE cause of the recurring "one tab's input wedges forever; session stays alive;
+  survives a GUI restart; only a host restart clears it" symptom, and of the
+  `libxev_kqueue: invalid state in submission queue state=.active` bursts. **Root cause:**
+  `SegmentedPool` (`src/datastruct/segmented_pool.zig`), which vends the stable-pointer
+  `xev.WriteRequest`/`[64]u8` slots for the PTY write path (`Exec.zig` `write_req_pool` /
+  `write_buf_pool`; also `Client.zig`), was a RING (`get()` = `@mod(i, len)`) whose `grow()`
+  reset the ring cursor `i` against a **doubled modulus** while writes were still outstanding.
+  Once more than `prealloc`(=32) writes were outstanding at one moment — a >2 KB paste chunked
+  into 64-byte writes, an output/DA/DSR burst, or a reattach flood — the grow desynced the
+  cursor from the outstanding window, so a later `get()` handed back a slot whose
+  `xev.Completion` was **still armed in kqueue**. Reusing that live completion double-added it
+  to `loop.submissions` (→ the `.active` log) AND, more often, clobbered the WriteQueue's
+  intrusive `next` pointer (`stream.zig`, `req.* = .{}`), **severing the write daisy-chain so
+  every subsequent keystroke to that session was dropped forever**. Only ~9% of hits landed on
+  the active head (the logged error); ~91% hit a queued slot and wedged **silently**, so the
+  logged bursts under-counted the real frequency ~10×. State is per-session, host-side,
+  RAM-only → a GUI reattach (same `session_id`, fresh sockets) rejoined the same corrupted
+  session; only a host restart re-inited the pool. **Fix:** `SegmentedPool` now tracks slot
+  liveness EXPLICITLY with a free-list (a parallel index ring `idx` + `head`/`available`): a
+  slot is vended only from the genuinely-free region and `grow()` renormalizes to `head=0`
+  with the fresh slots as the free region, so a live slot can NEVER be re-vended regardless of
+  grow timing. Public API (`get`/`getGrow`/argument-less FIFO `put`/`deinit`, default `.{}`)
+  is byte-compatible, so both callers are unchanged and the GUI `.client` write pool is fixed
+  by the same change. `get`/`put` stay O(1) + allocation-free; only `getGrow`/`grow` allocate.
+  Proven by a 220k-iteration fuzz test (shadow model asserting no live aliasing + count
+  invariant + no live-slot clobber) and a deterministic 8-op grow-while-outstanding repro,
+  both of which FAIL on the old ring and PASS on the fix. **This is a core `src/` change that
+  links into `ghostty-host`, so it only takes effect after a host redeploy + LaunchAgent
+  bootout+bootstrap (ends live RAM-only sessions) AND a GUI lib/xcframework rebuild.** Wiring:
+  `src/datastruct/segmented_pool.zig` (free-list rewrite + the two tests). Callers unchanged:
+  `src/termio/Exec.zig`, `src/termio/Client.zig`.
 - **Known scalability caveat (not a correctness bug):** attach/close do blocking
   socket writes under `registry_mutex`, so they serialize behind one slow GUI peer —
   acceptable for a single local GUI.
@@ -167,8 +199,11 @@ in the remediation doc.
   "SPURIOUS child_exited: pid=… STILL ALIVE at emit"**. This is the proof probe for the
   reported symptom *"the GUI shows Process-exited but the session is still live in the
   host"* — if it ever fires `warn`, the `xev.Process` completion fired erroneously
-  (suspected libxev completion corruption; correlate with the `libxev_kqueue: invalid
-  state in submission queue` bursts in the same log). Reads STORED backend state only
+  (suspected libxev completion corruption; historically correlated with the
+  `libxev_kqueue: invalid state in submission queue` bursts — but note those bursts are now
+  ROOT-CAUSED and FIXED via the SegmentedPool write-pool grow bug above, so post-fix a
+  `warn` here would point at a DIFFERENT completion-corruption source, not the write pool).
+  Reads STORED backend state only
   (`Session.childPidForDiag` → `Exec.childPidForDiag`, the `.exec` fork/exec leader pid);
   no syscalls beyond the `kill(pid,0)` probe, no mutation — **`.exec` runtime is
   byte-for-byte unchanged** (the GUI never reaches `onChildExited`; it's host-only).
