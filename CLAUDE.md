@@ -595,7 +595,15 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   Ghostty links NO tracker; the template names shell `list`/`status`/`claim` provider commands (item
   fields reach the provider as argv `{key}` and the agent as `GHOSTTY_ITEM_*` env — NEVER
   string-spliced). The engine is a deterministic loop in the shared TS sidecar (no LLM in the
-  control path). HARD DEPS (self-disables otherwise): pty-host + the Claude agent-state hooks (Codex
+  control path). **Dashboard commands (adopt/promote/demote/release/set_keep/pause/stop) take effect
+  in ~1 round-trip, not 30–90s**: a new surface-less `queue_command` MCPEventBus event (fired by
+  `enqueueQueueCommand` after the FIFO append) drives a sidecar `queueReactiveLoop` long-poll
+  (mirrors the bell loop) that wakes a **coalesced** sweep immediately instead of waiting out the
+  in-flight sweep + the 5s `QUEUE_POLL_INTERVAL_MS` gap (the timer stays as backstop; the 0.5s event
+  ring + timer make a command un-losable); and the per-agent provider `status` probes in a sweep now
+  fire CONCURRENTLY (`Promise.all` in `advanceStates`) instead of sequential N×5s, which was what
+  ballooned a sweep. Pure Swift + TS, throttle/determinism unchanged — see AGENT-QUEUE.md → "Command
+  latency". HARD DEPS (self-disables otherwise): pty-host + the Claude agent-state hooks (Codex
   can dispatch but not auto-close). No-duplicates rests on a persisted dispatch LATCH (re-dispatch
   needs a real status round-trip) + reconcile + restart survival. Grid is a balanced BSP with
   multi-tab overflow (`largestLeafSplit` MUST use real pixel bounds) that is **grid-CONSTRAINED** —

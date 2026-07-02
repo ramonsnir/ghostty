@@ -90,13 +90,23 @@ final class MCPEventBus {
     // does not depend on it). The hook signal already reaches the GUI via the MCP
     // `/agent-state` route + `.ghosttyAgentStateDidChange`; wiring it into this
     // waiter registry is the only missing piece.
-    enum EventType: String { case bell, exited, prompt }
+    // (ramon fork / Agent Queue latency) `queueCommand` is a surface-LESS wake signal: it
+    // fires when a GUI queue command (adopt/promote/pause/stop/…) lands on the FIFO, so the
+    // sidecar's queue-reactive long-poll wakes an immediate supervisor sweep instead of
+    // waiting out the in-flight sweep + the 5s poll gap. Its wire value is `queue_command`
+    // (snake_case, matching the tool's type whitelist).
+    enum EventType: String { case bell, exited, prompt, queueCommand = "queue_command" }
 
     struct Event {
         let id: UUID
         let type: EventType
         let ts: Date
     }
+
+    /// Sentinel surface id for surface-less `queueCommand` events. Queue-command waiters
+    /// register with an EMPTY `ids` filter (match any), so this id is never compared; it
+    /// only fills `Event.id`. A fixed all-zero UUID keeps the event self-documenting.
+    static let queueCommandSentinelID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
     // MARK: - Event source state (main only)
 
@@ -244,6 +254,16 @@ final class MCPEventBus {
 
         guard let server else { return }
         server.queue.async { [weak self] in self?.deliver(event) }
+    }
+
+    /// (ramon fork / Agent Queue latency) Emit a surface-less `queueCommand` wake event.
+    /// Called from `MCPServer.enqueueQueueCommand` AFTER the command is appended to the FIFO,
+    /// so a woken queue-reactive waiter always drains a non-empty buffer. Safe from any
+    /// thread (`record` locks the ring + hops to the serial queue). A no-op for effect when
+    /// no waiter is parked — the coalescing ring (0.5s) and the 5s timer sweep are the
+    /// fallbacks, so a command is never lost.
+    func recordQueueCommand() {
+        record(Event(id: Self.queueCommandSentinelID, type: .queueCommand, ts: Date()))
     }
 
     /// Fan an event out to matching waiters. Runs on the server serial queue.

@@ -116,7 +116,7 @@ enum MCPTools {
                         "type": "object",
                         "properties": [
                             "ids": ["type": "array", "items": ["type": "string"]],
-                            "types": ["type": "array", "items": ["type": "string", "enum": ["bell", "exited", "prompt"]]],
+                            "types": ["type": "array", "items": ["type": "string", "enum": ["bell", "exited", "prompt", "queue_command"]]],
                         ],
                         "additionalProperties": false,
                     ],
@@ -545,7 +545,7 @@ enum MCPTools {
             let types = (filter?["types"] as? [String]) ?? []
             // Validate event types up front so a typo fails fast rather than
             // silently never matching and timing out after 30s.
-            let knownTypes: Set<String> = ["bell", "exited", "prompt"]
+            let knownTypes: Set<String> = ["bell", "exited", "prompt", "queue_command"]
             for t in types where !knownTypes.contains(t) {
                 return .invalidParams("unknown event type: \(t)")
             }

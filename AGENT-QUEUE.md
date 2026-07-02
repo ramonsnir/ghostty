@@ -468,6 +468,53 @@ review ledger:
 The load-bearing facts for an agent working on the Agent Queue Supervisor code. The local
 design + review ledger is `scratchpad/agent-queue-design.md` (paths in the iteration worktree).
 
+### Command latency: push-wake + parallel status probes (why adopt/promote used to feel slow)
+
+A dashboard command (adopt / promote / demote / release / set_keep / pause / stop / …) is
+DELIVERED by polling, not push: the GUI appends it to a FIFO drained by the MCP
+`take_queue_commands` tool at the START of a supervisor sweep. Two things used to stack into a
+30–90s felt delay before a command took effect, both fixed here:
+
+1. **No push-wake ⇒ up to a full in-flight sweep + the 5s poll gap.** The queue loop
+   (`index.ts queueTick`) is self-paced (`QUEUE_POLL_INTERVAL_MS = 5000`, armed AFTER a sweep
+   settles), and a command is only drained at a sweep's start — so a command enqueued mid-sweep
+   waited out the rest of that sweep, then up to another 5s, then the next sweep's drain. FIX: a
+   **queue-command push-wake** mirroring the bell-reactive loop. A new surface-less
+   `MCPEventBus.EventType.queueCommand` (wire value `queue_command`, sentinel id
+   `queueCommandSentinelID`) is emitted by `MCPServer.enqueueQueueCommand` **after** the FIFO
+   append (`bus.recordQueueCommand()`); the sidecar's new `queueReactiveLoop` long-polls
+   `wait_for_event(types:["queue_command"])` and, on an event, fires a **detached, coalesced**
+   sweep so a command drains in ~1 round-trip. `queueTick` and the reactive loop share ONE
+   `makeCoalescedRunner(runQueueSweepSafe)` so the timer and the wake NEVER overlap (both mutate
+   the run store) — a trigger arriving mid-sweep just sets the coalescer's re-run flag. The 5s
+   timer stays as the BACKSTOP; the server's 0.5s event-ring coalesce catches a command enqueued
+   in the sliver between the old waiter resolving and the loop re-parking, so a command is never
+   lost (worst case it waits the ≤5s timer — no worse than before). Gated on a configured queue +
+   `wait_for_event` capability; NEVER exits on error (fail-open, re-arms after a short backoff).
+   The tool's type whitelist (`MCPTools.dispatch` `knownTypes` + the schema enum) gained
+   `queue_command`.
+
+2. **Sequential provider `status` probes ballooned a single sweep.** `advanceStates` probed each
+   active agent's provider `status` one-`await`-at-a-time; each probe is a CLI call bounded by
+   `DEFAULT_PROVIDER_TIMEOUT_MS` (5s), so N agents made one sweep take ~N×5s — the dominant cost
+   a queued command then had to wait out. FIX: the due probes for a run now fire CONCURRENTLY via
+   `Promise.all` (collected into a `statusByKey` map), and the anchor-fold + `nextState` stamping
+   stay SEQUENTIAL over the same `activeList` (they mutate `run` state) — only the I/O is
+   parallelized, so ordering/determinism and the throttle/window-burn semantics (`probed` = "≥1
+   probe fired", `statusDue`, no-live-agent-doesn't-burn) are unchanged. A per-probe rejection
+   guard keeps one throw from failing the whole batch (`probeStatus` already swallows exec
+   failures → `{terminal:false}`).
+
+Wiring: `macos/Sources/Features/MCP/MCPEventBus.swift` (`queueCommand` type + `queueCommandSentinelID`
++ `recordQueueCommand`), `MCPQueueCommands.swift` (`enqueueQueueCommand` fires the wake),
+`MCPTools.swift` (`queue_command` in the whitelist + schema), `macos/agent-manager/src/index.ts`
+(`QUEUE_WAIT_MS`/`QUEUE_WAIT_RETRY_MS` + `runQueueSweepCoalesced` + `queueReactiveLoop` + arm),
+`macos/agent-manager/src/queue/runner.ts` (`advanceStates` parallel probe batch). Tests:
+`runner.test.ts` (`advanceStates: due status probes … run CONCURRENTLY`), `MCPServerTests.swift`
+(`dispatchWaitForEventQueueCommandType`, `dispatchWaitForEventUnknownTypeRejected`,
+`queueCommandEventTypeWireValueAndSentinel`). **GUI relaunch + rebuilt sidecar `dist`; NO Zig/lib
+or host change** (pure Swift + TS).
+
 ### `agent-queue-max-total` — optional fleet cap, default 0 = UNLIMITED (and the getter bug)
 
 - **`agent-queue-max-total` defaults to `0` = UNLIMITED** (was `8`). It is an OPTIONAL

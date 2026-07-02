@@ -2451,6 +2451,73 @@ test("advanceStates: a due status sweep with NO live agent does not burn the int
   assert.equal(fake.calls.status.length, 1, "probes immediately once the agent is live (window not pre-burned)");
 });
 
+// (parallel probes / command-latency fix) The per-agent provider `status` probes in a sweep
+// run CONCURRENTLY, not one-await-at-a-time. Serialized N×5s probes were the dominant sweep-
+// latency source that made a queued adopt/promote wait tens of seconds. This measures PEAK
+// concurrency via a barrier exec: each status probe increments an in-flight counter and does
+// not resolve until ALL N are simultaneously in-flight (a 200ms safety net makes a serialized
+// regression FAIL the assertion promptly instead of hanging). Under Promise.all all N enter
+// together → peak N; a serial `for … await` would peak at 1.
+test("advanceStates: due status probes for multiple agents run CONCURRENTLY (not serialized)", async () => {
+  const N = 3;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let release!: () => void;
+  const allIn = new Promise<void>((r) => (release = r));
+
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1"},{"id":"K-2"},{"id":"K-3"}]',
+    spawns: [
+      { id: "s1", sessionId: 901 },
+      { id: "s2", sessionId: 902 },
+      { id: "s3", sessionId: 903 },
+    ],
+  });
+  let surfaces: Surface[] = [];
+  (fake.client as unknown as { listSurfaces: () => Promise<Surface[]> }).listSurfaces =
+    async () => surfaces;
+
+  // Barrier status exec (list/graph delegate to the fake). Peak concurrency is recorded as
+  // each probe enters; the probe unblocks only once all N are in-flight together.
+  const exec: Exec = async (argv, opts) => {
+    if (argv[0] !== "status") return fake.exec(argv, opts);
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    if (inFlight >= N) release();
+    await Promise.race([allIn, new Promise<void>((r) => setTimeout(r, 200))]);
+    inFlight -= 1;
+    return { code: 0, stdout: '{"state":"working"}', stderr: "" };
+  };
+
+  const t = tmpl({
+    concurrency: N,
+    grid: { cols: N, rows: 1, fill: "columns" },
+    intervals: { listMs: 0, statusMs: 0 },
+  });
+  const run = makeQueueRun(t, memStore());
+  let now = 3_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { exec });
+
+  // Dispatch all N (→ SPAWNED). Surfaces not live yet → no probe fires.
+  await runQueueSweep(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, N, "all N items dispatched");
+  assert.equal(maxInFlight, 0, "no status probe while the agents aren't live yet");
+
+  // The N agents are now live + working → the next sweep probes all N.
+  surfaces = [
+    queueSurface({ id: "s1", sessionID: 901, agentState: "working", queueKey: "K-1", queueName: "backlog" }),
+    queueSurface({ id: "s2", sessionID: 902, agentState: "working", queueKey: "K-2", queueName: "backlog" }),
+    queueSurface({ id: "s3", sessionID: 903, agentState: "working", queueKey: "K-3", queueName: "backlog" }),
+  ];
+  now += 5000;
+  await runQueueSweep(deps);
+
+  assert.equal(maxInFlight, N, "all N status probes were in-flight simultaneously (parallelized)");
+});
+
 // ---------------------------------------------------------------------------
 // (backlog graph) provider.graph fetch + report_queue_graph push (throttled, present:false).
 // ---------------------------------------------------------------------------
