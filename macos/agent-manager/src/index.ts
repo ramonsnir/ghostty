@@ -128,6 +128,19 @@ const BELL_WAIT_RETRY_MS = 3000;
 const QUEUE_WAIT_MS = 60000;
 /** Backoff before re-parking after a failed queue-command `wait_for_event`. */
 const QUEUE_WAIT_RETRY_MS = 3000;
+/** (Agent Queue latency — anti-spin) MINIMUM gap between two reactive wakes. The GUI's
+ *  `MCPEventBus.register` COALESCES: a `wait_for_event` resolves IMMEDIATELY on any matching
+ *  event seen within its 0.5s ring window. The bell loop is naturally spaced by its slow
+ *  Haiku classify between re-parks, but the queue loop fires its sweep fire-and-forget and
+ *  re-parks with NO await — so a single `recordQueueCommand` event stays "recent" and the loop
+ *  re-resolves on that SAME stale event hundreds of times/sec for the whole window (an event
+ *  STORM that saturates the MCP serial queue → other tool calls time out → the GUI beachballs;
+ *  observed live at ~471 wakes/sec). Sleeping past the coalesce window before re-parking lets
+ *  the event age out, so the next park is a real park. Cost: a distinct command that lands
+ *  during the sleep is drained ≤ this-many-ms later — still far under the 5s timer, and the
+ *  command is never lost (the FIFO holds it + the timer is a backstop). MUST exceed the GUI's
+ *  0.5s `coalesceWindow`. */
+const QUEUE_REACTIVE_MIN_INTERVAL_MS = 750;
 
 /** (orphan guard) How often the parent-death watchdog checks `process.ppid`. The sidecar
  *  is a child of the GUI; when that GUI dies (crash / SIGKILL / a clean-quit teardown that
@@ -1348,6 +1361,11 @@ async function main(): Promise<void> {
         void runQueueSweepCoalesced().catch((err) =>
           errlog(`queue reactive sweep failed: ${err instanceof Error ? err.message : String(err)}`),
         );
+        // ANTI-SPIN: wait past the GUI's coalesce window before re-parking so this same event
+        // can't immediately re-resolve the next `wait_for_event` (see QUEUE_REACTIVE_MIN_INTERVAL_MS).
+        // Without this the loop spins at hundreds of wakes/sec for the whole 0.5s window — an
+        // event storm that saturates the MCP server and beachballs the GUI.
+        await sleep(QUEUE_REACTIVE_MIN_INTERVAL_MS);
       }
       // ev === null ⇒ park timeout; just loop and re-park.
     }

@@ -567,6 +567,21 @@ DELIVERED by polling, not push: the GUI appends it to a FIFO drained by the MCP
    `wait_for_event` capability; NEVER exits on error (fail-open, re-arms after a short backoff).
    The tool's type whitelist (`MCPTools.dispatch` `knownTypes` + the schema enum) gained
    `queue_command`.
+   **⚠️ ANTI-SPIN (fixed 2026-07-03).** That same 0.5s event-ring coalesce could turn the
+   reactive loop into an **event STORM**: `MCPEventBus.register` resolves a `wait_for_event`
+   IMMEDIATELY if a matching event is within the 0.5s ring window, and the queue loop fires its
+   sweep fire-and-forget then re-parks with **no await** — so ONE `recordQueueCommand` kept
+   re-resolving the loop's re-parks hundreds of times/sec for the whole window (observed ~471
+   wakes/sec), saturating the MCP serial queue until other tool calls (`set_surface_annotation`,
+   `report_queue_status`, even `spawn_split_command`) timed out at 15s → the GUI BEACHBALLED.
+   (The bell loop is immune: its slow Haiku classify naturally spaces re-parks past the window.)
+   Surfaced when a **Schedule** run-now landed during a spin (its split-spawn sweep is heavier).
+   FIX: the queue reactive loop sleeps `QUEUE_REACTIVE_MIN_INTERVAL_MS` (750ms, > the 0.5s window)
+   after each wake before re-parking, so the just-consumed event ages out and the next park is a
+   real park. A command landing during the sleep is still drained ≤750ms later (never lost — the
+   FIFO holds it + the 5s timer backstops). Pre-existing latent bug; the schedule dispatch only
+   made it visible. Wiring: `index.ts` (`QUEUE_REACTIVE_MIN_INTERVAL_MS` + the `await sleep` in
+   `queueReactiveLoop`).
 
 2. **Sequential provider `status` probes ballooned a single sweep.** `advanceStates` probed each
    active agent's provider `status` one-`await`-at-a-time; each probe is a CLI call bounded by
