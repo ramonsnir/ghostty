@@ -41,6 +41,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
+    schedules: [],
     ...over,
   };
 }

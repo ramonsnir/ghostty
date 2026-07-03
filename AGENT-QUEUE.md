@@ -487,6 +487,83 @@ Hero classification (the run-level `hero` set) is persisted in the per-run store
 across a sidecar/GUI restart**, so a promoted split comes back a hero. `maxItems` accounting rides
 the single total `lifetimeDispatched` counter (regular + hero), also persisted. Cleared on abort.
 
+## Schedules (recurring scan agents that groom the backlog)
+
+A **schedule** is a recurring, **low-cognition** scan agent a queue runs on a cron cadence — it
+periodically sweeps the queue's *project* (docs / backlog / code) and **opens or amends backlog
+issues** for the drift, tech-debt, and coverage gaps it finds (e.g. "this customer-facing doc
+drifted from the code — open a doc-update issue", "these two tasks are missing to fully cover
+objective X", "reorganize these dependencies"). It's project/tech-debt *maintenance* you shouldn't
+have to remember to trigger. Schedules run in the **same grid/tab as regular work agents**; they
+are a per-queue feature, not a new subsystem.
+
+**Autonomy is entirely the PROSE.** A schedule is just a cron cadence + a prompt (inline `prompt`
+or a neighboring `promptFile`). The prompt tells the agent what it may do — open issues (with an
+agreed **auto-generated label** so they're recognizable), amend an existing one, or accept it's
+already in progress — and Ghostty adds **no** special issue-creation machinery. Dedup rests on the
+cadence (roughly one run per cycle) plus the prose ("search existing issues before opening new
+ones"). A schedule can be pointed at production tools, MCP servers, etc. — that's your prose's call.
+
+Declare schedules in the template:
+
+```jsonc
+{
+  // …the usual name/workdir/agent/provider…
+  "schedules": [
+    {
+      "id": "doc-drift",                 // stable id: single-flight key + persistence key
+      "name": "Doc drift scan",          // dashboard label (defaults to id)
+      "cron": "0 9,14 * * 1-5",          // weekdays at 9am + 2pm, LOCAL time (5-field cron)
+      "promptFile": "./schedules/doc-drift.md",   // prose (relative to the template dir); or "prompt": "…"
+      "command": "exec ./schedules/schedule-agent.sh", // a launcher that CONSUMES $GHOSTTY_SCHEDULE_PROMPT
+      "closeOnComplete": true            // default true — auto-close an exited scan
+    }
+  ]
+}
+```
+
+**How the prose reaches the agent — by FILE PATH, not on the command line.** ⚠️ The prose is **not**
+put on the launch command. `spawn_split_command` delivers a split's command by TYPING it into the
+shell (interior newlines collapsed) — a large multi-line/UTF-8 prose there gets mangled (em-dashes →
+control-char garbage, interleaved with the shell's login banner, never cleanly submitted). So the
+runner passes a **short** env instead: `promptFile` → **`GHOSTTY_SCHEDULE_PROMPT_FILE`** = its
+absolute path (the launcher `cat`s it — full newlines + UTF-8 preserved); a short inline `prompt`
+(no file) → `GHOSTTY_SCHEDULE_PROMPT` on the command line. Both come with `GHOSTTY_SCHEDULE_ID`/
+`_NAME` and the run's resolved param env (e.g. `LINEAR_PROJECT`/`LINEAR_MILESTONES`, so the scan is
+**scoped to the same project/milestone as the run**) — the SAME "context via env" contract as a work
+item's `GHOSTTY_ITEM_*`. So the schedule's **`command` must CONSUME the prompt** — a small launcher
+like `claude "$(cat "$GHOSTTY_SCHEDULE_PROMPT_FILE")"`. ⚠️ It **defaults to the template
+`agent.command`**, the *work-item* launcher (expects `GHOSTTY_ITEM_*`, misfires for a schedule) — so
+a schedule almost always sets its own `command` pointing at a schedule launcher. **Use `promptFile`
+for anything longer than a short line.**
+
+**Cadence — completion-anchored, with a half-gap skip.** The `cron` is a standard 5-field
+expression in **local wall-clock** time (minute hour day-of-month month day-of-week; lists/ranges/
+steps supported; day-of-week `0`/`7` = Sunday). The next run is computed from **when the previous
+run's split closed**, not a fixed grid — so a long run pushes the next one out — and the next cron
+firing is **skipped if it lands within half the local cadence** of the last completion (so a scan
+that overran deep into a cycle waits a full further cycle rather than firing right on its heels).
+Missed firings while the sidecar/GUI was down (or the schedule was paused) are **not** replayed —
+the next due run fires once, then re-anchors. **Single-flight:** a schedule never has two runs at
+once (a new run is armed only after the current one closes).
+
+**Completion = the split closing** — by any cause: the agent exits and (with `closeOnComplete`)
+the split is auto-closed, *or* you close it yourself. No hook/idle dependency, so it works for
+Codex too. A schedule that needs your input just **bells like any agent** and stays open until you
+handle + close it; that close is its completion.
+
+**Dashboard — a thin Schedules lane + a tile glyph.** Under each queue's health row, a compact
+**Schedules** lane shows one row per schedule — *name · next-run / paused / running · last-run*,
+a **Run-now** button, and a **pause/resume** toggle — plus a **pause-all** control (the vacation
+switch). A running scheduled split carries a teal recurring-clock glyph on its dashboard tile
+(distinct from the hero purple star). Pausing is per-schedule (or all at once); a paused schedule
+never fires, but **Run-now still works** so you can kick one off ad hoc.
+
+Schedules bypass the `concurrency` / `agent-queue-max-total` / `maxItems` caps (they're maintenance,
+not throughput), but they **do occupy the grid** (overflowing to a new row/tab when full, like a
+work item). Cadence + pause state persist in the per-run store and survive a sidecar/GUI restart;
+a still-open scheduled split is re-adopted after a restart (no re-dispatch).
+
 ## What it guarantees
 
 - **No duplicate agents per item key** — across the dispatch race (before an item leaves the
@@ -596,6 +673,21 @@ DELIVERED by polling, not push: the GUI appends it to a FIFO drained by the MCP
    `wait_for_event` capability; NEVER exits on error (fail-open, re-arms after a short backoff).
    The tool's type whitelist (`MCPTools.dispatch` `knownTypes` + the schema enum) gained
    `queue_command`.
+   **⚠️ ANTI-SPIN (fixed 2026-07-03).** That same 0.5s event-ring coalesce could turn the
+   reactive loop into an **event STORM**: `MCPEventBus.register` resolves a `wait_for_event`
+   IMMEDIATELY if a matching event is within the 0.5s ring window, and the queue loop fires its
+   sweep fire-and-forget then re-parks with **no await** — so ONE `recordQueueCommand` kept
+   re-resolving the loop's re-parks hundreds of times/sec for the whole window (observed ~471
+   wakes/sec), saturating the MCP serial queue until other tool calls (`set_surface_annotation`,
+   `report_queue_status`, even `spawn_split_command`) timed out at 15s → the GUI BEACHBALLED.
+   (The bell loop is immune: its slow Haiku classify naturally spaces re-parks past the window.)
+   Surfaced when a **Schedule** run-now landed during a spin (its split-spawn sweep is heavier).
+   FIX: the queue reactive loop sleeps `QUEUE_REACTIVE_MIN_INTERVAL_MS` (750ms, > the 0.5s window)
+   after each wake before re-parking, so the just-consumed event ages out and the next park is a
+   real park. A command landing during the sleep is still drained ≤750ms later (never lost — the
+   FIFO holds it + the 5s timer backstops). Pre-existing latent bug; the schedule dispatch only
+   made it visible. Wiring: `index.ts` (`QUEUE_REACTIVE_MIN_INTERVAL_MS` + the `await sleep` in
+   `queueReactiveLoop`).
 
 2. **Sequential provider `status` probes ballooned a single sweep.** `advanceStates` probed each
    active agent's provider `status` one-`await`-at-a-time; each probe is a CLI call bounded by
@@ -1841,3 +1933,51 @@ or host change** (pure Swift + TS).
     (any fs error falls back to console only, never throws); installed first thing in `index.ts main()`.
     Pure `formatLogLine`/`defaultLogPath` unit-tested (`logfile.test.ts`). **Sidecar-only — rebuilt
     `dist` + sidecar restart; no host/Zig/GUI-Swift change.**
+
+- **Schedules (recurring scan agents).** A per-queue array of cron-scheduled scan agents (see
+  "Schedules" above). NO config key + NO new MCP tool + NO Zig/host change — GUI relaunch +
+  rebuilt sidecar `dist`. Cadence is PURE (`queue/schedule.ts`): a vendored 5-field cron parser
+  (`parseCron`/`nextAfter`/`prevBefore`, LOCAL time) + `computeNextStart(cron, state)` implementing
+  the completion-anchored **half-of-local-gap skip** (`A > C + (A − prevFiring)/2`, strictly
+  greater; never-ran uses the arm anchor with NO skip). The runner's `scheduleSweep` (runner.ts,
+  called every sweep from `runOne`) arms/prunes cadence state, detects completion (a tracked
+  scheduled surface gone from `list_surfaces` → `lastCompletionAt = now`), re-adopts a live
+  scheduled surface after a restart, auto-closes an EXITED split (when `closeOnComplete`), and
+  dispatches a due/run-now schedule via a grid-packed split (`dispatchSchedule`). The prose reaches
+  the agent as the `GHOSTTY_SCHEDULE_PROMPT` env (+ a single-quoted command PREFIX for the pty-host
+  backend, like GHOSTTY_ITEM_*), ALONGSIDE `GHOSTTY_SCHEDULE_ID`/`_NAME` and the run's resolved
+  param env (`resolveParamsEnv` — so a scan is scoped to the same project/milestone as the run);
+  the agent's `command`/launcher CONSUMES it (`claude "$GHOSTTY_SCHEDULE_PROMPT"`) rather than us
+  typing it (a fresh raw-mode TUI drops pre-first-input typing). The dispatch BYPASSES the
+  concurrency/maxItems/max-total caps (it
+  is NOT in `run.active`) but still packs into the grid. A scheduled split carries a `queueName` +
+  `schedule`/`scheduleId` annotation but **no `queueKey`**, so the work-item `reconcile` leaves it
+  alone (it only adopts keyed surfaces). Single-flight is structural (`run.scheduleActive`, keyed by
+  schedule id, rebuilt each sweep from the annotated live surfaces). Cadence + pause persist in the
+  per-run store (`StoreFile.schedules`, `{armedAt, lastCompletionAt?, paused?}`) + rehydrate on the
+  first reconcile. **Wire contract (both sides must match — the `coerceQueueCommands` lesson):**
+  template `schedules[]` is a validation chokepoint (`templates.ts validateSchedules` whitelists the
+  fields + parses the cron; the loader resolves `promptFile`→`prompt`); commands
+  `pause_schedule`/`resume_schedule`/`run_schedule_now`/`pause_all_schedules` carrying `{run,
+  scheduleId?}` are in the `coerceQueueCommands` `QUEUE_ACTIONS` whitelist (mcp.ts) — omission
+  SILENTLY DROPS them; `list_surfaces` emits `scheduleId` (the reconcile-visibility chokepoint,
+  `MCPLayout.surfacesJSONData`); the status report carries a `schedules[]` array
+  (`{id,name,paused,running,nextRunAt?,lastCompletionAt?}`) for the dashboard lane. Wiring:
+  sidecar `queue/schedule.ts` (NEW), `queue/types.ts` (`ScheduleSpec` + `QueueTemplate.schedules`),
+  `queue/templates.ts` (`validateSchedules` + promptFile resolution), `queue/store.ts`
+  (`StoreFile.schedules` + `parseSchedules`/serialize), `queue/runner.ts` (`scheduleSweep`/
+  `dispatchSchedule`/`scheduleStatuses`/`scheduleRecord`/`persistRun` + rehydrate), `queue/commands.ts`
+  (4 actions + `scheduleId`), `queue/status.ts` (`ScheduleStatus` + report echo), `mcp.ts`
+  (`coerceQueueCommands` whitelist + `scheduleId` + `Annotation`/`Surface` fields + report wire);
+  macOS `MCPAnnotation.swift`/`AgentStateBridge.swift` (`queueSchedule`/`scheduleId` on
+  `AgentAnnotation` + parse + merge), `MCPTools.swift` (`set_surface_annotation` schema),
+  `MCPLayout.swift` (`SurfaceRow.scheduleId` + emit), `AgentDashboardController.swift`
+  (`HookSnapshotEntry.scheduleId`, `pauseSchedule`/`resumeSchedule`/`runScheduleNow`/
+  `pauseAllSchedules`), `QueueCommandBridge.swift` (4 `Action` cases + `scheduleId` + jsonObject +
+  `QueueStatus.ScheduleStatus` decode), `AgentPreviewTile.swift` (teal schedule glyph),
+  `AgentDashboardView.swift` (the thin Schedules lane). Tests: sidecar `queue/schedule.test.ts`
+  (cron + skip matrix), `queue/templates.test.ts` (validate + promptFile), `queue/store.test.ts`
+  (persist round-trip), `queue/commands.test.ts` (4 actions), `queue/runner.test.ts` (dispatch /
+  single-flight / prose / completion / auto-close), `mcp.test.ts` (coerce whitelist), `status.test.ts`;
+  Swift `MCPAnnotationTests` (parse + merge), `MCPServerTests` (`scheduleId` emit), `QueuePaletteTests`
+  (command round-trip + status decode).

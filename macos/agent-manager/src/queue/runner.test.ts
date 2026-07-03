@@ -63,6 +63,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
+    schedules: [],
     ...over,
   };
 }
@@ -103,6 +104,7 @@ interface QueueFake {
     forceClose: string[];
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
+    sendText: Array<{ id: string; text: string }>;
     moveIntoTab: Array<{ sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }>;
     /** (hero) perform_action calls — the promote eject uses `move_split_to_new_tab`. */
     perform: Array<{ id: string; action: string }>;
@@ -121,6 +123,7 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     forceClose: [],
     signal: [],
     sendKey: [],
+    sendText: [],
     moveIntoTab: [],
     perform: [],
     list: 0,
@@ -163,6 +166,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     },
     async sendKey(id: string, key: string): Promise<void> {
       calls.sendKey.push({ id, key });
+    },
+    async sendText(id: string, text: string): Promise<void> {
+      calls.sendText.push({ id, text });
     },
     async moveSurfaceIntoTab(args: { sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }): Promise<void> {
       calls.moveIntoTab.push(args);
@@ -3479,4 +3485,123 @@ test("runQueueSweep: a run with empty templateDir OMITS GHOSTTY_QUEUE_TEMPLATE_D
     !(fake.calls.spawn[0].command as string).includes("GHOSTTY_QUEUE_TEMPLATE_DIR"),
     "no command prefix",
   );
+});
+
+// ---------------------------------------------------------------------------
+// (schedules) recurring scan-agent dispatch / single-flight / completion / auto-close.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: dispatches a DUE schedule, holds single-flight while live, delivers prose, re-arms on close", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan the docs", closeOnComplete: true }] }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  // Whole-minute clock so `* * * * *` fires deterministically (armedAt lands on a firing).
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  // sweep 1: ARM (dispatch-suppressed) — no spawn.
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 0, "first sweep arms, does not dispatch");
+  assert.ok(run.schedules.get("s1"), "s1 armed");
+
+  // sweep 2: DUE (armedAt=100M is a firing; now is past it) → dispatch the scheduled split.
+  now = 101 * M;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 1, "due schedule dispatches exactly one split");
+  const ann = fake.calls.annotate.find((a) => (a.ann as { scheduleId?: string }).scheduleId === "s1");
+  assert.ok(ann, "the scheduled split is annotated with its scheduleId");
+  assert.equal((ann!.ann as { schedule?: boolean }).schedule, true, "annotated schedule:true");
+  assert.equal(run.scheduleActive.has("s1"), true, "tracked as the live scheduled run");
+  // The prose + schedule identity ride the spawn command as a GHOSTTY_SCHEDULE_* env prefix
+  // (consumed by the agent, e.g. `claude "$GHOSTTY_SCHEDULE_PROMPT"`) — NOT typed in.
+  const cmd = fake.calls.spawn[0].command as string;
+  assert.ok(cmd.includes("GHOSTTY_SCHEDULE_ID='s1'"), "schedule id env prefix on the command");
+  assert.ok(cmd.includes("GHOSTTY_SCHEDULE_PROMPT='scan the docs'"), "prose delivered as env");
+
+  // The scheduled split is now live in list_surfaces → single-flight holds (no second dispatch).
+  spec.surfaces = [
+    Object.assign(surface({ id: "sch-1", agentState: "working" }), {
+      queueName: run.runName,
+      scheduleId: "s1",
+    }) as Surface & { sessionID?: number },
+  ];
+  (spec.surfaces[0] as { sessionID?: number }).sessionID = 500;
+
+  // sweep 3: single-flight (no new spawn).
+  now = 102 * M;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 1, "single-flight: no second dispatch while live");
+
+  // sweep 4: the split CLOSED (gone from list_surfaces) → completion re-anchors the cadence.
+  spec.surfaces = [];
+  now = 103 * M;
+  await runQueueSweep(deps);
+  assert.equal(run.scheduleActive.has("s1"), false, "single-flight slot freed on close");
+  assert.equal(run.schedules.get("s1")!.lastCompletionAt, 103 * M, "completion re-anchored to close time");
+});
+
+test("runQueueSweep: a promptFile schedule delivers the FILE PATH (not the prose) on the command", async () => {
+  // The load-bearing fix: the multi-line/UTF-8 prose must NOT go on the command line (which
+  // spawn_split_command types + mangles). When promptFilePath is set, the command carries a
+  // short GHOSTTY_SCHEDULE_PROMPT_FILE env; the prose (GHOSTTY_SCHEDULE_PROMPT) is NOT present.
+  const run = makeQueueRun(
+    tmpl({
+      schedules: [
+        {
+          id: "s1",
+          cron: "* * * * *",
+          prompt: "line one\nline two\nwith an em-dash — and more",
+          promptFilePath: "/cfg/queues/scans/s1.md",
+          closeOnComplete: true,
+        },
+      ],
+    }),
+    memStore(),
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // dispatch
+  assert.equal(fake.calls.spawn.length, 1);
+  const cmd = fake.calls.spawn[0].command as string;
+  assert.ok(cmd.includes("GHOSTTY_SCHEDULE_PROMPT_FILE='/cfg/queues/scans/s1.md'"), "delivers the file path");
+  assert.ok(!cmd.includes("GHOSTTY_SCHEDULE_PROMPT="), "does NOT put the prose on the command line");
+  assert.ok(!cmd.includes("em-dash"), "the prose text is not on the command line");
+});
+
+test("runQueueSweep: auto-closes an EXITED scheduled split when closeOnComplete (the default)", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }] }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // dispatch → sch-1
+
+  // The scheduled agent's child EXITED (scan finished) while the split is still present.
+  spec.surfaces = [
+    Object.assign(surface({ id: "sch-1", exited: true }), {
+      queueName: run.runName,
+      scheduleId: "s1",
+    }),
+  ];
+  now = 102 * M;
+  await runQueueSweep(deps);
+  assert.ok(fake.calls.forceClose.includes("sch-1"), "an exited scheduled split is force-closed");
 });

@@ -663,3 +663,94 @@ test("substituteTemplateDir: a template WITHOUT the token is deep-equal after su
   const out = substituteTemplateDir(t, "/anything");
   assert.deepEqual(out, t); // no-op safety
 });
+
+// ---------------------------------------------------------------------------
+// schedules — validateTemplate (shape + cron) + loader promptFile resolution.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: schedules default to [] when absent", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (r.ok) assert.deepEqual(r.template.schedules, []);
+});
+
+test("validateTemplate: a valid inline-prompt schedule parses (cron kept, closeOnComplete defaults true)", () => {
+  const obj = goodTemplateObj();
+  obj.schedules = [
+    { id: "doc-drift", name: "Doc drift", cron: "0 9 * * 1-5", prompt: "scan the docs" },
+  ];
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  if (r.ok) {
+    assert.equal(r.template.schedules.length, 1);
+    const s = r.template.schedules[0];
+    assert.equal(s.id, "doc-drift");
+    assert.equal(s.name, "Doc drift");
+    assert.equal(s.cron, "0 9 * * 1-5");
+    assert.equal(s.prompt, "scan the docs");
+    assert.equal(s.closeOnComplete, true);
+  }
+});
+
+test("validateTemplate: rejects a schedule with a bad cron, missing id, or neither/both prompt sources", () => {
+  const badCron = goodTemplateObj();
+  badCron.schedules = [{ id: "x", cron: "0 99 * * *", prompt: "p" }];
+  assert.equal(validateTemplate(badCron).ok, false);
+
+  const noId = goodTemplateObj();
+  noId.schedules = [{ cron: "0 9 * * *", prompt: "p" }];
+  assert.equal(validateTemplate(noId).ok, false);
+
+  const noPrompt = goodTemplateObj();
+  noPrompt.schedules = [{ id: "x", cron: "0 9 * * *" }];
+  assert.equal(validateTemplate(noPrompt).ok, false);
+
+  const bothPrompt = goodTemplateObj();
+  bothPrompt.schedules = [{ id: "x", cron: "0 9 * * *", prompt: "p", promptFile: "f.md" }];
+  assert.equal(validateTemplate(bothPrompt).ok, false);
+
+  const dupId = goodTemplateObj();
+  dupId.schedules = [
+    { id: "x", cron: "0 9 * * *", prompt: "a" },
+    { id: "x", cron: "0 10 * * *", prompt: "b" },
+  ];
+  assert.equal(validateTemplate(dupId).ok, false);
+});
+
+/** A path-aware in-memory fs seam: maps absolute paths → text; mtime non-null for known
+ *  paths. Used to test promptFile resolution (the loader reads the template JSON AND the
+ *  resolved prompt file). */
+function pathFs(files: Record<string, string>): TemplateFs {
+  return {
+    statMtimeMs: (p: string) => (p in files ? 1 : null),
+    readText: (p: string) => (p in files ? files[p] : null),
+  };
+}
+
+test("makeTemplateLoader: resolves promptFile relative to the template dir into prompt", () => {
+  const obj = goodTemplateObj();
+  obj.schedules = [{ id: "doc-drift", cron: "0 9 * * 1-5", promptFile: "scans/doc.md" }];
+  const fs = pathFs({
+    "/cfg/queues/q.json": JSON.stringify(obj),
+    "/cfg/queues/scans/doc.md": "review the docs and open issues",
+  });
+  const loader = makeTemplateLoader("/cfg/queues/q.json", fs);
+  const r = loader.load();
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  if (r.ok) {
+    assert.equal(r.template.schedules[0].prompt, "review the docs and open issues");
+    // The ABSOLUTE resolved path is kept too, so the runner can deliver the prose by FILE
+    // (GHOSTTY_SCHEDULE_PROMPT_FILE) rather than putting the whole prose on the command line.
+    assert.equal(r.template.schedules[0].promptFilePath, "/cfg/queues/scans/doc.md");
+  }
+});
+
+test("makeTemplateLoader: an unreadable/empty promptFile fails the load", () => {
+  const obj = goodTemplateObj();
+  obj.schedules = [{ id: "doc-drift", cron: "0 9 * * 1-5", promptFile: "missing.md" }];
+  const fs = pathFs({ "/cfg/queues/q.json": JSON.stringify(obj) }); // no missing.md
+  const loader = makeTemplateLoader("/cfg/queues/q.json", fs);
+  const r = loader.load();
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.ok(r.errors[0].includes("promptFile"));
+});

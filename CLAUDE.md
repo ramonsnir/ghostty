@@ -842,6 +842,57 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   the two-pool model, wire contract) + `AGENT-QUEUE.md`/`AGENT-DASHBOARD.md`. GUI relaunch + Zig/lib
   rebuild (new config key) + rebuilt sidecar `dist`; NO host restart.**
 
+- **Agent Queue Schedules** (fork-only, macOS; NO config key — declared per-queue in the template)
+  — **recurring, low-cognition scan agents** a queue runs on a cron cadence to GROOM its project:
+  each periodically sweeps the docs / backlog / code and **opens or amends backlog issues** for
+  drift / tech-debt / coverage gaps (e.g. "this doc drifted — open a doc-update issue", "two tasks
+  missing to cover objective X", "reorganize these deps"). A schedule is a **per-queue FEATURE, not
+  a subsystem** (contrast the whole engine, the "Supervisor"; the name "schedules" was chosen to
+  avoid overloading it). **Autonomy is entirely the PROSE** (`promptFile`/`prompt`) — the prompt
+  says what the agent may do (open issues with an agreed auto-gen LABEL, amend, or accept
+  already-in-progress) and Ghostty adds NO issue-creation machinery; dedup rests on the cadence +
+  the prose ("check existing issues first"). Schedules run in the **same grid/tab as work agents**
+  and **BYPASS the concurrency/`agent-queue-max-total`/`maxItems` caps** (maintenance, not
+  throughput) but still occupy the grid (overflow like a work item). **Cadence — completion-anchored
+  with a half-of-local-gap skip:** the `cron` is a 5-field LOCAL-time expression; the next run is
+  computed from **when the previous run's split CLOSED** (a long run pushes the next out), and the
+  next cron firing is SKIPPED if it lands within half the local cadence of the last completion
+  (`A > C + (A − prevFiring)/2`, strictly greater — pins the boundary; never-ran uses the arm
+  anchor with NO skip). No backfill of missed firings (down/paused ⇒ fire once, re-anchor).
+  **Single-flight** (never two runs of one schedule at once — structural, a new run arms only after
+  the current closes). **Completion = the split closing, by ANY cause** (agent exits + `closeOnComplete`
+  auto-closes it, OR you close it) — NO hook/idle dependency, so it works for **Codex** too; a
+  schedule that needs you just BELLS like any agent and stays open until you close it. **Dashboard:**
+  a thin **Schedules lane** under each queue (name · next-run/paused/running · last-run · Run-now ·
+  pause/resume, plus pause-all = the vacation switch) + a **teal recurring-clock tile glyph** (distinct
+  from hero purple). Cadence + pause persist in the per-run store and survive a restart (a still-open
+  scheduled split is re-adopted, no re-dispatch). **A scheduled surface carries `queueName` +
+  `schedule`/`scheduleId` annotation but NO `queueKey`, so the work-item reconcile leaves it alone**
+  (it only adopts keyed surfaces) — the schedule pass tracks it separately. **Wire contract (both
+  sides must match — the `coerceQueueCommands` lesson):** template `schedules[]` (validated by
+  `validateSchedules`, cron parsed, `promptFile` resolved by the loader); commands
+  `pause_schedule`/`resume_schedule`/`run_schedule_now`/`pause_all_schedules` carrying `{run,
+  scheduleId?}` are in the `coerceQueueCommands` `QUEUE_ACTIONS` whitelist (mcp.ts) — omission
+  SILENTLY DROPS them; `list_surfaces` emits `scheduleId` (reconcile-visibility chokepoint,
+  `MCPLayout.surfacesJSONData`); the status report carries a `schedules[]` array for the lane.
+  **NO new MCP tool** (the 4 commands ride `take_queue_commands`; `schedule`/`scheduleId` ride
+  `set_surface_annotation`) and **NO Zig/host change** — GUI relaunch + rebuilt sidecar `dist`.
+  Wiring — sidecar: `queue/schedule.ts` (NEW pure cron + `computeNextStart`), `queue/types.ts`
+  (`ScheduleSpec` + `QueueTemplate.schedules`), `queue/templates.ts` (`validateSchedules` + promptFile
+  resolution), `queue/store.ts` (`StoreFile.schedules` + `parseSchedules`), `queue/runner.ts`
+  (`scheduleSweep`/`dispatchSchedule`/`scheduleStatuses`/`scheduleRecord`/`persistRun` + rehydrate),
+  `queue/commands.ts` (4 actions + `scheduleId`), `queue/status.ts` (`ScheduleStatus`), `mcp.ts`
+  (coerce whitelist + `Annotation`/`Surface` fields + report wire). macOS: `MCPAnnotation.swift` +
+  `AgentStateBridge.swift` (`queueSchedule`/`scheduleId` + parse/merge), `MCPTools.swift` (schema),
+  `MCPLayout.swift` (`SurfaceRow.scheduleId` + emit), `AgentDashboardController.swift`
+  (`HookSnapshotEntry.scheduleId` + `pauseSchedule`/`resumeSchedule`/`runScheduleNow`/`pauseAllSchedules`),
+  `QueueCommandBridge.swift` (4 `Action` cases + `scheduleId` + `QueueStatus.ScheduleStatus`),
+  `AgentPreviewTile.swift` (teal glyph), `AgentDashboardView.swift` (Schedules lane). Tests: sidecar
+  `queue/schedule.test.ts` (cron/skip matrix), `templates`/`store`/`commands`/`runner`/`mcp`/`status`
+  `.test.ts`; Swift `MCPAnnotationTests`/`MCPServerTests`/`QueuePaletteTests`. Fork-only, template-only
+  — keep the `schedules[]` in your queue JSON under `~/.config/ghostty-ramon/agent-manager/queues/`.
+  **See `AGENT-QUEUE.md` (→ Schedules / Implementation notes) + `AGENT-DASHBOARD.md`.**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.

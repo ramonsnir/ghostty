@@ -125,6 +125,11 @@ enum MCPLayout {
         /// Defaulted so the (separate) WebMonitor SurfaceRow + test constructors are
         /// unaffected, same `var`-with-default reasoning as the queue tags above.
         var hero: Bool = false
+        /// fork / Agent Queue Schedules: the SCHEDULE id of a recurring scan-agent split (its
+        /// annotation's `scheduleId`), echoed into the `list_surfaces` row so the supervisor
+        /// tracks the scheduled run + re-adopts it after a restart (the reconcile-visibility
+        /// chokepoint — mirrors `queueKey`). nil for a normal split / work-item tile.
+        var scheduleId: String? = nil
     }
 
     /// MUST be called on main. Walks AppKit surfaces and returns value rows.
@@ -197,7 +202,8 @@ enum MCPLayout {
                     queueKey: hook?.queueKey,
                     queueName: hook?.queueName,
                     queueUrl: hook?.queueUrl,
-                    hero: hook?.queueHero ?? false))
+                    hero: hook?.queueHero ?? false,
+                    scheduleId: hook?.scheduleId))
             }
         }
         return rows
@@ -248,6 +254,10 @@ enum MCPLayout {
             // mirroring the omit-when-default style of `hidden` + the queue tags. The
             // reconcile-visibility chokepoint — the supervisor reads it back off the row.
             if $0.hero { d["hero"] = true }
+            // fork / Agent Queue Schedules: echo the scheduleId (with queueName above) so the
+            // supervisor reads back its scheduled runs off the row (reconcile-visibility
+            // chokepoint). Omit when nil (a non-schedule surface carries none).
+            if let sid = $0.scheduleId { d["scheduleId"] = sid }
             return d
         }
     }

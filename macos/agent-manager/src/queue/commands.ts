@@ -53,7 +53,11 @@ export interface QueueCommand {
     | "adopt"
     | "infer_key"
     | "promote"
-    | "demote";
+    | "demote"
+    | "pause_schedule"
+    | "resume_schedule"
+    | "run_schedule_now"
+    | "pause_all_schedules";
   /** The template basename to start (start only). */
   template?: string;
   /** The active run name (its `runName`) to pause/resume/stop/abort/set_max_items/set_concurrency/set_keep. */
@@ -89,6 +93,10 @@ export interface QueueCommand {
    *  carried one. OPTIONAL even for `adopt` (graph-local title-preview lookups usually have no
    *  url). Populated by the coercer; absent ⇒ no queueUrl stamped. */
   url?: string;
+  /** (schedules) The SCHEDULE id for `pause_schedule` / `resume_schedule` / `run_schedule_now`
+   *  (the dashboard Schedules lane controls). Absent for `pause_all_schedules` (whole run) and
+   *  other actions. */
+  scheduleId?: string;
 }
 
 /** The injectable run FACTORY: build a fresh QueueRun for a template BASENAME (+ the
@@ -126,6 +134,7 @@ export interface ApplyResult {
     | "adopted"
     | "promoted"
     | "demoted"
+    | "scheduleChanged"
     | "noop";
   /** The affected run's NAME, when one was resolved (started/flag-flipped). */
   runName?: string;
@@ -311,6 +320,65 @@ export function applyCommand(
       run.keepDirty.add(key);
       log(`run "${name}" key "${key}" keep set to ${cmd.keep}`);
       return { kind: "keepSet", runName: name };
+    }
+    case "pause_schedule":
+    case "resume_schedule":
+    case "run_schedule_now": {
+      // (schedules) Mutate per-run schedule state (paused flag / run-now request). Persisted by
+      // the run's next sweep (like set_keep) — NOT an active-runs change. `armedAt` uses a `0`
+      // placeholder when the schedule hasn't been armed yet (paused/run-now don't consult it;
+      // scheduleSweep re-anchors a never-run `0` to now), so applyCommand stays clock-free/pure.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`${cmd.action} command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const id = cmd.scheduleId;
+      if (id === undefined || id.length === 0) {
+        errlog(`${cmd.action} for run "${name}" with no scheduleId — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`${cmd.action} for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      if (cmd.action === "run_schedule_now") {
+        run.scheduleRunNow.add(id);
+        log(`run "${name}" schedule "${id}" run-now requested`);
+      } else {
+        const paused = cmd.action === "pause_schedule";
+        const st = run.schedules.get(id) ?? { armedAt: 0 };
+        st.paused = paused;
+        run.schedules.set(id, st);
+        log(`run "${name}" schedule "${id}" ${paused ? "paused" : "resumed"}`);
+      }
+      return { kind: "scheduleChanged", runName: name };
+    }
+    case "pause_all_schedules": {
+      // (schedules) Pause EVERY schedule of a run (the vacation switch). Arms + pauses each
+      // template schedule id and any already-armed id. Per-run state, persisted next sweep.
+      const name = cmd.run;
+      if (name === undefined || name.length === 0) {
+        errlog(`pause_all_schedules command with no run — ignored`);
+        return { kind: "noop" };
+      }
+      const run = registry.get(name);
+      if (run === undefined) {
+        errlog(`pause_all_schedules for unknown run "${name}" — ignored`);
+        return { kind: "noop" };
+      }
+      const ids = new Set<string>([
+        ...run.template.schedules.map((s) => s.id),
+        ...run.schedules.keys(),
+      ]);
+      for (const id of ids) {
+        const st = run.schedules.get(id) ?? { armedAt: 0 };
+        st.paused = true;
+        run.schedules.set(id, st);
+      }
+      log(`run "${name}" all schedules paused (${ids.size})`);
+      return { kind: "scheduleChanged", runName: name };
     }
     case "release": {
       // (release) Clear the §7.1 dispatch LATCH (and the time-based cooldown) for one item, or

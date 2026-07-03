@@ -352,6 +352,7 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       held: [{ key: "EX-4", title: "Held one", url: "https://linear.app/x/EX-4" }],
       heroMax: 2,
       heroActive: 1,
+      schedules: [],
     }),
   );
   assert.equal(method, "tools/call");
@@ -500,6 +501,25 @@ test("coerceQueueCommands: drops non-object entries and unrecognized actions, ke
     { action: "stop" },
     { action: "resume", run: "r" },
     { action: "pause" },
+  ]);
+});
+
+test("coerceQueueCommands: carries the schedule actions + scheduleId (the chokepoint whitelist)", () => {
+  const out = coerceQueueCommands({
+    commands: [
+      { action: "pause_schedule", run: "R", scheduleId: "doc-drift" },
+      { action: "resume_schedule", run: "R", scheduleId: "doc-drift" },
+      { action: "run_schedule_now", run: "R", scheduleId: "backlog" },
+      { action: "pause_all_schedules", run: "R" },
+      { action: "pause_schedule", run: "R", scheduleId: 9 }, // non-string scheduleId dropped
+    ],
+  });
+  assert.deepEqual(out, [
+    { action: "pause_schedule", run: "R", scheduleId: "doc-drift" },
+    { action: "resume_schedule", run: "R", scheduleId: "doc-drift" },
+    { action: "run_schedule_now", run: "R", scheduleId: "backlog" },
+    { action: "pause_all_schedules", run: "R" },
+    { action: "pause_schedule", run: "R" }, // scheduleId stripped, action + run kept
   ]);
 });
 

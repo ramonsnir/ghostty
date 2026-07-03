@@ -433,4 +433,46 @@ struct QueuePaletteTests {
         #expect(QueueCommand(action: .demote, run: "R", surfaceUUID: "U")
             .jsonObject["key"] == nil)
     }
+
+    // MARK: - (Schedules) command round-trip + status decode
+
+    @Test func scheduleCommandsSerializeToSnakeCaseActionsWithScheduleId() {
+        #expect(QueueCommand.Action.pauseSchedule.rawValue == "pause_schedule")
+        #expect(QueueCommand.Action.resumeSchedule.rawValue == "resume_schedule")
+        #expect(QueueCommand.Action.runScheduleNow.rawValue == "run_schedule_now")
+        #expect(QueueCommand.Action.pauseAllSchedules.rawValue == "pause_all_schedules")
+        let cmd = QueueCommand(action: .pauseSchedule, run: "R", scheduleId: "doc-drift")
+        let json = cmd.jsonObject
+        #expect(json["action"] as? String == "pause_schedule")
+        #expect(json["run"] as? String == "R")
+        #expect(json["scheduleId"] as? String == "doc-drift")
+        // pause-all carries no scheduleId.
+        #expect(QueueCommand(action: .pauseAllSchedules, run: "R").jsonObject["scheduleId"] == nil)
+    }
+
+    @Test func queueStatusDecodesSchedulesArray() {
+        let payload = QueueStatusPayload.fromArguments([
+            "queueName": "R",
+            "schedules": [
+                ["id": "doc-drift", "name": "Doc drift", "paused": false, "running": false,
+                 "nextRunAt": NSNumber(value: 2_000_000), "lastCompletionAt": NSNumber(value: 1_000_000)],
+                ["id": "backlog", "paused": true, "running": false],
+            ],
+        ])
+        let s = payload?.status.schedules ?? []
+        #expect(s.count == 2)
+        #expect(s.first?.scheduleID == "doc-drift")
+        #expect(s.first?.name == "Doc drift")
+        #expect(s.first?.nextRunAt == Date(timeIntervalSince1970: 2000))
+        #expect(s.first?.lastCompletionAt == Date(timeIntervalSince1970: 1000))
+        // name falls back to id; paused decoded; times absent ⇒ nil.
+        #expect(s.last?.name == "backlog")
+        #expect(s.last?.paused == true)
+        #expect(s.last?.nextRunAt == nil)
+    }
+
+    @Test func queueStatusSchedulesDefaultEmptyWhenAbsent() {
+        let payload = QueueStatusPayload.fromArguments(["queueName": "R"])
+        #expect(payload?.status.schedules.isEmpty == true)
+    }
 }

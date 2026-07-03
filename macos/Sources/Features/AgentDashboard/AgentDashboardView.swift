@@ -165,7 +165,11 @@ struct AgentDashboardView: View {
                                             focusHidden(id)
                                         }
                                     })
-                            }
+                            },
+                            onPauseSchedule: { id in model.pauseSchedule(run: section.id, scheduleID: id) },
+                            onResumeSchedule: { id in model.resumeSchedule(run: section.id, scheduleID: id) },
+                            onRunScheduleNow: { id in model.runScheduleNow(run: section.id, scheduleID: id) },
+                            onPauseAllSchedules: { model.pauseAllSchedules(run: section.id) }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -484,6 +488,12 @@ private struct OriginSectionHeader: View {
     let graph: QueueGraph?
     /// (backlog graph) Open the dependency-graph canvas for this run.
     let onOpenBacklog: () -> Void
+    /// (Schedules) Lane controls: pause / resume / run-now a single schedule (by id), and
+    /// pause every schedule of the run.
+    let onPauseSchedule: (String) -> Void
+    let onResumeSchedule: (String) -> Void
+    let onRunScheduleNow: (String) -> Void
+    let onPauseAllSchedules: () -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
@@ -628,6 +638,12 @@ private struct OriginSectionHeader: View {
                     }
                     Spacer(minLength: 0)
                 }
+                // (Schedules) The thin recurring-scan lane — one compact row per schedule
+                // (next-run / last-run / pause + run-now). Sized for a handful; omitted when
+                // the run declares none.
+                if !status.schedules.isEmpty {
+                    schedulesLane(status)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -651,6 +667,69 @@ private struct OriginSectionHeader: View {
         } message: {
             Text("Immediately force-closes all \(section.count) agent split\(section.count == 1 ? "" : "s") in this run, discarding any in-progress work.")
         }
+    }
+
+    // MARK: - (Schedules) the thin recurring-scan lane
+
+    /// (Schedules) The lane header + one row per schedule. Deliberately compact (a handful of
+    /// rows): name · state (next-run / paused / running) · Run-now · Pause/Resume, plus a
+    /// "pause all" (vacation) control in the header.
+    @ViewBuilder
+    private func schedulesLane(_ status: QueueStatus) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 4) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.caption2).foregroundStyle(.teal)
+                Text("Schedules").font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Button(action: onPauseAllSchedules) {
+                    Text("pause all").font(.caption2)
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help("Pause every schedule in this run (e.g. while you're on vacation)")
+            }
+            ForEach(status.schedules) { s in
+                HStack(spacing: 6) {
+                    Text(s.name).font(.caption2).lineLimit(1).truncationMode(.middle)
+                    Text(Self.scheduleStateText(s))
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button { onRunScheduleNow(s.scheduleID) } label: {
+                        Image(systemName: "play.circle").font(.caption2)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .help("Run this schedule now")
+                    Button {
+                        s.paused ? onResumeSchedule(s.scheduleID) : onPauseSchedule(s.scheduleID)
+                    } label: {
+                        Image(systemName: s.paused ? "play.fill" : "pause.fill").font(.caption2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(s.paused ? Color.accentColor : Color.secondary)
+                    .help(s.paused ? "Resume this schedule" : "Pause this schedule")
+                }
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.top, 1)
+    }
+
+    /// (Schedules) The one-line state for a schedule row: running / paused / next-run, plus a
+    /// "· ran … ago" suffix when it has run before (and isn't running now). PURE-ish (reads the
+    /// current clock for the relative phrasing).
+    private static func scheduleStateText(_ s: QueueStatus.ScheduleStatus) -> String {
+        let ran = s.lastCompletionAt.map { " · ran \(relative($0))" } ?? ""
+        if s.running { return "running…" }
+        if s.paused { return "paused" + ran }
+        if let next = s.nextRunAt { return "next \(relative(next))" + ran }
+        return "—" + ran
+    }
+
+    /// Abbreviated relative time ("in 24 min" / "34 min ago").
+    private static func relative(_ date: Date) -> String {
+        let fmt = RelativeDateTimeFormatter()
+        fmt.unitsStyle = .abbreviated
+        return fmt.localizedString(for: date, relativeTo: Date())
     }
 
     /// (backlog graph) The "N backlog" button that opens the dependency-graph canvas. The
