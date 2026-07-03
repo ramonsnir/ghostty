@@ -254,6 +254,14 @@ export interface ScheduleState {
   armedAt: number;
   lastCompletionAt?: number;
   paused?: boolean;
+  /** (restart re-adoption) The host `sessionID` of the schedule's CURRENTLY-LIVE scan split,
+   *  when one is in flight; absent/0 when not running. PERSISTED so a GUI restart (which wipes
+   *  the in-memory `queueSchedule`/`scheduleId` annotation the sidecar normally re-adopts from)
+   *  can still recognize the surviving scan by its stable sessionID, mark it running again, and
+   *  re-stamp its annotation — instead of showing "not running" and re-dispatching a duplicate.
+   *  Backfilled from the live surface each sweep (a fresh spawn's id attaches asynchronously, so
+   *  it may start 0), cleared on completion. */
+  activeSessionID?: number;
 }
 
 /**

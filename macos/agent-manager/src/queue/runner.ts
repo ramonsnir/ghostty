@@ -1972,39 +1972,86 @@ async function scheduleSweep(
     }
   }
 
-  // Map THIS run's live scheduled surfaces by scheduleId (annotation read-back — the row
-  // carries queueName + scheduleId, echoed by list_surfaces; a surface of another run or with
-  // no scheduleId is skipped).
-  const liveById = new Map<string, Surface>();
+  // TWO-SIGNAL LIVENESS (survives a GUI restart). A scheduled scan is recognized live by EITHER:
+  //   (a) its `scheduleId` ANNOTATION, echoed by list_surfaces — the steady-state signal; but the
+  //       annotation lives in the GUI's IN-MEMORY model and is WIPED by a GUI restart, so right
+  //       after a restart a still-open scan carries NO scheduleId; and
+  //   (b) its host `sessionID` matching the schedule's persisted `activeSessionID` — the
+  //       restart-survivable signal (sessionID is stable across a GUI restart; persisted in the
+  //       store). Without (b), a restart made the scan look COMPLETED (step 1 fired on the missing
+  //       annotation) → the schedule re-anchored + risked re-dispatching a DUPLICATE.
+  const liveById = new Map<string, Surface>(); // by scheduleId annotation (this run)
+  const bySession = new Map<number, Surface>(); // ALL surfaces by sessionID (for re-adopt)
   for (const s of surfaces) {
+    if (typeof s.sessionID === "number" && s.sessionID > 0) bySession.set(s.sessionID, s);
     const sQueueName = (s as { queueName?: string }).queueName;
     if (sQueueName !== undefined && sQueueName !== run.runName) continue;
     const sid = (s as { scheduleId?: string }).scheduleId;
     if (typeof sid === "string" && sid.length > 0) liveById.set(sid, s);
   }
+  // Resolve the live surface for a schedule id: annotation first, else the persisted activeSessionID.
+  const liveSurfaceFor = (id: string): Surface | undefined => {
+    const byAnno = liveById.get(id);
+    if (byAnno !== undefined) return byAnno;
+    const sess = run.schedules.get(id)?.activeSessionID;
+    if (sess !== undefined && sess > 0) return bySession.get(sess);
+    return undefined;
+  };
 
-  // 1) COMPLETION: a tracked schedule whose surface is gone → its split closed.
-  for (const [id, act] of [...run.scheduleActive]) {
-    if (!liveById.has(id)) {
+  // 1) COMPLETION: a tracked schedule whose surface is gone by BOTH signals → its split closed.
+  //    Clears activeSessionID so a later same-sessionID surface can't be mistaken for this run.
+  for (const [id] of [...run.scheduleActive]) {
+    if (liveSurfaceFor(id) === undefined) {
       const st = run.schedules.get(id);
       if (st !== undefined) {
         st.lastCompletionAt = nowMs;
+        st.activeSessionID = undefined;
         changed = true;
       }
       run.scheduleActive.delete(id);
     }
   }
 
-  // 2) RE-ADOPT: a live scheduled surface we don't yet track (restart). gridSlot -1 = unknown
-  // geometry (excluded from occupancy). The prose was delivered at spawn (via env), so there is
-  // nothing to re-deliver.
-  for (const [id, s] of liveById) {
-    if (!run.scheduleActive.has(id) && run.schedules.has(id)) {
-      run.scheduleActive.set(id, {
-        uuid: s.id,
-        sessionID: typeof s.sessionID === "number" ? s.sessionID : 0,
-        gridSlot: -1,
-      });
+  // 2) RE-ADOPT: a live scheduled surface we don't yet track (restart) — matched by annotation OR
+  //    persisted activeSessionID. gridSlot -1 = unknown geometry (excluded from occupancy). The
+  //    prose was delivered at spawn (via env), so there is nothing to re-deliver. When adopted via
+  //    the sessionID fallback (annotation wiped by the restart), RE-STAMP the annotation so the
+  //    dashboard re-groups + re-marks the tile and list_surfaces carries scheduleId again.
+  for (const [id, st] of run.schedules) {
+    if (run.scheduleActive.has(id)) continue;
+    const s = liveSurfaceFor(id);
+    if (s === undefined) continue;
+    const sessionID = typeof s.sessionID === "number" ? s.sessionID : 0;
+    run.scheduleActive.set(id, { uuid: s.id, sessionID, gridSlot: -1 });
+    if (!liveById.has(id)) {
+      // Adopted by sessionID (annotation was wiped) — re-stamp it (best-effort).
+      try {
+        await deps.client.setAnnotation(s.id, {
+          queueName: run.runName,
+          schedule: true,
+          scheduleId: id,
+        });
+      } catch (err) {
+        errlog(`run "${run.runName}": schedule "${id}" re-stamp annotation failed: ${msg(err)}`);
+      }
+    }
+    if (st.activeSessionID !== sessionID && sessionID > 0) {
+      st.activeSessionID = sessionID;
+      changed = true;
+    }
+  }
+
+  // 2b) BACKFILL activeSessionID from the live surface (a fresh spawn's sessionID attaches
+  //     asynchronously, so dispatchSchedule may have recorded 0/stale) so the restart-survivable
+  //     signal is always current.
+  for (const [id, act] of run.scheduleActive) {
+    const st = run.schedules.get(id);
+    if (st === undefined) continue;
+    const s = liveSurfaceFor(id);
+    const sess = typeof s?.sessionID === "number" && s.sessionID > 0 ? s.sessionID : act.sessionID;
+    if (sess > 0 && st.activeSessionID !== sess) {
+      st.activeSessionID = sess;
+      changed = true;
     }
   }
 
@@ -2013,7 +2060,7 @@ async function scheduleSweep(
   // open for manual review (the normal bell already fired). (The prose was delivered at spawn
   // via GHOSTTY_SCHEDULE_PROMPT — no per-sweep delivery to do.)
   for (const [id] of run.scheduleActive) {
-    const s = liveById.get(id);
+    const s = liveSurfaceFor(id);
     if (s === undefined || !s.exited) continue;
     const spec = specs.find((x) => x.id === id);
     if (spec?.closeOnComplete !== false) {
@@ -2168,6 +2215,13 @@ async function dispatchSchedule(
     sessionID: spawned.sessionId,
     gridSlot: slot,
   });
+  // Persist the sessionID immediately so a GUI restart before the next sweep can still re-adopt
+  // this scan by its stable sessionID (scheduleSweep also backfills it, but a spawn's sessionId is
+  // known here). Persisted by the caller's persistRun when the sweep's `changed` flag is set.
+  const stForSpec = run.schedules.get(spec.id);
+  if (stForSpec !== undefined && spawned.sessionId > 0) {
+    stForSpec.activeSessionID = spawned.sessionId;
+  }
 
   // Annotate so the dashboard groups it under the queue + marks it a schedule, and a restart can
   // re-adopt it. NO queueKey — a schedule is not a work item, so the work-item reconcile leaves
