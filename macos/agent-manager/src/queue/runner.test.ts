@@ -3605,3 +3605,121 @@ test("runQueueSweep: auto-closes an EXITED scheduled split when closeOnComplete 
   await runQueueSweep(deps);
   assert.ok(fake.calls.forceClose.includes("sch-1"), "an exited scheduled split is force-closed");
 });
+
+test("runQueueSweep: a live schedule OCCUPIES its grid slot — a later work item joins/overflows around it, never overfilling the tab", async () => {
+  // REGRESSION (schedules slot in wrong → "7th split in a full tab"): dispatchOne must see the
+  // schedule's grid pane. Grid 2×1 (cap 2/tab). The schedule seats slot 0 in tab 0; then three
+  // work items dispatch. Blind to the schedule (the bug), item A would take slot 0 (COLLISION) +
+  // firstTab; seeing it, A takes slot 1 and BALANCED-splits the schedule's tab, B overflows to a
+  // new tab, C balanced-splits tab 1 — so no tab ever exceeds cols*rows.
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      concurrency: 4,
+      grid: { cols: 2, rows: 1, fill: "columns" },
+      schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }],
+    }),
+    store,
+  );
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: "[]",
+    spawns: [
+      { id: "sch-1", sessionId: 500 }, // the schedule
+      { id: "w-a", sessionId: 1 },
+      { id: "w-b", sessionId: 2 },
+      { id: "w-c", sessionId: 3 },
+    ],
+  };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // schedule DUE → dispatches sch-1 into slot 0 (firstTab)
+  assert.equal(fake.calls.spawn.length, 1, "only the schedule dispatched (no work items listed yet)");
+  assert.equal(run.scheduleActive.get("s1")!.gridSlot, 0, "schedule seats grid slot 0");
+
+  // The schedule split is now live; three work items appear.
+  spec.surfaces = [
+    Object.assign(surface({ id: "sch-1", agentState: "working" }), {
+      queueName: run.runName,
+      scheduleId: "s1",
+    }) as Surface & { sessionID?: number },
+  ];
+  (spec.surfaces[0] as { sessionID?: number }).sessionID = 500;
+  spec.listJson = '[{"id":"A"},{"id":"B"},{"id":"C"}]';
+  now = 102 * M;
+  await runQueueSweep(deps);
+
+  const wa = fake.calls.spawn[1];
+  const wb = fake.calls.spawn[2];
+  const wc = fake.calls.spawn[3];
+  // A does NOT collide with the schedule's slot 0.
+  assert.equal(run.active.get("A")!.gridSlot, 1, "work item A takes slot 1, not the schedule's slot 0");
+  // A joins the schedule's tab as a balanced split anchored on the schedule pane (proves the
+  // work-item placement SEES the schedule).
+  assert.equal(wa.balanced, true, "A is a balanced split within the schedule's tab");
+  assert.equal(wa.targetUUID, "sch-1", "A anchors on the schedule pane");
+  // B overflows to a NEW tab (tab 0 is now full: schedule + A = cap 2).
+  assert.equal(wb.firstTab, true, "B overflows to a new tab (schedule filled tab 0)");
+  assert.equal(wb.balanced, undefined, "B is not a balanced split");
+  assert.equal(run.active.get("B")!.gridSlot, 2, "B seats the first slot of the overflow tab");
+  // C balanced-splits the overflow tab (tab 1), never re-crowding tab 0.
+  assert.equal(wc.balanced, true, "C is a balanced split in the overflow tab");
+  assert.equal(run.active.get("C")!.gridSlot, 3, "C seats the second slot of the overflow tab");
+});
+
+test("runQueueSweep: a RE-ADOPTED schedule (restart) reserves a real grid slot so work items don't overfill its tab", async () => {
+  // REGRESSION: after a restart, an open scheduled split is re-adopted. It USED to get gridSlot -1
+  // (excluded from occupancy), so work items — whose own slots ARE restored from the store — would
+  // balanced-split its tab past cap. Re-adopt now reserves the lowest free slot. Grid 2×1 (cap 2).
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      concurrency: 4,
+      grid: { cols: 2, rows: 1, fill: "columns" },
+      schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }],
+    }),
+    store,
+  );
+  // Simulate the post-restart cadence state (the schedule is known) but no live scheduleActive yet.
+  run.schedules.set("s1", { armedAt: 100 * 60_000 });
+  const M = 60_000;
+  const spec: QueueFakeSpec = {
+    // The scheduled split survived the restart and is live in list_surfaces.
+    surfaces: [
+      Object.assign(surface({ id: "sch-1", agentState: "working" }), {
+        queueName: run.runName,
+        scheduleId: "s1",
+      }) as Surface & { sessionID?: number },
+    ],
+    listJson: "[]",
+    spawns: [
+      { id: "w-a", sessionId: 1 },
+      { id: "w-b", sessionId: 2 },
+    ],
+  };
+  (spec.surfaces[0] as { sessionID?: number }).sessionID = 500;
+  const fake = makeQueueFake(spec);
+  let now = 101 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  // Sweep 1: re-adopt the surviving schedule (reserving a slot), arm-suppressed for dispatch.
+  await runQueueSweep(deps);
+  const readoptSlot = run.scheduleActive.get("s1")!.gridSlot;
+  assert.ok(readoptSlot >= 0, "re-adopted schedule reserves a REAL grid slot (not -1)");
+
+  // Two work items appear; they must place AROUND the re-adopted schedule.
+  spec.listJson = '[{"id":"A"},{"id":"B"}]';
+  now = 102 * M;
+  await runQueueSweep(deps);
+
+  const slotA = run.active.get("A")!.gridSlot;
+  const slotB = run.active.get("B")!.gridSlot;
+  assert.notEqual(slotA, readoptSlot, "work item A does not collide with the schedule's slot");
+  assert.notEqual(slotB, readoptSlot, "work item B does not collide with the schedule's slot");
+  assert.notEqual(slotA, slotB, "the two work items take distinct slots");
+});

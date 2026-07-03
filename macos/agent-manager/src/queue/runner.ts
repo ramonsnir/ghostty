@@ -1717,15 +1717,18 @@ async function dispatchOne(
   // BSP grid packing (HERO-AGENTS.md § Layout). It is assigned grid slot -1 (a sentinel that
   // `occupiesSlot`/the occupied-set scan below EXCLUDE via `gridSlot >= 0`), so it doesn't
   // shift the regular grid's slot indices, and it is spawned as a fresh first-tab below.
-  const occupied = new Set<number>();
-  for (const a of run.active.values()) {
-    if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
-  }
+  // Occupancy MUST include live SCHEDULE panes, not just work items (see gridOccupancy): a
+  // schedule bypasses concurrency but still holds a physical grid slot, so ignoring it here
+  // let a work item collide with a schedule's slot and overflow its tab past cols*rows.
+  const { occupied, slotUUID } = gridOccupancy(run);
   // The total pane budget is the EFFECTIVE concurrency (across ALL the run's tabs); the
   // lowest free slot fills the lowest tab first, then overflows (§12). A slot exists for
-  // every agent the (gated) concurrency allows.
+  // every agent the (gated) concurrency allows. The search range is WIDENED by the live
+  // schedule count so a schedule holding a low slot pushes this work item to a higher slot /
+  // overflow tab rather than wrongly reporting "full" — the concurrency gate (remainingSlots)
+  // already ran counting only regular occupancy, so a free physical slot is guaranteed in range.
   const cap = effectiveConcurrency(run);
-  const slot = isHero ? -1 : lowestFreeSlot(occupied, cap);
+  const slot = isHero ? -1 : lowestFreeSlot(occupied, cap + run.scheduleActive.size);
   if (slot === null) return false; // full — shouldn't happen (remainingSlots gated)
   // Plan how to materialize this slot's pane (§12): the run's first tab, an OVERFLOW tab
   // (slot is the first of a fresh tab), or a BALANCED split within the slot's existing tab.
@@ -1809,15 +1812,18 @@ async function dispatchOne(
     } else if (sp.firstTab === true) {
       spawnArgs = { ...base, firstTab: true };
     } else if (sp.newTab === true) {
-      // Overflow tab: open a new tab anchored on the run's window (any live pane).
-      const windowAnchorUUID = occupiedUUID(run, sp.windowAnchorSlotIndex);
+      // Overflow tab: open a new tab anchored on the run's window (any live pane). Resolve via
+      // the combined slotUUID (work items + schedules) so a schedule-only anchor still works.
+      const windowAnchorUUID = slotUUID.get(sp.windowAnchorSlotIndex) ?? occupiedUUID(run, sp.windowAnchorSlotIndex);
       spawnArgs = { ...base, firstTab: true, ...(windowAnchorUUID !== undefined ? { windowAnchorUUID } : {}) };
     } else {
       // Balanced split WITHIN the slot's tab — pass the template grid caps (§12 grid cap)
       // so the BSP never exceeds cols columns / rows rows in that tab (further splits stack
       // into rows / add columns). firstTab/newTab branches do NOT pass caps: a fresh tab's
       // first leaf has no grid context and largestLeafSplit isn't called for them.
-      const targetUUID = occupiedUUID(run, sp.anchorSlotIndex);
+      // Resolve via the combined slotUUID (work items + schedules) so a balanced split anchors
+      // on a real pane even when the lowest pane in the target tab is a schedule's.
+      const targetUUID = slotUUID.get(sp.anchorSlotIndex) ?? occupiedUUID(run, sp.anchorSlotIndex);
       spawnArgs = {
         ...base,
         ...(targetUUID !== undefined ? { targetUUID } : {}),
@@ -1995,15 +2001,22 @@ async function scheduleSweep(
     }
   }
 
-  // 2) RE-ADOPT: a live scheduled surface we don't yet track (restart). gridSlot -1 = unknown
-  // geometry (excluded from occupancy). The prose was delivered at spawn (via env), so there is
-  // nothing to re-deliver.
+  // 2) RE-ADOPT: a live scheduled surface we don't yet track (restart). RESERVE the lowest free
+  // grid slot (NOT -1) so the re-adopted schedule PARTICIPATES in occupancy. With -1 the schedule
+  // pane was invisible to `gridOccupancy`, so after a restart a work item — blind to the still-open
+  // schedule split — would balanced-split its tab PAST cols*rows (the "7th split in a full 3×2 tab
+  // after a restart" bug; work-item slots ARE restored from the store, only the schedule's was
+  // lost). Post-restart geometry isn't perfectly recoverable, but reserving a real slot bounds each
+  // tab to its grid cap. gridOccupancy is recomputed per iteration so multiple re-adopted schedules
+  // take distinct slots. The prose was delivered at spawn (via env), so nothing to re-deliver.
   for (const [id, s] of liveById) {
     if (!run.scheduleActive.has(id) && run.schedules.has(id)) {
+      const { occupied } = gridOccupancy(run);
+      const slot = lowestFreeSlot(occupied, occupied.size + 1) ?? occupied.size;
       run.scheduleActive.set(id, {
         uuid: s.id,
         sessionID: typeof s.sessionID === "number" ? s.sessionID : 0,
-        gridSlot: -1,
+        gridSlot: slot,
       });
     }
   }
@@ -2072,21 +2085,9 @@ async function dispatchSchedule(
 
   // Combined grid occupancy: work-item slots (run.active) + other live schedules' slots, with a
   // slot→UUID map so a balanced split anchors on a real pane (schedules aren't in run.active, so
-  // occupiedUUID alone would miss a schedule-only run).
-  const occupied = new Set<number>();
-  const slotUUID = new Map<number, string>();
-  for (const a of run.active.values()) {
-    if (a.gridSlot >= 0 && occupiesSlot(a) && a.surfaceUUID !== undefined) {
-      occupied.add(a.gridSlot);
-      slotUUID.set(a.gridSlot, a.surfaceUUID);
-    }
-  }
-  for (const act of run.scheduleActive.values()) {
-    if (act.gridSlot >= 0) {
-      occupied.add(act.gridSlot);
-      slotUUID.set(act.gridSlot, act.uuid);
-    }
-  }
+  // occupiedUUID alone would miss a schedule-only run). Shared with dispatchOne so the two
+  // placement paths can never disagree on which slots are taken.
+  const { occupied, slotUUID } = gridOccupancy(run);
   // A generous cap so lowestFreeSlot always finds a slot (schedules bypass concurrency); overflow
   // to new tabs/rows is handled by splitPlan + the GUI's grid caps, exactly like a work item.
   const capForSlot = occupied.size + t.schedules.length + 4;
@@ -2183,6 +2184,32 @@ async function dispatchSchedule(
   }
   log(`run "${run.runName}": dispatched schedule "${spec.id}" (${spec.name ?? spec.id})`);
   return true;
+}
+
+/** The COMBINED grid occupancy across BOTH work-item slots (`run.active`) and live SCHEDULE
+ *  slots (`run.scheduleActive`), with a slot→UUID map for anchor resolution. PURE. A schedule
+ *  bypasses the concurrency cap but STILL occupies a physical grid pane (dispatchSchedule seats
+ *  it with a balanced split, exactly like a work item), so EVERY placement decision — a work
+ *  item's OR a schedule's — must see both pools. Seeing only `run.active` let a work item land on
+ *  a schedule's slot and balanced-split its tab PAST `cols*rows` (the "7th split in a 3×2 tab"
+ *  bug) instead of overflowing to a new tab. `occupied` includes PENDING (not-yet-seated) panes
+ *  via `occupiesSlot`; `slotUUID` carries only seated panes (a UUID exists). */
+function gridOccupancy(run: QueueRun): { occupied: Set<number>; slotUUID: Map<number, string> } {
+  const occupied = new Set<number>();
+  const slotUUID = new Map<number, string>();
+  for (const a of run.active.values()) {
+    if (a.gridSlot >= 0 && occupiesSlot(a)) {
+      occupied.add(a.gridSlot);
+      if (a.surfaceUUID !== undefined) slotUUID.set(a.gridSlot, a.surfaceUUID);
+    }
+  }
+  for (const act of run.scheduleActive.values()) {
+    if (act.gridSlot >= 0) {
+      occupied.add(act.gridSlot);
+      slotUUID.set(act.gridSlot, act.uuid);
+    }
+  }
+  return { occupied, slotUUID };
 }
 
 function occupiedUUID(run: QueueRun, slotIndex: number): string | undefined {
@@ -2498,20 +2525,20 @@ async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
  */
 export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
   const capPerTab = gridCap(run.template.grid.cols, run.template.grid.rows);
-  // Occupied slots = every slot-occupying assignment (seated or not) so the tab grouping is
-  // accurate; the move itself only proceeds when the source panes are seated (have a UUID).
-  const occupied = new Set<number>();
-  for (const a of run.active.values()) {
-    if (a.gridSlot >= 0 && occupiesSlot(a)) occupied.add(a.gridSlot);
-  }
+  // Occupied slots = every slot-occupying pane (seated or not, WORK ITEMS + live SCHEDULES) so
+  // the tab grouping + target free-space accounting are accurate; the move itself only proceeds
+  // when the source panes are seated work items (have a UUID; a schedule slot isn't in run.active,
+  // so `seatedAtSlot` returns undefined below → the merge defers rather than over-packing a tab
+  // that a schedule already fills — the packing equivalent of dispatchOne's schedule blindness).
+  const { occupied, slotUUID } = gridOccupancy(run);
   const plan = packMove(occupied, capPerTab);
   if (plan === null) return 0;
 
   // Resolve a SEATED anchor pane in the target tab (any occupied target-range slot with a
-  // UUID); without one we can't address the destination tab — defer to a later sweep.
+  // UUID, work item OR schedule); without one we can't address the destination tab — defer.
   let targetAnchorUUID: string | undefined;
   for (let k = 0; k < capPerTab; k++) {
-    const uuid = occupiedUUID(run, plan.targetTab * capPerTab + k);
+    const uuid = slotUUID.get(plan.targetTab * capPerTab + k);
     if (uuid !== undefined) { targetAnchorUUID = uuid; break; }
   }
   if (targetAnchorUUID === undefined) return 0;
