@@ -564,6 +564,21 @@ not throughput), but they **do occupy the grid** (overflowing to a new row/tab w
 work item). Cadence + pause state persist in the per-run store and survive a sidecar/GUI restart;
 a still-open scheduled split is re-adopted after a restart (no re-dispatch).
 
+> **Grid occupancy is SHARED between work items and schedules (regression fixed 2026-07-03).** A
+> schedule holds a real grid slot, so **every** placement decision must count it — both a schedule
+> picking its slot AND a work item picking its. The bug: `dispatchOne` (work-item placement) scanned
+> only `run.active`, blind to `run.scheduleActive`, so a work item could land on a slot the schedule
+> already held and *balanced-split its tab past `cols*rows`* — e.g. a **7th split in a full 3×2 tab**
+> — instead of overflowing to a new tab. Two gaps, both closed: (1) a shared `gridOccupancy(run)`
+> helper merges work-item + schedule slots and is now used by `dispatchOne`, `dispatchSchedule`, and
+> `packRun` (they can no longer disagree on which slots are taken); `dispatchOne`'s slot search is
+> widened by the live schedule count so a schedule holding a low slot pushes the work item to an
+> overflow tab rather than reporting "full". (2) The restart **re-adopt** path used to assign a
+> re-adopted schedule `gridSlot -1` (unknown geometry, excluded from occupancy) — while work-item
+> slots ARE restored from the store — so after a restart the still-open schedule was invisible and
+> its tab overfilled; re-adopt now **reserves the lowest free slot** so the schedule participates in
+> occupancy (post-restart geometry is approximate but each tab stays bounded to its grid cap).
+
 ## What it guarantees
 
 - **No duplicate agents per item key** — across the dispatch race (before an item leaves the
@@ -1950,7 +1965,16 @@ or host change** (pure Swift + TS).
   the agent's `command`/launcher CONSUMES it (`claude "$GHOSTTY_SCHEDULE_PROMPT"`) rather than us
   typing it (a fresh raw-mode TUI drops pre-first-input typing). The dispatch BYPASSES the
   concurrency/maxItems/max-total caps (it
-  is NOT in `run.active`) but still packs into the grid. A scheduled split carries a `queueName` +
+  is NOT in `run.active`) but still packs into the grid. **Grid-slot placement is shared:**
+  `gridOccupancy(run)` (a pure helper) merges `run.active` (work items) + `run.scheduleActive`
+  (schedules) into one `{occupied, slotUUID}` view, used by `dispatchOne`, `dispatchSchedule`, AND
+  `packRun` — so a work item can never land on a schedule's slot and over-crowd its tab past
+  `cols*rows` (the 2026-07-03 "7th split in a full 3×2 tab" regression; `dispatchOne` used to scan
+  only `run.active`). `dispatchOne`'s slot search is widened by `run.scheduleActive.size` so a
+  schedule holding a low slot pushes the work item to an overflow tab. The restart **re-adopt**
+  branch of `scheduleSweep` now RESERVES the lowest free slot for a surviving scheduled surface
+  (was `gridSlot -1` = invisible to occupancy, the other half of the same regression). A scheduled
+  split carries a `queueName` +
   `schedule`/`scheduleId` annotation but **no `queueKey`**, so the work-item `reconcile` leaves it
   alone (it only adopts keyed surfaces). Single-flight is structural (`run.scheduleActive`, keyed by
   schedule id, rebuilt each sweep from the annotated live surfaces). Cadence + pause persist in the

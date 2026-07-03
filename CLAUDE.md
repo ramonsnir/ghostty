@@ -853,7 +853,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   already-in-progress) and Ghostty adds NO issue-creation machinery; dedup rests on the cadence +
   the prose ("check existing issues first"). Schedules run in the **same grid/tab as work agents**
   and **BYPASS the concurrency/`agent-queue-max-total`/`maxItems` caps** (maintenance, not
-  throughput) but still occupy the grid (overflow like a work item). **Cadence — completion-anchored
+  throughput) but still occupy the grid (overflow like a work item). **⚠️ A schedule holds a REAL
+grid slot, so ALL placement must count it (fixed 2026-07-03):** a shared pure `gridOccupancy(run)`
+merges work-item (`run.active`) + schedule (`run.scheduleActive`) slots and is used by `dispatchOne`,
+`dispatchSchedule`, AND `packRun` — previously `dispatchOne` scanned only `run.active`, so a work
+item could land on a schedule's slot and balanced-split its tab PAST `cols*rows` (the "7th split in
+a full 3×2 tab" report). Two gaps closed: (1) `dispatchOne` now uses `gridOccupancy` + widens its
+slot search by `run.scheduleActive.size` so a low schedule slot pushes the work item to an overflow
+tab; (2) the restart **re-adopt** in `scheduleSweep` now RESERVES the lowest free slot for a
+surviving scheduled surface instead of `gridSlot -1` (which was invisible to occupancy — work-item
+slots ARE restored from the store, so only the schedule's was lost → the tab overfilled). Tests:
+`runner.test.ts` (`a live schedule OCCUPIES its grid slot…`, `a RE-ADOPTED schedule (restart)
+reserves a real grid slot…`). **Cadence — completion-anchored
   with a half-of-local-gap skip:** the `cron` is a 5-field LOCAL-time expression; the next run is
   computed from **when the previous run's split CLOSED** (a long run pushes the next out), and the
   next cron firing is SKIPPED if it lands within half the local cadence of the last completion
