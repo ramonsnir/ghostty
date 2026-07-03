@@ -140,7 +140,7 @@ enum MCPKnowledge {
     /// The canonical feature ids docs_for_feature accepts.
     static let featureIDs = [
         "agent-dashboard", "agent-manager", "agent-queue",
-        "web-monitor", "mcp", "project-selector", "splits",
+        "web-monitor", "mcp", "project-selector", "splits", "bell",
     ]
 
     /// Static (config-independent) facts about a feature. The live `enabled`/
@@ -157,7 +157,7 @@ enum MCPKnowledge {
         "agent-dashboard": FeatureSpec(
             name: "Agent Dashboard",
             summary: "A sidebar panel with a live preview of every split running a CLI agent (Claude/Codex) across all tabs and windows; click a tile to jump to it.",
-            configKeys: ["agent-dashboard", "agent-dashboard-commands", "agent-dashboard-pin"],
+            configKeys: ["agent-dashboard", "agent-dashboard-commands", "agent-dashboard-pin", "agent-dashboard-spotlight-seconds"],
             enableSteps: [
                 "Set agent-dashboard = true in ~/.config/ghostty-ramon/config.",
                 "Relaunch Ghostty (the panel is read at launch); or invoke the toggle_agent_dashboard action / command palette entry.",
@@ -167,7 +167,7 @@ enum MCPKnowledge {
         "agent-manager": FeatureSpec(
             name: "Agent Manager",
             summary: "A Haiku status summarizer that annotates each Agent Dashboard tile with a live one-line semantic status. Read-only; never types into a session.",
-            configKeys: ["agent-manager", "agent-manager-node-path", "mcp-listen", "mcp-token"],
+            configKeys: ["agent-manager", "agent-manager-node-path", "agent-manager-usage-tracking", "agent-manager-warm-base", "mcp-listen", "mcp-token"],
             enableSteps: [
                 "Set agent-manager = true in ~/.config/ghostty-ramon/config.",
                 "Set mcp-listen and mcp-token (the sidecar drives the MCP server).",
@@ -177,8 +177,8 @@ enum MCPKnowledge {
             docPath: "AGENT-MANAGER.md"),
         "agent-queue": FeatureSpec(
             name: "Agent Queue Supervisor",
-            summary: "Turns the dashboard into an active supervisor: from a JSON template it opens a tab of splits, launches one CLI agent per work item, caps concurrency, and tracks each to completion.",
-            configKeys: ["agent-queue", "agent-queue-templates-dir", "agent-queue-max-total", "mcp-listen", "mcp-token"],
+            summary: "Turns the dashboard into an active supervisor: from a JSON template it opens a tab of splits, launches one CLI agent per work item, caps concurrency, and tracks each to completion. A queue item can be a HERO (load-bearing work that competes for your attention, not a machine slot): heroes run off-grid in their own tab, capped fleet-wide by agent-queue-hero-max.",
+            configKeys: ["agent-queue", "agent-queue-templates-dir", "agent-queue-max-total", "agent-queue-hero-max", "mcp-listen", "mcp-token"],
             enableSteps: [
                 "Set agent-queue = true in ~/.config/ghostty-ramon/config.",
                 "Set mcp-listen and mcp-token (the supervisor drives the MCP server).",
@@ -224,6 +224,16 @@ enum MCPKnowledge {
                 "Always available — no config key. Bind the actions in ~/.config/ghostty-ramon/config or run them from the command palette.",
             ],
             docPath: "CLAUDE.md"),
+        "bell": FeatureSpec(
+            name: "Bell / Attention",
+            summary: "Two-tier bell handling. Every bell fires the bell-features set (or bell-features-focused when the ringing split is truly focused). A bell the Agent Manager's per-bell classify judges worth interrupting you for is PROMOTED and additionally fires the loud attention-features tier. bell-diagnostics writes a JSONL trace of why each bell did / didn't fire.",
+            configKeys: ["bell-features", "bell-features-focused", "attention-features", "agent-manager-bell-filter", "bell-diagnostics"],
+            enableSteps: [
+                "Tier-1 effects are always on — tune bell-features (out-of-focus) and bell-features-focused (in-focus) in ~/.config/ghostty-ramon/config.",
+                "For the loud ATTENTION tier, set agent-manager-bell-filter = true; promotion runs in the sidecar, so it also needs mcp-listen + mcp-token + node (see the agent-manager feature). Set attention-features to choose what the promoted tier does.",
+                "Set bell-diagnostics = true to trace decisions to ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl (turn off when done — append-only).",
+            ],
+            docPath: "BELL-ATTENTION.md"),
     ]
 
     /// Build the live FeatureDoc for a feature id. `requires`/`enabled` are
@@ -251,6 +261,10 @@ enum MCPKnowledge {
         /// Whether a node binary resolves (config path set OR a probe succeeded).
         /// Supplied by the caller — `status` does not probe.
         let nodeResolvable: Bool
+        /// Whether agent-manager-bell-filter is on (the per-bell promotion classifier —
+        /// the third sidecar-arming arm alongside agent-manager / agent-queue). Used by the
+        /// `bell` feature to report what the loud ATTENTION-tier promotion still needs.
+        let bellFilter: Bool
 
         static func from(_ c: Ghostty.Config, nodeResolvable: Bool) -> Preconditions {
             Preconditions(
@@ -261,7 +275,8 @@ enum MCPKnowledge {
                 mcpToken: c.mcpToken,
                 webMonitorListen: c.webMonitorListen,
                 projectDirectories: c.projectDirectories,
-                nodeResolvable: nodeResolvable)
+                nodeResolvable: nodeResolvable,
+                bellFilter: c.agentManagerBellFilter)
         }
     }
 
@@ -305,6 +320,21 @@ enum MCPKnowledge {
         case "splits":
             // Always available (no config gate).
             return ([], true)
+
+        case "bell":
+            // Tier-1 bell effects are ALWAYS available (GUI-only, no master flag), so the
+            // feature is always "enabled". The loud ATTENTION-tier PROMOTION runs in the
+            // sidecar, so when agent-manager-bell-filter is on it additionally needs
+            // mcp-listen + mcp-token + node — the bellFilter arm of
+            // AgentManagerController.sidecarShouldStart. Surface those as `requires` (what's
+            // missing for PROMOTION) without gating the base feature.
+            var req: [String] = []
+            if pre.bellFilter {
+                if pre.mcpListen.isEmpty { req.append("mcp-listen set (for bell promotion)") }
+                if pre.mcpToken.isEmpty { req.append("mcp-token set (for bell promotion)") }
+                if !pre.nodeResolvable { req.append("node on PATH (for bell promotion)") }
+            }
+            return (req, true)
 
         default:
             return ([], false)

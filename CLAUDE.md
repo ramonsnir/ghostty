@@ -334,10 +334,17 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   never echoed; PURE Swift over the typed `Ghostty.Config` getters, `isDefault` compared
   against a fresh `Ghostty.Config.defaultConfig()` (a finalized initial-defaults config).
   (2) **`docs_for_feature`** — a curated `FeatureDoc` table (agent-dashboard / agent-manager
-  / agent-queue / web-monitor / mcp / project-selector / splits / `all`) whose `enabled`/
+  / agent-queue / web-monitor / mcp / project-selector / splits / **bell** / `all`) whose `enabled`/
   `requires` are computed LIVE from the config with the REAL precondition predicates (the
   pure `MCPKnowledge.status(_:pre:)` MIRRORS `AgentManagerController.sidecarShouldStart` for
-  the sidecar features). (3) **`describe_config_key`** — one key's doc text (same as
+  the sidecar features — INCLUDING the **`bellFilter` arm**: the `bell` feature reports the loud
+  ATTENTION-tier promotion's sidecar deps (mcp-listen/mcp-token/node) as `requires` when
+  `agent-manager-bell-filter` is on, without gating the always-on tier-1 bell effects).
+  **⚠️ Every fork-only config key MUST appear in some feature's `configKeys`** (except infra
+  keys like `pty-host`) — guarded by the `featureDocsCoverAllForkOnlyKeys` test (the
+  `docs_for_feature` twin of `readersIncludeAllForkOnlyKeys`); it catches a new fork key that
+  landed in `readers` but not in any FeatureDoc (the drift that hid `agent-queue-hero-max` /
+  `agent-dashboard-spotlight-seconds` / `agent-manager-usage-tracking`/`-warm-base`). (3) **`describe_config_key`** — one key's doc text (same as
   `+explain-config`), fork-only flag, current value (type/default live inside the doc text). (4) **`list_config_keys`** — every
   key's name + one-line summary + fork flag, with `filter`/`forkOnly`. (3)+(4) are backed by
   a NEW read-only Zig C API that needs NO `*Config` (reads the generated `help_strings` + the
