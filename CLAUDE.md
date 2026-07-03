@@ -879,7 +879,16 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   vacation switch) + a **teal recurring-clock tile glyph** (distinct from hero purple). Cadence + pause persist in the per-run store and survive a restart (a still-open
   scheduled split is re-adopted, no re-dispatch). **A scheduled surface carries `queueName` +
   `schedule`/`scheduleId` annotation but NO `queueKey`, so the work-item reconcile leaves it alone**
-  (it only adopts keyed surfaces) — the schedule pass tracks it separately. **Wire contract (both
+  (it only adopts keyed surfaces) — the schedule pass tracks it separately. **Restart re-adoption
+  is TWO-SIGNAL (fixed the "running status didn't survive a restart" bug):** steady-state liveness
+  is the `scheduleId` annotation echoed by `list_surfaces`, but a GUI restart WIPES the in-memory
+  annotation → a surviving scan comes back with no `scheduleId` → naively read as completed
+  (re-anchor + duplicate-dispatch risk). So each schedule also PERSISTS the running scan's stable
+  host `sessionID` (`ScheduleState.activeSessionID`, backfilled each sweep since a fresh spawn's id
+  attaches async); `scheduleSweep`'s `liveSurfaceFor(id)` matches annotation OR sessionID, completion
+  fires only when gone by BOTH (clearing `activeSessionID`), and a sessionID-only re-adopt RE-STAMPS
+  the wiped annotation (`setAnnotation` queueName/schedule/scheduleId) so the tile re-groups + the
+  row carries `scheduleId` again. Mirrors the work-item reconcile's sessionID-keyed re-adoption. **Wire contract (both
   sides must match — the `coerceQueueCommands` lesson):** template `schedules[]` (validated by
   `validateSchedules`, cron parsed, `promptFile` resolved by the loader); commands
   `pause_schedule`/`resume_schedule`/`run_schedule_now`/`pause_all_schedules` carrying `{run,
@@ -888,10 +897,10 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `MCPLayout.surfacesJSONData`); the status report carries a `schedules[]` array for the lane.
   **NO new MCP tool** (the 4 commands ride `take_queue_commands`; `schedule`/`scheduleId` ride
   `set_surface_annotation`) and **NO Zig/host change** — GUI relaunch + rebuilt sidecar `dist`.
-  Wiring — sidecar: `queue/schedule.ts` (NEW pure cron + `computeNextStart`), `queue/types.ts`
-  (`ScheduleSpec` + `QueueTemplate.schedules`), `queue/templates.ts` (`validateSchedules` + promptFile
-  resolution), `queue/store.ts` (`StoreFile.schedules` + `parseSchedules`), `queue/runner.ts`
-  (`scheduleSweep`/`dispatchSchedule`/`scheduleStatuses`/`scheduleRecord`/`persistRun` + rehydrate),
+  Wiring — sidecar: `queue/schedule.ts` (NEW pure cron + `computeNextStart` + `ScheduleState.activeSessionID`),
+  `queue/types.ts` (`ScheduleSpec` + `QueueTemplate.schedules`), `queue/templates.ts` (`validateSchedules` + promptFile
+  resolution), `queue/store.ts` (`StoreFile.schedules` + `parseSchedules` incl. `activeSessionID`), `queue/runner.ts`
+  (`scheduleSweep` two-signal `liveSurfaceFor`+re-stamp/`dispatchSchedule` sessionID-persist/`scheduleStatuses`/`scheduleRecord`/`persistRun` + rehydrate),
   `queue/commands.ts` (4 actions + `scheduleId`), `queue/status.ts` (`ScheduleStatus`), `mcp.ts`
   (coerce whitelist + `Annotation`/`Surface` fields + report wire). macOS: `MCPAnnotation.swift` +
   `AgentStateBridge.swift` (`queueSchedule`/`scheduleId` + parse/merge), `MCPTools.swift` (schema),

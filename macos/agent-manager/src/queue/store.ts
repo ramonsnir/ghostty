@@ -192,6 +192,13 @@ function sanitizeSchedules(
       s.lastCompletionAt = Math.floor(r.lastCompletionAt);
     }
     if (r.paused === true) s.paused = true;
+    if (
+      typeof r.activeSessionID === "number" &&
+      Number.isFinite(r.activeSessionID) &&
+      r.activeSessionID > 0
+    ) {
+      s.activeSessionID = Math.floor(r.activeSessionID);
+    }
     out[id] = s;
   }
   return out;

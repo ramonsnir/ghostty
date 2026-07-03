@@ -3723,3 +3723,54 @@ test("runQueueSweep: a RE-ADOPTED schedule (restart) reserves a real grid slot s
   assert.notEqual(slotB, readoptSlot, "work item B does not collide with the schedule's slot");
   assert.notEqual(slotA, slotB, "the two work items take distinct slots");
 });
+
+test("runQueueSweep: re-adopts a running schedule by sessionID after a GUI restart (annotation wiped) and re-stamps it", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }] }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // dispatch → sch-1, sessionId 500
+  assert.equal(fake.calls.spawn.length, 1, "one dispatch");
+  assert.equal(run.schedules.get("s1")!.activeSessionID, 500, "activeSessionID persisted at dispatch");
+
+  // Simulate a GUI RESTART: the scan split is STILL LIVE (same host sessionID 500), but the
+  // GUI's in-memory annotation model is WIPED, so list_surfaces carries NO queueName/scheduleId.
+  // The in-memory scheduleActive map is also gone (a fresh sidecar process); run.schedules is the
+  // persisted cadence that would be rehydrated (still holds activeSessionID=500).
+  run.scheduleActive.clear();
+  spec.surfaces = [
+    Object.assign(surface({ id: "sch-1", agentState: "working" }), {
+      sessionID: 500, // stable across restart — the re-adoption signal
+    }),
+  ];
+  const spawnsBefore = fake.calls.spawn.length;
+  const annotatesBefore = fake.calls.annotate.length;
+  now = 102 * M;
+  await runQueueSweep(deps);
+
+  assert.equal(run.scheduleActive.has("s1"), true, "re-adopted by sessionID (annotation wiped)");
+  assert.equal(run.schedules.get("s1")!.lastCompletionAt, undefined, "NOT marked completed — still live");
+  assert.equal(fake.calls.spawn.length, spawnsBefore, "no duplicate dispatch after restart");
+  const restamp = fake.calls.annotate
+    .slice(annotatesBefore)
+    .find((a) => (a.ann as { scheduleId?: string }).scheduleId === "s1");
+  assert.ok(restamp, "re-stamps the wiped scheduleId annotation");
+  assert.equal((restamp!.ann as { schedule?: boolean }).schedule, true, "re-stamp carries schedule:true");
+
+  // And once THAT split truly closes, completion re-anchors + clears the sessionID.
+  spec.surfaces = [];
+  now = 103 * M;
+  await runQueueSweep(deps);
+  assert.equal(run.scheduleActive.has("s1"), false, "freed on real close");
+  assert.equal(run.schedules.get("s1")!.lastCompletionAt, 103 * M, "completion re-anchored");
+  assert.equal(run.schedules.get("s1")!.activeSessionID, undefined, "activeSessionID cleared on completion");
+});

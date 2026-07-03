@@ -562,7 +562,16 @@ never fires, but **Run-now still works** so you can kick one off ad hoc.
 Schedules bypass the `concurrency` / `agent-queue-max-total` / `maxItems` caps (they're maintenance,
 not throughput), but they **do occupy the grid** (overflowing to a new row/tab when full, like a
 work item). Cadence + pause state persist in the per-run store and survive a sidecar/GUI restart;
-a still-open scheduled split is re-adopted after a restart (no re-dispatch).
+a still-open scheduled split is **re-adopted after a restart with no re-dispatch**. Steady state,
+the sidecar tracks a running scan by its `scheduleId` annotation (echoed back by `list_surfaces`).
+But a **GUI restart wipes that in-memory annotation**, so a surviving scan comes back carrying no
+`scheduleId` — which naively read as "the split closed" (false completion → re-anchor → risk of a
+duplicate scan). To close that, each schedule also **persists the running scan's stable host
+`sessionID`** (`ScheduleState.activeSessionID`); on restart the sidecar re-adopts the scan by
+matching that sessionID against the live surfaces, marks it running again, and **re-stamps the
+wiped annotation** so the dashboard re-groups + re-marks the tile. Completion fires only when the
+scan is gone by **both** signals (no annotation match **and** no sessionID match); the sessionID is
+cleared on completion. (This mirrors the work-item reconcile's `sessionID`-keyed re-adoption.)
 
 > **Grid occupancy is SHARED between work items and schedules (regression fixed 2026-07-03).** A
 > schedule holds a real grid slot, so **every** placement decision must count it — both a schedule
@@ -1955,8 +1964,10 @@ or host change** (pure Swift + TS).
   (`parseCron`/`nextAfter`/`prevBefore`, LOCAL time) + `computeNextStart(cron, state)` implementing
   the completion-anchored **half-of-local-gap skip** (`A > C + (A − prevFiring)/2`, strictly
   greater; never-ran uses the arm anchor with NO skip). The runner's `scheduleSweep` (runner.ts,
-  called every sweep from `runOne`) arms/prunes cadence state, detects completion (a tracked
-  scheduled surface gone from `list_surfaces` → `lastCompletionAt = now`), re-adopts a live
+  called every sweep from `runOne`) arms/prunes cadence state, tracks liveness via **two signals**
+  (the `scheduleId` annotation echoed by `list_surfaces` OR the persisted `activeSessionID` matched
+  against the live surfaces — `liveSurfaceFor(id)`), detects completion only when a tracked schedule
+  is gone by BOTH (→ `lastCompletionAt = now`, `activeSessionID = undefined`), re-adopts a live
   scheduled surface after a restart, auto-closes an EXITED split (when `closeOnComplete`), and
   dispatches a due/run-now schedule via a grid-packed split (`dispatchSchedule`). The prose reaches
   the agent as the `GHOSTTY_SCHEDULE_PROMPT` env (+ a single-quoted command PREFIX for the pty-host
@@ -1977,9 +1988,17 @@ or host change** (pure Swift + TS).
   split carries a `queueName` +
   `schedule`/`scheduleId` annotation but **no `queueKey`**, so the work-item `reconcile` leaves it
   alone (it only adopts keyed surfaces). Single-flight is structural (`run.scheduleActive`, keyed by
-  schedule id, rebuilt each sweep from the annotated live surfaces). Cadence + pause persist in the
-  per-run store (`StoreFile.schedules`, `{armedAt, lastCompletionAt?, paused?}`) + rehydrate on the
-  first reconcile. **Wire contract (both sides must match — the `coerceQueueCommands` lesson):**
+  schedule id, rebuilt each sweep from the live surfaces resolved by `liveSurfaceFor`). Cadence +
+  pause persist in the per-run store (`StoreFile.schedules`, `{armedAt, lastCompletionAt?, paused?,
+  activeSessionID?}`) + rehydrate on the first reconcile. **Restart re-adoption (the "running status
+  didn't survive a restart" fix):** a GUI restart wipes the in-memory annotation, so a still-open
+  scan comes back with no `scheduleId` on its `list_surfaces` row; without a second signal the scan
+  read as completed → re-anchor + duplicate-dispatch risk. So `dispatchSchedule` persists the spawn's
+  stable host `sessionID` in `ScheduleState.activeSessionID` (also backfilled each sweep since a fresh
+  spawn's id attaches asynchronously), and `scheduleSweep` re-adopts a surviving scan by matching that
+  sessionID against the live surfaces, then **re-stamps the wiped annotation** (`setAnnotation` with
+  `queueName`/`schedule`/`scheduleId`) so the dashboard re-groups + re-marks the tile and
+  `list_surfaces` carries `scheduleId` again; the sessionID is cleared on real completion. **Wire contract (both sides must match — the `coerceQueueCommands` lesson):**
   template `schedules[]` is a validation chokepoint (`templates.ts validateSchedules` whitelists the
   fields + parses the cron; the loader resolves `promptFile`→`prompt`); commands
   `pause_schedule`/`resume_schedule`/`run_schedule_now`/`pause_all_schedules` carrying `{run,
@@ -2001,7 +2020,8 @@ or host change** (pure Swift + TS).
   `QueueStatus.ScheduleStatus` decode), `AgentPreviewTile.swift` (teal schedule glyph),
   `AgentDashboardView.swift` (the thin Schedules lane). Tests: sidecar `queue/schedule.test.ts`
   (cron + skip matrix), `queue/templates.test.ts` (validate + promptFile), `queue/store.test.ts`
-  (persist round-trip), `queue/commands.test.ts` (4 actions), `queue/runner.test.ts` (dispatch /
-  single-flight / prose / completion / auto-close), `mcp.test.ts` (coerce whitelist), `status.test.ts`;
+  (persist round-trip + `activeSessionID` round-trip), `queue/commands.test.ts` (4 actions),
+  `queue/runner.test.ts` (dispatch / single-flight / prose / completion / auto-close /
+  **restart re-adopt-by-sessionID + re-stamp**), `mcp.test.ts` (coerce whitelist), `status.test.ts`;
   Swift `MCPAnnotationTests` (parse + merge), `MCPServerTests` (`scheduleId` emit), `QueuePaletteTests`
   (command round-trip + status decode).
