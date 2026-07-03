@@ -190,83 +190,100 @@ struct AgentManagerControllerTests {
             == "http://127.0.0.1:8767/mcp")
     }
 
-    // MARK: - applyAgentQueueEnv (the §8a/§15 GUI→sidecar queue arming)
+    // MARK: - applyAgentQueueEnv (the §8a/§15 · shared-templates GUI→sidecar queue arming)
 
-    /// Disabled ⇒ env is unchanged AND any inherited queue keys are stripped, so a
-    /// disabled supervisor can never arm the sidecar's pass 3.
+    /// Disabled ⇒ env is unchanged AND any inherited queue keys are stripped — including
+    /// BOTH the plural `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` and the legacy singular
+    /// `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR` — so a disabled supervisor can never arm pass 3.
     @Test func agentQueueEnvDisabledStripsKeys() {
         let base = [
             "PATH": "/usr/bin",
-            "GHOSTTY_AGENT_QUEUE": "1",                 // stray inherited value
-            "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/x",
+            "GHOSTTY_AGENT_QUEUE": "1",                       // stray inherited value
+            "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS": "/x\n/y",  // stray plural
+            "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/x",        // stray legacy singular
             "GHOSTTY_AGENT_QUEUE_MAX_TOTAL": "99",
-            "GHOSTTY_AGENT_QUEUE_HERO_MAX": "7",       // stray inherited value
+            "GHOSTTY_AGENT_QUEUE_HERO_MAX": "7",             // stray inherited value
         ]
         let out = AgentManagerController.applyAgentQueueEnv(
-            into: base, enabled: false, templatesDir: "/should/not/appear", maxTotal: 8, heroMax: 2)
+            into: base, enabled: false, templatesDirs: ["/should/not/appear"],
+            defaultDir: "/def", maxTotal: 8, heroMax: 2)
         #expect(out["PATH"] == "/usr/bin")
         #expect(out["GHOSTTY_AGENT_QUEUE"] == nil)
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"] == nil)
         #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
         #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == nil)
         #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == nil)
     }
 
-    /// Enabled ⇒ arms the master enable + the fleet cap; an ABSOLUTE templates dir is
-    /// plumbed unchanged (so the palette + sidecar loader can't desync).
-    @Test func agentQueueEnvEnabledSetsAllThree() {
+    /// Enabled ⇒ arms the master enable + the fleet caps; the DIRS key is the effective
+    /// SEARCH PATH (default dir FIRST, then each configured dir), `\n`-joined; the legacy
+    /// singular is stripped (so the palette + sidecar loader can't desync).
+    @Test func agentQueueEnvEnabledSetsSearchPath() {
         let out = AgentManagerController.applyAgentQueueEnv(
-            into: ["PATH": "/usr/bin"],
+            into: ["PATH": "/usr/bin", "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/stale"],
             enabled: true,
-            templatesDir: "/Users/me/.config/ghostty-ramon/agent-manager/queues",
+            templatesDirs: ["/repo/queues"],
+            defaultDir: "/def/queues",
             maxTotal: 12,
             heroMax: 3)
         #expect(out["GHOSTTY_AGENT_QUEUE"] == "1")
         #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == "12")
         #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == "3")
-        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"]
-            == "/Users/me/.config/ghostty-ramon/agent-manager/queues")
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"] == "/def/queues\n/repo/queues")
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)  // legacy stripped
         #expect(out["PATH"] == "/usr/bin")  // untouched
     }
 
     /// The hero cap is forwarded verbatim, INCLUDING `0` (which disables hero
-    /// dispatch) — it must be an explicit "0", never absent.
+    /// dispatch) — it must be an explicit "0", never absent. The DIRS key is always
+    /// set (the default dir is never empty), even with NO configured dirs.
     @Test func agentQueueEnvForwardsHeroMaxIncludingZero() {
         let out = AgentManagerController.applyAgentQueueEnv(
-            into: [:], enabled: true, templatesDir: nil, maxTotal: 0, heroMax: 0)
+            into: [:], enabled: true, templatesDirs: [], defaultDir: "/def",
+            maxTotal: 0, heroMax: 0)
         #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == "0")
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"] == "/def")
     }
 
-    /// Enabled with a `~`-prefixed templates dir ⇒ the dir is TILDE-EXPANDED to an
-    /// absolute path (matching the palette's `discoverTemplates`, which does the same),
-    /// so the palette LISTS and the sidecar READS the identical dir. (Regression for the
-    /// templates-dir tilde desync: the sidecar does no `~` expansion of its own.)
-    @Test func agentQueueEnvEnabledExpandsTilde() {
+    /// A `~`-prefixed configured dir is TILDE-EXPANDED (no leading `~` survives); an
+    /// already-absolute dir passes through; the default is always FIRST. (Regression for
+    /// the templates-dir tilde desync: the sidecar does no `~` expansion of its own.)
+    @Test func agentQueueEnvExpandsTilde() {
         let out = AgentManagerController.applyAgentQueueEnv(
             into: [:],
             enabled: true,
-            templatesDir: "~/git/queues",
-            maxTotal: 8,
-            heroMax: 2)
-        let expected = ("~/git/queues" as NSString).expandingTildeInPath
-        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == expected)
-        // It must actually have expanded (no leading `~` survives).
-        #expect(!(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"]?.hasPrefix("~") ?? true))
+            templatesDirs: ["~/git/queues", "/abs/queues"],
+            defaultDir: "~/.config/ghostty-ramon/agent-manager/queues",
+            maxTotal: 8, heroMax: 2)
+        let def = (("~/.config/ghostty-ramon/agent-manager/queues" as NSString)
+            .expandingTildeInPath as NSString).standardizingPath
+        let cfg = (("~/git/queues" as NSString).expandingTildeInPath as NSString).standardizingPath
+        let dirs = out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"]?
+            .split(separator: "\n").map(String.init)
+        #expect(dirs == [def, cfg, "/abs/queues"])
+        // No leading `~` survives anywhere in the joined value.
+        #expect(!(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"]?.contains("~") ?? true))
     }
 
-    /// Enabled with NO templates dir (nil OR empty) ⇒ the master enable + cap are set
-    /// but the dir key is ABSENT so the sidecar uses its built-in default (which
-    /// matches the palette's default discovery dir).
-    @Test func agentQueueEnvEnabledWithoutDirOmitsDirKey() {
-        for dir in [nil, ""] as [String?] {
-            let out = AgentManagerController.applyAgentQueueEnv(
-                into: ["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR": "/stale"],
-                enabled: true, templatesDir: dir, maxTotal: 8, heroMax: 2)
-            #expect(out["GHOSTTY_AGENT_QUEUE"] == "1")
-            #expect(out["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] == "8")
-            #expect(out["GHOSTTY_AGENT_QUEUE_HERO_MAX"] == "2")
-            // A stale inherited dir must NOT survive — the sidecar default wins.
-            #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] == nil)
-        }
+    /// A configured dir EQUAL to the default is DEDUPED (default-first wins; it appears
+    /// once), and configured order is otherwise preserved.
+    @Test func agentQueueEnvDedupsDefault() {
+        let out = AgentManagerController.applyAgentQueueEnv(
+            into: [:], enabled: true,
+            templatesDirs: ["/def/queues", "/repo/queues"],
+            defaultDir: "/def/queues",
+            maxTotal: 8, heroMax: 2)
+        #expect(out["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"] == "/def/queues\n/repo/queues")
+    }
+
+    // MARK: - effectiveTemplateSearchPath (pure §1)
+
+    /// The default dir is prepended FIRST, configured order is preserved, and an
+    /// equivalent/repeated path is deduped (first occurrence wins).
+    @Test func effectiveTemplateSearchPathOrderAndDedup() {
+        let path = AgentManagerController.effectiveTemplateSearchPath(
+            configured: ["/a", "/b", "/a", "/def"], defaultDir: "/def")
+        #expect(path == ["/def", "/a", "/b"])
     }
 
     // MARK: - applySummarizerEnv (the independent summarizer arming)

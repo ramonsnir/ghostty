@@ -32,6 +32,44 @@ import type {
 /** The directory (under the agent-manager override dir) holding queue templates. */
 export const QUEUES_DIR = [".config", "ghostty-ramon", "agent-manager", "queues"];
 
+/** (shared templates) The literal portability token substituted with the template file's OWN
+ *  resolved directory (no trailing slash) so a shared-repo template can reference its sibling
+ *  scripts by relative path. Unlike `{key}` (a whole-argv-element swap in `renderArgv`), this
+ *  is a SUBSTRING replace within each string. Case-sensitive, braces included. */
+export const TEMPLATE_DIR_TOKEN = "{templateDir}";
+
+/**
+ * (shared templates) Substitute the literal `{templateDir}` token with `dir` (NO trailing
+ * slash) in the five contract sites — `provider.list.command`, `provider.status.command`,
+ * `provider.graph.command` (when present), `agent.command`, and every param `valuesCommand`
+ * (when present). PURE — returns a NEW template with those sub-objects deep-cloned; a token in
+ * any OTHER field is left untouched, `{key}` (renderArgv) is unaffected, and `provider.claim`
+ * is deliberately NOT substituted (see SHARED-QUEUES-SPEC §0 note). A template with no token is
+ * deep-equal to the input after substitution (no-op safety). Substring replace of ALL
+ * occurrences in a string.
+ */
+export function substituteTemplateDir(t: QueueTemplate, dir: string): QueueTemplate {
+  const sub = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(dir);
+  const provider: ProviderSpec = {
+    ...t.provider,
+    list: { ...t.provider.list, command: t.provider.list.command.map(sub) },
+    status: { ...t.provider.status, command: t.provider.status.command.map(sub) },
+  };
+  if (t.provider.graph !== undefined) {
+    provider.graph = { ...t.provider.graph, command: t.provider.graph.command.map(sub) };
+  }
+  // provider.claim is intentionally NOT substituted (contract note).
+  const params = t.params.map((p) =>
+    p.valuesCommand !== undefined ? { ...p, valuesCommand: p.valuesCommand.map(sub) } : p,
+  );
+  return {
+    ...t,
+    agent: { ...t.agent, command: sub(t.agent.command) },
+    provider,
+    params,
+  };
+}
+
 /** Defaults applied when an optional template field is omitted (§5). */
 export const TEMPLATE_DEFAULTS = {
   concurrency: 1,

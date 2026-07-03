@@ -23,6 +23,8 @@
 // NOTHING here is Linear/Git/issue-key aware: items reach the agent as GHOSTTY_ITEM_*
 // env vars (provider.buildItemEnv), provider `{key}` is an argv element — never spliced.
 
+import { dirname } from "node:path";
+
 import type { McpClient, Surface } from "../mcp.js";
 import { McpError } from "../mcp.js";
 import {
@@ -34,6 +36,7 @@ import {
 import {
   buildItemEnv,
   shellEnvPrefix,
+  shellSingleQuote,
   fetchListResult,
   fetchGraphResult,
   probeStatus,
@@ -268,6 +271,14 @@ export interface QueueRun {
    *  toggle membership. Persisted in the per-run store (`StoreFile.hero`) + rehydrated on the first
    *  reconcile so a promoted split stays a hero across a sidecar/GUI restart. Cleared on abort. */
   hero: Set<string>;
+  /** (shared templates §3) The RESOLVED absolute path this run's template was loaded from
+   *  (`""` for test-constructed runs with no path). Recorded into the active-runs record so a
+   *  restart re-resolves the SAME file even if a later-added search dir shadows the basename. */
+  templatePath: string;
+  /** (shared templates §2) The run's template DIRECTORY = `dirname(templatePath)` (`""` when no
+   *  path). Exported as `GHOSTTY_QUEUE_TEMPLATE_DIR` into BOTH the provider exec env AND the
+   *  spawned agent split env so team scripts can find their siblings. Derived at construction. */
+  templateDir: string;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -285,6 +296,7 @@ export function makeQueueRun(
     params?: Record<string, string>;
     maxItemsLive?: number | null;
     concurrencyLive?: number;
+    templatePath?: string;
   } = {},
 ): QueueRun {
   const params = opts.params ?? {};
@@ -295,6 +307,10 @@ export function makeQueueRun(
     identityScope: runIdentityScope(template, params),
     storeIO,
     params,
+    // (shared templates §2/§3) The resolved template path + its dir. Test-constructed runs omit
+    // it → "" (GHOSTTY_QUEUE_TEMPLATE_DIR then simply absent; existing tests unaffected).
+    templatePath: opts.templatePath ?? "",
+    templateDir: opts.templatePath ? dirname(opts.templatePath) : "",
     maxItemsLive: opts.maxItemsLive,
     concurrencyLive: opts.concurrencyLive,
     active: new Map<string, Assignment>(),
@@ -330,6 +346,22 @@ export function effectiveMaxItemsCap(run: QueueRun): number | null {
   const override = resolveMaxItemsOverride(run.template, run.params);
   const cap = override === undefined ? run.template.maxItems : override;
   return cap <= 0 ? null : cap;
+}
+
+/**
+ * (shared templates §2) The env handed to a run's PROVIDER commands (list/status/graph/claim):
+ * the resolved start-time param env PLUS `GHOSTTY_QUEUE_TEMPLATE_DIR` (the template's own dir)
+ * when the run has a resolved path, so a team script can find its siblings. PURE. Used at EVERY
+ * provider exec site (replacing the bare `resolveParamsEnv(...)`) so the var is delivered
+ * uniformly. `GHOSTTY_QUEUE_TEMPLATE_DIR` survives `sanitizeProviderEnv` (overlaid AFTER the
+ * base strip; not a `GHOSTTY_AGENT_`/`GHOSTTY_MCP_` deny-prefix). Omitted for a pathless (test)
+ * run so existing tests are unaffected.
+ */
+export function queueProviderEnv(run: QueueRun): Record<string, string> {
+  return {
+    ...resolveParamsEnv(run.template, run.params),
+    ...(run.templateDir ? { GHOSTTY_QUEUE_TEMPLATE_DIR: run.templateDir } : {}),
+  };
 }
 
 /** (keep) Whether an item's split is KEPT — exempt from the supervisor's auto-close. PURE.
@@ -457,6 +489,10 @@ export function activeRunRecords(registry: RunRegistry): ActiveRunRecord[] {
     // Persist a LIVE concurrency edit so a restart re-applies it (omitted when never edited,
     // so a restart falls back to the template concurrency).
     if (run.concurrencyLive !== undefined) rec.concurrencyLive = run.concurrencyLive;
+    // (shared templates §3) Persist the RESOLVED template path so a restart re-resolves the SAME
+    // file even if a later-added search dir shadows the basename. Omit when empty (test runs /
+    // back-compat) to keep the record tidy.
+    if (run.templatePath) rec.templatePath = run.templatePath;
     out.push(rec);
   }
   return out;
@@ -932,7 +968,7 @@ async function refreshGraph(run: QueueRun, deps: QueueDeps, nowMs: number): Prom
   try {
     res = await fetchGraphResult(spec, deps.exec, {
       cwd: run.template.workdir,
-      env: resolveParamsEnv(run.template, run.params),
+      env: queueProviderEnv(run),
     });
   } catch (err) {
     errlog(`provider.graph "${run.runName}": ${msg(err)}`);
@@ -1185,7 +1221,7 @@ async function advanceStates(
     : [];
   const statusByKey = new Map<string, boolean>();
   if (probeTargets.length > 0) {
-    const env = resolveParamsEnv(run.template, run.params);
+    const env = queueProviderEnv(run);
     const results = await Promise.all(
       probeTargets.map((a) =>
         probeStatus(run.template.provider.status, a.key, deps.exec, {
@@ -1449,7 +1485,7 @@ async function dispatchCandidates(
   try {
     const res = await fetchListResult(t.provider.list, deps.exec, {
       cwd: t.workdir,
-      env: resolveParamsEnv(t, run.params),
+      env: queueProviderEnv(run),
     });
     items = res.items;
     // (§11 health) Cache the list for the run-level status report. Only a SUCCESSFUL
@@ -1650,11 +1686,22 @@ async function dispatchOne(
   //     UUID                and the GUI splits its largest pane. We omit a missing UUID so the
   //                         tool's first-tab fallback applies cleanly.
   const itemEnv = buildItemEnv(item);
-  const commandWithItemEnv = shellEnvPrefix(item) + t.agent.command;
+  // (shared templates §2) Deliver GHOSTTY_QUEUE_TEMPLATE_DIR to the agent split BOTH ways, like
+  // the item env: as `env` (honored under `.exec`) AND as a single-quoted command PREFIX (under
+  // the `.client` pty-host backend the spawn `env` field is DROPPED — see shellEnvPrefix — so the
+  // prefix rides the forwarded command). Empty templateDir ⇒ no prefix / no key (back-compat).
+  const templateDirAssign = run.templateDir
+    ? `GHOSTTY_QUEUE_TEMPLATE_DIR=${shellSingleQuote(run.templateDir)} `
+    : "";
+  const commandWithItemEnv = templateDirAssign + shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
   try {
     let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
-    const base = { command: commandWithItemEnv, cwd: t.workdir, env: itemEnv };
+    const base = {
+      command: commandWithItemEnv,
+      cwd: t.workdir,
+      env: { ...itemEnv, ...(run.templateDir ? { GHOSTTY_QUEUE_TEMPLATE_DIR: run.templateDir } : {}) },
+    };
     if (sp === undefined) {
       // (hero) HERO tab: open a NEW dedicated single-terminal tab (never a grid split),
       // anchored on the run's window (any seated grid pane) so it shares the run's window like
@@ -1751,7 +1798,7 @@ async function dispatchOne(
     const argv = renderArgv(t.provider.claim.command, item.key);
     void runProvider(argv, deps.exec, {
       cwd: t.workdir,
-      env: resolveParamsEnv(t, run.params),
+      env: queueProviderEnv(run),
     }).catch(() => {
       /* claim failure is non-fatal + already logged inside runProvider's result */
     });
@@ -1878,7 +1925,7 @@ async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
     const argv = renderArgv(t.provider.claim.command, key);
     void runProvider(argv, deps.exec, {
       cwd: t.workdir,
-      env: resolveParamsEnv(t, run.params),
+      env: queueProviderEnv(run),
     }).catch(() => {
       /* claim failure is non-fatal + already logged inside runProvider's result */
     });

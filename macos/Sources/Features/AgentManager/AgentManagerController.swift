@@ -65,15 +65,21 @@ final class AgentManagerController {
     /// supervisor "pass 3". Captured on main at init. When true the controller
     /// arms the sidecar via `GHOSTTY_AGENT_QUEUE=1` (else pass 3 stays a no-op).
     private let agentQueueEnabled: Bool
-    /// The configured queue templates dir (nil ⇒ the sidecar's built-in default).
-    /// Plumbed verbatim so the palette's discovery dir and the sidecar's loader
-    /// never desync.
-    private let agentQueueTemplatesDir: String?
+    /// The CONFIGURED queue template search dirs (repeatable; may be empty). The
+    /// effective search path prepends `defaultTemplatesDir` and dedups; it is
+    /// forwarded as the newline-joined `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` so the
+    /// palette's discovery path and the sidecar's loader never desync.
+    private let agentQueueTemplatesDirs: [String]
     /// The global fleet-wide concurrency cap across all queue runs (default 8).
     private let agentQueueMaxTotal: UInt32
     /// The fleet-wide HERO cap across all queue runs (default 2; `0` disables
     /// hero dispatch). Orthogonal to `agentQueueMaxTotal`/concurrency/maxItems.
     private let agentQueueHeroMax: UInt32
+
+    /// The built-in default queue-templates dir, ALWAYS searched first (prepended to
+    /// the configured list by `effectiveTemplateSearchPath`). Keep in sync with
+    /// `QueuePaletteView.defaultTemplatesDir` and the sidecar `QUEUES_DIR`.
+    static let defaultTemplatesDir = "~/.config/ghostty-ramon/agent-manager/queues"
 
     /// The directory the sidecar lives in (`<app>/Contents/Resources/agent-manager`
     /// in a bundle; the source tree's `macos/agent-manager` during dev). Resolved
@@ -115,7 +121,7 @@ final class AgentManagerController {
         self.usageTracking = ghostty.config.agentManagerUsageTracking
         self.warmBase = ghostty.config.agentManagerWarmBase
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
-        self.agentQueueTemplatesDir = ghostty.config.agentQueueTemplatesDir
+        self.agentQueueTemplatesDirs = ghostty.config.agentQueueTemplatesDirs
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
         self.agentQueueHeroMax = ghostty.config.agentQueueHeroMax
         self.mcpPortOffset = MCPServer.portOffset(forBundleID: Bundle.main.bundleIdentifier)
@@ -292,7 +298,8 @@ final class AgentManagerController {
         env = Self.applyAgentQueueEnv(
             into: env,
             enabled: agentQueueEnabled,
-            templatesDir: agentQueueTemplatesDir,
+            templatesDirs: agentQueueTemplatesDirs,
+            defaultDir: Self.defaultTemplatesDir,
             maxTotal: agentQueueMaxTotal,
             heroMax: agentQueueHeroMax)
         return env
@@ -333,26 +340,30 @@ final class AgentManagerController {
         return env
     }
 
-    /// (Agent Queue Supervisor §8a/§15) Layer the queue-supervisor env onto the
-    /// sidecar's environment. PURE + unit-tested. When `enabled` is false the env
-    /// is returned UNCHANGED (and any stray inherited `GHOSTTY_AGENT_QUEUE*` keys
-    /// are stripped so a disabled controller can't accidentally arm pass 3 via the
-    /// parent process environment). When enabled it sets:
+    /// (Agent Queue Supervisor §8a/§15 · shared templates) Layer the queue-supervisor
+    /// env onto the sidecar's environment. PURE + unit-tested. When `enabled` is false the
+    /// env is returned UNCHANGED except that any stray inherited `GHOSTTY_AGENT_QUEUE*`
+    /// keys — INCLUDING both the plural `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` and the legacy
+    /// singular `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR` — are stripped so a disabled controller
+    /// can't accidentally arm pass 3 via the parent process environment. When enabled it sets:
     ///   - `GHOSTTY_AGENT_QUEUE=1` (the master enable the sidecar's pass-3 gate reads),
-    ///   - `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR` (only when a non-empty templates dir is
-    ///     configured — absent ⇒ the sidecar falls back to its built-in default, which
-    ///     matches the palette's default discovery dir, so they never desync). A `~`-prefixed
-    ///     dir is TILDE-EXPANDED here (same `expandingTildeInPath` the palette's
-    ///     `discoverTemplates` uses), so the palette and the sidecar resolve the SAME
-    ///     absolute dir — the sidecar does no `~` expansion of its own (Node `path.join`
-    ///     would treat `~` as a literal relative segment),
+    ///   - `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` (the FULL effective search path — the
+    ///     default dir FIRST then each configured dir, each tilde-expanded + standardized,
+    ///     deduped, order-preserving; joined by a single NEWLINE). The default dir is never
+    ///     empty, so this key is ALWAYS set; the legacy singular
+    ///     `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR` is STRIPPED (the sidecar reads the plural,
+    ///     falling back to the singular only for BACK-COMPAT with an older GUI). Expansion
+    ///     happens here (the sidecar does NO `~` expansion — Node `path.join` treats `~` as a
+    ///     literal relative segment), so the palette LISTS and the sidecar READS the identical
+    ///     dirs,
     ///   - `GHOSTTY_AGENT_QUEUE_MAX_TOTAL` (the global fleet cap, as a decimal string),
     ///   - `GHOSTTY_AGENT_QUEUE_HERO_MAX` (the fleet-wide hero cap, as a decimal string;
     ///     `0` disables hero dispatch — orthogonal to the regular pools).
     static func applyAgentQueueEnv(
         into env: [String: String],
         enabled: Bool,
-        templatesDir: String?,
+        templatesDirs: [String],
+        defaultDir: String,
         maxTotal: UInt32,
         heroMax: UInt32
     ) -> [String: String] {
@@ -361,6 +372,7 @@ final class AgentManagerController {
             // Defensively drop any inherited queue keys: a disabled supervisor must
             // never arm pass 3, even if the parent process happened to export them.
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE")
+            env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS")
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR")
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_MAX_TOTAL")
             env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_HERO_MAX")
@@ -369,18 +381,39 @@ final class AgentManagerController {
         env["GHOSTTY_AGENT_QUEUE"] = "1"
         env["GHOSTTY_AGENT_QUEUE_MAX_TOTAL"] = String(maxTotal)
         env["GHOSTTY_AGENT_QUEUE_HERO_MAX"] = String(heroMax)
-        if let dir = templatesDir, !dir.isEmpty {
-            // Expand `~` to an absolute path so this matches the palette's
-            // `discoverTemplates` (which also `expandingTildeInPath`s) and the sidecar —
-            // which does NO tilde expansion — resolves the identical dir. (An already-
-            // absolute path passes through unchanged.)
-            env["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR"] = (dir as NSString).expandingTildeInPath
-        } else {
-            // No explicit dir ⇒ let the sidecar's built-in default win; ensure no
-            // stale inherited value points it elsewhere.
-            env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR")
-        }
+        // The default dir is always included, so the search path is never empty and the
+        // plural key is always set. Strip the legacy singular so an older inherited value
+        // can't override the plural in the sidecar's back-compat fallback.
+        let searchPath = Self.effectiveTemplateSearchPath(
+            configured: templatesDirs, defaultDir: defaultDir)
+        env["GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS"] = searchPath.joined(separator: "\n")
+        env.removeValue(forKey: "GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR")
         return env
+    }
+
+    /// (shared templates §1) Build the effective template SEARCH PATH from the configured
+    /// list. AUTHORITATIVE (the GUI computes this; the sidecar consumes it verbatim):
+    /// the built-in `defaultDir` is prepended FIRST, then each configured dir in order;
+    /// each entry is `expandingTildeInPath` + `standardizingPath`, empties dropped, and
+    /// deduped by the standardized absolute path (order-preserving — first occurrence wins).
+    /// PURE (no filesystem access; expansion/standardization only). This is the SINGLE
+    /// authoritative implementation: `QueuePaletteView.effectiveSearchDirs(configured:)`
+    /// DELEGATES here (passing its `defaultTemplatesDir`), so the env the sidecar consumes
+    /// and the dirs the palette lists can never desync.
+    static func effectiveTemplateSearchPath(
+        configured: [String],
+        defaultDir: String
+    ) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for dir in [defaultDir] + configured {
+            let expanded = (dir as NSString).expandingTildeInPath
+            let standardized = (expanded as NSString).standardizingPath
+            guard !standardized.isEmpty else { continue }
+            guard seen.insert(standardized).inserted else { continue }
+            out.append(standardized)
+        }
+        return out
     }
 
     // MARK: - node resolution

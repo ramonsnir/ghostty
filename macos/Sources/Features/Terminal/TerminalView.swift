@@ -158,7 +158,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         surfaceView: surfaceView,
                         isPresented: $viewModel.queueSelectorIsShowing,
                         ghosttyConfig: ghostty.config,
-                        templatesDir: ghostty.config.agentQueueTemplatesDir
+                        templatesDirs: ghostty.config.agentQueueTemplatesDirs
                     )
                 }
 

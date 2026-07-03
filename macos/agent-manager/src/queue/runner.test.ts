@@ -3411,3 +3411,72 @@ test("hero: promote persistence round-trip — a promoted split rehydrates a her
   assert.ok(run2.hero.has("R-1"), "hero set rehydrated after restart");
   assert.equal(run2.active.get("R-1")!.hero, true, "reconciled record re-stamped as a hero after restart");
 });
+
+// ---------------------------------------------------------------------------
+// (shared templates) GHOSTTY_QUEUE_TEMPLATE_DIR reaches provider exec env + agent spawn.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: GHOSTTY_QUEUE_TEMPLATE_DIR reaches the provider exec env AND the agent spawn (both ways)", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1","title":"do a thing","url":"http://x/K-1"}]',
+    spawns: [{ id: "s1", sessionId: 501 }],
+  });
+  // Wrap the fake exec to capture the env passed to the provider LIST call.
+  let listEnv: Record<string, string> | undefined;
+  const capturingExec: Exec = async (argv, opts) => {
+    if (argv[0] === "list") listEnv = opts?.env;
+    return fake.exec(argv, opts);
+  };
+  const run = makeQueueRun(tmpl(), memStore(), { templatePath: "/shared/queues/backlog.json" });
+  assert.equal(run.templateDir, "/shared/queues", "templateDir = dirname(templatePath)");
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { exec: capturingExec });
+
+  await runQueueSweep(deps); // arm (dispatch-suppressed)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch
+
+  // (a) the PROVIDER exec env carries the template dir.
+  assert.ok(listEnv, "provider list exec ran");
+  assert.equal(listEnv!.GHOSTTY_QUEUE_TEMPLATE_DIR, "/shared/queues", "provider env carries the dir");
+
+  // (b) the AGENT spawn carries it BOTH in the env map AND as an inline command prefix.
+  assert.equal(fake.calls.spawn.length, 1, "dispatched once");
+  const spawnEnv = fake.calls.spawn[0].env as Record<string, string>;
+  assert.equal(spawnEnv.GHOSTTY_QUEUE_TEMPLATE_DIR, "/shared/queues", "spawn env carries the dir");
+  assert.ok(
+    (fake.calls.spawn[0].command as string).startsWith("GHOSTTY_QUEUE_TEMPLATE_DIR='/shared/queues' "),
+    "command carries the single-quoted prefix (for the .client backend)",
+  );
+});
+
+test("runQueueSweep: a run with empty templateDir OMITS GHOSTTY_QUEUE_TEMPLATE_DIR (back-compat)", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"K-1","title":"t"}]',
+    spawns: [{ id: "s1", sessionId: 501 }],
+  });
+  let listEnv: Record<string, string> | undefined;
+  const capturingExec: Exec = async (argv, opts) => {
+    if (argv[0] === "list") listEnv = opts?.env;
+    return fake.exec(argv, opts);
+  };
+  const run = makeQueueRun(tmpl(), memStore()); // no templatePath → templateDir ""
+  assert.equal(run.templateDir, "");
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, { exec: capturingExec });
+
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch
+
+  assert.ok(listEnv);
+  assert.equal("GHOSTTY_QUEUE_TEMPLATE_DIR" in listEnv!, false, "provider env omits the key");
+  const spawnEnv = fake.calls.spawn[0].env as Record<string, string>;
+  assert.equal("GHOSTTY_QUEUE_TEMPLATE_DIR" in spawnEnv, false, "spawn env omits the key");
+  assert.ok(
+    !(fake.calls.spawn[0].command as string).includes("GHOSTTY_QUEUE_TEMPLATE_DIR"),
+    "no command prefix",
+  );
+});

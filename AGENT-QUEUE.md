@@ -65,8 +65,15 @@ shared `~/.config/ghostty/config`, which an official Ghostty also reads):
 
 ```
 agent-queue = true
-# where queue templates live (default shown):
-# agent-queue-templates-dir = ~/.config/ghostty-ramon/agent-manager/queues
+# Where queue templates live. REPEATABLE — a search LIST of base dirs, each scanned
+# for `*.json` templates. The built-in default below is ALWAYS searched FIRST, so you
+# only ADD extra dirs (e.g. a shared repo of team templates). A basename found in more
+# than one dir resolves to the FIRST-in-search-order copy (your personal/default dir
+# wins over a shared repo). `~` is expanded. See "Sharing queue templates across a repo".
+#   default (always first, no need to list it):
+#     ~/.config/ghostty-ramon/agent-manager/queues
+#   add a shared repo (repeat the key for more):
+# agent-queue-templates-dir = ~/git/your-project/ghostty-queues
 # OPTIONAL global cap across ALL running queues combined (per-queue cap is in the
 # template). Default 0 = UNLIMITED — a queue is bounded only by its own
 # concurrency/maxItems/grid. Set a positive value only to opt into a fleet ceiling:
@@ -237,6 +244,95 @@ waits for the poll.
 There's a no-Linear demo (a fake `list`/`status` that drains as you `touch` marker files)
 to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
 
+## Sharing queue templates across a repo
+
+Templates + their sibling scripts are just files, so a team can keep them in a **shared git
+repo** and everyone points Ghostty at that repo — no more hand-copying a template (and its
+`list`/`status`/`valuesCommand` scripts) into each person's `~/.config`. Two mechanisms make
+this work; a third note keeps the repo clean and secret-free.
+
+### 1. A search LIST of template dirs (`agent-queue-templates-dir`)
+
+`agent-queue-templates-dir` is a **repeatable list** (a `RepeatableString`, like
+`project-directory`), not a single path. The effective **search path** is:
+
+```
+1. ~/.config/ghostty-ramon/agent-manager/queues   ← the built-in default, ALWAYS first
+2. each configured agent-queue-templates-dir, in the order you wrote them
+```
+
+- **Default-first.** The default queues dir is always searched first — you never list it;
+  you only ADD extra dirs. So a shared repo is *additive* to your personal templates.
+- **First-in-search-order wins on a basename clash.** If both your default dir and a shared
+  repo dir contain `backlog.json`, the **default (personal) copy wins** and shadows the
+  repo's. The palette badges the winning source (**"· from <dir>"**) whenever a basename is
+  duplicated, so a shadow is visible, never silent. To let the repo's copy win, rename your
+  personal one (or remove it).
+- **Deduped, order-preserving.** Equivalent paths collapse to one entry (dedup key =
+  `standardizingPath`, macOS-side — it expands `~`, collapses `.`/`..`, but does **not**
+  resolve symlinks, so a symlink is a legitimately distinct dir).
+- Set it in `~/.config/ghostty-ramon/config` (repeat the key for more dirs):
+
+  ```
+  agent-queue-templates-dir = ~/git/your-project/ghostty-queues
+  agent-queue-templates-dir = ~/git/team-shared/queues
+  ```
+
+### 2. The `{templateDir}` portability token + `GHOSTTY_QUEUE_TEMPLATE_DIR`
+
+A shared template usually references **sibling scripts** that live next to it in the repo
+(`list.py`, `list-projects.py`, …). Hard-coding an absolute path breaks the moment a
+colleague clones the repo somewhere else. Two portability hooks fix that:
+
+- **`{templateDir}` token.** The literal string `{templateDir}` inside a command is
+  substituted with the template file's **own resolved directory** (no trailing slash) when
+  the template loads — so a script sitting beside the template is always found:
+
+  ```jsonc
+  "provider": {
+    "list":   { "command": ["python3", "{templateDir}/list.py"] },
+    "status": { "command": ["python3", "{templateDir}/status.py", "{key}"] }
+  },
+  "agent":  { "command": "{templateDir}/run-agent.sh" },
+  "params": [
+    { "name": "project", "env": "PROJECT",
+      "valuesCommand": ["python3", "{templateDir}/list-projects.py"] }
+  ]
+  ```
+
+  It substitutes (as a **substring**, all occurrences) in exactly these sites:
+  `provider.list.command`, `provider.status.command`, `provider.graph.command`,
+  `agent.command`, and each param `valuesCommand`. It is **not** applied to
+  `provider.claim.command` (out of scope for now — raise it if you need it). A template
+  with no token is byte-identical after substitution (no-op safe). It is distinct from the
+  `{key}` argv placeholder, which is untouched by this substitution.
+- **`GHOSTTY_QUEUE_TEMPLATE_DIR` env.** The same directory is also exported into **both** the
+  provider exec env (for `list`/`status`/`graph`/`claim`/`valuesCommand`) **and** the spawned
+  agent split env, so a script can find its siblings without threading `{templateDir}`
+  through every argument (e.g. `"$GHOSTTY_QUEUE_TEMPLATE_DIR/helpers/foo.sh"`).
+
+### 3. Repo-vs-`~/.config` split, secrets, and `.gitignore`
+
+- **What goes in the repo:** the portable template JSON + the sibling scripts it references
+  via `{templateDir}`. These are safe to share.
+- **What stays machine-local:** anything per-machine or secret. **Secrets (API keys,
+  tokens) NEVER go in the repo** — scripts read them from `~/.config` or a git-ignored local
+  `*.env`, never from a tracked file. Machine-local overrides live in your personal
+  `~/.config/ghostty-ramon/agent-manager/queues` copy (which wins by first-in-order).
+- **Per-run STATE never lands in the repo.** The queue's run state (`active-runs.json` and
+  per-run `*.state.json`) is always written to
+  `~/.config/ghostty-ramon/agent-manager/queues/.state` — hardcoded and **independent of the
+  templates search path** — so pointing the queue at a shared repo dir cannot write state
+  next to the shared templates.
+- **Recommended repo `.gitignore`:**
+
+  ```gitignore
+  __pycache__/
+  .DS_Store
+  .state/
+  *.env
+  ```
+
 ## Starting / controlling a queue
 
 - **Start:** the `start_agent_queue` keybind action (bind it in your fork config, e.g.
@@ -244,6 +340,11 @@ to try the mechanics first — see `scratchpad/queue-example/` in this checkout.
   entry — opens a fuzzy picker of your templates **shown by each template's `name`** (e.g.
   "ExampleOS", not the file's `example.json`); choose one and the sidecar starts the run on
   its next sweep. `start_agent_queue:<template-name>` (the file basename) skips the picker.
+  The picker enumerates the **full search path** (the default dir plus every
+  `agent-queue-templates-dir`, default-first) and merges them by basename with
+  **first-in-search-order wins**; when a basename exists in more than one dir the winning
+  copy's option carries a **"· from <dir>"** source badge so a shadowed template is never
+  silently ambiguous. See "Sharing queue templates across a repo".
 - **Watch:** the Agent Dashboard now **groups tiles by origin** — one section per running
   queue (plus `(other)` for non-queue agents) — with a per-tile origin **marker** and a
   top **filter bar** to include/exclude origins (see everything, only one queue, or mute a
@@ -560,6 +661,105 @@ or host change** (pure Swift + TS).
   `runner.test.ts` (`maxTotal = Infinity … imposes no fleet cap`). **GUI relaunch + rebuilt
   lib/xcframework (Zig default changed) + rebuilt sidecar `dist`; no host restart** (the host
   ignores the key).
+
+### Shared templates — search-list `agent-queue-templates-dir` + `{templateDir}` (user doc: "Sharing queue templates across a repo")
+
+- **`agent-queue-templates-dir` became a `RepeatableString` search LIST** (was a scalar
+  `?[:0]const u8`), modeled exactly on `project-directory`. No new C plumbing: it reuses the
+  `ghostty_config_string_list_s` bridge (`RepeatableString.list_c`), so the macOS getter is a
+  string-list read like `projectDirectories`. The scalar `ghostty_config_get` NOTE in the old
+  doc is gone.
+- **Search path is GUI-authoritative** (`§1` of `SHARED-QUEUES-SPEC.md`). The macOS side
+  computes `[default] + configured`, `expandingTildeInPath` + `standardizingPath` each, drops
+  empties, dedups by the standardized path (order-preserving), and emits the final ordered
+  list. There is ONE implementation, not two "kept-in-sync" copies:
+  `AgentManagerController.effectiveTemplateSearchPath(configured:defaultDir:)` (sidecar
+  transport) is authoritative, and `QueuePaletteView.effectiveSearchDirs(configured:)`
+  (palette discovery) DELEGATES to it with its `defaultTemplatesDir`, so the two can never
+  desync (a differential test, `effectiveSearchDirsMatchesControllerTwin`, also runs both on
+  the same non-trivial input as a guard). Pure (expansion/standardization only, no
+  filesystem). The default dir constant is mirrored as
+  `AgentManagerController.defaultTemplatesDir` / `QueuePaletteView.defaultTemplatesDir`
+  (identical strings) and must match the sidecar's `defaultTemplatesDir()`.
+- **GUI→sidecar env is the PLURAL `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS`** = the full search
+  path, tilde-expanded macOS-side, joined by **newlines**. The legacy singular
+  `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR` is STRIPPED when enabled and both are stripped when
+  disabled. The sidecar `parseTemplatesDirs(env)` splits the plural on `"\n"` (drops blanks),
+  falls back to the singular as a one-element list, else `[defaultTemplatesDir()]`; it
+  consumes the list VERBATIM (does NOT re-canonicalize — the GUI already deduped; a weaker
+  TS-side key is fine and harmless).
+- **First-wins basename resolution.** `resolveTemplatePath(searchPath, basename)` (TS) returns
+  the first `join(dir, basename+".json")` that exists; the palette's `discoverTemplates(dirs:)`
+  merges per-dir results by basename with first-in-order wins, tags each kept entry's winning
+  `sourceDir`, and flags `hasDuplicate` when a later dir also had it (drives the "· from <dir>"
+  source badge). The per-dir primitive `discoverTemplates(dir:)` is unchanged; params/probe for
+  a merged entry resolve against `entry.sourceDir`.
+- **`{templateDir}` substitution** is a PURE TS helper `substituteTemplateDir(t, dir)` in
+  `queue/templates.ts` (`TEMPLATE_DIR_TOKEN = "{templateDir}"`), a **substring** replace (all
+  occurrences) in the five contract sites (`provider.list`/`status`/`graph.command`,
+  `agent.command`, param `valuesCommand`) — **NOT** `provider.claim.command` (deliberate). It
+  runs in `loadTemplateAtPath(path)` AFTER load/validate + `workdir` `~`-expansion, with
+  `dir = dirname(path)` (no trailing slash). `loadTemplateByName(searchPath, basename)` is a
+  thin `resolveTemplatePath` → `loadTemplateAtPath` wrapper.
+- **`GHOSTTY_QUEUE_TEMPLATE_DIR` env** rides `run.templateDir` (= `dirname(run.templatePath)`,
+  set by `makeQueueRun`; `""` for test-constructed runs → key omitted). Provider exec: a helper
+  `queueProviderEnv(run)` overlays it onto `resolveParamsEnv(...)` at ALL FIVE exec sites
+  (list/status-probe-batch/graph/claim×2 — the status-probe batch is a `const env` binding, not
+  an inline `env:`, so it's enumerated explicitly). Agent split: injected on BOTH delivery paths
+  — the `env` field (`.exec`) AND a `GHOSTTY_QUEUE_TEMPLATE_DIR=<quoted> ` command prefix
+  (`.client`, whose spawn `env` is dropped — same dual-delivery as `GHOSTTY_ITEM_*`), via
+  `shellSingleQuote`.
+- **Palette exec-path parity (the SECOND exec path).** The start-form's live `list` PREVIEW
+  and each param's `valuesCommand` SUGGESTION probe run provider argv GUI-side
+  (`QueueParamProber` → `QueueProviderProbe.run`), independent of the sidecar loader, so the
+  palette substitutes `{templateDir}` and exports `GHOSTTY_QUEUE_TEMPLATE_DIR` ITSELF —
+  otherwise a shared-repo template's sibling-script preview/suggestions silently break even
+  though the real run works. `QueuePaletteView.substituteTemplateDir(_:dir:)` (pure, mirrors
+  the TS helper's substring semantics) is applied to `templateProbe`'s `list.command` and
+  `templateParams`' `valuesCommand`, using the SAME resolved dir the reader computes
+  (`expandingTildeInPath` of `entry.sourceDir`); that dir rides `QueueTemplateProbe.templateDir`
+  / `QueueParamPrompt.templateDir` into `QueueParamProber`, which overlays
+  `GHOSTTY_QUEUE_TEMPLATE_DIR` onto the `providerEnv` for BOTH the preview and suggestion execs.
+- **Rehydration determinism.** `ActiveRunRecord.templatePath?` persists the RESOLVED abs path;
+  `activeRunRecords` writes it (omitted when empty), `parseActiveRuns` tolerantly carries it
+  (non-empty string only), `serializeActiveRuns` round-trips it. `rehydrateActiveRuns` prefers
+  `rec.templatePath` when it still exists (so a later-added dir that shadows the basename cannot
+  re-point a running queue), else falls back to first-wins `resolveTemplatePath`, else drops the
+  run.
+- **State stays out of shared repos.** `defaultStateDir()` is hardcoded to
+  `~/.config/…/queues/.state`, INDEPENDENT of the templates search path — a hygiene invariant
+  (no code change), so per-run state never lands next to a shared template.
+- Wiring: core — `src/config/Config.zig` (`@"agent-queue-templates-dir": RepeatableString`
+  field + doc + `agent-queue-templates-dir: RepeatableString parse` test; the `agent-queue:
+  parse and default` test dropped its scalar assertions). macOS —
+  `Ghostty.Config.swift` (`agentQueueTemplatesDirs` list getter, replacing the scalar),
+  `MCPKnowledge.swift` (reader joins the list for `get_effective_config`),
+  `AgentManagerController.swift` (`agentQueueTemplatesDirs` field + `defaultTemplatesDir` +
+  `effectiveTemplateSearchPath` + the plural-env emit/strip in `applyAgentQueueEnv`),
+  `QueuePalette.swift` (`templatesDirs` + `effectiveSearchDirs` + multi-dir `discoverTemplates`
+  + `QueueTemplateEntry.sourceDir`/`hasDuplicate` + source-badge subtitle +
+  `substituteTemplateDir`/`templateDirToken` + `QueueTemplateProbe.templateDir`/
+  `QueueParamPrompt.templateDir` + `QueueParamProber` `GHOSTTY_QUEUE_TEMPLATE_DIR` overlay),
+  `TerminalView.swift` (passes `agentQueueTemplatesDirs`). Sidecar —
+  `queue/templates.ts` (`TEMPLATE_DIR_TOKEN`/`substituteTemplateDir`), `queue/wiring.ts`
+  (`parseTemplatesDirs`/`resolveTemplatePath`/`loadTemplateAtPath` + `makeFileRunFactory`/
+  `rehydrateActiveRuns` take a `searchPath`), `queue/runner.ts` (`QueueRun.templatePath`/
+  `templateDir` + `queueProviderEnv` + agent-split env/prefix + `activeRunRecords`),
+  `queue/store.ts` (`ActiveRunRecord.templatePath` parse/serialize), `index.ts`
+  (`parseTemplatesDirs(process.env)` → `searchPath` threaded to rehydrate/factory).
+- Tests: Zig `agent-queue-templates-dir: RepeatableString parse` (default/single/multiple/
+  reset/cval/formatEntry round-trip). Sidecar `templates.test.ts` (`substituteTemplateDir`
+  sites + substring + no-op + claim-not-touched + `{key}` untouched), `wiring.test.ts`
+  (`parseTemplatesDirs`/`resolveTemplatePath` first-wins/`loadTemplateAtPath`/`makeFileRunFactory`
+  path threading/`rehydrateActiveRuns` determinism), `store.test.ts` (`templatePath`
+  carry/round-trip), `runner.test.ts` (`GHOSTTY_QUEUE_TEMPLATE_DIR` in provider env + agent
+  env + command prefix; empty-dir omits). Swift `QueuePaletteTests.swift`
+  (`discoverTemplates(dirs:)` first-wins + `hasDuplicate`/`sourceDir` + `effectiveSearchDirs`
+  default-first/dedup + winning-dir params + `substituteTemplateDir` +
+  `templateProbe`/`templateParams` `{templateDir}` substitution), `AgentManagerControllerTests.swift`
+  (`GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` build/expand/dedup + legacy strip + disabled strip +
+  pure `effectiveTemplateSearchPath`). **GUI relaunch + rebuilt lib/xcframework (Zig field
+  changed) + rebuilt sidecar `dist`; NO host restart / no protocol change / no new C API.**
 
 ### `agent-queue-hero-max` + the HERO pool (concurrency cap off the grid, `maxItems` shared)
 

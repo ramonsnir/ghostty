@@ -995,17 +995,20 @@ extension Ghostty {
             return v
         }
 
-        // (ramon fork / Agent Queue Supervisor) Directory holding the queue TEMPLATE
-        // JSON files; nil/empty when unset (the sidecar uses its built-in default
-        // ~/.config/ghostty-ramon/agent-manager/queues).
-        var agentQueueTemplatesDir: String? {
-            guard let config = self.config else { return nil }
-            var v: UnsafePointer<Int8>?
+        // (ramon fork / Agent Queue Supervisor) The CONFIGURED template search dirs
+        // (repeatable, like `project-directory`). Empty when unset; the default dir
+        // (`~/.config/ghostty-ramon/agent-manager/queues`) is prepended by the effective
+        // search-path builder (default-first, first-in-search-order wins on a basename
+        // clash), NOT here. `~` is expanded by the search-path builders on both readers
+        // (the palette + AgentManagerController), not in this getter.
+        var agentQueueTemplatesDirs: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
             let key = "agent-queue-templates-dir"
-            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
-            guard let ptr = v else { return nil }
-            let s = String(cString: ptr)
-            return s.isEmpty ? nil : s
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
         }
 
         // (ramon fork / Agent Queue Supervisor) Optional global concurrency cap across

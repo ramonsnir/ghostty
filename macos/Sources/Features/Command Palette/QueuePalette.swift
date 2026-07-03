@@ -29,12 +29,14 @@ struct QueuePaletteView: View {
     /// The configuration so we can look up the background color.
     @ObservedObject var ghosttyConfig: Ghostty.Config
 
-    /// The configured queue-templates directory, or nil to use the default
-    /// (`~/.config/ghostty-ramon/agent-manager/queues`). `~/` is expanded here.
-    let templatesDir: String?
+    /// The CONFIGURED queue-templates search dirs (repeatable; may be empty). The
+    /// effective search path prepends `defaultTemplatesDir` (always searched first) and
+    /// dedups; `~/` is expanded by `effectiveSearchDirs`.
+    let templatesDirs: [String]
 
-    /// The default templates dir when `agent-queue-templates-dir` is unset — kept
-    /// in sync with the sidecar's built-in default (see the queue templates loader).
+    /// The default templates dir, ALWAYS searched first (prepended to the configured
+    /// list by `effectiveSearchDirs`). Kept in sync with the sidecar's built-in default
+    /// (see the queue templates loader) and `AgentManagerController.defaultTemplatesDir`.
     static let defaultTemplatesDir = "~/.config/ghostty-ramon/agent-manager/queues"
 
     /// (§8b) The active param-prompt, set when a template that declares params is
@@ -119,47 +121,79 @@ struct QueuePaletteView: View {
         }
     }
 
-    /// The list of template options discovered from the templates dir. If the dir
-    /// is missing or holds no templates, a single informational row is shown so
-    /// the toggle is never a silent no-op (mirrors `ProjectPaletteView`).
+    /// The list of template options discovered across the effective search path (the
+    /// default dir first, then each configured dir; first-in-search-order wins on a
+    /// basename clash). If the search path holds no templates, a single informational
+    /// row is shown so the toggle is never a silent no-op (mirrors `ProjectPaletteView`).
     private var templateOptions: [CommandOption] {
-        let dir = templatesDir ?? Self.defaultTemplatesDir
-        let templates = Self.discoverTemplates(dir: dir)
+        let dirs = Self.effectiveSearchDirs(configured: templatesDirs)
+        let templates = Self.discoverTemplates(dirs: dirs)
 
         guard !templates.isEmpty else {
-            Ghostty.logger.warning("queue selector found no templates under the configured templates dir")
+            Ghostty.logger.warning("queue selector found no templates under the configured search path")
+            let pathDesc = dirs
+                .map { ($0 as NSString).abbreviatingWithTildeInPath }
+                .joined(separator: ", ")
             return [emptyStateOption(
                 title: "No queue templates found",
-                subtitle: "Add a *.json template under \((dir as NSString).abbreviatingWithTildeInPath)"
+                subtitle: "Add a *.json template under \(pathDesc)"
             )]
         }
 
         return templates.map { entry in
-            CommandOption(
+            // A shadowed basename (present in more than one search dir) badges its
+            // WINNING source dir so the choice isn't silently ambiguous; a unique
+            // basename keeps the plain subtitle.
+            let subtitle = entry.hasDuplicate
+                ? "Start a queue run · from \((entry.sourceDir as NSString).abbreviatingWithTildeInPath)"
+                : "Start a queue run from this template"
+            return CommandOption(
                 // Show the template's human `name` (e.g. "ExampleOS"); the START command
                 // still carries the file `basename` (the sidecar loads templates by it).
                 title: entry.displayName,
-                subtitle: "Start a queue run from this template",
+                subtitle: subtitle,
                 leadingIcon: "square.stack.3d.up"
             ) {
                 // (§8b) If the template declares start-time params, transition to the
                 // prompt form (the start is enqueued from the form's Start). Otherwise
                 // enqueue the start intent directly — the SAME path
                 // `Ghostty.App.startAgentQueue` uses for the `:<name>` form and the
-                // dashboard control buttons.
-                let params = Self.templateParams(dir: dir, basename: entry.basename)
+                // dashboard control buttons. Params/probe resolve against the entry's
+                // WINNING source dir (first-in-search-order).
+                let params = Self.templateParams(dir: entry.sourceDir, basename: entry.basename)
                 if params.isEmpty {
                     Self.postStart(template: entry.basename, params: nil)
                 } else {
                     prompt.active = QueueParamPrompt(
                         template: entry.basename,
                         displayName: entry.displayName,
+                        // The resolved winning dir, exported as GHOSTTY_QUEUE_TEMPLATE_DIR into
+                        // the form's probe env (parity with the sidecar's queueProviderEnv).
+                        templateDir: (entry.sourceDir as NSString).expandingTildeInPath,
                         params: params,
-                        probe: Self.templateProbe(dir: dir, basename: entry.basename)
+                        probe: Self.templateProbe(dir: entry.sourceDir, basename: entry.basename)
                     )
                 }
             }
         }
+    }
+
+    /// (shared templates §2) The `{templateDir}` portability token. The palette is a
+    /// SECOND exec path (live `list` preview + param `valuesCommand` suggestions) alongside
+    /// the sidecar loader, so it must substitute the token itself to reach parity with the
+    /// sidecar's `substituteTemplateDir` + `queueProviderEnv` — otherwise a shared-repo
+    /// template that references sibling scripts via `{templateDir}` gets a broken preview and
+    /// empty suggestions even though the actual queue run works.
+    static let templateDirToken = "{templateDir}"
+
+    /// (shared templates §2, pure, testable) Substring-replace ALL `{templateDir}`
+    /// occurrences in each argv element with `dir` (the template's OWN resolved directory,
+    /// no trailing slash). An empty `dir` leaves the argv untouched (the token stays literal,
+    /// so the run fails visibly rather than silently pointing at the cwd). Matches the
+    /// sidecar's `substituteTemplateDir` substring semantics (NOT the whole-element `{key}`).
+    static func substituteTemplateDir(_ argv: [String], dir: String) -> [String] {
+        guard !dir.isEmpty else { return argv }
+        return argv.map { $0.replacingOccurrences(of: templateDirToken, with: dir) }
     }
 
     /// Enqueue a `{action:start, template, params?}` command onto the MCP server's FIFO.
@@ -174,15 +208,81 @@ struct QueuePaletteView: View {
         )
     }
 
-    /// (testable, pure filesystem) Discover the queue templates under `dir`: every
+    /// (shared templates §1, pure) Build the effective template SEARCH PATH from the
+    /// CONFIGURED dirs: the built-in `defaultTemplatesDir` is prepended FIRST, then each
+    /// configured dir in order; each entry is `expandingTildeInPath` + `standardizingPath`,
+    /// empties dropped, deduped by the standardized absolute path (order-preserving — first
+    /// occurrence wins). This is the palette twin of
+    /// `AgentManagerController.effectiveTemplateSearchPath(configured:defaultDir:)` — the two
+    /// MUST agree (default-first, first-in-search-order wins, same dedup key), so this
+    /// DELEGATES to that single authoritative implementation with `defaultTemplatesDir` as
+    /// the default (both consts are the same string). This is not merely "kept in sync" —
+    /// there is ONE implementation, so a one-sided edit is impossible. The `fileManager` is
+    /// accepted for signature symmetry but unused (no filesystem access — pure expansion/
+    /// standardization).
+    static func effectiveSearchDirs(
+        configured: [String],
+        fileManager fm: FileManager = .default
+    ) -> [String] {
+        _ = fm
+        return AgentManagerController.effectiveTemplateSearchPath(
+            configured: configured, defaultDir: defaultTemplatesDir)
+    }
+
+    /// (shared templates §1, pure filesystem) Discover templates ACROSS the effective
+    /// search path: iterate `dirs` in order, calling the single-dir primitive
+    /// `discoverTemplates(dir:fileManager:)` for each, and merge by basename with
+    /// FIRST-IN-SEARCH-ORDER WINS. Each kept entry records its WINNING source dir; a
+    /// basename that also appears in a LATER dir is flagged `hasDuplicate == true` (so the
+    /// palette can badge the winning dir). Sorted case-insensitively by displayName
+    /// (basename tie-break), same as the single-dir version.
+    static func discoverTemplates(
+        dirs: [String],
+        fileManager fm: FileManager = .default
+    ) -> [QueueTemplateEntry] {
+        var winners: [String: QueueTemplateEntry] = [:]  // basename -> winning entry
+        var order: [String] = []                          // basename first-seen order
+        var duplicated = Set<String>()                     // basenames seen in >1 dir
+        for dir in dirs {
+            for entry in discoverTemplates(dir: dir, fileManager: fm) {
+                if winners[entry.basename] == nil {
+                    winners[entry.basename] = entry
+                    order.append(entry.basename)
+                } else {
+                    duplicated.insert(entry.basename)
+                }
+            }
+        }
+
+        let merged: [QueueTemplateEntry] = order.compactMap { base in
+            guard let w = winners[base] else { return nil }
+            guard duplicated.contains(base) else { return w }
+            return QueueTemplateEntry(
+                basename: w.basename,
+                displayName: w.displayName,
+                sourceDir: w.sourceDir,
+                hasDuplicate: true)
+        }
+
+        return merged.sorted {
+            let c = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+            if c != .orderedSame { return c == .orderedAscending }
+            return $0.basename.localizedCaseInsensitiveCompare($1.basename) == .orderedAscending
+        }
+    }
+
+    /// (testable, pure filesystem) Discover the queue templates under a SINGLE `dir`: every
     /// immediate child whose name ends in `.json` (case-insensitive), as a
     /// `QueueTemplateEntry` carrying both the `basename` (the `*.json` filename minus
     /// extension — the START command's `template` + the key for params/probe) AND the
     /// human `displayName` read from the template JSON's `name` field (so the palette
     /// shows e.g. "ExampleOS" rather than the file's "example"; falls back to the
-    /// basename when the file has no `name`). Deduped by basename; sorted
-    /// case-insensitively by displayName (basename tie-break). `dir` is tilde-expanded;
-    /// an unreadable dir yields an empty list. Hidden files are skipped.
+    /// basename when the file has no `name`). The entry's `sourceDir` is `dir` (as passed);
+    /// `hasDuplicate` is false (cross-dir shadowing is decided by the multi-dir merge).
+    /// Deduped by basename; sorted case-insensitively by displayName (basename tie-break).
+    /// `dir` is tilde-expanded; an unreadable dir yields an empty list. Hidden files
+    /// are skipped. This is the per-dir PRIMITIVE the multi-dir `discoverTemplates(dirs:)`
+    /// composes.
     static func discoverTemplates(
         dir: String,
         fileManager fm: FileManager = .default
@@ -200,8 +300,8 @@ struct QueuePaletteView: View {
             guard !base.isEmpty, seen.insert(base).inserted else { continue }
             out.append(QueueTemplateEntry(
                 basename: base,
-                displayName: Self.templateDisplayName(dir: dir, basename: base, fileManager: fm)
-            ))
+                displayName: Self.templateDisplayName(dir: dir, basename: base, fileManager: fm),
+                sourceDir: dir))
         }
 
         return out.sorted {
@@ -253,9 +353,13 @@ struct QueuePaletteView: View {
         for p in arr {
             guard let name = p["name"] as? String, !name.isEmpty, seen.insert(name).inserted else { continue }
             let isMax = (p["target"] as? String) == "maxItems"
-            let valuesCommand = (p["valuesCommand"] as? [Any])?
+            let rawValuesCommand = (p["valuesCommand"] as? [Any])?
                 .compactMap { $0 as? String }
                 .nonEmptyOrNil
+            // (shared templates §2) Substitute `{templateDir}` = the resolved template dir
+            // so a shared-repo template's sibling-script `valuesCommand` runs in the palette
+            // suggestion probe (parity with the sidecar loader).
+            let valuesCommand = rawValuesCommand.map { Self.substituteTemplateDir($0, dir: expanded) }
             out.append(QueueParamSpec(
                 name: name,
                 label: (p["label"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? name,
@@ -289,9 +393,13 @@ struct QueuePaletteView: View {
         else { return nil }
         return QueueTemplateProbe(
             workdir: (workdir as NSString).expandingTildeInPath,
-            listCommand: command,
+            // (shared templates §2) Substitute `{templateDir}` = the resolved template dir so
+            // a shared-repo template's sibling-script `list` command runs in the live preview
+            // probe (parity with the sidecar loader).
+            listCommand: Self.substituteTemplateDir(command, dir: expanded),
             titleField: (list["titleField"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-            keyField: keyField
+            keyField: keyField,
+            templateDir: expanded
         )
     }
 
@@ -314,6 +422,26 @@ struct QueuePaletteView: View {
 struct QueueTemplateEntry: Equatable {
     let basename: String
     let displayName: String
+    /// The search dir this entry was resolved from — the WINNING dir under multi-dir
+    /// discovery (first-in-search-order), or the passed dir under the single-dir
+    /// primitive. Params/probe/displayName are resolved against THIS dir.
+    let sourceDir: String
+    /// True when the SAME basename also exists in a LATER search dir (shadowed) — the
+    /// palette badges the winning `sourceDir` so the choice isn't silently ambiguous.
+    /// Always false from the single-dir primitive (cross-dir shadowing is a merge concern).
+    let hasDuplicate: Bool
+
+    init(
+        basename: String,
+        displayName: String,
+        sourceDir: String = "",
+        hasDuplicate: Bool = false
+    ) {
+        self.basename = basename
+        self.displayName = displayName
+        self.sourceDir = sourceDir
+        self.hasDuplicate = hasDuplicate
+    }
 }
 
 // MARK: - §8b start-time params: model + spec + form
@@ -359,12 +487,30 @@ struct QueueParamSpec: Equatable {
 struct QueueTemplateProbe: Equatable {
     /// The provider cwd (tilde-expanded to an absolute path).
     let workdir: String
-    /// The `provider.list.command` argv.
+    /// The `provider.list.command` argv (with `{templateDir}` already substituted).
     let listCommand: [String]
     /// Field on each emitted item to display (defaults to the keyField when absent).
     let titleField: String?
     /// The required dedup key field — used as the preview label when there is no title.
     let keyField: String
+    /// (shared templates §2) The template's OWN resolved directory — exported as
+    /// `GHOSTTY_QUEUE_TEMPLATE_DIR` into the preview probe env so a sibling script can find
+    /// its neighbors (parity with the sidecar's `queueProviderEnv`). `""` when unknown.
+    let templateDir: String
+
+    init(
+        workdir: String,
+        listCommand: [String],
+        titleField: String?,
+        keyField: String,
+        templateDir: String = ""
+    ) {
+        self.workdir = workdir
+        self.listCommand = listCommand
+        self.titleField = titleField
+        self.keyField = keyField
+        self.templateDir = templateDir
+    }
 }
 
 /// (§8b) A pending param prompt: which template + the fields to fill + the optional
@@ -374,8 +520,27 @@ struct QueueParamPrompt: Equatable {
     let template: String
     /// The template's human display name (its JSON `name`) — shown in the form title.
     let displayName: String
+    /// (shared templates §2) The template's OWN resolved directory — exported as
+    /// `GHOSTTY_QUEUE_TEMPLATE_DIR` into every probe env (list preview + each param
+    /// `valuesCommand` suggestion) so sibling scripts resolve. `""` when unknown (probes
+    /// then run without the var, back-compat).
+    let templateDir: String
     let params: [QueueParamSpec]
     let probe: QueueTemplateProbe?
+
+    init(
+        template: String,
+        displayName: String,
+        templateDir: String = "",
+        params: [QueueParamSpec],
+        probe: QueueTemplateProbe?
+    ) {
+        self.template = template
+        self.displayName = displayName
+        self.templateDir = templateDir
+        self.params = params
+        self.probe = probe
+    }
 }
 
 /// Reference-type holder so the palette's escaping option closures can set the
@@ -579,6 +744,9 @@ final class QueueParamProber: ObservableObject {
     private let params: [QueueParamSpec]
     private let probe: QueueTemplateProbe?
     private let cwd: String
+    /// (shared templates §2) The template's resolved dir, overlaid as
+    /// `GHOSTTY_QUEUE_TEMPLATE_DIR` on every probe env (parity with the sidecar).
+    private let templateDir: String
     private var generation = 0
     private var pending: DispatchWorkItem?
 
@@ -591,6 +759,7 @@ final class QueueParamProber: ObservableObject {
         self.params = prompt.params
         self.probe = prompt.probe
         self.cwd = prompt.probe?.workdir ?? NSHomeDirectory()
+        self.templateDir = prompt.templateDir
         if prompt.probe == nil { self.preview = .unavailable }
     }
 
@@ -606,7 +775,11 @@ final class QueueParamProber: ObservableObject {
     private func runProbes(values: [String: String]) {
         generation += 1
         let gen = generation
-        let env = QueueProviderProbe.providerEnv(params: params, values: values)
+        var env = QueueProviderProbe.providerEnv(params: params, values: values)
+        // (shared templates §2) Export GHOSTTY_QUEUE_TEMPLATE_DIR so a sibling script invoked
+        // by the list preview / a valuesCommand can find its neighbors (parity with the
+        // sidecar's queueProviderEnv). Omitted when unknown (back-compat).
+        if !templateDir.isEmpty { env["GHOSTTY_QUEUE_TEMPLATE_DIR"] = templateDir }
 
         // --- Preview: only when all REQUIRED params are filled (else the provider would
         // just error on a missing scope, which isn't a useful signal). ----------------

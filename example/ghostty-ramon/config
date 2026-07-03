@@ -120,6 +120,15 @@ agent-manager = false
 # ("Start Agent Queue…") or bind start_agent_queue. See AGENT-QUEUE.md.
 agent-queue = true
 
+# Share queue templates from a repo (fork-only). `agent-queue-templates-dir` is a
+# REPEATABLE search list — the built-in default (agent-manager/queues) is ALWAYS
+# searched first, so you only ADD extra dirs (e.g. a shared repo of team templates).
+# First-in-order wins on a basename clash (your personal copy overrides the repo's).
+# A template may reference sibling scripts via the {templateDir} token (and the
+# GHOSTTY_QUEUE_TEMPLATE_DIR env). Secrets stay machine-local — never in the repo.
+# See AGENT-QUEUE.md → "Sharing queue templates across a repo". Repeat for more dirs:
+#agent-queue-templates-dir = ~/git/your-project/ghostty-queues
+
 # Hero agents (fork-only): a HERO is a load-bearing queue item that competes for
 # YOUR ATTENTION rather than a machine slot — it lives in its own dedicated tab,
 # is never auto-closed, and pushes a distinct "hero" push glyph when it needs
@@ -251,7 +260,9 @@ bell-diagnostics = true
 # a host crash or machine reboot (sessions live only in host RAM, no
 # persistence); already-open .exec tabs can't be migrated — only tabs opened
 # after this is in effect are hosted.
-pty-host = /Users/ramon/.ghostty-ramon-host.sock
+# NOTE: launchd + the apprt need an ABSOLUTE socket path here (no ~ expansion),
+# so substitute your own home for the placeholder below.
+pty-host = /Users/you/.ghostty-ramon-host.sock
 
 # --- Web monitor (fork-only) -------------------------------------------------
 # GUI-embedded HTTP server: watch/drive splits from a phone over Tailscale.

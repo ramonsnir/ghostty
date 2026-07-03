@@ -15,6 +15,7 @@ import {
   runDisplayName,
   runIdentityScope,
   scopeSlug,
+  substituteTemplateDir,
   validateTemplate,
   type TemplateFs,
 } from "./templates.js";
@@ -594,4 +595,71 @@ test("scopeSlug: empty scope → '' (bare basename); non-empty → a stable file
   assert.ok(a.length > 0 && /^[a-z0-9]+$/.test(a), "base36, filename-safe");
   assert.equal(scopeSlug("LINEAR_PROJECT=Acme"), a, "deterministic");
   assert.notEqual(scopeSlug("LINEAR_PROJECT=Globex"), a, "distinct scopes → distinct slugs");
+});
+
+// ---------------------------------------------------------------------------
+// substituteTemplateDir — the {templateDir} portability token (shared templates §2).
+// ---------------------------------------------------------------------------
+
+/** A VALID template whose five contract sites each reference `{templateDir}` (plus a claim
+ *  site + a `{key}` placeholder, which must be LEFT UNTOUCHED). */
+function tokenTemplate(): QueueTemplate {
+  const obj: Record<string, unknown> = {
+    name: "shared",
+    workdir: "~/git/proj",
+    agent: { command: '{templateDir}/agent.sh "$GHOSTTY_ITEM_KEY"' },
+    provider: {
+      list: { command: ["python3", "{templateDir}/list.py"], keyField: "id" },
+      status: { command: ["{templateDir}/status.sh", "{key}"], doneStates: ["done"] },
+      claim: { command: ["{templateDir}/claim.sh", "{key}"] },
+      graph: { command: ["{templateDir}/graph.py"] },
+    },
+    params: [
+      { name: "project", env: "PROJECT", valuesCommand: ["{templateDir}/projects.sh"] },
+    ],
+  };
+  const r = validateTemplate(obj);
+  if (!r.ok) throw new Error(`bad template: ${r.errors.join("; ")}`);
+  return r.template;
+}
+
+test("substituteTemplateDir: substitutes the token in list/status/graph/agent/valuesCommand", () => {
+  const out = substituteTemplateDir(tokenTemplate(), "/dir");
+  assert.deepEqual(out.provider.list.command, ["python3", "/dir/list.py"]);
+  assert.deepEqual(out.provider.status.command, ["/dir/status.sh", "{key}"]);
+  assert.deepEqual(out.provider.graph?.command, ["/dir/graph.py"]);
+  assert.equal(out.agent.command, '/dir/agent.sh "$GHOSTTY_ITEM_KEY"');
+  assert.deepEqual(out.params[0].valuesCommand, ["/dir/projects.sh"]);
+});
+
+test("substituteTemplateDir: substring replace of ALL occurrences (not whole-element)", () => {
+  const r = validateTemplate({
+    name: "x",
+    workdir: "/w",
+    agent: { command: "a" },
+    provider: {
+      list: { command: ["cat", "{templateDir}/a {templateDir}/b"], keyField: "id" },
+      status: { command: ["s", "{key}"], doneStates: ["done"] },
+    },
+  });
+  assert.ok(r.ok);
+  const out = substituteTemplateDir(r.template, "/x");
+  // Both occurrences inside the single element are replaced (substring, not whole-element swap).
+  assert.deepEqual(out.provider.list.command, ["cat", "/x/a /x/b"]);
+});
+
+test("substituteTemplateDir: provider.claim is NOT substituted (locks the contract note)", () => {
+  const out = substituteTemplateDir(tokenTemplate(), "/dir");
+  assert.deepEqual(out.provider.claim?.command, ["{templateDir}/claim.sh", "{key}"]);
+});
+
+test("substituteTemplateDir: {key} placeholders are untouched by the dir substitution", () => {
+  const out = substituteTemplateDir(tokenTemplate(), "/dir");
+  assert.ok(out.provider.status.command.includes("{key}"), "{key} survives");
+});
+
+test("substituteTemplateDir: a template WITHOUT the token is deep-equal after substitution", () => {
+  const t = goodTemplate();
+  const out = substituteTemplateDir(t, "/anything");
+  assert.deepEqual(out, t); // no-op safety
 });

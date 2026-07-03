@@ -33,6 +33,7 @@ import {
   realTemplateFs,
   runIdentityScope,
   scopeSlug,
+  substituteTemplateDir,
   type LoadResult,
 } from "./templates.js";
 import type { QueueTemplate } from "./types.js";
@@ -158,10 +159,48 @@ export function defaultStateDir(home: string = homedir()): string {
   return join(home, ...QUEUES_DIR, ".state");
 }
 
-/** The default templates directory (the spec §15 default). Overridable by the Swift
- *  side via `agent-queue-templates-dir` → the GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR env. */
+/** The default templates directory (the built-in dir ALWAYS searched first). The GUI
+ *  prepends this and appends `agent-queue-templates-dir` into the effective search path it
+ *  ships over `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS`; this is the fallback when neither env is set. */
 export function defaultTemplatesDir(home: string = homedir()): string {
   return join(home, ...QUEUES_DIR);
+}
+
+/**
+ * (shared templates §6.2) Resolve the effective template SEARCH PATH from the process env
+ * (contract item 4). PURE. Prefers the plural `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` (the GUI's
+ * already-tilde-expanded, default-first, deduped list joined by "\n"); falls back to the legacy
+ * singular `GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR` as a ONE-element list (back-compat); else
+ * `[defaultTemplatesDir(home)]`. The list is consumed VERBATIM (the GUI is authoritative for
+ * dedup — §1); we only split, trim, and drop empty/blank lines, and fall back to the default
+ * dir if that leaves nothing.
+ */
+export function parseTemplatesDirs(env: NodeJS.ProcessEnv, home?: string): string[] {
+  const fallback = [defaultTemplatesDir(home)];
+  const plural = env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS;
+  if (typeof plural === "string" && plural.length > 0) {
+    const dirs = plural.split("\n").map((s) => s.trim()).filter(Boolean);
+    return dirs.length > 0 ? dirs : fallback;
+  }
+  const singular = env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR;
+  if (typeof singular === "string" && singular.trim().length > 0) {
+    return [singular.trim()];
+  }
+  return fallback;
+}
+
+/**
+ * (shared templates §1) Resolve a template BASENAME to a file path by first-in-search-order
+ * wins: the FIRST `join(dir, basename + ".json")` in `searchPath` that exists on disk. PURE-ish
+ * (only `existsSync`). Returns null when no search dir holds `<basename>.json`. No `~` expansion
+ * (the search dirs arrive absolute, already expanded macOS-side).
+ */
+export function resolveTemplatePath(searchPath: string[], basename: string): string | null {
+  for (const dir of searchPath) {
+    const p = join(dir, `${basename}.json`);
+    if (existsSync(p)) return p; // FIRST hit wins
+  }
+  return null;
 }
 
 /** The active-runs persistence file (one per state dir), holding the started-run SET (§8a). */
@@ -175,28 +214,47 @@ export function makeActiveRunsStoreIO(stateDir: string): StoreIO {
 }
 
 /**
- * (§8a) Load + validate ONE template by BASENAME (the `*.json` filename minus extension)
- * from `templatesDir`. The `start` command's run factory + active-run rehydration both
- * resolve a template this way (on demand) — a template merely existing on disk no longer
- * auto-runs (replaces the Phase-1 `loadRuns(all)`). Returns the loader's LoadResult; an
- * absent/invalid template is `{ok:false, errors}` the caller surfaces (a failed start).
+ * (§8a) Load + validate ONE template at an ABSOLUTE `path`. Returns the loader's LoadResult; an
+ * absent/invalid template is `{ok:false, errors}` the caller surfaces (a failed start). On
+ * success this impure seam performs the two path-dependent rewrites the pure validator can't:
+ *   1. Expand a leading `~` in the template's `workdir` to an ABSOLUTE path (once, at load) so
+ *      every downstream use is absolute — the provider commands' cwd (realExec) AND the spawned
+ *      agent split's cwd. The macOS SurfaceConfiguration.workingDirectory does NOT expand `~`,
+ *      so an unexpanded `~/foo` would be dropped and the split would inherit the wrong cwd.
+ *   2. (shared templates §2) Substitute the `{templateDir}` token with `dirname(path)` in the
+ *      five contract sites, so a shared-repo template's provider/agent/param commands can
+ *      reference sibling scripts by relative path. Done AFTER load/validate, BEFORE the run.
  */
-export function loadTemplateByName(
-  templatesDir: string,
-  basename: string,
-): LoadResult {
-  const path = join(templatesDir, `${basename}.json`);
+export function loadTemplateAtPath(path: string): LoadResult {
   const loader = makeTemplateLoader(path, realTemplateFs);
   const res = loader.load();
-  // Expand a leading `~` in the template's workdir to an ABSOLUTE path HERE (once, at
-  // load), so every downstream use is absolute: the provider commands' cwd (realExec)
-  // AND the spawned agent split's cwd (passed to spawn_split_command). The macOS
-  // SurfaceConfiguration.workingDirectory does NOT expand `~` (it only normalizes
-  // separators), so an unexpanded `~/foo` is dropped and the split inherits the parent's
-  // cwd — the agent then runs in the WRONG directory. The validator stays pure (no
-  // homedir lookup); this impure seam owns the expansion.
-  if (res.ok) res.template.workdir = expandHome(res.template.workdir);
+  if (res.ok) {
+    res.template.workdir = expandHome(res.template.workdir);
+    res.template = substituteTemplateDir(res.template, dirname(path));
+  }
   return res;
+}
+
+/**
+ * (§8a) Load + validate ONE template by BASENAME by resolving it against the effective
+ * `searchPath` (first-in-search-order wins, §1) and loading the resolved path. A basename
+ * absent from every search dir yields a not-found LoadResult (a failed start), listing the
+ * search path. Thin wrapper over `resolveTemplatePath` + `loadTemplateAtPath` so call sites
+ * that only know the basename read naturally; the resolved path is available via
+ * `resolveTemplatePath` directly when the caller needs to thread it (the run factory does).
+ */
+export function loadTemplateByName(
+  searchPath: string[],
+  basename: string,
+): LoadResult {
+  const path = resolveTemplatePath(searchPath, basename);
+  if (path === null) {
+    return {
+      ok: false,
+      errors: [`template not found: ${basename}.json in [${searchPath.join(", ")}]`],
+    };
+  }
+  return loadTemplateAtPath(path);
 }
 
 /**
@@ -247,11 +305,20 @@ export function shouldMigrateLegacyState(
  * bad/absent template (logged here) so `applyCommand` treats it as a failed start.
  */
 export function makeFileRunFactory(
-  templatesDir: string,
+  searchPath: string[],
   stateDir: string,
 ): RunFactory {
   return (basename: string, params?: Record<string, string>): QueueRun | null => {
-    const res = loadTemplateByName(templatesDir, basename);
+    // (shared templates §1) Resolve the basename against the search path (first-wins) so we can
+    // thread the RESOLVED path into the run for deterministic rehydration (§3) + `{templateDir}`.
+    const path = resolveTemplatePath(searchPath, basename);
+    if (path === null) {
+      console.error(
+        `agent-manager: queue: cannot start template "${basename}": not found in [${searchPath.join(", ")}]`,
+      );
+      return null;
+    }
+    const res = loadTemplateAtPath(path);
     if (!res.ok) {
       console.error(
         `agent-manager: queue: cannot start template "${basename}": ${res.errors.join("; ")}`,
@@ -269,7 +336,11 @@ export function makeFileRunFactory(
     }
     const runParams = params ?? {};
     const storeIO = makeFileStoreIO(runStatePath(stateDir, basename, res.template, runParams));
-    return makeQueueRun(res.template, storeIO, { templateName: basename, params: runParams });
+    return makeQueueRun(res.template, storeIO, {
+      templateName: basename,
+      params: runParams,
+      templatePath: path,
+    });
   };
 }
 
@@ -283,11 +354,27 @@ export function makeFileRunFactory(
  * sidecar restart with NO re-dispatch. A template merely existing on disk does NOT appear
  * here — only a persisted/started run does.
  */
-export function rehydrateActiveRuns(templatesDir: string, stateDir: string): QueueRun[] {
+export function rehydrateActiveRuns(searchPath: string[], stateDir: string): QueueRun[] {
   const records: ActiveRunRecord[] = loadActiveRunRecords(makeActiveRunsStoreIO(stateDir));
   const runs: QueueRun[] = [];
   for (const rec of records) {
-    const res = loadTemplateByName(templatesDir, rec.template);
+    // (shared templates §3) Rehydration determinism: prefer the RESOLVED path the run was loaded
+    // from (recorded in the active-runs record) when it still exists, so a later-added search dir
+    // that shadows the basename can NOT re-point a running queue. Fall back to first-wins
+    // resolution for pre-this-change records or a moved file.
+    const path =
+      rec.templatePath !== undefined &&
+      rec.templatePath.length > 0 &&
+      existsSync(rec.templatePath)
+        ? rec.templatePath
+        : resolveTemplatePath(searchPath, rec.template);
+    if (path === null) {
+      console.error(
+        `agent-manager: queue: dropping rehydrated run "${rec.name}" (template "${rec.template}"): not found in [${searchPath.join(", ")}]`,
+      );
+      continue;
+    }
+    const res = loadTemplateAtPath(path);
     if (!res.ok) {
       console.error(
         `agent-manager: queue: dropping rehydrated run "${rec.name}" (template "${rec.template}"): ${res.errors.join("; ")}`,
@@ -321,6 +408,7 @@ export function rehydrateActiveRuns(templatesDir: string, stateDir: string): Que
         params: runParams,
         maxItemsLive: rec.maxItemsLive,
         concurrencyLive: rec.concurrencyLive,
+        templatePath: path,
       }),
     );
   }

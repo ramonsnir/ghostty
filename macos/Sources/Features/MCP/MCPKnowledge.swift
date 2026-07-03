@@ -69,7 +69,7 @@ enum MCPKnowledge {
         ("agent-manager-usage-tracking", { String($0.agentManagerUsageTracking) }),
         ("agent-manager-warm-base", { String($0.agentManagerWarmBase) }),
         ("agent-queue", { String($0.agentQueueEnabled) }),
-        ("agent-queue-templates-dir", { $0.agentQueueTemplatesDir ?? "" }),
+        ("agent-queue-templates-dir", { $0.agentQueueTemplatesDirs.joined(separator: ", ") }),
         ("agent-queue-max-total", { String($0.agentQueueMaxTotal) }),
         ("agent-queue-hero-max", { String($0.agentQueueHeroMax) }),
         ("pty-host", { $0.ptyHost ?? "" }),

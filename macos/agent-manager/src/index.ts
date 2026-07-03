@@ -102,7 +102,7 @@ import {
 } from "./queue/store.js";
 import {
   defaultStateDir,
-  defaultTemplatesDir,
+  parseTemplatesDirs,
   rehydrateActiveRuns,
   makeActiveRunsStoreIO,
   makeFileRunFactory,
@@ -1109,11 +1109,15 @@ async function main(): Promise<void> {
   if (bellFilter) log("bell-attention: bell promotion ENABLED");
 
   // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on (the Swift
-  // controller sets GHOSTTY_AGENT_QUEUE=1 + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR +
-  // GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork config keys). Absent ⇒ the queue stays
-  // a no-op; this is INDEPENDENT of the summarizer (either can run alone).
+  // controller sets GHOSTTY_AGENT_QUEUE=1 + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS (the full
+  // default-first search path, newline-joined) + GHOSTTY_AGENT_QUEUE_MAX_TOTAL from the fork
+  // config keys). Absent ⇒ the queue stays a no-op; this is INDEPENDENT of the summarizer
+  // (either can run alone).
   if (queueEnabled) {
-    const templatesDir = process.env.GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR ?? defaultTemplatesDir();
+    // (shared templates §1/§6.2) The effective template SEARCH PATH: the plural env (default-first,
+    // deduped by the GUI) split on "\n"; back-compat singular GHOSTTY_AGENT_QUEUE_TEMPLATES_DIR as
+    // a one-element list; else [defaultTemplatesDir()]. First-in-search-order wins on a basename clash.
+    const searchPath = parseTemplatesDirs(process.env);
     const stateDir = defaultStateDir();
     // agent-queue-max-total: an OPTIONAL fleet-wide cap. A positive value caps the
     // total agents across ALL runs; 0 / absent / invalid ⇒ UNLIMITED (Infinity), so
@@ -1139,7 +1143,7 @@ async function main(): Promise<void> {
     // Key restored runs by their `runName` IDENTITY — the SAME key `start` uses — so
     // control commands (set_max_items/pause/stop/…) resolve against a rehydrated run, and
     // parallel scoped runs of one template don't collide on the bare template name.
-    registerRehydratedRuns(registry, rehydrateActiveRuns(templatesDir, stateDir));
+    registerRehydratedRuns(registry, rehydrateActiveRuns(searchPath, stateDir));
     const activeRunsIO = makeActiveRunsStoreIO(stateDir);
 
     deps.queue = {
@@ -1151,7 +1155,7 @@ async function main(): Promise<void> {
       budget: new QueueConcurrencyBudget(maxTotal),
       now: () => Date.now(),
       registry,
-      factory: makeFileRunFactory(templatesDir, stateDir),
+      factory: makeFileRunFactory(searchPath, stateDir),
       takeCommands: () => client.takeQueueCommands(),
       persistActiveRuns: (records: ActiveRunRecord[]) =>
         persistActiveRunsToIO(activeRunsIO, records),
@@ -1195,7 +1199,7 @@ async function main(): Promise<void> {
     };
     log(
       `queue: supervisor armed (on-demand); ${registry.size} run(s) rehydrated; ` +
-        `templatesDir=${templatesDir}; maxTotal=${maxTotal}; heroMax=${heroMax}`,
+        `templatesDirs=[${searchPath.join(", ")}]; maxTotal=${maxTotal}; heroMax=${heroMax}`,
     );
   }
 

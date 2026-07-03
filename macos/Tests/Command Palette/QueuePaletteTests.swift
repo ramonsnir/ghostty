@@ -102,6 +102,82 @@ struct QueuePaletteTests {
         #expect(QueuePaletteView.discoverTemplates(dir: base.path).isEmpty)
     }
 
+    // MARK: - effectiveSearchDirs + multi-dir discoverTemplates (shared templates §1)
+
+    /// `effectiveSearchDirs` prepends the DEFAULT dir first, preserves configured order,
+    /// and dedups an equivalent/repeated path (order-preserving).
+    @Test func effectiveSearchDirsPrependsDefaultAndDedups() {
+        let def = ((QueuePaletteView.defaultTemplatesDir as NSString)
+            .expandingTildeInPath as NSString).standardizingPath
+        let dirs = QueuePaletteView.effectiveSearchDirs(configured: ["/a", "/b", "/a"])
+        #expect(dirs == [def, "/a", "/b"])
+        // The default appearing again in `configured` is deduped (still once, first).
+        let dirs2 = QueuePaletteView.effectiveSearchDirs(configured: [def, "/c"])
+        #expect(dirs2 == [def, "/c"])
+    }
+
+    /// The two "MUST agree" search-path twins are ONE implementation: the palette's
+    /// `effectiveSearchDirs(configured:)` delegates to the controller's
+    /// `effectiveTemplateSearchPath(configured:defaultDir:)` with `defaultTemplatesDir`
+    /// as the default. Run BOTH on the SAME non-trivial input (a `~`-dir, absolutes, a
+    /// dir equal to the default, and a repeat) and assert byte-for-byte equality so a
+    /// future re-fork of either implementation without the other fails here.
+    @Test func effectiveSearchDirsMatchesControllerTwin() {
+        let configured = ["~/team/queues", "/abs/one", "/abs/two", "/abs/one",
+                          QueuePaletteView.defaultTemplatesDir]
+        let palette = QueuePaletteView.effectiveSearchDirs(configured: configured)
+        let controller = AgentManagerController.effectiveTemplateSearchPath(
+            configured: configured, defaultDir: QueuePaletteView.defaultTemplatesDir)
+        #expect(palette == controller)
+        // Sanity: the shared default consts are the same string on both twins.
+        #expect(QueuePaletteView.defaultTemplatesDir
+            == AgentManagerController.defaultTemplatesDir)
+        // Sanity: the result is non-trivial (default first, tilde expanded, deduped).
+        let def = ((QueuePaletteView.defaultTemplatesDir as NSString)
+            .expandingTildeInPath as NSString).standardizingPath
+        #expect(palette.first == def)
+        #expect(palette == [def, ((("~/team/queues" as NSString)
+            .expandingTildeInPath) as NSString).standardizingPath, "/abs/one", "/abs/two"])
+    }
+
+    /// `discoverTemplates(dirs:)` merges by basename with FIRST-IN-SEARCH-ORDER wins: dir
+    /// A's `dup.json` beats dir B's; the winner's `sourceDir` is dir A and it is flagged
+    /// `hasDuplicate`, while a basename unique to one dir is not flagged.
+    @Test func discoverDirsFirstWins() throws {
+        let a = try makeTempDir(); defer { try? FileManager.default.removeItem(at: a) }
+        let b = try makeTempDir(); defer { try? FileManager.default.removeItem(at: b) }
+        try write(a.appendingPathComponent("dup.json"), #"{ "name": "FromA" }"#)
+        try write(b.appendingPathComponent("dup.json"), #"{ "name": "FromB" }"#)
+        try write(b.appendingPathComponent("onlyB.json"), #"{ "name": "OnlyB" }"#)
+
+        let entries = QueuePaletteView.discoverTemplates(dirs: [a.path, b.path])
+        #expect(entries.map(\.basename).sorted() == ["dup", "onlyB"])
+        let dup = try #require(entries.first { $0.basename == "dup" })
+        #expect(dup.displayName == "FromA")   // dir A wins the basename
+        #expect(dup.sourceDir == a.path)
+        #expect(dup.hasDuplicate == true)      // present in both dirs
+        let onlyB = try #require(entries.first { $0.basename == "onlyB" })
+        #expect(onlyB.sourceDir == b.path)
+        #expect(onlyB.hasDuplicate == false)   // unique to one dir
+    }
+
+    /// A duplicate entry's params (and probe) resolve against the WINNING `sourceDir`: put
+    /// DISTINCT params in dir A vs dir B for the same basename and assert dir A's are read.
+    @Test func discoverDirsParamsResolveAgainstWinner() throws {
+        let a = try makeTempDir(); defer { try? FileManager.default.removeItem(at: a) }
+        let b = try makeTempDir(); defer { try? FileManager.default.removeItem(at: b) }
+        try write(a.appendingPathComponent("q.json"),
+                  #"{ "name": "Q", "params": [ { "name": "aparam" } ] }"#)
+        try write(b.appendingPathComponent("q.json"),
+                  #"{ "name": "Q", "params": [ { "name": "bparam" } ] }"#)
+
+        let entries = QueuePaletteView.discoverTemplates(dirs: [a.path, b.path])
+        let q = try #require(entries.first { $0.basename == "q" })
+        #expect(q.sourceDir == a.path)
+        let params = QueuePaletteView.templateParams(dir: q.sourceDir, basename: q.basename)
+        #expect(params.map(\.name) == ["aparam"])  // dir A's params, not dir B's
+    }
+
     // MARK: - templateParams (§8b)
 
     private func write(_ url: URL, _ json: String) throws {
@@ -158,10 +234,54 @@ struct QueuePaletteTests {
         """)
         let probe = QueuePaletteView.templateProbe(dir: base.path, basename: "q")
         #expect(probe == QueueTemplateProbe(workdir: "/tmp/repo", listCommand: ["python3", "list.py"],
-                                            titleField: "title", keyField: "identifier"))
+                                            titleField: "title", keyField: "identifier",
+                                            templateDir: base.path))
         // No provider.list → nil.
         try write(base.appendingPathComponent("p.json"), #"{ "name": "P", "workdir": "/x" }"#)
         #expect(QueuePaletteView.templateProbe(dir: base.path, basename: "p") == nil)
+    }
+
+    // MARK: - {templateDir} substitution (shared templates §2)
+
+    /// `substituteTemplateDir` substring-replaces ALL `{templateDir}` occurrences with the
+    /// resolved dir; an empty dir leaves the token literal; a token-free argv is unchanged.
+    @Test func substituteTemplateDirReplacesToken() {
+        #expect(QueuePaletteView.substituteTemplateDir(
+            ["python3", "{templateDir}/list.py", "--root={templateDir}"], dir: "/repo/q")
+            == ["python3", "/repo/q/list.py", "--root=/repo/q"])
+        // No token → unchanged.
+        #expect(QueuePaletteView.substituteTemplateDir(["python3", "list.py"], dir: "/repo/q")
+            == ["python3", "list.py"])
+        // Empty dir → token stays literal (fails visibly rather than pointing at cwd).
+        #expect(QueuePaletteView.substituteTemplateDir(["{templateDir}/x"], dir: "")
+            == ["{templateDir}/x"])
+    }
+
+    /// `templateProbe` substitutes `{templateDir}` in the list command AND records the
+    /// resolved dir (so the prober can export GHOSTTY_QUEUE_TEMPLATE_DIR).
+    @Test func templateProbeSubstitutesTemplateDir() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("q.json"), """
+        { "name": "Q", "workdir": "/tmp/repo",
+          "provider": { "list": { "command": ["python3", "{templateDir}/list.py"], "keyField": "id" } } }
+        """)
+        let probe = QueuePaletteView.templateProbe(dir: base.path, basename: "q")
+        #expect(probe?.listCommand == ["python3", "\(base.path)/list.py"])
+        #expect(probe?.templateDir == base.path)
+    }
+
+    /// `templateParams` substitutes `{templateDir}` in a param's `valuesCommand`.
+    @Test func templateParamsSubstitutesTemplateDirInValuesCommand() throws {
+        let base = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try write(base.appendingPathComponent("example.json"), """
+        { "name": "ExampleOS", "params": [
+            { "name": "project", "env": "LINEAR_PROJECT", "valuesCommand": ["python3", "{templateDir}/projects.py"] }
+        ] }
+        """)
+        let params = QueuePaletteView.templateParams(dir: base.path, basename: "example")
+        #expect(params.first?.valuesCommand == ["python3", "\(base.path)/projects.py"])
     }
 
     // MARK: - QueueProviderProbe pure helpers

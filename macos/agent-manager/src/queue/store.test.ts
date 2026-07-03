@@ -501,6 +501,25 @@ test("serializeActiveRuns / parseActiveRuns: round-trips a live concurrency edit
   assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
 });
 
+test("serializeActiveRuns / parseActiveRuns: round-trips the resolved templatePath (shared templates §3)", () => {
+  const runs: ActiveRunRecord[] = [
+    { template: "backlog", name: "backlog", paused: false, draining: false, templatePath: "/shared/queues/backlog.json" },
+  ];
+  assert.deepEqual(parseActiveRuns(serializeActiveRuns(runs)), runs);
+});
+
+test("parseActiveRuns: carries templatePath as a non-empty string only (empty / non-string dropped)", () => {
+  for (const v of ['""', "5", "true", "null", "[]"]) {
+    const recs = parseActiveRuns(`{"version":1,"runs":[{"template":"t","name":"t","templatePath":${v}}]}`);
+    assert.equal(recs.length, 1, `v=${v} keeps the record`);
+    assert.equal(recs[0].templatePath, undefined, `v=${v} drops the bad templatePath`);
+  }
+  assert.equal(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","templatePath":"/a/b.json"}]}')[0].templatePath,
+    "/a/b.json",
+  );
+});
+
 test("parseActiveRuns: tolerates a malformed concurrencyLive (non-positive / non-int / string / null dropped)", () => {
   for (const v of ["0", "-2", "2.5", '"9"', "true", "null"]) {
     const recs = parseActiveRuns(`{"version":1,"runs":[{"template":"t","name":"t","concurrencyLive":${v}}]}`);

@@ -823,6 +823,11 @@ export interface ActiveRunRecord {
    *  live-edited (a restart then falls back to the template concurrency). Persisted so a
    *  restart re-applies the user's live edit. */
   concurrencyLive?: number;
+  /** (shared templates §3) The RESOLVED absolute path this run's template was loaded from, so a
+   *  restart re-resolves the SAME file even if a later-added templates search dir shadows the
+   *  basename. OMITTED for test/back-compat records (rehydrate then falls back to first-wins
+   *  basename resolution over the current search path). */
+  templatePath?: string;
 }
 
 /** The on-disk active-runs file shape. Versioned for additive migration. */
@@ -896,6 +901,11 @@ export function parseActiveRuns(text: string | null): ActiveRunRecord[] {
     const cl = r.concurrencyLive;
     if (typeof cl === "number" && Number.isInteger(cl) && cl > 0) {
       rec.concurrencyLive = cl;
+    }
+    // (shared templates §3) carry the resolved template path (non-empty string only) so a restart
+    // re-resolves the SAME file; dropped when absent/empty/non-string (falls back to first-wins).
+    if (typeof r.templatePath === "string" && r.templatePath.length > 0) {
+      rec.templatePath = r.templatePath;
     }
     out.push(rec);
   }

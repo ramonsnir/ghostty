@@ -2992,17 +2992,19 @@ keybind: Keybinds = .{},
 /// `~/.config/ghostty/config` would error on it).
 @"agent-queue": bool = false,
 
-/// (ramon fork / Agent Queue Supervisor) Directory holding the queue TEMPLATE
-/// JSON files (team policy: provider commands, agent launch command,
-/// concurrency, grid, intervals, completion rule). Null (the default) ⇒ the
-/// sidecar's built-in default
-/// `~/.config/ghostty-ramon/agent-manager/queues`. `~` is expanded
-/// macOS-side. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
-// NOTE: `[:0]const u8` (NOT `[]const u8`) so the C config getter
-// (ghostty_config_get) can return it as a NUL-terminated string — the
-// macOS apprt reads this via the `agentQueueTemplatesDir` Swift getter
-// (mirrors `agent-manager-node-path`).
-@"agent-queue-templates-dir": ?[:0]const u8 = null,
+/// (ramon fork / Agent Queue Supervisor) Base directories searched for queue
+/// TEMPLATE JSON files (team policy: provider commands, agent launch command,
+/// concurrency, grid, intervals, completion rule). Repeatable — each entry is a
+/// directory scanned for `*.json` templates. The built-in default
+/// `~/.config/ghostty-ramon/agent-manager/queues` is ALWAYS searched FIRST, then
+/// each configured directory in order; a template basename found in more than one
+/// directory resolves to the first-in-search-order copy (so the personal/default
+/// dir overrides a shared repo dir). `~` is expanded macOS-side. This is a
+/// fork-only key, so keep it in `~/.config/ghostty-ramon/config` (an official
+/// Ghostty would error on it). Reuses the `project-directory` RepeatableString
+/// plumbing (the macOS apprt reads it via the `agentQueueTemplatesDirs` Swift
+/// getter over `ghostty_config_string_list_s`).
+@"agent-queue-templates-dir": RepeatableString = .{},
 
 /// (ramon fork / Agent Queue Supervisor) Optional global concurrency cap across
 /// ALL queue runs — a hard ceiling on how many queue agents the supervisor may
@@ -11739,7 +11741,6 @@ test "agent-queue: parse and default" {
         defer cfg.deinit();
         try cfg.finalize();
         try testing.expectEqual(false, cfg.@"agent-queue");
-        try testing.expect(cfg.@"agent-queue-templates-dir" == null);
         try testing.expectEqual(@as(u32, 0), cfg.@"agent-queue-max-total");
     }
 
@@ -11748,17 +11749,113 @@ test "agent-queue: parse and default" {
         defer cfg.deinit();
         var it: TestIterator = .{ .data = &.{
             "--agent-queue=true",
-            "--agent-queue-templates-dir=/Users/ramon/.config/ghostty-ramon/agent-manager/queues",
             "--agent-queue-max-total=4",
         } };
         try cfg.loadIter(alloc, &it);
         try cfg.finalize();
         try testing.expectEqual(true, cfg.@"agent-queue");
-        try testing.expectEqualStrings(
-            "/Users/ramon/.config/ghostty-ramon/agent-manager/queues",
-            cfg.@"agent-queue-templates-dir".?,
-        );
         try testing.expectEqual(@as(u32, 4), cfg.@"agent-queue-max-total");
+    }
+}
+
+test "agent-queue-templates-dir: RepeatableString parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default: empty list.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"agent-queue-templates-dir".list.items.len,
+        );
+    }
+
+    // Single entry.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-templates-dir=/a/b",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const items = cfg.@"agent-queue-templates-dir".list.items;
+        try testing.expectEqual(@as(usize, 1), items.len);
+        try testing.expectEqualStrings("/a/b", items[0]);
+    }
+
+    // Two entries, order preserved.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-templates-dir=/a/b",
+            "--agent-queue-templates-dir=/c/d",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const items = cfg.@"agent-queue-templates-dir".list.items;
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expectEqualStrings("/a/b", items[0]);
+        try testing.expectEqualStrings("/c/d", items[1]);
+    }
+
+    // Empty value resets the list.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-templates-dir=/a/b",
+            "--agent-queue-templates-dir=",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"agent-queue-templates-dir".list.items.len,
+        );
+    }
+
+    // C-list view (mirrors `RepeatableString cval`).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-templates-dir=/a/b",
+            "--agent-queue-templates-dir=/c/d",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const cv = cfg.@"agent-queue-templates-dir".cval();
+        try testing.expectEqual(@as(usize, 2), cv.len);
+        try testing.expectEqualStrings("/a/b", std.mem.sliceTo(cv.items[0], 0));
+        try testing.expectEqualStrings("/c/d", std.mem.sliceTo(cv.items[1], 0));
+    }
+
+    // Round-trip via formatEntry (mirrors `formatConfig multiple items`).
+    {
+        var buf: std.Io.Writer.Allocating = .init(alloc);
+        defer buf.deinit();
+
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--agent-queue-templates-dir=/a/b",
+            "--agent-queue-templates-dir=/c/d",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try cfg.@"agent-queue-templates-dir".formatEntry(
+            formatterpkg.entryFormatter("agent-queue-templates-dir", &buf.writer),
+        );
+        try testing.expectEqualSlices(
+            u8,
+            "agent-queue-templates-dir = /a/b\nagent-queue-templates-dir = /c/d\n",
+            buf.written(),
+        );
     }
 }
 
