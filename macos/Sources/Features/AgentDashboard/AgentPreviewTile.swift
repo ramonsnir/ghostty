@@ -269,6 +269,15 @@ struct AgentPreviewTile: View {
     /// marker (all purple `star.fill`), so a hero reads consistently in the chrome + the dashboard.
     private static let heroPurple = Color.purple
 
+    /// (Schedules) Whether this tile is a recurring SCHEDULE scan-agent run (its annotation's
+    /// `queueSchedule`). Drives a distinct clock glyph — a NON-purple tint so it never reads as
+    /// a hero.
+    private var isSchedule: Bool {
+        entry.annotation?.queueSchedule ?? false
+    }
+    /// (Schedules) The schedule marker color — teal, distinct from the hero purple + the amber bell.
+    private static let scheduleTeal = Color.teal
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -347,6 +356,14 @@ struct AgentPreviewTile: View {
                     .font(.caption2)
                     .foregroundStyle(Self.heroPurple)
                     .dashboardTooltip("Hero split")
+            }
+            // (Schedules) A teal recurring-clock glyph marks a scheduled scan-agent split (queue
+            // tiles only) — a low-cognition maintenance run. Distinct tint from the hero star.
+            if isQueueOwned && isSchedule {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.caption2)
+                    .foregroundStyle(Self.scheduleTeal)
+                    .dashboardTooltip("Scheduled scan")
             }
             // (keep) The 📌 pin toggle — queue tiles only. Shown PERSISTENTLY when kept (so
             // a pinned split is obvious without hovering) and on hover otherwise. Filled +

@@ -63,6 +63,7 @@ function tmpl(over: Partial<QueueTemplate> = {}): QueueTemplate {
     keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
+    schedules: [],
     ...over,
   };
 }
@@ -103,6 +104,7 @@ interface QueueFake {
     forceClose: string[];
     signal: Array<{ id: string; reason?: string }>;
     sendKey: Array<{ id: string; key: string }>;
+    sendText: Array<{ id: string; text: string }>;
     moveIntoTab: Array<{ sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }>;
     /** (hero) perform_action calls — the promote eject uses `move_split_to_new_tab`. */
     perform: Array<{ id: string; action: string }>;
@@ -121,6 +123,7 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     forceClose: [],
     signal: [],
     sendKey: [],
+    sendText: [],
     moveIntoTab: [],
     perform: [],
     list: 0,
@@ -163,6 +166,9 @@ function makeQueueFake(spec: QueueFakeSpec): QueueFake {
     },
     async sendKey(id: string, key: string): Promise<void> {
       calls.sendKey.push({ id, key });
+    },
+    async sendText(id: string, text: string): Promise<void> {
+      calls.sendText.push({ id, text });
     },
     async moveSurfaceIntoTab(args: { sourceUUID: string; targetAnchorUUID: string; balanced?: boolean; maxCols?: number; maxRows?: number }): Promise<void> {
       calls.moveIntoTab.push(args);
@@ -3410,4 +3416,90 @@ test("hero: promote persistence round-trip — a promoted split rehydrates a her
 
   assert.ok(run2.hero.has("R-1"), "hero set rehydrated after restart");
   assert.equal(run2.active.get("R-1")!.hero, true, "reconciled record re-stamped as a hero after restart");
+});
+
+// ---------------------------------------------------------------------------
+// (schedules) recurring scan-agent dispatch / single-flight / completion / auto-close.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: dispatches a DUE schedule, holds single-flight while live, delivers prose, re-arms on close", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan the docs", closeOnComplete: true }] }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  // Whole-minute clock so `* * * * *` fires deterministically (armedAt lands on a firing).
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  // sweep 1: ARM (dispatch-suppressed) — no spawn.
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 0, "first sweep arms, does not dispatch");
+  assert.ok(run.schedules.get("s1"), "s1 armed");
+
+  // sweep 2: DUE (armedAt=100M is a firing; now is past it) → dispatch the scheduled split.
+  now = 101 * M;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 1, "due schedule dispatches exactly one split");
+  const ann = fake.calls.annotate.find((a) => (a.ann as { scheduleId?: string }).scheduleId === "s1");
+  assert.ok(ann, "the scheduled split is annotated with its scheduleId");
+  assert.equal((ann!.ann as { schedule?: boolean }).schedule, true, "annotated schedule:true");
+  assert.equal(run.scheduleActive.has("s1"), true, "tracked as the live scheduled run");
+
+  // The scheduled split is now live in list_surfaces (agent up) → single-flight + prose delivery.
+  spec.surfaces = [
+    Object.assign(surface({ id: "sch-1", agentState: "working" }), {
+      queueName: run.runName,
+      scheduleId: "s1",
+    }) as Surface & { sessionID?: number },
+  ];
+  (spec.surfaces[0] as { sessionID?: number }).sessionID = 500;
+
+  // sweep 3: single-flight (no new spawn) + deliver the prose (typed + Enter).
+  now = 102 * M;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 1, "single-flight: no second dispatch while live");
+  assert.ok(
+    fake.calls.sendText.some((t) => t.id === "sch-1" && t.text === "scan the docs"),
+    "prose typed into the scheduled split once the agent is up",
+  );
+  assert.ok(fake.calls.sendKey.some((k) => k.id === "sch-1" && k.key === "enter"), "prose submitted");
+
+  // sweep 4: the split CLOSED (gone from list_surfaces) → completion re-anchors the cadence.
+  spec.surfaces = [];
+  now = 103 * M;
+  await runQueueSweep(deps);
+  assert.equal(run.scheduleActive.has("s1"), false, "single-flight slot freed on close");
+  assert.equal(run.schedules.get("s1")!.lastCompletionAt, 103 * M, "completion re-anchored to close time");
+});
+
+test("runQueueSweep: auto-closes an EXITED scheduled split when closeOnComplete (the default)", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }] }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // dispatch → sch-1
+
+  // The scheduled agent's child EXITED (scan finished) while the split is still present.
+  spec.surfaces = [
+    Object.assign(surface({ id: "sch-1", exited: true }), {
+      queueName: run.runName,
+      scheduleId: "s1",
+    }),
+  ];
+  now = 102 * M;
+  await runQueueSweep(deps);
+  assert.ok(fake.calls.forceClose.includes("sch-1"), "an exited scheduled split is force-closed");
 });

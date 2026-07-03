@@ -19,6 +19,7 @@
 // `reconcile` and all classification helpers are PURE (no I/O, no own clock — `nowMs`
 // is injected) and unit-tested directly. NOTHING here is Linear/Git/issue-key aware.
 
+import type { ScheduleState } from "./schedule.js";
 import type { Assignment, AssignmentState } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,14 @@ export interface StoreFile {
    *  `agent-queue-hero-max` cap, NOT `maxItems`, so this counter is informational — but it is
    *  persisted for symmetry + future budgeting. */
   heroLifetimeDispatched?: number;
+  /** (schedules) The per-schedule CADENCE state, keyed by ScheduleSpec.id: `armedAt`
+   *  (when first enabled — the never-ran anchor), `lastCompletionAt` (when the most
+   *  recent run's split closed), and `paused` (user muted for vacation). RUN-LEVEL state
+   *  like `keep`/`hero` (survives reconcile + restart). "Active right now" is NOT stored
+   *  — it is re-derived each sweep from `list_surfaces` (a live surface carrying this
+   *  run's queueSchedule/scheduleId annotation), so a restart re-adopts a still-open
+   *  scheduled split without re-dispatch. Additive (absent ⇒ no schedule state). */
+  schedules?: Record<string, ScheduleState>;
 }
 
 /** The current store schema version. */
@@ -123,6 +132,7 @@ export function serializeStore(
   keep: Record<string, boolean> = {},
   hero: string[] = [],
   heroLifetimeDispatched = 0,
+  schedules: Record<string, ScheduleState> = {},
 ): string {
   const lifetime =
     Number.isFinite(lifetimeDispatched) && lifetimeDispatched > 0
@@ -151,7 +161,40 @@ export function serializeStore(
       ? Math.floor(heroLifetimeDispatched)
       : 0;
   if (heroLifetime > 0) file.heroLifetimeDispatched = heroLifetime;
+  // (schedules) Serialize the per-schedule cadence state, sorted by id (deterministic),
+  // dropping malformed entries. Omit the field entirely when empty (back-compat).
+  const schedOut = sanitizeSchedules(schedules);
+  if (Object.keys(schedOut).length > 0) file.schedules = schedOut;
   return JSON.stringify(file, null, 2);
+}
+
+/** Sanitize an arbitrary schedule-state map into a clean `{id: ScheduleState}` with a
+ *  finite non-negative `armedAt`, an optional finite non-negative `lastCompletionAt`,
+ *  and an optional boolean `paused`, in sorted key order. PURE. Used by serialize +
+ *  parse so the on-disk shape is deterministic and tolerant of a hand-edit. */
+function sanitizeSchedules(
+  schedules: Record<string, unknown>,
+): Record<string, ScheduleState> {
+  const out: Record<string, ScheduleState> = {};
+  for (const id of Object.keys(schedules).sort()) {
+    if (id.length === 0) continue;
+    const v = schedules[id];
+    if (v === null || typeof v !== "object" || Array.isArray(v)) continue;
+    const r = v as Record<string, unknown>;
+    const armedAt = r.armedAt;
+    if (typeof armedAt !== "number" || !Number.isFinite(armedAt) || armedAt < 0) continue;
+    const s: ScheduleState = { armedAt: Math.floor(armedAt) };
+    if (
+      typeof r.lastCompletionAt === "number" &&
+      Number.isFinite(r.lastCompletionAt) &&
+      r.lastCompletionAt >= 0
+    ) {
+      s.lastCompletionAt = Math.floor(r.lastCompletionAt);
+    }
+    if (r.paused === true) s.paused = true;
+    out[id] = s;
+  }
+  return out;
 }
 
 /** Sanitize an arbitrary keep map into a clean `{key: boolean}` with non-empty string keys,
@@ -341,6 +384,41 @@ export function loadHeroLifetimeDispatched(io: StoreIO): number {
   return parseHeroLifetimeDispatched(text);
 }
 
+/**
+ * (schedules) Parse the persisted per-schedule cadence state map. PURE + TOLERANT. A
+ * null/empty input (first run), unparseable JSON, a wrong-shaped object, or a missing /
+ * non-object `schedules` all yield `{}`; malformed per-id entries are dropped (via
+ * `sanitizeSchedules`). Read alongside `parseStore` on the first reconcile to rehydrate
+ * the cadence so a sidecar/GUI restart doesn't reset a schedule's timing.
+ */
+export function parseSchedules(text: string | null): Record<string, ScheduleState> {
+  if (text === null || text.trim().length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+  const s = (parsed as { schedules?: unknown }).schedules;
+  if (s === null || typeof s !== "object" || Array.isArray(s)) return {};
+  return sanitizeSchedules(s as Record<string, unknown>);
+}
+
+/** Read + parse the persisted schedule cadence map via the seam. Returns `{}` on any
+ *  read/parse failure; never throws into the loop. */
+export function loadSchedules(io: StoreIO): Record<string, ScheduleState> {
+  let text: string | null;
+  try {
+    text = io.read();
+  } catch {
+    return {};
+  }
+  return parseSchedules(text);
+}
+
 /** Coerce arbitrary parsed JSON into a valid Assignment, or null when it lacks the
  *  required identity fields. PURE. (Defensive against a hand-edited / older file.) */
 function coerceAssignment(raw: unknown): Assignment | null {
@@ -418,10 +496,19 @@ export function persistStore(
   keep: Record<string, boolean> = {},
   hero: string[] = [],
   heroLifetimeDispatched = 0,
+  schedules: Record<string, ScheduleState> = {},
 ): boolean {
   try {
     io.write(
-      serializeStore(records, lifetimeDispatched, dispatched, keep, hero, heroLifetimeDispatched),
+      serializeStore(
+        records,
+        lifetimeDispatched,
+        dispatched,
+        keep,
+        hero,
+        heroLifetimeDispatched,
+        schedules,
+      ),
     );
     return true;
   } catch {

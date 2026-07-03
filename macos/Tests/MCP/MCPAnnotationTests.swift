@@ -292,4 +292,27 @@ struct MCPAnnotationTests {
         default: Issue.record("expected .invalidParams for empty annotation body")
         }
     }
+
+    // MARK: - (Schedules) schedule marker + id
+
+    @Test func scheduleFieldsParse() {
+        let p = AgentAnnotationPayload.fromArguments([
+            "id": UUID().uuidString, "schedule": true, "scheduleId": "doc-drift"])
+        #expect(p?.annotation.queueSchedule == true)
+        #expect(p?.annotation.scheduleId == "doc-drift")
+        // absent ⇒ nil (partial-merge preserves prior)
+        let sumOnly = AgentAnnotationPayload.fromArguments(["summary": "ok"])
+        #expect(sumOnly?.annotation.queueSchedule == nil)
+        #expect(sumOnly?.annotation.scheduleId == nil)
+        // scheduleId alone is a valid (non-empty) update
+        #expect(AgentAnnotationPayload.fromArguments(["scheduleId": "s1"])?.annotation.scheduleId == "s1")
+    }
+
+    @Test func scheduleFieldsSurviveMerge() {
+        let base = AgentAnnotation(queueName: "R", queueSchedule: true, scheduleId: "s1")
+        let merged = base.merging(AgentAnnotation(summary: "scanning"))
+        #expect(merged.queueSchedule == true)
+        #expect(merged.scheduleId == "s1")
+        #expect(merged.summary == "scanning")
+    }
 }

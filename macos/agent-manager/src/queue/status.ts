@@ -72,6 +72,28 @@ export interface QueueStatusReport {
    *  The hero gate's remaining is `heroMax − heroActive`; when ≥ `heroMax`, a waiting hero
    *  carries a `heroSlots` block reason. Global, NOT per-run. */
   heroActive: number;
+  /** (schedules) The run's recurring scan-agent SCHEDULES, for the dashboard's thin Schedules
+   *  lane (see AGENT-QUEUE.md → Schedules). Empty when the template declares none. Built by the
+   *  runner (the cron math lives with the run state) and echoed here unchanged. */
+  schedules: ScheduleStatus[];
+}
+
+/** (schedules) One schedule's live status for the dashboard Schedules lane. */
+export interface ScheduleStatus {
+  /** The schedule id (stable identity). */
+  id: string;
+  /** Display name (defaults to the id). */
+  name: string;
+  /** User-muted (vacation). */
+  paused: boolean;
+  /** A scan is in flight right now (single-flight — no new run until it closes). */
+  running: boolean;
+  /** ms-since-epoch of the next scheduled start; absent when paused or currently running
+   *  (nothing is armed while a run is in flight). The lane renders it as "next in …". */
+  nextRunAt?: number;
+  /** ms-since-epoch the most recent run's split closed; absent if it has never run. Rendered
+   *  as "ran … ago". */
+  lastCompletionAt?: number;
 }
 
 /** Inputs for the pure status builder — primitives + the run's in-memory facts. */
@@ -115,6 +137,9 @@ export interface QueueStatusInputs {
   // room REMAINING (≥ 0); a gate is "blocking" when its room is ≤ 0. They are the SAME
   // primitives the dispatch gate consults (`dispatchCandidates`), passed in so the report
   // stays a pure function. Omitted ⇒ no attribution (legacy/present:false ⇒ blockReasons absent).
+  /** (schedules) The run's schedule statuses, prebuilt by the runner (cron math lives with the
+   *  run state). Echoed unchanged into the report. Defaults to [] (no schedules / legacy). */
+  schedules?: ScheduleStatus[];
   /** (hero) The fleet-wide `agent-queue-hero-max` cap (0 = hero dispatch disabled). Echoed as
    *  `heroMax`. */
   heroMax?: number;
@@ -163,6 +188,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       held: [],
       heroMax: input.heroMax ?? 0,
       heroActive: input.heroActive ?? 0,
+      schedules: input.schedules ?? [],
     };
   }
 
@@ -271,6 +297,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     held: heldItems.slice(0, nextLimit).map(toRef),
     heroMax: input.heroMax ?? 0,
     heroActive: input.heroActive ?? 0,
+    schedules: input.schedules ?? [],
   };
 }
 

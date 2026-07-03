@@ -974,6 +974,11 @@ final class AgentDashboardModel: ObservableObject {
         /// mirroring `queueKey`/`queueName`. nil when the surface carries no annotation / is
         /// not a hero (the row emits `hero:false` then).
         let queueHero: Bool?
+        /// (ramon fork / Agent Queue Schedules) The SCHEDULE id from the annotation's
+        /// `scheduleId`, echoed into the `list_surfaces` row (`SurfaceRow.scheduleId`) so the
+        /// supervisor tracks + re-adopts the scheduled run — the reconcile-visibility chokepoint,
+        /// mirroring `queueKey`. nil for a normal split.
+        let scheduleId: String?
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -996,7 +1001,8 @@ final class AgentDashboardModel: ObservableObject {
                 queueKey: annotations[id]?.queueKey,
                 queueName: annotations[id]?.queueName,
                 queueUrl: annotations[id]?.queueUrl,
-                queueHero: annotations[id]?.queueHero)
+                queueHero: annotations[id]?.queueHero,
+                scheduleId: annotations[id]?.scheduleId)
         }
         return out
     }
@@ -1448,6 +1454,48 @@ final class AgentDashboardModel: ObservableObject {
             userInfo: [
                 QueueCommandUserInfoKey.command:
                     QueueCommand(action: .setConcurrency, run: run, concurrency: trimmed),
+            ])
+    }
+
+    // MARK: - (Schedules) recurring scan-agent lane controls
+
+    /// (Schedules) Post a single-schedule control intent (pause / resume / run-now) for a queue
+    /// RUN onto the MCP FIFO — the sidecar's `coerceQueueCommands` recognizes the snake_case
+    /// action and `applyCommand` mutates the run's per-schedule state on its next (reactively
+    /// woken) sweep, which re-pushes the status so the lane reflects it. No optimistic update:
+    /// the round-trip is ~one wake (the reactive loop), and the schedule state lives only in the
+    /// sidecar. No-op for the `(other)` catch-all / empty ids.
+    func sendScheduleCommand(_ action: QueueCommand.Action, run: String, scheduleID: String) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty, !scheduleID.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: action, run: run, scheduleId: scheduleID),
+            ])
+    }
+
+    func pauseSchedule(run: String, scheduleID: String) {
+        sendScheduleCommand(.pauseSchedule, run: run, scheduleID: scheduleID)
+    }
+    func resumeSchedule(run: String, scheduleID: String) {
+        sendScheduleCommand(.resumeSchedule, run: run, scheduleID: scheduleID)
+    }
+    func runScheduleNow(run: String, scheduleID: String) {
+        sendScheduleCommand(.runScheduleNow, run: run, scheduleID: scheduleID)
+    }
+
+    /// (Schedules) Pause EVERY schedule of a run (the vacation switch) — one `pause_all_schedules`
+    /// command (`run` only). Same FIFO path.
+    func pauseAllSchedules(run: String) {
+        guard run != AgentDashboardModel.otherOrigin, !run.isEmpty else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyQueueCommand,
+            object: nil,
+            userInfo: [
+                QueueCommandUserInfoKey.command:
+                    QueueCommand(action: .pauseAllSchedules, run: run),
             ])
     }
 

@@ -73,6 +73,12 @@ export interface Surface {
    *  Set (re-stamped every sweep), so this is a visibility field for the reconcile-visibility
    *  chokepoint (HERO-AGENTS.md wire contract), not the source of truth. */
   hero?: boolean;
+  /** (schedules) The SCHEDULE id echoed back off the surface's `scheduleId` annotation — set on
+   *  a recurring scan-agent split (see AGENT-QUEUE.md → Schedules). OMITTED (=== undefined) for a
+   *  normal split / work-item tile. The runner reads this back to track a scheduled run's
+   *  single-flight + completion (and re-adopt it after a restart). Carries `queueName` too so it
+   *  is grouped under the queue; it has NO queueKey, so the work-item reconcile leaves it alone. */
+  scheduleId?: string;
 }
 
 /** read_surface return: the viewport screen text + its grid dimensions. */
@@ -118,6 +124,12 @@ export interface Annotation {
    *  ALWAYS written on the infer_key path, never omitted, so the GUI can drop its spinner);
    *  ABSENT (=== undefined) = "no suggestion yet". Partial-merge, like the rest. */
   queueKeySuggested?: string;
+  /** (schedules) Marks this surface a recurring SCHEDULE scan-agent split (see AGENT-QUEUE.md →
+   *  Schedules): `schedule:true` drives the dashboard tile's schedule glyph, and `scheduleId`
+   *  is the schedule's id (which the runner reads back off `list_surfaces` to track the run).
+   *  Written at schedule dispatch. Partial-merge, like the rest. */
+  schedule?: boolean;
+  scheduleId?: string;
 }
 
 /** Minimal shape of a JSON-RPC response we care about. */
@@ -199,6 +211,9 @@ export class McpClient {
     // sentinel, distinct from absent = "no suggestion yet" — §1.3). `!== undefined`, NOT a
     // truthiness check.
     if (ann.queueKeySuggested !== undefined) args.queueKeySuggested = ann.queueKeySuggested;
+    // (schedules) Forward the schedule marker + id (Swift maps them to queueSchedule/scheduleId).
+    if (ann.schedule !== undefined) args.schedule = ann.schedule;
+    if (ann.scheduleId !== undefined) args.scheduleId = ann.scheduleId;
     // The result is "{\"ok\":true}" wrapped; we only need it not to be an error.
     await this.call("set_surface_annotation", args);
   }
@@ -226,6 +241,7 @@ export class McpClient {
       held: status.held,           // (release) a few held items, each releasable in-place
       heroMax: status.heroMax,     // (hero) fleet-wide agent-queue-hero-max (0 = disabled)
       heroActive: status.heroActive, // (hero) fleet-wide live-hero count (heroActiveGlobal)
+      schedules: status.schedules, // (schedules) the Schedules-lane rows
     });
   }
 
@@ -591,6 +607,14 @@ const QUEUE_ACTIONS: ReadonlySet<string> = new Set([
   // promote/demote are a no-op (the adopt-chokepoint lesson, HERO-AGENTS.md wire contract).
   "promote",
   "demote",
+  // (schedules) the dashboard Schedules-lane controls: pause/resume/run-now a single schedule
+  // (carry `{run, scheduleId}`) and pause every schedule of a run (`{run}`). Ride this SAME FIFO
+  // — WITHOUT them here the GUI emit is SILENTLY DROPPED and the lane buttons are no-ops (the
+  // adopt/hero chokepoint lesson; AGENT-QUEUE.md → Schedules wire contract).
+  "pause_schedule",
+  "resume_schedule",
+  "run_schedule_now",
+  "pause_all_schedules",
 ]);
 
 /**
@@ -633,6 +657,8 @@ export function coerceQueueCommands(obj: unknown): QueueCommand[] {
     if (typeof r.surfaceUUID === "string" && r.surfaceUUID.length > 0) cmd.surfaceUUID = r.surfaceUUID;
     // (adopt) the work-item url for the dashboard badge, when the picked graph node had one.
     if (typeof r.url === "string" && r.url.length > 0) cmd.url = r.url;
+    // (schedules) the schedule id for pause/resume/run-now (absent for pause_all_schedules).
+    if (typeof r.scheduleId === "string" && r.scheduleId.length > 0) cmd.scheduleId = r.scheduleId;
     out.push(cmd);
   }
   return out;

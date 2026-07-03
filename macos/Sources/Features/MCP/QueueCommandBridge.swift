@@ -64,6 +64,14 @@ struct QueueCommand: Equatable, Sendable {
         /// whitelists. Shaped like `promote`/`adopt`: uses `run` + `surfaceUUID` (required) +
         /// `key` (optional).
         case demote
+        /// (Schedules) The dashboard Schedules-lane controls. pause/resume/run-now a single
+        /// schedule carry `run` + `scheduleId`; pause-all carries `run` only. Serialize to the
+        /// snake_case actions the sidecar's `coerceQueueCommands` whitelist recognizes — WITHOUT
+        /// them there the emit is silently dropped (AGENT-QUEUE.md → Schedules wire contract).
+        case pauseSchedule = "pause_schedule"
+        case resumeSchedule = "resume_schedule"
+        case runScheduleNow = "run_schedule_now"
+        case pauseAllSchedules = "pause_all_schedules"
     }
 
     let action: Action
@@ -98,6 +106,9 @@ struct QueueCommand: Equatable, Sendable {
     /// (adopt) The work-item URL for the dashboard's clickable origin badge, set ONLY
     /// when the picked graph node carried one. nil for other actions.
     let url: String?
+    /// (Schedules) The SCHEDULE id for `pauseSchedule`/`resumeSchedule`/`runScheduleNow`.
+    /// nil for `pauseAllSchedules` (whole run) and other actions.
+    let scheduleId: String?
 
     init(
         action: Action,
@@ -109,7 +120,8 @@ struct QueueCommand: Equatable, Sendable {
         key: String? = nil,
         keep: Bool? = nil,
         surfaceUUID: String? = nil,
-        url: String? = nil
+        url: String? = nil,
+        scheduleId: String? = nil
     ) {
         self.action = action
         self.template = template
@@ -121,6 +133,7 @@ struct QueueCommand: Equatable, Sendable {
         self.keep = keep
         self.surfaceUUID = surfaceUUID
         self.url = url
+        self.scheduleId = scheduleId
     }
 
     /// PURE: the wire dict drained by `take_queue_commands`. `action` is always
@@ -145,6 +158,8 @@ struct QueueCommand: Equatable, Sendable {
         // equivalent to omitting it).
         if let surfaceUUID, !surfaceUUID.isEmpty { d["surfaceUUID"] = surfaceUUID }
         if let url, !url.isEmpty { d["url"] = url }
+        // (Schedules) the schedule id for pause/resume/run-now (absent for pause-all).
+        if let scheduleId, !scheduleId.isEmpty { d["scheduleId"] = scheduleId }
         return d
     }
 }
@@ -202,6 +217,20 @@ struct QueueStatus: Equatable, Sendable {
         }
     }
 
+    /// (ramon fork / Agent Queue Schedules) One schedule's row for the dashboard's thin
+    /// Schedules lane (mirrors the sidecar `ScheduleStatus` in status.ts). `nextRunAt` is
+    /// absent while paused or running (nothing armed); `lastCompletionAt` is absent until the
+    /// schedule has run once. Times are decoded from the sidecar's ms-since-epoch numbers.
+    struct ScheduleStatus: Equatable, Sendable, Identifiable {
+        let scheduleID: String
+        let name: String
+        let paused: Bool
+        let running: Bool
+        let nextRunAt: Date?
+        let lastCompletionAt: Date?
+        var id: String { scheduleID }
+    }
+
     /// The run NAME (= dashboard origin) this status is for.
     let queueName: String
     /// false ⇒ the run was removed (drained/aborted/quit) — the dashboard clears it.
@@ -246,16 +275,19 @@ struct QueueStatus: Equatable, Sendable {
     /// `≤ 0` a waiting hero item is `heroSlots`-blocked (surfaced per-item via
     /// `Item.blockReasons`). 0 when unknown (legacy/missing). Mirrors `heroMax`.
     let heroActive: Int
+    /// (ramon fork / Agent Queue Schedules) The run's recurring scan-agent SCHEDULES for the
+    /// dashboard's thin Schedules lane. Empty when the template declares none / a legacy payload.
+    let schedules: [ScheduleStatus]
 
-    /// Memberwise init with `heroMax`/`heroActive` DEFAULTED to 0, so legacy/partial payloads
-    /// and older call sites that predate Hero Agents still construct (an explicit init is needed
-    /// because Swift's synthesized memberwise init won't give a stored `let` a default). Every
-    /// other field is required, exactly as the synthesized init required them.
+    /// Memberwise init with `heroMax`/`heroActive`/`schedules` DEFAULTED, so legacy/partial
+    /// payloads and older call sites still construct (an explicit init is needed because Swift's
+    /// synthesized memberwise init won't give a stored `let` a default). Every other field is
+    /// required, exactly as the synthesized init required them.
     init(
         queueName: String, present: Bool, phase: String, queued: Int, listOk: Bool,
         active: Int, dispatched: Int, maxItems: Int?, concurrency: Int,
         next: [Item], running: [Item], heldCount: Int, held: [Item],
-        heroMax: Int = 0, heroActive: Int = 0
+        heroMax: Int = 0, heroActive: Int = 0, schedules: [ScheduleStatus] = []
     ) {
         self.queueName = queueName
         self.present = present
@@ -272,6 +304,7 @@ struct QueueStatus: Equatable, Sendable {
         self.held = held
         self.heroMax = heroMax
         self.heroActive = heroActive
+        self.schedules = schedules
     }
 
     // MARK: - Optimistic edits (instant dashboard feedback before the sidecar confirms)
@@ -283,7 +316,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: newMax,
             concurrency: concurrency, next: next, running: running,
-            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive)
+            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive, schedules: schedules)
     }
 
     /// A copy with `phase` replaced — optimistic pause/resume/stop feedback.
@@ -292,7 +325,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: newPhase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
             concurrency: concurrency, next: next, running: running,
-            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive)
+            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive, schedules: schedules)
     }
 
     /// A copy with `concurrency` replaced — optimistic parallel-edit feedback (the
@@ -302,7 +335,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
             concurrency: newConcurrency, next: next, running: running,
-            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive)
+            heldCount: heldCount, held: held, heroMax: heroMax, heroActive: heroActive, schedules: schedules)
     }
 
     /// (release) A copy with the HELD set replaced — optimistic release feedback. Dropping a
@@ -314,7 +347,7 @@ struct QueueStatus: Equatable, Sendable {
             queueName: queueName, present: present, phase: phase, queued: queued,
             listOk: listOk, active: active, dispatched: dispatched, maxItems: maxItems,
             concurrency: concurrency, next: next, running: running,
-            heldCount: newHeld.count, held: newHeld, heroMax: heroMax, heroActive: heroActive)
+            heldCount: newHeld.count, held: newHeld, heroMax: heroMax, heroActive: heroActive, schedules: schedules)
     }
 
     /// (pure, testable) Parse the concurrency-editor's raw string the SAME way the sidecar's
@@ -385,6 +418,27 @@ struct QueueStatusPayload {
         let heldItems = items("held")
         let heldCount = (arguments["heldCount"] as? NSNumber)?.intValue ?? heldItems.count
 
+        // (Schedules) Parse the Schedules-lane rows. Each needs a non-empty id; name falls back
+        // to the id; times decode from ms-since-epoch numbers (absent ⇒ nil).
+        func date(_ entry: [String: Any], _ key: String) -> Date? {
+            guard let ms = (entry[key] as? NSNumber)?.doubleValue else { return nil }
+            return Date(timeIntervalSince1970: ms / 1000)
+        }
+        var schedules: [QueueStatus.ScheduleStatus] = []
+        if let raw = arguments["schedules"] as? [[String: Any]] {
+            for entry in raw {
+                guard let sid = (entry["id"] as? String), !sid.isEmpty else { continue }
+                let name = (entry["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? sid
+                schedules.append(QueueStatus.ScheduleStatus(
+                    scheduleID: sid,
+                    name: name,
+                    paused: (entry["paused"] as? Bool) ?? false,
+                    running: (entry["running"] as? Bool) ?? false,
+                    nextRunAt: date(entry, "nextRunAt"),
+                    lastCompletionAt: date(entry, "lastCompletionAt")))
+            }
+        }
+
         return QueueStatusPayload(status: QueueStatus(
             queueName: queueName, present: present, phase: phase,
             queued: int("queued"), listOk: listOk, active: int("active"),
@@ -393,7 +447,8 @@ struct QueueStatusPayload {
             next: items("next"), running: items("running"),
             heldCount: heldCount, held: heldItems,
             // (hero) Fleet-wide hero cap + live-hero count. Absent (legacy) ⇒ 0.
-            heroMax: int("heroMax"), heroActive: int("heroActive")))
+            heroMax: int("heroMax"), heroActive: int("heroActive"),
+            schedules: schedules))
     }
 }
 

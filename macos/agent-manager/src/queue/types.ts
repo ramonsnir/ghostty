@@ -202,6 +202,47 @@ export interface QueueParam {
   valuesCommand?: string[];
 }
 
+/** (ramon fork / Agent Queue — Schedules) One SCHEDULE: a recurring, low-cognition
+ *  scan agent that periodically sweeps the queue's project (docs / backlog / code) and
+ *  opens or amends backlog issues — "project/tech-debt maintenance" work the human
+ *  shouldn't have to remember to trigger. See AGENT-QUEUE.md → Schedules and
+ *  queue/schedule.ts for the timing model. A schedule is NOT a WorkItem: it is not
+ *  emitted by the provider `list`, not counted against `concurrency`/`maxItems`/
+ *  `agent-queue-max-total`, and its "completion" is its SPLIT CLOSING (not a provider
+ *  `status` round-trip). It runs in the SAME grid/tab as regular work agents.
+ *
+ *  Autonomy is entirely a matter of the PROSE (`promptFile`/`prompt`): the prompt tells
+ *  the agent what it may do — open issues (with an agreed auto-generated label so they
+ *  are recognizable), amend an existing one, or accept it is already in progress — and
+ *  Ghostty adds no special issue-creation machinery. Dedup is handled by the cadence
+ *  (roughly-once-per-cycle) plus the prose ("check existing issues first"). */
+export interface ScheduleSpec {
+  /** Stable identity: the single-flight key (never two runs of the SAME id at once)
+   *  and the persistence key for this schedule's cadence state. REQUIRED, non-empty. */
+  id: string;
+  /** Display name for the dashboard Schedules lane (defaults to `id` when absent). */
+  name?: string;
+  /** The cadence: a 5-field LOCAL-time cron expression (see queue/schedule.ts), e.g.
+   *  `0 9 * * 1-5` (weekday 9am) or `0 9,13,17 * * 1-5` (weekdays 9/13/17). REQUIRED;
+   *  validated at template load (a bad expression rejects the template). */
+  cron: string;
+  /** The prose scan instruction, delivered to the launched agent as its initial input.
+   *  Exactly ONE of `promptFile` (a path relative to the template's directory) or
+   *  `prompt` (inline) is REQUIRED; the validator resolves `promptFile` into `prompt`. */
+  promptFile?: string;
+  prompt?: string;
+  /** The shell command the scheduled split runs (defaults to the template's
+   *  `agent.command` when absent). The prose is typed in AFTER launch, so this is
+   *  normally just the interactive agent (`claude` / `codex`). */
+  command?: string;
+  /** When true (the DEFAULT), a scheduled split whose agent has EXITED is force-closed
+   *  automatically (hands-off cycle). When false, an exited scheduled split is LEFT
+   *  OPEN (leave-and-bell) for manual review; you close it when done. EITHER WAY the
+   *  schedule's cadence re-arms only once the split actually CLOSES (by any cause —
+   *  auto-close, agent exit + auto-close, or a human closing it). NOT hook/idle-driven. */
+  closeOnComplete?: boolean;
+}
+
 /** A fully-parsed, validated queue template (§5). The runtime engine consumes this;
  *  it is produced by `validateTemplate` from raw JSON. */
 export interface QueueTemplate {
@@ -222,6 +263,9 @@ export interface QueueTemplate {
   provider: ProviderSpec;
   onAgentExit: OnAgentExit;
   closeOnComplete: boolean;
+  /** (schedules) The recurring scan agents this queue runs (see ScheduleSpec). Empty
+   *  array when the template declares none (the prior behavior — no schedules). */
+  schedules: ScheduleSpec[];
   /** (keep) The per-QUEUE default for "keep" — when true, a completed split is KEPT OPEN
    *  (held in DONE_PENDING, never auto-closed) by default so you can do manual work in it
    *  after the task is done; a per-split toggle (the dashboard 📌 pin → the `set_keep`

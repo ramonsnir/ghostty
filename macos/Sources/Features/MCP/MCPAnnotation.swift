@@ -57,6 +57,10 @@ struct AgentAnnotationPayload {
         // sentinel distinct from absent ("no suggestion yet"). Present-as-string ⇒ that
         // value verbatim (incl. ""); absent/non-string ⇒ nil.
         let queueKeySuggested = arguments["queueKeySuggested"] as? String
+        // (schedules) the schedule marker + id — present-as-bool/string ⇒ that value;
+        // absent ⇒ nil (partial-merge, like the rest).
+        let queueSchedule = arguments["schedule"] as? Bool
+        let scheduleId = trimmedString("scheduleId")
 
         // At least one updatable field must be present; otherwise the update is a
         // no-op and we reject it (mirrors the old "blank summary" rejection but for
@@ -67,13 +71,14 @@ struct AgentAnnotationPayload {
             || queueKeep != nil
             || queueKeySuggested != nil
             || queueHero != nil
+            || queueSchedule != nil || scheduleId != nil
         else { return nil }
 
         return AgentAnnotationPayload(annotation: AgentAnnotation(
             summary: summary, phase: phase, needsUser: needsUser,
             queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
             queueKeep: queueKeep, queueKeySuggested: queueKeySuggested,
-            queueHero: queueHero))
+            queueHero: queueHero, queueSchedule: queueSchedule, scheduleId: scheduleId))
     }
 }
 

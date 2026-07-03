@@ -40,6 +40,7 @@ function tmpl(name: string): QueueTemplate {
     keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
+    schedules: [],
   };
 }
 
@@ -633,5 +634,66 @@ test("applyCommands: a promote/demote-only batch is NOT an active-run-set change
     applyCommands(reg, [{ action: "demote", run: "R", surfaceUUID: "u-K", key: "K" }], () => null),
     false,
     "demote is a per-run store change, not an active-runs change",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// (schedules) pause / resume / run-now / pause-all command reducer.
+// ---------------------------------------------------------------------------
+
+/** A run whose template declares two schedules, registered under its runName. */
+function scheduleReg(): { reg: RunRegistry; run: QueueRun } {
+  const t = tmpl("R");
+  t.schedules = [
+    { id: "doc-drift", cron: "0 9 * * 1-5", prompt: "scan docs", closeOnComplete: true },
+    { id: "backlog", cron: "0 12 * * 1", prompt: "scan backlog", closeOnComplete: true },
+  ];
+  const run = makeQueueRun(t, memStore());
+  const reg: RunRegistry = new Map([[run.runName, run]]);
+  return { reg, run };
+}
+
+test("pause_schedule / resume_schedule flips the schedule's paused flag", () => {
+  const { reg, run } = scheduleReg();
+  assert.equal(
+    applyCommand(reg, { action: "pause_schedule", run: "R", scheduleId: "doc-drift" }, () => null).kind,
+    "scheduleChanged",
+  );
+  assert.equal(run.schedules.get("doc-drift")?.paused, true);
+  applyCommand(reg, { action: "resume_schedule", run: "R", scheduleId: "doc-drift" }, () => null);
+  assert.equal(run.schedules.get("doc-drift")?.paused, false);
+});
+
+test("run_schedule_now records a run-now request for that schedule", () => {
+  const { reg, run } = scheduleReg();
+  applyCommand(reg, { action: "run_schedule_now", run: "R", scheduleId: "backlog" }, () => null);
+  assert.equal(run.scheduleRunNow.has("backlog"), true);
+});
+
+test("pause_all_schedules pauses every schedule of the run", () => {
+  const { reg, run } = scheduleReg();
+  applyCommand(reg, { action: "pause_all_schedules", run: "R" }, () => null);
+  assert.equal(run.schedules.get("doc-drift")?.paused, true);
+  assert.equal(run.schedules.get("backlog")?.paused, true);
+});
+
+test("schedule commands need a run + (for single-schedule) a scheduleId; unknown run is a no-op", () => {
+  const { reg } = scheduleReg();
+  assert.equal(applyCommand(reg, { action: "pause_schedule", run: "R" }, () => null).kind, "noop"); // no scheduleId
+  assert.equal(
+    applyCommand(reg, { action: "pause_schedule", run: "nope", scheduleId: "x" }, () => null).kind,
+    "noop",
+  ); // unknown run
+});
+
+test("schedule commands are NOT counted as an active-runs change (persisted per-run, like set_keep)", () => {
+  const { reg } = scheduleReg();
+  assert.equal(
+    applyCommands(reg, [{ action: "pause_schedule", run: "R", scheduleId: "doc-drift" }], () => null),
+    false,
+  );
+  assert.equal(
+    applyCommands(reg, [{ action: "pause_all_schedules", run: "R" }], () => null),
+    false,
   );
 });

@@ -41,6 +41,7 @@ function tmpl(name = "R"): QueueTemplate {
     keepOnComplete: false,
     closeStableSeconds: 5,
     params: [],
+    schedules: [],
   };
 }
 

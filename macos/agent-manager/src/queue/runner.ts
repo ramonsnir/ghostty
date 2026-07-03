@@ -60,6 +60,7 @@ import {
   loadDispatched,
   loadKeep,
   loadHero,
+  loadSchedules,
   loadStore,
   makePendingRecord,
   persistStore,
@@ -68,6 +69,7 @@ import {
   type LiveSurface,
   type StoreIO,
 } from "./store.js";
+import { computeNextStart, isDue, parseCron, type ScheduleState } from "./schedule.js";
 import {
   resolveMaxItemsOverride,
   resolveParamsEnv,
@@ -79,12 +81,14 @@ import {
   backlogCount,
   type QueueStatusReport,
   type QueueGraphReport,
+  type ScheduleStatus,
 } from "./status.js";
 import type {
   Assignment,
   GraphNode,
   QueueGraph,
   QueueTemplate,
+  ScheduleSpec,
   WorkItem,
 } from "./types.js";
 
@@ -268,6 +272,28 @@ export interface QueueRun {
    *  toggle membership. Persisted in the per-run store (`StoreFile.hero`) + rehydrated on the first
    *  reconcile so a promoted split stays a hero across a sidecar/GUI restart. Cleared on abort. */
   hero: Set<string>;
+  /** (schedules) The per-schedule CADENCE state, keyed by ScheduleSpec.id: armedAt /
+   *  lastCompletionAt / paused (see queue/schedule.ts). RUN-LEVEL state persisted in the
+   *  per-run store (`StoreFile.schedules`) + rehydrated on the first reconcile, so a
+   *  schedule's timing (and its pause) survives a sidecar/GUI restart. Armed (armedAt = now)
+   *  the first time each template schedule is seen; entries for removed schedules are pruned. */
+  schedules: Map<string, ScheduleState>;
+  /** (schedules) The LIVE scheduled runs, keyed by ScheduleSpec.id — the in-flight scan for
+   *  each schedule (its surface UUID + host sessionID + grid slot + whether the prose prompt
+   *  has been delivered yet, and the prose to deliver). This is the SINGLE-FLIGHT gate (a
+   *  schedule with a live entry never dispatches a second run) and the completion detector (an
+   *  entry that vanishes from `list_surfaces` = its split closed = a completion). NOT persisted
+   *  — rebuilt each sweep from the annotated live surfaces (`queueSchedule`/`scheduleId`), so a
+   *  restart re-adopts a still-open scheduled split without re-dispatch. */
+  scheduleActive: Map<
+    string,
+    { uuid: string; sessionID: number; gridSlot: number; promptSent: boolean; prose: string }
+  >;
+  /** (schedules) Schedule ids with a pending "Run now" request (the dashboard button →
+   *  `run_schedule_now` command). Consumed on the next dispatch (bypasses the cron due-check
+   *  and a `paused` state). NOT persisted (a run-now that didn't fire before a restart is lost
+   *  — acceptable; the cadence resumes normally). */
+  scheduleRunNow: Set<string>;
 }
 
 /** Build a fresh run state for a template. The store is loaded lazily on the first
@@ -303,6 +329,12 @@ export function makeQueueRun(
     keep: new Map<string, boolean>(),
     keepDirty: new Set<string>(),
     hero: new Set<string>(),
+    schedules: new Map<string, ScheduleState>(),
+    scheduleActive: new Map<
+      string,
+      { uuid: string; sessionID: number; gridSlot: number; promptSent: boolean; prose: string }
+    >(),
+    scheduleRunNow: new Set<string>(),
     idleAnchor: new Map<string, number | undefined>(),
     closeAwait: new Map<string, { exitKeysSent: boolean; sinceMs: number }>(),
     lifetimeDispatched: 0,
@@ -366,6 +398,32 @@ export function effectiveHero(run: QueueRun, key: string): boolean {
  *  store holds an array, not a Set). PURE. */
 export function heroRecord(run: QueueRun): string[] {
   return [...run.hero];
+}
+
+/** (schedules) Snapshot the run's schedule cadence map as a plain `{id: ScheduleState}` for
+ *  `persistStore` (the durable store holds an object, not a Map). PURE. */
+export function scheduleRecord(run: QueueRun): Record<string, ScheduleState> {
+  const out: Record<string, ScheduleState> = {};
+  for (const [id, st] of run.schedules) out[id] = st;
+  return out;
+}
+
+/** Persist ALL of the run's durable state through the store seam — the single write path
+ *  used everywhere in the sweep. Centralizes the positional `persistStore` argument list
+ *  (records + lifetime counter + latch + keep + hero + schedules) so a new run-level field
+ *  is threaded in ONE place. `heroLifetimeDispatched` is passed 0 (informational only — the
+ *  single `lifetimeDispatched` counter caps both pools; see store.ts). Never throws. */
+function persistRun(run: QueueRun): void {
+  persistStore(
+    run.storeIO,
+    [...run.active.values()],
+    run.lifetimeDispatched,
+    [...run.dispatched],
+    keepRecord(run),
+    heroRecord(run),
+    0,
+    scheduleRecord(run),
+  );
 }
 
 /** The run's EFFECTIVE max simultaneous agents (the TOTAL pane budget across all its tabs):
@@ -799,6 +857,12 @@ async function runOne(
     // restart (mirrors the keep/dispatched rehydrate). `lifetimeDispatched` is a SINGLE total
     // counter (regular + hero), so there's no separate hero counter to rehydrate.
     for (const k of loadHero(run.storeIO)) run.hero.add(k);
+    // (schedules) Rehydrate the per-schedule cadence (armedAt / lastCompletionAt / paused) so a
+    // schedule's timing + pause survive a restart (mirrors the keep/hero rehydrate). The
+    // scheduleSweep re-arms any NEW template schedule + prunes removed ids from here.
+    for (const [id, st] of Object.entries(loadSchedules(run.storeIO))) {
+      if (!run.schedules.has(id)) run.schedules.set(id, st);
+    }
   }
 
   // Rebuild the in-memory active set from the kept records BEFORE any dispatch.
@@ -850,7 +914,7 @@ async function runOne(
       );
     }
   }
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  persistRun(run);
   run.reconciledOnce = true;
 
   // (keep) Re-stamp the annotation for any split whose keep was just toggled (a `set_keep`
@@ -884,6 +948,11 @@ async function runOne(
   // below so the run-level HEALTH report fires EVERY sweep (incl. the arm sweep) — that
   // is the "queue is present, here's what's next" signal the dashboard shows before any
   // split spawns.
+  // Whether the run was ALREADY armed BEFORE this sweep (i.e. this is not the first,
+  // dispatch-suppressed sweep). Captured before the block below flips `dispatchArmed`, and
+  // reused as the schedule-dispatch gate so schedules obey the SAME first-sweep suppression
+  // (a restart's first sweep re-adopts existing scheduled splits before any new dispatch).
+  const wasArmed = run.dispatchArmed;
   let dispatched = { regular: 0, hero: 0 };
   if (!run.dispatchArmed) {
     run.dispatchArmed = true; // arm for the NEXT sweep; suppress dispatch THIS sweep
@@ -899,6 +968,13 @@ async function runOne(
     await packRun(run, deps);
     dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining, heroRemaining);
   }
+
+  // --- 4.25) SCHEDULES: fire + track the recurring scan agents (see queue/schedule.ts).
+  // Completion-detection + auto-close ALWAYS run (so an in-flight scan finishes cleanly even
+  // during drain, and a restart re-adopts a still-open scheduled split); NEW dispatch only
+  // when the run is armed + enabled + not paused/draining (the same gate as work dispatch).
+  const canDispatchSchedules = wasArmed && !run.disabled && !run.paused && !run.draining;
+  await scheduleSweep(run, deps, nowMs, surfaces, canDispatchSchedules);
 
   // --- 4.5) REFRESH the backlog GRAPH (optional `provider.graph`), throttled to listMs.
   // Independent of dispatch (runs even while paused/draining/disabled) so the grooming
@@ -989,6 +1065,30 @@ async function reportGraphGone(deps: QueueDeps, name: string): Promise<void> {
 /** (§11 health) Build + push the run-level health report via the MCP client. Best-effort
  *  (a failed report is logged, never thrown into the sweep). `present:true` (the run is
  *  live); the caller reports `present:false` separately when it removes a run. */
+/** (schedules) Build the per-schedule status for the dashboard Schedules lane: paused/running
+ *  flags + the next-start (from `computeNextStart`, absent while paused/running) + last
+ *  completion. PURE-ish (reads the run's in-memory schedule state; the cron parse is cheap). A
+ *  bad cron yields no `nextRunAt` (the lane still shows the row). */
+function scheduleStatuses(run: QueueRun): ScheduleStatus[] {
+  return run.template.schedules.map((spec) => {
+    const st = run.schedules.get(spec.id);
+    const running = run.scheduleActive.has(spec.id);
+    const paused = st?.paused ?? false;
+    let nextRunAt: number | undefined;
+    if (st !== undefined && !running && !paused) {
+      try {
+        nextRunAt = computeNextStart(parseCron(spec.cron), st);
+      } catch {
+        nextRunAt = undefined;
+      }
+    }
+    const out: ScheduleStatus = { id: spec.id, name: spec.name ?? spec.id, paused, running };
+    if (nextRunAt !== undefined) out.nextRunAt = nextRunAt;
+    if (st?.lastCompletionAt !== undefined) out.lastCompletionAt = st.lastCompletionAt;
+    return out;
+  });
+}
+
 async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> {
   if (deps.client.reportQueueStatus === undefined) return; // optional client capability
   const occupying = [...run.active.values()].filter(occupiesSlot);
@@ -1042,6 +1142,8 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     // A generous cap for the "N waiting" dropdown (the count itself is always exact);
     // beyond this the GUI shows "… and N more".
     nextLimit: 25,
+    // (schedules) The Schedules-lane rows (next-run / last-run / paused / running).
+    schedules: scheduleStatuses(run),
   });
   try {
     await deps.client.reportQueueStatus(report);
@@ -1276,7 +1378,7 @@ async function advanceStates(
   // Consume the status-probe window only when a probe actually fired this sweep (see the
   // `statusDue`/`probed` note above).
   if (probed) run.lastStatusAtMs = nowMs;
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  if (changed) persistRun(run);
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,7 +1469,7 @@ async function runCloseSequences(
     }
     // else: still within the await window and not yet exited → keep polling next sweep.
   }
-  if (changed) persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  if (changed) persistRun(run);
 }
 
 /** Move a closed assignment to FINISHED and start its key's COOLDOWN, freeing the
@@ -1475,7 +1577,7 @@ async function dispatchCandidates(
         }
       }
       if (rearmed) {
-        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+        persistRun(run);
       }
     }
   } catch (err) {
@@ -1627,7 +1729,7 @@ async function dispatchOne(
   // re-grabbed. Stamped at the intent (alongside the lifetime counter) + persisted, so it
   // holds across a crash/restart; rolled back below only if the spawn itself fails.
   run.dispatched.add(item.key);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  persistRun(run);
 
   // (d) Spawn the split, DELIVERING item context to the agent (§13, the #1 requirement).
   // Item fields ride as GHOSTTY_ITEM_* env, NEVER spliced as bare shell text. They are
@@ -1696,7 +1798,7 @@ async function dispatchOne(
     // Roll back the §7.1 latch too: nothing actually launched, so the key must stay
     // eligible to retry on the next list (mirrors the lifetime-counter rollback).
     run.dispatched.delete(item.key);
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+    persistRun(run);
     errlog(`run "${run.runName}": spawn ${item.key} failed: ${msg(err)}`);
     return false;
   }
@@ -1726,7 +1828,7 @@ async function dispatchOne(
   // a pending session id reconcile will backfill (see above).
   const finalized = finalizeRecord(pending, spawned.sessionId, spawned.id, deps.now());
   run.active.set(item.key, finalized);
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  persistRun(run);
 
   // (f) Stamp the {queueKey} annotation so the dashboard groups it + reconcile can
   // adopt it after a crash (§8.5/§9). Best-effort.
@@ -1766,6 +1868,276 @@ async function dispatchOne(
  *  (the tool treats an absent target as a first-tab fallback). Returning "" instead
  *  would be sent on the wire as an empty target — a latent contract mismatch — so we
  *  never do that. The planner guarantees an occupied target in the happy path. */
+// ---------------------------------------------------------------------------
+// (schedules) Recurring scan-agent pass — see queue/schedule.ts + AGENT-QUEUE.md.
+// ---------------------------------------------------------------------------
+
+/** Single-quote a value for a safe shell env-assignment prefix (mirrors dispatchOne's
+ *  shellEnvPrefix): wrap in single quotes and escape embedded single quotes. PURE. */
+function shellQuote(v: string): string {
+  return `'${v.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * (schedules) The whole per-run schedule pass, run every sweep (see AGENT-QUEUE.md → Schedules):
+ *   0. ARM any new template schedule (armedAt = now) + PRUNE cadence state for removed ids.
+ *   1. COMPLETION: a tracked scheduled run whose surface vanished from `list_surfaces` (its
+ *      split CLOSED, by any cause) → record `lastCompletionAt = now` + free the single-flight
+ *      slot (this re-anchors the cadence for the next run).
+ *   2. RE-ADOPT: a live scheduled surface we don't yet track (a restart re-adopting a still-open
+ *      scan) → track it (no re-dispatch; its prose was already delivered).
+ *   3. For each live tracked run: DELIVER the prose prompt once the agent is up (typed input +
+ *      Enter), and AUTO-CLOSE an EXITED split when the schedule's `closeOnComplete` is set.
+ *   4. DISPATCH (only when `canDispatch`): for each schedule with no live run, not paused (unless
+ *      a Run-now request overrides), and DUE (`isDue`) or Run-now → spawn a scheduled split.
+ * All effects go through `deps`; errors are caught so one bad schedule never breaks the sweep.
+ * Schedules occupy the grid but bypass the concurrency/maxItems/max-total caps (they are not in
+ * `run.active`). Persists the run when the cadence state changed.
+ */
+async function scheduleSweep(
+  run: QueueRun,
+  deps: QueueDeps,
+  nowMs: number,
+  surfaces: Surface[],
+  canDispatch: boolean,
+): Promise<void> {
+  const specs = run.template.schedules;
+  if (specs.length === 0 && run.schedules.size === 0) return; // fast no-op
+
+  let changed = false;
+
+  // 0) Arm new schedules + prune removed ones.
+  const inTemplate = new Set<string>();
+  for (const s of specs) {
+    inTemplate.add(s.id);
+    const existing = run.schedules.get(s.id);
+    if (existing === undefined) {
+      run.schedules.set(s.id, { armedAt: nowMs });
+      changed = true;
+    } else if (existing.armedAt === 0 && existing.lastCompletionAt === undefined) {
+      // A pause/resume command created a placeholder (armedAt 0) before the schedule was ever
+      // armed — anchor it to now so a resume doesn't fire it retroactively from the epoch.
+      existing.armedAt = nowMs;
+      changed = true;
+    }
+  }
+  for (const id of [...run.schedules.keys()]) {
+    if (!inTemplate.has(id)) {
+      run.schedules.delete(id);
+      run.scheduleActive.delete(id);
+      run.scheduleRunNow.delete(id);
+      changed = true;
+    }
+  }
+
+  // Map THIS run's live scheduled surfaces by scheduleId (annotation read-back — the row
+  // carries queueName + scheduleId, echoed by list_surfaces; a surface of another run or with
+  // no scheduleId is skipped).
+  const liveById = new Map<string, Surface>();
+  for (const s of surfaces) {
+    const sQueueName = (s as { queueName?: string }).queueName;
+    if (sQueueName !== undefined && sQueueName !== run.runName) continue;
+    const sid = (s as { scheduleId?: string }).scheduleId;
+    if (typeof sid === "string" && sid.length > 0) liveById.set(sid, s);
+  }
+
+  // 1) COMPLETION: a tracked schedule whose surface is gone → its split closed.
+  for (const [id, act] of [...run.scheduleActive]) {
+    if (!liveById.has(id)) {
+      const st = run.schedules.get(id);
+      if (st !== undefined) {
+        st.lastCompletionAt = nowMs;
+        changed = true;
+      }
+      run.scheduleActive.delete(id);
+    }
+  }
+
+  // 2) RE-ADOPT: a live scheduled surface we don't yet track (restart). gridSlot -1 = unknown
+  // geometry (excluded from occupancy); the prose was already delivered pre-restart.
+  for (const [id, s] of liveById) {
+    if (!run.scheduleActive.has(id) && run.schedules.has(id)) {
+      run.scheduleActive.set(id, {
+        uuid: s.id,
+        sessionID: typeof s.sessionID === "number" ? s.sessionID : 0,
+        gridSlot: -1,
+        promptSent: true,
+        prose: "",
+      });
+    }
+  }
+
+  // 3) Live tracked runs: deliver the prose once the agent is up; auto-close an exited one.
+  for (const [id, act] of run.scheduleActive) {
+    const s = liveById.get(id);
+    if (s === undefined) continue;
+    const spec = specs.find((x) => x.id === id);
+    // (a) Deliver the prose ONCE, once the agent is detected/at a prompt (avoids racing the
+    // agent's startup). Typed input + Enter, the same seams the close sequence uses.
+    if (!act.promptSent && act.prose.length > 0) {
+      const agentUp = (typeof s.agentState === "string" && s.agentState.length > 0) || s.atPrompt;
+      if (agentUp) {
+        try {
+          await sendText(deps, s.id, act.prose);
+          await sendKey(deps, s.id, "enter");
+          act.promptSent = true;
+        } catch (err) {
+          errlog(`run "${run.runName}": schedule "${id}" prompt send failed: ${msg(err)}`);
+          // Leave promptSent false → retried next sweep.
+        }
+      }
+    }
+    // (b) Auto-close an EXITED scheduled split when the schedule opts in (default). Its
+    // disappearance next sweep records the completion (step 1). closeOnComplete:false leaves
+    // it open for manual review (the normal bell already fired).
+    if (s.exited && spec?.closeOnComplete !== false) {
+      try {
+        await deps.client.forceCloseSurface(s.id);
+      } catch (err) {
+        errlog(`run "${run.runName}": schedule "${id}" auto-close failed: ${msg(err)}`);
+      }
+    }
+  }
+
+  // 4) DISPATCH due / run-now schedules (single-flight: skip any with a live run).
+  if (canDispatch) {
+    for (const spec of specs) {
+      const id = spec.id;
+      if (run.scheduleActive.has(id)) continue; // single-flight
+      const st = run.schedules.get(id);
+      if (st === undefined) continue;
+      const runNow = run.scheduleRunNow.has(id);
+      if (st.paused && !runNow) continue; // paused (a Run-now request overrides)
+      let due = runNow;
+      if (!due) {
+        try {
+          due = isDue(parseCron(spec.cron), st, nowMs);
+        } catch (err) {
+          errlog(`run "${run.runName}": schedule "${id}" cron invalid: ${msg(err)}`);
+          continue;
+        }
+      }
+      if (!due) continue;
+      run.scheduleRunNow.delete(id);
+      const ok = await dispatchSchedule(run, spec, deps, nowMs);
+      if (ok) changed = true;
+    }
+  }
+
+  if (changed) persistRun(run);
+}
+
+/**
+ * (schedules) Dispatch ONE scheduled scan: pack a split into the run's grid (bypassing the
+ * concurrency cap — schedules are not in `run.active` and don't consume a slot budget),
+ * annotate it (`queueName` + `schedule` + `scheduleId`) so the dashboard groups + marks it and
+ * a restart can re-adopt it, and record it as the live run for this schedule with the prose
+ * PENDING (delivered by scheduleSweep once the agent is up). Returns true on a successful
+ * spawn. Best-effort annotation (a miss is re-stamped never — but reconcile ignores keyless
+ * surfaces, so at worst the tile lacks its glyph until the next dispatch).
+ */
+async function dispatchSchedule(
+  run: QueueRun,
+  spec: ScheduleSpec,
+  deps: QueueDeps,
+  nowMs: number,
+): Promise<boolean> {
+  const t = run.template;
+
+  // Combined grid occupancy: work-item slots (run.active) + other live schedules' slots, with a
+  // slot→UUID map so a balanced split anchors on a real pane (schedules aren't in run.active, so
+  // occupiedUUID alone would miss a schedule-only run).
+  const occupied = new Set<number>();
+  const slotUUID = new Map<number, string>();
+  for (const a of run.active.values()) {
+    if (a.gridSlot >= 0 && occupiesSlot(a) && a.surfaceUUID !== undefined) {
+      occupied.add(a.gridSlot);
+      slotUUID.set(a.gridSlot, a.surfaceUUID);
+    }
+  }
+  for (const act of run.scheduleActive.values()) {
+    if (act.gridSlot >= 0) {
+      occupied.add(act.gridSlot);
+      slotUUID.set(act.gridSlot, act.uuid);
+    }
+  }
+  // A generous cap so lowestFreeSlot always finds a slot (schedules bypass concurrency); overflow
+  // to new tabs/rows is handled by splitPlan + the GUI's grid caps, exactly like a work item.
+  const capForSlot = occupied.size + t.schedules.length + 4;
+  const slot = lowestFreeSlot(occupied, capForSlot) ?? occupied.size;
+  const sp = splitPlan(occupied, slot, gridCap(t.grid.cols, t.grid.rows));
+  const lowestUUID = (() => {
+    let best: { slot: number; uuid: string } | undefined;
+    for (const [sl, uuid] of slotUUID) {
+      if (best === undefined || sl < best.slot) best = { slot: sl, uuid };
+    }
+    return best?.uuid;
+  })();
+
+  // The launch command: the schedule's own `command` or the template agent's, prefixed with the
+  // schedule identity env (informational; the prose carries the actual instruction). The prefix
+  // rides the command so it survives the pty-host backend (which drops the `env` field, like
+  // dispatchOne); we also pass `env` for the `.exec` backend.
+  const command =
+    `GHOSTTY_SCHEDULE_ID=${shellQuote(spec.id)} ` +
+    `GHOSTTY_SCHEDULE_NAME=${shellQuote(spec.name ?? spec.id)} ` +
+    (spec.command ?? t.agent.command);
+  const env = { GHOSTTY_SCHEDULE_ID: spec.id, GHOSTTY_SCHEDULE_NAME: spec.name ?? spec.id };
+
+  let spawned: { id: string; sessionId: number };
+  try {
+    const base = { command, cwd: t.workdir, env };
+    let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
+    if (sp.firstTab === true) {
+      // The run's first pane — but if the run already has seated panes elsewhere, anchor on the
+      // run's window so the scheduled tab shares it (mirrors dispatchOne's overflow shape).
+      const anchor = lowestUUID;
+      spawnArgs = { ...base, firstTab: true, ...(anchor !== undefined ? { windowAnchorUUID: anchor } : {}) };
+    } else if (sp.newTab === true) {
+      const anchor = slotUUID.get(sp.windowAnchorSlotIndex ?? -1) ?? lowestUUID;
+      spawnArgs = { ...base, firstTab: true, ...(anchor !== undefined ? { windowAnchorUUID: anchor } : {}) };
+    } else {
+      const target = slotUUID.get(sp.anchorSlotIndex ?? -1) ?? lowestUUID;
+      spawnArgs = {
+        ...base,
+        ...(target !== undefined ? { targetUUID: target } : {}),
+        balanced: true,
+        maxCols: t.grid.cols,
+        maxRows: t.grid.rows,
+      };
+    }
+    spawned = await deps.client.spawnSplitCommand(spawnArgs);
+  } catch (err) {
+    errlog(`run "${run.runName}": schedule "${spec.id}" spawn failed: ${msg(err)}`);
+    return false;
+  }
+
+  // Record the live run BEFORE the (awaited) annotation — the single-flight gate must hold even
+  // if the annotation write throws. The prose is delivered by scheduleSweep once the agent is up.
+  run.scheduleActive.set(spec.id, {
+    uuid: spawned.id,
+    sessionID: spawned.sessionId,
+    gridSlot: slot,
+    promptSent: false,
+    prose: spec.prompt ?? "",
+  });
+
+  // Annotate so the dashboard groups it under the queue + marks it a schedule, and a restart can
+  // re-adopt it. NO queueKey — a schedule is not a work item, so the work-item reconcile leaves
+  // it alone (it only adopts surfaces carrying a queueKey).
+  try {
+    await deps.client.setAnnotation(spawned.id, {
+      queueName: run.runName,
+      schedule: true,
+      scheduleId: spec.id,
+    });
+  } catch (err) {
+    errlog(`run "${run.runName}": schedule "${spec.id}" annotate failed: ${msg(err)}`);
+  }
+  log(`run "${run.runName}": dispatched schedule "${spec.id}" (${spec.name ?? spec.id})`);
+  return true;
+}
+
 function occupiedUUID(run: QueueRun, slotIndex: number): string | undefined {
   for (const a of run.active.values()) {
     if (a.gridSlot === slotIndex && a.surfaceUUID !== undefined) return a.surfaceUUID;
@@ -1852,7 +2224,7 @@ async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
         // MOVE failed → ROLL BACK the latch (the adoption did not happen, so the item must
         // stay dispatchable), persist, and return.
         run.dispatched.delete(key);
-        persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+        persistRun(run);
         errlog(`run "${name}": adopt ${key} move failed: ${msg(err)} — latch rolled back, item stays free`);
         return;
       }
@@ -1886,7 +2258,7 @@ async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
 
   // PERSIST the latch NOW (the active map is updated by the NEXT reconcile's adopt; persisting
   // the latch here ensures suppression survives a crash before that reconcile).
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  persistRun(run);
   log(`run "${run.runName}": ADOPTED ${key} (surface ${uuid}) — latched, moved, annotated`);
 }
 
@@ -1980,7 +2352,7 @@ async function runPromote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
 
   // PERSIST the run-level hero set now (the reducer flipped it; persisting here ensures the
   // promotion survives a crash before the next reconcile sweep, like runAdopt persists the latch).
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  persistRun(run);
   log(`run "${run.runName}": PROMOTED ${key ?? uuid} to HERO — ejected to own tab, annotated`);
 }
 
@@ -2063,7 +2435,7 @@ async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
     errlog(`run "${name}": demote annotate ${key ?? uuid}: ${msg(err)}`);
   }
 
-  persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+  persistRun(run);
   log(`run "${run.runName}": DEMOTED ${key ?? uuid} to regular — hero annotation dropped${repacked ? ` (re-packed into grid slot ${asgn?.gridSlot})` : " (no grid anchor — stays in own tab)"}`);
 }
 
@@ -2130,7 +2502,7 @@ export async function packRun(run: QueueRun, deps: QueueDeps): Promise<number> {
     moved += 1;
   }
   if (moved > 0) {
-    persistStore(run.storeIO, [...run.active.values()], run.lifetimeDispatched, [...run.dispatched], keepRecord(run), heroRecord(run));
+    persistRun(run);
     log(`run "${run.runName}": packed ${moved} pane(s) into tab ${plan.targetTab} (continuous packing)`);
   }
   return moved;
