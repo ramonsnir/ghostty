@@ -1495,12 +1495,12 @@ struct MCPServerTests {
     private func pre(
         dashboard: Bool = false, manager: Bool = false, queue: Bool = false,
         mcpListen: String = "", mcpToken: String = "", webMonitor: String = "",
-        projects: [String] = [], node: Bool = false
+        projects: [String] = [], node: Bool = false, bellFilter: Bool = false
     ) -> MCPKnowledge.Preconditions {
         MCPKnowledge.Preconditions(
             agentDashboard: dashboard, agentManager: manager, agentQueue: queue,
             mcpListen: mcpListen, mcpToken: mcpToken, webMonitorListen: webMonitor,
-            projectDirectories: projects, nodeResolvable: node)
+            projectDirectories: projects, nodeResolvable: node, bellFilter: bellFilter)
     }
 
     @Test func featureStatusSplitsAlwaysEnabled() {
@@ -1557,6 +1557,51 @@ struct MCPServerTests {
         #expect(!d.enableSteps.isEmpty)
         // Unknown feature id ⇒ nil.
         #expect(MCPKnowledge.featureDoc("nope", pre: pre()) == nil)
+    }
+
+    // The bell/attention subsystem is discoverable and its status reflects the loud-tier
+    // (promotion) sidecar dependency without gating the always-on tier-1 effects.
+    @Test func featureStatusBellPromotionArm() {
+        // Tier-1 always enabled; nothing required when bell-filter (promotion) is off.
+        let off = MCPKnowledge.status("bell", pre: pre())
+        #expect(off.enabled == true)
+        #expect(off.requires.isEmpty)
+        // With promotion armed but the sidecar unconfigured, it stays enabled (base bell)
+        // yet lists what promotion needs.
+        let armed = MCPKnowledge.status("bell", pre: pre(bellFilter: true))
+        #expect(armed.enabled == true)
+        #expect(armed.requires.contains { $0.contains("mcp-listen") })
+        #expect(armed.requires.contains { $0.contains("mcp-token") })
+        #expect(armed.requires.contains { $0.contains("node") })
+        // Fully configured promotion ⇒ no unmet requirements.
+        let ready = MCPKnowledge.status(
+            "bell", pre: pre(mcpListen: "127.0.0.1:8765", mcpToken: "x", node: true, bellFilter: true))
+        #expect(ready.requires.isEmpty)
+        // The FeatureDoc exists and points at the bell doc.
+        let d = MCPKnowledge.featureDoc("bell", pre: pre())!
+        #expect(d.docPath == "BELL-ATTENTION.md")
+        #expect(d.configKeys.contains("bell-features"))
+        #expect(d.configKeys.contains("agent-manager-bell-filter"))
+    }
+
+    // GUARD (mirrors readersIncludeAllForkOnlyKeys for docs_for_feature): every fork-only
+    // config key must be listed in SOME feature's configKeys, so a user asking
+    // docs_for_feature can always find the feature a fork key belongs to. This is the drift
+    // check that would have caught agent-queue-hero-max / agent-dashboard-spotlight-seconds /
+    // agent-manager-usage-tracking|warm-base slipping out of the FeatureDoc table.
+    @Test func featureDocsCoverAllForkOnlyKeys() {
+        let p = pre()
+        var covered = Set<String>()
+        for id in MCPKnowledge.featureIDs {
+            if let doc = MCPKnowledge.featureDoc(id, pre: p) { covered.formUnion(doc.configKeys) }
+        }
+        // Infrastructure keys that are NOT a per-feature knob (the backend socket), so they
+        // legitimately live in no feature's configKeys.
+        let infra: Set<String> = ["pty-host"]
+        let forkKeys = Ghostty.Config.allConfigKeys().filter { $0.forkOnly }.map { $0.key }
+        for key in forkKeys where !infra.contains(key) {
+            #expect(covered.contains(key), "no docs_for_feature lists fork-only key: \(key)")
+        }
     }
 
     // MARK: - MCP knowledge: get_effective_config entry computation (pure)
