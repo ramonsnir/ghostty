@@ -311,6 +311,10 @@ export function makeTemplateLoader(
           promptErrors.push(`schedule "${s.id}" promptFile unreadable/empty: ${p}`);
         } else {
           s.prompt = txt;
+          // Keep the ABSOLUTE path too: the runner passes it as GHOSTTY_SCHEDULE_PROMPT_FILE
+          // (short) so the launcher reads the prose from the file, never the whole prose on the
+          // command line (which spawn_split_command would type + mangle). See ScheduleSpec.
+          s.promptFilePath = p;
         }
       }
       cachedResult =

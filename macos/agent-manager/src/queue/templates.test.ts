@@ -669,7 +669,12 @@ test("makeTemplateLoader: resolves promptFile relative to the template dir into 
   const loader = makeTemplateLoader("/cfg/queues/q.json", fs);
   const r = loader.load();
   assert.equal(r.ok, true, JSON.stringify(r.errors));
-  if (r.ok) assert.equal(r.template.schedules[0].prompt, "review the docs and open issues");
+  if (r.ok) {
+    assert.equal(r.template.schedules[0].prompt, "review the docs and open issues");
+    // The ABSOLUTE resolved path is kept too, so the runner can deliver the prose by FILE
+    // (GHOSTTY_SCHEDULE_PROMPT_FILE) rather than putting the whole prose on the command line.
+    assert.equal(r.template.schedules[0].promptFilePath, "/cfg/queues/scans/doc.md");
+  }
 });
 
 test("makeTemplateLoader: an unreadable/empty promptFile fails the load", () => {

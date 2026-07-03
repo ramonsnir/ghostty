@@ -3476,6 +3476,39 @@ test("runQueueSweep: dispatches a DUE schedule, holds single-flight while live, 
   assert.equal(run.schedules.get("s1")!.lastCompletionAt, 103 * M, "completion re-anchored to close time");
 });
 
+test("runQueueSweep: a promptFile schedule delivers the FILE PATH (not the prose) on the command", async () => {
+  // The load-bearing fix: the multi-line/UTF-8 prose must NOT go on the command line (which
+  // spawn_split_command types + mangles). When promptFilePath is set, the command carries a
+  // short GHOSTTY_SCHEDULE_PROMPT_FILE env; the prose (GHOSTTY_SCHEDULE_PROMPT) is NOT present.
+  const run = makeQueueRun(
+    tmpl({
+      schedules: [
+        {
+          id: "s1",
+          cron: "* * * * *",
+          prompt: "line one\nline two\nwith an em-dash — and more",
+          promptFilePath: "/cfg/queues/scans/s1.md",
+          closeOnComplete: true,
+        },
+      ],
+    }),
+    memStore(),
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // dispatch
+  assert.equal(fake.calls.spawn.length, 1);
+  const cmd = fake.calls.spawn[0].command as string;
+  assert.ok(cmd.includes("GHOSTTY_SCHEDULE_PROMPT_FILE='/cfg/queues/scans/s1.md'"), "delivers the file path");
+  assert.ok(!cmd.includes("GHOSTTY_SCHEDULE_PROMPT="), "does NOT put the prose on the command line");
+  assert.ok(!cmd.includes("em-dash"), "the prose text is not on the command line");
+});
+
 test("runQueueSweep: auto-closes an EXITED scheduled split when closeOnComplete (the default)", async () => {
   const store = memStore();
   const run = makeQueueRun(

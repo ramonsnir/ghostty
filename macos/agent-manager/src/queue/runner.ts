@@ -2064,12 +2064,22 @@ async function dispatchSchedule(
   // Delivered TWO ways for the two backends (mirrors dispatchOne): a single-quoted env-assignment
   // PREFIX on `command` (survives the pty-host `.client` backend, which forwards the command but
   // NOT the `env` field) AND the `env` map (honored under `.exec`).
+  // Deliver the prose by FILE PATH when we have one (a `promptFile` → its absolute
+  // `promptFilePath`), NOT the prose itself — the command becomes a short single-quoted env
+  // PREFIX that spawn_split_command can type + submit cleanly. Putting the whole multi-line
+  // non-ASCII prose here instead mangles it (em-dashes → control chars, interleaved with the
+  // shell login banner, never submitted). Only a SHORT inline `prompt` (no file) falls back to
+  // GHOSTTY_SCHEDULE_PROMPT on the command line.
   const scheduleEnv: Record<string, string> = {
     ...resolveParamsEnv(t, run.params),
     GHOSTTY_SCHEDULE_ID: spec.id,
     GHOSTTY_SCHEDULE_NAME: spec.name ?? spec.id,
-    GHOSTTY_SCHEDULE_PROMPT: spec.prompt ?? "",
   };
+  if (spec.promptFilePath !== undefined && spec.promptFilePath.length > 0) {
+    scheduleEnv.GHOSTTY_SCHEDULE_PROMPT_FILE = spec.promptFilePath;
+  } else {
+    scheduleEnv.GHOSTTY_SCHEDULE_PROMPT = spec.prompt ?? "";
+  }
   const prefix = Object.entries(scheduleEnv)
     .map(([k, v]) => `${k}=${shellQuote(v)}`)
     .join(" ");
