@@ -169,7 +169,12 @@ struct AgentDashboardView: View {
                             onPauseSchedule: { id in model.pauseSchedule(run: section.id, scheduleID: id) },
                             onResumeSchedule: { id in model.resumeSchedule(run: section.id, scheduleID: id) },
                             onRunScheduleNow: { id in model.runScheduleNow(run: section.id, scheduleID: id) },
-                            onPauseAllSchedules: { model.pauseAllSchedules(run: section.id) }
+                            onPauseAllSchedules: { model.pauseAllSchedules(run: section.id) },
+                            onFocusSchedule: { id in
+                                if let uuid = model.surfaceID(forSchedule: section.id, scheduleID: id) {
+                                    focusHidden(uuid)
+                                }
+                            }
                         )
                         .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 2, trailing: 8))
                         .listRowBackground(Color.clear)
@@ -494,6 +499,8 @@ private struct OriginSectionHeader: View {
     let onResumeSchedule: (String) -> Void
     let onRunScheduleNow: (String) -> Void
     let onPauseAllSchedules: () -> Void
+    /// (Schedules) Jump to the running scan's split (the ▶ focus button).
+    let onFocusSchedule: (String) -> Void
 
     // Stop and Abort discard in-flight work and have no undo, so they confirm
     // before firing (Pause/Resume are cheap + reversible, so they stay one-tap).
@@ -694,6 +701,14 @@ private struct OriginSectionHeader: View {
                     Text(Self.scheduleStateText(s))
                         .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     Spacer(minLength: 4)
+                    // Focus (jump to) the running scan's split. Shown only while running.
+                    if s.running {
+                        Button { onFocusSchedule(s.scheduleID) } label: {
+                            Image(systemName: "arrow.right.circle").font(.caption2)
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                        .help("Go to this scan's split")
+                    }
                     Button { onRunScheduleNow(s.scheduleID) } label: {
                         Image(systemName: "play.circle").font(.caption2)
                     }

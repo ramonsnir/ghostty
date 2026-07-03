@@ -802,6 +802,17 @@ final class AgentDashboardModel: ObservableObject {
         return nil
     }
 
+    /// (Schedules) Resolve a running SCHEDULE (run name + schedule id) to its live surface
+    /// UUID — the scheduled split's surface carries `queueName` + `scheduleId`, so this finds
+    /// the split to "go to" from the Schedules-lane focus (▶) button. Returns nil if no live
+    /// surface carries that tag (e.g. the scan just closed).
+    func surfaceID(forSchedule queueName: String, scheduleID: String) -> UUID? {
+        for (id, ann) in annotations where ann.queueName == queueName && ann.scheduleId == scheduleID {
+            return id
+        }
+        return nil
+    }
+
     // MARK: - Reconciliation
 
     /// Snapshot of one live surface taken on main (value types + weak view).
