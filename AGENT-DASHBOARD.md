@@ -127,13 +127,17 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
 - **Agent Queue Schedules lane.** When a queue run declares recurring scan agents (see
   `AGENT-QUEUE.md` → Schedules), a thin **Schedules** lane appears under that queue's health row:
   one compact row per schedule — *name · next-run / paused / running · last-run* — with a
-  **Run-now** button and a **pause/resume** toggle, plus a **pause-all** (vacation) control. A
-  running scheduled split's tile carries a teal recurring-clock glyph (distinct from the hero
-  purple star). The lane's controls post `pause_schedule`/`resume_schedule`/`run_schedule_now`/
-  `pause_all_schedules` queue commands (the sidecar owns the cadence; the dashboard is a control
-  surface). Wiring: `AgentDashboardView.swift` (`schedulesLane`), `AgentPreviewTile.swift`
-  (`isSchedule` glyph), `AgentDashboardController.swift` (the four `…Schedule` command posters),
-  `QueueCommandBridge.swift` (`QueueStatus.ScheduleStatus` decode).
+  **Run-now** button, a **pause/resume** toggle, a **pause-all** (vacation) control, and — on a
+  RUNNING row only — a **focus (→-in-a-circle) button** that jumps to that scan's live split
+  (resolved GUI-side via the surface's `queueName`+`scheduleId` annotation → `focusHidden`, the
+  same jump the running-items dropdown uses). A running scheduled split's tile also carries a teal
+  recurring-clock glyph (distinct from the hero purple star). The lane's controls post
+  `pause_schedule`/`resume_schedule`/`run_schedule_now`/`pause_all_schedules` queue commands (the
+  sidecar owns the cadence; the dashboard is a control surface); the focus button is a pure GUI
+  jump (no command). Wiring: `AgentDashboardView.swift` (`schedulesLane` + `onFocusSchedule`),
+  `AgentPreviewTile.swift` (`isSchedule` glyph), `AgentDashboardController.swift` (the four
+  `…Schedule` command posters + `surfaceID(forSchedule:scheduleID:)`), `QueueCommandBridge.swift`
+  (`QueueStatus.ScheduleStatus` decode).
 - **Click a row** to jump to that real split — it raises the window, selects the tab,
   **un-zooms** if the split is hidden under a zoom, and gives the standard locate-pane
   highlight flash. The tiles are **read-only**: no inline reply / key forwarding (jump

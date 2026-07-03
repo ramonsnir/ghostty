@@ -864,8 +864,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   auto-closes it, OR you close it) — NO hook/idle dependency, so it works for **Codex** too; a
   schedule that needs you just BELLS like any agent and stays open until you close it. **Dashboard:**
   a thin **Schedules lane** under each queue (name · next-run/paused/running · last-run · Run-now ·
-  pause/resume, plus pause-all = the vacation switch) + a **teal recurring-clock tile glyph** (distinct
-  from hero purple). Cadence + pause persist in the per-run store and survive a restart (a still-open
+  pause/resume · a **focus-▶** button on a RUNNING row that jumps to its split · pause-all = the
+  vacation switch) + a **teal recurring-clock tile glyph** (distinct from hero purple). Cadence + pause persist in the per-run store and survive a restart (a still-open
   scheduled split is re-adopted, no re-dispatch). **A scheduled surface carries `queueName` +
   `schedule`/`scheduleId` annotation but NO `queueKey`, so the work-item reconcile leaves it alone**
   (it only adopts keyed surfaces) — the schedule pass tracks it separately. **Wire contract (both
@@ -885,9 +885,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (coerce whitelist + `Annotation`/`Surface` fields + report wire). macOS: `MCPAnnotation.swift` +
   `AgentStateBridge.swift` (`queueSchedule`/`scheduleId` + parse/merge), `MCPTools.swift` (schema),
   `MCPLayout.swift` (`SurfaceRow.scheduleId` + emit), `AgentDashboardController.swift`
-  (`HookSnapshotEntry.scheduleId` + `pauseSchedule`/`resumeSchedule`/`runScheduleNow`/`pauseAllSchedules`),
+  (`HookSnapshotEntry.scheduleId` + `pauseSchedule`/`resumeSchedule`/`runScheduleNow`/`pauseAllSchedules`
+  + `surfaceID(forSchedule:scheduleID:)` for the focus button),
   `QueueCommandBridge.swift` (4 `Action` cases + `scheduleId` + `QueueStatus.ScheduleStatus`),
-  `AgentPreviewTile.swift` (teal glyph), `AgentDashboardView.swift` (Schedules lane). Tests: sidecar
+  `AgentPreviewTile.swift` (teal glyph), `AgentDashboardView.swift` (Schedules lane + `onFocusSchedule`). Tests: sidecar
   `queue/schedule.test.ts` (cron/skip matrix), `templates`/`store`/`commands`/`runner`/`mcp`/`status`
   `.test.ts`; Swift `MCPAnnotationTests`/`MCPServerTests`/`QueuePaletteTests`. Fork-only, template-only
   — keep the `schedules[]` in your queue JSON under `~/.config/ghostty-ramon/agent-manager/queues/`.
