@@ -279,16 +279,14 @@ export interface QueueRun {
    *  the first time each template schedule is seen; entries for removed schedules are pruned. */
   schedules: Map<string, ScheduleState>;
   /** (schedules) The LIVE scheduled runs, keyed by ScheduleSpec.id — the in-flight scan for
-   *  each schedule (its surface UUID + host sessionID + grid slot + whether the prose prompt
-   *  has been delivered yet, and the prose to deliver). This is the SINGLE-FLIGHT gate (a
-   *  schedule with a live entry never dispatches a second run) and the completion detector (an
-   *  entry that vanishes from `list_surfaces` = its split closed = a completion). NOT persisted
-   *  — rebuilt each sweep from the annotated live surfaces (`queueSchedule`/`scheduleId`), so a
-   *  restart re-adopts a still-open scheduled split without re-dispatch. */
-  scheduleActive: Map<
-    string,
-    { uuid: string; sessionID: number; gridSlot: number; promptSent: boolean; prose: string }
-  >;
+   *  each schedule (its surface UUID + host sessionID + grid slot). This is the SINGLE-FLIGHT
+   *  gate (a schedule with a live entry never dispatches a second run) and the completion
+   *  detector (an entry that vanishes from `list_surfaces` = its split closed = a completion).
+   *  The prose is delivered at spawn via the `GHOSTTY_SCHEDULE_PROMPT` env (see dispatchSchedule),
+   *  NOT typed after the fact — so nothing about delivery is tracked here. NOT persisted — rebuilt
+   *  each sweep from the annotated live surfaces (`queueSchedule`/`scheduleId`), so a restart
+   *  re-adopts a still-open scheduled split without re-dispatch. */
+  scheduleActive: Map<string, { uuid: string; sessionID: number; gridSlot: number }>;
   /** (schedules) Schedule ids with a pending "Run now" request (the dashboard button →
    *  `run_schedule_now` command). Consumed on the next dispatch (bypasses the cron due-check
    *  and a `paused` state). NOT persisted (a run-now that didn't fire before a restart is lost
@@ -330,10 +328,7 @@ export function makeQueueRun(
     keepDirty: new Set<string>(),
     hero: new Set<string>(),
     schedules: new Map<string, ScheduleState>(),
-    scheduleActive: new Map<
-      string,
-      { uuid: string; sessionID: number; gridSlot: number; promptSent: boolean; prose: string }
-    >(),
+    scheduleActive: new Map<string, { uuid: string; sessionID: number; gridSlot: number }>(),
     scheduleRunNow: new Set<string>(),
     idleAnchor: new Map<string, number | undefined>(),
     closeAwait: new Map<string, { exitKeysSent: boolean; sinceMs: number }>(),
@@ -1954,43 +1949,27 @@ async function scheduleSweep(
   }
 
   // 2) RE-ADOPT: a live scheduled surface we don't yet track (restart). gridSlot -1 = unknown
-  // geometry (excluded from occupancy); the prose was already delivered pre-restart.
+  // geometry (excluded from occupancy). The prose was delivered at spawn (via env), so there is
+  // nothing to re-deliver.
   for (const [id, s] of liveById) {
     if (!run.scheduleActive.has(id) && run.schedules.has(id)) {
       run.scheduleActive.set(id, {
         uuid: s.id,
         sessionID: typeof s.sessionID === "number" ? s.sessionID : 0,
         gridSlot: -1,
-        promptSent: true,
-        prose: "",
       });
     }
   }
 
-  // 3) Live tracked runs: deliver the prose once the agent is up; auto-close an exited one.
-  for (const [id, act] of run.scheduleActive) {
+  // 3) AUTO-CLOSE an EXITED scheduled split when the schedule opts in (default). Its
+  // disappearance next sweep records the completion (step 1). closeOnComplete:false leaves it
+  // open for manual review (the normal bell already fired). (The prose was delivered at spawn
+  // via GHOSTTY_SCHEDULE_PROMPT — no per-sweep delivery to do.)
+  for (const [id] of run.scheduleActive) {
     const s = liveById.get(id);
-    if (s === undefined) continue;
+    if (s === undefined || !s.exited) continue;
     const spec = specs.find((x) => x.id === id);
-    // (a) Deliver the prose ONCE, once the agent is detected/at a prompt (avoids racing the
-    // agent's startup). Typed input + Enter, the same seams the close sequence uses.
-    if (!act.promptSent && act.prose.length > 0) {
-      const agentUp = (typeof s.agentState === "string" && s.agentState.length > 0) || s.atPrompt;
-      if (agentUp) {
-        try {
-          await sendText(deps, s.id, act.prose);
-          await sendKey(deps, s.id, "enter");
-          act.promptSent = true;
-        } catch (err) {
-          errlog(`run "${run.runName}": schedule "${id}" prompt send failed: ${msg(err)}`);
-          // Leave promptSent false → retried next sweep.
-        }
-      }
-    }
-    // (b) Auto-close an EXITED scheduled split when the schedule opts in (default). Its
-    // disappearance next sweep records the completion (step 1). closeOnComplete:false leaves
-    // it open for manual review (the normal bell already fired).
-    if (s.exited && spec?.closeOnComplete !== false) {
+    if (spec?.closeOnComplete !== false) {
       try {
         await deps.client.forceCloseSurface(s.id);
       } catch (err) {
@@ -2074,15 +2053,28 @@ async function dispatchSchedule(
     return best?.uuid;
   })();
 
-  // The launch command: the schedule's own `command` or the template agent's, prefixed with the
-  // schedule identity env (informational; the prose carries the actual instruction). The prefix
-  // rides the command so it survives the pty-host backend (which drops the `env` field, like
-  // dispatchOne); we also pass `env` for the `.exec` backend.
-  const command =
-    `GHOSTTY_SCHEDULE_ID=${shellQuote(spec.id)} ` +
-    `GHOSTTY_SCHEDULE_NAME=${shellQuote(spec.name ?? spec.id)} ` +
-    (spec.command ?? t.agent.command);
-  const env = { GHOSTTY_SCHEDULE_ID: spec.id, GHOSTTY_SCHEDULE_NAME: spec.name ?? spec.id };
+  // The schedule context reaches the agent as ENV — exactly like a work item's GHOSTTY_ITEM_*
+  // (§13): the launcher/agent command CONSUMES it (e.g. `claude "$GHOSTTY_SCHEDULE_PROMPT"`),
+  // rather than us typing the prose in (a fresh raw-mode TUI drops pre-first-input typing, and
+  // its agentState never reports until it gets input — so a send_text gate would never fire).
+  //   - GHOSTTY_SCHEDULE_PROMPT : the resolved prose (from promptFile/prompt) — the actual scan.
+  //   - GHOSTTY_SCHEDULE_ID / _NAME : the schedule identity.
+  //   - the run's resolved param env (LINEAR_PROJECT / …) so the scan is SCOPED to the same
+  //     project/milestone as the run ("parameterized by queue") — same env the provider gets.
+  // Delivered TWO ways for the two backends (mirrors dispatchOne): a single-quoted env-assignment
+  // PREFIX on `command` (survives the pty-host `.client` backend, which forwards the command but
+  // NOT the `env` field) AND the `env` map (honored under `.exec`).
+  const scheduleEnv: Record<string, string> = {
+    ...resolveParamsEnv(t, run.params),
+    GHOSTTY_SCHEDULE_ID: spec.id,
+    GHOSTTY_SCHEDULE_NAME: spec.name ?? spec.id,
+    GHOSTTY_SCHEDULE_PROMPT: spec.prompt ?? "",
+  };
+  const prefix = Object.entries(scheduleEnv)
+    .map(([k, v]) => `${k}=${shellQuote(v)}`)
+    .join(" ");
+  const command = `${prefix} ${spec.command ?? t.agent.command}`;
+  const env = scheduleEnv;
 
   let spawned: { id: string; sessionId: number };
   try {
@@ -2113,13 +2105,11 @@ async function dispatchSchedule(
   }
 
   // Record the live run BEFORE the (awaited) annotation — the single-flight gate must hold even
-  // if the annotation write throws. The prose is delivered by scheduleSweep once the agent is up.
+  // if the annotation write throws. (The prose was delivered at spawn via GHOSTTY_SCHEDULE_PROMPT.)
   run.scheduleActive.set(spec.id, {
     uuid: spawned.id,
     sessionID: spawned.sessionId,
     gridSlot: slot,
-    promptSent: false,
-    prose: spec.prompt ?? "",
   });
 
   // Annotate so the dashboard groups it under the queue + marks it a schedule, and a restart can

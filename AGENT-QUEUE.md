@@ -412,15 +412,24 @@ Declare schedules in the template:
     {
       "id": "doc-drift",                 // stable id: single-flight key + persistence key
       "name": "Doc drift scan",          // dashboard label (defaults to id)
-      "cron": "0 9,13,17 * * 1-5",       // weekdays at 9/13/17, LOCAL time (5-field cron)
-      "promptFile": "./schedules/doc-drift.md", // prose (relative to the template dir); or "prompt": "…"
-      "command": "claude",               // optional; defaults to the template agent.command
+      "cron": "0 9,14 * * 1-5",          // weekdays at 9am + 2pm, LOCAL time (5-field cron)
+      "promptFile": "./schedules/doc-drift.md",   // prose (relative to the template dir); or "prompt": "…"
+      "command": "exec ./schedules/schedule-agent.sh", // a launcher that CONSUMES $GHOSTTY_SCHEDULE_PROMPT
       "closeOnComplete": true            // default true — auto-close an exited scan
-    },
-    { "id": "backlog-coverage", "cron": "0 9 * * 1", "prompt": "Review the backlog against the milestone objectives; open issues for any gap. Search existing open issues first and amend instead of duplicating. Label anything you open `auto/groom`." }
+    }
   ]
 }
 ```
+
+**How the prose reaches the agent — via env, like a work item.** The resolved prose is passed to
+the scheduled split as **`GHOSTTY_SCHEDULE_PROMPT`** (plus `GHOSTTY_SCHEDULE_ID`/`_NAME` and the
+run's resolved param env, e.g. `LINEAR_PROJECT`/`LINEAR_MILESTONES`, so the scan is **scoped to the
+same project/milestone as the run**) — the SAME "context via env" contract as a work item's
+`GHOSTTY_ITEM_*`, NOT typed in. So the schedule's **`command` must CONSUME it** — a small launcher
+like `claude "$GHOSTTY_SCHEDULE_PROMPT"`. ⚠️ It **defaults to the template `agent.command`**, which
+is the *work-item* launcher (it expects `GHOSTTY_ITEM_*` and will misfire for a schedule) — so a
+schedule almost always sets its own `command` pointing at a schedule launcher. (A bare interactive
+`claude` would ignore the prompt env and just sit empty.)
 
 **Cadence — completion-anchored, with a half-gap skip.** The `cron` is a standard 5-field
 expression in **local wall-clock** time (minute hour day-of-month month day-of-week; lists/ranges/
@@ -1713,9 +1722,14 @@ or host change** (pure Swift + TS).
   greater; never-ran uses the arm anchor with NO skip). The runner's `scheduleSweep` (runner.ts,
   called every sweep from `runOne`) arms/prunes cadence state, detects completion (a tracked
   scheduled surface gone from `list_surfaces` → `lastCompletionAt = now`), re-adopts a live
-  scheduled surface after a restart, delivers the prose via `sendText`+Enter once the agent is up,
-  auto-closes an EXITED split (when `closeOnComplete`), and dispatches a due/run-now schedule via a
-  grid-packed split (`dispatchSchedule`) that BYPASSES the concurrency/maxItems/max-total caps (it
+  scheduled surface after a restart, auto-closes an EXITED split (when `closeOnComplete`), and
+  dispatches a due/run-now schedule via a grid-packed split (`dispatchSchedule`). The prose reaches
+  the agent as the `GHOSTTY_SCHEDULE_PROMPT` env (+ a single-quoted command PREFIX for the pty-host
+  backend, like GHOSTTY_ITEM_*), ALONGSIDE `GHOSTTY_SCHEDULE_ID`/`_NAME` and the run's resolved
+  param env (`resolveParamsEnv` — so a scan is scoped to the same project/milestone as the run);
+  the agent's `command`/launcher CONSUMES it (`claude "$GHOSTTY_SCHEDULE_PROMPT"`) rather than us
+  typing it (a fresh raw-mode TUI drops pre-first-input typing). The dispatch BYPASSES the
+  concurrency/maxItems/max-total caps (it
   is NOT in `run.active`) but still packs into the grid. A scheduled split carries a `queueName` +
   `schedule`/`scheduleId` annotation but **no `queueKey`**, so the work-item `reconcile` leaves it
   alone (it only adopts keyed surfaces). Single-flight is structural (`run.scheduleActive`, keyed by

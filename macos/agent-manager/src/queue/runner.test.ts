@@ -3448,8 +3448,13 @@ test("runQueueSweep: dispatches a DUE schedule, holds single-flight while live, 
   assert.ok(ann, "the scheduled split is annotated with its scheduleId");
   assert.equal((ann!.ann as { schedule?: boolean }).schedule, true, "annotated schedule:true");
   assert.equal(run.scheduleActive.has("s1"), true, "tracked as the live scheduled run");
+  // The prose + schedule identity ride the spawn command as a GHOSTTY_SCHEDULE_* env prefix
+  // (consumed by the agent, e.g. `claude "$GHOSTTY_SCHEDULE_PROMPT"`) — NOT typed in.
+  const cmd = fake.calls.spawn[0].command as string;
+  assert.ok(cmd.includes("GHOSTTY_SCHEDULE_ID='s1'"), "schedule id env prefix on the command");
+  assert.ok(cmd.includes("GHOSTTY_SCHEDULE_PROMPT='scan the docs'"), "prose delivered as env");
 
-  // The scheduled split is now live in list_surfaces (agent up) → single-flight + prose delivery.
+  // The scheduled split is now live in list_surfaces → single-flight holds (no second dispatch).
   spec.surfaces = [
     Object.assign(surface({ id: "sch-1", agentState: "working" }), {
       queueName: run.runName,
@@ -3458,15 +3463,10 @@ test("runQueueSweep: dispatches a DUE schedule, holds single-flight while live, 
   ];
   (spec.surfaces[0] as { sessionID?: number }).sessionID = 500;
 
-  // sweep 3: single-flight (no new spawn) + deliver the prose (typed + Enter).
+  // sweep 3: single-flight (no new spawn).
   now = 102 * M;
   await runQueueSweep(deps);
   assert.equal(fake.calls.spawn.length, 1, "single-flight: no second dispatch while live");
-  assert.ok(
-    fake.calls.sendText.some((t) => t.id === "sch-1" && t.text === "scan the docs"),
-    "prose typed into the scheduled split once the agent is up",
-  );
-  assert.ok(fake.calls.sendKey.some((k) => k.id === "sch-1" && k.key === "enter"), "prose submitted");
 
   // sweep 4: the split CLOSED (gone from list_surfaces) → completion re-anchors the cadence.
   spec.surfaces = [];

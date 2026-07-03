@@ -226,14 +226,20 @@ export interface ScheduleSpec {
    *  `0 9 * * 1-5` (weekday 9am) or `0 9,13,17 * * 1-5` (weekdays 9/13/17). REQUIRED;
    *  validated at template load (a bad expression rejects the template). */
   cron: string;
-  /** The prose scan instruction, delivered to the launched agent as its initial input.
-   *  Exactly ONE of `promptFile` (a path relative to the template's directory) or
-   *  `prompt` (inline) is REQUIRED; the validator resolves `promptFile` into `prompt`. */
+  /** The prose scan instruction. Exactly ONE of `promptFile` (a path relative to the
+   *  template's directory) or `prompt` (inline) is REQUIRED; the loader resolves `promptFile`
+   *  into `prompt`. It reaches the launched agent as the `GHOSTTY_SCHEDULE_PROMPT` env var —
+   *  the SAME "context via env" contract as a work item's GHOSTTY_ITEM_* (§13), NOT typed in
+   *  (a fresh raw-mode TUI drops pre-first-input typing). So the `command` (or a launcher it
+   *  wraps) CONSUMES it, e.g. `claude "$GHOSTTY_SCHEDULE_PROMPT"`. */
   promptFile?: string;
   prompt?: string;
-  /** The shell command the scheduled split runs (defaults to the template's
-   *  `agent.command` when absent). The prose is typed in AFTER launch, so this is
-   *  normally just the interactive agent (`claude` / `codex`). */
+  /** The shell command the scheduled split runs (defaults to the template's `agent.command`
+   *  when absent). It receives `GHOSTTY_SCHEDULE_PROMPT` / `GHOSTTY_SCHEDULE_ID` /
+   *  `GHOSTTY_SCHEDULE_NAME` + the run's resolved param env (e.g. LINEAR_PROJECT) and must USE
+   *  the prompt env (a bare interactive `claude` would ignore it). NOTE: the default
+   *  `agent.command` is the WORK-ITEM launcher, which typically expects GHOSTTY_ITEM_* — a
+   *  schedule usually needs its OWN launcher that reads GHOSTTY_SCHEDULE_PROMPT instead. */
   command?: string;
   /** When true (the DEFAULT), a scheduled split whose agent has EXITED is force-closed
    *  automatically (hands-off cycle). When false, an exited scheduled split is LEFT
