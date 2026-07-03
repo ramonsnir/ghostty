@@ -193,6 +193,41 @@ struct ConfigTests {
         #expect(config.backgroundOpacity == 0.7)
     }
 
+    // (ramon fork / issue #4) The actual production seam. On a fresh machine's FIRST
+    // launch, Ghostty.App.init reads the config BEFORE ForkSetup seeds
+    // ~/.config/ghostty-ramon/{config,local} (mcp-listen + a generated mcp-token), so
+    // app.config has no MCP keys and the MCP server never starts ("MCP not connected")
+    // until a relaunch. The fix is Ghostty.App.reloadConfigFromDisk(), which must
+    // reassign `self.config` SYNCHRONOUSLY so the server gates in
+    // applicationDidFinishLaunching (which read ghostty.config right after ForkSetup
+    // seeds the files) see the freshly-seeded values on that first launch. This models
+    // it end-to-end: an App that read a config WITHOUT the MCP keys, then the file gains
+    // them and reloadConfigFromDisk() surfaces them at once. (Robust even if
+    // ghostty_app_new degrades in the harness: reloadConfigFromDisk reassigns
+    // `self.config` regardless of whether `app` is non-nil.)
+    @Test @MainActor func appReloadFromDiskPicksUpSeededMCPKeys() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("config").path
+
+        // FIRST launch on a fresh machine: the config exists but has no MCP keys yet.
+        try "".write(toFile: path, atomically: true, encoding: .utf8)
+        let app = Ghostty.App(configPath: path)
+        #expect(app.config.mcpListen.isEmpty)
+        #expect(app.config.mcpToken.isEmpty)
+
+        // ForkSetup seeds the files; reloadConfigFromDisk must surface them immediately.
+        try """
+        mcp-listen = 127.0.0.1:8765
+        mcp-token = deadbeefcafe
+        """.write(toFile: path, atomically: true, encoding: .utf8)
+        #expect(app.reloadConfigFromDisk() == true)
+        #expect(app.config.mcpListen == "127.0.0.1:8765")
+        #expect(app.config.mcpToken == "deadbeefcafe")
+    }
+
     @Test func defaultConfigIsLoaded() throws {
         let config = try TemporaryConfig("")
         #expect(config.optionalAutoUpdateChannel != nil) // release or tip
