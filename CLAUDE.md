@@ -973,7 +973,22 @@ facts for an agent touching this code:
   the SECOND launch on a fresh machine** — the GUI reads `pty-host` in `Ghostty.App.init()`
   (before any launch callback), so the freshly-seeded value isn't seen until the next launch.
   `performHostSetup()` removes the connection RACE on every configured launch, not the one-time
-  relaunch (no `Client.zig` connect-retry was added — deliberate). **Two safety gates make it
+  relaunch (no `Client.zig` connect-retry was added — deliberate). **⭐ The MCP / web-monitor /
+  agent-manager servers, by contrast, DO start on the FIRST launch (issue #4 fix):** those gates
+  read `mcp-listen`/`mcp-token`/`web-monitor-listen` from `ghostty.config` LATER in
+  `applicationDidFinishLaunching`, so right after `performHostSetup()` seeds the config + `local`
+  the AppDelegate calls `ghostty.reloadConfigFromDisk()` (a new synchronous `Ghostty.App` reload
+  that reassigns `self.config` right away, unlike `reloadConfig(soft:)` which relies on the async
+  `configChange` callback) — so the gates read the freshly-seeded values instead of the stale
+  in-memory config, and the MCP server is listening on the very first launch (Claude Code no
+  longer shows "MCP not connected" until a relaunch). Gated on `performHostSetup()`'s bundled-host
+  return (dev/local builds never pay it); idempotent + cheap on steady-state launches (files
+  already existed at `init`, so the reload yields identical values). `pty-host` can't ride this —
+  it's consumed in `Ghostty.App.init` before any launch callback runs, so it alone still needs the
+  second launch. Wiring: `Ghostty.App.swift` (`reloadConfigFromDisk()`), `AppDelegate.swift` (the
+  `if forkHostSetupRan { ghostty.reloadConfigFromDisk() }` before the initial config load +
+  server gates). Test: `ConfigTests.reloadPicksUpNewlySeededMCPKeys` (a config with no MCP keys
+  reports them after a disk reload). **Two safety gates make it
   impossible to clobber a hand-managed host** (Ramon's own dev setup uses the SAME label
   `com.mitchellh.ghostty-ramon.host`): it only acts when a host is actually bundled
   (local/dev builds skip — they don't bundle it), and it writes an ownership marker

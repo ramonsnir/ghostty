@@ -36,6 +36,15 @@ mcp-token  = <48-hex secret>                # `openssl rand -hex 24`
 > out of the box with no hand-written token. It never rotates or clobbers a token you
 > already set there; to rotate, edit the `mcp-token` line in `local`. The keys below are
 > for a from-scratch / repo-clone setup, or to override the auto-provisioned values.
+>
+> **The server is up on that FIRST launch, not the second (issue #4).** `ForkSetup` seeds the
+> config + `local` (the `mcp-listen`/`mcp-token` above) *during* `applicationDidFinishLaunching`,
+> AFTER `Ghostty.App.init` already read the (absent) config — so the AppDelegate reloads the
+> config from disk (`ghostty.reloadConfigFromDisk()`) right after the seed and before the MCP
+> server gate reads `mcp-listen`. Without that reload the gate saw an empty value and the server
+> never started until a relaunch, so a fresh `claude` session showed the Ghostty MCP as **not
+> connected**. (`pty-host` is the one exception that still needs a second launch — it is consumed
+> in `Ghostty.App.init` before any reload can run.)
 
 - **`mcp-listen`** — `addr:port` to bind. **Localhost (`127.0.0.1`)** is recommended: the
   agent (a local Claude Code / Codex, via the stdio shim) runs on this same Mac. It's a

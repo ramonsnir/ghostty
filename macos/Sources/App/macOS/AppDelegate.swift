@@ -301,6 +301,19 @@ class AppDelegate: NSObject,
         // hosting. See ForkSetup's LAUNCH ORDERING doc.
         let forkHostSetupRan = ForkSetup.performHostSetup()
 
+        // (ramon fork) performHostSetup may have just SEEDED the fork config + the
+        // machine-local `local` file (mcp-listen + a generated mcp-token) on a fresh
+        // machine. Those files did not exist when Ghostty.App.init read the config, so
+        // the in-memory config is stale — reload it from disk NOW, before the initial
+        // config load and the MCP / web-monitor / agent-manager start gates below, so
+        // they see the freshly-seeded values. Without this the MCP server never starts
+        // on the first launch and Claude Code shows "MCP not connected" until a relaunch
+        // (issue #4). Idempotent on steady-state launches (the files already existed at
+        // init, so the reload yields identical values).
+        if forkHostSetupRan {
+            ghostty.reloadConfigFromDisk()
+        }
+
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
 

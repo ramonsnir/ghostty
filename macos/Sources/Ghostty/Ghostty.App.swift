@@ -256,6 +256,32 @@ extension Ghostty {
             /// applied config will be updated in ``Self.configChange(_:target:v:)``
         }
 
+        /// (ramon fork) Rebuild `config` from disk and push it into the ghostty app,
+        /// updating `self.config` SYNCHRONOUSLY so callers that read `config` right
+        /// after this returns see the fresh values. This differs from
+        /// `reloadConfig(soft:)`, which leaves `self.config` to be updated later by the
+        /// async `configChange` callback.
+        ///
+        /// Needed on a fresh machine's FIRST launch: `ForkSetup` seeds the fork config
+        /// + the machine-local `local` file (`mcp-listen` + a generated `mcp-token`)
+        /// during `applicationDidFinishLaunching`, AFTER `init` already read the
+        /// (absent) config — so the in-memory config is stale and the MCP /
+        /// web-monitor / agent-manager start gates would read empty values, leaving
+        /// those servers down until a relaunch (issue #4: "First launching Ghostty,
+        /// MCP not connected"). Idempotent: on a steady-state launch the files already
+        /// existed at `init`, so the reload yields identical values.
+        @discardableResult
+        func reloadConfigFromDisk() -> Bool {
+            let newConfig = Config(at: configPath)
+            guard newConfig.loaded else {
+                Ghostty.logger.warning("failed to reload configuration from disk")
+                return false
+            }
+            self.config = newConfig
+            if let app { ghostty_app_update_config(app, newConfig.config!) }
+            return true
+        }
+
         func reloadConfig(surface: ghostty_surface_t, soft: Bool = false) {
             // Soft updates just call with our existing config
             if soft {
