@@ -84,17 +84,26 @@ extension MCPServer {
     /// Returns true iff the surface exists; false ⇒ the tool reports an unknown id.
     /// Mirrors `handleAgentState`'s resolve-on-main + post-on-main shape.
     func applyAnnotation(uuid: UUID, annotation: AgentAnnotation) -> Bool {
-        let exists = DispatchQueue.main.sync {
-            MCPLayout.surface(forUUID: uuid) != nil
-        }
-        guard exists else { return false }
-        DispatchQueue.main.async {
+        // (ramon fork / Agent Queue latency) Resolve AND deliver SYNCHRONOUSLY on main, so the
+        // annotation is applied to the dashboard model BEFORE this call returns. Load-bearing for
+        // adopt latency: the sidecar `await`s set_surface_annotation and then, in the SAME sweep,
+        // calls list_surfaces — which reads queueKey/queueName off the dashboard model's
+        // hookSnapshot(). Delivering synchronously (the post below runs INSIDE this main.sync, and
+        // NotificationCenter delivers to observers inline on the posting thread, so the observer's
+        // `model.applyAnnotation` runs before we return — see `subscribeAnnotation`, which drops
+        // `receive(on:)` precisely so this stays synchronous) guarantees that same-sweep
+        // list_surfaces sees the fresh tags, so reconcile folds an adopted split into `run.active`
+        // THIS sweep instead of on a later poll (the eliminated adopt "next round"). The prior
+        // `main.async` post landed the write a main-thread turn LATER — after the same-sweep
+        // snapshot was already taken — which is exactly what deferred adopt tracking by a sweep.
+        return DispatchQueue.main.sync {
+            guard MCPLayout.surface(forUUID: uuid) != nil else { return false }
             NotificationCenter.default.post(
                 name: .ghosttyAgentAnnotationDidChange, object: nil,
                 userInfo: [AgentStateUserInfoKey.surfaceID: uuid,
                            AgentStateUserInfoKey.annotation: annotation])
+            return true
         }
-        return true
     }
 
     /// (ramon fork / Bell Attention) Resolve `uuid` on MAIN and, if it exists, post

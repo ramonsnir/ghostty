@@ -602,7 +602,13 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   in-flight sweep + the 5s `QUEUE_POLL_INTERVAL_MS` gap (the timer stays as backstop; the 0.5s event
   ring + timer make a command un-losable); and the per-agent provider `status` probes in a sweep now
   fire CONCURRENTLY (`Promise.all` in `advanceStates`) instead of sequential N×5s, which was what
-  ballooned a sweep. Pure Swift + TS, throttle/determinism unchanged — see AGENT-QUEUE.md → "Command
+  ballooned a sweep. **Adopt fold-in is also SAME-SWEEP now** (no extra reconcile round): the
+  queueKey/queueName annotation is delivered SYNCHRONOUSLY on main — `MCPServer.applyAnnotation` posts
+  inside `main.sync` and `subscribeAnnotation` drops `receive(on:)` — so the `await`ed
+  `set_surface_annotation` returns only after the model holds the tag, and the same sweep's
+  `list_surfaces` sees it → reconcile folds the adopted split into `run.active` that sweep. INVARIANT:
+  post `.ghosttyAgentAnnotationDidChange` ONLY via `applyAnnotation` (always on main), never off-main.
+  Pure Swift + TS, throttle/determinism unchanged — see AGENT-QUEUE.md → "Command
   latency". HARD DEPS (self-disables otherwise): pty-host + the Claude agent-state hooks (Codex
   can dispatch but not auto-close). No-duplicates rests on a persisted dispatch LATCH (re-dispatch
   needs a real status round-trip) + reconcile + restart survival. Grid is a balanced BSP with
