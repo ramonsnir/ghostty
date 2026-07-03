@@ -227,19 +227,32 @@ export interface ScheduleSpec {
    *  validated at template load (a bad expression rejects the template). */
   cron: string;
   /** The prose scan instruction. Exactly ONE of `promptFile` (a path relative to the
-   *  template's directory) or `prompt` (inline) is REQUIRED; the loader resolves `promptFile`
-   *  into `prompt`. It reaches the launched agent as the `GHOSTTY_SCHEDULE_PROMPT` env var —
-   *  the SAME "context via env" contract as a work item's GHOSTTY_ITEM_* (§13), NOT typed in
-   *  (a fresh raw-mode TUI drops pre-first-input typing). So the `command` (or a launcher it
-   *  wraps) CONSUMES it, e.g. `claude "$GHOSTTY_SCHEDULE_PROMPT"`. */
+   *  template's directory) or `prompt` (inline) is REQUIRED; the loader resolves `promptFile`'s
+   *  ABSOLUTE path into `promptFilePath` (and its content into `prompt`, for inline callers).
+   *
+   *  ⚠️ Delivery is via ENV, NOT typed input — and, crucially, the PROSE ITSELF IS NOT PUT ON
+   *  THE COMMAND LINE. `spawn_split_command` delivers a split's command as `initialInput` (typed
+   *  into the shell, interior newlines collapsed): a large multi-line non-ASCII prose there gets
+   *  mangled (em-dashes → control-char garbage, interleaved with the shell's login banner, never
+   *  cleanly submitted). So the runner passes a SHORT env instead:
+   *    - `promptFile` present ⇒ `GHOSTTY_SCHEDULE_PROMPT_FILE` = its absolute path; the launcher
+   *      reads the file (`cat`) — full UTF-8 + newlines preserved.
+   *    - inline `prompt` (no file) ⇒ `GHOSTTY_SCHEDULE_PROMPT` = the inline text (keep it SHORT +
+   *      single-line-ish; long/multi-line prose MUST use `promptFile`).
+   *  Same "context via env" contract as a work item's GHOSTTY_ITEM_* (§13). */
   promptFile?: string;
   prompt?: string;
+  /** (INTERNAL — set by the loader, not authored) The resolved ABSOLUTE path of `promptFile`.
+   *  Delivered to the agent as `GHOSTTY_SCHEDULE_PROMPT_FILE` (short, ASCII) so the launcher
+   *  reads the prose from the file instead of us putting the whole prose on the command line. */
+  promptFilePath?: string;
   /** The shell command the scheduled split runs (defaults to the template's `agent.command`
-   *  when absent). It receives `GHOSTTY_SCHEDULE_PROMPT` / `GHOSTTY_SCHEDULE_ID` /
-   *  `GHOSTTY_SCHEDULE_NAME` + the run's resolved param env (e.g. LINEAR_PROJECT) and must USE
-   *  the prompt env (a bare interactive `claude` would ignore it). NOTE: the default
-   *  `agent.command` is the WORK-ITEM launcher, which typically expects GHOSTTY_ITEM_* — a
-   *  schedule usually needs its OWN launcher that reads GHOSTTY_SCHEDULE_PROMPT instead. */
+   *  when absent). It receives `GHOSTTY_SCHEDULE_PROMPT_FILE` (or `GHOSTTY_SCHEDULE_PROMPT` for
+   *  inline) + `GHOSTTY_SCHEDULE_ID` / `GHOSTTY_SCHEDULE_NAME` + the run's resolved param env
+   *  (e.g. LINEAR_PROJECT) and must USE the prompt (a bare interactive `claude` would ignore it),
+   *  e.g. `claude "$(cat "$GHOSTTY_SCHEDULE_PROMPT_FILE")"`. NOTE: the default `agent.command` is
+   *  the WORK-ITEM launcher, which typically expects GHOSTTY_ITEM_* — a schedule usually needs
+   *  its OWN launcher. */
   command?: string;
   /** When true (the DEFAULT), a scheduled split whose agent has EXITED is force-closed
    *  automatically (hands-off cycle). When false, an exited scheduled split is LEFT

@@ -421,15 +421,20 @@ Declare schedules in the template:
 }
 ```
 
-**How the prose reaches the agent — via env, like a work item.** The resolved prose is passed to
-the scheduled split as **`GHOSTTY_SCHEDULE_PROMPT`** (plus `GHOSTTY_SCHEDULE_ID`/`_NAME` and the
-run's resolved param env, e.g. `LINEAR_PROJECT`/`LINEAR_MILESTONES`, so the scan is **scoped to the
-same project/milestone as the run**) — the SAME "context via env" contract as a work item's
-`GHOSTTY_ITEM_*`, NOT typed in. So the schedule's **`command` must CONSUME it** — a small launcher
-like `claude "$GHOSTTY_SCHEDULE_PROMPT"`. ⚠️ It **defaults to the template `agent.command`**, which
-is the *work-item* launcher (it expects `GHOSTTY_ITEM_*` and will misfire for a schedule) — so a
-schedule almost always sets its own `command` pointing at a schedule launcher. (A bare interactive
-`claude` would ignore the prompt env and just sit empty.)
+**How the prose reaches the agent — by FILE PATH, not on the command line.** ⚠️ The prose is **not**
+put on the launch command. `spawn_split_command` delivers a split's command by TYPING it into the
+shell (interior newlines collapsed) — a large multi-line/UTF-8 prose there gets mangled (em-dashes →
+control-char garbage, interleaved with the shell's login banner, never cleanly submitted). So the
+runner passes a **short** env instead: `promptFile` → **`GHOSTTY_SCHEDULE_PROMPT_FILE`** = its
+absolute path (the launcher `cat`s it — full newlines + UTF-8 preserved); a short inline `prompt`
+(no file) → `GHOSTTY_SCHEDULE_PROMPT` on the command line. Both come with `GHOSTTY_SCHEDULE_ID`/
+`_NAME` and the run's resolved param env (e.g. `LINEAR_PROJECT`/`LINEAR_MILESTONES`, so the scan is
+**scoped to the same project/milestone as the run**) — the SAME "context via env" contract as a work
+item's `GHOSTTY_ITEM_*`. So the schedule's **`command` must CONSUME the prompt** — a small launcher
+like `claude "$(cat "$GHOSTTY_SCHEDULE_PROMPT_FILE")"`. ⚠️ It **defaults to the template
+`agent.command`**, the *work-item* launcher (expects `GHOSTTY_ITEM_*`, misfires for a schedule) — so
+a schedule almost always sets its own `command` pointing at a schedule launcher. **Use `promptFile`
+for anything longer than a short line.**
 
 **Cadence — completion-anchored, with a half-gap skip.** The `cron` is a standard 5-field
 expression in **local wall-clock** time (minute hour day-of-month month day-of-week; lists/ranges/
