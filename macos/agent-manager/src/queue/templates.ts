@@ -11,8 +11,10 @@
 // NOTHING here is queue-content aware; it only checks shape + ranges.
 
 import { statSync, readFileSync } from "node:fs";
+import { dirname, resolve as resolvePath } from "node:path";
 
 import { gridCap, MAX_QUEUE_TABS } from "./grid.js";
+import { CronParseError, parseCron } from "./schedule.js";
 import type {
   AgentSpec,
   GridFill,
@@ -27,6 +29,7 @@ import type {
   QueueParam,
   QueueParamTarget,
   QueueTemplate,
+  ScheduleSpec,
 } from "./types.js";
 
 /** The directory (under the agent-manager override dir) holding queue templates. */
@@ -104,6 +107,10 @@ export function validateTemplate(obj: unknown): ValidateResult {
   // NOTE: `quitWhenEmpty` was removed (see types.ts) — a `quitWhenEmpty` key in template
   // JSON is now silently ignored, never parsed.
   const params = validateParams(rec.params, errors);
+  // (schedules) The recurring scan agents. Validated for shape + a parseable cron; the
+  // `promptFile` field is RESOLVED to `prompt` later, in the file loader (which knows the
+  // template's directory) — validateTemplate stays pure/no-I/O.
+  const schedules = validateSchedules(rec.schedules, errors);
 
   if (
     errors.length > 0 ||
@@ -132,8 +139,76 @@ export function validateTemplate(obj: unknown): ValidateResult {
     keepOnComplete,
     closeStableSeconds,
     params,
+    schedules,
   };
   return { ok: true, template, errors: [] };
+}
+
+/**
+ * Validate the optional `schedules` array (see ScheduleSpec / queue/schedule.ts). PURE.
+ * Each entry needs a non-empty `id` (unique across the array — the single-flight key), a
+ * parseable 5-field `cron`, and EXACTLY ONE of `prompt` (inline) / `promptFile` (a path
+ * resolved later by the loader). `name`/`command` are optional non-empty strings;
+ * `closeOnComplete` defaults true. Pushes an error per problem (all surfaced at once) and
+ * still returns the specs it could build; validateTemplate bails on any error. Absent ⇒
+ * []. This is the chokepoint that whitelists schedule fields (the `validateProviderList`
+ * lesson) — a field not carried here is silently dropped from the runtime template.
+ */
+function validateSchedules(v: unknown, errors: string[]): ScheduleSpec[] {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) {
+    errors.push("schedules must be an array");
+    return [];
+  }
+  const out: ScheduleSpec[] = [];
+  const seenIds = new Set<string>();
+  v.forEach((raw, i) => {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      errors.push(`schedules[${i}] must be an object`);
+      return;
+    }
+    const r = raw as Record<string, unknown>;
+    const id = reqNonEmptyString(r.id, `schedules[${i}].id`, errors);
+    const cron = reqNonEmptyString(r.cron, `schedules[${i}].cron`, errors);
+    if (cron !== undefined) {
+      try {
+        parseCron(cron);
+      } catch (err) {
+        errors.push(
+          `schedules[${i}].cron is invalid: ${err instanceof CronParseError ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (id !== undefined) {
+      if (seenIds.has(id)) errors.push(`schedules[${i}].id "${id}" is duplicated`);
+      seenIds.add(id);
+    }
+    // Exactly one of prompt / promptFile.
+    const hasPrompt = typeof r.prompt === "string" && r.prompt.trim().length > 0;
+    const hasPromptFile = typeof r.promptFile === "string" && r.promptFile.trim().length > 0;
+    if (hasPrompt && hasPromptFile) {
+      errors.push(`schedules[${i}] must set only ONE of prompt / promptFile`);
+    } else if (!hasPrompt && !hasPromptFile) {
+      errors.push(`schedules[${i}] must set prompt or promptFile`);
+    }
+    let command: string | undefined;
+    if (r.command !== undefined) {
+      command = reqNonEmptyString(r.command, `schedules[${i}].command`, errors);
+    }
+    let name: string | undefined;
+    if (r.name !== undefined) {
+      name = reqNonEmptyString(r.name, `schedules[${i}].name`, errors);
+    }
+    const closeOnComplete = boolOrDefault(r.closeOnComplete, true);
+    if (id === undefined || cron === undefined) return;
+    const spec: ScheduleSpec = { id, cron, closeOnComplete };
+    if (name !== undefined) spec.name = name;
+    if (command !== undefined) spec.command = command;
+    if (hasPrompt) spec.prompt = (r.prompt as string).trim();
+    if (hasPromptFile) spec.promptFile = (r.promptFile as string).trim();
+    out.push(spec);
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,9 +293,30 @@ export function makeTemplateLoader(
         return cachedResult;
       }
       const v = validateTemplate(parsed);
-      cachedResult = v.ok
-        ? { ok: true, template: v.template, errors: [] }
-        : { ok: false, errors: v.errors };
+      if (!v.ok) {
+        cachedResult = { ok: false, errors: v.errors };
+        return cachedResult;
+      }
+      // (schedules) Resolve each schedule's `promptFile` (relative to THIS template's
+      // directory) into `prompt`, now that we have the path + fs seam. A promptFile that
+      // can't be read / is empty fails the load (so a broken schedule never dispatches a
+      // hollow scan). Inline `prompt` schedules are already resolved.
+      const baseDir = dirname(path);
+      const promptErrors: string[] = [];
+      for (const s of v.template.schedules) {
+        if (s.prompt !== undefined || s.promptFile === undefined) continue;
+        const p = resolvePath(baseDir, s.promptFile);
+        const txt = fs.readText(p);
+        if (txt === null || txt.trim().length === 0) {
+          promptErrors.push(`schedule "${s.id}" promptFile unreadable/empty: ${p}`);
+        } else {
+          s.prompt = txt;
+        }
+      }
+      cachedResult =
+        promptErrors.length > 0
+          ? { ok: false, errors: promptErrors }
+          : { ok: true, template: v.template, errors: [] };
       return cachedResult;
     },
   };

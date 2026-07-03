@@ -578,6 +578,36 @@ struct MCPServerTests {
         #expect(rd["hero"] == nil)
     }
 
+    // fork / Agent Queue Schedules: a scheduled scan-agent surface MUST emit `scheduleId`
+    // (with queueName) so the supervisor reads its scheduled runs back off list_surfaces
+    // (the reconcile-visibility chokepoint, mirroring queueKey). Omitted on a normal row.
+    @Test func surfacesJSONDataEmitsScheduleIdWhenPresentOmitsWhenNil() {
+        let sched = MCPLayout.SurfaceRow(
+            id: "ABC", title: "claude", pwd: "/tmp",
+            window: 0, tab: 1, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: "working", lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 7,
+            queueKey: nil, queueName: "Acme · Pilot", queueUrl: nil,
+            hero: false, scheduleId: "doc-drift")
+        let sd = MCPLayout.surfacesJSONData([sched])[0]
+        #expect(sd["scheduleId"] as? String == "doc-drift")
+        #expect(sd["queueName"] as? String == "Acme · Pilot")
+        #expect(sd["queueKey"] == nil) // a schedule is not a work item
+
+        let plain = MCPLayout.SurfaceRow(
+            id: "DEF", title: "vim", pwd: "/tmp",
+            window: 0, tab: 0, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: nil, hidden: false, sessionID: 0)
+        #expect(MCPLayout.surfacesJSONData([plain])[0]["scheduleId"] == nil)
+    }
+
     // MARK: - dispatch (AppKit-free paths only)
 
     @Test func dispatchUnknownToolError() {

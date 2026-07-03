@@ -68,6 +68,15 @@ struct AgentAnnotation: Equatable, Sendable {
     /// a partial update that omits it preserves the prior value on merge; nil reads as
     /// "not a hero" at the tile. Mirrors `queueKeep`.
     let queueHero: Bool?
+    /// (ramon fork / Agent Queue, Schedules) Marks this split a recurring SCHEDULE scan-agent
+    /// run (see AGENT-QUEUE.md → Schedules): true ⇒ the dashboard tile shows the schedule glyph.
+    /// Written at schedule dispatch (never toggled at the tile). OPTIONAL so a partial update
+    /// preserves the prior value on merge; nil reads as "not a schedule". Mirrors `queueHero`.
+    let queueSchedule: Bool?
+    /// (ramon fork / Agent Queue, Schedules) The SCHEDULE id of a scheduled scan-agent split —
+    /// echoed back into the MCP `list_surfaces` row so the supervisor tracks the run (and
+    /// re-adopts it after a restart). nil for a normal split / work-item tile.
+    let scheduleId: String?
 
     init(
         summary: String? = nil,
@@ -78,7 +87,9 @@ struct AgentAnnotation: Equatable, Sendable {
         queueUrl: String? = nil,
         queueKeep: Bool? = nil,
         queueKeySuggested: String? = nil,
-        queueHero: Bool? = nil
+        queueHero: Bool? = nil,
+        queueSchedule: Bool? = nil,
+        scheduleId: String? = nil
     ) {
         self.summary = summary
         self.phase = phase
@@ -89,6 +100,8 @@ struct AgentAnnotation: Equatable, Sendable {
         self.queueKeep = queueKeep
         self.queueKeySuggested = queueKeySuggested
         self.queueHero = queueHero
+        self.queueSchedule = queueSchedule
+        self.scheduleId = scheduleId
     }
 
     /// Overlay `other`'s PROVIDED (non-nil) fields onto `self`, keeping `self`'s
@@ -106,7 +119,9 @@ struct AgentAnnotation: Equatable, Sendable {
             queueUrl: other.queueUrl ?? queueUrl,
             queueKeep: other.queueKeep ?? queueKeep,
             queueKeySuggested: other.queueKeySuggested ?? queueKeySuggested,
-            queueHero: other.queueHero ?? queueHero)
+            queueHero: other.queueHero ?? queueHero,
+            queueSchedule: other.queueSchedule ?? queueSchedule,
+            scheduleId: other.scheduleId ?? scheduleId)
     }
 
     /// (ramon fork / Agent Queue, adopt) A copy of `self` with `queueKeySuggested` reset
@@ -120,7 +135,8 @@ struct AgentAnnotation: Equatable, Sendable {
         AgentAnnotation(
             summary: summary, phase: phase, needsUser: needsUser,
             queueKey: queueKey, queueName: queueName, queueUrl: queueUrl,
-            queueKeep: queueKeep, queueKeySuggested: nil, queueHero: queueHero)
+            queueKeep: queueKeep, queueKeySuggested: nil, queueHero: queueHero,
+            queueSchedule: queueSchedule, scheduleId: scheduleId)
     }
 }
 

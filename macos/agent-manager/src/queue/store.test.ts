@@ -15,6 +15,8 @@ import {
   loadKeep,
   loadHero,
   loadHeroLifetimeDispatched,
+  loadSchedules,
+  parseSchedules,
   loadStore,
   makePendingRecord,
   parseDispatched,
@@ -658,4 +660,38 @@ test("makePendingRecord carries the hero flag; loadHero/loadHeroLifetimeDispatch
   const io = memIO(serializeStore([pending], 0, [], {}, ["H-1"], 1));
   assert.deepEqual(loadHero(io), ["H-1"]);
   assert.equal(loadHeroLifetimeDispatched(io), 1);
+});
+
+test("serializeStore persists the schedule cadence map; parseSchedules round-trips it", () => {
+  const text = serializeStore([], 0, [], {}, [], 0, {
+    "doc-drift": { armedAt: 1000, lastCompletionAt: 5000 },
+    "backlog": { armedAt: 2000, paused: true },
+  });
+  assert.deepEqual(parseSchedules(text), {
+    "backlog": { armedAt: 2000, paused: true },
+    "doc-drift": { armedAt: 1000, lastCompletionAt: 5000 },
+  });
+});
+
+test("serializeStore omits the schedules field when empty (back-compat)", () => {
+  const obj = JSON.parse(serializeStore([])) as Record<string, unknown>;
+  assert.equal("schedules" in obj, false);
+});
+
+test("parseSchedules is TOLERANT of a pre-upgrade / corrupt file", () => {
+  assert.deepEqual(parseSchedules(null), {});
+  assert.deepEqual(parseSchedules("{}"), {}); // no `schedules` key
+  assert.deepEqual(parseSchedules('{"schedules":"nope"}'), {}); // wrong shape
+  // A missing/negative armedAt drops the entry; a bad lastCompletionAt/paused is ignored.
+  assert.deepEqual(
+    parseSchedules(
+      '{"schedules":{"a":{"armedAt":-1},"b":{"armedAt":10,"lastCompletionAt":"x","paused":"yes"},"c":{"armedAt":20,"paused":true}}}',
+    ),
+    { b: { armedAt: 10 }, c: { armedAt: 20, paused: true } },
+  );
+});
+
+test("loadSchedules reads the cadence map via the seam", () => {
+  const io = memIO(serializeStore([], 0, [], {}, [], 0, { s1: { armedAt: 7 } }));
+  assert.deepEqual(loadSchedules(io), { s1: { armedAt: 7 } });
 });

@@ -207,6 +207,10 @@ enum MCPTools {
                     // tool — declared so an additionalProperties:false validator doesn't reject
                     // the call (the same rationale as the queue tags above).
                     "hero": ["type": "boolean", "description": "Hero Agents: the split's hero verdict — true ⇒ this queue item is a HERO (own dedicated tab, loud attention tier, never auto-closed, accounted against the fleet-wide agent-queue-hero-max); drives the tab hero glyph + tile promote/demote visual."],
+                    // (Schedules) the recurring scan-agent markers, written through this same merge
+                    // tool — declared so an additionalProperties:false validator doesn't reject the call.
+                    "schedule": ["type": "boolean", "description": "Agent Queue (Schedules): true ⇒ this split is a recurring SCHEDULE scan-agent run; drives the dashboard tile's schedule glyph."],
+                    "scheduleId": ["type": "string", "description": "Agent Queue (Schedules): the schedule's id — echoed into list_surfaces so the supervisor tracks the scheduled run."],
                 ],
                 "required": ["id"],
                 "additionalProperties": false,
@@ -575,7 +579,7 @@ enum MCPTools {
             // above). At least one updatable field (summary/phase/needsUser or a
             // queue tag) must be present.
             guard let payload = AgentAnnotationPayload.fromArguments(arguments) else {
-                return .invalidParams("empty annotation: provide at least one of summary/phase/needsUser/queueKey/queueName/queueUrl/keep/queueKeySuggested")
+                return .invalidParams("empty annotation: provide at least one of summary/phase/needsUser/queueKey/queueName/queueUrl/keep/queueKeySuggested/hero/schedule/scheduleId")
             }
             let ok = server.applyAnnotation(uuid: uuid, annotation: payload.annotation)
             return ok ? .ok(["ok": true]) : .toolError("unknown surface id")
