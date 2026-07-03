@@ -1913,8 +1913,17 @@ final class AgentDashboardController: NSWindowController {
     /// unconditionally (not gated on `isShown`) and hands the annotation to the
     /// model, which rebuilds its `@Published` entries.
     private func subscribeAnnotation() {
+        // (ramon fork / Agent Queue latency) NO `.receive(on: DispatchQueue.main)` here — the SOLE
+        // poster of this notification is `MCPServer.applyAnnotation`, which now posts INSIDE a
+        // `main.sync` block, so the notification is ALWAYS delivered on main and the sink runs
+        // synchronously inline with the post. That synchronicity is load-bearing: it lets the MCP
+        // `set_surface_annotation` handler return only AFTER the model has stored the annotation, so
+        // the same sidecar sweep's `list_surfaces`/`hookSnapshot()` sees it and reconcile folds an
+        // adopted split in THIS sweep (no extra round). A `receive(on: main)` here would re-dispatch
+        // the apply to a LATER main turn — reintroducing exactly the deferral we removed. INVARIANT:
+        // do NOT post `.ghosttyAgentAnnotationDidChange` from off-main, or this sink runs off-main
+        // and mutates `@Published` model state off-main (post via `applyAnnotation` only).
         NotificationCenter.default.publisher(for: .ghosttyAgentAnnotationDidChange)
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] note in
                 guard let self,
                       let id = note.userInfo?[AgentStateUserInfoKey.surfaceID] as? UUID,

@@ -63,6 +63,7 @@ enum MCPKnowledge {
         ("agent-dashboard", { String($0.agentDashboard) }),
         ("agent-dashboard-commands", { $0.agentDashboardCommands.joined(separator: ",") }),
         ("agent-dashboard-pin", { String($0.agentDashboardPin) }),
+        ("agent-dashboard-spotlight-seconds", { String($0.agentDashboardSpotlightSeconds) }),
         ("agent-manager", { String($0.agentManagerEnabled) }),
         ("agent-manager-node-path", { $0.agentManagerNodePath ?? "" }),
         ("agent-manager-usage-tracking", { String($0.agentManagerUsageTracking) }),

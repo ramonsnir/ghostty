@@ -507,11 +507,30 @@ DELIVERED by polling, not push: the GUI appends it to a FIFO drained by the MCP
    guard keeps one throw from failing the whole batch (`probeStatus` already swallows exec
    failures → `{terminal:false}`).
 
+3. **Adopt fold-in is SAME-SWEEP (no extra reconcile round).** `runAdopt` runs BEFORE `list_surfaces`
+   in a sweep, so in principle reconcile could fold an adopted split into `run.active` (health-bar
+   count + status tracking) that same sweep — but the queueKey/queueName annotation used to reach the
+   dashboard model through TWO async main-thread hops (`set_surface_annotation` posted via
+   `main.async` + a Combine `receive(on: main)` sink), landing it a main-thread turn AFTER the
+   same-sweep `list_surfaces` snapshot was taken → the fold-in waited for a later sweep (up to the 5s
+   timer, since the reactive loop re-parks with no new event). FIX: deliver the annotation
+   SYNCHRONOUSLY on main — `MCPServer.applyAnnotation` posts the notification INSIDE its `main.sync`
+   block, and `subscribeAnnotation` DROPS `receive(on: main)` so the observer's `model.applyAnnotation`
+   runs inline with the post. Now the `await`ed `set_surface_annotation` returns only after the model
+   holds the tag, so the SAME sweep's `list_surfaces`/`hookSnapshot()` sees it and reconcile folds the
+   split in that sweep — adopt is fully tracked in ~1 round-trip. INVARIANT: this notification is
+   posted ONLY by `applyAnnotation` (always on main now); do NOT post it off-main or the synchronous
+   sink would mutate `@Published` model state off-main. (Promote had no such round — its hero-pool
+   accounting is authoritative in the sidecar's in-memory `run.hero` set, settled same-sweep.)
+
 Wiring: `macos/Sources/Features/MCP/MCPEventBus.swift` (`queueCommand` type + `queueCommandSentinelID`
 + `recordQueueCommand`), `MCPQueueCommands.swift` (`enqueueQueueCommand` fires the wake),
 `MCPTools.swift` (`queue_command` in the whitelist + schema), `macos/agent-manager/src/index.ts`
 (`QUEUE_WAIT_MS`/`QUEUE_WAIT_RETRY_MS` + `runQueueSweepCoalesced` + `queueReactiveLoop` + arm),
-`macos/agent-manager/src/queue/runner.ts` (`advanceStates` parallel probe batch). Tests:
+`macos/agent-manager/src/queue/runner.ts` (`advanceStates` parallel probe batch);
+`macos/Sources/Features/MCP/MCPAnnotation.swift` (`applyAnnotation` synchronous main.sync post) +
+`macos/Sources/Features/AgentDashboard/AgentDashboardController.swift` (`subscribeAnnotation` drops
+`receive(on:)` — the same-sweep adopt fold-in). Tests:
 `runner.test.ts` (`advanceStates: due status probes … run CONCURRENTLY`), `MCPServerTests.swift`
 (`dispatchWaitForEventQueueCommandType`, `dispatchWaitForEventUnknownTypeRejected`,
 `queueCommandEventTypeWireValueAndSentinel`). **GUI relaunch + rebuilt sidecar `dist`; NO Zig/lib
