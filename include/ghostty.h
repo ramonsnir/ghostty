@@ -494,9 +494,11 @@ typedef struct {
   // Host pty session to (re)attach to. 0 means none: spawn a FRESH host
   // session (today's behavior). A non-zero value requests that the `.client`
   // backend attach to the existing host session with this id instead of
-  // spawning a new one. Host session ids start at 1, so 0 is a safe sentinel.
-  // Only consulted when the `.client` backend is selected (i.e. `pty-host` is
-  // set); ignored for the in-process `.exec` backend.
+  // spawning a new one. Host session ids are RANDOM non-zero u64 (minted by the
+  // host's allocSessionId), so 0 is a safe sentinel meaning "no session". Only
+  // consulted when the `.client` backend is selected (i.e. `pty-host` is set or
+  // a per-surface `pty_host_socket` is supplied); ignored for the in-process
+  // `.exec` backend.
   uint64_t session_id;
   bool wait_after_command;
   ghostty_surface_context_e context;
@@ -507,6 +509,20 @@ typedef struct {
   // = a normal attach/spawn surface (today's behavior). Appended last so the ABI
   // stays additive; old zero-initialized callers get the safe default.
   bool mirror;
+  // (ramon fork / cloud-hosts) Per-surface AF_UNIX socket path of the
+  // `ghostty-host` this surface should dial. When non-NULL it OVERRIDES the
+  // global `pty-host` config scalar for this surface only (so a cloud split can
+  // dial a different, GUI-resolved forwarded socket while local splits use the
+  // global host). NULL (the default) ⇒ fall back to the global `pty-host`
+  // scalar (today's behavior). Appended last so the ABI stays additive;
+  // zero-initialized callers get NULL.
+  const char* pty_host_socket;
+  // (ramon fork / cloud-hosts) Identity label of the host this surface runs on,
+  // paired with `session_id` for reattach/persistence across a GUI restart
+  // (the `(host, session_id)` key). Caller-supplied; NEVER mutated by the host.
+  // NULL (the default) ⇒ the reserved name "local". Appended last so the ABI
+  // stays additive; zero-initialized callers get NULL.
+  const char* host_name;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -526,6 +542,19 @@ typedef struct {
   uint16_t rows;
   bool valid;
 } ghostty_surface_mirror_grid_s;
+
+// (ramon fork / cloud-hosts) Result of a one-shot Hello->HelloAck handshake
+// probe of a ghostty-host socket (see ghostty_probe_host). `reachable` is true
+// iff the socket connect() succeeded; `handshaked` is true iff a HelloAck was
+// decoded before EOF/timeout (a bare reachable connect is NOT ready — that is
+// the ssh -L accept-then-EOF false-positive). `major`/`minor` carry the host's
+// advertised protocol version and are meaningful ONLY when `handshaked`.
+typedef struct {
+  bool reachable;
+  bool handshaked;
+  uint16_t major;
+  uint16_t minor;
+} ghostty_host_probe_s;
 
 // Config types
 
@@ -729,7 +758,18 @@ typedef struct {
   // Optional command to feed to the new tab's shell as its first input
   // (caller includes any trailing newline). NULL opens an empty prompt.
   const char* initial_input;
+  // (ramon fork / cloud-hosts) Optional remote pty-remote-host registry name.
+  // When non-NULL (the new_tab_on_host action) the macOS handler resolves it to
+  // a forwarded socket and threads it onto the new tab's SurfaceConfiguration.
+  // NULL => a local tab (the pre-existing behavior).
+  const char* host_name;
 } ghostty_action_new_tab_s;
+
+// apprt.action.NewSplitOnHost.C — (ramon fork / cloud-hosts)
+typedef struct {
+  ghostty_action_split_direction_e direction;
+  const char* host_name;
+} ghostty_action_new_split_on_host_s;
 
 // apprt.action.SetTitle.C
 typedef struct {
@@ -1039,6 +1079,7 @@ typedef enum {
   GHOSTTY_ACTION_GOTO_LAST_SURFACE,
   GHOSTTY_ACTION_HIDE_DASHBOARD_SPLIT,
   GHOSTTY_ACTION_SPOTLIGHT_DASHBOARD_SPLIT,
+  GHOSTTY_ACTION_NEW_SPLIT_ON_HOST,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1087,6 +1128,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_new_split_on_host_s new_split_on_host;
 } ghostty_action_u;
 
 typedef struct {
@@ -1189,6 +1231,13 @@ GHOSTTY_API ghostty_config_key_info_s ghostty_config_key_at(uint32_t);
 // behavior: (protocol_major << 32) | (protocol_minor << 16) | host_reload_epoch.
 // ForkSetup gates the host LaunchAgent reload on this instead of the binary hash.
 GHOSTTY_API uint64_t ghostty_host_reload_identity(void);
+
+// (ramon fork / cloud-hosts) Probe a ghostty-host socket with one
+// Hello->HelloAck round-trip; see ghostty_host_probe_s. GUI-lib-only (never
+// compiled into ghostty-host). `timeout_ms` bounds the whole probe; a NULL
+// socket path returns {reachable=false}. Backs the SSH tunnel supervisor's
+// readiness gate (readiness requires handshaked==true).
+GHOSTTY_API ghostty_host_probe_s ghostty_probe_host(const char* socket_path, uint32_t timeout_ms);
 
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);

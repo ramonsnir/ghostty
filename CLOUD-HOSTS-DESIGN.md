@@ -1,7 +1,15 @@
 # Cloud-hosted terminals — some splits run on a remote host over SSH
 
-Status: **DESIGN / PROPOSAL — not yet implemented.** No code has been written for this
-feature. This document is written to be handed to a fresh implementing session; it is
+Status: **Phase 1 implemented.** This remains the DESIGN doc (rationale + full plan of
+record); the build-ready spec is `CLOUD-HOSTS-IMPL-PLAN.md`. Phase 1 landed the multi-host
+`.client` client + registry + launch + `(host, session_id)` identity: the `pty-remote-host`
+/ `pty-remote-ssh-options` config keys, a per-surface socket override (`ghostty_surface_config_s.pty_host_socket`
+/ `host_name` + `Client.Config.host_name`), the GUI-lib-only `ghostty_probe_host` Hello→HelloAck
+handshake probe, the `new_split_on_host` / `new_tab_on_host` actions + host-picker palette,
+`RemoteHostRegistry` + `RemoteTunnelController` (SSH unix-socket tunnel supervisor with a
+handshake-gated readiness signal), restored-remote-surface `hostName` persistence + deferred
+dial-on-readiness, and the `MCPLayout`/`MCPKnowledge` surfacing. Phases 2+ (redial state
+machine, cross-host session namespacing, Linux `proc_info` arm) are not yet built. It is
 grounded in the code at HEAD (citations are `file:symbol` / `file:line`), and every claim
 about *current* behavior was verified against the source unless explicitly marked
 "unverified".
@@ -799,10 +807,13 @@ doc is a **design doc**; the build-ready spec (with all resolutions/mitigations 
 **`CLOUD-HOSTS-IMPL-PLAN.md`**. Corrections applied to THIS doc so it no longer carries wrong
 facts:
 
-- **Backend selection line:** the `if (config.@"pty-host") |sock|` is at `Surface.zig:683`, not
+- **Backend selection line:** the `if (config.@"pty-host") |sock|` was at `Surface.zig:683`, not
   `~:667` (`:667` is the "SLICE 4 (backend selection)" comment). Behavior (`.client` via `try`,
-  no `.exec` fallback) was correct. Also flagged: the socket is the GLOBAL scalar — no
-  per-surface socket exists today (see plan §D5).
+  no `.exec` fallback) was correct. Also flagged: the socket was the GLOBAL scalar — no
+  per-surface socket existed at design time (plan §D5). **Phase 1 done:** `Surface.init` now
+  resolves the backend socket via `termio.Client.resolveSocketPath(per_surface_sock, config.@"pty-host")`
+  (per-surface override wins), reading `rt_surface.pty_host_socket` / `rt_surface.host_name`
+  (via `@hasField`) and threading `host_name` into `Client.Config`.
 - **`.attach` EOF behavior:** the doc claimed a `.attach` EOF "tears down the read thread and the
   surface shows an error." Corrected: on EOF the `.attach` role `break`s and re-polls (busy-loops,
   no `POLLHUP` check); on read error it returns but pushes NO surface message; all session-gone
@@ -814,9 +825,10 @@ facts:
   only `process_info` (name/command, `src/os/proc_info.zig` `resolve()`) is macOS-only. PTY /
   spawn / xev-Dynamic / SIGPIPE audited clean; the doc's `process_info`↔`foreground_pid` coupling
   was corrected.
-- **Stale in-tree comment (not a doc error, but noted):** `include/ghostty.h:497-499` says host
+- **Stale in-tree comment (fixed in Phase 1):** `include/ghostty.h` `session_id` used to say host
   session ids "start at 1"; `allocSessionId` (`Server.zig:1853`) actually mints RANDOM non-zero
-  u64. The plan fixes the header comment while touching it.
+  u64. Phase 1 corrected the header comment (random non-zero, `0` = "no session") while adding the
+  adjacent `pty_host_socket` / `host_name` fields.
 
 Open-question dispositions (full rationale + `planImpact` in the plan): OQ1 → RepeatableString
 `pty-remote-host`, Swift-side grammar, no new C API. OQ2 → GUI reads/validates HelloAck now

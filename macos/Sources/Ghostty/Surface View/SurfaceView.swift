@@ -189,10 +189,25 @@ extension Ghostty {
                 if !surfaceView.healthy {
                     Rectangle().fill(ghostty.config.backgroundColor)
                     SurfaceRendererUnhealthyView()
-                } else if surfaceView.error != nil {
+                } else if let error = surfaceView.error {
                     Rectangle().fill(ghostty.config.backgroundColor)
-                    SurfaceErrorView()
+                    SurfaceErrorView(error: error)
                 }
+
+                #if canImport(AppKit)
+                // (ramon fork / cloud-hosts) A restored/launched surface bound to a
+                // remote host defers its `.client` dial to the tunnel supervisor's
+                // readiness signal (D5/E2), so the surface is intentionally nil
+                // until the tunnel handshakes. Show an explanatory placeholder
+                // rather than an unexplained blank pane (design rule §564-566).
+                // This inline placeholder is the interim owner until the K1
+                // named-state overlay lands (Phase 2). `pendingRemoteHost` exists
+                // only on the macOS SurfaceView.
+                if let host = surfaceView.pendingRemoteHost {
+                    Rectangle().fill(ghostty.config.backgroundColor)
+                    AwaitingRemoteHostView(hostName: host)
+                }
+                #endif
 
                 // If we're part of a split view and don't have focus, we put a semi-transparent
                 // rectangle above our view to make it look unfocused. We include the last
@@ -241,6 +256,24 @@ extension Ghostty {
     }
 
     struct SurfaceErrorView: View {
+        /// The error that caused the surface to fail to initialize, if known.
+        /// When it is a `Ghostty.Error` with a specific message (e.g. the
+        /// cloud-hosts `.remoteHostUnresolvable`), we surface that message
+        /// verbatim instead of the generic "usually a bug" text.
+        var error: Ghostty.Error? = nil
+
+        private var message: String {
+            switch error {
+            case .some(.remoteHostUnresolvable(let name)):
+                return "This split is bound to remote host \"\(name)\", which is not in your pty-remote-host configuration (renamed, removed, or the config didn't load). Fix the host name in ~/.config/ghostty-ramon/config, or open a new local split."
+            default:
+                return """
+                    The terminal failed to initialize. Please check the logs for
+                    more information. This is usually a bug.
+                    """.replacingOccurrences(of: "\n", with: " ")
+            }
+        }
+
         var body: some View {
             HStack {
                 Image("AppIconImage")
@@ -250,12 +283,30 @@ extension Ghostty {
 
                 VStack(alignment: .leading) {
                     Text("Oh, no. 😭").font(.title)
-                    Text("""
-                        The terminal failed to initialize. Please check the logs for
-                        more information. This is usually a bug.
-                        """.replacingOccurrences(of: "\n", with: " ")
-                    )
-                    .frame(maxWidth: 350)
+                    Text(verbatim: message)
+                        .frame(maxWidth: 350)
+                }
+            }
+            .padding()
+        }
+    }
+
+    /// (ramon fork / cloud-hosts) Interim placeholder shown while a remote-host
+    /// `.client` surface waits for its SSH tunnel to hand-shake (E2). Driven by
+    /// `SurfaceView.pendingRemoteHost`; superseded by the K1 named-state overlay
+    /// in Phase 2. Kept intentionally minimal.
+    struct AwaitingRemoteHostView: View {
+        let hostName: String
+
+        var body: some View {
+            HStack {
+                ProgressView()
+                    .controlSize(.small)
+                VStack(alignment: .leading) {
+                    Text("Connecting to \(hostName)…").font(.headline)
+                    Text("Waiting for the SSH tunnel to \(hostName) to come up.")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 350)
                 }
             }
             .padding()
@@ -667,6 +718,23 @@ extension Ghostty {
         /// persisted across restarts via SurfaceView's Codable `sessionID` key.
         var sessionID: String?
 
+        /// (ramon fork / cloud-hosts) Explicit LOCAL forwarded socket path this
+        /// `.client` surface should dial, resolved GUI-side by the tunnel
+        /// supervisor (`RemoteTunnelController`) from `hostName`. nil ⇒ the core
+        /// falls back to the global `pty-host` scalar (a local surface).
+        /// Forwarded into `ghostty_surface_config_s.pty_host_socket` (D5). NOT
+        /// persisted directly — it is re-resolved from `hostName` at restore
+        /// (the forwarded socket path can change across GUI restarts).
+        var ptyHostSocket: String?
+
+        /// (ramon fork / cloud-hosts) Identity label of the host this surface is
+        /// bound to (the `pty-remote-host` registry key). nil / `"local"` ⇒ the
+        /// local `pty-host`. Persisted alongside `sessionID` (SurfaceView's
+        /// Codable `hostName` key) so the `(host, session_id)` pair survives a
+        /// GUI restart; on restore it is resolved back to a forwarded socket via
+        /// the registry (D3/D4). Forwarded into `ghostty_surface_config_s.host_name`.
+        var hostName: String?
+
         /// (ramon fork / Agent Dashboard, Layer 3) When true and the `.client`
         /// termio backend is in use together with a non-zero `sessionID`, the
         /// surface becomes a READ-ONLY render mirror of the host session
@@ -762,6 +830,15 @@ extension Ghostty {
                     return try initialInput.withCString { cInput in
                         config.initial_input = cInput
 
+                        // (ramon fork / cloud-hosts) Per-surface forwarded socket +
+                        // identity label (D5). null socket ⇒ the core falls back to
+                        // the global `pty-host` scalar; null host_name ⇒ "local".
+                        return try ptyHostSocket.withCString { cSock in
+                            config.pty_host_socket = cSock
+
+                            return try hostName.withCString { cHost in
+                                config.host_name = cHost
+
                         // Convert dictionary to arrays for easier processing
                         let keys = Array(environmentVariables.keys)
                         let values = Array(environmentVariables.values)
@@ -786,6 +863,8 @@ extension Ghostty {
                                 }
                             }
                         }
+                            } // hostName.withCString
+                        } // ptyHostSocket.withCString
                     }
                 }
             }

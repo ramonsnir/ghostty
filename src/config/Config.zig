@@ -3044,6 +3044,37 @@ keybind: Keybinds = .{},
 // monitor reads this via the `ptyHost` Swift getter to find the host socket.
 @"pty-host": ?[:0]const u8 = null,
 
+/// (ramon fork / cloud-hosts) Registry of REMOTE `ghostty-host` boxes reachable
+/// over an SSH unix-socket tunnel. Repeatable — each entry declares one named
+/// host so a split/tab can be launched on it (`new_split_on_host:<name>` /
+/// `new_tab_on_host:<name>`) and survive a GUI restart by reattaching to its
+/// `(host, session_id)`. The line grammar is parsed ENTIRELY macOS-side (this
+/// key stores each line verbatim; the fork's `RemoteHostRegistry` owns the
+/// grammar):
+///
+///     pty-remote-host = <name> = <ssh-target> : <remote-socket-path> [ : <local-socket-path> ]
+///
+/// e.g. `cloud-1 = user@cloud-1.example.ts.net : ~/.ghostty-ramon-host.sock`.
+/// The reserved name `local` always maps to the `pty-host` scalar and is never
+/// a remote entry. `~` is expanded macOS-side. This is a fork-only key, so keep
+/// it in `~/.config/ghostty-ramon/config` (an official Ghostty would error on
+/// it). Reuses the `project-directory` RepeatableString plumbing (the macOS
+/// apprt reads it via the `ptyRemoteHostLines` Swift getter over
+/// `ghostty_config_string_list_s`).
+@"pty-remote-host": RepeatableString = .{},
+
+/// (ramon fork / cloud-hosts) Extra `ssh` command-line options passed to the
+/// tunnel supervisor when it opens the SSH unix-socket forward for a
+/// `pty-remote-host` box (e.g. a jump host, an identity file, a custom port).
+/// The whole value is a single string threaded verbatim to the macOS tunnel
+/// supervisor; null/empty (the default) ⇒ no extra options. This is a fork-only
+/// key, so keep it in `~/.config/ghostty-ramon/config` (an official Ghostty
+/// would error on it).
+// NOTE: `[:0]const u8` (NOT `[]const u8`) so the C config getter
+// (ghostty_config_get) can return it as a NUL-terminated string — the macOS
+// apprt reads this via the `ptyRemoteSSHOptions` Swift getter.
+@"pty-remote-ssh-options": ?[:0]const u8 = null,
+
 /// Sets the reporting format for OSC sequences that request color information.
 /// Ghostty currently supports OSC 10 (foreground), OSC 11 (background), and
 /// OSC 4 (256 color palette) queries, and by default the reported values
@@ -11855,6 +11886,116 @@ test "agent-queue-templates-dir: RepeatableString parse" {
             u8,
             "agent-queue-templates-dir = /a/b\nagent-queue-templates-dir = /c/d\n",
             buf.written(),
+        );
+    }
+}
+
+test "pty-remote-host: RepeatableString parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default: empty list.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"pty-remote-host".list.items.len,
+        );
+    }
+
+    // Single entry — the whole line is stored verbatim (grammar is parsed
+    // macOS-side by RemoteHostRegistry, not here).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host=cloud-1 = user@cloud-1.example.ts.net : ~/.ghostty-ramon-host.sock",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const items = cfg.@"pty-remote-host".list.items;
+        try testing.expectEqual(@as(usize, 1), items.len);
+        try testing.expectEqualStrings(
+            "cloud-1 = user@cloud-1.example.ts.net : ~/.ghostty-ramon-host.sock",
+            items[0],
+        );
+    }
+
+    // Two entries, order preserved.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host=cloud-1 = user@cloud-1.example.ts.net : ~/.sock",
+            "--pty-remote-host=cloud-2 = user@cloud-2.example.ts.net : ~/.sock",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const items = cfg.@"pty-remote-host".list.items;
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expectEqualStrings("cloud-1 = user@cloud-1.example.ts.net : ~/.sock", items[0]);
+        try testing.expectEqualStrings("cloud-2 = user@cloud-2.example.ts.net : ~/.sock", items[1]);
+    }
+
+    // Empty value resets the list.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host=cloud-1 = user@cloud-1.example.ts.net : ~/.sock",
+            "--pty-remote-host=",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"pty-remote-host".list.items.len,
+        );
+    }
+
+    // C-list view (mirrors `RepeatableString cval`).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host=cloud-1 = a : b",
+            "--pty-remote-host=cloud-2 = c : d",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const cv = cfg.@"pty-remote-host".cval();
+        try testing.expectEqual(@as(usize, 2), cv.len);
+        try testing.expectEqualStrings("cloud-1 = a : b", std.mem.sliceTo(cv.items[0], 0));
+        try testing.expectEqualStrings("cloud-2 = c : d", std.mem.sliceTo(cv.items[1], 0));
+    }
+}
+
+test "pty-remote-ssh-options parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default is null.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expect(cfg.@"pty-remote-ssh-options" == null);
+    }
+
+    // Parses a verbatim options string.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-ssh-options=-J jump.example.ts.net -i ~/.ssh/id_ed25519",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqualStrings(
+            "-J jump.example.ts.net -i ~/.ssh/id_ed25519",
+            cfg.@"pty-remote-ssh-options".?,
         );
     }
 }

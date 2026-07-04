@@ -1,0 +1,232 @@
+import Darwin
+import Foundation
+import Testing
+@testable import Ghostty
+
+/// (ramon fork / cloud-hosts) Tests for the tunnel supervisor's READINESS gate — the
+/// core invariant that "ready" fires ONLY after a full Hello→HelloAck round-trip
+/// (`handshaked == true`), never on a bare `reachable` accept-then-EOF (the `ssh -L`
+/// false-positive of D1). Uses `FakeHostSocket`, a real local unix-socket acceptor that
+/// speaks the actual `HelloAck` wire frame so the REAL B5 export (`ghostty_probe_host`,
+/// via `RemoteTunnelController.probe`) decodes it — no Swift-side codec, no wire drift.
+struct RemoteTunnelControllerTests {
+
+    // MARK: - Probe (direct B5 export exercise)
+
+    @Test func probeDecodesHelloAckVersion() throws {
+        let acceptor = try FakeHostSocket(mode: .handshake(major: 5, minor: 2))
+        defer { acceptor.stop() }
+        let r = RemoteTunnelController.probe(socketPath: acceptor.path, timeoutMs: 1500)
+        #expect(r.reachable)
+        #expect(r.handshaked)
+        #expect(r.major == 5)
+        #expect(r.minor == 2)
+    }
+
+    @Test func probeReachableButNotHandshakedOnAcceptThenClose() throws {
+        // The exact ssh -L accept-then-EOF false-positive: connect succeeds, no ack.
+        let acceptor = try FakeHostSocket(mode: .acceptThenClose)
+        defer { acceptor.stop() }
+        let r = RemoteTunnelController.probe(socketPath: acceptor.path, timeoutMs: 600)
+        #expect(r.reachable)
+        #expect(!r.handshaked)
+    }
+
+    @Test func probeUnreachableWhenNoListener() {
+        let path = NSTemporaryDirectory() + "grt-none-\(UUID().uuidString.prefix(8)).sock"
+        let r = RemoteTunnelController.probe(socketPath: path, timeoutMs: 300)
+        #expect(!r.reachable)
+        #expect(!r.handshaked)
+    }
+
+    // MARK: - Readiness publisher
+
+    @Test func readinessFiresOnlyOnHandshakeAndStashesVersion() async throws {
+        let acceptor = try FakeHostSocket(mode: .handshake(major: 3, minor: 7))
+        defer { acceptor.stop() }
+        let controller = RemoteTunnelController.shared
+        let host = "test-handshake-\(UUID().uuidString.prefix(6))"
+        controller.startProbing(hostName: host, socketPath: acceptor.path, probeTimeoutMs: 1000)
+        defer { controller.stopProbing(hostName: host) }
+
+        let readiness = try await Self.waitForReadiness(controller, host, timeout: 4.0)
+        #expect(readiness.hostName == host)
+        #expect(readiness.socketPath == acceptor.path)
+        #expect(readiness.major == 3)   // stashed host version feeds Phase-2 classify (D1)
+        #expect(readiness.minor == 7)
+    }
+
+    @Test func acceptThenEofNeverFiresReady() async throws {
+        let acceptor = try FakeHostSocket(mode: .acceptThenClose)
+        defer { acceptor.stop() }
+        let controller = RemoteTunnelController.shared
+        let host = "test-eof-\(UUID().uuidString.prefix(6))"
+        controller.startProbing(hostName: host, socketPath: acceptor.path, probeTimeoutMs: 400)
+        defer { controller.stopProbing(hostName: host) }
+
+        // Observe a bounded window; a bare reachable-but-no-ack must NOT become ready.
+        try await Task.sleep(nanoseconds: 1_600_000_000)
+        #expect(controller.currentReadiness(for: host) == nil)
+    }
+
+    // MARK: - Pure helpers
+
+    @Test func backoffIsQuickBurstThenSteadyForever() {
+        #expect(RemoteTunnelController.backoff(forAttempt: 0) == 0.5)
+        #expect(RemoteTunnelController.backoff(forAttempt: 4) == 8)
+        // Past the burst it clamps to the steady cadence (never gives up).
+        #expect(RemoteTunnelController.backoff(forAttempt: 5) == 15)
+        #expect(RemoteTunnelController.backoff(forAttempt: 99) == 15)
+        // Defensive: a negative attempt never goes negative/zero.
+        #expect(RemoteTunnelController.backoff(forAttempt: -1) > 0)
+    }
+
+    @Test func shortHashIsStableEightHex() {
+        let a = RemoteTunnelController.shortHash("cloud-1")
+        let b = RemoteTunnelController.shortHash("cloud-1")
+        let c = RemoteTunnelController.shortHash("cloud-2")
+        #expect(a == b)
+        #expect(a != c)
+        #expect(a.count == 8)
+    }
+
+    @Test func checkSunPathRejectsOverlongPath() {
+        let ok = "/tmp/short.sock"
+        #expect(throws: Never.self) { try RemoteTunnelController.checkSunPath(ok) }
+        let tooLong = "/tmp/" + String(repeating: "x", count: 200) + ".sock"
+        #expect(throws: RemoteTunnelController.TunnelError.self) {
+            try RemoteTunnelController.checkSunPath(tooLong)
+        }
+    }
+
+    @Test func splitsSSHOptionsOnWhitespace() {
+        #expect(RemoteTunnelController.splitSSHOptions(nil).isEmpty)
+        #expect(RemoteTunnelController.splitSSHOptions("").isEmpty)
+        #expect(RemoteTunnelController.splitSSHOptions("-J jump.example.ts.net -i ~/.ssh/id")
+                == ["-J", "jump.example.ts.net", "-i", "~/.ssh/id"])
+    }
+
+    // MARK: - waitForReadiness
+
+    /// Poll the controller's synchronous readiness snapshot until it's set or the timeout
+    /// elapses. Avoids depending on the RunLoop.main delivery in the publisher path — the
+    /// probe loop sets the subject value synchronously off-main.
+    static func waitForReadiness(
+        _ controller: RemoteTunnelController,
+        _ host: String,
+        timeout: TimeInterval
+    ) async throws -> RemoteTunnelController.Readiness {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let r = controller.currentReadiness(for: host) { return r }
+            try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+        }
+        throw ReadinessTimeout()
+    }
+
+    struct ReadinessTimeout: Error {}
+}
+
+// MARK: - FakeHostSocket
+
+/// A minimal local unix-domain acceptor that speaks the REAL `ghostty-host` wire framing
+/// so `ghostty_probe_host` decodes it. `.handshake` writes one framed `HelloAck`;
+/// `.acceptThenClose` accepts then closes with zero bytes (the ssh -L false-positive).
+final class FakeHostSocket {
+    enum Mode {
+        case handshake(major: UInt16, minor: UInt16)
+        case acceptThenClose
+    }
+
+    let path: String
+    private let mode: Mode
+    private var listenFD: Int32 = -1
+    private var thread: Thread?
+    private var stopped = false
+
+    init(mode: Mode) throws {
+        self.mode = mode
+        // Short path under the per-user temp dir (well under sun_path's ~104 bytes).
+        self.path = NSTemporaryDirectory() + "grt-t-\(UUID().uuidString.prefix(8)).sock"
+        try bindAndListen()
+        startAccepting()
+    }
+
+    private func bindAndListen() throws {
+        unlink(path)
+        listenFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard listenFD >= 0 else { throw SocketError.create }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        guard bytes.count < capacity else { throw SocketError.pathTooLong }
+        withUnsafeMutablePointer(to: &addr.sun_path) { tuplePtr in
+            tuplePtr.withMemoryRebound(to: CChar.self, capacity: capacity) { cptr in
+                for (i, b) in bytes.enumerated() { cptr[i] = CChar(bitPattern: b) }
+                cptr[bytes.count] = 0
+            }
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listenFD, $0, size) }
+        }
+        guard rc == 0 else { throw SocketError.bind }
+        guard listen(listenFD, 4) == 0 else { throw SocketError.listen }
+    }
+
+    private func startAccepting() {
+        let t = Thread { [weak self] in
+            guard let self else { return }
+            while !self.stopped {
+                let client = accept(self.listenFD, nil, nil)
+                if client < 0 { break }  // listen fd closed by stop()
+                switch self.mode {
+                case let .handshake(major, minor):
+                    let frame = FakeHostSocket.helloAckFrame(major: major, minor: minor)
+                    frame.withUnsafeBytes { raw in
+                        _ = write(client, raw.baseAddress, raw.count)
+                    }
+                    // Give the write time to flush before we close.
+                    Thread.sleep(forTimeInterval: 0.2)
+                    close(client)
+                case .acceptThenClose:
+                    close(client)  // zero-byte EOF
+                }
+            }
+        }
+        t.stackSize = 1 << 20
+        t.start()
+        thread = t
+    }
+
+    func stop() {
+        stopped = true
+        if listenFD >= 0 {
+            close(listenFD)  // unblocks accept()
+            listenFD = -1
+        }
+        unlink(path)
+    }
+
+    /// Build a framed `HelloAck`: [u32 BE length][tag=1 (hello_ack)][payload]. In-frame
+    /// scalars are LITTLE-endian (protocol.zig `writeInt`): major u16, minor u16,
+    /// host_pid i32, host_start_epoch i64 = 16 payload bytes, length = 17.
+    static func helloAckFrame(major: UInt16, minor: UInt16) -> [UInt8] {
+        var payload: [UInt8] = []
+        payload += withUnsafeBytes(of: major.littleEndian) { Array($0) }        // 2
+        payload += withUnsafeBytes(of: minor.littleEndian) { Array($0) }        // 2
+        payload += withUnsafeBytes(of: Int32(4242).littleEndian) { Array($0) }  // host_pid
+        payload += withUnsafeBytes(of: Int64(1).littleEndian) { Array($0) }     // start epoch
+
+        let len = UInt32(1 + payload.count)  // tag byte + payload
+        var frame: [UInt8] = []
+        frame += withUnsafeBytes(of: len.bigEndian) { Array($0) }  // BE length prefix
+        frame.append(1)  // FrameType.hello_ack == 1
+        frame += payload
+        return frame
+    }
+
+    enum SocketError: Error { case create, bind, listen, pathTooLong }
+}

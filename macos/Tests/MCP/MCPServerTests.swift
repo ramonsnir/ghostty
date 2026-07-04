@@ -467,6 +467,27 @@ struct MCPServerTests {
         #expect((d["sessionID"] as? NSNumber)?.uint64Value == 4242)
         // fork / Agent Manager: hidden is OMITTED when false (not hidden).
         #expect(d["hidden"] == nil)
+        // fork / cloud-hosts (D3): hostName is emitted UNCONDITIONALLY; a row that
+        // did not set it defaults to "local".
+        #expect(d["hostName"] as? String == "local")
+    }
+
+    // fork / cloud-hosts (F1, D3): hostName is emitted next to sessionID — "local"
+    // by default and the registry NAME for a remote surface — while sessionID stays
+    // an NSNumber (the number→"${host}:${id}" string flip is the Phase-4 Q2 pair).
+    @Test func surfacesJSONDataEmitsHostName() {
+        let remote = MCPLayout.SurfaceRow(
+            id: "R1", title: "claude", pwd: "/tmp",
+            window: 0, tab: 0, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 99, hostName: "cloud-1")
+        let d = MCPLayout.surfacesJSONData([remote])[0]
+        #expect(d["hostName"] as? String == "cloud-1")
+        // sessionID wire type is unchanged (still NSNumber) — Phase 1 is additive.
+        #expect((d["sessionID"] as? NSNumber)?.uint64Value == 99)
     }
 
     // fork / Agent Manager: a hidden tile emits `hidden:true` so the summarizer skips it.
@@ -1612,6 +1633,30 @@ struct MCPServerTests {
         #expect(d.docPath == "BELL-ATTENTION.md")
         #expect(d.configKeys.contains("bell-features"))
         #expect(d.configKeys.contains("agent-manager-bell-filter"))
+    }
+
+    // fork / cloud-hosts (MCP-K1): the cloud-hosts FeatureDoc groups the Phase-1 keys
+    // and is enabled once at least one remote host is registered.
+    @Test func featureStatusCloudHostsGate() {
+        // No registry ⇒ disabled, lists the missing key.
+        let off = MCPKnowledge.status("cloud-hosts", pre: pre())
+        #expect(off.enabled == false)
+        #expect(off.requires.contains("pty-remote-host set"))
+        // A registered host ⇒ enabled, no unmet requirements.
+        let on = MCPKnowledge.status(
+            "cloud-hosts",
+            pre: MCPKnowledge.Preconditions(
+                agentDashboard: false, agentManager: false, agentQueue: false,
+                mcpListen: "", mcpToken: "", webMonitorListen: "",
+                projectDirectories: [], nodeResolvable: false, bellFilter: false,
+                remoteHosts: ["cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock"]))
+        #expect(on.enabled == true)
+        #expect(on.requires.isEmpty)
+        // The FeatureDoc exists, points at the design doc, and lists both Phase-1 keys.
+        let doc = MCPKnowledge.featureDoc("cloud-hosts", pre: pre())!
+        #expect(doc.docPath == "CLOUD-HOSTS-DESIGN.md")
+        #expect(doc.configKeys.contains("pty-remote-host"))
+        #expect(doc.configKeys.contains("pty-remote-ssh-options"))
     }
 
     // GUARD (mirrors readersIncludeAllForkOnlyKeys for docs_for_feature): every fork-only

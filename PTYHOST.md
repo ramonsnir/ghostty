@@ -227,6 +227,35 @@ Selected by the fork-only config key **`pty-host = <socket path>`** (consumed in
 `src/Surface.zig` before either backend is constructed): non-null ⇒ `.client`. No
 silent `.exec` fallback (see Goal status).
 
+**Cloud-hosts (Phase 1) — per-surface socket override + `(host, session_id)` identity.**
+The socket is no longer only the GLOBAL `pty-host` scalar: `Surface.init` now resolves it
+via `termio.Client.resolveSocketPath(per_surface_sock, config.@"pty-host")`, where
+`per_surface_sock` comes from the additive `rt_surface.pty_host_socket` field (carried from
+`ghostty_surface_config_s.pty_host_socket` / `apprt.Surface.Options.pty_host_socket`, read
+via `@hasField` so apprts without it compile to "global only"). A per-surface override WINS
+over the global scalar, so a *cloud* split dials a GUI-resolved SSH-forwarded local socket
+while local splits use the global host. A paired additive `host_name` field
+(`ghostty_surface_config_s.host_name` → `apprt.Surface.Options.host_name` → `Client.Config.host_name`,
+duped/freed like `socket_path`) records the **identity label** of the host this surface runs
+on; nil ⇒ the reserved name `local`. Together `(host_name, session_id)` is the reattach/persistence
+key across a GUI restart (the session_id is a RANDOM non-zero u64 minted host-side by
+`allocSessionId`; `0` = "no session"). `Client.Config.reconnect` is declared (default false)
+for the Phase-2 redial state machine but has NO behavior yet.
+
+**Deferred dial for a RESTORED/launched REMOTE surface.** The `.client` connect is single-shot
+(no retry — `connectAndAttach`), so a remote surface must NOT eagerly dial: its SSH tunnel may
+be down at restore time and would blank the pane. Instead the macOS `SurfaceView` resolves the
+host THREE ways (`resolveHost`): nil/`"local"` ⇒ the unchanged eager local dial; a name in the
+`pty-remote-host` registry ⇒ leave `self.surface` nil, stash the deferred-dial inputs, subscribe
+to the tunnel supervisor's readiness signal (a full Hello→HelloAck handshake via `ghostty_probe_host`),
+and run the single `ghostty_surface_new` in `materializeClientSurface` once it handshakes; a name
+NOT in the registry ⇒ an error state (never a local-socket fallback or a spawn). The GUI-lib-only
+`ghostty_probe_host` (backed by `termio.Client.probeHost`, reusing the real `protocol.zig` codec)
+is never compiled into `ghostty-host`. `hostName` is persisted in the surface archive only for a
+non-local surface; `ptyHostSocket` is NOT persisted (re-resolved from `hostName` on restore).
+Full design + wiring: `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md` and the CLAUDE.md
+cloud-hosts summary bullet.
+
 ### The mirror (the central decision)
 
 Under `.client` the renderer's source of truth is a host-supplied

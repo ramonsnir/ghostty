@@ -942,6 +942,69 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `SegmentedPool fuzz` / `SegmentedPool deterministic grow-while-outstanding repro` tests). Callers
   unchanged. **See `PTYHOST.md` → "Write-request pool grow corruption".**
 
+- **Cloud-hosted terminals (Phase 1: multi-host client + registry + launch + identity)**
+  (fork-only, macOS, OFF by default; config `pty-remote-host` / `pty-remote-ssh-options`,
+  actions `new_split_on_host` / `new_tab_on_host`) — lets *some* splits/tabs run their shell
+  on a **remote** `ghostty-host` box, reached over an SSH unix-socket forward (`ssh -L`), mixed
+  with local splits in the same window. The `.client` dials a *local* forwarded socket and is
+  essentially unaware it is remote; SSH is the whole auth/encryption story (no networked host,
+  no new protocol). Reattach is by a stable `(host, session_id)` identity across a GUI restart.
+  **Phase 1 scope = multi-host CLIENT + REGISTRY + LAUNCH + IDENTITY only** (no mid-session
+  redial state machine, no cross-host session namespacing, no Linux `proc_info` arm — those are
+  Phase 2+; see `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md`). Load-bearing gotchas: (1)
+  **the `pty-remote-host` line grammar is parsed ENTIRELY macOS-side** — the Zig key is a
+  `RepeatableString` storing each line verbatim; `RemoteHostRegistry` owns the grammar
+  (`<name> = <ssh-target> : <remote-socket> [ : <local-socket>]`; reserved name `local` = the
+  `pty-host` scalar). (2) **Tunnel readiness is a full Hello→HelloAck round-trip, NOT a bare
+  connect** — a bare `connect()` false-positives with `ssh -L` (accept-then-EOF); the GUI-lib-only
+  `ghostty_probe_host` reuses the REAL wire codec (`termio.Client.probeHost` → `protocol.encodeFrame`
+  + `FrameReader` + `HelloAck.decode`) so it can never drift, and `RemoteTunnelController` fires
+  its readiness signal only on `handshaked==true`. (3) **A restored/launched REMOTE surface DEFERS
+  its `.client` dial** to the tunnel's readiness (the `.client` backend is single-shot / no retry,
+  so eager-dialing a down tunnel would blank the pane) — `SurfaceView.pendingRemoteHost` +
+  `subscribeRemoteReadiness` → `materializeClientSurface` runs the single `ghostty_surface_new`
+  once the tunnel handshakes; a placeholder ("Connecting to <host>…") shows meanwhile. (4)
+  **Host resolution is THREE-WAY** (`resolveHost`): nil/`"local"` ⇒ eager local dial; a name in
+  the registry ⇒ deferred remote dial; a name NOT in the registry ⇒ `.remoteHostUnresolvable`
+  ERROR (NEVER a local-socket fallback or a fresh spawn). (5) `new_split_on_host` needed a NEW
+  apprt action appended LAST (the scalar `.new_split` can't carry a host name), while
+  `new_tab_on_host` REUSES `.new_tab` (additive `host_name` field). An EMPTY host name (the
+  argument-less palette entries) opens the host-picker `RemoteHostPalette`. (6) `hostName` is
+  persisted in the surface archive ONLY for a non-local surface (`shouldPersistHostName`), so
+  local / `.exec` archives stay byte-identical; `ptyHostSocket` is NOT persisted (re-resolved from
+  `hostName` on restore, since the forwarded socket path can change). (7) `MCPLayout` emits a
+  `hostName` on every `list_surfaces` row (default `"local"`), but **`sessionID` stays an
+  `NSNumber`** — the number→`"${host}:${id}"` string flip is the matched Phase-4 (Q2) emit↔parse
+  pair, so the shipping agent-queue reconcile is unaffected. Wiring: core — `src/config/Config.zig`
+  (`pty-remote-host: RepeatableString` + `pty-remote-ssh-options: ?[:0]const u8` + parse tests),
+  `src/termio/Client.zig` (`Config.host_name`/`reconnect`, `resolveSocketPath`, `ProbeResult` +
+  `probeHost`), `src/Surface.zig` (per-surface socket resolution + `new_split_on_host`/
+  `new_tab_on_host` dispatch), `src/apprt/action.zig` (`NewTab.host_name` + new `NewSplitOnHost`),
+  `src/apprt/embedded.zig` (`Surface.Options.pty_host_socket`/`host_name` + `ghostty_probe_host`/
+  `HostProbe`), `include/ghostty.h` (the two surface-config fields + `ghostty_host_probe_s`/
+  `ghostty_probe_host` + `ghostty_action_new_split_on_host_s` + `GHOSTTY_ACTION_NEW_SPLIT_ON_HOST`),
+  `src/input/Binding.zig` + `src/input/command.zig` (the two actions + palette entries). macOS —
+  `Ghostty.Config.swift` (`ptyRemoteHostLines`/`ptyRemoteSshOptions`), new `Features/RemoteHost/`
+  `RemoteHostRegistry.swift` + `RemoteTunnelController.swift`, new `Features/Command Palette/`
+  `RemoteHostPalette.swift`, `Ghostty.App.swift` (`newSplitOnHost`/`newTabOnRemoteHost`/
+  `postRemoteHostSelector`), `GhosttyPackage.swift` (`.ghosttyRemoteHostSelectorDidToggle`),
+  `BaseTerminalController.swift` + `TerminalView.swift` (selector toggle + presentation),
+  `SurfaceView.swift` (`hostName`/`ptyHostSocket` + `withCValue` population + `SurfaceErrorView`/
+  `AwaitingRemoteHostView`), `SurfaceView_AppKit.swift` (`hostName` persist + `resolveHost`/
+  `subscribeRemoteReadiness`/`materializeClientSurface` deferred dial + `hostName` Codable key),
+  `Ghostty.Error.swift` (`.remoteHostUnresolvable`), `MCPLayout.swift` (`SurfaceRow.hostName` +
+  emit), `MCPKnowledge.swift` (`cloud-hosts` FeatureDoc + the two readers), `project.pbxproj` (iOS
+  exclusion of the three new files). Tests: Zig `pty-remote-host`/`pty-remote-ssh-options` parse,
+  `Binding new_split_on_host`, `client probeHost*`/`resolveSocketPath` (`client_difftest.zig`);
+  Swift `RemoteHostRegistryTests`/`RemoteTunnelControllerTests`/`RemoteHostPaletteTests`,
+  `SurfaceViewAppKitTests` (resolveHost/persist), `MCPServerTests` (`hostName` emit +
+  `cloud-hosts` gate). Fork-only — keep `pty-remote-host` / `pty-remote-ssh-options` in
+  `~/.config/ghostty-ramon/config`. **GUI relaunch + a lib/xcframework rebuild (new config keys +
+  the `ghostty_probe_host` / `new_split_on_host` C exports); NO host restart** (the new C exports
+  are never compiled into `ghostty-host`). **See `CLOUD-HOSTS-DESIGN.md` (design/rationale) +
+  `CLOUD-HOSTS-IMPL-PLAN.md` (build-ready spec: Cross-cutting decisions D1–D7, the C-ABI ledger,
+  phase/task breakdown).**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
@@ -949,7 +1012,7 @@ reserves a real grid slot…`). **Cadence — completion-anchored
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-ssh-options`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

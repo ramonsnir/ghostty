@@ -73,6 +73,10 @@ enum MCPKnowledge {
         ("agent-queue-max-total", { String($0.agentQueueMaxTotal) }),
         ("agent-queue-hero-max", { String($0.agentQueueHeroMax) }),
         ("pty-host", { $0.ptyHost ?? "" }),
+        // (ramon fork / cloud-hosts) the remote-host registry + ssh options. The
+        // RepeatableString registry lines join like agent-queue-templates-dir.
+        ("pty-remote-host", { $0.ptyRemoteHostLines.joined(separator: ", ") }),
+        ("pty-remote-ssh-options", { $0.ptyRemoteSshOptions ?? "" }),
         // --- high-signal upstream keys ---
         ("bell-features", { describeBellFeatures($0.bellFeatures) }),
         ("background-opacity", { String($0.backgroundOpacity) }),
@@ -141,6 +145,7 @@ enum MCPKnowledge {
     static let featureIDs = [
         "agent-dashboard", "agent-manager", "agent-queue",
         "web-monitor", "mcp", "project-selector", "splits", "bell",
+        "cloud-hosts",
     ]
 
     /// Static (config-independent) facts about a feature. The live `enabled`/
@@ -234,6 +239,17 @@ enum MCPKnowledge {
                 "Set bell-diagnostics = true to trace decisions to ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl (turn off when done — append-only).",
             ],
             docPath: "BELL-ATTENTION.md"),
+        "cloud-hosts": FeatureSpec(
+            name: "Cloud-hosted terminals",
+            summary: "Mix local and remote (cloud-box) splits in one window. A remote split runs its shell on a ghostty-host on another machine, reached over an SSH-forwarded unix socket, and reattaches by (host, session id) across a GUI restart. Configure named remote hosts in pty-remote-host; new_split_on_host / new_tab_on_host (and the host picker palette) open a split on a chosen host.",
+            configKeys: ["pty-remote-host", "pty-remote-ssh-options"],
+            enableSteps: [
+                "Deploy ghostty-host on the remote box and make it reachable over SSH (see CLOUD-HOSTS-DESIGN.md → Deployment).",
+                "Add one pty-remote-host line per box in ~/.config/ghostty-ramon/config: `pty-remote-host = cloud-1 = user@cloud-1.example.ts.net : ~/.ghostty-ramon-host.sock`.",
+                "Optionally set pty-remote-ssh-options for extra ssh flags applied to every tunnel.",
+                "Relaunch Ghostty, then open a remote split via the host picker (New Split on Host…) or bind new_split_on_host:<name> / new_tab_on_host:<name>.",
+            ],
+            docPath: "CLOUD-HOSTS-DESIGN.md"),
     ]
 
     /// Build the live FeatureDoc for a feature id. `requires`/`enabled` are
@@ -265,6 +281,28 @@ enum MCPKnowledge {
         /// the third sidecar-arming arm alongside agent-manager / agent-queue). Used by the
         /// `bell` feature to report what the loud ATTENTION-tier promotion still needs.
         let bellFilter: Bool
+        /// (ramon fork / cloud-hosts) The configured remote-host registry lines
+        /// (`pty-remote-host`). Non-empty ⇒ the cloud-hosts feature is configured.
+        /// Defaulted so callers/tests that don't care omit it.
+        let remoteHosts: [String]
+
+        init(
+            agentDashboard: Bool, agentManager: Bool, agentQueue: Bool,
+            mcpListen: String, mcpToken: String, webMonitorListen: String,
+            projectDirectories: [String], nodeResolvable: Bool, bellFilter: Bool,
+            remoteHosts: [String] = []
+        ) {
+            self.agentDashboard = agentDashboard
+            self.agentManager = agentManager
+            self.agentQueue = agentQueue
+            self.mcpListen = mcpListen
+            self.mcpToken = mcpToken
+            self.webMonitorListen = webMonitorListen
+            self.projectDirectories = projectDirectories
+            self.nodeResolvable = nodeResolvable
+            self.bellFilter = bellFilter
+            self.remoteHosts = remoteHosts
+        }
 
         static func from(_ c: Ghostty.Config, nodeResolvable: Bool) -> Preconditions {
             Preconditions(
@@ -276,7 +314,8 @@ enum MCPKnowledge {
                 webMonitorListen: c.webMonitorListen,
                 projectDirectories: c.projectDirectories,
                 nodeResolvable: nodeResolvable,
-                bellFilter: c.agentManagerBellFilter)
+                bellFilter: c.agentManagerBellFilter,
+                remoteHosts: c.ptyRemoteHostLines)
         }
     }
 
@@ -335,6 +374,13 @@ enum MCPKnowledge {
                 if !pre.nodeResolvable { req.append("node on PATH (for bell promotion)") }
             }
             return (req, true)
+
+        case "cloud-hosts":
+            // Configured (enabled) once at least one remote host is registered. The
+            // tunnel/ghostty-host deployment is a runtime/box fact documented in
+            // enableSteps, not asserted here (mirrors agent-dashboard's pty-host note).
+            let req = pre.remoteHosts.isEmpty ? ["pty-remote-host set"] : []
+            return (req, !pre.remoteHosts.isEmpty)
 
         default:
             return ([], false)

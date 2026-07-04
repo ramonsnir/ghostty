@@ -1011,6 +1011,35 @@ extension Ghostty {
             return buffer.compactMap { $0.map { String(cString: $0) } }
         }
 
+        // (ramon fork / cloud-hosts) Raw `pty-remote-host` lines, one per configured
+        // remote host, each the VERBATIM value after the config key's first `=` (e.g.
+        // `cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock`). This getter
+        // does NOT parse the line grammar — that is the SOLE responsibility of
+        // `RemoteHostRegistry.parse(line:)`. A byte-for-byte copy of the
+        // `agentQueueTemplatesDirs` / `projectDirectories` `RepeatableString` readers.
+        var ptyRemoteHostLines: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-host"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts) Extra `ssh` options applied to every remote-host
+        // tunnel (verbatim, appended to the supervisor's ssh command line). nil/empty
+        // when unset. A scalar `?[]const u8`, so read like `ptyHost` above.
+        var ptyRemoteSshOptions: String? {
+            guard let config = self.config else { return nil }
+            var v: UnsafePointer<Int8>?
+            let key = "pty-remote-ssh-options"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+            guard let ptr = v else { return nil }
+            let s = String(cString: ptr)
+            return s.isEmpty ? nil : s
+        }
+
         // (ramon fork / Agent Queue Supervisor) Optional global concurrency cap across
         // ALL queue runs (the fleet-wide ceiling). 0 = UNLIMITED (the default).
         //

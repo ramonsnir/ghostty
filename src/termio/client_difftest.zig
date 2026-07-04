@@ -781,6 +781,11 @@ const TestListener = struct {
     capture: ?*std.ArrayList(u8) = null,
     capture_alloc: std.mem.Allocator = undefined,
 
+    /// Optional canned reply the accept thread writes to the connection right
+    /// after accepting (before draining) — a pre-framed HelloAck for the
+    /// `ghostty_probe_host` handshake test. Borrowed; must outlive `joinAccept`.
+    reply: ?[]const u8 = null,
+
     fn init(alloc: std.mem.Allocator) !TestListener {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
@@ -864,6 +869,47 @@ const TestListener = struct {
         // is joined, the listener contributes a STABLE fd count (just
         // listen_fd) to the fd-leak probe — the per-connection fd is a harness
         // artifact, not part of the client lifecycle under test.
+        posix.close(conn);
+    }
+
+    /// (cloud-hosts) Accept ONE connection, write `reply` (a pre-framed
+    /// HelloAck) after draining the client's Hello, then drain until the client
+    /// closes (EOF) and close our side. Backs the `probeHost` handshake test.
+    fn startReplying(self: *TestListener, reply: []const u8) !void {
+        self.reply = reply;
+        self.accept_thread = try std.Thread.spawn(.{}, acceptReply, .{self});
+    }
+
+    fn acceptReply(self: *TestListener) void {
+        const conn = posix.accept(self.listen_fd, null, null, 0) catch return;
+        var buf: [256]u8 = undefined;
+        // Read the client's Hello (one chunk) so the send buffer clears.
+        _ = posix.read(conn, &buf) catch {};
+        if (self.reply) |r| {
+            var written: usize = 0;
+            while (written < r.len) {
+                const n = posix.write(conn, r[written..]) catch break;
+                if (n == 0) break;
+                written += n;
+            }
+        }
+        // Drain until the client closes, then close our side.
+        while (true) {
+            const n = posix.read(conn, &buf) catch break;
+            if (n == 0) break;
+        }
+        posix.close(conn);
+    }
+
+    /// (cloud-hosts) Accept ONE connection then immediately close it (zero
+    /// bytes) so the client sees EOF before any HelloAck. Backs the
+    /// reachable-but-not-handshaked `probeHost` test.
+    fn startAcceptClose(self: *TestListener) !void {
+        self.accept_thread = try std.Thread.spawn(.{}, acceptClose, .{self});
+    }
+
+    fn acceptClose(self: *TestListener) void {
+        const conn = posix.accept(self.listen_fd, null, null, 0) catch return;
         posix.close(conn);
     }
 
@@ -2908,4 +2954,88 @@ test "client Surface.isMirror() is false for the .exec backend arm (Layer 2 FIX 
     surface.io.backend = .{ .exec = undefined };
     try testing.expect(!surface.isMirror());
     try testing.expect(!surface.mirrorChildExitShouldDim());
+}
+
+// (cloud-hosts) ghostty_probe_host / Client.probeHost — a one-shot
+// Hello->HelloAck handshake probe backing the SSH tunnel supervisor's readiness
+// gate. These exercise the REAL probe path (the same code the C export calls),
+// using the TestListener to stand up a fake host socket.
+
+test "client probeHost handshakes and reports the host version" {
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    // A canned HelloAck advertising a specific version, framed with the real
+    // codec, so the probe's FrameReader/HelloAck.decode consume real bytes.
+    const ack = try protocol.encodeFrame(alloc, .hello_ack, protocol.HelloAck{
+        .protocol_version_major = 7,
+        .protocol_version_minor = 9,
+        .host_pid = 1234,
+        .host_start_epoch = 42,
+    });
+    defer alloc.free(ack);
+
+    try listener.startReplying(ack);
+    const r = Client.probeHost(alloc, listener.path, 2000);
+    try testing.expect(r.reachable);
+    try testing.expect(r.handshaked);
+    try testing.expectEqual(@as(u16, 7), r.major);
+    try testing.expectEqual(@as(u16, 9), r.minor);
+}
+
+test "client probeHost reachable but not handshaked on accept-then-close" {
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    // Accept then close with zero bytes: the ssh -L accept-then-EOF false
+    // positive D1 warns about — reachable, but NOT ready.
+    try listener.startAcceptClose();
+    const r = Client.probeHost(alloc, listener.path, 2000);
+    try testing.expect(r.reachable);
+    try testing.expect(!r.handshaked);
+}
+
+test "client probeHost unreachable when nothing listens" {
+    const alloc = testing.allocator;
+
+    // A path in a real tmp dir but with no listener bound => connect() fails.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const path = try std.fmt.allocPrint(alloc, "{s}/nope.sock", .{dir_path});
+    defer alloc.free(path);
+
+    const r = Client.probeHost(alloc, path, 500);
+    try testing.expect(!r.reachable);
+    try testing.expect(!r.handshaked);
+}
+
+// (cloud-hosts) D5 socket resolution: a per-surface socket override takes
+// precedence over the global pty-host scalar (the `orelse` Surface.init uses).
+test "client resolveSocketPath prefers the per-surface socket over the global" {
+    const per: [:0]const u8 = "/tmp/gr-cloud1.sock";
+    const global: [:0]const u8 = "/tmp/ghostty-host.sock";
+
+    // Per-surface override wins over the global scalar.
+    try testing.expectEqualStrings(
+        per,
+        Client.resolveSocketPath(per, global).?,
+    );
+    // No override falls back to the global scalar.
+    try testing.expectEqualStrings(
+        global,
+        Client.resolveSocketPath(null, global).?,
+    );
+    // Neither => null (the .exec path).
+    try testing.expect(Client.resolveSocketPath(null, null) == null);
+    // Per-surface override wins even when the global is unset.
+    try testing.expectEqualStrings(
+        per,
+        Client.resolveSocketPath(per, null).?,
+    );
 }

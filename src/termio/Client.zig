@@ -401,6 +401,24 @@ pub const Config = struct {
     /// `owned_mutex` instead (standalone construction / decode tests). Plumbed
     /// from `Surface.init`; only exercised once Slice 4 selects `.client`.
     render_mutex: ?*std.Thread.Mutex = null,
+
+    /// (ramon fork / cloud-hosts) Identity label of the host this client dials,
+    /// paired with `session_id` for the `(host_name, session_id)` reattach key.
+    /// `null` (the default) ⇒ the reserved name "local" (byte-identical to
+    /// today's single-host behavior). Borrowed for the duration of `init`, which
+    /// DUPES it (when non-null) into Client-owned memory — same lifetime
+    /// reasoning as `socket_path` — so a later reader is UAF-safe; the stored
+    /// copy is freed in `deinit`. Declared now for a stable Config ABI; the
+    /// redial/persistence consumers land in a later phase.
+    host_name: ?[]const u8 = null,
+
+    /// (ramon fork / cloud-hosts) Opt-in mid-session redial. `false` (the
+    /// default) is the byte-identical single-shot connect path; set `true` ONLY
+    /// for a resolved REMOTE host (a `local`/nil host must stay `false` so the
+    /// redial loop never storms the local KeepAlive host). A SCALAR copied by
+    /// value. Declared now for a stable Config ABI; the redial state machine
+    /// that consumes it lands in a later phase (no behavior today).
+    reconnect: bool = false,
 };
 
 /// Forward-map a surface-config host session id (a `u64` carried from the
@@ -413,6 +431,18 @@ pub const Config = struct {
 /// mapping; `Surface.init` calls this when it builds the `.client` config.
 pub fn sessionIdFromConfig(id: u64) ?u64 {
     return if (id == 0) null else id;
+}
+
+/// (ramon fork / cloud-hosts) D5 socket resolution: a per-surface socket
+/// override (a cloud split's GUI-resolved forwarded socket) takes precedence
+/// over the global `pty-host` config scalar. `null` from BOTH ⇒ no `.client`
+/// backend (the `.exec` path). Single source of truth for the `orelse` so
+/// `Surface.init` and its test agree.
+pub fn resolveSocketPath(
+    per_surface: ?[:0]const u8,
+    global: ?[:0]const u8,
+) ?[:0]const u8 {
+    return per_surface orelse global;
 }
 
 /// Initialize the client state. This will NOT connect; it only sets up the
@@ -448,10 +478,20 @@ pub fn init(alloc: Allocator, cfg: Config) !Client {
         null;
     errdefer if (initial_input) |ii| alloc.free(ii);
 
+    // (cloud-hosts) Dupe the optional identity label into Client-owned memory
+    // too (same lifetime reasoning as socket_path — a later reader would UAF a
+    // borrowed slice). `null` stays null (the "local" default).
+    const host_name: ?[]const u8 = if (cfg.host_name) |hn|
+        try alloc.dupe(u8, hn)
+    else
+        null;
+    errdefer if (host_name) |hn| alloc.free(hn);
+
     var owned_cfg = cfg;
     owned_cfg.socket_path = socket_path;
     owned_cfg.working_directory = working_directory;
     owned_cfg.initial_input = initial_input;
+    owned_cfg.host_name = host_name;
 
     return .{
         .gpa = alloc,
@@ -552,6 +592,9 @@ pub fn deinit(self: *Client) void {
     // `config.initial_input` is OWNED when non-null (duped in `init`); free it
     // here. `null` (the no-input default) frees nothing.
     if (self.config.initial_input) |ii| self.gpa.free(ii);
+    // (cloud-hosts) `config.host_name` is OWNED when non-null (duped in `init`);
+    // free it here. `null` (the "local" default) frees nothing.
+    if (self.config.host_name) |hn| self.gpa.free(hn);
 }
 
 /// Call to initialize the terminal state as necessary for this backend.
@@ -1801,6 +1844,85 @@ fn connectUnix(path: []const u8) !posix.fd_t {
     const addr = try std.net.Address.initUnix(path);
     try posix.connect(fd, &addr.any, addr.getOsSockLen());
     return fd;
+}
+
+/// (ramon fork / cloud-hosts) Outcome of a one-shot Hello→HelloAck handshake
+/// probe (see `probeHost`). `major`/`minor` are meaningful ONLY when
+/// `handshaked` is true (the host's advertised protocol version, for the D1
+/// too-old/cannot-handshake classification).
+pub const ProbeResult = struct {
+    reachable: bool = false,
+    handshaked: bool = false,
+    major: u16 = 0,
+    minor: u16 = 0,
+};
+
+/// (ramon fork / cloud-hosts) Perform exactly ONE Hello→HelloAck round-trip
+/// against a `ghostty-host` listening on `path`, bounded by `timeout_ms`, and
+/// report the outcome WITHOUT spawning/attaching a session. This is the
+/// production mechanism behind the SSH tunnel supervisor's readiness gate: a
+/// bare `connect()` is NOT "ready" (the `ssh -L` accept-then-EOF false-positive
+/// D1 warns about) — readiness requires a decoded `HelloAck`.
+///
+/// REUSES the real wire codec (`protocol.encodeFrame` with `Hello` +
+/// `protocol.FrameReader` + `HelloAck.decode`) and `connectUnix`, so the probe
+/// can never drift from the byte layout the live `Client` speaks. Returns:
+///   - `{reachable=false}` when `connectUnix` fails (tunnel/host down).
+///   - `{reachable=true, handshaked=false}` when connected but no `HelloAck`
+///     arrives before EOF or the timeout (ambiguous: starting up / down /
+///     incompatible-major — the host closes without an ack on a major mismatch).
+///   - `{reachable=true, handshaked=true, major, minor}` on a decoded `HelloAck`.
+///
+/// Backs the GUI-lib-only `ghostty_probe_host` C export; it is never referenced
+/// from `ghostty-host` (so it is not codegen'd into that binary).
+pub fn probeHost(alloc: Allocator, path: []const u8, timeout_ms: u32) ProbeResult {
+    const fd = connectUnix(path) catch return .{};
+    defer posix.close(fd);
+    var result: ProbeResult = .{ .reachable = true };
+
+    // Send one Hello frame using the real codec (BE len + tag + payload).
+    const framed = protocol.encodeFrame(alloc, .hello, protocol.Hello{}) catch
+        return result;
+    defer alloc.free(framed);
+    var written: usize = 0;
+    while (written < framed.len) {
+        const n = posix.write(fd, framed[written..]) catch return result;
+        if (n == 0) return result;
+        written += n;
+    }
+
+    // Read framed replies until we decode a HelloAck or hit EOF/timeout.
+    var reader: protocol.FrameReader = .{};
+    defer reader.deinit(alloc);
+    var pollfds = [_]posix.pollfd{
+        .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+    var buf: [512]u8 = undefined;
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) return result; // timeout, !handshaked
+        const remaining: i32 = @intCast(@min(
+            deadline - now,
+            @as(i64, std.math.maxInt(i32)),
+        ));
+        const ready = posix.poll(&pollfds, remaining) catch return result;
+        if (ready == 0) return result; // timeout, !handshaked
+        const n = posix.read(fd, &buf) catch return result;
+        if (n == 0) return result; // EOF before ack, !handshaked
+        reader.push(alloc, buf[0..n]) catch return result;
+        while (reader.next(alloc) catch return result) |frame| {
+            if (frame.tag == .hello_ack) {
+                const ack = protocol.HelloAck.decode(alloc, frame.payload) catch
+                    return result;
+                result.handshaked = true;
+                result.major = ack.protocol_version_major;
+                result.minor = ack.protocol_version_minor;
+                return result;
+            }
+            // Any other pre-attach frame is unexpected; keep reading.
+        }
+    }
 }
 
 // --- read thread ---

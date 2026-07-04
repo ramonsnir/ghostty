@@ -806,8 +806,19 @@ test "client backend selection seam (slice 4)" {
     //      `self.io.backend` (the lifetime-critical part), NOT a pre-move local.
     const surface_src = @embedFile("../Surface.zig");
 
-    // (1) selection keyed off the config key, with both backend arms present.
-    const sel = std.mem.indexOf(u8, surface_src, "if (config.@\"pty-host\")") orelse
+    // (1) selection keyed off the resolved socket, with both backend arms present.
+    // (cloud-hosts D5) The seam now prefers a per-surface forwarded socket (a
+    // cloud split's GUI-resolved forwarded path) over the global `pty-host`
+    // scalar via `termio.Client.resolveSocketPath`, so the selection branch is
+    // `if (sock_opt)` where
+    // `sock_opt = resolveSocketPath(per_surface_sock, config.@"pty-host")`.
+    // Null both => .exec (byte-for-byte-unchanged default); non-null => .client,
+    // so `config.@"pty-host"` is still the today-default source of the decision.
+    const resolve = std.mem.indexOf(u8, surface_src, "termio.Client.resolveSocketPath(") orelse
+        return error.PtyHostSelectionMissing;
+    // The resolution is fed by the global `pty-host` scalar (today's source).
+    try testing.expect(std.mem.indexOfPos(u8, surface_src, resolve, "config.@\"pty-host\"") != null);
+    const sel = std.mem.indexOf(u8, surface_src, "if (sock_opt)") orelse
         return error.PtyHostSelectionMissing;
     const client_init = std.mem.indexOf(u8, surface_src, "termio.Client.init(alloc") orelse
         return error.ClientInitMissing;
@@ -815,7 +826,7 @@ test "client backend selection seam (slice 4)" {
         return error.ExecInitMissing;
 
     // (2) Client.init is in the then-arm and Exec.init is in the else-arm:
-    // both must appear AFTER the `if (config.@"pty-host")`, and Client.init
+    // both must appear AFTER the `if (sock_opt)` selection, and Client.init
     // (then) must precede Exec.init (else). This makes Exec.init — the call
     // that forks the pty child — unreachable when .client is selected.
     try testing.expect(client_init > sel);

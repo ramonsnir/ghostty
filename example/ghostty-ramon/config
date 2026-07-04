@@ -264,6 +264,20 @@ bell-diagnostics = true
 # so substitute your own home for the placeholder below.
 pty-host = /Users/you/.ghostty-ramon-host.sock
 
+# --- Cloud-hosted terminals (fork-only, Phase 1) -----------------------------
+# Run SOME splits/tabs on a REMOTE ghostty-host box, reached over an SSH
+# unix-socket forward, mixed with local splits in the same window. Repeatable —
+# one line per named host. Grammar (parsed macOS-side by RemoteHostRegistry):
+#   pty-remote-host = <name> = <ssh-target> : <remote-socket> [ : <local-socket>]
+# The reserved name `local` always means the pty-host scalar above. Open a
+# remote split via the "New Split on Host…" command palette entry (host picker),
+# or bind new_split_on_host:<name> / new_tab_on_host:<name>. See
+# CLOUD-HOSTS-DESIGN.md. Commented — set up a box first (untracked in `local`
+# if the ssh target is machine-specific).
+# pty-remote-host = cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock
+# Extra ssh flags applied to every tunnel (jump host, identity file, port, …):
+# pty-remote-ssh-options = -J jump.example.ts.net -i ~/.ssh/id_ed25519
+
 # --- Web monitor (fork-only) -------------------------------------------------
 # GUI-embedded HTTP server: watch/drive splits from a phone over Tailscale.
 # Full notes in WEB-MONITOR.md (repo root). Read at LAUNCH — relaunch the app

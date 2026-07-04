@@ -618,6 +618,20 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Open the fork's GitHub new-issue page in your browser.",
         }},
 
+        // Bare (picker) form: an empty host name signals the macOS handler to
+        // open the remote-host picker (mirrors start_agent_queue's bare form).
+        .new_split_on_host => comptime &.{.{
+            .action = .{ .new_split_on_host = "" },
+            .title = "New Split on Host…",
+            .description = "Open a new split running on a remote ghostty-host box.",
+        }},
+
+        .new_tab_on_host => comptime &.{.{
+            .action = .{ .new_tab_on_host = "" },
+            .title = "New Tab on Host…",
+            .description = "Open a new tab running on a remote ghostty-host box.",
+        }},
+
         .merge_tabs => comptime &.{
             .{
                 .action = .{ .merge_tabs = .next_horizontal },

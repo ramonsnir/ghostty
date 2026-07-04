@@ -238,6 +238,33 @@ extension Ghostty {
         /// backend) or for surfaces restored from pre-2b (v5/v7) archives.
         private(set) var sessionID: String?
 
+        /// (ramon fork / cloud-hosts) The identity label (`pty-remote-host`
+        /// registry key) of the host this surface is bound to. nil / `"local"`
+        /// ⇒ the local `pty-host` scalar. Captured from the base config at init
+        /// and persisted via the `hostName` Codable key so the `(host, sessionID)`
+        /// pair survives a GUI restart (D3). On restore it is resolved back to a
+        /// forwarded socket via the registry (D4) — see `resolveHost`.
+        private(set) var hostName: String?
+
+        /// (ramon fork / cloud-hosts) When non-nil, this surface is a RESTORED or
+        /// launched remote-host `.client` whose first dial is DEFERRED to the
+        /// tunnel supervisor's readiness signal (E2): `self.surface` is
+        /// intentionally nil until `materializeClientSurface` fires. Drives the
+        /// interim "awaiting tunnel" placeholder (§564-566). @Published so the
+        /// SwiftUI wrapper re-renders when the placeholder should appear/vanish.
+        @Published private(set) var pendingRemoteHost: String?
+
+        /// (ramon fork / cloud-hosts) The readiness subscription for a
+        /// `pendingRemoteHost` surface. Held until `materializeClientSurface`
+        /// (or deinit) so the deferred dial fires exactly once.
+        private var remoteReadinessCancellable: AnyCancellable?
+
+        /// (ramon fork / cloud-hosts) Captured inputs for the DEFERRED
+        /// `ghostty_surface_new` of a remote-host surface (E2). Held until the
+        /// tunnel handshakes, then consumed once in `materializeClientSurface`.
+        private var pendingRemoteApp: ghostty_app_t?
+        private var pendingRemoteConfig: SurfaceConfiguration?
+
         // Notification identifiers associated with this surface
         var notificationIdentifiers: Set<String> = []
 
@@ -450,6 +477,36 @@ extension Ghostty {
             // config carried one in.
             self.sessionID = surface_cfg.sessionID
 
+            // (ramon fork / cloud-hosts) Remember the host identity so it
+            // round-trips through restorable state paired with `sessionID` (D3).
+            self.hostName = surface_cfg.hostName
+
+            // (ramon fork / cloud-hosts) Three-way host resolution (D4). A surface
+            // bound to a REMOTE host must NOT eagerly single-shot dial: the SSH
+            // tunnel may be down at restore time, and the `.client` backend does
+            // not retry (the App-Nap / single-shot-connect hazard). Instead defer
+            // the dial to the tunnel supervisor's readiness signal (E2). A local
+            // surface (nil / "local") takes the unchanged eager path below.
+            switch Self.resolveHost(surface_cfg.hostName, registry: Self.remoteHostRegistry()) {
+            case .local:
+                break // fall through to the eager dial below (byte-identical)
+
+            case .remote(let entry):
+                // Defer: leave self.surface == nil, stash the deferred-dial inputs,
+                // and await readiness. `materializeClientSurface` runs the single
+                // `ghostty_surface_new` once the tunnel handshakes.
+                self.pendingRemoteApp = app
+                self.pendingRemoteConfig = surface_cfg
+                self.pendingRemoteHost = entry.name
+                self.subscribeRemoteReadiness(host: entry)
+                return
+
+            case .unresolvable(let name):
+                // Never a local-socket fallback and never a spawn (D4).
+                self.error = Ghostty.Error.remoteHostUnresolvable(name)
+                return
+            }
+
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }
@@ -464,6 +521,95 @@ extension Ghostty {
 
             // The UTTypes that can be dragged onto this view.
             registerForDraggedTypes(Array(Self.dropTypes))
+        }
+
+        // MARK: - (ramon fork / cloud-hosts) Remote-host deferred dial (E2)
+
+        /// The three-way host resolution (D4) — the PURE, testable core. `nil` or
+        /// the reserved `"local"` (case-insensitive) ⇒ `.local` (eager local
+        /// dial). A present name found in `registry` ⇒ `.remote` (deferred dial to
+        /// that host's forwarded socket). A present name NOT in `registry` ⇒
+        /// `.unresolvable` (the error state — NEVER a local dial or a spawn).
+        enum HostResolution: Equatable {
+            case local
+            case remote(RemoteHostEntry)
+            case unresolvable(String)
+        }
+
+        static func resolveHost(
+            _ hostName: String?,
+            registry: [String: RemoteHostEntry]
+        ) -> HostResolution {
+            guard let name = hostName, !name.isEmpty else { return .local }
+            if name.lowercased() == "local" { return .local }
+            if let entry = registry[name] { return .remote(entry) }
+            return .unresolvable(name)
+        }
+
+        /// Whether a `hostName` should be PERSISTED in the surface archive. Only a
+        /// real (non-local) host is persisted, so existing local / `.exec`
+        /// archives stay byte-identical (E1). PURE + testable; the encode gate
+        /// below is the sole caller.
+        static func shouldPersistHostName(_ hostName: String?) -> Bool {
+            guard let name = hostName, !name.isEmpty else { return false }
+            return name.lowercased() != "local"
+        }
+
+        /// Build the current `pty-remote-host` registry from the live app config.
+        /// Impure (reads the global config); the pure decision is `resolveHost`.
+        private static func remoteHostRegistry() -> [String: RemoteHostEntry] {
+            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return [:] }
+            return RemoteHostRegistry.parse(lines: appDelegate.ghostty.config.ptyRemoteHostLines)
+        }
+
+        /// Bring the tunnel for `host` up on demand and subscribe to its readiness.
+        /// The publisher replays to a late subscriber, so if the tunnel already
+        /// handshaked (another surface for the same host) we materialize at once.
+        @MainActor
+        private func subscribeRemoteReadiness(host: RemoteHostEntry) {
+            let sshOptions = (NSApplication.shared.delegate as? AppDelegate)?
+                .ghostty.config.ptyRemoteSshOptions
+            RemoteTunnelController.shared.ensureTunnel(host: host, sshOptions: sshOptions)
+            remoteReadinessCancellable = RemoteTunnelController.shared
+                .readinessPublisher(for: host.name)
+                .sink { [weak self] readiness in
+                    self?.materializeClientSurface(socketPath: readiness.socketPath)
+                }
+        }
+
+        /// Perform the DEFERRED `ghostty_surface_new` for a remote-host surface
+        /// once its tunnel has handshaked (E2). Idempotent: guarded on the surface
+        /// still being un-materialized and still pending, so a replayed / repeated
+        /// readiness emit is a no-op. Mirrors the eager designated-init body.
+        @MainActor
+        private func materializeClientSurface(socketPath: String) {
+            guard self.surface == nil,
+                  self.pendingRemoteHost != nil,
+                  let app = self.pendingRemoteApp,
+                  var cfg = self.pendingRemoteConfig else { return }
+
+            cfg.ptyHostSocket = socketPath
+            let surface = cfg.withCValue(view: self) { surface_cfg_c in
+                ghostty_surface_new(app, &surface_cfg_c)
+            }
+            guard let surface = surface else {
+                self.error = Ghostty.Error.apiFailed
+                self.clearPendingRemoteState()
+                return
+            }
+            self.surfaceModel = Ghostty.Surface(cSurface: surface)
+            self.clearPendingRemoteState()
+
+            // Complete the deferred view setup the eager path did inline.
+            updateTrackingAreas()
+            registerForDraggedTypes(Array(Self.dropTypes))
+        }
+
+        private func clearPendingRemoteState() {
+            self.pendingRemoteHost = nil
+            self.remoteReadinessCancellable = nil
+            self.pendingRemoteApp = nil
+            self.pendingRemoteConfig = nil
         }
 
         required init?(coder: NSCoder) {
@@ -2119,6 +2265,10 @@ extension Ghostty {
             case title
             case isUserSetTitle
             case sessionID
+            // (ramon fork / cloud-hosts) The host identity paired with sessionID
+            // (D3). Emitted ONLY for a non-local surface, so existing local /
+            // `.exec` archives stay byte-identical.
+            case hostName
             // (ramon fork) Persist the bell / attention indicators so they
             // survive a GUI restart-for-a-new-build instead of silently
             // vanishing. They ride the same window-state archive that already
@@ -2149,6 +2299,11 @@ extension Ghostty {
             // reads nil there and we fall back to a fresh spawn — today's
             // layout-only restore.
             config.sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+
+            // (ramon fork / cloud-hosts) Carry the host identity so the restored
+            // surface re-resolves its forwarded socket via the registry (D4).
+            // Absent in local / `.exec` / pre-cloud archives ⇒ nil ⇒ local.
+            config.hostName = try container.decodeIfPresent(String.self, forKey: .hostName)
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -2193,6 +2348,14 @@ extension Ghostty {
                 return id != 0 ? String(id) : nil
             }
             try container.encodeIfPresent(liveSessionID ?? sessionID, forKey: .sessionID)
+
+            // (ramon fork / cloud-hosts) Persist the host identity ONLY for a
+            // non-local surface so the `(host, sessionID)` pair can be re-resolved
+            // on restore (D3/D4). A nil / "local" hostName is omitted, keeping
+            // existing local / `.exec` archives byte-for-byte unchanged.
+            if Self.shouldPersistHostName(hostName), let hostName {
+                try container.encode(hostName, forKey: .hostName)
+            }
 
             // (ramon fork) Persist the bell / attention indicators so they
             // survive a GUI restart (see CodingKeys + init(from:)). Only

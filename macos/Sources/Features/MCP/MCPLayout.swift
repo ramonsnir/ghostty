@@ -107,6 +107,16 @@ enum MCPLayout {
         /// pty-host) — the supervisor self-disables on a 0 here. A PLAIN integer —
         /// emitted UNCONDITIONALLY in JSON (the sidecar reads it every sweep).
         let sessionID: UInt64
+        /// (ramon fork / cloud-hosts, D3) The identity of the host this surface's
+        /// session lives on — the `pty-remote-host` registry NAME, or `"local"` for
+        /// the in-process / KeepAlive host (absent/nil `SurfaceView.hostName` ⇒
+        /// `"local"`). Paired with `sessionID`, it forms the `(host, session_id)`
+        /// key the GUI + sidecar use to disambiguate sessions aggregated across
+        /// multiple hosts. PURELY ADDITIVE in Phase 1 — nothing reads it back off
+        /// the row until Phase 4 (Q2/Q3); `sessionID` stays an `NSNumber` here.
+        /// `var` with a default so the (separate) WebMonitor SurfaceRow + test
+        /// constructors are unaffected, matching the queue-tag fields below.
+        var hostName: String = "local"
         /// fork / Agent Queue (adopt): the queue tags from this surface's annotation,
         /// echoed so the supervisor's reconcile orphan-adoption can fold an ADOPTED
         /// split into `run.active` (it keys off `queueName`/`queueKey` read back from
@@ -199,6 +209,7 @@ enum MCPLayout {
                     agentKind: hook?.agentKind,
                     hidden: hook?.hidden ?? false,
                     sessionID: sessionID,
+                    hostName: view.hostName ?? "local",
                     queueKey: hook?.queueKey,
                     queueName: hook?.queueName,
                     queueUrl: hook?.queueUrl,
@@ -244,6 +255,11 @@ enum MCPLayout {
             // off list rows and "sessionId" off the spawn result); keep them in sync if
             // either key is renamed.
             d["sessionID"] = NSNumber(value: $0.sessionID)
+            // fork / cloud-hosts (D3): the host identity paired with sessionID. Emit
+            // UNCONDITIONALLY (like sessionID) — a plain String, "local" by default.
+            // Purely additive in Phase 1; sessionID stays an NSNumber (its number→
+            // "${host}:${id}" string flip is the matched Phase-4 Q2 emit↔parse pair).
+            d["hostName"] = $0.hostName
             // fork / Agent Queue (adopt): echo the queue tags so the supervisor's
             // reconcile can fold an adopted surface into run.active. Omit when nil
             // (honest absence — a non-queue surface carries no tags).

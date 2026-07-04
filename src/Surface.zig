@@ -680,7 +680,28 @@ pub fn init(
         // the top of this fn). That shared mutex is threaded through
         // `Client.Config.render_mutex` here, so `renderMutex()` resolves to the
         // renderer-state mutex (no separate `setRenderMutex` call needed).
-        const backend: termio.Backend = if (config.@"pty-host") |sock| backend: {
+        // (cloud-hosts) Prefer a PER-SURFACE socket override (a cloud split
+        // dials a GUI-resolved forwarded socket) over the global `pty-host`
+        // scalar. Read defensively via @hasField so apprts without the field
+        // compile to "global only" (byte-identical to today when unset). D5:
+        // `const sock = options.pty_host_socket orelse config.@"pty-host"`.
+        const per_surface_sock: ?[:0]const u8 = if (@hasField(
+            @TypeOf(rt_surface.*),
+            "pty_host_socket",
+        )) rt_surface.pty_host_socket else null;
+        const sock_opt: ?[:0]const u8 = termio.Client.resolveSocketPath(
+            per_surface_sock,
+            config.@"pty-host",
+        );
+        const backend: termio.Backend = if (sock_opt) |sock| backend: {
+            // (cloud-hosts) Identity label of the host this surface runs on,
+            // paired with `session_id` for the `(host_name, session_id)` key.
+            // Read defensively via @hasField (same pattern as session_id) so
+            // apprts without the field compile to null ⇒ "local".
+            const req_host_name: ?[]const u8 = if (@hasField(
+                @TypeOf(rt_surface.*),
+                "host_name",
+            )) rt_surface.host_name else null;
             // Forward-map the surface-config session id (carried on the
             // apprt surface from `Options.session_id`) into the Client's
             // Attach: 0 => null (spawn a FRESH host session, today's
@@ -708,6 +729,10 @@ pub fn init(
                 .render_mutex = mutex,
                 .session_id = termio.Client.sessionIdFromConfig(req_session_id),
                 .role = client_role,
+                // (cloud-hosts) Identity label for the `(host_name, session_id)`
+                // pair. Client.init DUPES it, so the borrowed slice need not
+                // outlive this call. `null` ⇒ "local" (today's behavior).
+                .host_name = req_host_name,
                 // SLICE 11 (cwd-inherit): pass the SAME working-directory the
                 // `.exec` arm passes to `Exec.init` below (line ~718). The GUI
                 // already computes the new tab's cwd into
@@ -6033,6 +6058,20 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             );
         },
 
+        .new_tab_on_host => |name| {
+            // (cloud-hosts) Open a new tab on a REMOTE ghostty-host box. The
+            // whole value is the `pty-remote-host` registry NAME; the macOS
+            // handler resolves it to a forwarded socket and threads it onto the
+            // new tab's SurfaceConfiguration. REUSES the .new_tab apprt action.
+            const host: [:0]const u8 = try self.alloc.dupeZ(u8, name);
+            defer self.alloc.free(host);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                .{ .host_name = host },
+            );
+        },
+
         .close_tab => |v| return try self.rt_app.performAction(
             .{ .surface = self },
             .close_tab,
@@ -6079,6 +6118,27 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     .down,
             },
         ),
+
+        .new_split_on_host => |name| {
+            // (cloud-hosts) Open a new split on a REMOTE ghostty-host box. The
+            // value is the `pty-remote-host` registry NAME; the direction is
+            // resolved from the surface aspect (like `new_split:auto`) and the
+            // macOS handler resolves the name to a forwarded socket + threads it
+            // onto the new split's SurfaceConfiguration.
+            const host: [:0]const u8 = try self.alloc.dupeZ(u8, name);
+            defer self.alloc.free(host);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_split_on_host,
+                .{
+                    .direction = if (self.size.screen.width > self.size.screen.height)
+                        .right
+                    else
+                        .down,
+                    .host_name = host,
+                },
+            );
+        },
 
         .goto_split => |direction| return try self.rt_app.performAction(
             .{ .surface = self },
