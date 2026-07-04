@@ -68,9 +68,13 @@ change.
 
 - Two termio backends (`src/termio/backend.zig`): `.exec` (in-process `Terminal`, upstream,
   unchanged) and `.client` (`src/termio/Client.zig`, proxies to the host). The backend is
-  selected in `src/Surface.zig` (`Surface.init`, ~`Surface.zig:667`): `if (config.@"pty-host")
-  |sock|` build `.client`, else `.exec`. Non-null `pty-host` ⇒ `.client`, with **no silent
-  `.exec` fallback** (`PTYHOST.md` "Connect failure").
+  selected in `src/Surface.zig` (`Surface.init`) at **`Surface.zig:683`** — `const backend:
+  termio.Backend = if (config.@"pty-host") |sock| backend: {` (line `:667` is the "SLICE 4
+  (backend selection)" comment, not the `if`). Non-null `pty-host` ⇒ `.client` (the arm at
+  `:683` uses `try`, so a connect/attach failure propagates), else `.exec` — **no silent
+  `.exec` fallback** (`PTYHOST.md` "Connect failure"). **⚠️ The socket comes from the GLOBAL
+  scalar `config.@"pty-host"` (`.socket_path = sock` at `:683`/`:707`) — there is NO per-surface
+  socket path today; adding one is load-bearing for multi-host (see Wiring / the plan's §D5).
 
 - The socket is `AF_UNIX` `SOCK_STREAM`. `Client.connectUnix` (`src/termio/Client.zig:1793`)
   is exactly:
@@ -91,9 +95,18 @@ This is the load-bearing constraint for the reconnect subsystem. Confirmed:
 - `connectAndAttach` (`Client.zig:653`) calls `connectUnix` once (`Client.zig:661`); on any
   error it unwinds via errdefers and returns the error — there is **no loop, no backoff, no
   re-dial**.
-- The read thread `ReadThread.threadMainPosix` (`Client.zig:1813`) polls the socket; on EOF or
-  read error it tears down the read thread and (for `.attach`) the surface shows an error — it
-  does **not** reconnect.
+- The read thread `ReadThread.threadMainPosix` (`Client.zig:1813`) polls the socket; it does
+  **not** reconnect. **⚠️ Corrected behavior (the design originally overstated the `.attach`
+  teardown):** on a read **error** the `.attach` role `return`s/tears down (`:1856-1868`) but
+  pushes **NO** surface message; on a clean **EOF (n==0)** the `.attach` role just `break`s the
+  inner loop and re-polls (`:1870-1877`), and because the outer `poll()` uses timeout `-1` and
+  checks only the quit pipe `pollfds[1]` (`:1925`) — never the socket's `POLLHUP` — a
+  peer-closed socket **busy-loops** (read 0 → break → poll returns immediately → read 0 …). All
+  session-gone signalling (synthetic `child_exited` via `markMirrorEnded`, `Client.zig:1085`) is
+  **`is_mirror`-gated** (`:1849,1860,1866,1874,…`), so "the surface shows an error" is a
+  **mirror-only** behavior — a `.attach` transport drop surfaces nothing today. Phase 2 must add
+  explicit `.attach` EOF/`POLLHUP`/error teardown + a named surface state before any redial loop
+  can hook it.
 - `CLAUDE.md` ("App Nap opt-out") documents the rationale explicitly: *"the host connection is
   opened from per-surface IO threads at surface creation and is single-shot (no retry — see
   `src/termio/Client.zig` `connectAndAttach`)"*, and that a reconnect was **deliberately
@@ -404,7 +417,8 @@ single-shot (the KeepAlive LaunchAgent assumption is still valid locally — do 
 
 While redialing, draw a **reconnecting overlay** on the split (frozen last frame dimmed + a
 "Reconnecting to cloud-1…" banner), reusing the mirror-ended/dimming machinery
-(`markMirrorEnded`, `Client.zig:1066`). Distinguish three terminal states visibly:
+(`markMirrorEnded`, declared at `Client.zig:1085`; the self-locking wrapper delegates to
+`markMirrorEndedLocked` at `:1052`). Distinguish three terminal states visibly:
 "reconnecting" (transient), "session ended" (child exited / unknown id after host restart),
 and "host unreachable / version mismatch" (loud error, see fleet versioning).
 
@@ -565,15 +579,22 @@ instead of launchd.
   it links the core `src/` emulator, not the macOS app. Ghostty targets Linux, so the host
   cross-compiles/builds on Linux with the same `zig build -Demit-macos-app=false
   -Doptimize=ReleaseFast` invocation, producing `zig-out/bin/ghostty-host`.
-- **The one portability caveat to verify/port:** the foreground-process resolution path
-  (`process_info` / `foreground_pid` frames) uses **macOS `libproc` / `sysctl(KERN_PROCARGS2)`**
-  (verified: comments at `src/host/protocol.zig:215`, `src/host/Session.zig:432,1758`,
-  `src/host/Server.zig:1647,2490`). On Linux this needs a `/proc`-based equivalent
-  (`/proc/<pid>/comm`, `/proc/<pid>/cmdline`, `tcgetpgrp` for the foreground pgid — `tcgetpgrp`
-  itself is portable). This is a **real host code change for full agent-detection on cloud
-  boxes**; a dumb-terminal cloud split (Phase 1) does not need it (those frames are
-  minor-gated and simply absent). Flag: confirm no other macOS-only syscall is on the host's
-  hot path before shipping a Linux host.
+- **The one portability caveat (narrowed by verification):** ONLY the `process_info` frame
+  (name + command) is macOS-only — it resolves via `src/os/proc_info.zig` `resolve()` (`:118`,
+  comptime-null off-Darwin) using `libproc` `proc_name` + `sysctl(KERN_PROCARGS2)` +
+  `proc_listchildpids`. The **`foreground_pid` frame ALREADY works on Linux** (its pid comes
+  from `tcgetpgrp`, which has a working Linux branch at `pty.zig:274-282`). So a Linux host
+  emits correct `foreground_pid` out of the box; only the human-facing name/command is blank
+  until `proc_info.zig` gains a `.linux` arm (`/proc/<pid>/comm`, `/proc/<pid>/cmdline`, plus a
+  `/proc`-PPID descent to replace `proc_listchildpids` so classification finds the agent under
+  the `bash`/`claude-pool` wrapper, not the wrapper). This is a **real host code change for full
+  agent NAME classification**, needed only for Phase 4 cloud agents — a dumb-terminal cloud
+  split (Phases 0–2) does not need it. **Audited clean (no other macOS-only host-hot-path
+  syscall):** PTY (`pty.zig` openpty/termios/TIOCSCTTY + `.linux` branches), spawn
+  (`Command.zig:372-410,189` `.linux` dup3 + `fork`), event loop (`xev.Dynamic` →
+  io_uring/epoll, `global.zig:17,123`), and SIGPIPE (globally ignored for all POSIX at
+  `global.zig:215`, reached via `main_host.zig:27`, so a dropped forwarded socket won't kill the
+  host). `build.zig:97-99` confirms `ghostty-host` builds natively on Linux.
 - The socket-forwarding transport itself needs **no host change** — the host already listens on
   a Unix socket regardless of platform.
 
@@ -768,3 +789,50 @@ Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend t
 8. **Sudden multi-host id collision** — two hosts *can* mint the same random u64. `(host,
    session_id)` disambiguates for reattach, but any place that ever keys on the bare u64 across
    hosts (audit `MCPLayout`, the sidecar store) must be found and switched to the pair.
+
+---
+
+## Verification log (corrections applied)
+
+An independent citation-verification + adversarial-review pass ran against HEAD. This design
+doc is a **design doc**; the build-ready spec (with all resolutions/mitigations folded in) is
+**`CLOUD-HOSTS-IMPL-PLAN.md`**. Corrections applied to THIS doc so it no longer carries wrong
+facts:
+
+- **Backend selection line:** the `if (config.@"pty-host") |sock|` is at `Surface.zig:683`, not
+  `~:667` (`:667` is the "SLICE 4 (backend selection)" comment). Behavior (`.client` via `try`,
+  no `.exec` fallback) was correct. Also flagged: the socket is the GLOBAL scalar — no
+  per-surface socket exists today (see plan §D5).
+- **`.attach` EOF behavior:** the doc claimed a `.attach` EOF "tears down the read thread and the
+  surface shows an error." Corrected: on EOF the `.attach` role `break`s and re-polls (busy-loops,
+  no `POLLHUP` check); on read error it returns but pushes NO surface message; all session-gone
+  signalling is `is_mirror`-gated. So the reconnect-UX work must ADD `.attach` teardown +
+  signalling from scratch (plan Phase 2, task G).
+- **`markMirrorEnded` line:** declared at `Client.zig:1085` (self-locking wrapper → `:1052`
+  `markMirrorEndedLocked`), not `:1066` (that's inside the doc-comment).
+- **Linux portability:** `foreground_pid` ALREADY works on Linux (`pty.zig:274-282` `tcgetpgrp`);
+  only `process_info` (name/command, `src/os/proc_info.zig` `resolve()`) is macOS-only. PTY /
+  spawn / xev-Dynamic / SIGPIPE audited clean; the doc's `process_info`↔`foreground_pid` coupling
+  was corrected.
+- **Stale in-tree comment (not a doc error, but noted):** `include/ghostty.h:497-499` says host
+  session ids "start at 1"; `allocSessionId` (`Server.zig:1853`) actually mints RANDOM non-zero
+  u64. The plan fixes the header comment while touching it.
+
+Open-question dispositions (full rationale + `planImpact` in the plan): OQ1 → RepeatableString
+`pty-remote-host`, Swift-side grammar, no new C API. OQ2 → GUI reads/validates HelloAck now
+(no host change); a MAJOR mismatch is an AMBIGUOUS retryable "cannot handshake" state (never an
+inferred "too old"); `hello_nack` deferred to a scheduled MINOR bump. OQ3 → per-queue `host`
+(provider laptop-side, agent cloud-side). OQ4 → BOTH `pty-remote-project-directory` bases + cached
+`ssh find` over the ControlMaster. OQ5 → Phases 0–2 ship with ZERO host changes; only
+`proc_info.zig` needs a Linux arm (Phase 4). OQ6 → per-box billing, docs-only (`get_haiku_usage`
+never tracked work-agent spend). OQ7 → `poll()` on the read thread's quit self-pipe (Darwin has no
+eventfd), settled. OQ8 → namespace by host LAPTOP-SIDE only (no protocol change); exhaustive site
+list (incl. the dashboard `AgentStateStore`/`manualOrder` stores, `AgentPreviewTile` `.id`/dial,
+and WebMonitor `routeStream` the original note missed) is in the plan (§D3, tasks Q3–Q4).
+
+Adversarial-review blockers folded into the plan (§Cross-cutting decisions): tunnel-readiness
+must be a full Hello→HelloAck round-trip (not a bare connect, which false-positives with
+`ssh -L`); the redial must be an IO-thread state machine (the write path is IO-thread-owned);
+three-way host resolution (unresolvable ≠ local fallback); do NOT ship the master `mcp-token` to
+boxes (per-box capability-scoped token via a 0600 file) and correlate agents via a GUI-minted
+nonce (session_id is unknown at spawn time).
