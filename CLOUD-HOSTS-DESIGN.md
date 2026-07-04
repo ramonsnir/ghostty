@@ -1,0 +1,770 @@
+# Cloud-hosted terminals — some splits run on a remote host over SSH
+
+Status: **DESIGN / PROPOSAL — not yet implemented.** No code has been written for this
+feature. This document is written to be handed to a fresh implementing session; it is
+grounded in the code at HEAD (citations are `file:symbol` / `file:line`), and every claim
+about *current* behavior was verified against the source unless explicitly marked
+"unverified".
+
+---
+
+## Summary / motivation
+
+This fork already runs terminal **emulation on a separate host process** (`ghostty-host`).
+The macOS GUI is a thin **`.client`** that connects to the host over an `AF_UNIX` socket and
+attaches to RAM-only sessions by `session_id`; a session (live shell + children + screen
+state) survives a GUI restart because the host outlives it. See `PTYHOST.md`.
+
+Today there is exactly **one** host — a local launchd LaunchAgent — and its socket path is a
+single config scalar `pty-host` (`src/config/Config.zig:3045`).
+
+**Goal:** let *some* splits run their shell on a **remote** host (a cloud Linux box) for more
+RAM/CPU/GPU and to keep running while the laptop sleeps/hibernates, mixed seamlessly with
+local splits **in the same GUI window**. The user has worked in cloud VMs over SSH for years
+and wants a cloud split to feel exactly like that: authoritative remote output, plain-SSH
+latency, reconnect across sleep — but rendered as a native Ghostty split, with the fork's
+agent ecosystem (dashboard / queue / manager) working across hosts.
+
+The enabling insight: because the GUI already talks to the host over a **local Unix socket**,
+we do not need a networked host or a new auth protocol. We **forward the remote host's
+existing Unix socket to the laptop over SSH** (`ssh -L localsock:remotesock`), so the `.client`
+dials a *local* forwarded socket and is essentially unaware it is remote. SSH provides auth,
+encryption, and a TCP_NODELAY transport; the host keeps its Unix socket and needs (almost) no
+change.
+
+---
+
+## Goals
+
+- Launch a split whose shell runs on a chosen remote host, rendered natively alongside local
+  splits in the same window/tab.
+- Latency **equal to plain SSH** to that box (no worse). Authoritative remote output, no local
+  echo.
+- Reattach a cloud split across GUI restart **and** across transport drops (sleep, WiFi roam,
+  Tailscale reconnect) by a stable `(host, session_id)` identity.
+- The agent ecosystem (Agent Dashboard / Queue / Manager / MCP) works for agents running on a
+  cloud box.
+- Version-mismatch and connect failures are **loud and diagnosable**, never a silent blank
+  pane.
+
+## Non-goals (explicit)
+
+- **Predictive/local echo (mosh-style).** Out of scope. The host is authoritative; latency is
+  plain-SSH. Do not build client-side speculative echo.
+- **A networked `ghostty-host` listener.** The host keeps its `AF_UNIX` socket only. No TCP
+  bind, no TLS in the host.
+- **A protocol-level auth handshake.** SSH (optionally Tailscale SSH) is the entire auth +
+  encryption story. `Hello.identity_bundle_id` stays empty/advisory.
+- **Native multi-pane / server-side layout.** No tmux-style server-owned window tree. Layout
+  stays GUI-side; a cloud split is just a split whose backend points at a remote-forwarded
+  socket.
+- **Migrating a live session between hosts.** A session is pinned to the host it spawned on.
+
+---
+
+## Current architecture (grounded)
+
+### The host and the `.client` backend
+
+- Two termio backends (`src/termio/backend.zig`): `.exec` (in-process `Terminal`, upstream,
+  unchanged) and `.client` (`src/termio/Client.zig`, proxies to the host). The backend is
+  selected in `src/Surface.zig` (`Surface.init`, ~`Surface.zig:667`): `if (config.@"pty-host")
+  |sock|` build `.client`, else `.exec`. Non-null `pty-host` ⇒ `.client`, with **no silent
+  `.exec` fallback** (`PTYHOST.md` "Connect failure").
+
+- The socket is `AF_UNIX` `SOCK_STREAM`. `Client.connectUnix` (`src/termio/Client.zig:1793`)
+  is exactly:
+  ```zig
+  const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+  const addr = try std.net.Address.initUnix(path);
+  try posix.connect(fd, &addr.any, addr.getOsSockLen());
+  ```
+  i.e. a **path-addressed Unix socket** — this is the single fact that makes SSH unix→unix
+  forwarding viable (a forwarded local socket path is dialed identically).
+
+### The connect is SINGLE-SHOT with NO retry — VERIFIED
+
+This is the load-bearing constraint for the reconnect subsystem. Confirmed:
+
+- `Client.threadEnter` (`Client.zig:591`) calls `self.connectAndAttach(...)` **once**
+  (`Client.zig:630`).
+- `connectAndAttach` (`Client.zig:653`) calls `connectUnix` once (`Client.zig:661`); on any
+  error it unwinds via errdefers and returns the error — there is **no loop, no backoff, no
+  re-dial**.
+- The read thread `ReadThread.threadMainPosix` (`Client.zig:1813`) polls the socket; on EOF or
+  read error it tears down the read thread and (for `.attach`) the surface shows an error — it
+  does **not** reconnect.
+- `CLAUDE.md` ("App Nap opt-out") documents the rationale explicitly: *"the host connection is
+  opened from per-surface IO threads at surface creation and is single-shot (no retry — see
+  `src/termio/Client.zig` `connectAndAttach`)"*, and that a reconnect was **deliberately
+  skipped** because the local host is a KeepAlive LaunchAgent (≈always up) and a dropped local
+  host can't restore RAM-only sessions anyway.
+
+For a **remote** host this rationale no longer holds: the forwarded socket vanishes whenever
+the SSH tunnel drops (sleep / roam / Tailscale reconnect), while the remote session is still
+perfectly alive. So reconnect becomes mandatory (see the reconnect section).
+
+### The mirror + one mutex
+
+Under `.client` the renderer's source of truth is a host-supplied, viewport-only
+`terminal.RenderState` mirror rehydrated from decoded `grid_frame`s; there is no local
+scrollback. Writer (read thread `handleFrame`) and reader (renderer) share one mutex
+(`Client.renderMutex()`, `Client.zig:476`). None of this changes for remote hosts — it is
+transport-agnostic.
+
+### Protocol + version negotiation — VERIFIED
+
+- `src/host/protocol.zig`: length-prefixed binary frames (`[u32 BE length][u8 tag][payload]`,
+  in-frame scalars LE). `PROTOCOL_VERSION_MAJOR = 1` (`protocol.zig:44`),
+  `PROTOCOL_VERSION_MINOR = 4` (`protocol.zig:79`).
+- Handshake: a `Hello` (major+minor+advisory `identity_bundle_id`) must precede any stateful
+  frame. The host gate is in `Server.dispatch` (`src/host/Server.zig:1120`):
+  - Pre-handshake, any frame other than `.hello`/`.ping` ⇒ `conn.closed.store(true)` + return
+    (`Server.zig:1132`).
+  - On `.hello`, if `hello.protocol_version_major != PROTOCOL_VERSION_MAJOR` ⇒ **log a warning
+    and close the connection** (`Server.zig:1142-1148`). **No error frame is sent back** — the
+    GUI just sees the socket close.
+  - Else `conn.handshaked = true`, `conn.negotiated_minor = hello.protocol_version_minor`
+    (`Server.zig:1149-1153`), and replies `HelloAck` (which *does* carry the host's major/minor,
+    `protocol.zig:497`).
+- **Minor negotiation is per-connection and additive.** New host→GUI frames are gated on
+  `conn.negotiated_minor` (e.g. `processInfoAllowed(minor)>=3`, `foregroundPidAllowed(minor)>=4`
+  — `Server.zig:2249,2257`). An unknown frame **tag** on the GUI side is FATAL:
+  `FrameReader.next` returns `error.InvalidFrameType` (`protocol.zig:350`) and the client read
+  loop treats it as fatal, so the host must never send a tag the peer didn't negotiate
+  (`protocol.zig:62-70`).
+
+**Critical current failure mode:** a major mismatch (or any pre-handshake reject) is surfaced
+to the GUI *only* as a connection close — which the `.client` connect path renders as a
+generic connect failure / blank-or-error pane. There is **no version-mismatch signal the GUI
+can read** (the GUI does not even inspect `HelloAck`'s version fields today — verified: no
+major/minor comparison exists in `Client.handleFrame`). Fleet versioning (below) must fix
+this.
+
+### sessionID / reattach — VERIFIED single ID space
+
+- Host session ids are **random non-zero u64** (`Server.allocSessionId`, `Server.zig:1853`); 0
+  is the "unattached / spawn-fresh" sentinel (`Client.sessionIdFromConfig`, `Client.zig:414`).
+- Forward (GUI→host on attach): `ghostty_surface_config_s.session_id` → `Client.Config.session_id`.
+  Reverse (host→GUI): `Attached.session_id` stored into `Client.session_id`
+  (`std.atomic.Value(u64)`, `Client.zig:239`), read back via `ghostty_surface_session_id()`.
+- Persistence: macOS `SurfaceView.sessionID: String?` (`SurfaceView_AppKit.swift:239`), a
+  `Codable` key (`SurfaceView_AppKit.swift:2121`), decoded with `decodeIfPresent`
+  (`:2151`), and **encoded preferring the LIVE `ghostty_surface_session_id(s)` over the
+  init-time value** (`:2184-2195`), inside `TerminalRestorableState` (v8, `PTYHOST.md`).
+- Re-adoption on GUI relaunch feeds the persisted id back through the surface config; an
+  unknown id degrades to a fresh spawn (`PTYHOST.md` "Unknown `session_id`").
+- The agent-queue "survive a GUI restart" path also re-adopts a running scan **by
+  `sessionID`** (recent commit `0397875aa`), and `MCPLayout`/`list_surfaces` carry `sessionID`
+  for the queue reconcile.
+
+**The problem for multi-host:** `session_id` is a single u64 namespace with **no host
+component anywhere**. Two hosts can independently mint the same random u64 (birthday-bounded
+but real), and — more importantly — a persisted `sessionID` has no record of *which host* it
+belongs to, so on relaunch the GUI cannot know which host to dial to re-adopt it. Identity
+must become `(host, session_id)` (see below).
+
+### The agent ecosystem is LAPTOP-1-LOCAL — VERIFIED
+
+The dashboard/queue/manager correlate an agent-state hook to a surface by **local process-tree
+walking**:
+
+- The Claude Code hook `example/claude-hooks/ghostty-agent-state.sh` walks **up its own ppid
+  chain** to find the nearest ancestor with a real controlling **tty** (its own tty is `??`),
+  then fires a fire-and-forget POST to `http://127.0.0.1:<port>/agent-state` with `{tty,
+  state}` (`ghostty-agent-state.sh:95-116`).
+- The MCP server `/agent-state` route (`MCPServer.swift:452,507`) resolves the hook's `tty` to
+  a live surface UUID on the **main thread** via `MCPAgentState.resolveSurface(forTTY:
+  surfaces:)`, matching the tty against the local `SurfaceView.foregroundPID`
+  (`MCPServer.swift:519-533`).
+- The foreground pid itself arrives from the host as the minor-4 `foreground_pid` frame
+  (`protocol.zig:231`), and the GUI walks the **local** process subtree to classify the agent
+  (pids are system-global **on one machine**).
+
+Every step assumes a single machine: the hook curls **the same box's** `127.0.0.1`, the tty
+and pids are **local**, and the process tree is walked **locally**. For an agent on a cloud box
+this is entirely broken: `127.0.0.1` on the cloud box is not the GUI, the cloud tty/pids mean
+nothing locally, and there is no local process tree. This is the crux of the cross-host agent
+work (below), and the fix is actually *cleaner* than today's heuristic.
+
+### App Nap / connect-race (relevant)
+
+`CLAUDE.md` documents that the GUI holds a process-lifetime
+`beginActivity(.userInitiatedAllowingIdleSystemSleep)` (`AppDelegate.appNapAssertion`) so the
+single-shot connect isn't napped before it lands. The remote-connect path adds a *new* reason
+the connect can be slow/fail (the SSH tunnel isn't up yet), which the single-shot path handles
+badly — another reason reconnect is mandatory.
+
+---
+
+## Proposed architecture
+
+### Transport: forward the remote Unix socket over SSH
+
+The remote `ghostty-host` runs on the cloud box exactly as locally, listening on a **local**
+Unix socket there (e.g. `~/.ghostty-ramon-host.sock` on the box). We forward it to a
+laptop-local path and point a `.client` at the local path:
+
+```
+ssh -N \
+    -o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60 \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -L ${LOCAL_SOCK}:${REMOTE_SOCK} \
+    cloud-1
+```
+
+`ssh -L localsock:remotesock` uses OpenSSH's **unix→unix** forwarding (a local Unix listener
+whose accepted connections are forwarded to a remote Unix socket). The `.client` then dials
+`LOCAL_SOCK` via the *unmodified* `connectUnix` path.
+
+```
+   ┌─────────────────────────── laptop (macOS GUI) ────────────────────────────┐
+   │                                                                            │
+   │   Surface (local split)  ──.client──▶  /Users/me/.ghostty-ramon-host.sock  │
+   │                                              │ (AF_UNIX)                    │
+   │                                              ▼                              │
+   │                                    local ghostty-host (LaunchAgent)         │
+   │                                                                            │
+   │   Surface (cloud split)  ──.client──▶  /Users/me/.ghostty-remote/cloud-1.sock
+   │                                              │ (AF_UNIX, LOCAL forwarded)   │
+   └──────────────────────────────────────────────┼────────────────────────────┘
+                                                   │  ssh -L (unix→unix), over Tailscale
+                                                   ▼
+   ┌─────────────────────────── cloud-1 (Linux) ───────────────────────────────┐
+   │                     sshd  ──▶  ~/.ghostty-ramon-host.sock (AF_UNIX)         │
+   │                                       │                                     │
+   │                                       ▼                                     │
+   │                              ghostty-host (systemd user service)            │
+   └────────────────────────────────────────────────────────────────────────────┘
+```
+
+Why this is the right transport:
+- **No host change for auth/transport.** SSH provides authentication, encryption, and NAT
+  traversal (composed with Tailscale). The host keeps its `AF_UNIX` socket; `Hello`'s
+  `identity_bundle_id` stays advisory.
+- **No session-loss host redeploy for transport.** Adding remote support is a **GUI-side +
+  ops-side** change; the host binary is (nearly) untouched, so existing sessions are not killed
+  to gain the feature. (The one possible host touch is fleet-versioning; see Wiring.)
+- **`.client` is nearly unaware.** It dials a local path either way. The only `.client`-level
+  new behavior is **reconnect** (which we need anyway) and threading a host label into
+  identity.
+
+Latency: because the host streams *authoritative* output (no local echo — see the mirror), a
+keystroke round-trips laptop→host→shell→frame→laptop **exactly like plain SSH** to that box.
+SSH already sets `TCP_NODELAY`; our obligation is only *"don't make the transport worse than
+SSH"* — i.e. **no input-path coalescing / batching**. `Client.queueWrite` already sends one
+Input frame per call (`Client.zig:884`); keep it that way over the tunnel. Do **not** add a
+Nagle-style buffer.
+
+#### Compose with Tailscale for addressing/NAT
+
+The `ssh` target (`cloud-1`) is a tailnet name. Two auth options, both fine:
+- **SSH over the tailnet**: normal OpenSSH keys/agent, reachable via the Tailscale IP/MagicDNS
+  name. Tailscale handles NAT/roaming; SSH handles auth.
+- **Tailscale SSH**: Tailscale ACLs + identity do the auth (no separate SSH key management).
+
+Either way the forwarded socket **never leaves the cloud box's loopback namespace** — only the
+SSH stream crosses the network (encrypted).
+
+### Multi-host client + `(host, session_id)` identity
+
+Introduce a small **host registry** in the GUI: an ordered set of named hosts, each with a
+`.client` socket path. The special reserved name **`local`** is the existing `pty-host`
+socket; every other entry is a remote whose socket path is the **laptop-local forwarded path**
+that the tunnel supervisor (below) creates.
+
+`session_id` must be namespaced by host **everywhere it is stored or keyed for
+reattach/persistence**. Concretely, replace the bare `u64` session identity with a pair
+`(host_name, session_id)`:
+
+| Place today (single ID space) | Change |
+|---|---|
+| `Client.Config.session_id: ?u64` (`Client.zig:361`) | add `host_name` (the registry key); the socket path is derived from it |
+| `Client.session_id` atomic (`Client.zig:239`) | unchanged type; the *host* is Config-side, so the pair is `(config.host_name, session_id)` |
+| `ghostty_surface_config_s.session_id` / `ghostty_surface_session_id()` | keep the u64; add a `host_name` string field alongside it in the C surface config + a getter |
+| macOS `SurfaceView.sessionID: String?` Codable (`SurfaceView_AppKit.swift:239,2121,2195`) | add a persisted `hostName: String?` sibling key (additive, `decodeIfPresent` → nil = `local`, back-compat) |
+| `MCPLayout` / `list_surfaces` `sessionID` emission | add `hostName` so the queue reconcile keys on the pair |
+| agent-queue re-adopt-by-sessionID (`queue/runner.ts`, store) | key on `(hostName, sessionID)` |
+
+**Re-adoption rule:** on GUI relaunch, a surface with persisted `(hostName, sessionID)` where
+`hostName != local` must (1) ensure the tunnel for `hostName` is up (supervisor), then (2)
+dial that host's local forwarded socket with `session_id = sessionID`. An unknown id still
+degrades to a fresh spawn on **that** host (existing `handleAttach` behavior), never on the
+wrong host.
+
+Back-compat: a nil/absent `hostName` means `local` (every existing persisted surface). This is
+strictly additive, matching the `decodeIfPresent ?? default` discipline the fork already uses
+for `sessionID`/`bell`/`attentionNeeded` (`PTYHOST.md`; `SurfaceView_AppKit.swift`).
+
+### Config / host registry (proposed keys — fork-only)
+
+Follow the `RepeatableString` precedent (`project-directory` `Config.zig:2908`;
+`agent-queue-templates-dir` `Config.zig:3007`; C bridge `ghostty_config_string_list_s`
+`include/ghostty.h:561` backed by `list_c` `Config.zig:6375`). A registry entry needs
+name + ssh target + remote socket path (+ optional local socket path), so a plain
+`RepeatableString` of structured lines is the least-friction shape:
+
+```
+# fork-only; keep in ~/.config/ghostty-ramon/config
+# name = ssh-target : remote-socket-path  [ : local-socket-path ]
+pty-remote-host = cloud-1 = cloud-1 : ~/.ghostty-ramon-host.sock
+pty-remote-host = big-gpu = user@big-gpu.tailnet.ts.net : /run/user/1000/ghostty-host.sock
+```
+
+- Parse each line into `{ name, sshTarget, remoteSocket, localSocket? }`; default
+  `localSocket` to a derived per-name path under a fork dir (e.g.
+  `~/.ghostty-ramon/remote/<name>.sock`).
+- `local` is reserved and always maps to the scalar `pty-host` value (unchanged key).
+- Reuse the existing `RepeatableString` + `list_c` C plumbing; **no new C API** for the config
+  list itself.
+- Two more optional scalars: `pty-remote-ssh-options` (extra `ssh` args appended verbatim) and
+  `pty-remote-connect-timeout` (seconds; feeds the reconnect backoff cap).
+
+Keeping these in `~/.config/ghostty-ramon/config` is mandatory (an official Ghostty shares
+`~/.config/ghostty/config` and would error on the unknown keys — the fork's standing rule).
+
+### Launch-on-host action (propose; do not implement)
+
+Two entry points, both thin wrappers that set the surface's target host before spawning a
+`.client`:
+
+- **Keybind action** `new_split_on_host:<name>` / `new_tab_on_host:<name>` (fork-only,
+  surface-scoped), mirroring the existing `new_tab:<dir>` shape. It resolves `<name>` in the
+  registry, ensures the tunnel is up, and spawns a fresh `.client` surface with
+  `host_name=<name>` (session_id null ⇒ fresh spawn on that host). A command-palette entry
+  "New Split on Host…" opens a fuzzy host picker (like the project selector).
+- **MCP tool** `spawn_split_command` already exists (`macos/Sources/Features/MCP/…`); add an
+  optional `host` argument so an orchestrating agent can place a split on a named host. This
+  needs the same registry lookup + tunnel-ensure. **No new tool** — extend the existing one's
+  schema (mind the `toolsListHasAllTools` count assertion if a *new* tool is ever added).
+
+`cwd` semantics: a fresh cloud split's `working_directory` is **host-relative** — it names a
+path on the cloud box, not the laptop. See the locality taxonomy.
+
+---
+
+## The reconnect subsystem (the biggest engineering item)
+
+Two independent layers must both be built; they are complementary, not redundant.
+
+### Layer 1 — SSH tunnel lifecycle (the transport)
+
+A **tunnel supervisor** (GUI-side, one per remote host that has at least one live surface)
+owns the `ssh -L` process and keeps the forwarded local socket alive:
+
+- **Multiplexing:** `ControlMaster=auto` + `ControlPath` + `ControlPersist` so N cloud splits
+  to one host share **one** TCP/SSH connection (one auth, one NAT hole). The first surface
+  brings the master up; later surfaces reuse it.
+- **Keepalive:** `ServerAliveInterval=15` + `ServerAliveCountMax=3` so a dead tunnel is
+  detected in ~45s (and torn down rather than hanging).
+- **Respawn (autossh-style):** the supervisor watches the `ssh` child; on exit it respawns with
+  exponential backoff (1, 2, 4, 8, 16, capped ~30–60s, forever while ≥1 surface for that host
+  is alive), then **recreates the local forwarded socket**. Reuse the fork's existing backoff
+  shape (`AgentPreviewTile` `mirrorReconnectDelay`: a quick burst then a steady cadence forever
+  — `CLAUDE.md` "Preview auto-reconnect").
+- **Readiness:** the local forwarded socket must exist *and accept a connection* before the
+  `.client` dials it. The supervisor exposes a "ready" signal (poll-connect the local socket)
+  that the redial loop waits on.
+- **Lifecycle bounding:** tear the tunnel down when the last surface for that host closes
+  (respecting `ControlPersist` for a brief reuse window).
+
+Implementation note: launch `ssh` as a child `Process` (like `AgentManagerController` launches
+the sidecar), inherit the user's SSH agent, and parent-death-guard it (the sidecar orphan-guard
+pattern, `CLAUDE.md` "Sidecar orphan guard") so a GUI crash doesn't leak `ssh` children.
+
+### Layer 2 — `.client` redial loop (the session)
+
+This is the change that reverses the *deliberate* single-shot decision (`Client.connectAndAttach`
+`Client.zig:653`). It must be **opt-in per host** so the local host stays byte-for-byte
+single-shot (the KeepAlive LaunchAgent assumption is still valid locally — do not add retry to
+`local`).
+
+- When a remote `.client`'s read thread hits EOF / read error (the forwarded socket died with
+  the tunnel), instead of tearing the surface down it enters a **redial state**: wait for the
+  Layer-1 "ready" signal (with backoff), then re-run the connect + `Hello` + **`Attach{
+  session_id = <known id> }`** to *reattach* the still-alive remote session by its id — not a
+  fresh spawn.
+- The id to reattach is the one the surface already holds (`Client.session_id` atomic, seeded
+  from the persisted/last-known id), so reattach targets the exact `(host, session_id)`.
+- On reattach the host does a `pushFullFrames` seed (existing path), so the mirror repaints
+  the current screen — exactly the GUI-restart reattach flow, now triggered by a *transport*
+  drop instead of a GUI restart.
+- **Distinguish reconnecting from dead.** EOF now has two meanings: (a) tunnel dropped, session
+  alive → redial; (b) session genuinely gone (host restarted → unknown id → fresh spawn, or
+  child exited → `child_exited` frame). The `child_exited` frame is explicit and unambiguous
+  (`protocol.zig:110`); treat a bare EOF as (a) and redial, and let the reattach's
+  known-vs-returned-id check (already logged today, `PTYHOST.md`) detect a host restart and
+  degrade. Surface a clear reconnecting overlay meanwhile (see below).
+- **App Nap interaction:** the redial loop must survive backgrounding. The existing App-Nap
+  opt-out covers the *initial* connect; the redial loop runs on the same IO thread and inherits
+  it, but verify the loop's backoff timer isn't a `sleep` that a suspended thread stalls
+  (prefer a poll/eventfd wait so the quit pipe still works).
+
+### Reconnecting UX (never a silent blank pane)
+
+While redialing, draw a **reconnecting overlay** on the split (frozen last frame dimmed + a
+"Reconnecting to cloud-1…" banner), reusing the mirror-ended/dimming machinery
+(`markMirrorEnded`, `Client.zig:1066`). Distinguish three terminal states visibly:
+"reconnecting" (transient), "session ended" (child exited / unknown id after host restart),
+and "host unreachable / version mismatch" (loud error, see fleet versioning).
+
+---
+
+## Cross-host agent ecosystem
+
+The correlation must move from **local process-tree walking** (verified laptop-1-local, above)
+to **environment self-identification**, which also works locally and is *more* robust.
+
+### Inject `(host, session_id)` into the spawned shell's environment
+
+When a `.client` spawns a fresh session, the host already accepts spawn-opts on `Attach`
+(`working_directory`, `initial_input` — `protocol.zig:554`). Add the split's stable identity as
+**environment** in the spawned shell, e.g.:
+
+```
+GHOSTTY_SURFACE_HOST=cloud-1
+GHOSTTY_SURFACE_SESSION=<session_id>
+GHOSTTY_MCP_URL=https://<laptop-tailnet-name>:<mcp-port>/agent-state
+GHOSTTY_MCP_TOKEN=<mcp-token>
+```
+
+- Delivery mirrors the queue's existing dual-delivery of `GHOSTTY_QUEUE_TEMPLATE_DIR`
+  (`env` for `.exec`; a command prefix for `.client` — `CLAUDE.md` agent-queue shared-templates
+  bullet). For `.client` this rides the spawned shell (an `env`-prefix on the initial command,
+  or a new spawn-opt env map on `Attach` if we want it clean — that would be a host touch;
+  the command-prefix path avoids it).
+- The `GHOSTTY_MCP_URL` points at the **laptop's tailnet address**, not `127.0.0.1`, so a cloud
+  hook can reach the MCP server over the tailnet.
+
+### Hook self-identifies instead of walking ppid/tty
+
+Update `ghostty-agent-state.sh` (`example/claude-hooks/`) so that **if `GHOSTTY_SURFACE_SESSION`
+is set, it POSTs `{host, session, state}` directly** and skips the ppid/tty walk entirely.
+The MCP `/agent-state` route (`MCPServer.swift:507`) gains a branch: when the body carries
+`{host, session}` it resolves the surface by matching the persisted `(hostName, sessionID)`
+pair (a direct map lookup) instead of `resolveSurface(forTTY:)`. This is:
+
+- **Correct across hosts** (the cloud tty/pids are irrelevant; the token is the identity).
+- **More robust locally** (no fragile ancestor-tty heuristic, no `claude-pool`-wrapper pid
+  guessing).
+- **Additive** (keep the tty path as a fallback for un-instrumented shells).
+
+### MCP over the tailnet
+
+- The MCP server currently binds loopback (`mcp-listen = 127.0.0.1:8765`, the token is a
+  shell-execution credential). To be reachable from a cloud box, front it with `tailscale
+  serve` (HTTPS on the tailnet, same pattern the web monitor already documents — `CLAUDE.md`
+  web-monitor bullet, `WEB-MONITOR.md`) rather than binding `0.0.0.0`. The token travels to the
+  cloud shell via `GHOSTTY_MCP_TOKEN`.
+- ACL note: the tailnet ACL must permit the cloud box → laptop MCP port. Because the token is a
+  shell-exec credential, the tailnet is the trust boundary; do not expose the port off-tailnet.
+
+### claude / node / billing on the cloud box (flag)
+
+An agent running on the cloud box runs **there**, so:
+
+- `claude` and `node` must be installed **on the cloud box** and on the shell's PATH (the
+  fork's robust `probeExecutableViaLoginShell` logic — `CLAUDE.md` Agent Manager bullet — is a
+  *GUI-side* macOS probe; it does not help the remote box). Document this as a per-box setup
+  step.
+- Billing rides **whatever Claude auth exists on the cloud box** (its own `~/.claude` / config
+  dir), which may be a *different* account than the laptop's. Call this out: the Agent
+  Manager's warm-base account routing (`CLAUDE.md`) is laptop-local; a cloud agent's cost is on
+  the cloud box's account and is **not** visible to the laptop's `get_haiku_usage`.
+- The Agent Manager **summarizer/bell-classify** (Haiku calls made by the laptop sidecar) is a
+  separate concern from the cloud agent's own Claude usage; the sidecar still runs on the
+  laptop and classifies host-fed frames, so it works for a cloud split's *rendered output*
+  without needing claude on the box. Only agents *launched on* the box (queue dispatch) need
+  claude there.
+
+---
+
+## Per-action locality taxonomy
+
+A cloud split's shell sees the **cloud filesystem**; a local split sees the laptop's. Every
+"open something and do something" action has an implicit host. `cwd`/env resolve **relative to
+the target surface's host**.
+
+| Action / feature | Locality | Notes |
+|---|---|---|
+| `new_split` / `new_tab` (bare, inherit cwd) | **either** | Inherit cwd **from the source surface's host** — a cloud split's new tab inherits the cloud cwd; a local split's inherits the laptop cwd. The inheriting surface and source must share a host, or the cwd is meaningless. |
+| `new_tab:<dir>` | **host of the new tab** | `<dir>` is a path on the **target** host. If the target is `local`, laptop path; if cloud, cloud path (no `~` expansion locally for cloud). |
+| `new_tab_command:<cmd>` | **host of the new tab** | The command runs on the target host's shell (delivered as `initial_input`). |
+| `new_split_on_host:<name>` / `new_tab_on_host:<name>` (proposed) | **cloud-only** target `<name>` | Fresh spawn on that host; cwd host-relative to `<name>`. |
+| `toggle_project_selector` / `project-directory` | **needs a host answer** | See below — projects are per-host directory listings. |
+| Agent Queue template `{templateDir}` + provider `list/status/claim` scripts | **runs where the queue runs** | The provider scripts and `{templateDir}` are resolved on the **laptop** today (GUI-side / sidecar). If a queue dispatches agents onto a cloud host, the *agent split* is cloud-side but the *provider scripts* are laptop-side — a split-brain the queue must make explicit (a per-queue `host` field). Flag as an open question. |
+| Agent split env (`GHOSTTY_QUEUE_TEMPLATE_DIR`, item env) | **host of the agent split** | Must be delivered into the cloud shell (dual-delivery, above). A `{templateDir}` that names a laptop path is wrong for a cloud agent — either ship the scripts to the box or keep provider scripts laptop-side and only the agent remote. |
+| `mark/pull/swap/flip/toggle/goto` split ops, `move_split_to_new_tab`, zoom | **host-agnostic** | Pure GUI layout transforms on `SplitTree`; they move *surfaces* (each keeping its own host) around the tree. A cloud split and a local split can be siblings. |
+| `goto_last_surface`, dashboard/queue/manager tiles | **host-agnostic** | Operate on surfaces regardless of host, once correlation is `(host, session)`. |
+| Clipboard (OSC52), title, bell, notifications, pwd (OSC7) | **host of the surface** | Already host-fed via `surface_event` frames; work unchanged over the tunnel. Bell/attention persist per surface. |
+| `report_bug`, config discovery MCP tools | **laptop-only** | GUI/config features; no host relevance. |
+
+### `project-directory` needs a "which host" answer
+
+`project-directory` (fork-only, `Config.zig:2908`) lists **laptop** subdirectories today. For a
+cloud host the project list must come from the **cloud** filesystem. Options (pick in
+implementation):
+
+1. **Per-host project bases**: extend the registry / add `pty-remote-project-directory =
+   <name> = <base>` and have the project selector, when a cloud host is chosen, list the cloud
+   box's subdirs (a small `ssh cloud-1 ls` over the multiplexed control connection, cached).
+2. **Host-scoped picker**: the project palette first asks *which host*, then lists that host's
+   projects; picking one opens a split **on that host** in that dir.
+
+Recommend (2) layered on (1): the palette is host-aware, and each host contributes its own
+bases. The MCP `list`/`describe` config discovery tools remain laptop-only.
+
+---
+
+## Fleet versioning + loud version-mismatch error
+
+Today the GUI does **not** inspect versions and a mismatch is only a socket close (verified
+above). With a *fleet* of independently-deployed hosts (some cloud boxes will lag the laptop's
+host build), this becomes the dominant failure mode and **must be loud**.
+
+- **Each peer declares its supported version window.** The `Hello`/`HelloAck` already carry
+  `major` + `minor` (`protocol.zig:462,497`). Add a *minimum required major/minor* to the
+  handshake (either additional Hello fields — additive, minor-gated — or interpret the existing
+  major as the compat key it already is). The host already refuses a wrong major
+  (`Server.zig:1142`).
+- **The GUI MUST read `HelloAck` and validate the negotiated version** (it does not today). On
+  the client read of `HelloAck`, compare host major/minor against the GUI's requirement; on
+  incompatibility, transition the surface to a **loud, actionable error state** rather than a
+  blank/generic-connect-fail pane:
+  > `cloud-1: ghostty-host is too old (host protocol 1.2, this GUI needs ≥ 1.4). Redeploy
+  > ghostty-host on cloud-1 (see CLOUD-HOSTS-DESIGN.md → Deployment).`
+- **The host side should also surface a reason on refuse.** Today it closes silently
+  (`Server.zig:1146`). Optionally add a tiny `hello_nack{reason}` frame (additive; the GUI must
+  negotiate its awareness so an old GUI never receives an unknown tag — the same
+  minor-gating discipline). Simpler alternative that needs no host change: the GUI infers
+  "version refused" from *"connected, sent Hello, got an immediate EOF with no HelloAck"* and
+  shows the actionable message; a genuine connect failure (no socket) is a *different* message
+  ("tunnel down / host unreachable"). Prefer the no-host-change inference unless a
+  `hello_nack` is cheap to add during a scheduled host bump.
+- **Reuse the existing non-destructive reload discipline** (`CLAUDE.md` "First-launch-setup" →
+  reload identity): a MAJOR bump is a breaking fleet event; treat the fleet like the colleague
+  fleet — bump `host_reload_epoch` / minor first so peers record identity, and never leave a
+  major-N GUI silently talking to a major-(N−1) host. The blank-pane-on-major-mismatch is
+  exactly what the loud error prevents.
+
+**Design rule for this doc's whole feature:** any connect/handshake/version failure resolves to
+one of three *named, actionable* surface states — **reconnecting**, **session ended**, **host
+unreachable / too old** — never an unexplained blank pane.
+
+---
+
+## Deployment (cloud box)
+
+The cloud box has no GUI and no `ForkSetup` first-launch flow — it is a **manual deploy**, like
+Ramon's hand-managed dev host (`CLAUDE.md` PTY-host LaunchAgent section), but under **systemd**
+instead of launchd.
+
+### The host is headless core Zig and builds on Linux
+
+- `ghostty-host` is the headless core (`src/host/main.zig` `--listen=<path>`, `src/host/*.zig`);
+  it links the core `src/` emulator, not the macOS app. Ghostty targets Linux, so the host
+  cross-compiles/builds on Linux with the same `zig build -Demit-macos-app=false
+  -Doptimize=ReleaseFast` invocation, producing `zig-out/bin/ghostty-host`.
+- **The one portability caveat to verify/port:** the foreground-process resolution path
+  (`process_info` / `foreground_pid` frames) uses **macOS `libproc` / `sysctl(KERN_PROCARGS2)`**
+  (verified: comments at `src/host/protocol.zig:215`, `src/host/Session.zig:432,1758`,
+  `src/host/Server.zig:1647,2490`). On Linux this needs a `/proc`-based equivalent
+  (`/proc/<pid>/comm`, `/proc/<pid>/cmdline`, `tcgetpgrp` for the foreground pgid — `tcgetpgrp`
+  itself is portable). This is a **real host code change for full agent-detection on cloud
+  boxes**; a dumb-terminal cloud split (Phase 1) does not need it (those frames are
+  minor-gated and simply absent). Flag: confirm no other macOS-only syscall is on the host's
+  hot path before shipping a Linux host.
+- The socket-forwarding transport itself needs **no host change** — the host already listens on
+  a Unix socket regardless of platform.
+
+### systemd user unit (sketch — analogous to the documented macOS LaunchAgent)
+
+```ini
+# ~/.config/systemd/user/ghostty-host.service   (on cloud-1)
+[Unit]
+Description=ghostty-host (emulation-on-host backend)
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/ghostty-host --listen=%h/.ghostty-ramon-host.sock
+# TERM/terminfo so the child shell gets xterm-ghostty (mirror of the LaunchAgent's
+# GHOSTTY_RESOURCES_DIR env — point at the installed core resources on the box).
+Environment=GHOSTTY_RESOURCES_DIR=%h/.local/share/ghostty
+Restart=always
+RestartSec=2
+# The socket stays on loopback/AF_UNIX; only sshd reaches it via the -L forward.
+
+[Install]
+WantedBy=default.target
+```
+
+Enable with `systemctl --user enable --now ghostty-host` (and `loginctl enable-linger $USER`
+so it runs while logged out — the "keep running while the laptop hibernates" property). Unlike
+the macOS ad-hoc dev host, there is **no LWCR/cdhash trap** on Linux (systemd does not pin a
+code-signing requirement), so a redeploy is a plain `systemctl --user restart ghostty-host` —
+but that still **kills all RAM-only sessions on that box** (the inherent host trade), so
+schedule it deliberately, exactly as documented for the macOS host.
+
+### Per-box setup checklist (one-time)
+
+1. Build/copy `ghostty-host` → `~/.local/bin/ghostty-host` on the box; place core resources for
+   `GHOSTTY_RESOURCES_DIR`.
+2. Write + enable the systemd user unit above; `enable-linger`.
+3. Ensure the box is on the tailnet (Tailscale) and SSH-reachable from the laptop.
+4. (For agents on the box) install `claude` + `node` on the box's PATH; log into the Claude
+   account to bill; drop the self-identifying hook (`ghostty-agent-state.sh` variant) into the
+   box's Claude Code settings.
+5. On the laptop: add a `pty-remote-host = <name> = <ssh-target> : <remote-socket>` line to
+   `~/.config/ghostty-ramon/config`.
+
+---
+
+## Security posture
+
+- **Auth + encryption = SSH** (keys via the SSH agent) or **Tailscale SSH** (tailnet identity +
+  ACLs). No credentials in the host protocol; `Hello.identity_bundle_id` stays advisory.
+- **The host socket never leaves the box.** It is `AF_UNIX` on the box's loopback namespace;
+  only `sshd` connects to it via the `-L` forward. There is no network listener to attack.
+- **The forwarded local socket** lives under the laptop user's home (mode 0700 dir); local Unix
+  socket perms apply.
+- **MCP over tailnet**: the MCP token is a shell-exec credential, so the tailnet (with ACLs
+  restricting which peers may reach the laptop's MCP port) is the trust boundary. Front with
+  `tailscale serve` (HTTPS); never bind `0.0.0.0`. The token travels to the cloud shell as env
+  over the (already-trusted) tunnel.
+- **Blast radius**: a compromised cloud box can drive its own sessions and (with the token)
+  call the laptop's MCP — scope MCP surface control accordingly; the token gates it and the
+  ACL gates reachability.
+
+---
+
+## Wiring touchpoints (for the implementer)
+
+Honest split of GUI-only vs host (session-loss) changes. **The SSH-forwarding transport choice
+was made specifically to keep host changes near-zero — verified: transport needs no host
+change** (the host already listens on a Unix socket). The only *potential* host touches are
+(a) fleet-versioning niceties and (b) a Linux `/proc` port for agent detection — both
+optional/phased.
+
+### GUI-only (no host restart, no session loss)
+
+- `src/config/Config.zig` — add `pty-remote-host` (RepeatableString, reuse `list_c` /
+  `ghostty_config_string_list_s`), `pty-remote-ssh-options`, `pty-remote-project-directory`,
+  `pty-remote-connect-timeout`. + parse tests. (Zig/lib rebuild, **not** a host rebuild — the
+  host ignores these keys.)
+- `src/termio/Client.zig` — add `Config.host_name`; **the redial loop** (reverse the single-shot
+  `connectAndAttach`, opt-in per non-`local` host); reconnecting state + reuse `markMirrorEnded`
+  dimming; read + validate `HelloAck` version → loud error state.
+- `src/Surface.zig` — backend selection threads `host_name` (socket path resolved from the
+  registry) alongside `pty-host`; session-id getter/setter gains the host component.
+- `include/ghostty.h` + `src/apprt/embedded.zig` — add `host_name` to the surface config + a
+  reverse getter (lib/xcframework rebuild; **no host compile** — these C exports aren't in
+  `ghostty-host`).
+- macOS: a **tunnel supervisor** (new file, e.g. `Features/RemoteHost/RemoteTunnelController.swift`)
+  owning `ssh -L` `Process`es with ControlMaster/keepalive/backoff + parent-death guard;
+  `SurfaceView.hostName` Codable sibling to `sessionID` (`SurfaceView_AppKit.swift`);
+  restore/re-adopt keys on `(hostName, sessionID)`; `new_split_on_host` action + palette host
+  picker; `spawn_split_command` host arg (`Features/MCP/…`); `/agent-state` route self-ID branch
+  + `MCPAgentState` map lookup by `(hostName, sessionID)` (`MCPServer.swift`,
+  `MCPLayout.swift`); reconnecting/ended/too-old overlays (`TerminalView.swift`).
+- `example/claude-hooks/ghostty-agent-state.sh` — self-ID branch (`GHOSTTY_SURFACE_SESSION`) that
+  POSTs `{host,session,state}` to `GHOSTTY_MCP_URL`, tty-walk kept as fallback.
+- Agent-queue sidecar (`macos/agent-manager/`) — reconcile keyed on `(hostName, sessionID)`;
+  per-queue `host` field for cloud dispatch; agent-split env delivery to cloud shells.
+
+### Host changes (rebuild + systemd/LaunchAgent reload = SESSION LOSS — schedule deliberately)
+
+- **None required for the core transport / multi-host / reconnect feature.** (This is the whole
+  point of the SSH-forwarding choice.)
+- *Optional, phased:* a `hello_nack{reason}` frame (additive, minor-gated) for an explicit
+  version-refuse reason — only if we prefer that over the no-host-change EOF inference.
+- *For full agent detection on a Linux cloud box:* port the `process_info` / `foreground_pid`
+  resolution from macOS `libproc`/`sysctl` to Linux `/proc`. Needed only for cloud agents, not
+  dumb cloud terminals.
+
+---
+
+## Testing plan (follow existing patterns)
+
+- **Zig — protocol/version negotiation** (`src/host/test.zig`, `src/host/protocol.zig` tests,
+  `src/termio/client_difftest.zig`): a Hello major-mismatch produces the loud path (assert the
+  GUI-side classification of "got EOF with no HelloAck" → too-old vs "no socket" → unreachable);
+  minor negotiation gates any new frame. Reuse the existing `TestListener` +
+  connect/attach/resize lifecycle harness (`client_difftest.zig` T1/T2/T3).
+- **Zig — reconnect** (new, `client_difftest.zig`): drive `connectAndAttach` against a
+  `TestListener` that drops the connection after N frames; assert the redial loop reattaches
+  with `Attach{session_id=<same>}` (not a fresh spawn), backs off, and never re-dials `local`
+  (opt-in gate). A deterministic drop-then-accept repro like the SegmentedPool grow repro
+  pattern (`src/datastruct/segmented_pool.zig` tests).
+- **Zig — config** (`src/config/Config.zig` tests): `pty-remote-host: RepeatableString parse`
+  (name/target/socket split; `local` reserved), mirroring the `agent-queue-templates-dir`
+  parse test (`Config.zig:11761`).
+- **Swift — host-registry + identity** (`macos/Tests/…`): registry line parsing (pure);
+  `(hostName, sessionID)` Codable round-trip with `decodeIfPresent → local` back-compat
+  (mirror the existing `sessionID`/`bell` Codable tests); re-adoption keys on the pair; the
+  `/agent-state` self-ID map lookup vs the tty fallback (`MCPAgentStateTests`); the tunnel
+  supervisor's backoff schedule (pure, like `AgentMirrorReconnectTests`
+  `backoffQuickBurstThenSteadyMinute`).
+- **Swift — version-mismatch UX**: assert a too-old host yields the actionable message string,
+  a missing tunnel yields the unreachable message, and neither yields a blank pane.
+- **Live smoke** (documented, like `PTYHOST.md`'s): stand up a `ghostty-host` on a Linux box +
+  `ssh -L`, launch a cloud split, run `sleep 9999 & echo MARKER-$$`, sleep the laptop / drop
+  WiFi, wake, and assert the split **reattaches** (same MARKER pid) after the tunnel
+  re-establishes.
+
+---
+
+## Phased implementation plan (dumb-terminal first)
+
+Build a rendering + reconnecting remote split **before** any agent-ecosystem work.
+
+- **Phase 0 — Linux host bring-up (ops).** Build `ghostty-host` for Linux, systemd unit,
+  Tailscale + SSH reachability. Manual `ssh -L` by hand; point a temporary `pty-host` at the
+  forwarded socket and confirm a *single* remote split renders + takes input (no registry, no
+  reconnect yet). This validates the transport with zero code.
+- **Phase 1 — Multi-host client + registry + launch action.** `pty-remote-host` config,
+  `host_name` through Client/Surface/C-ABI, `(host, session_id)` identity + persistence,
+  `new_split_on_host` + palette. Tunnel supervisor **basic** (bring-up on first surface, no
+  auto-respawn yet). Deliverable: mix local + cloud splits in one window; cloud split survives
+  a **GUI restart** (reattach by `(host, session_id)`).
+- **Phase 2 — Reconnect subsystem.** Layer-1 respawn/keepalive/readiness + Layer-2 redial loop +
+  reconnecting overlay. Deliverable: cloud split survives **sleep / WiFi roam / Tailscale
+  reconnect** without a manual restart.
+- **Phase 3 — Loud fleet versioning.** GUI reads/validates `HelloAck`; the three named error
+  states; (optional) `hello_nack`. Deliverable: an old cloud host shows an actionable message,
+  never a blank pane.
+- **Phase 4 — Cross-host agent ecosystem.** Env self-ID injection, hook self-ID branch, MCP over
+  tailnet, `(host, session)` correlation in dashboard/queue/manager, Linux `/proc` port for
+  `foreground_pid`/`process_info`, per-queue `host`, claude/node/billing docs. Deliverable: an
+  agent on a cloud box shows in the dashboard/queue with correct state.
+
+Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend to agents.
+
+---
+
+## Open questions
+
+1. **Registry line format** — a `RepeatableString` of `name = target : socket` is proposed;
+   is a structured config sub-object worth the extra C plumbing instead? (Recommend: no, reuse
+   `list_c`.)
+2. **`hello_nack` vs EOF inference** — add the additive frame for an explicit refuse reason, or
+   infer "too old" from *connected-but-immediate-EOF-no-HelloAck*? The inference needs no host
+   change; the frame is cleaner. (Recommend: inference now, frame during the next scheduled host
+   bump.)
+3. **Queue split-brain** — when a laptop queue dispatches agents onto a cloud host, provider
+   `list/status/claim` scripts + `{templateDir}` are laptop-side but the agent split is
+   cloud-side. Do we (a) ship provider scripts to the box, (b) keep provider laptop-side and only
+   remote the agent, or (c) run the whole queue on the box? Needs a per-queue `host` design.
+4. **`project-directory` per-host listing** — cache an `ssh cloud-1 ls` over the control
+   connection, or require an explicit `pty-remote-project-directory` per box? (Recommend: both —
+   explicit bases, listed via the multiplexed connection, cached.)
+5. **Linux host portability audit** — beyond `libproc`/`sysctl` for process info, is any other
+   macOS-only syscall on the host's hot path? (Must audit before shipping a Linux host; the
+   emulator core is portable, but verify PTY/`xev` specifics.)
+6. **Billing visibility** — a cloud agent bills the box's Claude account, invisible to the
+   laptop's `get_haiku_usage`. Do we want a cross-host usage aggregation, or is per-box
+   accounting acceptable? (Recommend: acceptable for v1; document it.)
+7. **App-Nap + redial** — confirm the redial backoff uses a poll/eventfd wait (not a bare
+   `sleep`) so a backgrounded IO thread still redials and still honors the quit pipe.
+8. **Sudden multi-host id collision** — two hosts *can* mint the same random u64. `(host,
+   session_id)` disambiguates for reattach, but any place that ever keys on the bare u64 across
+   hosts (audit `MCPLayout`, the sidecar store) must be found and switched to the pair.
