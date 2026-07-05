@@ -1339,6 +1339,17 @@ final class WebMonitorServer {
         return nil
     }
 
+    /// NATIVE macOS virtual keycode (NSEvent.keyCode space — see KeySpec.keycode)
+    /// for each lowercase letter, used by the general `ctrl-<letter>` rule in
+    /// `keySpecs(forKey:)`. Read from `src/input/keycodes.zig` (the same table the
+    /// core matches via `entry.native == keycode`); a GHOSTTY_KEY_* enum value here
+    /// would silently no-op. `ctrl-c`=8 and `ctrl-u`=32 match the explicit cases.
+    static let ctrlLetterKeycodes: [Character: UInt32] = [
+        "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4, "i": 34,
+        "j": 38, "k": 40, "l": 37, "m": 46, "n": 45, "o": 31, "p": 35, "q": 12,
+        "r": 15, "s": 1, "t": 17, "u": 32, "v": 9, "w": 13, "x": 7, "y": 16, "z": 6,
+    ]
+
     /// PURE: map a named key command to a single key-event spec. Unknown -> nil.
     /// Named keys carry a `ghostty_input_key_e` keycode (so Ghostty synthesizes
     /// the real keypress/escape sequence); `y`/`n` are just printable text.
@@ -1369,7 +1380,22 @@ final class WebMonitorServer {
         // Space is a plain printable 0x20 — same byte a Space keypress sends, and
         // useful in Claude Code (toggle/confirm). Ride the text path like y/n.
         case "space": return keySpecs(forText: " ")
-        default: return nil
+        default:
+            // General ctrl-<letter> rule (ctrl-a, ctrl-d, ctrl-z, …) beyond the
+            // explicit ctrl-c/ctrl-u above — the desktop client needs the full set
+            // of terminal control keys. A Ctrl-modified letter key event carrying
+            // the letter's NATIVE macOS virtual keycode + its unshifted scalar.
+            // Only a single a-z letter maps; any other `ctrl-…` combo returns nil
+            // (a 400 at the route, unchanged).
+            if key.hasPrefix("ctrl-") {
+                let rest = key.dropFirst(5)
+                if rest.count == 1, let ch = rest.first,
+                   let keycode = ctrlLetterKeycodes[ch], let ascii = ch.asciiValue {
+                    return [KeySpec(keycode: keycode, mods: GHOSTTY_MODS_CTRL,
+                                    unshiftedCodepoint: UInt32(ascii))]
+                }
+            }
+            return nil
         }
     }
 
@@ -1932,9 +1958,25 @@ final class WebMonitorServer {
     });
     """
 
-    // MARK: - Embedded mobile HTML page
-
-    // Not `private` so the embedded page can be asserted on in unit tests.
+    // MARK: - Embedded HTML page
+    //
+    // The SINGLE responsive, capability-adaptive web client, served at GET "/" to
+    // BOTH phone and desktop. Layout is responsive off ONE state machine (a
+    // `data-view` attribute on #app): a PERSISTENT surface-picker sidebar beside
+    // the viewer on a wide screen (>=860px, selecting a surface swaps the viewer
+    // without hiding the list), collapsing to a full-width drawer with a back/menu
+    // control on a narrow one (<860px, the phone behavior). Capabilities are
+    // FEATURE-DETECTED, never guessed from the viewport: browser copy/paste is
+    // gated on a secure context + navigator.clipboard (Send-field fallback), and
+    // the global keydown driver that maps browser keystrokes to real key events
+    // attaches UNIVERSALLY (inert without a physical keyboard, bails inside typing
+    // fields / focused controls). Renders a surface in full color via the vendored
+    // xterm.js fed the host's raw PTY byte stream; the frame-mode scroll,
+    // reconnect-on-refocus resync, and the bell->Web-Push notifier are universal.
+    // Keyboard fidelity for non-text keys assumes a Mac client with a standard
+    // layout (native macOS keycodes; printable text still works off-Mac). See
+    // WEB-MONITOR.md + DESKTOP-MONITOR-DESIGN.md. Not `private` so the page can be
+    // asserted on in unit tests.
     static let htmlPage = """
     <!DOCTYPE html>
     <html lang="en">
@@ -1943,218 +1985,258 @@ final class WebMonitorServer {
     <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
     <title>Ghostty Web Monitor</title>
     <style>
-      :root { color-scheme: dark; }
-      body { margin: 0; background: #11131a; color: #d6dae3; font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; font-size: 14px; }
-      header { padding: 10px 12px; background: #1b1e27; position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
-      header b { color: #f0a35e; }
-      /* The session id/title is the only growable header item: let it shrink and
-         ellipsize so the (compact, icon-only) Notify button never wraps to a 2nd
-         line on a narrow phone. */
-      #cur { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      #notify { flex: 0 0 auto; padding: 6px 9px; }
+      /* Theme-aware CHROME only: the terminal colors come from the host's ANSI
+         stream (xterm.js), so the terminal itself is never theme-toggled — only
+         the surrounding sidebar/header/banners. Dark is the default; a light
+         media block overrides the chrome variables. */
+      :root {
+        --bg: #11131a; --panel: #1b1e27; --panel2: #161922; --border: #2a2e3b;
+        --fg: #d6dae3; --muted: #8b93a7; --accent: #f0a35e; --termbg: #0c0e13;
+        --inputbg: #0c0e13;
+        --rowbg: #1b1e27; --active: #2b3550; --activeborder: #4a8fe7;
+        color-scheme: dark;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f4f6f9; --panel: #ffffff; --panel2: #eef1f6; --border: #d3d8e2;
+          --fg: #1b2029; --muted: #66707f; --accent: #b46418; --termbg: #0c0e13;
+          --inputbg: #ffffff;
+          --rowbg: #ffffff; --active: #dbe6fb; --activeborder: #3b7fe0;
+          color-scheme: light;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      /* Whole page is a flex column: always-visible banner/notice chrome at the
+         top, then the flex-fill #app. The banners live OUTSIDE #app (not inside
+         #main) so a status message / token-recovery notice stays visible in EVERY
+         layout state — including the narrow list-view drawer, where #main is
+         display:none. */
+      body { margin: 0; background: var(--bg); color: var(--fg);
+             font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; font-size: 14px;
+             display: flex; flex-direction: column; }
       button, input, select { font-family: inherit; font-size: 14px; }
-      button { background: #2a2e3b; color: #d6dae3; border: 1px solid #3a3f4f; border-radius: 6px; padding: 8px 10px; touch-action: manipulation; }
-      button:active { background: #3a3f4f; }
-      /* Brief local tap acknowledgement (~150ms), independent of the network
-         round-trip, so a quick-key tap visibly registers even on high latency. */
+      button { background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+               border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+      button:hover { border-color: var(--accent); }
+      button:active { background: var(--border); }
+      button:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
+      button.danger { margin-left: 12px; background: #5a2a2a; color: #ffd9d9; border-color: #7a3a3a; }
+      button.danger:active { background: #7a3a3a; }
+      /* Local tap-ack flash (~150ms, added/removed by flashTap): a quick-key tap
+         registers visibly independent of the network round-trip, so it's felt even on
+         a high-latency mobile connection (button:active only covers finger-down, not
+         the post-release ack / repeat pulses). Fixed colors read on both themes. */
       button.tapped { background: #4a8fe7; color: #fff; border-color: #4a8fe7; }
       button.danger.tapped { background: #c25555; color: #fff; border-color: #c25555; }
-      button:disabled { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
-      #list { padding: 8px; }
-      /* (ramon fork) Agent filters above the session list. Hidden while viewing a
-         split (the list itself is hidden then too). Greys out when the Agent
-         Dashboard isn't running (filters are then n/a). */
-      /* Not sticky: the header already sticks at top:0, so a second sticky bar
-         would slide under it on scroll. The filters live just below the header and
-         scroll with the list. */
-      #filterbar { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
-                   padding: 9px 12px; background: #161922; border-bottom: 1px solid #2a2e3b; }
-      #filterbar label { display: inline-flex; gap: 6px; align-items: center; color: #c8cedb;
+      /* Whole-window flex: fixed sidebar + flex-fill viewer. Responsive off the
+         #app `data-view` state (see the narrow media query at the end): wide keeps
+         both panes; narrow shows only one. min-width:0 lets it collapse cleanly on
+         a phone (the narrow breakpoint drives the drawer). */
+      #app { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; overflow-x: hidden; }
+      /* ---- Sidebar (persistent surface picker) ---------------------------- */
+      #sidebar { flex: 0 0 268px; width: 268px; min-width: 268px; display: flex;
+                 flex-direction: column; background: var(--panel2);
+                 border-right: 1px solid var(--border); overflow: hidden; }
+      #sidehdr { display: flex; gap: 8px; align-items: center; padding: 11px 12px;
+                 background: var(--panel); border-bottom: 1px solid var(--border); }
+      #sidehdr b { color: var(--accent); flex: 1 1 auto; min-width: 0; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
+      #notify { flex: 0 0 auto; padding: 6px 9px; }
+      #notify.armed { background: #4a3a1a; border-color: var(--accent); color: #f0c060; }
+      /* Same three agent filters as the phone (localStorage-persisted): heroes
+         focus, agents-only, hide-hidden. Greyed when the dashboard isn't running. */
+      #filterbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+                   padding: 9px 12px; border-bottom: 1px solid var(--border); }
+      #filterbar label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted);
                          font-size: 13px; user-select: none; -webkit-user-select: none; }
-      #filterbar input[type=checkbox] { width: 16px; height: 16px; accent-color: #f0a35e; }
+      #filterbar input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); }
       #filterbar.disabled { opacity: 0.5; }
-      #filterbar.disabled label { color: #8b93a7; }
-      /* (ramon fork / Hero Agents) The hero-focus toggle + the per-row hero star are purple,
-         matching the dashboard tile / backlog / tab marker. */
       #filterbar label.herofocus { color: #b18cff; font-weight: 600; }
       #filterbar input#f-heroes { accent-color: #b18cff; }
       .herostar { color: #b18cff; margin-right: 3px; }
-      #filternote { color: #8b93a7; font-size: 11px; flex: 1 1 100%; }
-      .grouphdr { padding: 10px 6px 5px; margin-top: 10px; border-bottom: 1px solid #2a2e3b; }
+      #filternote { color: var(--muted); font-size: 11px; flex: 1 1 100%; }
+      #tokenrecovery { display: none; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+      #tokenrecovery input[type=text] { width: 100%; background: var(--inputbg); color: var(--fg);
+        border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 6px; }
+      #list { flex: 1 1 auto; overflow-y: auto; padding: 8px; }
+      .grouphdr { padding: 10px 4px 5px; margin-top: 8px; border-bottom: 1px solid var(--border); }
       .grouphdr:first-child { margin-top: 0; }
-      .grouphdr .loc { color: #8b93a7; font-size: 11px; font-weight: bold; letter-spacing: .04em;
+      .grouphdr .loc { color: var(--muted); font-size: 10px; font-weight: bold; letter-spacing: .04em;
                        text-transform: uppercase; }
-      .grouphdr .ttl { color: #c8cedb; font-size: 13px; margin-top: 2px; word-break: break-word; }
-      .row { position: relative; padding: 12px; margin: 6px 0 6px 10px; background: #1b1e27; border: 1px solid #2a2e3b;
-             border-left: 3px solid #3a4250; border-radius: 8px; }
+      .grouphdr .ttl { color: var(--fg); font-size: 12px; margin-top: 2px; word-break: break-word; }
+      .row { position: relative; padding: 9px 10px; margin: 5px 0; background: var(--rowbg);
+             border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 7px;
+             cursor: pointer; }
+      .row:hover { border-color: var(--accent); }
+      /* The row of the surface shown in the viewer is highlighted so the picker
+         always tells you what you're driving. */
+      .row.active { background: var(--active); border-color: var(--activeborder);
+                    border-left-color: var(--activeborder); }
       .row.ishidden { opacity: 0.55; }
-      .row .t { color: #d6dae3; font-weight: bold; padding-right: 56px; }
-      /* Per-row Hide/Show toggle (mirrors the Agent Dashboard hide set). Absolutely
-         positioned top-right; its own tap must not open the surface (stopPropagation). */
-      .row .hidebtn { position: absolute; top: 10px; right: 10px; padding: 3px 9px; border-radius: 6px;
-                      background: #2a2e3b; border: 1px solid #3a3f4f; color: #b6bccb; font-size: 11px; cursor: pointer; }
-      .row .hidebtn:active { background: #3a3f4f; }
-      .row .badge { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 10px;
-                    background: #2a2e3b; color: #b6bccb; font-size: 11px; font-weight: normal;
+      .row .t { color: var(--fg); font-weight: bold; padding-right: 46px; font-size: 13px;
+                word-break: break-word; }
+      .row .hidebtn { position: absolute; top: 8px; right: 8px; padding: 2px 8px; border-radius: 6px;
+                      background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+                      font-size: 11px; }
+      .row .badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 10px;
+                    background: var(--panel); color: var(--muted); font-size: 10px; font-weight: normal;
                     vertical-align: middle; }
-      .row .bellflag { margin-left: 8px; font-size: 13px; vertical-align: middle; }
-      #clearbell { background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
-      #clearbell:active { background: #6a5320; }
-      #clearattn { background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
-      #clearattn:active { background: #6a5320; }
-      .row .p { color: #b6bccb; font-size: 12px; margin-top: 4px; word-break: break-all; }
-      .empty { padding: 12px; color: #b6bccb; }
-      #viewer { display: none; padding: 8px; }
-      #screenwrap { position: relative; }
-      /* dvh (dynamic viewport) tracks the soft keyboard so the terminal shrinks
-         when it opens instead of reserving full-height space and shoving the
-         controls off-screen; the vh line is a fallback for engines without dvh. */
-      #screen { white-space: pre; background: #0c0e13; padding: 10px; border-radius: 8px;
-                min-height: 50vh; min-height: 50dvh; max-height: 70vh; max-height: 70dvh;
-                overflow-x: auto; overflow-y: auto; }
-      #screen.wrap { white-space: pre-wrap; word-break: break-word; }
-      /* xterm.js live terminal. Shown only when the raw stream is active; the
-         <pre id="screen"> poll viewer is the fallback when xterm is missing or
-         the /stream route is unavailable (501 / error). */
-      #xterm { display: none; background: #0c0e13; padding: 6px; border-radius: 8px;
-               min-height: 50vh; min-height: 50dvh; max-height: 70vh; max-height: 70dvh; overflow: auto; }
-      #jumpbottom { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 1;
-        width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
-        background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 18px; cursor: pointer; }
-      #jumpbottom:active { background: #3a3f4f; }
-      #livebtn { display: none; position: absolute; right: 14px; bottom: 12px; z-index: 2;
-        padding: 7px 13px; border-radius: 17px; opacity: 0.92;
-        background: #2a2e3b; border: 1px solid #3a3f4f; color: #f0a35e; font-size: 13px; cursor: pointer; }
-      #livebtn:active { background: #3a3f4f; }
-      .bar { display: flex; gap: 6px; padding: 8px; flex-wrap: wrap; align-items: center; }
-      .bar input[type=text] { flex: 1; min-width: 120px; background: #0c0e13; color: #d6dae3; border: 1px solid #2a2e3b; border-radius: 6px; padding: 8px; }
-      .bar label { color: #b6bccb; font-size: 12px; }
-      .notice { padding: 12px; color: #e08a8a; }
-      #tokenrecovery { display: none; padding: 0 12px 12px; }
-      #tokenrecovery input[type=text] { width: 100%; box-sizing: border-box; background: #0c0e13; color: #d6dae3; border: 1px solid #2a2e3b; border-radius: 6px; padding: 8px; margin-bottom: 6px; }
-      #banner { display: none; padding: 8px 12px; background: #5a2a2a; color: #ffd9d9; text-align: center; }
+      .row .bellflag { margin-left: 6px; font-size: 12px; vertical-align: middle; }
+      .row .p { color: var(--muted); font-size: 11px; margin-top: 3px; word-break: break-all; }
+      .empty { padding: 12px; color: var(--muted); }
+      /* ---- Main viewer ---------------------------------------------------- */
+      #main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+      /* flex-wrap so the header's fixed children (menu + mac-layout note + Copy +
+         Clear) wrap onto a second line rather than overflowing the page body
+         sideways on a narrow viewport (the note is also hidden on narrow below). */
+      #viewhdr { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 9px 12px;
+                 background: var(--panel); border-bottom: 1px solid var(--border); }
+      /* Back/menu control — hidden on wide (the sidebar is always present), shown
+         only inside the narrow media query where it reopens the sidebar drawer. */
+      #menubtn { display: none; flex: 0 0 auto; }
+      #cur { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; color: var(--fg); font-weight: bold; }
+      #copybtn { flex: 0 0 auto; }
+      #clearbell, #clearattn { flex: 0 0 auto; background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
+      #clearbell:active, #clearattn:active { background: #6a5320; }
+      #banner { display: none; padding: 7px 12px; background: #5a2a2a; color: #ffd9d9; text-align: center; }
       #banner.ok { background: #2a4a2a; color: #d9ffd9; }
-      /* Ctrl-C is destructive next to benign keys (y/n/Esc): a danger color and a
-         left gap separate it so it is not a one-tap fat-finger neighbor. */
-      button.danger { margin-left: 12px; background: #5a2a2a; color: #ffd9d9; border-color: #7a3a3a; }
-      button.danger:active { background: #7a3a3a; }
-      /* The push toggle when ARMED — amber, matching the bell motif elsewhere. */
-      #notify.armed { background: #4a3a1a; border-color: #f0a35e; color: #f0c060; }
+      #notice { display: none; padding: 9px 12px; background: #4a3a1a; color: #f0c060; }
+      #screenwrap { position: relative; flex: 1 1 auto; min-height: 0; padding: 8px; }
+      /* xterm.js live terminal — the primary view. The <pre id="screen"> poll
+         viewer is the fallback when xterm.js is missing or /stream is unavailable. */
+      #xterm { display: none; height: 100%; background: var(--termbg); padding: 8px;
+               border-radius: 8px; overflow: auto; }
+      #screen { display: none; white-space: pre; background: var(--termbg); color: var(--fg);
+                padding: 10px; border-radius: 8px; height: 100%; margin: 0;
+                overflow-x: auto; overflow-y: auto; }
+      #placeholder { display: flex; height: 100%; align-items: center; justify-content: center;
+                     color: var(--muted); text-align: center; padding: 20px; }
+      #jumpbottom { display: none; position: absolute; right: 22px; bottom: 18px; z-index: 1;
+        width: 34px; height: 34px; padding: 0; line-height: 1; border-radius: 17px; opacity: 0.85;
+        background: var(--panel); border: 1px solid var(--border); color: var(--accent); font-size: 18px; }
+      #livebtn { display: none; position: absolute; right: 22px; bottom: 18px; z-index: 2;
+        padding: 7px 13px; border-radius: 17px; opacity: 0.92;
+        background: var(--panel); border: 1px solid var(--border); color: var(--accent); font-size: 13px; }
+      .bar { display: flex; gap: 6px; padding: 8px 12px; flex-wrap: wrap; align-items: center;
+             border-top: 1px solid var(--border); }
+      .bar input[type=text] { flex: 1; min-width: 160px; background: var(--inputbg); color: var(--fg);
+             border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+      .bar label { color: var(--muted); font-size: 12px; }
+      /* ---- Narrow (phone) breakpoint -------------------------------------- */
+      /* Below 860px the two panes become mutually exclusive, driven by #app's
+         `data-view` state: data-view="list" shows the full-width sidebar (the
+         picker) and hides the viewer; data-view="surface" hides the sidebar and
+         gives the viewer the whole screen (today's phone behavior). The #menubtn
+         back control reopens the picker. `dvh` sizes #app to the DYNAMIC viewport
+         so the flex-fill terminal tracks the soft keyboard instead of being shoved
+         off-screen (vh is the fallback for engines without dvh). */
+      @media (max-width: 859px) {
+        body { height: 100vh; height: 100dvh; }
+        #sidebar { flex-basis: 100%; width: 100%; min-width: 0; border-right: none; }
+        #main { display: none; }
+        #app[data-view="surface"] #sidebar { display: none; }
+        #app[data-view="surface"] #main { display: flex; }
+        #menubtn { display: inline-block; }
+      }
     </style>
     </head>
     <body>
-    <header>
-      <!-- No "Ghostty Web Monitor" branding here: the header is tight on a phone,
-           so the space goes to the session title (#cur), which shrinks+ellipsizes
-           rather than wrapping to a 2nd line. The browser tab <title> still names
-           the page. -->
-      <button id="back" style="display:none">&larr; Sessions</button>
-      <span id="cur"></span>
-      <!-- Push-on-bell toggle. ARM when you step away from the laptop, MUTE when
-           you are back. Disabled (n/a) unless the origin is a secure context
-           (HTTPS via `tailscale serve`) and the browser supports Push. -->
-      <button id="notify" style="margin-left:auto" aria-label="Notify on bell"
-              title="Push a notification to this device when any split rings a bell">&#128276;</button>
-    </header>
+    <!-- Always-visible chrome (top-level, OUTSIDE #app) — a status banner and a
+         role=alert notice (token recovery). Kept out of #main so they stay visible
+         in every layout state, including the narrow list-view drawer where #main is
+         hidden. -->
     <div id="banner" role="status" aria-live="polite"></div>
-    <div id="notice" class="notice" style="display:none" role="alert" aria-live="assertive"></div>
-    <div id="tokenrecovery">
-      <input id="tokeninput" type="text" placeholder="Paste token"
-             autocapitalize="off" autocorrect="off" autocomplete="off"
-             spellcheck="false" inputmode="text" enterkeyhint="go"
-             aria-label="Token">
-      <button id="tokenconnect">Connect</button>
-    </div>
-    <!-- (ramon fork) Agent filters. Mirror the Agent Dashboard: "Agents only" keeps
-         only detected CLI-agent splits; "Hide hidden" drops splits hidden in the
-         dashboard. Both default ON and persist (localStorage). Disabled when the
-         dashboard isn't running. -->
-    <div id="filterbar">
-      <label class="herofocus"><input type="checkbox" id="f-heroes"> &#9733; Focus on heroes</label>
-      <label><input type="checkbox" id="f-agents"> Agents only</label>
-      <label><input type="checkbox" id="f-visible"> Hide hidden</label>
-      <span id="filternote"></span>
-    </div>
-    <div id="list"></div>
-    <div id="viewer">
-      <!-- Poll-fallback view controls (viewport/scrollback + Refresh) only drive
-           the <pre id="screen"> poll viewer; the whole bar is hidden while the
-           live xterm stream is active, so it costs no vertical space in the
-           common case. Wrap + font-size controls were dropped to save room
-           (xterm streams at the host grid size with its own scrollback). -->
-      <div class="bar" id="modebar">
-        <label for="mode">View</label>
-        <select id="mode" aria-label="Screen view mode">
-          <option value="viewport">Viewport</option>
-          <option value="scrollback">Scrollback</option>
-        </select>
-        <button id="refresh">Refresh</button>
-      </div>
-      <div id="screenwrap">
-        <div id="xterm"></div>
-        <pre id="screen"></pre>
-        <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
-        <!-- Shown only while scrolling a full-screen app (frame mode): the phone
-             is showing the host's authoritative frames, not the live stream.
-             Tap to return to the live view. -->
-        <button id="livebtn" style="display:none" title="Return to live view">&#x25cf; Live</button>
-      </div>
-      <div class="bar">
-        <button data-key="enter">Enter</button>
-        <button data-key="space">Space</button>
-        <button data-key="y">y</button>
-        <button data-key="n">n</button>
-        <button data-key="esc">Esc</button>
-        <button data-key="tab">Tab</button>
-        <button data-key="backspace" title="Backspace / delete char">&#9003;</button>
-        <button data-key="ctrl-u" title="Clear line (Ctrl-U)">Clear</button>
-        <button data-key="ctrl-c" class="danger">Ctrl-C</button>
-        <!-- Shown only while this split has an active (unacknowledged) bell;
-             hidden again once the clear is processed (visible confirmation). -->
-        <button id="clearbell" style="display:none"
-                title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
-        <!-- (Bell Attention v2) Shown only while this split has a PROMOTED attention
-             state; clears it independently of the raw bell (P5). Uses the same 🔔
-             glyph as Clear-bell (the hourglass read as unclear) — the two stay
-             distinguished by their tooltips, not by icon. -->
-        <button id="clearattn" style="display:none"
-                title="Acknowledge/clear the &quot;needs you&quot; state for this split (it can re-promote later)">&#128276; Clear</button>
-      </div>
-      <!-- Arrows + remote-control scroll on ONE row to save vertical space.
-           Scroll is "smart" (see smartScroll): local xterm scrollback when the
-           app has any (a shell), else a real host wheel to the app (Claude Code,
-           htop, less) — which scrolls + redraws in color. Decided on xterm.js's
-           local scrollback depth, since the phone's xterm mode is unreliable. The
-           double-line glyphs (⇑⇓) distinguish scroll from the nav arrows (↑↓). -->
-      <div class="bar">
-        <button data-key="up" aria-label="Up">&uarr;</button>
-        <button data-key="down" aria-label="Down">&darr;</button>
-        <button data-key="left" aria-label="Left">&larr;</button>
-        <button data-key="right" aria-label="Right">&rarr;</button>
-        <button id="scrollup" title="Scroll up — local scrollback, or a real wheel to the app (Claude Code, htop, less)">&#8679; Scroll</button>
-        <button id="scrolldown" title="Scroll down — local scrollback, or a real wheel to the app (Claude Code, htop, less)">&#8681; Scroll</button>
-      </div>
-      <!-- Compose input is LAST so the on-screen keyboard (which docks below the
-           focused field) cannot hide the quick-key rows above it. -->
-      <div class="bar">
-        <input id="inp" type="text" placeholder="type a reply, then Send (tap Enter above to submit)"
-               autocapitalize="off" autocorrect="off" autocomplete="off"
-               spellcheck="false" inputmode="text" enterkeyhint="send"
-               aria-label="Input to send to the terminal">
-        <button id="send" title="Type into the terminal (does NOT submit — tap Enter above to send the line)">Send</button>
-      </div>
+    <div id="notice" class="notice" role="alert" aria-live="assertive"></div>
+    <div id="app" data-view="list">
+      <aside id="sidebar">
+        <div id="sidehdr">
+          <b>Ghostty Web Monitor</b>
+          <!-- Push-on-bell toggle (reuses the phone's push routes verbatim). -->
+          <button id="notify" aria-label="Notify on bell"
+                  title="Push a notification to this device when any split rings a bell">&#128276;</button>
+        </div>
+        <!-- Same three filters as the phone list (localStorage-persisted). -->
+        <div id="filterbar">
+          <label class="herofocus"><input type="checkbox" id="f-heroes"> &#9733; Focus on heroes</label>
+          <label><input type="checkbox" id="f-agents"> Agents only</label>
+          <label><input type="checkbox" id="f-visible"> Hide hidden</label>
+          <span id="filternote"></span>
+        </div>
+        <div id="tokenrecovery">
+          <input id="tokeninput" type="text" placeholder="Paste token"
+                 autocapitalize="off" autocorrect="off" autocomplete="off"
+                 spellcheck="false" inputmode="text" enterkeyhint="go" aria-label="Token">
+          <button id="tokenconnect">Connect</button>
+        </div>
+        <div id="list"></div>
+      </aside>
+      <main id="main">
+        <header id="viewhdr">
+          <!-- Narrow-layout back/menu: reopens the sidebar drawer. CSS-hidden on
+               wide (the sidebar is always present there). -->
+          <button id="menubtn" title="Back to the session list">&larr; Sessions</button>
+          <span id="cur"></span>
+          <button id="copybtn" title="Copy the terminal selection (or use &#8984;C)">Copy</button>
+          <button id="clearbell" style="display:none"
+                  title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
+          <button id="clearattn" style="display:none"
+                  title="Acknowledge/clear the &quot;needs you&quot; state for this split">&#128276; Clear</button>
+        </header>
+        <div id="screenwrap">
+          <div id="xterm"></div>
+          <pre id="screen"></pre>
+          <div id="placeholder">Select a split from the sidebar to drive it here.</div>
+          <button id="jumpbottom" title="Jump to live bottom" aria-label="Jump to live bottom">&#x2193;</button>
+          <button id="livebtn" style="display:none" title="Return to live view">&#x25cf; Live</button>
+        </div>
+        <!-- Poll-fallback controls (only drive the <pre id="screen"> poll viewer;
+             hidden while the live xterm stream is active). -->
+        <div class="bar" id="modebar" style="display:none">
+          <label for="mode">View</label>
+          <select id="mode" aria-label="Screen view mode">
+            <option value="viewport">Viewport</option>
+            <option value="scrollback">Scrollback</option>
+          </select>
+          <button id="refresh">Refresh</button>
+        </div>
+        <!-- On-screen quick-key row: a fallback for keystrokes the browser/OS eats
+             (⌘-combos, some function keys) so no action is stranded (like the phone). -->
+        <div class="bar">
+          <button data-key="enter">Enter</button>
+          <button data-key="space">Space</button>
+          <button data-key="y">y</button>
+          <button data-key="n">n</button>
+          <button data-key="esc">Esc</button>
+          <button data-key="tab">Tab</button>
+          <button data-key="backspace" title="Backspace / delete char">&#9003;</button>
+          <button data-key="ctrl-u" title="Clear line (Ctrl-U)">Clear</button>
+          <button data-key="ctrl-c" class="danger">Ctrl-C</button>
+          <button data-key="up" aria-label="Up">&uarr;</button>
+          <button data-key="down" aria-label="Down">&darr;</button>
+          <button data-key="left" aria-label="Left">&larr;</button>
+          <button data-key="right" aria-label="Right">&rarr;</button>
+          <button id="scrollup" title="Scroll up (real wheel to the app; paints the host frame)">&#8679; Scroll</button>
+          <button id="scrolldown" title="Scroll down (real wheel to the app; paints the host frame)">&#8681; Scroll</button>
+        </div>
+        <div class="bar">
+          <input id="inp" type="text" placeholder="type a reply, then Send (or just type on the terminal directly)"
+                 autocapitalize="off" autocorrect="off" autocomplete="off"
+                 spellcheck="false" inputmode="text" enterkeyhint="send"
+                 aria-label="Input to send to the terminal">
+          <button id="send" title="Type into the terminal (does NOT submit — press Enter to send)">Send</button>
+        </div>
+      </main>
     </div>
     <script>
     (function () {
-      // The token arrives in the initial URL (?token=...). We stash it in
-      // sessionStorage and thereafter send it ONLY in the X-Ghostty-Token
-      // header, so it stops appearing in request URLs / referers. NOTE: it
-      // still appears in the INITIAL page URL + browser history; if that
-      // leaks, rotate web-monitor-token.
+      // Token bootstrap — identical to the phone page: the ?token= arrives in the
+      // initial URL, is stashed in sessionStorage, and thereafter rides only the
+      // X-Ghostty-Token header on /api/* (scrubbed from the visible URL/history).
       var token = new URLSearchParams(location.search).get("token");
       if (token) {
         try { sessionStorage.setItem("ghostty_token", token); } catch (e) {}
-        // Scrub it from the visible URL / history.
         try { history.replaceState(null, "", location.pathname); } catch (e) {}
       } else {
         try { token = sessionStorage.getItem("ghostty_token"); } catch (e) {}
@@ -2165,40 +2247,38 @@ final class WebMonitorServer {
       var tokenInput = document.getElementById("tokeninput");
       var tokenConnect = document.getElementById("tokenconnect");
       var banner = document.getElementById("banner");
+      var app = document.getElementById("app");
+      var menuBtn = document.getElementById("menubtn");
       var listEl = document.getElementById("list");
       var filterBar = document.getElementById("filterbar");
       var fHeroes = document.getElementById("f-heroes");
       var fAgents = document.getElementById("f-agents");
       var fVisible = document.getElementById("f-visible");
       var filterNote = document.getElementById("filternote");
-      var viewer = document.getElementById("viewer");
       var screenEl = document.getElementById("screen");
+      var xtermEl = document.getElementById("xterm");
+      var placeholderEl = document.getElementById("placeholder");
       var jumpBtn = document.getElementById("jumpbottom");
       var liveBtn = document.getElementById("livebtn");
-      var backBtn = document.getElementById("back");
       var curEl = document.getElementById("cur");
+      var copyBtn = document.getElementById("copybtn");
       var clearBellBtn = document.getElementById("clearbell");
       var clearAttnBtn = document.getElementById("clearattn");
       var modeEl = document.getElementById("mode");
-      // The whole poll-fallback control bar (View/Refresh); hidden while the live
-      // xterm stream is active so it costs no vertical space in the common case.
       var modeToggleEl = document.getElementById("modebar");
       var inp = document.getElementById("inp");
-      var xtermEl = document.getElementById("xterm");
       var current = null, timer = null, listTimer = null;
-      // Active live-stream handle (xterm.js raw byte stream). Held in a module
-      // var so showSurface/Back/teardown can dispose it before starting another.
+      // Active live-stream handle (xterm.js raw byte stream). Single-surface
+      // invariant: at most one live stream — showSurface disposes the old first.
       var stream = null;
+      // Frame-mode state (scrolling a full-screen app; see smartScroll).
+      var frameMode = false, framePending = false;
+      // The surface for which we've already seeded the scroll cursor (see sendScroll).
+      var scrollSeededFor = null;
 
-      // Show the no-token / 401 notice together with an in-page token-recovery
-      // form. The URL was scrubbed via replaceState, so a phone user who lost
-      // the ?token=... link has no other way to re-enter it. Connecting stores
-      // the entered token in sessionStorage and (re)starts the fetches.
       function showTokenRecovery(msg) {
         notice.style.display = "block";
-        notice.textContent = msg;  // textContent: untrusted-safe, no innerHTML
-        // Don't disturb the input (clear/refocus) if the form is already shown:
-        // a background poll/list 401 must not wipe a token the user is typing.
+        notice.textContent = msg;
         if (tokenRecovery.style.display === "block") return;
         tokenRecovery.style.display = "block";
         tokenInput.value = "";
@@ -2212,19 +2292,15 @@ final class WebMonitorServer {
         notice.style.display = "none";
         tokenRecovery.style.display = "none";
         tokenInput.value = "";
-        start();  // re-run the fetches with the freshly entered token
+        start();
       };
       tokenInput.addEventListener("keydown", function (e) {
         if (e.key === "Enter") { e.preventDefault(); tokenConnect.onclick(); }
       });
 
-      // Token is OPTIONAL: when the server runs open (empty web-monitor-token)
-      // we proceed without one. If a token IS required and we lack it, requests
-      // return 401 and the 401 handlers below show the in-page recovery UI.
-
       function headers(extra) {
         var h = {};
-        if (token) h["X-Ghostty-Token"] = token;  // omitted when running open
+        if (token) h["X-Ghostty-Token"] = token;
         if (extra) for (var k in extra) h[k] = extra[k];
         return h;
       }
@@ -2234,12 +2310,8 @@ final class WebMonitorServer {
         for (var k in params) { if (params[k] != null && params[k] !== "") { p.set(k, params[k]); any = true; } }
         return any ? (path + "?" + p.toString()) : path;
       }
-      // Load the vendored xterm.js + xterm.css served by the app (assetRoutes,
-      // query-token allowed). These are TAGS, not fetches, so the token rides
-      // in the query string like the GET / bootstrap. If they fail to load,
-      // window.Terminal stays undefined and openStream() degrades to the
-      // <pre id="screen"> poll fallback. Build the URLs with url() so the token
-      // is appended exactly like every other request.
+      // Load the SAME vendored xterm.js + xterm.css + JetBrains Mono the phone page
+      // uses (served by assetRoutes; token rides the query string on these tags).
       (function () {
         var css = document.createElement("link");
         css.rel = "stylesheet";
@@ -2248,9 +2320,6 @@ final class WebMonitorServer {
         var js = document.createElement("script");
         js.src = url("/xterm.js", { token: token });
         document.head.appendChild(js);
-        // Inject the JetBrains Mono @font-face HERE (not in static <style>) so the
-        // woff2 src URLs carry ?token= via url(), exactly like the xterm assets the
-        // browser pulls in. font-display:swap renders fallback first, then swaps.
         var ff = document.createElement("style");
         ff.textContent =
           '@font-face{font-family:"JetBrains Mono";font-weight:400;font-style:normal;font-display:swap;' +
@@ -2258,17 +2327,11 @@ final class WebMonitorServer {
           '@font-face{font-family:"JetBrains Mono";font-weight:700;font-style:normal;font-display:swap;' +
             'src:url("' + url("/jetbrains-mono-bold.woff2", { token: token }) + '") format("woff2");}';
         document.head.appendChild(ff);
-        // Eagerly start the download so the font is ready before the user opens a
-        // surface; xterm.js caches char metrics at term.open(), and the later
-        // resize-to-host-grid re-measures, so a slightly-late swap self-corrects.
         if (document.fonts && document.fonts.load) {
-          try { document.fonts.load('14px "JetBrains Mono"'); document.fonts.load('bold 14px "JetBrains Mono"'); } catch (e) {}
+          try { document.fonts.load('15px "JetBrains Mono"'); document.fonts.load('bold 15px "JetBrains Mono"'); } catch (e) {}
         }
       })();
-      // bannerIsError tracks whether the visible banner is a sticky error
-      // (send failure / session closed). Sticky errors persist until the next
-      // explicit user action; the poll()/loadList() success paths must NOT wipe
-      // them. Call setBanner(msg, ok, true) to mark a banner sticky.
+
       var bannerIsError = false;
       function setBanner(msg, ok, sticky) {
         if (!msg) { banner.style.display = "none"; bannerIsError = false; return; }
@@ -2277,24 +2340,12 @@ final class WebMonitorServer {
         banner.style.display = "block";
         bannerIsError = !!sticky;
       }
-      // Clear the banner only if it is not a sticky error. Used on the
-      // poll()/loadList() success paths so a send-failure / session-closed
-      // banner survives the next successful poll.
       function clearBannerIfNotError() { if (!bannerIsError) setBanner(null); }
 
-      // True until the list has rendered real content at least once; only then
-      // do we suppress the "Loading…" placeholder so background refreshes
-      // (~3s) re-render rows in place without flashing/losing scroll.
       var listLoaded = false;
-      // Enable/disable the agent filters depending on whether the Agent Dashboard
-      // is running. When it isn't, the checkboxes are disabled (their persisted
-      // checked state is kept, just not applied) and a note explains why. "Hide
-      // hidden" only layers on top of "Agents only" (hiding is an agent concept),
-      // so it's also disabled — and not applied — whenever "Agents only" is off.
+      // Same availability logic as the phone: filters need the dashboard running;
+      // "Focus on heroes" is a full override that greys out the other two.
       function applyFilterAvailability(dashboard) {
-        // (Hero Agents) "Focus on heroes" is a full override: when it's on it shows ONLY heroes
-        // and IGNORES agents-only / hide-hidden, so those two are disabled (state kept, not
-        // applied). It needs the dashboard running (the hero set comes from it).
         var heroFocus = dashboard && fHeroes.checked;
         fHeroes.disabled = !dashboard;
         fAgents.disabled = !dashboard || heroFocus;
@@ -2310,10 +2361,20 @@ final class WebMonitorServer {
         }
       }
 
+      // Mark the row of the currently-viewed surface active (so the persistent
+      // sidebar always shows what the viewer is driving). Called immediately on
+      // select and again after each list refresh.
+      function highlightActive() {
+        Array.prototype.forEach.call(listEl.querySelectorAll(".row"), function (el) {
+          el.classList.toggle("active", el.getAttribute("data-id") === current);
+        });
+      }
+
+      // Reused nearly verbatim from the phone loadList(): fetch /api/surfaces,
+      // apply the three filters, group by window+tab, render rows. The desktop
+      // difference is the row carries data-id + an active highlight and the list
+      // is NEVER hidden (it lives in the persistent sidebar).
       function loadList() {
-        // Show the placeholder only on the FIRST/empty load. On a background
-        // refresh the rows are diffed/replaced in place (see below) so the
-        // list does not flash or jump to the top.
         if (!listLoaded) listEl.innerHTML = "<div class='empty'>Loading\\u2026</div>";
         fetch(url("/api/surfaces"), { headers: headers() }).then(function (r) {
           if (r.status === 401) throw new Error("401");
@@ -2322,17 +2383,9 @@ final class WebMonitorServer {
         }).then(function (data) {
           clearBannerIfNotError();
           listLoaded = true;
-          // The /api/surfaces response is {agentDashboard:Bool, surfaces:[...]}.
           var allRows = (data && data.surfaces) || [];
           var dashboard = !!(data && data.agentDashboard);
           applyFilterAvailability(dashboard);
-          // Filters only apply when the dashboard is running (its agent/hidden
-          // signal would be meaningless otherwise — never silently hide rows).
-          // "Hide hidden" only applies on top of "Agents only": with agents-only
-          // off, hidden splits are SHOWN (the checkbox is disabled too).
-          // (Hero Agents) "Focus on heroes" OVERRIDES the other filters: show ONLY heroes and
-          // IGNORE hides/agents-only (a hero is load-bearing — you want it regardless of hide
-          // state). When off, regular mode (agents-only + hide-hidden) as before.
           var heroFocus = dashboard && fHeroes.checked;
           var agentsOnly = !heroFocus && dashboard && fAgents.checked;
           var hideHidden = agentsOnly && fVisible.checked;
@@ -2342,43 +2395,25 @@ final class WebMonitorServer {
             if (hideHidden && row.hidden) return false;
             return true;
           });
-          if (!allRows.length) {
-            listEl.innerHTML = "<div class='empty'>No active sessions.</div>";
-            return;
-          }
-          if (!rows.length) {
-            // Surfaces exist but all were filtered out — say so rather than imply
-            // there are no sessions, so the filters never read as a dead end.
-            listEl.innerHTML = "<div class='empty'>No sessions match the filters.</div>";
-            return;
-          }
-          // Group the panes by window + tab so the list mirrors the Mac layout.
+          if (!allRows.length) { listEl.innerHTML = "<div class='empty'>No active sessions.</div>"; return; }
+          if (!rows.length) { listEl.innerHTML = "<div class='empty'>No sessions match the filters.</div>"; return; }
           var groups = [], byKey = {};
           rows.forEach(function (row) {
             var wi = row.window || 0, ti = row.tab || 0;
             var key = wi + ":" + ti;
             var g = byKey[key];
-            if (!g) {
-              g = byKey[key] = { window: wi, tab: ti, tabTitle: row.tabTitle || "", rows: [] };
-              groups.push(g);
-            }
+            if (!g) { g = byKey[key] = { window: wi, tab: ti, tabTitle: row.tabTitle || "", rows: [] }; groups.push(g); }
             g.rows.push(row);
           });
           groups.sort(function (a, b) { return (a.window - b.window) || (a.tab - b.tab); });
-          // Only label the window when there's more than one window group.
           var winSet = {}; groups.forEach(function (g) { winSet[g.window] = 1; });
           var multiWin = Object.keys(winSet).length > 1;
-          // Build the new rows off-screen, then swap them in atomically so the
-          // visible list never blanks to a placeholder between refreshes.
           var frag = document.createDocumentFragment();
           groups.forEach(function (g) {
             var h = document.createElement("div"); h.className = "grouphdr";
-            // Location line: omit "Window N" entirely when everything is in one
-            // window, so the common case reads as just "Tab 1", "Tab 2", ...
             var loc = document.createElement("div"); loc.className = "loc";
             loc.textContent = (multiWin ? ("Window " + (g.window + 1) + " \\u00b7 ") : "") + "Tab " + (g.tab + 1);
             h.appendChild(loc);
-            // Tab title on its own line so a long title wraps instead of crowding.
             if (g.tabTitle) {
               var ttl = document.createElement("div"); ttl.className = "ttl";
               ttl.textContent = g.tabTitle;
@@ -2388,23 +2423,18 @@ final class WebMonitorServer {
             g.rows.forEach(function (row) {
               var d = document.createElement("div");
               d.className = "row";
+              d.setAttribute("data-id", row.id);
+              if (row.id === current) d.classList.add("active");
               var t = document.createElement("div"); t.className = "t";
-              // (Hero Agents) A purple star marks a hero split (matches the dashboard/tab star).
               if (row.hero) {
                 var hs = document.createElement("span"); hs.className = "herostar";
                 hs.textContent = "\\u2605"; hs.title = "Hero";
                 t.appendChild(hs);
               }
               t.appendChild(document.createTextNode(row.title || "(untitled)"));
-              // (Bell Attention v2) The alert flag follows the monitor-tier-routed
-              // `attnIndicator`. Both a PROMOTED attention and a raw bell render the
-              // SAME 🔔 glyph — the hourglass for "needs you" read as unclear, so the two
-              // tiers are visually unified to one bell. The underlying `attentionNeeded`
-              // vs `bell` distinction still drives the Clear-attention / Clear-bell
-              // controls; only the at-a-glance list marker is unified.
               if (row.attnIndicator) {
                 var bf = document.createElement("span"); bf.className = "bellflag";
-                bf.textContent = "\\uD83D\\uDD14";    // 🔔 — a bell OR a promoted "needs you"
+                bf.textContent = "\\uD83D\\uDD14";
                 t.appendChild(bf);
               }
               if ((row.splitCount || 1) > 1) {
@@ -2414,10 +2444,6 @@ final class WebMonitorServer {
               }
               var p = document.createElement("div"); p.className = "p"; p.textContent = row.pwd || "";
               d.appendChild(t); d.appendChild(p);
-              // Hide/Show toggle: reuses the Agent Dashboard hide set (POST /hidden),
-              // so hiding here == hiding in the dashboard. Only meaningful when the
-              // dashboard is running, so it's shown only then. When a hidden row is
-              // visible (because "Hide hidden" is off) it reads "Show" and dims the row.
               if (dashboard) {
                 if (row.hidden) d.classList.add("ishidden");
                 var hb = document.createElement("button"); hb.className = "hidebtn";
@@ -2425,10 +2451,7 @@ final class WebMonitorServer {
                 hb.title = row.hidden
                   ? "Reveal this split (in the dashboard + monitor)"
                   : "Hide this split from the dashboard + monitor";
-                hb.onclick = function (ev) {
-                  ev.stopPropagation();       // don't also open the surface
-                  setHidden(row.id, !row.hidden);
-                };
+                hb.onclick = function (ev) { ev.stopPropagation(); setHidden(row.id, !row.hidden); };
                 d.appendChild(hb);
               }
               d.onclick = function () { showSurface(row.id, row.title, row.bell); };
@@ -2440,24 +2463,19 @@ final class WebMonitorServer {
           if (String(e.message) === "401") {
             showTokenRecovery("Unauthorized. The token is wrong or was rotated. Reopen with ?token=..., or paste a token below.");
             listEl.innerHTML = "";
-            listLoaded = false;  // wiped: let a recovery re-show the placeholder
+            listLoaded = false;
           } else {
             setBanner("Connection lost \\u2014 retrying\\u2026", false);
           }
         });
       }
 
-      // The session this viewer was watching is gone (server returned 404).
-      // Shared by the poll() 404 path and reportSend()'s 404 handling so a
-      // send that 404s tears down identically instead of leaving a stale
-      // viewer + sticky banner until the next poll fires.
+      // The viewed session is gone (404): drop the viewer back to the placeholder
+      // but keep the sidebar. Shared by the poll()/stream/send 404 paths.
       function sessionClosedTeardown() {
         setBanner("Session closed.", false, true);
-        if (timer) { clearInterval(timer); timer = null; }
-        current = null;
-        // Offer return to the list.
+        showPlaceholder();
         loadList();
-        showList();
       }
 
       function poll(userInitiated) {
@@ -2471,13 +2489,9 @@ final class WebMonitorServer {
           })
           .then(function (txt) {
             clearBannerIfNotError();
-            // Preserve scroll: only auto-stick to bottom if already near it.
-            // On a user-initiated change (mode/wrap/font), the old pixel
-            // scrollTop is meaningless against the new content, so jump to the
-            // live bottom instead of restoring it.
             var wasNearBottom = isNearBottom();
             var prevTop = screenEl.scrollTop;
-            screenEl.textContent = txt;  // textContent: no HTML/JS injection
+            screenEl.textContent = txt;
             if (userInitiated || wasNearBottom) screenEl.scrollTop = screenEl.scrollHeight;
             else screenEl.scrollTop = prevTop;
             updateJumpBtn();
@@ -2487,81 +2501,67 @@ final class WebMonitorServer {
             if (m === "404") {
               sessionClosedTeardown();
             } else if (m === "401") {
-              // Token was rotated mid-session: stop polling (otherwise we'd
-              // 401-spam every 700ms) and surface the same persistent, actionable
-              // notice as loadList's 401 path.
               if (timer) { clearInterval(timer); timer = null; }
               current = null;
               setBanner(null);
               showTokenRecovery("Unauthorized. The token is wrong or was rotated. Reopen with ?token=..., or paste a token below.");
-              showList();
+              showPlaceholder();
             } else {
               setBanner("Connection lost \\u2014 reconnecting\\u2026", false);
             }
           });
       }
 
-      // True when the screen is scrolled to (or very near) its live bottom.
-      // The same threshold drives auto-follow re-stick and the jump button's
-      // visibility, so the button appears exactly when auto-follow has stopped.
       function isNearBottom() {
         return (screenEl.scrollHeight - screenEl.scrollTop - screenEl.clientHeight) < 24;
       }
-      // Show the jump-to-bottom button only while the user has scrolled up
-      // (auto-follow paused). Hidden when already at the live bottom so it stays
-      // unobtrusive, especially on mobile.
       function updateJumpBtn() {
-        jumpBtn.style.display = isNearBottom() ? "none" : "block";
+        jumpBtn.style.display = (screenEl.style.display !== "none" && !isNearBottom()) ? "block" : "none";
       }
       jumpBtn.onclick = function () {
-        screenEl.scrollTop = screenEl.scrollHeight;  // jump to live bottom, re-arm auto-follow
+        screenEl.scrollTop = screenEl.scrollHeight;
         updateJumpBtn();
       };
       screenEl.addEventListener("scroll", updateJumpBtn);
 
-      // Dispose any active live stream: cancel the body reader and tear down the
-      // xterm.js instance, then hide the xterm container. Idempotent.
       function disposeStream() {
         if (!stream) return;
         var s = stream; stream = null;
         try { s.dispose(); } catch (e) {}
         xtermEl.style.display = "none";
-        xtermEl.replaceChildren();  // drop the old terminal's DOM
+        xtermEl.replaceChildren();
       }
 
-      // Switch this viewer to the plain-text poll fallback (the <pre id="screen">
-      // viewer). Used when xterm.js is unavailable or the /stream route fails.
-      // Shows the poll viewer, starts the 700ms poll, and surfaces a banner.
       function fallbackToPoll(msg) {
         disposeStream();
         frameMode = false; framePending = false; liveBtn.style.display = "none";
+        placeholderEl.style.display = "none";
         screenEl.style.display = "block";
-        modeToggleEl.style.display = "";  // poll viewer active: the mode toggle applies again
+        modeToggleEl.style.display = "flex";
         if (msg) setBanner(msg, false);
         if (!current) return;
         poll();
         if (timer) clearInterval(timer);
-        timer = setInterval(poll, 700);  // >= ~600ms (cache TTL ~500ms)
+        timer = setInterval(poll, 700);
       }
 
-      // Open the live raw-byte stream for `uuid` into an xterm.js terminal. Only
-      // attempts the stream if window.Terminal loaded; otherwise returns null so
-      // the caller uses the poll fallback. Pipes response.body bytes into
-      // term.write(). On fetch reject / non-ok / 501 / stream end, surfaces the
-      // connection-lost / "Session closed." banner and falls back to the poll
-      // viewer. Returns a handle with dispose() (cancel reader + term.dispose()).
+      // Open the live raw-byte stream for `uuid` into an xterm.js terminal — the
+      // same path as the phone page, but with a desktop-scale font size. Sizes the
+      // terminal to the HOST grid from the X-Ghostty-Cols/-Rows headers (never
+      // resizes the PTY). Degrades to the poll fallback on any failure.
       function openStream(uuid) {
         if (!window.Terminal) return null;
         var term = new Terminal({
           convertEol: false,
           scrollback: 10000,
-          fontSize: 14,
+          fontSize: 15,
           fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace'
         });
         term.open(xtermEl);
+        placeholderEl.style.display = "none";
         xtermEl.style.display = "block";
-        screenEl.style.display = "none";  // hide the poll fallback while streaming
-        modeToggleEl.style.display = "none";  // viewport/scrollback toggle is moot under xterm
+        screenEl.style.display = "none";
+        modeToggleEl.style.display = "none";
 
         var reader = null;
         var disposed = false;
@@ -2574,16 +2574,12 @@ final class WebMonitorServer {
 
         fetch(url("/api/surface/" + uuid + "/stream"), { headers: headers({}) })
           .then(function (r) {
-            // 404 -> session gone; 501 -> no pty-host (stream unavailable); any
-            // other non-ok -> connection problem. All degrade to the poll viewer.
             if (r.status === 404) { if (stream === handle) { sessionClosedTeardown(); } return; }
             if (!r.ok || !r.body) {
               if (stream === handle) fallbackToPoll("Live stream unavailable \\u2014 using snapshot.");
               return;
             }
             reader = r.body.getReader();
-            // Match xterm.js to the HOST grid (sent as headers) so cursor-
-            // addressed output renders correctly instead of wrapping into garbage.
             var hc = parseInt(r.headers.get("X-Ghostty-Cols"), 10);
             var hr = parseInt(r.headers.get("X-Ghostty-Rows"), 10);
             if (hc > 0 && hr > 0) { try { term.resize(hc, hr); } catch (e) {} }
@@ -2591,16 +2587,10 @@ final class WebMonitorServer {
               return reader.read().then(function (res) {
                 if (disposed) return;
                 if (res.done) {
-                  // Source closed: the session ended or the host dropped. Fall
-                  // back to a poll so a still-live session keeps updating.
                   if (stream === handle) fallbackToPoll("Live stream ended \\u2014 using snapshot.");
                   return;
                 }
-                // In frame mode we PAINT the host's authoritative frames instead
-                // (see frameScroll); skip the live re-emulated bytes so they don't
-                // fight the painted frame. Keep draining the reader so the socket
-                // doesn't stall; on exit we reconnect to resync cleanly.
-                if (!frameMode) term.write(res.value);  // Uint8Array; xterm accepts it
+                if (!frameMode) term.write(res.value);
                 return pump();
               });
             }
@@ -2611,49 +2601,42 @@ final class WebMonitorServer {
             if (stream === handle) fallbackToPoll("Connection lost \\u2014 using snapshot.");
           });
 
-        // Expose `term` so smartScroll can read the live terminal's mode
-        // (alt-screen buffer + mouse-tracking) to decide wheel vs. PageUp/Down.
         var handle = { dispose: teardown, term: term };
         return handle;
       }
 
-      function showList() {
+      // No surface selected: keep the sidebar, show the placeholder in the viewer.
+      // On narrow layouts data-view="list" collapses the viewer and reveals the
+      // full-width sidebar drawer (the phone "back" behavior); on wide it is inert.
+      function showPlaceholder() {
         disposeStream();
         frameMode = false; framePending = false; liveBtn.style.display = "none";
-        viewer.style.display = "none";
-        listEl.style.display = "block";
-        filterBar.style.display = "flex";
-        backBtn.style.display = "none";
+        current = null;
+        app.dataset.view = "list";
+        if (timer) { clearInterval(timer); timer = null; }
+        xtermEl.style.display = "none";
+        screenEl.style.display = "none";
+        modeToggleEl.style.display = "none";
+        placeholderEl.style.display = "flex";
         curEl.textContent = "";
-        jumpBtn.style.display = "none";  // not viewing a screen: hide the jump affordance
+        jumpBtn.style.display = "none";
         setClearBellVisible(false);
         setClearAttnVisible(false);
+        highlightActive();
       }
 
-      // The Clear-bell button is only meaningful when this split has an active
-      // bell, so it's hidden otherwise; its disappearance after a clear doubles
-      // as confirmation the bell was acknowledged (no trip back to the list).
-      function setClearBellVisible(on) {
-        clearBellBtn.style.display = on ? "inline-block" : "none";
-      }
+      function setClearBellVisible(on) { clearBellBtn.style.display = on ? "inline-block" : "none"; }
+      function setClearAttnVisible(on) { clearAttnBtn.style.display = on ? "inline-block" : "none"; }
 
-      // (Bell Attention v2) The Clear-attention button mirrors Clear-bell for the
-      // PROMOTED state (P5: cleared independently of the raw bell).
-      function setClearAttnVisible(on) {
-        clearAttnBtn.style.display = on ? "inline-block" : "none";
-      }
-
-      // While viewing a split the detail view doesn't poll the session list, so
-      // refresh the Clear-bell/Clear-attention buttons against the live state —
-      // both to reveal one if a bell rings / a promotion lands mid-view and to
-      // drop it once a clear lands.
+      // Refresh the Clear-bell/Clear-attention buttons against the live state for
+      // the viewed split (a bell may ring / a promotion may land mid-view).
       function refreshBellButton() {
         if (!current) return;
         var want = current;
         fetch(url("/api/surfaces"), { headers: headers() })
           .then(function (r) { return r && r.ok ? r.json() : null; })
           .then(function (data) {
-            if (!data || current !== want) return;  // navigated away meanwhile
+            if (!data || current !== want) return;
             var rows = data.surfaces || [];
             var hit = null;
             for (var i = 0; i < rows.length; i++) { if (rows[i].id === want) { hit = rows[i]; break; } }
@@ -2662,51 +2645,67 @@ final class WebMonitorServer {
           .catch(function () {});
       }
 
+      // Pick a surface: swap the viewer's content in place (sidebar stays). Single
+      // live stream — dispose the old, open the new. Reuses the phone's
+      // disposeStream()+openStream() sequence.
+      //
+      // NOTE: unlike the old phone-only page this deliberately does NOT inp.focus()
+      // at the end. On the unified client an always-focused Send field would make
+      // the global keydown driver bail (isTypingField), disabling desktop keyboard
+      // driving — so we leave focus on the body/terminal. The phone trade-off is the
+      // soft keyboard no longer auto-pops on open (tap the Send field to raise it).
       function showSurface(id, title, bell) {
         current = id;
-        frameMode = false; framePending = false; liveBtn.style.display = "none";  // fresh view = live
-        scrollSeededFor = null;       // re-seed the scroll cursor once for this viewing
-        setClearBellVisible(!!bell);  // seed from the clicked row; refresh corrects it
-        setClearAttnVisible(false);   // refresh corrects from live state
+        // On narrow layouts this collapses the sidebar drawer and gives the viewer
+        // the whole screen; on wide it is inert (both panes always show).
+        app.dataset.view = "surface";
+        frameMode = false; framePending = false; liveBtn.style.display = "none";
+        scrollSeededFor = null;
+        setClearBellVisible(!!bell);
+        setClearAttnVisible(false);
         refreshBellButton();
-        listEl.style.display = "none";
-        filterBar.style.display = "none";
-        viewer.style.display = "block";
-        backBtn.style.display = "inline-block";
+        placeholderEl.style.display = "none";
         curEl.textContent = title || "";
         setBanner(null);
-        // Prefer the live xterm.js raw stream (color + scrollback + live). If
-        // xterm.js isn't loaded, openStream returns null and we use the plain
-        // poll viewer. openStream itself falls back to the poll on stream failure.
         disposeStream();
         stream = openStream(id);
         if (stream) {
-          // Streaming: no poll timer (the stream is the live source). Keep the
-          // poll fallback hidden until/unless the stream degrades.
           if (timer) { clearInterval(timer); timer = null; }
         } else {
           screenEl.style.display = "block";
-          modeToggleEl.style.display = "";  // poll viewer: the viewport/scrollback toggle applies
+          modeToggleEl.style.display = "flex";
           poll();
           if (timer) clearInterval(timer);
-          timer = setInterval(poll, 700);  // >= ~600ms (cache TTL ~500ms)
+          timer = setInterval(poll, 700);
         }
-        inp.focus();
+        highlightActive();
       }
 
-      backBtn.onclick = function () {
-        // If we were paging a full-screen app via frame mode, snap it back to the
-        // live bottom so the desktop mirror isn't left parked in scrollback.
+      // Narrow-layout back/menu control: reopen the sidebar drawer, mirroring the
+      // phone "← Sessions" back. If we were in frame mode (scrollback), snap the
+      // app back to the live bottom first (same as exiting frame mode), then drop
+      // to the placeholder (which disposes the stream + sets data-view="list") and
+      // refresh the list. CSS-hidden on wide, so this only runs on narrow.
+      menuBtn.onclick = function () {
         if (frameMode) { sendScroll(-30); sendScroll(-30); }
-        current = null;
-        if (timer) { clearInterval(timer); timer = null; }
-        showList();   // resets frameMode + disposes the stream
+        showPlaceholder();
         loadList();
       };
 
-      // Acknowledge/clear the bell for the viewed split WITHOUT focusing it on
-      // the Mac (so it stays free to ring again later). The server drops the
-      // 🔔/border/badge for that surface.
+      copyBtn.onclick = function () {
+        if (!(stream && stream.term)) { noActiveSession(); return; }
+        var sel = "";
+        try { sel = stream.term.getSelection(); } catch (e) {}
+        if (!sel) { setBanner("No selection to copy.", false); setTimeout(clearBannerIfNotError, 1200); return; }
+        if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(sel)
+            .then(function () { setBanner("Copied.", true); setTimeout(clearBannerIfNotError, 1200); })
+            .catch(function () { setBanner("Copy failed \\u2014 try \\u2318C.", false, true); });
+        } else {
+          setBanner("Copy needs HTTPS \\u2014 use \\u2318C, or put `tailscale serve` in front.", false, true);
+        }
+      };
+
       clearBellBtn.onclick = function () {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/bell"), { method: "POST", headers: headers() })
@@ -2717,10 +2716,6 @@ final class WebMonitorServer {
           })
           .catch(function () { setBanner("Clear bell failed \\u2014 not delivered.", false, true); });
       };
-
-      // (Bell Attention v2) Acknowledge/clear the PROMOTED "needs you" state for the
-      // viewed split WITHOUT focusing it — drops the attention-tier border/title/badge
-      // independently of the raw bell (the sidecar can re-promote later).
       clearAttnBtn.onclick = function () {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/attention"), { method: "POST", headers: headers() })
@@ -2732,16 +2727,10 @@ final class WebMonitorServer {
           .catch(function () { setBanner("Clear attention failed \\u2014 not delivered.", false, true); });
       };
 
-      // View preferences persist across page loads (localStorage; best-effort).
       function prefGet(k, dflt) { try { var v = localStorage.getItem(k); return v === null ? dflt : v; } catch (e) { return dflt; } }
       function prefSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
-      // Restore the saved poll-fallback view mode (wrap/font controls were removed).
       modeEl.value = prefGet("ghostty_mode", modeEl.value);
 
-      // Agent filters: default ON (only non-hidden agents) and persist per device.
-      // Toggling re-renders the list immediately against the cached fetch.
-      // (Hero Agents) "Focus on heroes" defaults OFF (regular mode); persisted. Toggling it
-      // re-applies availability (it greys out the other two while on) then reloads the list.
       fHeroes.checked = prefGet("ghostty_filter_heroes", "0") === "1";
       fAgents.checked = prefGet("ghostty_filter_agents", "1") === "1";
       fVisible.checked = prefGet("ghostty_filter_visible", "1") === "1";
@@ -2752,9 +2741,6 @@ final class WebMonitorServer {
       document.getElementById("refresh").onclick = poll;
       modeEl.onchange = function () { prefSet("ghostty_mode", modeEl.value); poll(true); };
 
-      // A quick-key / Send tapped after the viewed session was torn down (e.g. a
-      // 404 cleared `current`) would otherwise be a silent dead tap. Surface a
-      // brief, non-sticky "No active session." banner instead so the tap isn't lost.
       function noActiveSession() { setBanner("No active session.", false); setTimeout(clearBannerIfNotError, 1500); }
       function sendKey(key) {
         if (!current) { noActiveSession(); return; }
@@ -2769,18 +2755,12 @@ final class WebMonitorServer {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/input"), {
           method: "POST",
-          headers: headers({ "Content-Type": "text/plain" }),  // explicit: server keys off Content-Type (S11)
+          headers: headers({ "Content-Type": "text/plain" }),
           body: text
         }).then(reportSend).catch(function () { setBanner("Send failed \\u2014 not delivered.", false, true); });
       }
       function reportSend(r) {
-        // ~1500ms (was 600ms): a throttled/backgrounded mobile tab can easily miss
-        // a 600ms flash. A later successful poll/list still clears it earlier via
-        // clearBannerIfNotError (it is not sticky), so this only sets the ceiling.
         if (r && r.ok) { setBanner("Sent.", true); setTimeout(function () { clearBannerIfNotError(); }, 1500); }
-        // A 404 means the session is gone: tear down exactly like the poll()
-        // 404 path (clear timer, current=null, sticky "Session closed." banner,
-        // back to the list) instead of leaving a stale viewer + sticky banner.
         else if (r && r.status === 404) { sessionClosedTeardown(); }
         else { setBanner("Send failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
       }
@@ -2788,10 +2768,6 @@ final class WebMonitorServer {
       function doSend() {
         var v = inp.value;
         if (!v) return;
-        // Type the text into the terminal (text/plain -> server turns it into
-        // typed key events). Does NOT press Enter: submitting is a separate,
-        // explicit action (the Enter quick-key below), so you can type/review a
-        // reply on the live screen and then send it deliberately.
         sendText(v);
         inp.value = "";
         inp.focus();
@@ -2799,32 +2775,150 @@ final class WebMonitorServer {
       }
       var sendBtn = document.getElementById("send");
       sendBtn.onclick = doSend;
-      // Return in the text field types the text too (does NOT submit) — Enter is
-      // the explicit Enter quick-key.
       inp.addEventListener("keydown", function (e) {
         if (e.key === "Enter") { e.preventDefault(); doSend(); }
       });
-      function syncSendEnabled() {
-        sendBtn.disabled = !inp.value;
-      }
+      function syncSendEnabled() { sendBtn.disabled = !inp.value; }
       inp.addEventListener("input", syncSendEnabled);
       syncSendEnabled();
 
-      // Brief local visual ack on tap, independent of the network round-trip,
-      // so the user sees the press registered even under latency. Re-arms the
-      // timer on rapid repeat taps so the flash always lasts ~150ms from the
-      // last tap; does not change what bytes are sent.
+      // ---- Global keyboard handling (the core desktop-mode work) --------------
+      // A CAPTURE-phase document keydown handler maps browser keystrokes to real
+      // key events on the surface (POST /input), then preventDefault()s so the
+      // browser doesn't also act. Capture runs BEFORE xterm.js's own hidden
+      // textarea handler, so we own the keystroke (xterm is display-only here).
+      //
+      // Text batching: consecutive printables are coalesced into one text/plain
+      // POST within a short window (kinder to the core's 64-slot IO mailbox — see
+      // keySpecs(forText:)); a named/ctrl key flushes the buffer first so ordering
+      // is preserved (typed "ab" then Enter submits "ab" then Enter).
+      var typeBuf = "", typeTimer = null;
+      function flushType() {
+        if (typeTimer) { clearTimeout(typeTimer); typeTimer = null; }
+        var t = typeBuf; typeBuf = "";
+        if (t) sendText(t);
+      }
+      function queueType(ch) {
+        typeBuf += ch;
+        if (!typeTimer) typeTimer = setTimeout(flushType, 12);
+      }
+      // Only OUR own text fields swallow keys; the xterm helper textarea does NOT
+      // (it's display-only, so keystrokes there must still reach the surface).
+      function isTypingField(t) { return t === inp || t === tokenInput; }
+      // Named / arrow keys the server's keySpecs(forKey:) knows, derived from
+      // KeyboardEvent.key (positional intent). PageUp/PageDown are handled
+      // separately (frame-mode scroll), not here.
+      function keyNameFor(e) {
+        switch (e.key) {
+          case "Enter": return "enter";
+          case "Escape": return "esc";
+          case "Tab": return "tab";
+          case "Backspace": return "backspace";
+          case "ArrowUp": return "up";
+          case "ArrowDown": return "down";
+          case "ArrowLeft": return "left";
+          case "ArrowRight": return "right";
+          case "Home": return "home";
+          case "End": return "end";
+        }
+        return null;
+      }
+      document.addEventListener("keydown", function (e) {
+        if (!current) return;
+        if (isTypingField(e.target)) return;   // let our Send/token fields type normally
+        // Never steal keys from a focused UI control (sidebar filter checkboxes,
+        // the mode <select>, buttons, any input) — those must keep native keyboard
+        // behavior (Space toggles, Enter activates, arrows move). The ONE exception
+        // is xterm.js's own hidden helper textarea (focused when the terminal has
+        // focus): that IS the terminal, so let it fall through to the handler.
+        // Body-level focus (nothing focused) also falls through, so typing after a
+        // click on the terminal still reaches the surface.
+        var tgt = e.target;
+        if (tgt && tgt !== document.body &&
+            !(tgt.classList && tgt.classList.contains("xterm-helper-textarea"))) {
+          var tag = tgt.tagName;
+          if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" ||
+              tag === "BUTTON" || tag === "OPTION" || tag === "A") return;
+        }
+
+        // ⌘ (Meta): repurposed for clipboard/selection, NOT forwarded to the shell.
+        // ⌘A selects all IN THE TERMINAL; ⌘C/⌘X/⌘V fall through so the native
+        // copy/cut/paste DOM events fire (handled below), and ⌘R still reloads.
+        if (e.metaKey) {
+          var mk = (e.key || "").toLowerCase();
+          if (mk === "a") {
+            if (stream && stream.term) { try { stream.term.selectAll(); } catch (err) {} e.preventDefault(); }
+          }
+          return;
+        }
+
+        // PageUp/PageDown: frame-mode scroll (same host-wheel path as the on-screen
+        // Scroll buttons) so a scroll-region TUI doesn't garble under re-emulation.
+        if (e.key === "PageUp") { e.preventDefault(); e.stopPropagation(); smartScroll(1); return; }
+        if (e.key === "PageDown") { e.preventDefault(); e.stopPropagation(); smartScroll(-1); return; }
+
+        // Ctrl-<letter> -> a real Ctrl key event (ctrl-a … ctrl-z). Derive the
+        // letter from KeyboardEvent.code (KeyD -> d), the physical position that
+        // matches the native keycode the server maps (see keySpecs(forKey:)).
+        if (e.ctrlKey && !e.altKey && !e.metaKey) {
+          var code = e.code || "";
+          if (/^Key[A-Z]$/.test(code)) {
+            flushType();
+            e.preventDefault(); e.stopPropagation();
+            sendKey("ctrl-" + code.slice(3).toLowerCase());
+            return;
+          }
+        }
+
+        // Named / arrow keys.
+        var name = keyNameFor(e);
+        if (name) {
+          flushType();
+          e.preventDefault(); e.stopPropagation();
+          sendKey(name);
+          return;
+        }
+
+        // Printable text (no Ctrl/Meta/Alt): e.key is already the shifted char.
+        if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key && e.key.length === 1) {
+          e.preventDefault(); e.stopPropagation();
+          queueType(e.key);
+          return;
+        }
+      }, true);   // CAPTURE
+
+      // ---- Copy / paste -------------------------------------------------------
+      // Copy/cut: put the xterm.js SELECTION on the clipboard (synchronous via the
+      // event's clipboardData, no permission prompt). Cut never deletes — the
+      // mirror is read-only, so it behaves like copy.
+      function writeSelectionToEvent(e) {
+        if (!(stream && stream.term && stream.term.hasSelection())) return false;
+        var sel = "";
+        try { sel = stream.term.getSelection(); } catch (err) {}
+        if (!sel) return false;
+        try { e.clipboardData.setData("text/plain", sel); e.preventDefault(); return true; } catch (err) { return false; }
+      }
+      document.addEventListener("copy", function (e) { writeSelectionToEvent(e); });
+      document.addEventListener("cut", function (e) { writeSelectionToEvent(e); });
+      // Paste: read the clipboard text from the paste event and send it via the
+      // text/plain input path (server maps it through keySpecs(forText:); newlines
+      // become real Enter key events). The Send field is the manual fallback.
+      document.addEventListener("paste", function (e) {
+        if (!current) return;
+        if (isTypingField(e.target)) return;   // let the Send field paste into itself
+        var t = "";
+        try { t = (e.clipboardData || window.clipboardData).getData("text"); } catch (err) {}
+        if (t) { e.preventDefault(); sendText(t); }
+      });
+
       function flashTap(b) {
         b.classList.add("tapped");
         if (b._tapTimer) clearTimeout(b._tapTimer);
         b._tapTimer = setTimeout(function () { b.classList.remove("tapped"); }, 150);
       }
 
-      // Press-and-hold auto-repeat (initial delay, then fast repeat) for the
-      // navigation keys where tapping repeatedly is tedious: scroll, arrows,
-      // backspace. Pointer events cover touch + mouse; preventDefault on
-      // pointerdown + touch-action:none stop the hold from scrolling the page,
-      // and the synthetic click is suppressed (we fire on pointerdown).
+      // Press-and-hold auto-repeat (pointer events cover mouse + touch) for the
+      // navigation quick-keys where a repeated tap is tedious.
       function addRepeat(el, fire) {
         el.style.touchAction = "none";
         var delayT = null, repT = null, active = false;
@@ -2848,23 +2942,15 @@ final class WebMonitorServer {
         el.addEventListener("click", function (e) { e.preventDefault(); });
       }
 
-      // Arrows + backspace auto-repeat on hold; the rest (enter/y/n/esc/tab/
-      // ctrl-c) are single-fire — you never want those repeating.
+      // On-screen quick-key row: arrows + backspace auto-repeat on hold; the rest
+      // (enter/space/y/n/esc/tab/ctrl-u/ctrl-c) are single-fire.
       var repeatKeys = { up: 1, down: 1, left: 1, right: 1, backspace: 1 };
       Array.prototype.forEach.call(document.querySelectorAll("[data-key]"), function (b) {
         var k = b.getAttribute("data-key");
-        if (repeatKeys[k]) {
-          addRepeat(b, function () { sendKey(k); });
-        } else {
-          b.onclick = function () { flashTap(b); sendKey(k); };
-        }
+        if (repeatKeys[k]) { addRepeat(b, function () { sendKey(k); }); }
+        else { b.onclick = function () { flashTap(b); sendKey(k); }; }
       });
 
-      // Remote-control scroll: POST a wheel delta to /scroll. The host turns it into a
-      // real mouse-wheel event (positive dy = scroll up/back). `seed` asks the server to
-      // (re)position the cursor at the surface center FIRST; we send it only on the first
-      // scroll of a viewing (see smartScroll) so a mouse-reporting TUI's scrolls
-      // accumulate (seeding — a mouse move — before every wheel resets Claude's scroll).
       function sendScroll(dy, seed) {
         if (!current) { noActiveSession(); return; }
         fetch(url("/api/surface/" + current + "/scroll"), {
@@ -2873,14 +2959,7 @@ final class WebMonitorServer {
           body: JSON.stringify(seed ? { dy: dy, seed: true } : { dy: dy })
         }).catch(function () {});
       }
-      // The surface for which we've already seeded the scroll cursor. Reset on
-      // showSurface so re-opening a surface re-seeds once.
-      var scrollSeededFor = null;
 
-      // Hide/reveal a split from the phone by toggling the Agent Dashboard hide set
-      // (POST /api/surface/{id}/hidden). On success reload the list so the row
-      // updates (it vanishes when "Hide hidden" is on; flips Hide<->Show otherwise).
-      // 503 => the dashboard isn't running (button shouldn't have shown); surface it.
       function setHidden(id, hidden) {
         fetch(url("/api/surface/" + id + "/hidden"), {
           method: "POST",
@@ -2893,21 +2972,10 @@ final class WebMonitorServer {
         }).catch(function () { setBanner("Hide failed \\u2014 not delivered.", false, true); });
       }
 
-      // FRAME MODE (for scrolling a full-screen app like Claude Code). The phone's
-      // xterm.js RE-EMULATES the raw byte stream, and its emulation of the app's
-      // scroll-region redraw DRIFTS from the host's during a multi-step scroll ->
-      // interleaved garble (the desktop never drifts because it shows the host's
-      // authoritative render). So while scrolling such an app we STOP re-emulating
-      // and instead PAINT the host's authoritative frames: drive the host wheel
-      // (/scroll), then fetch the host's exact render (/frame -> ANSI with color)
-      // and write it. The live pump's bytes are skipped while in frame mode (see
-      // openStream). "● Live" (or Back / scroll-to-bottom) exits: snap the app
-      // to the bottom and RECONNECT the stream to resync cleanly.
-      var frameMode = false;
-      var framePending = false;
-
-      // Fetch the host's authoritative frame and paint it into xterm.js. Coalesced
-      // via framePending so a burst of scrolls doesn't queue many fetches.
+      // FRAME MODE (scrolling a full-screen app) — carried over unchanged from the
+      // phone page: drive the host wheel (/scroll) then PAINT the host's
+      // authoritative frame (/frame) so xterm.js never drifts. "● Live" / a
+      // surface swap exits by snapping to bottom + reconnecting the stream.
       function paintFrame() {
         if (!frameMode || !current || framePending) return;
         framePending = true;
@@ -2925,20 +2993,12 @@ final class WebMonitorServer {
           })
           .catch(function () { framePending = false; });
       }
-
       function enterFrameMode() {
         if (frameMode) return;
         frameMode = true;
         liveBtn.style.display = "block";
-        setBanner("Scrollback \\u2014 tap \\u25cf Live to resume", true);
+        setBanner("Scrollback \\u2014 click \\u25cf Live to resume", true);
       }
-
-      // Leave frame mode: snap the app back to the live bottom (a big wheel-down)
-      // and RECONNECT the stream so xterm.js resyncs to the current live state.
-      // We reconnect (vs. just resuming the paused pump) because the pump skipped
-      // bytes while painting frames, so xterm.js's internal state (scroll region,
-      // cursor, modes) is stale; the reconnect replays the host ring and rebuilds
-      // it cleanly. The short delay lets the snap-to-bottom land in that ring first.
       function exitFrameMode() {
         if (!frameMode) return;
         frameMode = false;
@@ -2946,70 +3006,41 @@ final class WebMonitorServer {
         liveBtn.style.display = "none";
         clearBannerIfNotError();
         var want = current;
-        sendScroll(-30); sendScroll(-30);   // clamp is ±30/req; snap the app to bottom
+        sendScroll(-30); sendScroll(-30);
         setTimeout(function () {
-          if (current === want) { showSurface(want, curEl.textContent, false); }  // reconnect -> clean resync
+          if (current === want) { showSurface(want, curEl.textContent, false); }
         }, 250);
       }
       liveBtn.onclick = exitFrameMode;
 
-      // Scroll: ALWAYS use frame mode when we have a live xterm. We deliberately do
-      // NOT try to distinguish "shell (scroll xterm locally)" from "full-screen app
-      // (frame mode)": the only local signal available is `term.buffer.active.baseY`,
-      // and it's UNRELIABLE — a full-screen app (Claude Code) can have stray xterm.js
-      // scrollback (baseY>0) from the replay, which mis-routed it to local
-      // re-emulation scrolling → the garble came back (and no ● Live button). Frame
-      // mode is correct for EVERYTHING: drive the host wheel (which the app — or the
-      // shell's own scrollback — scrolls) and PAINT the host's authoritative render
-      // (`/frame`, exact color, no re-emulation drift). Seed the cursor ONCE per
-      // viewing so a mouse-reporting app's scrolls accumulate (seeding is a move and
-      // such apps reset scroll on a move). Trade-off: a plain shell no longer gets
-      // instant local scroll, but it scrolls correctly via the host — consistent and
-      // never garbled. No live xterm (poll fallback) -> the poll reads the
-      // host-scrolled mirror, so a plain host wheel suffices. dir: +1 = up/back.
       function smartScroll(dir) {
         var seed = scrollSeededFor !== current; scrollSeededFor = current;
         if (!(stream && stream.term)) { sendScroll(dir * 3, seed); return; }
         enterFrameMode();
         sendScroll(dir * 3, seed);
-        setTimeout(paintFrame, 120);   // let the app's redraw land, then read the host frame
+        setTimeout(paintFrame, 120);
       }
       addRepeat(document.getElementById("scrollup"), function () { smartScroll(1); });
       addRepeat(document.getElementById("scrolldown"), function () { smartScroll(-1); });
 
-      // Pause the 700ms poll while hidden (wasteful, and mobile throttles it
-      // anyway); re-poll / re-list immediately when the page returns to the
-      // foreground, re-arming the interval if a surface is being viewed.
+      // ---- Reconnect-on-refocus ----------------------------------------------
+      // A backgrounded desktop tab can silently stall the stream. On return to the
+      // foreground WHILE viewing a surface, do a clean resync — dispose + re-open
+      // the stream (idempotent; replays the host ring and rebuilds xterm.js state).
+      // With no surface selected, just refresh the sidebar.
       document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "visible") {
-          if (current) {
-            // While the live xterm stream is active there is no poll timer to
-            // re-arm (the stream is the source); leave it to keep streaming.
-            if (stream) return;
-            poll();
-            if (timer) clearInterval(timer);
-            timer = setInterval(poll, 700);
-          } else {
-            loadList();
-          }
-        } else if (timer) {
-          clearInterval(timer);
-          timer = null;
-        }
+          if (current) { showSurface(current, curEl.textContent, false); }
+          else { loadList(); }
+        } else if (timer) { clearInterval(timer); timer = null; }
       });
 
-      // ---- Web Push (notify-on-bell) ----------------------------------------
-      // ARM = subscribe this device + flip the server's global enable flag so a
-      // bell on ANY split pushes a background notification (works tab-closed /
-      // phone-locked). MUTE = flip the flag off. Requires a secure context
-      // (HTTPS via `tailscale serve`) + browser Push support, else disabled.
+      // ---- Web Push (notify-on-bell) — reused verbatim from the phone page -----
       var notifyBtn = document.getElementById("notify");
       var pushVapidKey = null, pushEnabled = false;
-
       function pushSupported() {
         return ("serviceWorker" in navigator) && ("PushManager" in window) && window.isSecureContext;
       }
-      // base64url -> Uint8Array (applicationServerKey wants raw bytes).
       function vapidKeyBytes(b64) {
         var pad = "=".repeat((4 - b64.length % 4) % 4);
         var s = (b64 + pad).replace(/-/g, "+").replace(/_/g, "/");
@@ -3018,9 +3049,6 @@ final class WebMonitorServer {
         return arr;
       }
       function refreshNotifyButton() {
-        // Icon-only (just the bell) so the header never wraps to a 2nd line on a
-        // phone; state is conveyed by the `.armed` amber color + the title, and
-        // the disabled (greyed) bell covers the n/a case.
         notifyBtn.textContent = "\\uD83D\\uDD14";
         if (!pushSupported()) {
           notifyBtn.disabled = true;
@@ -3033,8 +3061,8 @@ final class WebMonitorServer {
         notifyBtn.disabled = false;
         notifyBtn.classList.toggle("armed", pushEnabled);
         notifyBtn.title = pushEnabled
-          ? "Notifications ARMED \\u2014 tap to mute"
-          : "Tap to get a push on this device when any split rings a bell";
+          ? "Notifications ARMED \\u2014 click to mute"
+          : "Click to get a push on this device when any split rings a bell";
       }
       function loadPushConfig() {
         if (!pushSupported()) { refreshNotifyButton(); return; }
@@ -3045,7 +3073,7 @@ final class WebMonitorServer {
           pushVapidKey = cfg.vapidPublicKey;
           pushEnabled = !!cfg.enabled;
           refreshNotifyButton();
-        }).catch(function () { /* leave the button in its default state */ });
+        }).catch(function () {});
       }
       function setServerPushEnabled(on) {
         return fetch(url("/api/push/enabled"), {
@@ -3058,7 +3086,6 @@ final class WebMonitorServer {
         flashTap(notifyBtn);
         if (!pushSupported()) return;
         if (pushEnabled) { setServerPushEnabled(false).catch(function () {}); return; }
-        // Arm: permission -> register SW -> subscribe -> register sub -> enable.
         Notification.requestPermission().then(function (perm) {
           if (perm !== "granted") { setBanner("Notification permission denied", false, true); return; }
           return navigator.serviceWorker.register(url("/sw.js", { token: token })).then(function (reg) {
@@ -3085,13 +3112,21 @@ final class WebMonitorServer {
       };
       refreshNotifyButton();
 
-      // Start (or restart, after token recovery) the fetches: refresh the list
-      // now and keep the (cheap) session list fresh while browsing it. The list
-      // timer is armed only once; re-running start() after recovery just kicks
-      // a fresh loadList().
+      // Keep the persistent sidebar fresh while browsing AND while viewing (so new
+      // bells/rows appear and the active highlight stays correct); refresh the
+      // viewed split's Clear buttons too.
       function start() {
         if (!listTimer) {
-          listTimer = setInterval(function () { if (current) refreshBellButton(); else loadList(); }, 3000);
+          listTimer = setInterval(function () {
+            // On a narrow layout while viewing a surface the sidebar is collapsed
+            // (data-view="surface"), so its DOM is off-screen — skip the wasted list
+            // refetch/rebuild and only keep the viewed split's Clear buttons live.
+            // On wide the sidebar is always visible, so it always refreshes.
+            var sidebarHidden = current && app.dataset.view === "surface" &&
+              window.matchMedia("(max-width: 859px)").matches;
+            if (!sidebarHidden) loadList();
+            if (current) refreshBellButton();
+          }, 3000);
         }
         loadList();
         loadPushConfig();
@@ -3103,4 +3138,5 @@ final class WebMonitorServer {
     </body>
     </html>
     """
+
 }

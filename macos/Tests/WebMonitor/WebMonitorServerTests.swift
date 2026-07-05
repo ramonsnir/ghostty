@@ -114,6 +114,70 @@ struct WebMonitorServerTests {
                                          unshiftedCodepoint: UInt32(UnicodeScalar("u").value))])
     }
 
+    @Test func keySpecsCtrlLetterIsRealCtrlKeyEvent() {
+        // The desktop client needs the general ctrl-<letter> set (beyond the
+        // explicit ctrl-c/ctrl-u): each maps to a Ctrl-modified key event with the
+        // letter's NATIVE macOS virtual keycode (NSEvent.keyCode space) and the
+        // letter's unshifted scalar.
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-d")
+            == [WebMonitorServer.KeySpec(keycode: 2, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("d").value))])
+        // A few more letters map to their correct native keycodes (a=0, z=6, l=37).
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-a")
+            == [WebMonitorServer.KeySpec(keycode: 0, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("a").value))])
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-z")
+            == [WebMonitorServer.KeySpec(keycode: 6, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("z").value))])
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-l")
+            == [WebMonitorServer.KeySpec(keycode: 37, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("l").value))])
+    }
+
+    @Test func keySpecsCtrlLetterCoversAllTwentySixLetters() {
+        // Exhaustive guard for the ctrl-<letter> keycode table — DESKTOP-MONITOR-DESIGN.md
+        // Open Question #1 flags it as "the one place a wrong constant silently no-ops",
+        // and the per-letter assertions above only sample a/d/z/l. Every a-z must map to a
+        // NON-nil single spec carrying GHOSTTY_MODS_CTRL + the letter's own scalar, and the
+        // 26 resulting NATIVE keycodes must be DISTINCT (a typo that duplicated or wrong-
+        // valued one of the 22 unsampled letters — e.g. 'k'→'j' — would otherwise ship green).
+        var keycodes: [UInt32] = []
+        for c in "abcdefghijklmnopqrstuvwxyz" {
+            let specs = WebMonitorServer.keySpecs(forKey: "ctrl-\(c)")
+            #expect(specs != nil, "ctrl-\(c) must not be nil")
+            #expect(specs?.count == 1, "ctrl-\(c) must be a single spec")
+            guard let spec = specs?.first else { continue }
+            #expect(spec.mods == GHOSTTY_MODS_CTRL, "ctrl-\(c) must carry ctrl")
+            #expect(spec.unshiftedCodepoint == UInt32(c.unicodeScalars.first!.value),
+                    "ctrl-\(c) must carry the letter's scalar")
+            #expect(spec.text == nil, "ctrl-\(c) is a key event, not text")
+            keycodes.append(spec.keycode)
+        }
+        #expect(keycodes.count == 26)
+        // All 26 native keycodes are distinct (no collision / duplicated constant).
+        #expect(Set(keycodes).count == 26, "ctrl-<letter> keycodes must all be distinct: \(keycodes)")
+    }
+
+    @Test func keySpecsCtrlCAndCtrlUUnchangedByGeneralRule() {
+        // Regression: adding the general ctrl-<letter> rule must NOT change the
+        // pre-existing ctrl-c / ctrl-u mappings (keycode 8 / 32 + ctrl + scalar).
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-c")
+            == [WebMonitorServer.KeySpec(keycode: 8, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("c").value))])
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-u")
+            == [WebMonitorServer.KeySpec(keycode: 32, mods: GHOSTTY_MODS_CTRL,
+                                         unshiftedCodepoint: UInt32(UnicodeScalar("u").value))])
+    }
+
+    @Test func keySpecsUnknownCtrlComboIsNil() {
+        // A ctrl-<x> that is not a single a-z letter is unknown -> nil (a 400 at
+        // the route), so bogus ctrl-combos still fail closed.
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-") == nil)
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-1") == nil)
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-cd") == nil)
+        #expect(WebMonitorServer.keySpecs(forKey: "ctrl-tab") == nil)
+    }
+
     @Test func keySpecsYNArePrintableText() {
         // y/n are just printable text: text-bearing, keycode unset (0),
         // unshiftedCodepoint = the scalar.
@@ -868,6 +932,230 @@ struct WebMonitorServerTests {
         #expect(decide("POST", "/") == .methodNotAllowed)
     }
 
+    // MARK: - Unified page: responsive + capability-adaptive markers
+    //
+    // Stage 1 unified the phone + desktop clients into ONE responsive page served
+    // at GET "/"; the /desktop route + desktopHtmlPage are gone. These guard the
+    // features the single page now carries for BOTH form factors. (The phone-only
+    // guards further down — bell/token/scroll/etc. — still apply to this same page.)
+
+    @Test func htmlPageHasResponsiveSidebar() {
+        // The persistent split-picker sidebar + the flex viewer, driven by a #app
+        // `data-view` state machine with an 860px breakpoint: wide keeps both panes,
+        // narrow (<860px, the phone drawer) shows one at a time. Selecting a surface
+        // swaps the VIEWER, never hides the list.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("id=\"app\" data-view=\"list\""))
+        #expect(page.contains("data-view=\"surface\""))
+        #expect(page.contains("@media (max-width: 859px)"))   // the narrow breakpoint
+        #expect(page.contains("id=\"sidebar\""))
+        #expect(page.contains("id=\"main\""))
+        #expect(page.contains("id=\"list\""))
+        // The active-row highlight tells you which split the viewer is driving.
+        #expect(page.contains("function highlightActive"))
+        #expect(page.contains("data-id"))
+        // Single-surface invariant: dispose the old stream before opening the new.
+        #expect(page.contains("disposeStream"))
+        #expect(page.contains("stream = openStream(id)"))
+    }
+
+    @Test func htmlPageReusesXtermAssets() {
+        // Reuses the SAME vendored assets + streaming/frame path — no new routes.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("/xterm.js"))
+        #expect(page.contains("/xterm.css"))
+        #expect(page.contains("/jetbrains-mono-regular.woff2"))
+        #expect(page.contains("/jetbrains-mono-bold.woff2"))
+        #expect(page.contains("function openStream"))
+        #expect(page.contains("/stream"))
+        #expect(page.contains("X-Ghostty-Cols"))
+        #expect(page.contains("X-Ghostty-Rows"))
+        #expect(page.contains("function enterFrameMode"))
+        #expect(page.contains("function paintFrame"))
+        #expect(page.contains("function exitFrameMode"))
+        #expect(page.contains("/frame"))
+    }
+
+    @Test func htmlPageHasGlobalKeydownWiring() {
+        // A CAPTURE-phase global keydown handler maps browser keystrokes to /input,
+        // including the general ctrl-<letter> path (derived from KeyboardEvent.code).
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("addEventListener(\"keydown\", function (e) {"))
+        #expect(page.contains("}, true);"))                 // CAPTURE phase
+        #expect(page.contains("function keyNameFor"))
+        #expect(page.contains("sendKey(\"ctrl-\" + code.slice(3).toLowerCase())"))
+        #expect(page.contains("/^Key[A-Z]$/.test(code)"))   // derive from KeyboardEvent.code
+        // The form-control guard: the handler must NOT steal keys from a focused UI
+        // control (sidebar filter checkboxes, the mode <select>, buttons, the Send
+        // field), while still letting xterm's own helper textarea (the focused
+        // terminal) fall through. The xterm exception is load-bearing, so pin the
+        // actual GUARD expression (a classList.contains check) — matching the bare
+        // string would be satisfied by the code comment alone.
+        #expect(page.contains("classList.contains(\"xterm-helper-textarea\")"))
+        // All six focusable form-control tags must bail (only SELECT was pinned
+        // before — a dropped tag would silently steal that control's keystrokes).
+        #expect(page.contains("tag === \"INPUT\""))
+        #expect(page.contains("tag === \"SELECT\""))
+        #expect(page.contains("tag === \"TEXTAREA\""))
+        #expect(page.contains("tag === \"BUTTON\""))
+        #expect(page.contains("tag === \"OPTION\""))
+        #expect(page.contains("tag === \"A\""))
+        #expect(page.contains("function queueType"))         // printable batching
+        #expect(page.contains("function flushType"))
+        // ⌘ is repurposed for clipboard/selection, not forwarded to the shell.
+        #expect(page.contains("if (e.metaKey)"))
+        #expect(page.contains("stream.term.selectAll()"))
+    }
+
+    @Test func htmlPageHasCopyPasteHooks() {
+        // Browser clipboard: paste -> text/plain /input; xterm selection -> copy/cut.
+        // The selection copy is secure-context gated (navigator.clipboard) with the
+        // Send field as the manual fallback.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("addEventListener(\"paste\""))
+        #expect(page.contains("addEventListener(\"copy\""))
+        #expect(page.contains("addEventListener(\"cut\""))
+        #expect(page.contains("getData(\"text\")"))
+        #expect(page.contains("stream.term.getSelection()"))
+        #expect(page.contains("navigator.clipboard.writeText"))
+        // A bare `window.isSecureContext` substring is NOT enough — that token also
+        // appears in the unrelated push code (pushSupported()/notify title), so it
+        // would pass even if the copy path's gate were deleted. Pin the FULL combined
+        // gate expression AND slice copyBtn.onclick to assert the gate + its
+        // else-fallback both live inside the copy handler (the same defense
+        // htmlPageHasGlobalKeydownWiring uses against the bare-string trap).
+        #expect(page.contains("window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText"))
+        // Slice to the NEXT handler declaration (not the first `};` — the inner
+        // .catch(...) closes with `});`, which would cut the slice before the else).
+        if let start = page.range(of: "copyBtn.onclick = function ()")?.lowerBound,
+           let end = page.range(of: "clearBellBtn.onclick", range: start..<page.endIndex)?.lowerBound {
+            let body = String(page[start..<end])
+            // The secure-context gate guards the clipboard write...
+            #expect(body.contains("window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText"))
+            #expect(body.contains("navigator.clipboard.writeText(sel)"))
+            // ...and the non-secure `else` branch degrades to the ⌘C/Send fallback,
+            // never an unconditional clipboard write.
+            #expect(body.contains("Copy needs HTTPS"))
+        } else {
+            Issue.record("copyBtn.onclick handler not found in htmlPage")
+        }
+        // Pin the paste handler's DESTINATION, not just that it listens: a paste must
+        // route through sendText(...) (the text/plain /input path) and bail via
+        // isTypingField so pasting into the Send field doesn't also fire into the
+        // surface. Mis-routing the paste is a documented load-bearing hazard, and the
+        // listener-only assertions above would stay green through such a regression.
+        if let start = page.range(of: "addEventListener(\"paste\"")?.lowerBound,
+           let end = page.range(of: "function flashTap", range: start..<page.endIndex)?.lowerBound {
+            let body = String(page[start..<end])
+            #expect(body.contains("isTypingField(e.target)"))   // Send field pastes into itself
+            #expect(body.contains("getData(\"text\")"))
+            #expect(body.contains("sendText(t)"))               // -> text/plain /input path
+        } else {
+            Issue.record("paste handler not found in htmlPage")
+        }
+    }
+
+    @Test func htmlPageHasReconnectOnRefocus() {
+        // A UNIVERSAL visibilitychange handler resyncs the live stream on foreground
+        // (dispose + re-open via showSurface) so a backgrounded tab that stalled the
+        // stream recovers.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("addEventListener(\"visibilitychange\""))
+        #expect(page.contains("document.visibilityState === \"visible\""))
+        // The resync is gated ONLY on `current` (a surface is being viewed), then
+        // showSurface disposes + re-opens the stream.
+        #expect(page.contains("if (current) { showSurface(current, curEl.textContent, false); }"))
+        // NEGATIVE guard against the regression the governance change forbids: the
+        // handler must NO LONGER bail early when a stream is already live. The old
+        // early-bail would test `stream`; the correct handler references only
+        // `current`/`showSurface`/`loadList`/`timer` and never `stream`. Slice the
+        // handler body (up to its closing `});`) and assert `stream` never appears —
+        // so re-adding `if (stream) return;` fails this test.
+        if let start = page.range(of: "addEventListener(\"visibilitychange\"")?.lowerBound,
+           let end = page.range(of: "});", range: start..<page.endIndex)?.upperBound {
+            let body = String(page[start..<end])
+            #expect(!body.contains("stream"))
+        } else {
+            Issue.record("visibilitychange handler not found in htmlPage")
+        }
+    }
+
+    @Test func htmlPageHasThemeAwareChromeAndPollFallback() {
+        // Theme-aware CHROME only (the terminal colors come from the ANSI stream),
+        // and the /screen poll viewer is the fallback when the live stream is down.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("@media (prefers-color-scheme: light)"))
+        #expect(page.contains("function fallbackToPoll"))
+        #expect(page.contains("/screen"))
+        #expect(page.contains("id=\"screen\""))
+    }
+
+    @Test func htmlPageDataViewStateMachineTransitions() {
+        // The narrow drawer hinges on the state-machine FLIPS, not just the initial
+        // attribute: showSurface sets #app data-view="surface" and showPlaceholder
+        // sets it back to "list". Without them a phone (<860px) selecting a surface
+        // leaves the viewer hidden by #app[data-view="list"] #main{display:none} — a
+        // total break of the drawer.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("app.dataset.view = \"surface\""))   // showSurface
+        #expect(page.contains("app.dataset.view = \"list\""))      // showPlaceholder
+    }
+
+    @Test func htmlPageSidebarHideRuleIsNarrowOnly() {
+        // The "selecting a surface hides the sidebar" rule MUST stay inside the narrow
+        // @media block — on wide the sidebar is ALWAYS visible (it swaps the viewer
+        // without hiding the list). If the rule leaked out of the media query, a wide
+        // screen would lose its persistent picker on select.
+        let page = WebMonitorServer.htmlPage
+        let media = page.range(of: "@media (max-width: 859px) {")
+        let rule = page.range(of: "#app[data-view=\"surface\"] #sidebar { display: none; }")
+        let styleClose = page.range(of: "</style>")
+        #expect(media != nil && rule != nil && styleClose != nil)
+        if let m = media, let r = rule, let s = styleClose {
+            #expect(m.lowerBound < r.lowerBound)   // rule is inside/after the narrow query
+            #expect(r.lowerBound < s.lowerBound)   // ...and still within the stylesheet
+        }
+    }
+
+    @Test func htmlPageViewHeaderWrapsOnNarrow() {
+        // #viewhdr must flex-wrap (its fixed children — menu + title + Copy + Clear —
+        // can exceed a phone width) so the header never scrolls the page body sideways.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("#viewhdr { display: flex; flex-wrap: wrap;"))
+    }
+
+    @Test func htmlPageBannersAreTopLevelChrome() {
+        // #banner + #notice live OUTSIDE #main (above #app) so a status message /
+        // token-recovery notice stays visible in the narrow list-view drawer, where
+        // #main is display:none. Guards the regression where they were nested in #main
+        // and vanished on the phone list.
+        let page = WebMonitorServer.htmlPage
+        let banner = page.range(of: "<div id=\"banner\"")
+        let notice = page.range(of: "<div id=\"notice\"")
+        let appDiv = page.range(of: "<div id=\"app\" data-view=\"list\">")
+        #expect(banner != nil && notice != nil && appDiv != nil)
+        if let b = banner, let a = appDiv { #expect(b.lowerBound < a.lowerBound) }  // banner precedes #app
+        if let n = notice, let a = appDiv { #expect(n.lowerBound < a.lowerBound) }  // notice precedes #app
+    }
+
+    @Test func htmlPageHasBackToListControl() {
+        // The narrow drawer's "reopen the list" affordance: a #menubtn whose handler
+        // returns to the picker (showPlaceholder + loadList). Without it a phone user
+        // is stranded in the viewer with no way back to the session list.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("id=\"menubtn\""))
+        #expect(page.contains("menuBtn.onclick = function () {"))
+    }
+
+    @Test func htmlPageKeydownBailsInTypingFields() {
+        // The global keydown driver must bail inside our own Send/token fields (the
+        // "must bail inside typing fields" half of the guard) so a reply / a pasted
+        // token typed into those fields isn't ALSO fired into the surface.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("function isTypingField"))
+        #expect(page.contains("if (isTypingField(e.target)) return;"))
+    }
+
     @Test func decideRouteSurfacesGet() {
         #expect(decide("GET", "/api/surfaces") == .surfacesList)
     }
@@ -1023,6 +1311,14 @@ struct WebMonitorServerTests {
         #expect(decide("DELETE", "/totally/unknown") == .notFound)
     }
 
+    @Test func decideRouteDesktopPathIsNotFound() {
+        // The old standalone desktop client (/desktop route + RouteDecision.desktopPage +
+        // desktopHtmlPage) is REMOVED — the single responsive htmlPage at "/" now serves
+        // both phone and desktop. Pin the exact "/desktop" path so a re-added `.desktopPage`
+        // branch (which the generic /totally/unknown probe would slip past) fails here.
+        #expect(decide("GET", "/desktop") == .notFound)
+    }
+
     @Test func decideRouteTokenViaQueryParam() {
         // Initial page load presents the token in the query string.
         let d = WebMonitorServer.decideRoute(
@@ -1129,23 +1425,26 @@ struct WebMonitorServerTests {
 
     @Test func htmlPageHasAgentFilters() {
         let page = WebMonitorServer.htmlPage
-        // The agent filters (checkboxes), their persistence, and the disabled
+        // All THREE agent filters (checkboxes), their persistence, and the disabled
         // handling when the dashboard isn't running must all be wired in the page.
         #expect(page.contains("id=\"filterbar\""))
+        #expect(page.contains("id=\"f-heroes\""))
         #expect(page.contains("id=\"f-agents\""))
         #expect(page.contains("id=\"f-visible\""))
         #expect(page.contains("applyFilterAvailability"))
         // Filters read the new response envelope, default ON, and persist.
         #expect(page.contains("data.surfaces"))
         #expect(page.contains("data.agentDashboard"))
+        #expect(page.contains("ghostty_filter_heroes"))
         #expect(page.contains("ghostty_filter_agents"))
         #expect(page.contains("ghostty_filter_visible"))
         #expect(page.contains("row.isAgent"))
         #expect(page.contains("row.hidden"))
         // "Hide hidden" only layers on "Agents only": it's disabled when agents-only
         // is off, and the hide filter is gated behind agentsOnly (so hidden splits
-        // are shown when agents-only is off).
-        #expect(page.contains("fVisible.disabled = !dashboard || !fAgents.checked"))
+        // are shown when agents-only is off). It is ALSO disabled under heroes-focus
+        // (heroFocus), which overrides the other two to show ONLY heroes.
+        #expect(page.contains("fVisible.disabled = !dashboard || heroFocus || !fAgents.checked"))
         #expect(page.contains("var hideHidden = agentsOnly && fVisible.checked"))
     }
 
@@ -1177,20 +1476,23 @@ struct WebMonitorServerTests {
 
     @Test func htmlPageHasSmartScroll() {
         let page = WebMonitorServer.htmlPage
-        // The scroll buttons drive smartScroll, which reads the LIVE xterm.js
-        // terminal mode to pick the right gesture.
+        // The scroll buttons + PageUp/PageDown drive smartScroll. Unification note:
+        // smartScroll ALWAYS uses FRAME MODE when a live xterm is present — it drives
+        // a real HOST wheel (which the host routes per the app's true mode) and paints
+        // the host's AUTHORITATIVE frame, rather than scrolling xterm.js locally (the
+        // old baseY-based local/alt-screen branching drifted + garbled and was removed).
         #expect(page.contains("function smartScroll"))
         #expect(page.contains("smartScroll(1)"))
         #expect(page.contains("smartScroll(-1)"))
-        // Normal buffer: the scrollback lives IN xterm.js, so it scrolls LOCALLY
-        // (term.scrollLines) — a host wheel emits no raw bytes back to the phone.
-        #expect(page.contains("term.scrollLines(dir > 0 ? -3 : 3)"))
-        // It branches on the alternate-screen buffer + mouse-tracking mode, and
-        // sends PageUp/PageDown in the alt-screen-without-mouse case.
-        #expect(page.contains("active.type === \"alternate\""))
-        #expect(page.contains("mouseTrackingMode"))
-        #expect(page.contains("sendKey(dir > 0 ? \"pageup\" : \"pagedown\")"))
-        // The stream handle exposes `term` so smartScroll can read its mode.
+        // No live term -> a bare host wheel (the poll fallback reads the scrolled mirror).
+        #expect(page.contains("if (!(stream && stream.term)) { sendScroll(dir * 3, seed); return; }"))
+        // With a live term: enter frame mode, drive the host wheel, then paint the frame.
+        #expect(page.contains("enterFrameMode();"))
+        #expect(page.contains("setTimeout(paintFrame, 120);"))
+        // The removed local-scroll / alt-screen-mode branching must NOT reappear.
+        #expect(!page.contains("term.scrollLines(dir > 0 ? -3 : 3)"))
+        #expect(!page.contains("mouseTrackingMode"))
+        // The stream handle exposes `term` so smartScroll can gate on a live xterm.
         #expect(page.contains("dispose: teardown, term: term"))
     }
 

@@ -235,10 +235,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 
 - **Web monitor** (fork-only, OFF by default; config `web-monitor-listen` / `web-monitor-token`)
   — a GUI-embedded HTTP server (one `NWListener` on a dedicated serial queue) that, from a phone
-  over Tailscale, lists live surfaces, renders one in full color via `xterm.js` fed the host's
-  raw PTY byte stream (color + scrollback + live), sends input, and remote-controls scroll; plus
-  a bell→Web-Push "I stepped away" notifier. **SCOPE: phone workflows ONLY — do not build new
-  features on it; other work may COPY its patterns but must stand alone.** Load-bearing gotchas:
+  OR a second laptop over Tailscale, lists live surfaces, renders one in full color via `xterm.js`
+  fed the host's raw PTY byte stream (color + scrollback + live), sends input, and remote-controls
+  scroll; plus a bell→Web-Push "I stepped away" notifier. **SCOPE (governance changed 2026-07): ONE
+  responsive, capability-adaptive page (`htmlPage`, `GET /`) serves BOTH phone and desktop — the old
+  "phone-only / frozen page / standalone `/desktop` copy" lock is RETIRED (no `/desktop` route, no
+  `desktopHtmlPage`).** Other work may still COPY its patterns but must stand alone. Load-bearing gotchas:
   input is sent as REAL key/wheel events (`ghostty_surface_key` with the NATIVE macOS virtual
   keycode — the `GHOSTTY_KEY_*` enum value is WRONG and silently no-ops), NOT the paste path;
   **Scroll ↑/↓ is "smart" (`smartScroll`, page-side) + a server-side POSITION fix** — the fix for the
@@ -304,9 +306,50 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   emit + filter tuple), `AgentDashboardController.swift` (`heroIDs`/`isHeroSurface` +
   `webMonitorFilterState` triple), `WebMonitorPush.swift` (`onBell` hero glyph), page JS/CSS
   (`f-heroes` + `.herostar`). Tests: `WebMonitorServerTests` (`surfacesJSONEmitsHero`). GUI-only.
-  **See `WEB-MONITOR.md` (→ Implementation
-  notes) for the color/scrollback architecture, the Claude scroll-region finding, HTTP API,
-  threading, push/VAPID, wiring + tests.**
+  **ONE responsive, capability-adaptive client — phone + desktop (fork-only, GUI/page-only;
+  governance change 2026-07):** the SINGLE `htmlPage` (`GET /`) now serves BOTH devices — the old
+  `/desktop` route + `desktopHtmlPage` + `RouteDecision.desktopPage` + `isBootstrapPath("/desktop")`
+  are **REMOVED**. Layout is responsive off ONE `data-view` state machine on `#app` with an **860px
+  breakpoint**: wide (≥860px) keeps a **PERSISTENT split-picker sidebar** (same three `f-heroes`/
+  `f-agents`/`f-visible` filters) beside a flex-fill viewer that swaps on row-select without hiding
+  the list (single-stream invariant: `disposeStream()` + `openStream(id)`); narrow (<860px, the
+  phone behavior) collapses the sidebar to a full-width **drawer** with a back/menu control, the two
+  panes mutually exclusive. Capabilities are **feature-detected, never viewport-guessed** — the
+  **CAPTURE-phase global keydown driver** attaches UNIVERSALLY (inert without a physical keyboard;
+  fires only while a surface is selected, and **bails on any focused form control** — `isTypingField`
+  Send/token fields + focused `INPUT`/`SELECT`/`TEXTAREA`/`BUTTON`/`OPTION`/`A`, the ONE exception
+  being xterm.js's own `.xterm-helper-textarea` = the terminal), mapping keystrokes → `/input`
+  (printables batched via the `text/plain` path; named/arrow via `{"key":…}` from
+  `KeyboardEvent.code`/`.key`; PageUp/Down → frame-mode scroll; **⌘ REPURPOSED for
+  clipboard/selection**, not forwarded). The one server-side extension is unchanged —
+  **`keySpecs(forKey:)`'s general `ctrl-<letter>` rule** (`ctrlLetterKeycodes` a–z → NATIVE macOS
+  keycodes from `src/input/keycodes.zig`; explicit `ctrl-c`=8/`ctrl-u`=32 unchanged; non-letter →
+  nil/400) so Ctrl-D/Z/A/E/R/L/… all deliver. Browser copy/paste (`navigator.clipboard` ⇄
+  `text/plain` `/input` + `term.getSelection()`) is **secure-context-gated** (`window.isSecureContext`)
+  with a Send fallback; frame-mode scroll + `/screen` poll fallback carried over; theme-aware CHROME
+  only; **universal reconnect-on-refocus** (`visibilitychange` → clean dispose + re-`showSurface`,
+  else `loadList()`). **NATIVE-keycode caveat + Mac-client assumption:** named/positional keys assume
+  a Mac client with a standard layout (printable text still works off-Mac since it rides `keycode 0`).
+  GUI/page-only — NO Zig/host/protocol change, no host restart. Wiring (all `WebMonitorServer.swift`):
+  the single `htmlPage` (responsive layout + capability gates + universal keydown/copy/paste/reconnect)
+  and the `keySpecs(forKey:)` `ctrl-<letter>` rule + `ctrlLetterKeycodes` (the `/desktop` route +
+  `desktopHtmlPage` removed). Tests: `WebMonitorServerTests` (`htmlPageHasResponsiveSidebar`,
+  `htmlPageReusesXtermAssets`, `htmlPageHasGlobalKeydownWiring`, `htmlPageHasCopyPasteHooks`,
+  `htmlPageHasReconnectOnRefocus`, `htmlPageHasThemeAwareChromeAndPollFallback`,
+  `keySpecsCtrlLetterIsRealCtrlKeyEvent`/`keySpecsCtrlLetterCoversAllTwentySixLetters`/
+  `keySpecsCtrlCAndCtrlUUnchangedByGeneralRule`/`keySpecsUnknownCtrlComboIsNil`, plus the
+  responsive state-machine/layout guards `htmlPageDataViewStateMachineTransitions`/
+  `htmlPageSidebarHideRuleIsNarrowOnly`/`htmlPageViewHeaderWrapsAndHidesMacNoteOnNarrow`/
+  `htmlPageBannersAreTopLevelChrome`/`htmlPageHasBackToListControl`/
+  `htmlPageKeydownBailsInTypingFields`). Layout note: `#banner`/`#notice` are TOP-LEVEL chrome
+  (outside `#main`) so they stay visible in the narrow list-view drawer, `#viewhdr` is `flex-wrap`
+  + the `#maclayoutnote` desktop affordance is hidden on narrow so the header never scrolls the
+  page body sideways, and `showSurface` deliberately does NOT focus the Send field (an
+  always-focused input would make the global keydown driver bail). **See `WEB-MONITOR.md`
+  (→ "Using it from a laptop" for the user-facing sidebar/keyboard/clipboard UX, → Scope / The
+  responsive client, and → Implementation notes) for the responsive layout + capability model,
+  the color/scrollback architecture, the Claude scroll-region finding, HTTP API, threading,
+  push/VAPID, wiring + tests; + `DESKTOP-MONITOR-DESIGN.md` (SUPERSEDED — historical).**
 
 - **MCP server** (fork-only, OFF by default; config `mcp-listen` / `mcp-token` — the token is a
   SHELL-EXECUTION credential, so bind localhost + always set it) — a GUI-embedded MCP server

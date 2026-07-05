@@ -1,11 +1,14 @@
-# Web monitor — watch & drive Ghostty splits from your phone
+# Web monitor — watch & drive Ghostty splits from a phone or a second laptop
 
 Fork-only feature of **"Ghostty (ramon)"** (bundle id `com.mitchellh.ghostty-ramon`).
-A single GUI-embedded HTTP server *inside the running app* serves a mobile web page,
-a small JSON API, **and a live raw-byte stream** on one port. From a phone (e.g. over
-**Tailscale**) you can: list the live terminal surfaces, **watch one in color with
-scrollback and live updates**, **send input** (notably approving CLI-agent prompts),
-and **scroll / drive** a remote TUI.
+A single GUI-embedded HTTP server *inside the running app* serves ONE responsive,
+capability-adaptive web page, a small JSON API, **and a live raw-byte stream** on one
+port — the same page adapts to a phone AND a second laptop on the tailnet (persistent
+sidebar on a wide screen, drawer on a phone; see "Scope" under Implementation notes).
+From either device (e.g. over **Tailscale**) you can: list the live terminal surfaces,
+**watch one in color with scrollback and live updates**, **send input** (notably
+approving CLI-agent prompts, or full-keyboard driving from a laptop), and **scroll /
+drive** a remote TUI.
 
 **OFF by default.** One app, one rebuild/restart — no second process.
 
@@ -149,6 +152,40 @@ is loopback, hence identical; only your `ts.net` hostname differs:
 
 ---
 
+## Using it from a laptop
+
+It's the **same URL and the same page** — the client is one responsive, capability-adaptive
+web page (there's no separate "desktop" address). On a wide screen it simply lays out
+differently and lights up the capabilities a laptop has:
+
+1. **Persistent split-picker sidebar.** On a wide window (≥ ~860px) the session list stays
+   pinned in a left sidebar (with the same **★ Focus on heroes / Agents only / Hide hidden**
+   filters and per-row **Hide / Show**), and picking a split swaps the **viewer** beside it
+   **without** hiding the list — so you can jump between splits without going "back" each time.
+   The active split's row is highlighted. Narrow it below ~860px and the sidebar collapses back
+   into the phone-style drawer with a **← Sessions** button.
+2. **Full-keyboard driving.** Just click into the terminal and type — keystrokes go straight to
+   the surface as **real key events**: printable text, **Enter / Esc / Tab / Backspace /
+   arrows / Home / End**, **Ctrl-<letter>** (Ctrl-C, Ctrl-D, Ctrl-Z, Ctrl-A, Ctrl-R, …), and
+   **PageUp / PageDown** (scrollback, via frame mode). This is inert without a physical keyboard
+   (so a phone is unaffected) and it steps aside whenever a form control (the Send field, the
+   filter checkboxes, the token box) is focused, so those keep normal keyboard behavior.
+   > **Mac-client / standard-layout assumption.** Named and positional keys are routed by the
+   > client's *native macOS virtual keycode*, so a non-Mac client or a non-standard physical
+   > layout may mis-map them (printable text still works). The header shows a small
+   > "Mac client, standard layout assumed" note as a reminder (hidden on a phone).
+3. **Browser copy / paste.** Select text in the terminal and **⌘C** copies it; **⌘V** pastes the
+   clipboard into the surface (as real input — newlines become Enter); **⌘A** selects the whole
+   terminal. This uses the browser clipboard and so needs a **secure context** (which
+   `tailscale serve` already provides); without one, use the **Copy** button / **Send** field
+   fallback. ⌘ is never forwarded to the shell (⌘R still reloads the page).
+4. Everything from **Using it from the phone** still applies — the on-screen quick-key row, the
+   Send field, scroll/frame-mode, the notify-on-bell toggle, jump-to-bottom, and the poll
+   fallback are all present (harmless extras on a laptop). Switching a laptop tab away and back
+   **cleanly resyncs** the live stream, so a backgrounded tab that stalled recovers on return.
+
+---
+
 ## Notify on bell (background push notifications)
 
 > If [**Bell Attention**](BELL-ATTENTION.md) is enabled, the session list shows a raw bell
@@ -259,7 +296,7 @@ real scrollback can't come from the GUI. Instead:
 
 | Route | Purpose |
 |---|---|
-| `GET /` | the embedded mobile page (`?token=` accepted here when a token is set) |
+| `GET /` | the embedded responsive page — serves both phone and laptop (`?token=` accepted here when a token is set) |
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
 | `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,isAgent,hidden,hero}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is) |
@@ -355,17 +392,160 @@ The deep dev-internals below were relocated from `CLAUDE.md`. They are the load-
 facts for an agent working on the web-monitor code — preserved verbatim/near-verbatim,
 including every gotcha.
 
-### Scope — phone workflows ONLY
+### Scope — ONE responsive, capability-adaptive client (phone + desktop)
 
-> **SCOPE — phone workflows ONLY.** The web monitor is the phone-usage feature
-> (list/render/input/scroll from a handset over Tailscale) and nothing else. Do
-> **not** build new features on top of it — it is not maintained as a highly-stable
-> foundation. Other work (e.g. an MCP server / agent control) may *reuse its
+> **SCOPE — a single responsive client serving BOTH phone and desktop.** The web
+> monitor is **one page** (`htmlPage`, served at `GET /`) that adapts to whatever
+> device opens it — a handset over Tailscale AND a second laptop on the tailnet
+> alike. There is **no `/desktop` route and no second `desktopHtmlPage`**; the
+> earlier "phone-only, frozen page / standalone desktop copy" governance is
+> **retired** (see `DESKTOP-MONITOR-DESIGN.md`, now SUPERSEDED). Layout is
+> **responsive** (a persistent split-picker sidebar on a wide screen, collapsing to
+> a full-width drawer on a phone) and capabilities are **feature-detected, never
+> guessed from the viewport** (copy/paste gated on secure-context + clipboard; the
+> global keydown driver attaches universally and is inert without a physical
+> keyboard). Other work (e.g. an MCP server / agent control) may still *reuse its
 > architecture and copy code* (the host-protocol client, `keySpecs` input mapping,
 > `decideRoute`/`RequestParser` patterns, the serial-queue + main-hop threading
 > model), but should stand on its own and build directly on Ghostty + the host's
-> existing abstractions — there is already enough tooling there. Keep the web
-> monitor's surface frozen to what phone usage needs.
+> existing abstractions.
+
+### The responsive, capability-adaptive client (fork-only, GUI/page-only)
+
+There is now **ONE page** (`htmlPage`, `GET /`) for every device — no second route,
+no `desktopHtmlPage`. It reuses the frozen server plumbing (`/api/surfaces`,
+`/stream`, `/frame`, `/input`, `/scroll`, the vendored `xterm.js` / JetBrains Mono
+assets) and adds a responsive layout + capability gates + the keyboard driver a
+laptop needs. **GUI/page-only — no Zig, no host, no protocol change; no host restart
+/ no session loss to ship.** Reach it at `https://<machine>.<tailnet>.ts.net:<port>/`
+(the same `tailscale serve` front end); `?token=` on `GET /` still authenticates the
+bootstrap and is stashed + sent as `X-Ghostty-Token` on `/api/*`.
+
+**Responsive layout — one `data-view` state machine, 860px breakpoint.** A single
+`data-view` attribute on `#app` drives both modes off pure CSS; there is no "phone
+page" vs "desktop page":
+- **Wide (≥860px):** a PERSISTENT surface-picker sidebar (`id="sidebar"`, `id="list"`)
+  beside a flex-fill viewer (`id="main"`). Selecting a row swaps the viewer in place
+  (`highlightActive` marks the active `data-id` row) **without hiding the list** — the
+  sidebar keeps refreshing while you drive a surface.
+- **Narrow (<860px, the phone behavior):** the sidebar becomes a full-width **drawer**
+  and the two panes are mutually exclusive — `data-view="list"` shows the picker,
+  `data-view="surface"` hides it and shows the viewer, with a back/menu control
+  (`#menubtn`, CSS-hidden on wide, where the sidebar is always present) to reopen the
+  drawer (`menuBtn.onclick` → `showPlaceholder()` + `loadList()`). The transitions are
+  the load-bearing part: `showSurface` flips `#app` to `data-view="surface"` and
+  `showPlaceholder` back to `"list"` (guarded by `htmlPageDataViewStateMachineTransitions`).
+
+**Always-visible chrome + header layout (narrow-safety).** Two elements are laid out so
+the narrow drawer can't hide a message or overflow sideways: (1) **`#banner` + `#notice`
+are TOP-LEVEL** (siblings above `#app`, not nested in `#main`) — the body is a flex
+column with the banners at the top and `#app` flex-filling — so a status banner
+(connection-lost / session-closed / hide-failed) and the token-recovery `role=alert`
+notice stay visible even in the narrow `data-view="list"` drawer where `#main` is
+`display:none` (the regression they fix). (2) **`#viewhdr` is `flex-wrap:wrap`** and the
+desktop **`#maclayoutnote` is hidden inside the `@media (max-width:859px)` block** (with
+`overflow-x:hidden` on `#app` as a backstop), so the header's fixed children (menu + mac
+note + Copy + Clear) wrap instead of scrolling the page body sideways on a phone. Also,
+`showSurface` deliberately does **NOT** `inp.focus()` (unlike the old phone page): an
+always-focused Send field would make the global keydown driver bail (`isTypingField`),
+disabling desktop keyboard driving — the phone trade-off is the soft keyboard no longer
+auto-pops on open. The 3s list timer **skips the `loadList()` refetch when the sidebar is
+collapsed** (narrow + `data-view="surface"`) since its DOM is off-screen, still refreshing
+the viewed split's Clear buttons.
+
+The sidebar carries the SAME three filters as before — **★ Focus on heroes**
+(`f-heroes`), **Agents only** (`f-agents`), **Hide hidden** (`f-visible`),
+localStorage-persisted (`ghostty_filter_*`), availability driven by
+`applyFilterAvailability` + `data.agentDashboard`. The **single-surface invariant** is
+preserved (selecting a row disposes the old stream then opens the new). The live
+viewer, host-grid sizing (`X-Ghostty-Cols`/`-Rows`), frame-mode scroll
+(`smartScroll`/`enterFrameMode`/`paintFrame`/`exitFrameMode` + `/frame`), and the
+`/screen` poll fallback (`fallbackToPoll`, `id="screen"`) are unchanged. Chrome is
+theme-aware (a `@media (prefers-color-scheme: light)` block over the dark default);
+only the CHROME is themed — the terminal colors come from the host's ANSI stream.
+
+**Capability gates — feature-detected, never viewport-guessed.** Both the keyboard
+driver and copy/paste attach on every device and light up only where the capability
+exists:
+- The **global keydown driver attaches UNIVERSALLY** — it is inert without a physical
+  keyboard (a phone with no keyboard simply never fires `keydown`), so there is no
+  desktop-only gating. Copy/paste is gated on **secure context + `navigator.clipboard`**
+  (`window.isSecureContext`), satisfied by the same `tailscale serve` HTTPS the Web
+  Push already needs, and falls back to the Send field when unavailable.
+
+**Universal keyboard driver + the form-control guard.** A **CAPTURE-phase global
+keydown handler** (`addEventListener("keydown", …, true)`) maps browser keystrokes to
+`POST /api/surface/{uuid}/input` and `preventDefault()`s so the browser doesn't also
+act. It only fires while a surface is selected (`if (!current) return;`) and **guards
+focused form controls** so on-screen UI keeps native keyboard behavior: it bails on
+`isTypingField(e.target)` (the Send / token fields) AND on any focused `INPUT`/`SELECT`/
+`TEXTAREA`/`BUTTON`/`OPTION`/`A` (so the sidebar filter checkboxes, the mode `<select>`,
+and buttons keep Space-toggles / Enter-activates / arrow-moves) — with the **one
+exception** of xterm.js's own hidden `.xterm-helper-textarea` (that IS the terminal, so
+it falls through), and body-level focus (nothing focused) also falls through so typing
+after a click on the terminal still reaches the surface. The mapping:
+- **Printable characters** are batched (`queueType`/`flushType`) and sent via the
+  `text/plain` path (server → `keySpecs(forText:)`), kinder to the core's 64-slot IO
+  mailbox than one POST per key.
+- **Named / arrow keys** map `KeyboardEvent.code`/`.key` → the server `key` names
+  (`keyNameFor`) that `keySpecs(forKey:)` knows (`enter`, `esc`, `tab`, `backspace`,
+  arrows, `pageup`/`pagedown` → frame-mode scroll, `home`/`end`, `space`).
+- **Ctrl-`<letter>`** rides the one server-side extension: `keySpecs(forKey:)` has a
+  **general `ctrl-<letter>` rule** (`ctrlLetterKeycodes` table, a–z → native macOS
+  virtual keycodes read from `src/input/keycodes.zig`) so Ctrl-D/Z/A/E/R/L/… all
+  deliver, not just the original explicit `ctrl-c`=8/`ctrl-u`=32 (which are unchanged —
+  regression-guarded). A non-letter `ctrl-…` returns nil (400). The page derives it as
+  `sendKey("ctrl-" + code.slice(3).toLowerCase())` when `/^Key[A-Z]$/.test(code)` and
+  Ctrl is held.
+- **⌘ (Meta) is REPURPOSED for clipboard/selection, NOT forwarded to the shell**
+  (`if (e.metaKey)` → ⌘A → `stream.term.selectAll()`; ⌘C/⌘V/⌘X fall through so the
+  native copy/cut/paste DOM events fire; ⌘R still reloads). Most ⌘ combos are
+  browser/OS-owned and undeliverable anyway (⌘W/T/N/L/Q/Tab, browser zoom). The
+  on-screen quick-key row (Enter/Ctrl-C/Clear/…) is kept as a fallback.
+- **⚠️ NATIVE-keycode caveat + Mac-client assumption.** `KeySpec.keycode` is a NATIVE
+  macOS virtual keycode (the core matches `entry.native == keycode`; a `GHOSTTY_KEY_*`
+  enum value silently no-ops), and it is a **physical-position** code. Named/control/arrow
+  keys therefore assume **a Mac client with a standard layout** (the "my other MacBook"
+  case) — stated in the UI. Off-Mac, positional keys may mis-map, but **printable text
+  still works** (it rides the `text` field with `keycode 0`).
+
+**Copy / paste.** DOM `paste` → `e.clipboardData.getData("text")` → `text/plain` `/input`
+(newlines become real Enter via `keySpecs(forText:)`); DOM `copy`/`cut` +
+`stream.term.getSelection()` → `navigator.clipboard.writeText`. Both are
+secure-context-gated (see above) and fall back to the Send field when unavailable.
+
+**Reconnect-on-refocus (universal).** A `visibilitychange` handler does a **clean
+resync** of the active stream on foreground (`document.visibilityState === "visible"`
+→ `showSurface(current, curEl.textContent, false)` = dispose + re-open the stream,
+idempotent, replaying the host ring and rebuilding xterm.js state); with no surface
+selected it just refreshes the sidebar (`loadList()`). This covers a backgrounded tab
+(phone or laptop) whose stream silently stalled — the same reconnect `exitFrameMode`
+uses.
+
+**Resize is a non-goal** (inherited): the client VIEWS at the host's grid size
+(`term.resize` sizes only the xterm.js client) and never resizes the PTY, sidestepping
+the two-clients-one-PTY size conflict.
+
+**Security reuse.** No new auth model or attack surface: `GET /` passes through the
+SAME `decideRoute` gate (Host-header allowlist, token gate, per-peer failed-auth
+backoff, per-connection bounds) as every route.
+
+Wiring (all `WebMonitorServer.swift`): the SINGLE `htmlPage` static string carries the
+responsive layout + capability gates + the universal keydown/copy/paste/reconnect
+wiring; the `keySpecs(forKey:)` general `ctrl-<letter>` rule + `ctrlLetterKeycodes`
+table is the only server-side addition. (The former `/desktop` route,
+`RouteDecision.desktopPage`, `isBootstrapPath("/desktop")`, and `desktopHtmlPage` are
+**removed** — one page, one route.) Tests (`WebMonitorServerTests.swift`): the
+`htmlPage*` content guards (`htmlPageHasResponsiveSidebar` — the `data-view` machine +
+860px breakpoint, `htmlPageReusesXtermAssets`, `htmlPageHasGlobalKeydownWiring`,
+`htmlPageHasCopyPasteHooks`, `htmlPageHasReconnectOnRefocus`,
+`htmlPageHasThemeAwareChromeAndPollFallback`, and the layout/state-machine guards
+`htmlPageDataViewStateMachineTransitions`, `htmlPageSidebarHideRuleIsNarrowOnly` (the
+sidebar-hide rule stays inside the narrow `@media`), `htmlPageViewHeaderWrapsAndHidesMacNoteOnNarrow`,
+`htmlPageBannersAreTopLevelChrome`, `htmlPageHasBackToListControl`,
+`htmlPageKeydownBailsInTypingFields`); the `keySpecs` extension tests
+(`keySpecsCtrlLetterIsRealCtrlKeyEvent`, `keySpecsCtrlLetterCoversAllTwentySixLetters`,
+`keySpecsCtrlCAndCtrlUUnchangedByGeneralRule`, `keySpecsUnknownCtrlComboIsNil`).
 
 The server lives INSIDE the app — one binary, one rebuild/restart, NO second process. A
 SINGLE `NWListener` (dedicated serial queue) serves the page, the JSON API, the vendored
