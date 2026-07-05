@@ -1576,7 +1576,7 @@ struct WebMonitorServerTests {
         // A send that gets HTTP 404 means the session is gone; reportSend must
         // run the same teardown as the poll 404 path rather than leaving a stale
         // viewer + sticky "Send failed" banner until the next poll fires.
-        #expect(page.contains("else if (r && r.status === 404) { sessionClosedTeardown(); }"))
+        #expect(page.contains("if (r && r.status === 404) { sessionClosedTeardown(); return; }"))
     }
 
     @Test func htmlPageCtrlCQuickKeyIsDestyled() {
@@ -1588,12 +1588,14 @@ struct WebMonitorServerTests {
         #expect(page.contains("margin-left: 12px"))
     }
 
-    @Test func htmlPageSentToastLingers() {
+    @Test func htmlPageSuccessfulSendIsSilent() {
         let page = WebMonitorServer.htmlPage
-        // The "Sent." success toast clears after ~1500ms (was 600ms) so a
-        // throttled/backgrounded mobile tab does not miss the flash.
-        #expect(page.contains("setBanner(\"Sent.\", true); setTimeout(function () { clearBannerIfNotError(); }, 1500);"))
-        #expect(!page.contains("clearBannerIfNotError(); }, 600)"))
+        // A successful send shows NO banner: the global keydown driver calls
+        // reportSend per keystroke, and the typed character already appears on the
+        // terminal, so a per-keypress "Sent." toast is just noise + a layout shift.
+        // Only failures surface. Guards the regression where success set a banner.
+        #expect(!page.contains("setBanner(\"Sent.\""))
+        #expect(page.contains("if (r && r.ok) return;"))
     }
 
     @Test func htmlPageDeadTapShowsNoActiveSession() {

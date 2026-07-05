@@ -2760,9 +2760,12 @@ final class WebMonitorServer {
         }).then(reportSend).catch(function () { setBanner("Send failed \\u2014 not delivered.", false, true); });
       }
       function reportSend(r) {
-        if (r && r.ok) { setBanner("Sent.", true); setTimeout(function () { clearBannerIfNotError(); }, 1500); }
-        else if (r && r.status === 404) { sessionClosedTeardown(); }
-        else { setBanner("Send failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
+        // Success is SILENT: the global keydown driver calls this per keystroke, and
+        // the typed character/effect already shows on the terminal — a per-keypress
+        // "Sent." banner is pure noise and shifts the layout. Only surface failures.
+        if (r && r.ok) return;
+        if (r && r.status === 404) { sessionClosedTeardown(); return; }
+        setBanner("Send failed (HTTP " + (r ? r.status : "?") + ").", false, true);
       }
 
       function doSend() {
