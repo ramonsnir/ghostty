@@ -2097,7 +2097,6 @@ final class WebMonitorServer {
       #menubtn { display: none; flex: 0 0 auto; }
       #cur { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
              white-space: nowrap; color: var(--fg); font-weight: bold; }
-      #copybtn { flex: 0 0 auto; }
       #clearbell, #clearattn { flex: 0 0 auto; background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
       #clearbell:active, #clearattn:active { background: #6a5320; }
       #banner { display: none; padding: 7px 12px; background: #5a2a2a; color: #ffd9d9; text-align: center; }
@@ -2178,7 +2177,6 @@ final class WebMonitorServer {
                wide (the sidebar is always present there). -->
           <button id="menubtn" title="Back to the session list">&larr; Sessions</button>
           <span id="cur"></span>
-          <button id="copybtn" title="Copy the terminal selection (or use &#8984;C)">Copy</button>
           <button id="clearbell" style="display:none"
                   title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
           <button id="clearattn" style="display:none"
@@ -2261,7 +2259,6 @@ final class WebMonitorServer {
       var jumpBtn = document.getElementById("jumpbottom");
       var liveBtn = document.getElementById("livebtn");
       var curEl = document.getElementById("cur");
-      var copyBtn = document.getElementById("copybtn");
       var clearBellBtn = document.getElementById("clearbell");
       var clearAttnBtn = document.getElementById("clearattn");
       var modeEl = document.getElementById("mode");
@@ -2690,20 +2687,6 @@ final class WebMonitorServer {
         if (frameMode) { sendScroll(-30); sendScroll(-30); }
         showPlaceholder();
         loadList();
-      };
-
-      copyBtn.onclick = function () {
-        if (!(stream && stream.term)) { noActiveSession(); return; }
-        var sel = "";
-        try { sel = stream.term.getSelection(); } catch (e) {}
-        if (!sel) { setBanner("No selection to copy.", false); setTimeout(clearBannerIfNotError, 1200); return; }
-        if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(sel)
-            .then(function () { setBanner("Copied.", true); setTimeout(clearBannerIfNotError, 1200); })
-            .catch(function () { setBanner("Copy failed \\u2014 try \\u2318C.", false, true); });
-        } else {
-          setBanner("Copy needs HTTPS \\u2014 use \\u2318C, or put `tailscale serve` in front.", false, true);
-        }
       };
 
       clearBellBtn.onclick = function () {

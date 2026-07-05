@@ -506,13 +506,14 @@ after a click on the terminal still reaches the surface. The mapping:
   macOS virtual keycode (the core matches `entry.native == keycode`; a `GHOSTTY_KEY_*`
   enum value silently no-ops), and it is a **physical-position** code. Named/control/arrow
   keys therefore assume **a Mac client with a standard layout** (the "my other MacBook"
-  case) — stated in the UI. Off-Mac, positional keys may mis-map, but **printable text
+  case) — documented here. Off-Mac, positional keys may mis-map, but **printable text
   still works** (it rides the `text` field with `keycode 0`).
 
 **Copy / paste.** DOM `paste` → `e.clipboardData.getData("text")` → `text/plain` `/input`
 (newlines become real Enter via `keySpecs(forText:)`); DOM `copy`/`cut` +
-`stream.term.getSelection()` → `navigator.clipboard.writeText`. Both are
-secure-context-gated (see above) and fall back to the Send field when unavailable.
+`stream.term.getSelection()` → `e.clipboardData` synchronously (via `writeSelectionToEvent`). Using the clipboard
+event rather than `navigator.clipboard` means copy/paste work without a secure context;
+there is no on-screen Copy button, and the Send field is the manual fallback for typing.
 
 **Reconnect-on-refocus (universal).** A `visibilitychange` handler does a **clean
 resync** of the active stream on foreground (`document.visibilityState === "visible"`

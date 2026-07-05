@@ -1008,37 +1008,22 @@ struct WebMonitorServerTests {
     }
 
     @Test func htmlPageHasCopyPasteHooks() {
-        // Browser clipboard: paste -> text/plain /input; xterm selection -> copy/cut.
-        // The selection copy is secure-context gated (navigator.clipboard) with the
-        // Send field as the manual fallback.
+        // Browser clipboard via the native DOM events (⌘C / ⌘X / ⌘V), NOT a button:
+        // copy/cut write the xterm selection onto the event's clipboardData; paste
+        // routes the pasted text through the text/plain /input path.
         let page = WebMonitorServer.htmlPage
         #expect(page.contains("addEventListener(\"paste\""))
         #expect(page.contains("addEventListener(\"copy\""))
         #expect(page.contains("addEventListener(\"cut\""))
         #expect(page.contains("getData(\"text\")"))
         #expect(page.contains("stream.term.getSelection()"))
-        #expect(page.contains("navigator.clipboard.writeText"))
-        // A bare `window.isSecureContext` substring is NOT enough — that token also
-        // appears in the unrelated push code (pushSupported()/notify title), so it
-        // would pass even if the copy path's gate were deleted. Pin the FULL combined
-        // gate expression AND slice copyBtn.onclick to assert the gate + its
-        // else-fallback both live inside the copy handler (the same defense
-        // htmlPageHasGlobalKeydownWiring uses against the bare-string trap).
-        #expect(page.contains("window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText"))
-        // Slice to the NEXT handler declaration (not the first `};` — the inner
-        // .catch(...) closes with `});`, which would cut the slice before the else).
-        if let start = page.range(of: "copyBtn.onclick = function ()")?.lowerBound,
-           let end = page.range(of: "clearBellBtn.onclick", range: start..<page.endIndex)?.lowerBound {
-            let body = String(page[start..<end])
-            // The secure-context gate guards the clipboard write...
-            #expect(body.contains("window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText"))
-            #expect(body.contains("navigator.clipboard.writeText(sel)"))
-            // ...and the non-secure `else` branch degrades to the ⌘C/Send fallback,
-            // never an unconditional clipboard write.
-            #expect(body.contains("Copy needs HTTPS"))
-        } else {
-            Issue.record("copyBtn.onclick handler not found in htmlPage")
-        }
+        // Copy/cut put the selection on the clipboard synchronously via the event
+        // (clipboardData.setData), which works without a secure context — so there is
+        // NO navigator.clipboard write and NO Copy button anymore.
+        #expect(page.contains("e.clipboardData.setData(\"text/plain\", sel)"))
+        #expect(!page.contains("copyBtn"))
+        #expect(!page.contains("id=\"copybtn\""))
+        #expect(!page.contains("navigator.clipboard.writeText"))
         // Pin the paste handler's DESTINATION, not just that it listens: a paste must
         // route through sendText(...) (the text/plain /input path) and bail via
         // isTypingField so pasting into the Send field doesn't also fire into the
