@@ -154,7 +154,9 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         surfaceView: surfaceView,
                         isPresented: $viewModel.projectSelectorIsShowing,
                         ghosttyConfig: ghostty.config,
-                        projectDirectories: ghostty.config.projectDirectories
+                        projectDirectories: ghostty.config.projectDirectories,
+                        remoteProjectLines: ghostty.config.remoteProjectDirectories,
+                        remoteHostLines: ghostty.config.ptyRemoteHostLines
                     )
 
                     QueuePaletteView(

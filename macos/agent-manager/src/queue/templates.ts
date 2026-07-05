@@ -42,32 +42,43 @@ export const QUEUES_DIR = [".config", "ghostty-ramon", "agent-manager", "queues"
 export const TEMPLATE_DIR_TOKEN = "{templateDir}";
 
 /**
- * (shared templates) Substitute the literal `{templateDir}` token with `dir` (NO trailing
- * slash) in the five contract sites — `provider.list.command`, `provider.status.command`,
- * `provider.graph.command` (when present), `agent.command`, and every param `valuesCommand`
- * (when present). PURE — returns a NEW template with those sub-objects deep-cloned; a token in
- * any OTHER field is left untouched, `{key}` (renderArgv) is unaffected, and `provider.claim`
- * is deliberately NOT substituted (see SHARED-QUEUES-SPEC §0 note). A template with no token is
- * deep-equal to the input after substitution (no-op safety). Substring replace of ALL
- * occurrences in a string.
+ * (shared templates) Substitute the literal `{templateDir}` token in the five contract sites —
+ * `provider.list.command`, `provider.status.command`, `provider.graph.command` (when present),
+ * `agent.command`, and every param `valuesCommand` (when present). PURE — returns a NEW template
+ * with those sub-objects deep-cloned; a token in any OTHER field is left untouched, `{key}`
+ * (renderArgv) is unaffected, and `provider.claim` is deliberately NOT substituted (see
+ * SHARED-QUEUES-SPEC §0 note). Substring replace of ALL occurrences in a string.
+ *
+ * (ramon fork / cloud-hosts, Phase 4 O2) Takes TWO dirs so a cloud queue routes the RIGHT path
+ * to each side: the four PROVIDER/param sites (which run LAPTOP-side) get `providerDir` (the
+ * laptop template dir), while `agent.command` (which runs ON THE BOX) gets `agentDir` (the
+ * HOST-RELATIVE `remoteTemplateDir` when `host !== "local"`). `agentDir` DEFAULTS to `providerDir`,
+ * so a LOCAL run substitutes the same dir everywhere — byte-identical to the prior single-dir
+ * behavior. A template with no token is deep-equal to the input after substitution (no-op safety).
  */
-export function substituteTemplateDir(t: QueueTemplate, dir: string): QueueTemplate {
-  const sub = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(dir);
+export function substituteTemplateDir(
+  t: QueueTemplate,
+  providerDir: string,
+  agentDir: string = providerDir,
+): QueueTemplate {
+  const subProvider = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(providerDir);
+  const subAgent = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(agentDir);
   const provider: ProviderSpec = {
     ...t.provider,
-    list: { ...t.provider.list, command: t.provider.list.command.map(sub) },
-    status: { ...t.provider.status, command: t.provider.status.command.map(sub) },
+    list: { ...t.provider.list, command: t.provider.list.command.map(subProvider) },
+    status: { ...t.provider.status, command: t.provider.status.command.map(subProvider) },
   };
   if (t.provider.graph !== undefined) {
-    provider.graph = { ...t.provider.graph, command: t.provider.graph.command.map(sub) };
+    provider.graph = { ...t.provider.graph, command: t.provider.graph.command.map(subProvider) };
   }
   // provider.claim is intentionally NOT substituted (contract note).
   const params = t.params.map((p) =>
-    p.valuesCommand !== undefined ? { ...p, valuesCommand: p.valuesCommand.map(sub) } : p,
+    p.valuesCommand !== undefined ? { ...p, valuesCommand: p.valuesCommand.map(subProvider) } : p,
   );
   return {
     ...t,
-    agent: { ...t.agent, command: sub(t.agent.command) },
+    // agent.command runs on the BOX → route the host-relative agentDir into it.
+    agent: { ...t.agent, command: subAgent(t.agent.command) },
     provider,
     params,
   };
@@ -144,6 +155,15 @@ export function validateTemplate(obj: unknown): ValidateResult {
   );
   // NOTE: `quitWhenEmpty` was removed (see types.ts) — a `quitWhenEmpty` key in template
   // JSON is now silently ignored, never parsed.
+  // (ramon fork / cloud-hosts, Phase 4 O2) The remote-host trio. MUST be whitelisted HERE or
+  // the loader silently drops them (the `validateProviderList`/`coerceQueueCommands` lesson) →
+  // the agent split would never leave the laptop. `host` defaults to "local"; an empty/whitespace
+  // string normalizes to "local". `agentWorkdir`/`remoteTemplateDir` are optional non-empty
+  // strings, NOT `~`-expanded (they are host-relative absolute paths on the box). Only sensible
+  // when `host !== "local"`; ignored otherwise (kept for round-trip honesty).
+  const host = optNonEmptyStringOrDefault(rec.host, "local", "host", errors);
+  const agentWorkdir = optNonEmptyString(rec.agentWorkdir, "agentWorkdir", errors);
+  const remoteTemplateDir = optNonEmptyString(rec.remoteTemplateDir, "remoteTemplateDir", errors);
   const params = validateParams(rec.params, errors);
   // (schedules) The recurring scan agents. Validated for shape + a parseable cron; the
   // `promptFile` field is RESOLVED to `prompt` later, in the file loader (which knows the
@@ -165,6 +185,9 @@ export function validateTemplate(obj: unknown): ValidateResult {
 
   const template: QueueTemplate = {
     name,
+    host,
+    ...(agentWorkdir !== undefined ? { agentWorkdir } : {}),
+    ...(remoteTemplateDir !== undefined ? { remoteTemplateDir } : {}),
     workdir,
     agent,
     concurrency,
@@ -378,6 +401,34 @@ function reqNonEmptyString(
     return undefined;
   }
   return v;
+}
+
+/** (cloud-hosts) An OPTIONAL string: absent ⇒ `undefined` (no error); present-but-not-a-
+ *  non-empty-string ⇒ an error + `undefined`. Trimmed. PURE. */
+function optNonEmptyString(v: unknown, field: string, errors: string[]): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || v.trim().length === 0) {
+    errors.push(`${field} must be a non-empty string when present`);
+    return undefined;
+  }
+  return v.trim();
+}
+
+/** (cloud-hosts) An OPTIONAL string with a DEFAULT: absent / empty ⇒ `def` (no error); a
+ *  non-string ⇒ an error + `def`. Trimmed. PURE. Used for `host` (default "local"). */
+function optNonEmptyStringOrDefault(
+  v: unknown,
+  def: string,
+  field: string,
+  errors: string[],
+): string {
+  if (v === undefined) return def;
+  if (typeof v !== "string") {
+    errors.push(`${field} must be a string`);
+    return def;
+  }
+  const t = v.trim();
+  return t.length > 0 ? t : def;
 }
 
 function validateAgent(v: unknown, errors: string[]): AgentSpec | undefined {

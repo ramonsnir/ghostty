@@ -20,6 +20,7 @@
 // is injected) and unit-tested directly. NOTHING here is Linear/Git/issue-key aware.
 
 import type { ScheduleState } from "./schedule.js";
+import { sessionKey } from "./types.js";
 import type { Assignment, AssignmentState } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -198,6 +199,11 @@ function sanitizeSchedules(
       r.activeSessionID > 0
     ) {
       s.activeSessionID = Math.floor(r.activeSessionID);
+    }
+    // (cloud-hosts Q2) Carry the schedule's live-scan host (paired with activeSessionID). Keep
+    // ONLY a non-"local" name so a local schedule's persisted state stays byte-identical.
+    if (typeof r.hostName === "string" && r.hostName.length > 0 && r.hostName !== "local") {
+      s.hostName = r.hostName;
     }
     out[id] = s;
   }
@@ -442,6 +448,10 @@ function coerceAssignment(raw: unknown): Assignment | null {
     queueName,
     key,
     sessionID: typeof r.sessionID === "number" ? r.sessionID : 0,
+    // (ramon fork / cloud-hosts, Phase 4 Q2) Carry a persisted sibling `hostName` (default
+    // "local" for a pre-migration record with none). Paired with `sessionID` via `sessionKey`
+    // as the cross-host re-adoption key. Kept ONLY when non-"local" so a local record's
+    // serialization stays byte-identical (the `?? "local"` read handles the omitted case).
     gridSlot: typeof r.gridSlot === "number" ? r.gridSlot : 0,
     state,
     sinceMs: typeof r.sinceMs === "number" ? r.sinceMs : 0,
@@ -453,6 +463,10 @@ function coerceAssignment(raw: unknown): Assignment | null {
   if (typeof r.surfaceUUID === "string") a.surfaceUUID = r.surfaceUUID;
   if (typeof r.title === "string") a.title = r.title;
   if (typeof r.url === "string") a.url = r.url;
+  // (cloud-hosts Q2) Non-"local" host only (omitted ⇒ "local" via the read default).
+  if (typeof r.hostName === "string" && r.hostName.length > 0 && r.hostName !== "local") {
+    a.hostName = r.hostName;
+  }
   return a;
 }
 
@@ -542,7 +556,7 @@ export function makePendingRecord(
   key: string,
   gridSlot: number,
   nowMs: number,
-  extra?: { title?: string; url?: string; hero?: boolean },
+  extra?: { title?: string; url?: string; hero?: boolean; hostName?: string },
 ): Assignment {
   const a: Assignment = {
     queueName,
@@ -557,6 +571,11 @@ export function makePendingRecord(
   };
   if (extra?.title !== undefined) a.title = extra.title;
   if (extra?.url !== undefined) a.url = extra.url;
+  // (cloud-hosts Q2/Q3) Record the DISPATCH host (from the run's template.host) — the record's
+  // cross-host re-adoption key going forward. Non-"local" only (omitted ⇒ "local" via the read
+  // default), so a local dispatch's record serializes byte-identically. finalizeRecord spreads
+  // this through unchanged (the host is dispatch context, NOT the numeric spawn reply).
+  if (extra?.hostName !== undefined && extra.hostName !== "local") a.hostName = extra.hostName;
   return a;
 }
 
@@ -590,6 +609,11 @@ export function finalizeRecord(
  *  caller projects `list_surfaces` rows + the annotation read into this. */
 export interface LiveSurface {
   sessionID: number;
+  /** (ramon fork / cloud-hosts, Phase 4 Q2) The host the surface's session lives on — paired
+   *  with `sessionID` via `sessionKey` for the cross-host reconcile match. OPTIONAL / OMITTED ⇒
+   *  `"local"` (every read defaults it), so existing single-host callers/tests are unaffected.
+   *  `projectLiveSurfaces` derives it by parsing the composite wire `sessionID` (`parseSessionKey`). */
+  hostName?: string;
   surfaceUUID: string;
   /** The queueKey carried by the surface's annotation, if any (the orphan hint). A
    *  surface with a queueKey but no matching record is an orphan to adopt; a record
@@ -701,9 +725,12 @@ export function reconcile(
   // no-op (identical to the pre-fix `sinceMs`-only behavior) for callers that don't pass it.
   reconcileStartedMs: number = Number.NEGATIVE_INFINITY,
 ): ReconcilePlan {
-  // Index live surfaces by sessionID (only finalized, non-zero sessions can match a
-  // record). A sessionID of 0 is "unknown" and never a match key.
-  const liveBySession = new Map<number, LiveSurface>();
+  // Index live surfaces by the CROSS-HOST key `sessionKey(hostName, sessionID)` (only
+  // finalized, non-zero sessions can match a record). (cloud-hosts Q2) Keying on the
+  // (host, id) PAIR — not the bare numeric id — so two boxes can each mint the same
+  // session id 5 without a false reconcile match. A sessionID of 0 is "unknown" and never
+  // a match key. Host defaults to "local" when the surface omits it.
+  const liveBySession = new Map<string, LiveSurface>();
   // Also index by UUID: a freshly-dispatched record can carry sessionID 0 (the host
   // attaches asynchronously, so the split's id isn't ready at spawn time — see
   // dispatchOne). Such a record is matched by its stable surfaceUUID until its session
@@ -712,7 +739,7 @@ export function reconcile(
   // session has attached and orphan-adoption by the queueKey annotation recovers it.)
   const liveByUUID = new Map<string, LiveSurface>();
   for (const s of liveSurfaces) {
-    if (s.sessionID !== 0) liveBySession.set(s.sessionID, s);
+    if (s.sessionID !== 0) liveBySession.set(sessionKey(s.hostName ?? "local", s.sessionID), s);
     liveByUUID.set(s.surfaceUUID, s);
   }
 
@@ -722,13 +749,15 @@ export function reconcile(
   // Track which live surfaces were claimed by a record so the leftovers can be
   // considered for orphan adoption. Claim by sessionID (the match key) AND by UUID (for
   // sessionID-0 records matched by UUID, so they aren't also orphan-adopted).
-  const claimedSessions = new Set<number>();
+  // (cloud-hosts Q2) A Set of cross-host keys (sessionKey), not bare numeric ids.
+  const claimedSessions = new Set<string>();
   const claimedUUIDs = new Set<string>();
 
   for (const rec of records) {
-    const live = rec.sessionID !== 0 ? liveBySession.get(rec.sessionID) : undefined;
-    if (live !== undefined) {
-      claimedSessions.add(rec.sessionID);
+    const recKey = rec.sessionID !== 0 ? sessionKey(rec.hostName ?? "local", rec.sessionID) : undefined;
+    const live = recKey !== undefined ? liveBySession.get(recKey) : undefined;
+    if (live !== undefined && recKey !== undefined) {
+      claimedSessions.add(recKey);
       // Refresh the (re-minted) UUID from the live surface; flag a restamp when the
       // surface lost its queueKey annotation (the durable store is the truth).
       const refreshed: Assignment = { ...rec, surfaceUUID: live.surfaceUUID };
@@ -785,7 +814,8 @@ export function reconcile(
       claimedUUIDs.add(liveByUuid.surfaceUUID);
       if (liveByUuid.sessionID !== 0) {
         // The host has now attached → BACKFILL the real sessionID (and refresh the UUID).
-        claimedSessions.add(liveByUuid.sessionID);
+        // (cloud-hosts Q2) Claim by the cross-host key.
+        claimedSessions.add(sessionKey(liveByUuid.hostName ?? "local", liveByUuid.sessionID));
         const refreshed: Assignment = {
           ...rec,
           sessionID: liveByUuid.sessionID,
@@ -837,12 +867,15 @@ export function reconcile(
   // dispatch splitting into the adopted tab.
   const usedSlots = new Set<number>();
   for (const k of kept) if (k.gridSlot >= 0) usedSlots.add(k.gridSlot);
-  const adoptedSessions = new Set<number>();
+  const adoptedSessions = new Set<string>();
   for (const s of liveSurfaces) {
     if (s.sessionID === 0) continue; // can't be persistence-keyed → not adoptable
+    // (cloud-hosts Q2) Dedup / claim-skip on the cross-host key so two boxes' same-id sessions
+    // are distinct.
+    const sKey = sessionKey(s.hostName ?? "local", s.sessionID);
     if (claimedUUIDs.has(s.surfaceUUID)) continue; // a sessionID-0 record matched it by UUID
-    if (claimedSessions.has(s.sessionID)) continue;
-    if (adoptedSessions.has(s.sessionID)) continue;
+    if (claimedSessions.has(sKey)) continue;
+    if (adoptedSessions.has(sKey)) continue;
     const queueKey = s.queueKey;
     const queueName = s.queueName;
     if (
@@ -853,7 +886,7 @@ export function reconcile(
     ) {
       continue; // not a queue surface (no queueKey annotation) → leave it alone
     }
-    adoptedSessions.add(s.sessionID);
+    adoptedSessions.add(sKey);
     // Reclaim the lowest free non-negative slot for this adopted pane.
     let gridSlot = 0;
     while (usedSlots.has(gridSlot)) gridSlot += 1;
@@ -862,6 +895,9 @@ export function reconcile(
       queueName,
       key: queueKey,
       sessionID: s.sessionID,
+      // (cloud-hosts Q2) Record the adopted surface's host (non-"local" only, so a local
+      // adopt serializes byte-identically) — its cross-host re-adoption key going forward.
+      ...(s.hostName !== undefined && s.hostName !== "local" ? { hostName: s.hostName } : {}),
       surfaceUUID: s.surfaceUUID,
       // The original slot is unknown from the annotation, but a run keeps all its splits
       // in one tab so the precise geometry isn't load-bearing — what IS load-bearing is

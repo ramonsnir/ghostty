@@ -229,8 +229,23 @@ export function loadTemplateAtPath(path: string): LoadResult {
   const loader = makeTemplateLoader(path, realTemplateFs);
   const res = loader.load();
   if (res.ok) {
+    // (ramon fork / cloud-hosts, Phase 4 O3) `workdir` is the PROVIDER cwd (laptop-side realExec)
+    // + the LOCAL agent cwd, so it keeps its laptop `~` expansion. `agentWorkdir` /
+    // `remoteTemplateDir` are HOST-RELATIVE (absolute paths ON THE BOX) — we do NOT expandHome them
+    // against the laptop home (the box's home differs); they are passed through verbatim.
     res.template.workdir = expandHome(res.template.workdir);
-    res.template = substituteTemplateDir(res.template, dirname(path));
+    // (O2) Route the LAPTOP template dir into the provider/param `{templateDir}` sites and, when
+    // this run's agents run on a REMOTE host, the HOST-RELATIVE `remoteTemplateDir` into
+    // `agent.command`. A local run (or no remoteTemplateDir) uses the laptop dir on both sides
+    // (byte-identical to the prior single-dir substitution).
+    const laptopDir = dirname(path);
+    const tHost = res.template.host ?? "local";
+    const isRemote = tHost !== "local" && tHost.length > 0;
+    const agentDir =
+      isRemote && res.template.remoteTemplateDir !== undefined
+        ? res.template.remoteTemplateDir
+        : laptopDir;
+    res.template = substituteTemplateDir(res.template, laptopDir, agentDir);
   }
   return res;
 }

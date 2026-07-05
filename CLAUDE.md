@@ -1077,6 +1077,101 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `CLOUD-HOSTS-IMPL-PLAN.md` (build-ready spec: Cross-cutting decisions D1–D7, the C-ABI ledger,
   phase/task breakdown) + `PTYHOST.md` (→ Cloud-hosts Phase 2 redial subsection).**
 
+  **Phase 4 (cross-host agent ecosystem) — GUI-lib + sidecar + the ONE host-rebuild item.** Makes
+  a CLI agent running on a cloud box show up in the dashboard/queue with correct per-tile state,
+  and lets a queue dispatch its agents onto a box. Pieces: **(a) Cross-host agent self-ID by a
+  NONCE, not the tty walk (D6).** A box's hook can't name a laptop-side tty, and the session id is
+  unknown at spawn (minted host-side on `Attach`, after the launch line is already sent). So the GUI
+  mints a non-secret per-spawn correlation nonce (`RemoteAgentIdentity`, `Features/RemoteHost/
+  RemoteAgentIdentity.swift`), injects it into the remote shell via `initial_input`
+  (`export GHOSTTY_SURFACE_NONCE=…` — this CROSSES to the box, unlike `environmentVariables`), and
+  keeps a `nonce → (surfaceID, hostName, sessionID)` map; the box's hook POSTs `{nonce, state}` (NO
+  tty) and `/agent-state` resolves the nonce → local surface. `MCPAgentState.parse` now accepts a
+  body with a `nonce` and no `tty` (tty-walk is the LOCAL fallback; a body with NEITHER is rejected).
+  **⚠️ Only the NONCE is GUI-injected** (via `initial_input`); the hook's ingest URL
+  `GHOSTTY_MCP_URL` is NOT — it is a per-box, laptop-facing value provisioned in the BOX's own
+  environment (its `ghostty-host` systemd unit `Environment=`), so the hook's remote branch no-ops
+  until the box sets it (docs: hook header + MCP-SERVER.md + CLOUD-HOSTS-DESIGN.md Deployment).
+  **(b) Per-box CAPABILITY token — the master `mcp-token` is NEVER shipped to a box (D6).** The
+  master token is the fork's one shell-execution credential; a compromised box must not be able to
+  drive `spawn_split_command` on the fleet. `MCPServer.decideRoute` gates a per-box capability token
+  (`configureCapabilityTokens`, fail-closed empty set) to `/agent-state` INGEST ONLY — a capability
+  token presented to `/mcp` is `.unauthorized`. **The laptop-side ACCEPT set is wired from the fork
+  config key `pty-remote-capability-token`** (a `RepeatableString`, one token per box, kept in
+  `~/.config/ghostty-ramon/local`) — `AppDelegate` passes it to `configureCapabilityTokens` at
+  MCP-server construction (empty ⇒ fail-closed, the whole cross-host ingest path off); provision the
+  SAME token value per box into a 0600 file the hook reads (the hook feeds it to curl via `-K -`,
+  never argv). MCP over the tailnet: a MagicDNS Host is 403'd by the rebinding guard; PREFERRED fix
+  is a `tailscale serve` Host rewrite to loopback, or add the exact laptop FQDN via the fork config
+  key `pty-remote-mcp-allowed-host` (`AppDelegate` → `configureAllowedHosts`; never a wildcard).
+  **(c) Linux `/proc` arm — the ONE
+  host-rebuild item.** `foreground_pid` already worked on Linux (`tcgetpgrp`); only `process_info`
+  (name/command) was macOS-only, so `src/os/proc_info.zig` gained a `resolveLinux` arm
+  (`/proc/<pid>/comm` + `/proc/<pid>/cmdline` + a `/proc`-PPID launcher descent replacing
+  `proc_listchildpids`). This fills the already-negotiated minor-3 `process_info` frame — **NO
+  protocol change** — but it links into `ghostty-host`, so a Linux box's host must be rebuilt to name
+  cloud agents (a dumb-terminal remote split needs none). The pure parsers/pickers
+  (`parseProcCmdline`/`pickDescendChild`/`descendToProgramImpl`) are target-agnostic + unit-tested;
+  the Darwin body is comptime-dead on Linux. **(d) Per-queue `host` (OQ3 → provider-laptop /
+  agent-cloud split).** An Agent Queue template gains `host` (default `"local"`) + host-relative
+  `agentWorkdir`/`remoteTemplateDir`: the PROVIDER commands (`list`/`status`/`claim`/`graph`) ALWAYS
+  run laptop-side; only the AGENT split is placed on the box (via `spawn_split_command`'s new
+  OPTIONAL `host` arg — **NO new MCP tool, count STAYS 26**). The `{templateDir}` substitution
+  DIVERGES: the four provider/param sites keep the LAPTOP dir; `agent.command` (runs on the box) gets
+  `remoteTemplateDir`, dual-delivered as `GHOSTTY_QUEUE_TEMPLATE_DIR`. **(e) Host-aware project
+  palette (OQ4).** New fork config key `pty-remote-project-directory` (a `RepeatableString` of
+  `<host> = <base>` lines, grammar parsed macOS-side by `ProjectPaletteView.parseRemoteProjectBases`)
+  lists a box's subdirectories of `<base>` over the tunnel's ControlMaster (`RemoteTunnelController.
+  ensureProjects`/`listProjects`, a cached `ssh find -print0` with an `ls -1p` fallback,
+  stale-while-revalidate ~1s TTL), and opens a tab that runs on the host. **(f) `sessionID` composite
+  key (Q2, the matched emit↔parse pair).** `MCPLayout.surfacesJSONData` flips the `list_surfaces`
+  `sessionID` from an `NSNumber` to the STRING COMPOSITE **`"<hostName>:<sessionID>"`** (host
+  `"local"` when nil; `hostName` also emitted standalone); the sidecar parses it by splitting on the
+  LAST `:` (`parseSessionKey`/`sessionKey` in `queue/types.ts`), a bare-number legacy value ⇒ host
+  `"local"`. The dashboard `AgentStateStore`/`manualOrder`/mirror-`.id`, the sidecar reconcile +
+  schedule re-adopt maps, and the `Assignment.hostName`/`ScheduleState.hostName` store fields all key
+  on the `(host, u64)` PAIR now (OQ8 — two boxes can each mint the same `u64` without collision; a
+  local record OMITS `hostName` so its serialization is byte-identical). `spawn_split_command`'s
+  RESULT still returns lowercase `sessionId` as a NUMBER; the web monitor treats a remote surface as
+  "stream unavailable" (falls back to the `/screen` poll — remote raw streaming is out of scope for
+  v1). **(g) Billing (OQ6) is per-box, docs-only** — `get_haiku_usage` tracks ONLY the laptop
+  sidecar's own Haiku calls; a cloud work-agent bills the box's own Claude account, invisibly, which
+  is accepted for v1 (NOT a regression). Fork-only config key `pty-remote-project-directory` — keep
+  it (and the other `pty-remote-*` keys) in `~/.config/ghostty-ramon/config`. **GUI relaunch + a
+  lib/xcframework rebuild + rebuilt sidecar `dist`; the Linux `/proc` arm additionally needs a Linux
+  `ghostty-host` rebuild (item (c) — the ONLY host change, and only on the box, so no macOS session
+  loss).** Wiring — core: `src/config/Config.zig` (`pty-remote-project-directory` +
+  `pty-remote-capability-token` + `pty-remote-mcp-allowed-host` + parse tests),
+  `src/os/proc_info.zig` (`resolveLinux` + pure `/proc` parsers/pickers + tests). macOS:
+  `RemoteAgentIdentity.swift` (new), `MCPServer.swift` (capability tokens / allowed hosts /
+  nonce-branch `/agent-state`), `AppDelegate.swift` (wire `pty-remote-capability-token` →
+  `configureCapabilityTokens` + `pty-remote-mcp-allowed-host` → `configureAllowedHosts` at
+  MCP-server construction — WITHOUT this the cross-host ingest is fail-closed / unreachable),
+  `MCPAgentState.swift`/`AgentStateBridge.swift` (optional `tty` +
+  `nonce`), `MCPLayout.swift` (Q2 composite `sessionID` emit + `resolveHostSpawn` + nonce inject),
+  `MCPTools.swift` (`host` arg schema), `RemoteTunnelController.swift` (project cache/listing),
+  `ProjectPalette.swift`/`TerminalView.swift` (host-aware rows), `Ghostty.Config.swift`
+  (`remoteProjectDirectories` + `ptyRemoteCapabilityTokens` + `ptyRemoteMcpAllowedHosts`),
+  `AgentDashboardController.swift`/`AgentDashboardView.swift`/
+  `AgentPreviewTile.swift` (`AgentSessionKey` composite keying + host-aware mirror dial),
+  `MCPKnowledge.swift` (reader + `cloud-hosts` configKeys), `WebMonitorServer.swift` (remote =
+  stream-unavailable), `project.pbxproj` (iOS-exclude `RemoteAgentIdentity.swift`). Sidecar:
+  `queue/types.ts` (`host`/`agentWorkdir`/`remoteTemplateDir`/`Assignment.hostName` +
+  `sessionKey`/`parseSessionKey`), `queue/templates.ts` (validate the trio + two-dir
+  `substituteTemplateDir`), `queue/wiring.ts` (route laptop-vs-remote dir), `queue/runner.ts`
+  (remote dispatch + pair-keyed reconcile/schedule), `queue/store.ts` (persist non-local `hostName`),
+  `queue/schedule.ts` (`ScheduleState.hostName`), `mcp.ts` (composite `sessionID`/`hostName` +
+  `host` spawn arg). Tests: Zig `pty-remote-project-directory parse` + `pty-remote-capability-token`
+  / `pty-remote-mcp-allowed-host` parse + `proc_info` `/proc` tests;
+  Swift `MCPAgentStateTests` (nonce parse, capability-token route scoping, allowed-host FQDN),
+  `AgentDashboardTests` (composite keying + legacy→local + two-host-same-u64), `ProjectPaletteTests`
+  (`parseRemoteProjectBases` + cache freshness + `parseNulPaths`), `MCPServerTests`; sidecar
+  `types`/`store`/`templates`/`runner`/`mcp` `.test.ts` (pair-keying + remote dispatch +
+  legacy back-compat). **See `CLOUD-HOSTS-DESIGN.md` (→ Open questions OQ3/4/6/8 resolved, Phase 4
+  implemented) + `CLOUD-HOSTS-IMPL-PLAN.md` (Phase 4 tasks M–R + D3/D6) + the feature docs
+  (`AGENT-QUEUE.md` per-queue host, `AGENT-DASHBOARD.md` nonce/pair-keying, `MCP-SERVER.md` security
+  model, `AGENT-MANAGER.md` billing scope).**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
@@ -1084,7 +1179,7 @@ reserves a real grid slot…`). **Cadence — completion-anchored
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-ssh-options`, `pty-remote-connect-timeout` (a `u32`, seconds; `0` = compiled default). (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-project-directory` (a **RepeatableString** of `<host> = <base>` lines — the remote analog of `project-directory`; repeat for more hosts/bases), `pty-remote-ssh-options`, `pty-remote-connect-timeout` (a `u32`, seconds; `0` = compiled default), `pty-remote-capability-token` (a **RepeatableString** — per-box MCP `/agent-state` capability tokens the server accepts; a credential, keep in `local`), `pty-remote-mcp-allowed-host` (a **RepeatableString** — extra exact `Host`-header FQDNs the MCP server accepts, for tailnet ingest). (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

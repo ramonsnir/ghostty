@@ -251,6 +251,7 @@ enum MCPTools {
                     "env": ["type": "object", "description": "Item-context env vars (GHOSTTY_ITEM_*) set on the launched shell. NEVER splice these into 'command'.", "additionalProperties": ["type": "string"]],
                     "maxCols": ["type": "integer", "minimum": 1, "description": "Agent Queue grid cap: with balanced:true, never exceed this many COLUMNS in the split pane's row band (further splits stack into rows). Omit ⇒ pure-aspect balanced BSP (no grid cap). From the template grid.cols."],
                     "maxRows": ["type": "integer", "minimum": 1, "description": "Agent Queue grid cap: with balanced:true, never exceed this many ROWS in the split pane's column band (further splits add columns). Omit ⇒ pure-aspect. From the template grid.rows."],
+                    "host": ["type": "string", "description": "cloud-hosts (Phase 4): target host to spawn the agent ON. Omit or 'local' ⇒ the local pty-host (default). A 'pty-remote-host' registry NAME ⇒ spawn a REMOTE .client split on that box over the SSH tunnel (the GUI resolves name→forwarded socket + owns the tunnel; the dial defers to tunnel readiness). An UNKNOWN name FAILS the spawn (never a local fallback). With firstTab a remote tab; otherwise a remote split whose targetUUID tab is on that host."],
                 ],
                 "required": ["command"],
                 "additionalProperties": false,
@@ -629,11 +630,15 @@ enum MCPTools {
             // else nil ⇒ no cap (pure-aspect, byte-identical to today).
             let maxCols = positiveInt(arguments["maxCols"])
             let maxRows = positiveInt(arguments["maxRows"])
+            // (O6) Optional target host (cloud-hosts). nil / "local" ⇒ local; a registry
+            // name ⇒ remote spawn; an unknown name fails the spawn in newSplitCommand.
+            let host = (arguments["host"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             let result: (id: String, sessionID: UInt64)? = DispatchQueue.main.sync {
                 MCPLayout.newSplitCommand(
                     targetUUID: targetUUID, direction: direction, command: command,
                     cwd: cwd, firstTab: firstTab, env: env, balanced: balanced,
-                    windowAnchorUUID: windowAnchorUUID, maxCols: maxCols, maxRows: maxRows)
+                    windowAnchorUUID: windowAnchorUUID, maxCols: maxCols, maxRows: maxRows,
+                    host: host)
             }
             guard let result else { return .toolError("failed to spawn split") }
             // Casing note: this returns "sessionId" (lowercase); list_surfaces emits

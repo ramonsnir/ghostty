@@ -262,6 +262,12 @@ export interface ScheduleState {
    *  Backfilled from the live surface each sweep (a fresh spawn's id attaches asynchronously, so
    *  it may start 0), cleared on completion. */
   activeSessionID?: number;
+  /** (ramon fork / cloud-hosts, Phase 4 Q1/Q3) The HOST the live scan split runs on — paired with
+   *  `activeSessionID` (via `sessionKey`) so the restart re-adoption matches the right box's session
+   *  (two boxes can each mint the same numeric id). Default/omitted ⇒ `"local"` (a pre-migration
+   *  store record, or a schedule on the laptop). Set alongside `activeSessionID` when the scan is
+   *  dispatched to a remote host; cleared with it on completion. */
+  hostName?: string;
 }
 
 /**

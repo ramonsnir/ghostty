@@ -19,6 +19,12 @@ struct AgentEntry: Identifiable {
     let attention: Bool
     let hidden: Bool
     let sessionID: UInt64
+    /// (ramon fork / cloud-hosts, D3) The host this session lives on (`"local"` by
+    /// default). Paired with `sessionID` in `sessionKey` for the manual-order rank +
+    /// the mirror dial, so two same-`u64` sessions on different hosts never collapse.
+    var hostName: String = "local"
+    /// The composite `"<host>:<u64>"` key — the stable manual-order identity.
+    var sessionKey: String { AgentSessionKey.make(host: hostName, id: sessionID) }
     /// (ramon fork / Agent hooks) The hook-reported agent lifecycle state, or
     /// nil for a hookless tile (one that has never POSTed a hook event).
     let agentState: AgentState?
@@ -39,6 +45,27 @@ struct AgentEntry: Identifiable {
     /// not the user, so it is DEMOTED out of the attention sort + push and shows a
     /// neutral chip. Recomputed each rebuild for waiting tiles; in-memory ONLY.
     let backgroundShells: Int
+}
+
+/// (ramon fork / cloud-hosts, Phase 4 · D3/Q4) The COMPOSITE session key namespacing a
+/// host session across multiple hosts aggregated into one keyspace: `"<host>:<u64>"`,
+/// host defaulting to `"local"`. Used everywhere the dashboard PERSISTS a session id
+/// (the agent-state store, the manual order) so two sessions that happen to share a
+/// `u64` on DIFFERENT hosts (the host allocSessionId dedups only within one host) never
+/// collide / re-associate onto the wrong host across a GUI restart.
+enum AgentSessionKey {
+    /// Build the composite key. `host` empty ⇒ `"local"`.
+    static func make(host: String, id: UInt64) -> String {
+        "\(host.isEmpty ? "local" : host):\(id)"
+    }
+
+    /// Normalize a persisted key for back-compat: a PRE-migration bare-number key
+    /// (e.g. "12345", written before the host namespacing landed) is read as host
+    /// `"local"` — mirrors the Codable `decodeIfPresent ?? "local"`. A key already
+    /// carrying a `":"` (a composite) is returned unchanged.
+    static func normalizeLegacy(_ key: String) -> String {
+        key.contains(":") ? key : "local:\(key)"
+    }
 }
 
 /// Persistence boundary for the hide set, injected so the round-trip is
@@ -93,82 +120,84 @@ struct PersistedAgentState: Codable, Equatable {
 }
 
 /// Persistence boundary for per-session agent state, injected for testability
-/// (mirrors `HideStore`). Keyed by the HOST session id (`UInt64`) — the STABLE
-/// reattach key across a GUI restart, UNLIKE the surface UUID, which is freshly
-/// minted each launch (so a UUID-keyed store could never re-associate).
+/// (mirrors `HideStore`). Keyed by the COMPOSITE session key `"<host>:<u64>"`
+/// (`AgentSessionKey`) — the STABLE reattach key across a GUI restart, namespaced by
+/// host (D3) so two sessions sharing a `u64` on different hosts never collide. UNLIKE
+/// the surface UUID, which is freshly minted each launch (so a UUID-keyed store could
+/// never re-associate).
 protocol AgentStateStore {
-    func load() -> [UInt64: PersistedAgentState]
-    func save(_ map: [UInt64: PersistedAgentState])
+    func load() -> [String: PersistedAgentState]
+    func save(_ map: [String: PersistedAgentState])
 }
 
 /// Production store backed by the fork bundle-id `UserDefaults` domain. Encodes
-/// `[String: PersistedAgentState]` (session id → record) as JSON `Data` (the
-/// session id is stringified because plist/JSON keys must be strings).
+/// `[String: PersistedAgentState]` (composite session key → record) as JSON `Data`.
+/// On load, a PRE-migration bare-number key is normalized to the `local:` namespace
+/// (`AgentSessionKey.normalizeLegacy`) for back-compat.
 struct UserDefaultsAgentStateStore: AgentStateStore {
     static let key = "agentDashboardAgentStates"
     let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
-    func load() -> [UInt64: PersistedAgentState] {
+    func load() -> [String: PersistedAgentState] {
         guard let data = defaults.data(forKey: Self.key),
               let raw = try? JSONDecoder().decode([String: PersistedAgentState].self, from: data)
         else { return [:] }
-        var out: [UInt64: PersistedAgentState] = [:]
-        for (k, v) in raw { if let sid = UInt64(k) { out[sid] = v } }
+        var out: [String: PersistedAgentState] = [:]
+        for (k, v) in raw { out[AgentSessionKey.normalizeLegacy(k)] = v }
         return out
     }
 
-    func save(_ map: [UInt64: PersistedAgentState]) {
-        var raw: [String: PersistedAgentState] = [:]
-        for (k, v) in map { raw[String(k)] = v }
-        guard let data = try? JSONEncoder().encode(raw) else { return }
+    func save(_ map: [String: PersistedAgentState]) {
+        guard let data = try? JSONEncoder().encode(map) else { return }
         defaults.set(data, forKey: Self.key)
     }
 }
 
 /// In-memory `AgentStateStore` for tests.
 final class InMemoryAgentStateStore: AgentStateStore {
-    private var map: [UInt64: PersistedAgentState]
-    init(_ map: [UInt64: PersistedAgentState] = [:]) { self.map = map }
-    func load() -> [UInt64: PersistedAgentState] { map }
-    func save(_ map: [UInt64: PersistedAgentState]) { self.map = map }
+    private var map: [String: PersistedAgentState]
+    init(_ map: [String: PersistedAgentState] = [:]) { self.map = map }
+    func load() -> [String: PersistedAgentState] { map }
+    func save(_ map: [String: PersistedAgentState]) { self.map = map }
 }
 
 /// (ramon fork / Agent Dashboard) Persistence boundary for the user's manual
 /// tile order, injected for testability (mirrors `HideStore`/`AgentStateStore`).
-/// An ORDERED list of stable HOST session ids (`UInt64`) — NOT surface UUIDs,
-/// which are freshly minted each GUI launch (so a UUID-keyed order could never
-/// survive a relaunch — the same lesson `AgentStateStore` encodes).
+/// An ORDERED list of stable COMPOSITE session keys `"<host>:<u64>"`
+/// (`AgentSessionKey`) — NOT surface UUIDs, which are freshly minted each GUI launch
+/// (so a UUID-keyed order could never survive a relaunch — the same lesson
+/// `AgentStateStore` encodes), and host-namespaced so cross-host sessions don't collide.
 protocol OrderStore {
-    func load() -> [UInt64]
-    func save(_ order: [UInt64])
+    func load() -> [String]
+    func save(_ order: [String])
 }
 
 /// Production order store backed by the fork bundle-id `UserDefaults` domain.
-/// Session ids are stringified (a `UInt64` can exceed `Int`, and a plist number
-/// array can't safely hold the full range).
+/// Composite session keys are stored as a string array; a PRE-migration bare-number
+/// entry is normalized to the `local:` namespace on load (back-compat).
 struct UserDefaultsOrderStore: OrderStore {
     static let key = "agentDashboardManualOrder"
     let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
-    func load() -> [UInt64] {
-        (defaults.stringArray(forKey: Self.key) ?? []).compactMap { UInt64($0) }
+    func load() -> [String] {
+        (defaults.stringArray(forKey: Self.key) ?? []).map(AgentSessionKey.normalizeLegacy)
     }
 
-    func save(_ order: [UInt64]) {
-        defaults.set(order.map(String.init), forKey: Self.key)
+    func save(_ order: [String]) {
+        defaults.set(order, forKey: Self.key)
     }
 }
 
 /// In-memory `OrderStore` for tests.
 final class InMemoryOrderStore: OrderStore {
-    private var order: [UInt64]
-    init(_ order: [UInt64] = []) { self.order = order }
-    func load() -> [UInt64] { order }
-    func save(_ order: [UInt64]) { self.order = order }
+    private var order: [String]
+    init(_ order: [String] = []) { self.order = order }
+    func load() -> [String] { order }
+    func save(_ order: [String]) { self.order = order }
 }
 
 /// (ramon fork / Agent Queue, §11) Persistence boundary for the dashboard's
@@ -324,14 +353,14 @@ final class AgentDashboardModel: ObservableObject {
 
     // MARK: - Manual order (ramon fork / Agent Dashboard)
 
-    /// The user's manual tile order: an ORDERED list of stable HOST session ids
-    /// (`UInt64`). Drives the manual-rank sort key, which sits ABOVE the UUID
-    /// tie-break (placed tiles sort by this list; unplaced tiles — new agents —
-    /// float to the top by recency). `@Published` so the "Reset order"
+    /// The user's manual tile order: an ORDERED list of stable COMPOSITE session keys
+    /// `"<host>:<u64>"` (`AgentSessionKey`). Drives the manual-rank sort key, which sits
+    /// ABOVE the UUID tie-break (placed tiles sort by this list; unplaced tiles — new
+    /// agents — float to the top by recency). `@Published` so the "Reset order"
     /// affordance shows/hides reactively. Empty ⇒ no manual order. Persisted via
     /// `orderStore`. Each drag REWRITES this from the displayed order, so it
     /// never grows past the number of visible tiles.
-    @Published private(set) var manualOrder: [UInt64] = []
+    @Published private(set) var manualOrder: [String] = []
 
     // MARK: - Annotations (ramon fork / Agent Manager)
 
@@ -409,7 +438,7 @@ final class AgentDashboardModel: ObservableObject {
     /// Last-known agent state per HOST session id, persisted across GUI restarts
     /// via `agentStore`. Loaded (pruned) at init, rehydrated onto fresh surface
     /// UUIDs in `rebuild(live:)`, and written through on every state change.
-    private var restored: [UInt64: PersistedAgentState]
+    private var restored: [String: PersistedAgentState]
     private let agentStore: AgentStateStore
 
     /// Drop persisted records older than this on load (a dead session lingering
@@ -595,8 +624,10 @@ final class AgentDashboardModel: ObservableObject {
     /// Sessionless tiles (id 0 — e.g. no `pty-host`, or pre-attach) can't be
     /// ordered stably across a relaunch, so they're dropped from the saved
     /// order (they fall back to recency/UUID). Persists and re-sorts.
-    func setManualOrder(_ sessionIDs: [UInt64]) {
-        manualOrder = sessionIDs.filter { $0 != 0 }
+    func setManualOrder(_ sessionKeys: [String]) {
+        // A sessionless tile has key "<host>:0" — it can't be ordered stably across a
+        // relaunch, so drop it (it falls back to recency/UUID). Any host's ":0" suffix.
+        manualOrder = sessionKeys.filter { !$0.hasSuffix(":0") }
         orderStore.save(manualOrder)
         rebuildEntriesFromCurrentState()
     }
@@ -822,6 +853,13 @@ final class AgentDashboardModel: ObservableObject {
         let title: String
         let pwd: String
         let sessionID: UInt64
+        /// (ramon fork / cloud-hosts, D3) The host this session lives on — the
+        /// `pty-remote-host` registry name, or `"local"` (from `SurfaceView.hostName`,
+        /// nil ⇒ `"local"`). Paired with `sessionID` it forms the composite persistence
+        /// key so a cross-host session never re-associates onto the wrong host.
+        var hostName: String = "local"
+        /// The composite `"<host>:<u64>"` persistence/rehydration key.
+        var sessionKey: String { AgentSessionKey.make(host: hostName, id: sessionID) }
     }
 
     /// The current live surface snapshot, captured by `rebuild()` on main and
@@ -861,9 +899,9 @@ final class AgentDashboardModel: ObservableObject {
 
     /// Pure: drop records older than `maxAge`, then cap to the `maxCount` newest.
     static func prune(
-        _ map: [UInt64: PersistedAgentState], now: Date,
+        _ map: [String: PersistedAgentState], now: Date,
         maxAge: TimeInterval, maxCount: Int
-    ) -> [UInt64: PersistedAgentState] {
+    ) -> [String: PersistedAgentState] {
         let nowS = now.timeIntervalSince1970
         var kept = map.filter { nowS - $0.value.updated <= maxAge }
         if kept.count > maxCount {
@@ -873,10 +911,11 @@ final class AgentDashboardModel: ObservableObject {
         return kept
     }
 
-    /// The host session id for a live surface UUID, or nil if unknown (not yet
-    /// in the `live` snapshot, or no host session).
-    private func sessionID(for id: UUID) -> UInt64? {
-        live.first { $0.id == id }?.sessionID
+    /// The COMPOSITE session key for a live surface UUID, or nil if unknown (not yet
+    /// in the `live` snapshot) or sessionless (host session id 0 — no stable key).
+    private func sessionKey(for id: UUID) -> String? {
+        guard let s = live.first(where: { $0.id == id }), s.sessionID != 0 else { return nil }
+        return s.sessionKey
     }
 
     /// True iff `a` and `b` carry the same state/tool/prompt/message (IGNORING
@@ -889,12 +928,12 @@ final class AgentDashboardModel: ObservableObject {
     /// Persist the current state for `id`'s host session, if its session id is
     /// known and non-zero. Saves only when the persisted CONTENT changes.
     private func writeThrough(id: UUID) {
-        guard let sid = sessionID(for: id), sid != 0, let state = agentStates[id] else { return }
+        guard let key = sessionKey(for: id), let state = agentStates[id] else { return }
         let rec = PersistedAgentState(
             state: state.rawValue, tool: lastTool[id], prompt: lastPrompt[id],
             message: lastMessage[id], updated: Date().timeIntervalSince1970)
-        if !sameContent(restored[sid], rec) {
-            restored[sid] = rec
+        if !sameContent(restored[key], rec) {
+            restored[key] = rec
             agentStore.save(restored)
         }
     }
@@ -909,8 +948,9 @@ final class AgentDashboardModel: ObservableObject {
         var dirty = false
         let nowS = Date().timeIntervalSince1970
         for s in live where s.sessionID != 0 {
+            let key = s.sessionKey
             if agentStates[s.id] == nil {
-                guard let rec = restored[s.sessionID],
+                guard let rec = restored[key],
                       let state = AgentState(rawValue: rec.state) else { continue }
                 agentStates[s.id] = state
                 if let t = rec.tool { lastTool[s.id] = t }
@@ -921,10 +961,10 @@ final class AgentDashboardModel: ObservableObject {
                 let rec = PersistedAgentState(
                     state: state.rawValue, tool: lastTool[s.id], prompt: lastPrompt[s.id],
                     message: lastMessage[s.id], updated: nowS)
-                let cur = restored[s.sessionID]
+                let cur = restored[key]
                 let stale = cur.map { nowS - $0.updated > Self.persistTouchInterval } ?? true
                 if !sameContent(cur, rec) || stale {
-                    restored[s.sessionID] = rec
+                    restored[key] = rec
                     dirty = true
                 }
             }
@@ -990,6 +1030,13 @@ final class AgentDashboardModel: ObservableObject {
         /// supervisor tracks + re-adopts the scheduled run — the reconcile-visibility chokepoint,
         /// mirroring `queueKey`. nil for a normal split.
         let scheduleId: String?
+        /// (ramon fork / cloud-hosts, D3) The host this surface's session lives on
+        /// (`"local"` by default). Snapshotted alongside the queue tags so the MCP layer
+        /// can pair it with the session id if needed; `MCPLayout.surfaceRows` reads the
+        /// authoritative `SurfaceView.hostName` directly, so this is carried for
+        /// completeness / a consistent value-type snapshot. Defaulted so existing
+        /// constructors are unaffected.
+        var hostName: String = "local"
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -997,6 +1044,9 @@ final class AgentDashboardModel: ObservableObject {
     /// "nothing known" (the MCP shaper then omits those fields — honest absence).
     func hookSnapshot() -> [UUID: HookSnapshotEntry] {
         var out: [UUID: HookSnapshotEntry] = [:]
+        // Host per live surface (D3), so the snapshot carries the host identity.
+        var hostByID: [UUID: String] = [:]
+        for s in live { hostByID[s.id] = s.hostName }
         let ids = Set(agentStates.keys)
             .union(lastPrompt.keys).union(lastTool.keys)
             .union(annotations.keys).union(agents.keys)
@@ -1013,7 +1063,8 @@ final class AgentDashboardModel: ObservableObject {
                 queueName: annotations[id]?.queueName,
                 queueUrl: annotations[id]?.queueUrl,
                 queueHero: annotations[id]?.queueHero,
-                scheduleId: annotations[id]?.scheduleId)
+                scheduleId: annotations[id]?.scheduleId,
+                hostName: hostByID[id] ?? "local")
         }
         return out
     }
@@ -1057,6 +1108,7 @@ final class AgentDashboardModel: ObservableObject {
                     attention: attention[s.id] ?? false,
                     hidden: hidden.contains(s.id),
                     sessionID: s.sessionID,
+                    hostName: s.hostName,
                     agentState: agentStates[s.id],
                     lastTool: lastTool[s.id],
                     lastPrompt: lastPrompt[s.id],
@@ -1069,8 +1121,8 @@ final class AgentDashboardModel: ObservableObject {
                         : 0
                 )
             }
-        // session id → its index in the user's manual order (keep-first on the
-        // (impossible-in-practice) duplicate, to stay total).
+        // composite session key → its index in the user's manual order (keep-first on
+        // the (impossible-in-practice) duplicate, to stay total).
         let manualRank = Dictionary(
             manualOrder.enumerated().map { ($1, $0) },
             uniquingKeysWith: { first, _ in first })
@@ -1127,7 +1179,7 @@ final class AgentDashboardModel: ObservableObject {
     static func sorted(
         _ entries: [AgentEntry],
         lastSeen: [UUID: Date] = [:],
-        manualRank: [UInt64: Int] = [:],
+        manualRank: [String: Int] = [:],
         // (ramon fork) The spotlighted surface, if any — sorts absolute-first.
         spotlightedID: UUID? = nil,
         // Default true to match the config defaults (dashboard routed to both tiers);
@@ -1136,7 +1188,8 @@ final class AgentDashboardModel: ObservableObject {
         attnDashboard: Bool = true
     ) -> [AgentEntry] {
         func rank(_ e: AgentEntry) -> Int? {
-            e.sessionID == 0 ? nil : manualRank[e.sessionID]
+            // A sessionless tile (host session id 0) can't be ranked stably.
+            e.sessionID == 0 ? nil : manualRank[e.sessionKey]
         }
         return entries.sorted { a, b in
             // (ramon fork) Spotlight is the ABSOLUTE top — above attention, manual
@@ -2160,7 +2213,8 @@ final class AgentDashboardController: NSWindowController {
                     view: view,
                     title: view.title,
                     pwd: view.pwd ?? "",
-                    sessionID: sid
+                    sessionID: sid,
+                    hostName: view.hostName ?? "local"
                 ))
             }
         }

@@ -1027,6 +1027,50 @@ extension Ghostty {
             return buffer.compactMap { $0.map { String(cString: $0) } }
         }
 
+        // (ramon fork / cloud-hosts) Raw `pty-remote-project-directory` lines — one per
+        // configured base, each the VERBATIM value after the config key's first `=` (e.g.
+        // `cloud-1 = ~/git`). This getter does NOT parse the `<name> = <base>` grammar —
+        // that is `ProjectPaletteView.parseRemoteProjectBases`. A byte-for-byte copy of the
+        // `ptyRemoteHostLines` / `projectDirectories` `RepeatableString` readers.
+        var remoteProjectDirectories: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-project-directory"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts, D6) Per-box CAPABILITY tokens the in-GUI MCP server
+        // ACCEPTS for `/agent-state` ingest ONLY (never `/mcp`). Empty ⇒ fail-closed (no
+        // box token accepted). Wired into `MCPServer.configureCapabilityTokens` at launch.
+        // A byte-for-byte copy of the `ptyRemoteHostLines` RepeatableString reader.
+        var ptyRemoteCapabilityTokens: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-capability-token"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts, D6) Extra exact `Host`-header values the in-GUI MCP
+        // server ACCEPTS beyond the bind host + loopback (tailnet MagicDNS FQDNs), so an
+        // MCP / `/agent-state` request over the tailnet isn't 403'd by the rebinding guard.
+        // Wired into `MCPServer.configureAllowedHosts` at launch. A byte-for-byte copy of
+        // the `ptyRemoteHostLines` RepeatableString reader.
+        var ptyRemoteMcpAllowedHosts: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-mcp-allowed-host"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
         // (ramon fork / cloud-hosts) Extra `ssh` options applied to every remote-host
         // tunnel (verbatim, appended to the supervisor's ssh command line). nil/empty
         // when unset. A scalar `?[]const u8`, so read like `ptyHost` above.

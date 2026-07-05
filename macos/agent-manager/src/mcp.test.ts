@@ -14,6 +14,8 @@ import {
   McpError,
   McpClient,
 } from "./mcp.js";
+import type { Surface } from "./mcp.js";
+import { parseSessionKey } from "./queue/types.js";
 
 test("extractToolText: success returns the inner text string", () => {
   const env = {
@@ -221,6 +223,56 @@ test("spawnSplitCommand: encodes the tool + forwards only present fields", async
   assert.equal(args.cwd, "/repo");
   assert.equal("firstTab" in args, false);
   assert.deepEqual(result, { id: "new-uuid", sessionId: 17 });
+});
+
+// --- (ramon fork / cloud-hosts, Phase 4 O5/Q2) spawn host arg + hostName read-back ---
+
+test("spawnSplitCommand: carries `host` when it is a real remote name", async () => {
+  const { name, args } = await captureCall('{"id":"u","sessionId":1}', (c) =>
+    c.spawnSplitCommand({ command: "claude", firstTab: true, host: "cloud-1" }),
+  );
+  assert.equal(name, "spawn_split_command");
+  assert.equal(args.host, "cloud-1");
+});
+
+test("spawnSplitCommand: OMITS `host` for local / 'local' / empty (byte-identical local wire)", async () => {
+  for (const host of [undefined, "local", ""]) {
+    const { args } = await captureCall('{"id":"u","sessionId":1}', (c) =>
+      c.spawnSplitCommand({ command: "claude", firstTab: true, host }),
+    );
+    assert.equal("host" in args, false, `host=${JSON.stringify(host)} must be omitted`);
+  }
+});
+
+test("listSurfaces: reads the composite sessionID + hostName back off the row", async () => {
+  const payload = JSON.stringify({
+    surfaces: [
+      { id: "u-1", sessionID: "cloud-1:5", hostName: "cloud-1" },
+      { id: "u-2", sessionID: "local:9", hostName: "local" },
+    ],
+  });
+  const { result } = await captureCall(payload, (c) => c.listSurfaces());
+  const rows = result as Surface[];
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].sessionID, "cloud-1:5");
+  assert.equal(rows[0].hostName, "cloud-1");
+  // The sidecar splits the composite back into the (host, id) pair (the matched Q2 parse).
+  assert.deepEqual(parseSessionKey(rows[0].sessionID), { hostName: "cloud-1", sessionID: 5 });
+  assert.deepEqual(parseSessionKey(rows[1].sessionID), { hostName: "local", sessionID: 9 });
+});
+
+test("parseSessionKey: composite / bare-number / missing / host-with-colon-in-name", () => {
+  // Composite: split on the LAST ':'.
+  assert.deepEqual(parseSessionKey("cloud-1:42"), { hostName: "cloud-1", sessionID: 42 });
+  // A host label that itself contains a ':' (e.g. an IPv6-ish name) — LAST colon wins.
+  assert.deepEqual(parseSessionKey("a:b:7"), { hostName: "a:b", sessionID: 7 });
+  // Bare number (legacy emit) ⇒ local.
+  assert.deepEqual(parseSessionKey("13"), { hostName: "local", sessionID: 13 });
+  assert.deepEqual(parseSessionKey(13), { hostName: "local", sessionID: 13 });
+  // Missing / unparseable / zero ⇒ local + 0 (never a match key).
+  assert.deepEqual(parseSessionKey(undefined), { hostName: "local", sessionID: 0 });
+  assert.deepEqual(parseSessionKey("local:0"), { hostName: "local", sessionID: 0 });
+  assert.deepEqual(parseSessionKey("cloud-1:"), { hostName: "cloud-1", sessionID: 0 });
 });
 
 test("moveSurfaceIntoTab: encodes move_surface_into_tab + forwards source/anchor/balanced", async () => {

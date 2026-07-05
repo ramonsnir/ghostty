@@ -1,6 +1,6 @@
 # Cloud-hosted terminals — some splits run on a remote host over SSH
 
-Status: **Phases 1 + 2 implemented; Phase 3 L1 implemented (L3 deferred).** This remains the
+Status: **Phases 1 + 2 + 4 implemented; Phase 3 L1 implemented (L3 deferred).** This remains the
 DESIGN doc (rationale + full plan of record); the build-ready spec is `CLOUD-HOSTS-IMPL-PLAN.md`.
 Phase 1 landed the multi-host `.client` client + registry + launch + `(host, session_id)`
 identity: the `pty-remote-host` / `pty-remote-ssh-options` config keys, a per-surface socket
@@ -17,10 +17,19 @@ surface-visible connection channel (`ghostty_surface_client_state`), the `Remote
 single-owner never-give-up ssh-master respawn supervisor, and the `pty-remote-connect-timeout`
 per-attempt ceiling. **Phase 3 L1** added the `HelloAck` version read + the directional `too_old`
 overlay + the `ReconnectStateOverlay` banners. **L3 (`hello_nack`) is DEFERRED** (host protocol
-change ⇒ session loss ⇒ needs a scheduled MINOR bump); cross-host session namespacing + the Linux
-`proc_info` arm (Phase 4) are not yet built. **All of Phases 2–3 are GUI-lib-only — the redial
-machine, surface Options, probe, and state accessor are NOT compiled into `ghostty-host`, so no
-host restart / no session loss.** It is grounded in the code at HEAD (citations are `file:symbol`
+change ⇒ session loss ⇒ needs a scheduled MINOR bump). **Phase 4 (cross-host agent ecosystem) is
+now implemented:** cross-host agent self-ID by a GUI-minted correlation NONCE (a box can't name a
+laptop tty), a PER-BOX capability token scoped to `/agent-state` INGEST ONLY (the master
+`mcp-token` is NEVER shipped to a box — D6), the `(host, session_id)` PAIR keyed everywhere the
+GUI/sidecar persist a session (dashboard stores, sidecar reconcile + schedule maps, the
+`list_surfaces` `sessionID` STRING composite — OQ8/Q2), a per-queue `host` (provider laptop-side,
+agent cloud-side — OQ3), a host-aware project palette over the ControlMaster (`pty-remote-project-directory`
+— OQ4), and the Linux `/proc` arm in `proc_info.zig` (the ONE host change — a Linux box's host
+rebuild names cloud agents; `foreground_pid` already worked on Linux). **All of Phases 2–3 and the
+macOS side of Phase 4 are GUI-lib-only — the redial machine, surface Options, probe, state
+accessor, nonce map, capability tokens, and the composite-`sessionID` emit are NOT compiled into
+`ghostty-host`, so no macOS host restart / no session loss; only the Linux `/proc` arm links into
+`ghostty-host` and takes effect after a Linux-box host rebuild.** It is grounded in the code at HEAD (citations are `file:symbol`
 / `file:line`), and every claim about *current* behavior was verified against the source unless
 explicitly marked "unverified".
 
@@ -476,6 +485,18 @@ GHOSTTY_MCP_TOKEN=<mcp-token>
 - The `GHOSTTY_MCP_URL` points at the **laptop's tailnet address**, not `127.0.0.1`, so a cloud
   hook can reach the MCP server over the tailnet.
 
+> **✅ As implemented (D6) — the env set above narrowed to ONE GUI-injected value.** The
+> shipped self-ID delivers a single non-secret **per-spawn correlation NONCE**, not the
+> `(host, session_id)` pair (the session id is minted host-side on `Attach`, AFTER the launch
+> line is sent, so it isn't known when the initial input is built). `MCPLayout.newSplitCommand`
+> injects `export GHOSTTY_SURFACE_NONCE=<nonce>` via `initial_input` and keeps a
+> `nonce → (surfaceID, hostName, sessionID)` map; the hook POSTs `{nonce, state}`. **Neither
+> `GHOSTTY_MCP_URL` nor a token is GUI-injected:** `GHOSTTY_MCP_URL` is a per-box, laptop-facing
+> value provisioned in the BOX's own environment (its `ghostty-host` systemd unit
+> `Environment=GHOSTTY_MCP_URL=…`; see Deployment), and the credential is a **per-box CAPABILITY
+> token** the box reads from a 0600 file — NOT the master `mcp-token`, which never leaves the
+> laptop (see "MCP over the tailnet" and the security posture).
+
 ### Hook self-identifies instead of walking ppid/tty
 
 Update `ghostty-agent-state.sh` (`example/claude-hooks/`) so that **if `GHOSTTY_SURFACE_SESSION`
@@ -624,12 +645,19 @@ instead of launchd.
   comptime-null off-Darwin) using `libproc` `proc_name` + `sysctl(KERN_PROCARGS2)` +
   `proc_listchildpids`. The **`foreground_pid` frame ALREADY works on Linux** (its pid comes
   from `tcgetpgrp`, which has a working Linux branch at `pty.zig:274-282`). So a Linux host
-  emits correct `foreground_pid` out of the box; only the human-facing name/command is blank
-  until `proc_info.zig` gains a `.linux` arm (`/proc/<pid>/comm`, `/proc/<pid>/cmdline`, plus a
-  `/proc`-PPID descent to replace `proc_listchildpids` so classification finds the agent under
-  the `bash`/`claude-pool` wrapper, not the wrapper). This is a **real host code change for full
-  agent NAME classification**, needed only for Phase 4 cloud agents — a dumb-terminal cloud
-  split (Phases 0–2) does not need it. **Audited clean (no other macOS-only host-hot-path
+  emits correct `foreground_pid` out of the box; only the human-facing name/command was blank
+  until `proc_info.zig` gained a `.linux` arm. **✅ Phase 4 IMPLEMENTED** — `resolve()` now returns
+  first through `resolveLinux` on a `.linux` target (the Darwin sysctl/libproc body is comptime-dead
+  there): it reads `/proc/<pid>/comm` (name) + `/proc/<pid>/cmdline` (command, NUL-separated argv)
+  and does a `/proc`-PPID launcher descent (`/proc/<pid>/task/<pid>/children`, falling back to a
+  `/proc/*/stat` PPID scan) via the generic `descendToProgramImpl` + the pure `pickDescendChild`, so
+  classification finds the agent UNDER the `bash`/`claude-pool` wrapper, not the wrapper. The pure
+  parsers/pickers (`parseProcCmdline` / `pickDescendChild` / `descendToProgramImpl` /
+  `parsePpidFromStat`) are target-agnostic + unit-tested. This fills the already-negotiated minor-3
+  `process_info` frame — **NO protocol change** — but it links into `ghostty-host`, so it is the
+  **ONE Phase-4 host code change** (a Linux box's host must be rebuilt to name cloud agents); a
+  dumb-terminal cloud split (Phases 0–2) needs none, and the macOS host is untouched. **Audited clean
+  (no other macOS-only host-hot-path
   syscall):** PTY (`pty.zig` openpty/termios/TIOCSCTTY + `.linux` branches), spawn
   (`Command.zig:372-410,189` `.linux` dup3 + `fork`), event loop (`xev.Dynamic` →
   io_uring/epoll, `global.zig:17,123`), and SIGPIPE (globally ignored for all POSIX at
@@ -651,6 +679,12 @@ ExecStart=%h/.local/bin/ghostty-host --listen=%h/.ghostty-ramon-host.sock
 # TERM/terminfo so the child shell gets xterm-ghostty (mirror of the LaunchAgent's
 # GHOSTTY_RESOURCES_DIR env — point at the installed core resources on the box).
 Environment=GHOSTTY_RESOURCES_DIR=%h/.local/share/ghostty
+# (cloud-hosts, D6) The MCP ingest URL the agent-state hook POSTs to. It is a
+# per-box, laptop-facing value and is NOT GUI-injected — set it HERE so the
+# spawned shells (and thus a cloud agent's hook) inherit it. Point it at the
+# laptop's tailnet /agent-state URL (fronted by `tailscale serve` for HTTPS).
+# Omit for a dumb-terminal box that runs no cross-host agents.
+Environment=GHOSTTY_MCP_URL=https://laptop.example.ts.net/agent-state
 Restart=always
 RestartSec=2
 # The socket stays on loopback/AF_UNIX; only sshd reaches it via the -L forward.
@@ -674,9 +708,14 @@ schedule it deliberately, exactly as documented for the macOS host.
 3. Ensure the box is on the tailnet (Tailscale) and SSH-reachable from the laptop.
 4. (For agents on the box) install `claude` + `node` on the box's PATH; log into the Claude
    account to bill; drop the self-identifying hook (`ghostty-agent-state.sh` variant) into the
-   box's Claude Code settings.
+   box's Claude Code settings. Set `GHOSTTY_MCP_URL` in the box's environment (the systemd
+   unit above) to the laptop's tailnet `/agent-state` URL, and provision a per-box CAPABILITY
+   token into a 0600 file the hook reads (default `~/.config/ghostty-ramon/mcp-capability-token`).
 5. On the laptop: add a `pty-remote-host = <name> = <ssh-target> : <remote-socket>` line to
-   `~/.config/ghostty-ramon/config`.
+   `~/.config/ghostty-ramon/config`. For agents on the box, also add that box's capability
+   token as `pty-remote-capability-token = <token>` (in `~/.config/ghostty-ramon/local`) so the
+   MCP server ACCEPTS its `/agent-state` POSTs, and either front the MCP port with
+   `tailscale serve` or add the laptop's FQDN via `pty-remote-mcp-allowed-host`.
 
 ---
 
@@ -805,10 +844,16 @@ Build a rendering + reconnecting remote split **before** any agent-ecosystem wor
   (host closes before `HelloAck` ⇒ the ambiguous `cannot_handshake`; a decoded-ack major mismatch
   ⇒ the confident `too_old`). Deliverable: an old cloud host shows an actionable message, never a
   blank pane.
-- **Phase 4 — Cross-host agent ecosystem.** Env self-ID injection, hook self-ID branch, MCP over
-  tailnet, `(host, session)` correlation in dashboard/queue/manager, Linux `/proc` port for
-  `foreground_pid`/`process_info`, per-queue `host`, claude/node/billing docs. Deliverable: an
-  agent on a cloud box shows in the dashboard/queue with correct state.
+- **Phase 4 — Cross-host agent ecosystem. ✅ IMPLEMENTED.** Nonce self-ID injection
+  (`export GHOSTTY_SURFACE_NONCE` via `initial_input`) + the hook's `{nonce, state}` self-ID branch
+  + the `/agent-state` nonce resolver (`RemoteAgentIdentity`); the PER-BOX capability token scoped
+  to `/agent-state` only (never `/mcp` spawn) + MCP-over-tailnet host allow-list; `(host, session)`
+  correlation across the dashboard stores / sidecar reconcile + schedule maps / the `list_surfaces`
+  `sessionID` STRING composite (`"<host>:<id>"`); the Linux `/proc` arm for
+  `foreground_pid`/`process_info` (the one host change); per-queue `host` (provider laptop-side,
+  agent cloud-side) + `pty-remote-project-directory`; and the claude/node/billing docs. NO new MCP
+  tool (count stays 26 — `spawn_split_command` gained an optional `host` arg). Deliverable: an agent
+  on a cloud box shows in the dashboard/queue with correct state.
 
 Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend to agents.
 
@@ -827,15 +872,39 @@ Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend t
    `list/status/claim` scripts + `{templateDir}` are laptop-side but the agent split is
    cloud-side. Do we (a) ship provider scripts to the box, (b) keep provider laptop-side and only
    remote the agent, or (c) run the whole queue on the box? Needs a per-queue `host` design.
+   **✅ RESOLVED + IMPLEMENTED (Phase 4, option b): per-queue `host`.** The template gains
+   `host` (default `"local"`) + host-relative `agentWorkdir`/`remoteTemplateDir`. The PROVIDER
+   commands ALWAYS run laptop-side; only the AGENT split is placed on `host` (via
+   `spawn_split_command`'s optional `host` arg — no provider scripts shipped, whole queue not
+   moved). `{templateDir}` DIVERGES: provider/param sites keep the laptop dir, `agent.command` gets
+   `remoteTemplateDir` (dual-delivered as `GHOSTTY_QUEUE_TEMPLATE_DIR`). See AGENT-QUEUE.md →
+   "Running a queue's agents on a remote host".
 4. **`project-directory` per-host listing** — cache an `ssh cloud-1 ls` over the control
    connection, or require an explicit `pty-remote-project-directory` per box? (Recommend: both —
    explicit bases, listed via the multiplexed connection, cached.)
+   **✅ RESOLVED + IMPLEMENTED (Phase 4, both): explicit bases + cached `ssh find`.** The fork
+   config key `pty-remote-project-directory` (a `RepeatableString` of `<host> = <base>` lines,
+   grammar parsed macOS-side by `ProjectPaletteView.parseRemoteProjectBases`) names the explicit
+   bases; `RemoteTunnelController.ensureProjects`/`listProjects` list each base's immediate
+   subdirs over the supervisor's ControlMaster (`ssh … find -L <base> -mindepth 1 -maxdepth 1
+   -type d -print0`, `ls -1p` fallback) and CACHE it (stale-while-revalidate, ~1s TTL). The palette
+   reads the cache synchronously (never blocks) and opens a tab that runs on the host.
 5. **Linux host portability audit** — beyond `libproc`/`sysctl` for process info, is any other
    macOS-only syscall on the host's hot path? (Must audit before shipping a Linux host; the
    emulator core is portable, but verify PTY/`xev` specifics.)
+   **✅ RESOLVED: audited clean.** `foreground_pid` already works on Linux (`tcgetpgrp`); only
+   `process_info` (name/command) was macOS-only, now covered by the `proc_info.zig` `/proc` arm
+   (Phase 4). PTY / spawn (`Command.zig` `.linux` dup3+fork) / `xev.Dynamic` (io_uring/epoll) /
+   SIGPIPE (globally ignored) are all portable — no other macOS-only host-hot-path syscall. See
+   "The host is headless core Zig and builds on Linux".
 6. **Billing visibility** — a cloud agent bills the box's Claude account, invisible to the
    laptop's `get_haiku_usage`. Do we want a cross-host usage aggregation, or is per-box
    accounting acceptable? (Recommend: acceptable for v1; document it.)
+   **✅ RESOLVED (per-box, docs-only): acceptable for v1.** `get_haiku_usage` tracks ONLY the
+   laptop sidecar's own Haiku calls (summarizer / bell-classify / issue-key-infer); a cloud
+   work-agent bills the box's own Claude account, invisibly — NOT a regression (it never tracked
+   work-agent spend). No cross-host aggregation in v1; documented in AGENT-MANAGER.md → billing
+   scope.
 7. **App-Nap + redial** — ✅ SETTLED: poll on the read thread's quit self-pipe. The backoff is
    an `xev.Timer` on the IO loop (NEVER a bare `sleep`), so a clean quit stops the loop and
    cancels the timer; the read thread `poll()`s its quit self-pipe (Darwin has no eventfd), so a
@@ -843,6 +912,16 @@ Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend t
 8. **Sudden multi-host id collision** — two hosts *can* mint the same random u64. `(host,
    session_id)` disambiguates for reattach, but any place that ever keys on the bare u64 across
    hosts (audit `MCPLayout`, the sidecar store) must be found and switched to the pair.
+   **✅ RESOLVED + IMPLEMENTED (Phase 4, Q2/Q3/D3): all bare-u64 keying switched to the pair.**
+   The audit found and converted every site: `MCPLayout.surfacesJSONData` now emits `sessionID` as
+   the STRING composite `"<host>:<id>"` (the matched emit↔parse pair — the sidecar `parseSessionKey`
+   splits on the LAST `:`, a bare-number legacy value ⇒ host `"local"`); the sidecar keys
+   `reconcile` (`liveBySession`/`claimedSessions`) and `scheduleSweep` (`bySession` re-adopt) on
+   `sessionKey(host, id)` and persists `Assignment.hostName` / `ScheduleState.hostName`; the
+   dashboard's `AgentStateStore` + `manualOrder` + the mirror-preview `.id` + the mirror dial use
+   the composite `AgentSessionKey` (a pre-migration bare key reads back as `local:`). The web
+   monitor's raw stream is the one exception — a remote surface is "stream unavailable" (falls back
+   to the `/screen` poll), remote raw streaming being out of v1 scope.
 
 ---
 

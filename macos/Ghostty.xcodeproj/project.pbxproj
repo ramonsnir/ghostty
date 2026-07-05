@@ -196,6 +196,7 @@
 				Features/QuickTerminal/QuickTerminalSize.swift,
 				Features/QuickTerminal/QuickTerminalSpaceBehavior.swift,
 				Features/QuickTerminal/QuickTerminalWindow.swift,
+				Features/RemoteHost/RemoteAgentIdentity.swift,
 				Features/RemoteHost/RemoteHostRegistry.swift,
 				Features/RemoteHost/RemoteTunnelController.swift,
 				"Features/Secure Input/SecureInput.swift",

@@ -333,6 +333,51 @@ colleague clones the repo somewhere else. Two portability hooks fix that:
   *.env
   ```
 
+## Running a queue's agents on a remote host (cloud-hosts)
+
+*(fork-only, cloud-hosts Phase 4.)* A queue can dispatch its **agent splits onto a cloud box**
+while the queue's **provider commands stay on the laptop** — the "provider-laptop / agent-cloud"
+split. Set a per-queue **`host`** in the template (a name from your `pty-remote-host` registry;
+default `"local"` = the laptop's `pty-host`, i.e. today's behavior):
+
+```jsonc
+{
+  "name": "cloud backlog",
+  "host": "cloud-1",                         // agents run on this box (must be a pty-remote-host name)
+  "workdir": "~/git/proj",                   // LAPTOP path — the PROVIDER cwd (list/status/claim)
+  "agentWorkdir": "/home/user/git/proj",     // BOX path — the AGENT split's cwd (host-relative, NOT ~-expanded)
+  "remoteTemplateDir": "/home/user/git/proj/.queues", // BOX path — where the agent's sibling scripts live
+  "provider": { "list": …, "status": …, "claim": … },
+  "agent":    { "command": "{templateDir}/run-agent.sh" }
+}
+```
+
+What the split means:
+
+- **The provider is laptop-side, always.** `list` / `status` / `claim` / `graph` (and every param
+  `valuesCommand`) run on your Mac, as they do for a local queue — they talk to your tracker with
+  your local creds. Only the **agent split** is placed on `host`. (This is the deliberate choice:
+  no provider scripts are shipped to the box, and the whole queue does not move to the box.)
+- **`workdir` vs `agentWorkdir`.** `workdir` stays the laptop path (it is the provider cwd and the
+  cwd of a LOCAL agent). When `host !== "local"`, the agent split's cwd is `agentWorkdir` — an
+  **absolute path ON THE BOX**, passed through verbatim (NOT `~`-expanded against your laptop home,
+  since the box's home differs). Omit it and a remote agent falls back to `workdir` (rarely right).
+- **`{templateDir}` DIVERGES between the two sides.** The `{templateDir}` token (and the
+  `GHOSTTY_QUEUE_TEMPLATE_DIR` env) resolves to the **laptop** template dir in the four
+  provider/param sites (they run laptop-side), but to **`remoteTemplateDir`** in `agent.command`
+  (it runs on the box, where its sibling scripts live). A local queue substitutes the same dir
+  everywhere — byte-identical to before. So a shared-repo agent launcher finds its scripts on the
+  box while the provider finds its scripts on the laptop.
+- **Reattach is per-`(host, session)`.** A cloud agent's split survives a GUI restart and re-adopts
+  by the `(host, session id)` PAIR — two boxes can each mint the same numeric session id without a
+  false match. A **schedule** (recurring scan) runs on the queue's `host` too, beside the work
+  agents, and re-adopts by the same pair.
+- **Prereqs.** The `host` name must be a configured `pty-remote-host` (see CLOUD-HOSTS-DESIGN.md);
+  an unknown name FAILS the spawn (never a silent local fallback). The box needs a running
+  `ghostty-host` and — for per-tile agent state on Linux — a host rebuilt with the `/proc` arm (see
+  CLOUD-HOSTS-DESIGN.md → Linux). The cloud agent bills the box's own Claude account (see
+  AGENT-MANAGER.md → billing scope).
+
 ## Starting / controlling a queue
 
 - **Start:** the `start_agent_queue` keybind action (bind it in your fork config, e.g.
@@ -876,6 +921,51 @@ or host change** (pure Swift + TS).
   (`GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS` build/expand/dedup + legacy strip + disabled strip +
   pure `effectiveTemplateSearchPath`). **GUI relaunch + rebuilt lib/xcframework (Zig field
   changed) + rebuilt sidecar `dist`; NO host restart / no protocol change / no new C API.**
+
+### Per-queue `host` — provider-laptop / agent-cloud split (cloud-hosts Phase 4, user doc: "Running a queue's agents on a remote host")
+
+- **`host` / `agentWorkdir` / `remoteTemplateDir` on the template** (`queue/types.ts`
+  `QueueTemplate`, all OPTIONAL; `host` defaults `"local"` at every read via `?? "local"`).
+  `validateTemplate` (`queue/templates.ts`) MUST whitelist all three or the loader silently drops
+  them (the `validateProviderList`/`coerceQueueCommands` lesson) — `host` via
+  `optNonEmptyStringOrDefault(rec.host, "local", …)` (empty/whitespace ⇒ `"local"`),
+  `agentWorkdir`/`remoteTemplateDir` via `optNonEmptyString` (host-relative absolute paths, NOT
+  `~`-expanded).
+- **Provider stays laptop-side; only the agent split is remoted.** `dispatchOne`/`dispatchSchedule`
+  (`queue/runner.ts`) compute `isRemote = t.host !== "local"` and, when remote, use `agentWorkdir`
+  (else `workdir`) for the agent split's `cwd` and `remoteTemplateDir` (else `run.templateDir`) for
+  `GHOSTTY_QUEUE_TEMPLATE_DIR`, and pass `host: t.host` to `spawnSplitCommand`. `queueProviderEnv` /
+  the provider `cwd` are UNCHANGED (laptop-side) — adopt option (b).
+- **`{templateDir}` DIVERGENCE (O2).** `substituteTemplateDir(t, providerDir, agentDir = providerDir)`
+  (`queue/templates.ts`) now takes TWO dirs: the four provider/param sites substitute `providerDir`
+  (the LAPTOP `dirname(path)`), `agent.command` substitutes `agentDir`. `wiring.ts loadTemplateAtPath`
+  passes `agentDir = remoteTemplateDir` iff `isRemote` (else the laptop dir — byte-identical to the
+  prior single-dir behavior). `workdir` keeps its laptop `~`-expansion; `agentWorkdir`/
+  `remoteTemplateDir` are passed through verbatim.
+- **`host` reaches the GUI as `spawn_split_command`'s optional `host` arg — NO new tool, count STAYS
+  26.** `McpClient.spawnSplitCommand` (`mcp.ts`) carries `host` only when non-empty + non-`"local"`
+  (local wire byte-identical). `MCPTools.swift` adds the `host` schema; `MCPLayout.newSplitCommand`
+  gains `host:` + the pure `resolveHostSpawn` (three-way: nil/`"local"` ⇒ local; a registry name ⇒
+  `.remote(name)` sets `config.hostName` for the deferred remote dial; an UNKNOWN name ⇒
+  `.unresolvable`, spawn FAILS — never a local fallback, D4). A remote spawn also mints a nonce +
+  `export GHOSTTY_SURFACE_NONCE=…` `initial_input` prefix + registers `RemoteAgentIdentity` (D6, see
+  AGENT-DASHBOARD.md / MCP-SERVER.md).
+- **Cross-host identity — the `(host, sessionID)` PAIR (Q2/Q3, OQ8).** The wire `Surface.sessionID`
+  is the COMPOSITE STRING `"<host>:<id>"` (`MCPLayout.surfacesJSONData`); the sidecar parses it with
+  `parseSessionKey` and keys on `sessionKey(host, id)` (`queue/types.ts`) in BOTH `reconcile`'s
+  `liveBySession`/`claimedSessions` (`queue/store.ts`) and `scheduleSweep`'s `bySession` re-adopt
+  (`queue/runner.ts`) — so two boxes can each mint session id 5 without a false reconcile match, and
+  a schedule re-adopts THIS box's scan (not a same-id local decoy). `Assignment.hostName` +
+  `ScheduleState.hostName` persist the DISPATCH host (from `template.host`, NOT the numeric spawn
+  reply); `store.ts` keeps them **only when non-`"local"`** so a local record's serialization stays
+  byte-identical (a pre-migration record with no `hostName` reads back as `"local"`). Tests: sidecar
+  `types.test.ts` (`parseSessionKey`/`sessionKey` incl. legacy bare number → local),
+  `store.test.ts` (two-host-same-id no false match + local back-compat serialize), `runner.test.ts`
+  (remote work-item dispatch host/cwd/templateDir + remote schedule pair-keyed re-adopt vs local
+  decoy + local no-host byte-identical), `templates.test.ts` (two-dir substitute), Zig
+  `pty-remote-project-directory parse`. **GUI relaunch + lib/xcframework + rebuilt sidecar `dist`;
+  the Linux `/proc` arm needs a Linux `ghostty-host` rebuild for cloud-agent NAMES (macOS host
+  untouched).**
 
 ### `agent-queue-hero-max` + the HERO pool (concurrency cap off the grid, `maxItems` shared)
 

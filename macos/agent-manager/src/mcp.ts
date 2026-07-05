@@ -62,11 +62,21 @@ export interface Surface {
    *  OMITTED (=== undefined) when not hidden / unknown. The summarizer skips hidden
    *  tiles — no point spending a Haiku call on a tile you've decluttered away. */
   hidden?: boolean;
-  /** (Agent Queue) The STABLE host session id (`ghostty_surface_session_id`) — the
-   *  supervisor's persistence/re-adoption key (§9). OMITTED (=== undefined) when
-   *  absent so a pre-upgrade host that doesn't yet emit it still typechecks. Under
-   *  the `.exec` backend / no pty-host it is 0, which the supervisor self-disables on. */
-  sessionID?: number;
+  /** (Agent Queue) The STABLE session identity — the supervisor's persistence/re-adoption key
+   *  (§9). (ramon fork / cloud-hosts, Phase 4 Q2) The wire type is now the COMPOSITE STRING
+   *  `"${hostName}:${sessionID}"` emitted by `MCPLayout.surfacesJSONData` (the matched emit↔parse
+   *  pair), so a session id — unique only WITHIN a host — is disambiguated across boxes. Parse it
+   *  with `parseSessionKey` (split on the LAST `:`); a bare-number legacy value or a missing host
+   *  ⇒ host `"local"`. OMITTED (=== undefined) when absent so a pre-upgrade host still typechecks;
+   *  a `"<host>:0"` (or bare `0`) means no pty-host / not yet attached, which the supervisor
+   *  self-disables on. */
+  sessionID?: string;
+  /** (ramon fork / cloud-hosts, Phase 4 O5/F1) The host name the surface's session lives on,
+   *  emitted as a SEPARATE `list_surfaces` row field by `MCPLayout` (default `"local"`). Redundant
+   *  with the host embedded in the composite `sessionID` (the sidecar parses the composite as the
+   *  authoritative pair); carried for consumers that want the host without splitting. OMITTED
+   *  (=== undefined) when unknown ⇒ treat as `"local"`. */
+  hostName?: string;
   /** (hero) The HERO verdict echoed back off the surface's `queueHero` annotation (the wire
    *  arg `"hero"`). OMITTED (=== undefined) when not a hero / unknown — mirrors the queueKey
    *  read-back. The sidecar's AUTHORITATIVE source of hero-ness is its own run-level `hero`
@@ -304,6 +314,12 @@ export class McpClient {
     /** (grid cap §12) Never exceed this many ROWS; further splits add columns. From
      *  template grid.rows. Omitted ⇒ pure-aspect. */
     maxRows?: number;
+    /** (ramon fork / cloud-hosts, Phase 4 O5) The REMOTE host to spawn this split on — a name in
+     *  the macOS `pty-remote-host` registry, which the Swift `spawn_split_command` handler resolves
+     *  to a forwarded socket + `host_name` on the new split's SurfaceConfiguration. Omitted / "local"
+     *  ⇒ the laptop's `pty-host` (byte-identical wire to today). NO new MCP tool — this is an
+     *  additive optional arg on the existing tool (tool count STAYS 26). */
+    host?: string;
   }): Promise<{ id: string; sessionId: number }> {
     const toolArgs: Record<string, unknown> = { command: args.command };
     if (args.targetUUID !== undefined) toolArgs.targetUUID = args.targetUUID;
@@ -319,6 +335,11 @@ export class McpClient {
     // pure-aspect on the GUI (byte-identical to today).
     if (args.maxCols !== undefined && args.maxCols > 0) toolArgs.maxCols = args.maxCols;
     if (args.maxRows !== undefined && args.maxRows > 0) toolArgs.maxRows = args.maxRows;
+    // (cloud-hosts O5) Carry the remote host only when it is a real non-local name, so a local
+    // spawn's wire stays byte-identical to today.
+    if (args.host !== undefined && args.host.length > 0 && args.host !== "local") {
+      toolArgs.host = args.host;
+    }
     const payload = await this.call("spawn_split_command", toolArgs);
     const obj = parseToolJson(payload) as { id?: unknown; sessionId?: unknown };
     if (typeof obj.id !== "string" || obj.id.length === 0) {

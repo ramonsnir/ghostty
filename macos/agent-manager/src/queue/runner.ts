@@ -86,6 +86,7 @@ import {
   type QueueGraphReport,
   type ScheduleStatus,
 } from "./status.js";
+import { parseSessionKey, sessionKey } from "./types.js";
 import type {
   Assignment,
   GraphNode,
@@ -297,7 +298,7 @@ export interface QueueRun {
    *  NOT typed after the fact — so nothing about delivery is tracked here. NOT persisted — rebuilt
    *  each sweep from the annotated live surfaces (`queueSchedule`/`scheduleId`), so a restart
    *  re-adopts a still-open scheduled split without re-dispatch. */
-  scheduleActive: Map<string, { uuid: string; sessionID: number; gridSlot: number }>;
+  scheduleActive: Map<string, { uuid: string; sessionID: number; gridSlot: number; hostName?: string }>;
   /** (schedules) Schedule ids with a pending "Run now" request (the dashboard button →
    *  `run_schedule_now` command). Consumed on the next dispatch (bypasses the cron due-check
    *  and a `paused` state). NOT persisted (a run-now that didn't fire before a restart is lost
@@ -344,7 +345,7 @@ export function makeQueueRun(
     keepDirty: new Set<string>(),
     hero: new Set<string>(),
     schedules: new Map<string, ScheduleState>(),
-    scheduleActive: new Map<string, { uuid: string; sessionID: number; gridSlot: number }>(),
+    scheduleActive: new Map<string, { uuid: string; sessionID: number; gridSlot: number; hostName?: string }>(),
     scheduleRunNow: new Set<string>(),
     idleAnchor: new Map<string, number | undefined>(),
     closeAwait: new Map<string, { exitKeysSent: boolean; sinceMs: number }>(),
@@ -1224,13 +1225,15 @@ export function projectLiveSurfaces(
 ): LiveSurface[] {
   const out: LiveSurface[] = [];
   for (const s of surfaces) {
-    const sid = typeof s.sessionID === "number" ? s.sessionID : 0;
+    // (cloud-hosts Q2/Q3) The wire `sessionID` is the COMPOSITE "<host>:<id>" — split on the
+    // last ':' into the (host, numeric id) pair (bare-number legacy / missing ⇒ host "local").
+    const { hostName, sessionID: sid } = parseSessionKey(s.sessionID);
     // Only surfaces belonging to THIS run participate (matched by the annotation's
     // queueName); a surface with no queue annotation, or another run's, is skipped so
     // reconcile never adopts a foreign tile.
     const sQueueName = (s as { queueName?: string }).queueName;
     if (sQueueName !== undefined && sQueueName !== queueName) continue;
-    const live: LiveSurface = { sessionID: sid, surfaceUUID: s.id };
+    const live: LiveSurface = { sessionID: sid, hostName, surfaceUUID: s.id };
     const qk = (s as { queueKey?: string }).queueKey;
     if (typeof qk === "string") live.queueKey = qk;
     if (typeof sQueueName === "string") live.queueName = sQueueName;
@@ -1741,10 +1744,22 @@ async function dispatchOne(
   // (b) PENDING record written BEFORE the spawn (crash-safety, §9 step a). The record's
   // queueName is the run's IDENTITY name (`runName`), matching the annotation stamped below
   // + the reconcile filter, so parallel scoped runs of one template never cross-adopt (§9).
+  // (cloud-hosts O4) Remote-host dispatch context. When the template targets a non-"local"
+  // host, the AGENT split's cwd + template dir are the HOST-RELATIVE ones (never the laptop
+  // paths), and the spawn carries the `host` name (the GUI resolves it to a forwarded socket).
+  // The PROVIDER commands (queueProviderEnv / cwd) stay laptop-side (adopt option (b)).
+  const templateHost = t.host ?? "local";
+  const isRemote = templateHost !== "local" && templateHost.length > 0;
+  const agentCwd = isRemote && t.agentWorkdir !== undefined ? t.agentWorkdir : t.workdir;
+  const agentTemplateDir =
+    isRemote && t.remoteTemplateDir !== undefined ? t.remoteTemplateDir : run.templateDir;
+
   const pending = makePendingRecord(run.runName, item.key, slot, nowMs, {
     title: item.title,
     url: item.url,
     hero: isHero,
+    // (cloud-hosts Q3) the DISPATCH host — recorded on the record (not from the spawn reply).
+    hostName: templateHost,
   });
   // (c) SYNCHRONOUS active-set insert BEFORE the spawn await (within-tick dedup, §7).
   // The monotonic lifetime counter increments HERE (at the intent), so even a crash
@@ -1790,8 +1805,10 @@ async function dispatchOne(
   // the item env: as `env` (honored under `.exec`) AND as a single-quoted command PREFIX (under
   // the `.client` pty-host backend the spawn `env` field is DROPPED — see shellEnvPrefix — so the
   // prefix rides the forwarded command). Empty templateDir ⇒ no prefix / no key (back-compat).
-  const templateDirAssign = run.templateDir
-    ? `GHOSTTY_QUEUE_TEMPLATE_DIR=${shellSingleQuote(run.templateDir)} `
+  // (cloud-hosts O4) GHOSTTY_QUEUE_TEMPLATE_DIR delivered to the AGENT uses the HOST-RELATIVE
+  // dir when remote (its scripts live on the box); the laptop dir when local.
+  const templateDirAssign = agentTemplateDir
+    ? `GHOSTTY_QUEUE_TEMPLATE_DIR=${shellSingleQuote(agentTemplateDir)} `
     : "";
   const commandWithItemEnv = templateDirAssign + shellEnvPrefix(item) + t.agent.command;
   let spawned: { id: string; sessionId: number };
@@ -1799,8 +1816,11 @@ async function dispatchOne(
     let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
     const base = {
       command: commandWithItemEnv,
-      cwd: t.workdir,
-      env: { ...itemEnv, ...(run.templateDir ? { GHOSTTY_QUEUE_TEMPLATE_DIR: run.templateDir } : {}) },
+      // (cloud-hosts O4) the agent split's cwd is HOST-RELATIVE for a remote run, laptop for local.
+      cwd: agentCwd,
+      env: { ...itemEnv, ...(agentTemplateDir ? { GHOSTTY_QUEUE_TEMPLATE_DIR: agentTemplateDir } : {}) },
+      // (cloud-hosts O5) place the split on the resolved remote host (omitted/"local" ⇒ laptop).
+      ...(isRemote ? { host: templateHost } : {}),
     };
     if (sp === undefined) {
       // (hero) HERO tab: open a NEW dedicated single-terminal tab (never a grid split),
@@ -1987,20 +2007,27 @@ async function scheduleSweep(
   //       store). Without (b), a restart made the scan look COMPLETED (step 1 fired on the missing
   //       annotation) → the schedule re-anchored + risked re-dispatching a DUPLICATE.
   const liveById = new Map<string, Surface>(); // by scheduleId annotation (this run)
-  const bySession = new Map<number, Surface>(); // ALL surfaces by sessionID (for re-adopt)
+  // (cloud-hosts Q3) ALL surfaces keyed by the CROSS-HOST key sessionKey(host, id), so a
+  // schedule's persisted (activeSessionID, hostName) pair re-adopts the RIGHT box's session
+  // (two boxes can each mint the same numeric id). The composite wire sessionID is split by
+  // parseSessionKey into the pair.
+  const bySession = new Map<string, Surface>();
   for (const s of surfaces) {
-    if (typeof s.sessionID === "number" && s.sessionID > 0) bySession.set(s.sessionID, s);
+    const { hostName: sHost, sessionID: sSid } = parseSessionKey(s.sessionID);
+    if (sSid > 0) bySession.set(sessionKey(sHost, sSid), s);
     const sQueueName = (s as { queueName?: string }).queueName;
     if (sQueueName !== undefined && sQueueName !== run.runName) continue;
     const sid = (s as { scheduleId?: string }).scheduleId;
     if (typeof sid === "string" && sid.length > 0) liveById.set(sid, s);
   }
-  // Resolve the live surface for a schedule id: annotation first, else the persisted activeSessionID.
+  // Resolve the live surface for a schedule id: annotation first, else the persisted
+  // (activeSessionID, hostName) pair via the cross-host key.
   const liveSurfaceFor = (id: string): Surface | undefined => {
     const byAnno = liveById.get(id);
     if (byAnno !== undefined) return byAnno;
-    const sess = run.schedules.get(id)?.activeSessionID;
-    if (sess !== undefined && sess > 0) return bySession.get(sess);
+    const st = run.schedules.get(id);
+    const sess = st?.activeSessionID;
+    if (sess !== undefined && sess > 0) return bySession.get(sessionKey(st?.hostName ?? "local", sess));
     return undefined;
   };
 
@@ -2012,6 +2039,9 @@ async function scheduleSweep(
       if (st !== undefined) {
         st.lastCompletionAt = nowMs;
         st.activeSessionID = undefined;
+        // (cloud-hosts Q3) clear the pinned host with the id so a later same-id session on a
+        // DIFFERENT host isn't mistaken for this schedule's run.
+        delete st.hostName;
         changed = true;
       }
       run.scheduleActive.delete(id);
@@ -2034,10 +2064,16 @@ async function scheduleSweep(
     if (run.scheduleActive.has(id)) continue;
     const s = liveSurfaceFor(id);
     if (s === undefined) continue;
-    const sessionID = typeof s.sessionID === "number" ? s.sessionID : 0;
+    // (cloud-hosts Q3) split the composite wire sessionID into the (host, id) pair.
+    const { hostName: sHost, sessionID } = parseSessionKey(s.sessionID);
     const { occupied } = gridOccupancy(run);
     const slot = lowestFreeSlot(occupied, occupied.size + 1) ?? occupied.size;
-    run.scheduleActive.set(id, { uuid: s.id, sessionID, gridSlot: slot });
+    run.scheduleActive.set(id, {
+      uuid: s.id,
+      sessionID,
+      gridSlot: slot,
+      ...(sHost !== "local" ? { hostName: sHost } : {}),
+    });
     if (!liveById.has(id)) {
       // Adopted by sessionID (annotation was wiped) — re-stamp it (best-effort).
       try {
@@ -2050,8 +2086,11 @@ async function scheduleSweep(
         errlog(`run "${run.runName}": schedule "${id}" re-stamp annotation failed: ${msg(err)}`);
       }
     }
-    if (st.activeSessionID !== sessionID && sessionID > 0) {
+    if ((st.activeSessionID !== sessionID || (st.hostName ?? "local") !== sHost) && sessionID > 0) {
       st.activeSessionID = sessionID;
+      // (cloud-hosts Q3) pin the host alongside the id (non-"local" only).
+      if (sHost !== "local") st.hostName = sHost;
+      else delete st.hostName;
       changed = true;
     }
   }
@@ -2063,9 +2102,15 @@ async function scheduleSweep(
     const st = run.schedules.get(id);
     if (st === undefined) continue;
     const s = liveSurfaceFor(id);
-    const sess = typeof s?.sessionID === "number" && s.sessionID > 0 ? s.sessionID : act.sessionID;
-    if (sess > 0 && st.activeSessionID !== sess) {
+    // (cloud-hosts Q3) prefer the live surface's parsed (host, id); else the scheduleActive
+    // entry's remembered pair.
+    const parsed = s !== undefined ? parseSessionKey(s.sessionID) : undefined;
+    const sess = parsed !== undefined && parsed.sessionID > 0 ? parsed.sessionID : act.sessionID;
+    const sHost = parsed !== undefined && parsed.sessionID > 0 ? parsed.hostName : (act.hostName ?? "local");
+    if (sess > 0 && (st.activeSessionID !== sess || (st.hostName ?? "local") !== sHost)) {
       st.activeSessionID = sess;
+      if (sHost !== "local") st.hostName = sHost;
+      else delete st.hostName;
       changed = true;
     }
   }
@@ -2183,9 +2228,15 @@ async function dispatchSchedule(
   const command = `${prefix} ${spec.command ?? t.agent.command}`;
   const env = scheduleEnv;
 
+  // (cloud-hosts O4/Q3) A schedule runs on the SAME host as its queue's work agents, so it lands
+  // beside them in the grid — spawn it on `t.host` with the host-relative cwd when remote.
+  const templateHost = t.host ?? "local";
+  const isRemote = templateHost !== "local" && templateHost.length > 0;
+  const agentCwd = isRemote && t.agentWorkdir !== undefined ? t.agentWorkdir : t.workdir;
+
   let spawned: { id: string; sessionId: number };
   try {
-    const base = { command, cwd: t.workdir, env };
+    const base = { command, cwd: agentCwd, env, ...(isRemote ? { host: templateHost } : {}) };
     let spawnArgs: Parameters<typeof deps.client.spawnSplitCommand>[0];
     if (sp.firstTab === true) {
       // The run's first pane — but if the run already has seated panes elsewhere, anchor on the
@@ -2217,13 +2268,17 @@ async function dispatchSchedule(
     uuid: spawned.id,
     sessionID: spawned.sessionId,
     gridSlot: slot,
+    // (cloud-hosts Q3) pin the dispatch host (non-"local" only) so the pair-keyed re-adopt
+    // recognizes THIS box's session across a restart.
+    ...(isRemote ? { hostName: templateHost } : {}),
   });
-  // Persist the sessionID immediately so a GUI restart before the next sweep can still re-adopt
-  // this scan by its stable sessionID (scheduleSweep also backfills it, but a spawn's sessionId is
-  // known here). Persisted by the caller's persistRun when the sweep's `changed` flag is set.
+  // Persist the sessionID (+ host) immediately so a GUI restart before the next sweep can still
+  // re-adopt this scan by its stable (host, sessionID) pair (scheduleSweep also backfills it, but a
+  // spawn's sessionId is known here). Persisted by the caller's persistRun when `changed` is set.
   const stForSpec = run.schedules.get(spec.id);
   if (stForSpec !== undefined && spawned.sessionId > 0) {
     stForSpec.activeSessionID = spawned.sessionId;
+    if (isRemote) stForSpec.hostName = templateHost;
   }
 
   // Annotate so the dashboard groups it under the queue + marks it a schedule, and a restart can

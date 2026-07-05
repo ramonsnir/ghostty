@@ -600,7 +600,12 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
     errdefer render_loop.deinit();
     var render_stop = try xev.Async.init();
     errdefer render_stop.deinit();
-    const poll_timer = try xev.Timer.init();
+    // NOTE(cloud-hosts/Phase-0): `var`, not `const`. On the Linux xev backend
+    // (io_uring/epoll) `Timer.deinit` takes a mutable `*Self`, so a `const` timer
+    // fails to cross-compile for Linux (the headless host's target). Every other
+    // xev.Timer call site (Exec.zig, termio/Thread.zig, renderer/Thread.zig) uses
+    // `var` for exactly this reason; this was the lone `const` outlier.
+    var poll_timer = try xev.Timer.init();
     errdefer poll_timer.deinit();
 
     // Initialize all the by-value fields. renderer_state pointers that refer

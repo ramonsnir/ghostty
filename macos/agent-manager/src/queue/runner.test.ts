@@ -32,6 +32,7 @@ import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
 import type { QueueStatusReport, QueueGraphReport } from "./status.js";
 import { loadKeep, loadStore, loadDispatched, loadHero, reconcile, type LiveSurface, type StoreIO } from "./store.js";
 import { shellEnvPrefix, type Exec, type ExecResult } from "./provider.js";
+import { sessionKey } from "./types.js";
 import type { Assignment, AssignmentState, QueueTemplate } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -253,8 +254,15 @@ function makeQueueDeps(
   };
 }
 
-function surface(over: Partial<Surface> = {}): Surface {
-  return {
+// (cloud-hosts Q2) The wire `Surface.sessionID` is the COMPOSITE "<host>:<id>" string, but tests
+// author sessionID as a NUMBER (host defaults "local", or set `hostName` for a remote box). The
+// helper converts it to the composite the runner parses (parseSessionKey), so the ~dozens of
+// existing numeric callers stay unchanged and a two-host test just passes `hostName`.
+type SurfaceOver = Omit<Partial<Surface>, "sessionID"> & { sessionID?: number; hostName?: string };
+
+function surface(over: SurfaceOver = {}): Surface {
+  const { sessionID, hostName, ...rest } = over;
+  const s: Surface = {
     id: "u-1",
     title: "claude",
     pwd: "/repo",
@@ -267,15 +275,18 @@ function surface(over: Partial<Surface> = {}): Surface {
     bell: false,
     exited: false,
     atPrompt: false,
-    ...over,
+    ...rest,
   };
+  if (sessionID !== undefined) s.sessionID = sessionKey(hostName ?? "local", sessionID);
+  if (hostName !== undefined) s.hostName = hostName;
+  return s;
 }
 
 /** A live surface carrying the queue annotation fields (queueKey/queueName/queueUrl),
  *  which ride back on a list_surfaces row but are NOT on the base Surface type — the
  *  runner reads them via a cast, so the test attaches them the same way. */
 function queueSurface(
-  over: Partial<Surface> & { queueKey?: string; queueName?: string; queueUrl?: string },
+  over: SurfaceOver & { queueKey?: string; queueName?: string; queueUrl?: string },
 ): Surface {
   const { queueKey, queueName, queueUrl, ...rest } = over;
   return Object.assign(surface(rest), { queueKey, queueName, queueUrl });
@@ -3773,4 +3784,136 @@ test("runQueueSweep: re-adopts a running schedule by sessionID after a GUI resta
   assert.equal(run.scheduleActive.has("s1"), false, "freed on real close");
   assert.equal(run.schedules.get("s1")!.lastCompletionAt, 103 * M, "completion re-anchored");
   assert.equal(run.schedules.get("s1")!.activeSessionID, undefined, "activeSessionID cleared on completion");
+});
+
+// ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 4 O4/O5/Q3) Remote-host dispatch + schedule pair-keying.
+// ---------------------------------------------------------------------------
+
+test("runQueueSweep: a REMOTE work item spawns on host with the host-relative cwd + template dir; record carries the host", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      host: "cloud-1",
+      agentWorkdir: "/home/user/git/proj",
+      remoteTemplateDir: "/home/user/git/proj/.queues",
+      concurrency: 1,
+    }),
+    store,
+  );
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1", title: "Alpha" }]),
+    spawns: [{ id: "sp-1", sessionId: 900 }],
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm (reconcile only; dispatch suppressed on the first sweep)
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1
+
+  assert.equal(fake.calls.spawn.length, 1, "one dispatch");
+  const args = fake.calls.spawn[0];
+  // (O5) placed on the resolved remote host.
+  assert.equal(args.host, "cloud-1");
+  // (O4) the agent split's cwd is HOST-RELATIVE, not the laptop workdir.
+  assert.equal(args.cwd, "/home/user/git/proj");
+  // (O4) GHOSTTY_QUEUE_TEMPLATE_DIR (env + command prefix) uses the REMOTE template dir.
+  assert.equal((args.env as Record<string, string>).GHOSTTY_QUEUE_TEMPLATE_DIR, "/home/user/git/proj/.queues");
+  assert.ok(
+    (args.command as string).includes("GHOSTTY_QUEUE_TEMPLATE_DIR='/home/user/git/proj/.queues'"),
+    "command carries the remote template-dir prefix",
+  );
+  // (Q3) the finalized record records the DISPATCH host (from context, not the numeric spawn reply).
+  assert.equal(run.active.get("K-1")!.hostName, "cloud-1");
+});
+
+test("runQueueSweep: a LOCAL work item spawns with NO host arg + laptop cwd (byte-identical local wire)", async () => {
+  const store = memStore();
+  const run = makeQueueRun(tmpl({ concurrency: 1 }), store); // host defaults local
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }]),
+    spawns: [{ id: "sp-1", sessionId: 900 }],
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps);
+  now += 5000;
+  await runQueueSweep(deps);
+  const args = fake.calls.spawn[0];
+  assert.equal("host" in args, false, "no host on a local spawn");
+  assert.equal(args.cwd, "/repo", "laptop workdir");
+  assert.equal(run.active.get("K-1")!.hostName, undefined, "local record omits hostName");
+});
+
+test("runQueueSweep: a REMOTE schedule re-adopts by the (host, sessionID) PAIR — a same-id LOCAL decoy is not matched", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      host: "cloud-1",
+      agentWorkdir: "/home/user/git/proj",
+      schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }],
+    }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // arm
+  now = 101 * M;
+  await runQueueSweep(deps); // dispatch the schedule to cloud-1
+  assert.equal(fake.calls.spawn.length, 1, "one schedule dispatch");
+  assert.equal(fake.calls.spawn[0].host, "cloud-1", "schedule spawns on the queue's host");
+  assert.equal(run.schedules.get("s1")!.activeSessionID, 500, "persisted activeSessionID");
+  assert.equal(run.schedules.get("s1")!.hostName, "cloud-1", "persisted the schedule's host");
+
+  // GUI RESTART: annotation wiped + in-memory scheduleActive gone. The scan is still live on
+  // cloud-1 (sessionID 500), but a DIFFERENT local agent ALSO has numeric id 500 (the collision).
+  run.scheduleActive.clear();
+  spec.surfaces = [
+    surface({ id: "sch-1", agentState: "working", sessionID: 500, hostName: "cloud-1" }), // the scan
+    surface({ id: "decoy-local", agentState: "working", sessionID: 500, hostName: "local" }), // same u64, other host
+  ];
+  const spawnsBefore = fake.calls.spawn.length;
+  now = 102 * M;
+  await runQueueSweep(deps);
+
+  assert.equal(run.scheduleActive.has("s1"), true, "re-adopted");
+  assert.equal(run.scheduleActive.get("s1")!.uuid, "sch-1", "matched the CLOUD-1 scan, NOT the local decoy");
+  assert.equal(run.scheduleActive.get("s1")!.hostName, "cloud-1");
+  assert.equal(run.schedules.get("s1")!.lastCompletionAt, undefined, "NOT falsely completed");
+  assert.equal(fake.calls.spawn.length, spawnsBefore, "no duplicate dispatch");
+});
+
+test("runQueueSweep: a LOCAL (pre-migration, no host) schedule still re-adopts by sessionID", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }] }),
+    store,
+  );
+  const spec: QueueFakeSpec = { surfaces: [], listJson: "[]", spawns: [{ id: "sch-1", sessionId: 500 }] };
+  const fake = makeQueueFake(spec);
+  const M = 60_000;
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps);
+  now = 101 * M;
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn[0].host, undefined, "local schedule spawns with no host arg");
+  assert.equal(run.schedules.get("s1")!.hostName, undefined, "local schedule persists no host");
+
+  run.scheduleActive.clear();
+  // Pre-migration: the surface's wire sessionID is a BARE number (no host prefix) ⇒ local.
+  spec.surfaces = [Object.assign(surface({ id: "sch-1", agentState: "working" }), { sessionID: 500 })];
+  now = 102 * M;
+  await runQueueSweep(deps);
+  assert.equal(run.scheduleActive.has("s1"), true, "re-adopted the local scan");
+  assert.equal(run.scheduleActive.get("s1")!.uuid, "sch-1");
 });

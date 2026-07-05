@@ -677,6 +677,17 @@ struct AgentPreviewTile: View {
 
     // MARK: - Preview
 
+    /// (cloud-hosts D3/Q4) The RESOLVED local forwarded-socket path for a REMOTE tile's
+    /// mirror, or nil for a local tile (or a remote whose tunnel isn't handshaked yet).
+    /// Read from the single-owner tunnel supervisor's current readiness — a synchronous
+    /// snapshot (no blocking). When nil for a remote host, `AgentMirrorPreview` falls
+    /// back to the deferred-dial path (set `hostName`, await readiness) so it still never
+    /// dials the wrong (local) host.
+    private var mirrorSocketPath: String? {
+        guard entry.hostName != "local" else { return nil }
+        return RemoteTunnelController.shared.currentReadiness(for: entry.hostName)?.socketPath
+    }
+
     @ViewBuilder
     private var preview: some View {
         // `ghostty.app == nil` only during early-launch / teardown; guarding here
@@ -692,6 +703,11 @@ struct AgentPreviewTile: View {
                 ghostty: ghostty,
                 sessionID: entry.sessionID,
                 realSurface: realView,
+                // (cloud-hosts D3/Q4) The host + its RESOLVED forwarded socket so a
+                // REMOTE tile's read-only mirror dials the RIGHT host's socket, not the
+                // local pty-host. nil socket for local (unchanged eager local dial).
+                hostName: entry.hostName,
+                socketPath: mirrorSocketPath,
                 onEnded: { handleMirrorEnded() },
                 onStable: { handleMirrorStable() })
                 .frame(maxWidth: .infinity)
@@ -718,7 +734,10 @@ struct AgentPreviewTile: View {
                 // path — a new id tears down the dead `.client` connection and mounts a
                 // fresh one. (The @StateObject is otherwise keyed only by the ForEach
                 // UUID, so it would keep the old, dead session.)
-                .id("\(entry.sessionID)-\(mirrorGeneration)")
+                // (cloud-hosts D3/Q4) COMPOSITE id "<host>:<sessionID>-<gen>" so two
+                // same-u64 sessions on DIFFERENT hosts never collapse onto one mirror
+                // (a host change also forces a remount, re-dialing the right socket).
+                .id("\(entry.sessionKey)-\(mirrorGeneration)")
                 .contentShape(Rectangle())
                 .onTapGesture { jump() }
         } else {
@@ -938,6 +957,10 @@ struct AgentMirrorPreview: View {
         ghostty: Ghostty.App,
         sessionID: UInt64,
         realSurface: Ghostty.SurfaceView,
+        // (cloud-hosts D3/Q4) The host + its RESOLVED forwarded socket for a REMOTE
+        // mirror. Defaults keep the local path byte-identical.
+        hostName: String = "local",
+        socketPath: String? = nil,
         onEnded: @escaping () -> Void = {},
         onStable: @escaping () -> Void = {}
     ) {
@@ -949,6 +972,18 @@ struct AgentMirrorPreview: View {
         var cfg = Ghostty.SurfaceConfiguration()
         cfg.mirror = true
         cfg.sessionID = String(sessionID)
+        // (cloud-hosts D3/Q4) A REMOTE mirror must dial the REMOTE forwarded socket, not
+        // the local pty-host. When the tunnel is up we have the resolved socket → dial it
+        // eagerly (like a local mirror, just a different socket). Without a resolved
+        // socket yet, set `hostName` so the SurfaceView DEFERS the dial to tunnel
+        // readiness (never a wrong-host local dial). Local mirrors leave both nil.
+        if hostName != "local" {
+            if let socketPath {
+                cfg.ptyHostSocket = socketPath
+            } else {
+                cfg.hostName = hostName
+            }
+        }
         _surfaceView = StateObject(wrappedValue: Ghostty.SurfaceView(ghostty.app!, baseConfig: cfg))
     }
 

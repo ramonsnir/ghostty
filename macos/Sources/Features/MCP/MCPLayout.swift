@@ -112,8 +112,9 @@ enum MCPLayout {
         /// the in-process / KeepAlive host (absent/nil `SurfaceView.hostName` ⇒
         /// `"local"`). Paired with `sessionID`, it forms the `(host, session_id)`
         /// key the GUI + sidecar use to disambiguate sessions aggregated across
-        /// multiple hosts. PURELY ADDITIVE in Phase 1 — nothing reads it back off
-        /// the row until Phase 4 (Q2/Q3); `sessionID` stays an `NSNumber` here.
+        /// multiple hosts. Emitted STANDALONE in the JSON AND folded into the
+        /// `sessionID` string composite `"<hostName>:<sessionID>"` (Phase-4 Q2 flipped
+        /// `sessionID` from an `NSNumber` to that composite — see `surfacesJSONData`).
         /// `var` with a default so the (separate) WebMonitor SurfaceRow + test
         /// constructors are unaffected, matching the queue-tag fields below.
         var hostName: String = "local"
@@ -245,20 +246,23 @@ enum MCPLayout {
             // fork / Agent Manager: emit `hidden` only when true (absent ⇒ not
             // hidden), mirroring the omit-when-default style of the agent-* fields.
             if $0.hidden { d["hidden"] = true }
-            // (Agent Queue, §8.4) a PLAIN integer — emit UNCONDITIONALLY (the
-            // supervisor keys persistence on it and self-disables when it is 0).
-            // JSON numbers are doubles; UInt64 fits exactly within 2^53 session-id
-            // range, but pass it as an NSNumber so JSONSerialization emits an integer.
-            // NOTE on casing: list_surfaces emits "sessionID" (capital), while
-            // spawn_split_command returns "sessionId" (lowercase, MCPTools.swift). Each
-            // side is internally consistent with its TS reader (mcp.ts reads "sessionID"
-            // off list rows and "sessionId" off the spawn result); keep them in sync if
-            // either key is renamed.
-            d["sessionID"] = NSNumber(value: $0.sessionID)
-            // fork / cloud-hosts (D3): the host identity paired with sessionID. Emit
-            // UNCONDITIONALLY (like sessionID) — a plain String, "local" by default.
-            // Purely additive in Phase 1; sessionID stays an NSNumber (its number→
-            // "${host}:${id}" string flip is the matched Phase-4 Q2 emit↔parse pair).
+            // (Agent Queue, §8.4 + cloud-hosts D3/Q2) The STABLE session identity, emitted
+            // UNCONDITIONALLY (the supervisor keys persistence on it and self-disables when
+            // the id is 0). Phase-4 Q2 flips this from a bare NSNumber to the STRING COMPOSITE
+            // "<hostName>:<sessionID>" (hostName defaults "local" when nil) — the matched
+            // emit↔parse pair with the sidecar (`mcp.ts` SurfaceRow.sessionID: string;
+            // `store.ts` splits on the LAST ':' into (hostName, u64); a bare-number legacy
+            // value parses as host "local"). String is LOSSLESS above 2^53 (host session ids
+            // are full 64-bit random) and gives the (host, id) pair one clean key. The two
+            // sides MUST land together — an emit-only flip coerces every row to 0 and breaks
+            // the queue reconcile.
+            // NOTE on casing: list_surfaces emits "sessionID" (capital) as the composite
+            // STRING, while spawn_split_command still returns "sessionId" (lowercase) as a
+            // NUMBER (MCPTools.swift) with hostName read back off list_surfaces (O5/O6).
+            d["sessionID"] = "\($0.hostName):\($0.sessionID)"
+            // fork / cloud-hosts (D3): the host identity, also emitted STANDALONE (like the
+            // pre-Q2 additive field) so a reader can group by host without splitting the
+            // composite. A plain String, "local" by default.
             d["hostName"] = $0.hostName
             // fork / Agent Queue (adopt): echo the queue tags so the supervisor's
             // reconcile can fold an adopted surface into run.active. Omit when nil
@@ -475,8 +479,34 @@ enum MCPLayout {
         balanced: Bool = false,
         windowAnchorUUID: UUID? = nil,
         maxCols: Int? = nil,
-        maxRows: Int? = nil
+        maxRows: Int? = nil,
+        // (ramon fork / cloud-hosts, O6) Optional target host: nil / "local" ⇒ the
+        // local pty-host (unchanged). A registry name ⇒ spawn a REMOTE `.client`
+        // split on that box (the SurfaceView resolves name → forwarded socket +
+        // owns the tunnel via the deferred-dial path — setting `hostName` is the
+        // single source of truth, exactly like `new_split_on_host`). An UNRESOLVABLE
+        // name FAILS the spawn (returns nil) rather than silently dialing local.
+        host: String? = nil
     ) -> (id: String, sessionID: UInt64)? {
+        // (O6) Resolve the target host up front so an unresolvable name fails the
+        // spawn cleanly (never an error-state surface for the queue, never a local
+        // fallback — D4). nil / "local" ⇒ local (byte-identical path below).
+        let hostSpawn = resolveHostSpawn(host)
+        if case .unresolvable = hostSpawn { return nil }
+        let remoteHostName: String? = {
+            if case .remote(let name) = hostSpawn { return name }
+            return nil
+        }()
+
+        // (M1/D6) For a REMOTE spawn, mint a per-spawn correlation NONCE and inject it
+        // into the spawned shell via `initial_input` (an `export` prefix that CROSSES to
+        // the remote box — unlike `environmentVariables`, which only reach a LOCAL
+        // shell). The box's agent-state hook reads GHOSTTY_SURFACE_NONCE and POSTs
+        // `{nonce, state}` (per-box capability token); the `/agent-state` route resolves
+        // the nonce → this surface. Non-secret correlation id (the SSH same-user boundary
+        // already trusts co-processes on the box). Local spawns keep the env path.
+        let nonce: String? = remoteHostName != nil ? RemoteAgentIdentity.mintNonce() : nil
+
         // Render the command as a single line of initial input with one trailing
         // newline = one submit. `singleLine` collapses INTERIOR newlines (so a
         // multi-line template line never fires N partial submits); we then append
@@ -486,7 +516,22 @@ enum MCPLayout {
         // interior newlines but can leave whitespace), rather than submitting a
         // near-empty line. A real template always carries a substantive command.
         guard !oneLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let initialInput = oneLine + "\n"
+        // The remote nonce export is prepended as its own typed line (one extra submit);
+        // GHOSTTY_SURFACE_NONCE is thus exported before the agent launch inherits it.
+        let initialInput: String = {
+            let base = oneLine + "\n"
+            guard let nonce else { return base }
+            return "export GHOSTTY_SURFACE_NONCE='\(nonce)'\n" + base
+        }()
+
+        // Register the nonce → surface AFTER the surface is created (we then know its
+        // UUID). Applied at both the firstTab and split return sites.
+        func registerRemoteIdentity(_ view: Ghostty.SurfaceView) {
+            guard let nonce, let remoteHostName else { return }
+            let sid: UInt64 = view.surface.map { ghostty_surface_session_id($0) } ?? 0
+            RemoteAgentIdentity.shared.register(
+                nonce: nonce, surfaceID: view.id, hostName: remoteHostName, sessionID: sid)
+        }
 
         if firstTab {
             // Open the run's tab. Build a BARE config (no inherited context — the
@@ -496,6 +541,11 @@ enum MCPLayout {
             if let cwd { config.workingDirectory = cwd }
             config.initialInput = initialInput
             config.environmentVariables = env
+            // (O6) A remote spawn carries only `hostName` on the bare config; the
+            // SurfaceView resolves name → forwarded socket, ensures the tunnel
+            // (RemoteTunnelController), and DEFERS the dial to readiness (D4/D5). A
+            // local spawn leaves hostName nil (unchanged eager local dial).
+            if let remoteHostName { config.hostName = remoteHostName }
             guard let appDelegate = NSApp.delegate as? AppDelegate else { return nil }
             // Pick the window the new tab joins. For an OVERFLOW tab (§12) the engine passes
             // `windowAnchorUUID` = a live pane of the SAME run, so all the run's tabs stay in
@@ -514,6 +564,7 @@ enum MCPLayout {
             // The new tab's surface tree is populated synchronously: the run's first
             // leaf is the only/first leaf.
             guard let view = created.surfaceTree.first else { return nil }
+            registerRemoteIdentity(view)
             return identity(of: view)
         }
 
@@ -552,9 +603,32 @@ enum MCPLayout {
         if let cwd { config.workingDirectory = cwd }
         config.initialInput = initialInput
         config.environmentVariables = env
+        // (O6) Remote split: carry `hostName` (deferred remote dial, as above).
+        if let remoteHostName { config.hostName = remoteHostName }
         guard let newView = controller.newSplit(
             at: target, direction: newDir, baseConfig: config) else { return nil }
+        registerRemoteIdentity(newView)
         return identity(of: newView)
+    }
+
+    /// (ramon fork / cloud-hosts, O6) The three-way host resolution for a spawn: nil /
+    /// "local" (case-insensitive) ⇒ `.local`; a name present in the live
+    /// `pty-remote-host` registry ⇒ `.remote(name)`; a present name NOT in the registry
+    /// ⇒ `.unresolvable` (the spawn fails — NEVER a local fallback, D4). MUST be called
+    /// on main (reads the live app config). Mirrors `SurfaceView.resolveHost` but returns
+    /// the NAME (the config carrier), since the SurfaceView owns socket resolution.
+    enum HostSpawn: Equatable {
+        case local
+        case remote(String)
+        case unresolvable
+    }
+
+    static func resolveHostSpawn(_ host: String?) -> HostSpawn {
+        guard let name = host, !name.isEmpty else { return .local }
+        if name.lowercased() == "local" { return .local }
+        guard let appDelegate = NSApp.delegate as? AppDelegate else { return .unresolvable }
+        let registry = RemoteHostRegistry.parse(lines: appDelegate.ghostty.config.ptyRemoteHostLines)
+        return registry[name] != nil ? .remote(name) : .unresolvable
     }
 
     /// (Agent Queue §12 continuous packing) Move the surface `sourceUUID` INTO the tab that

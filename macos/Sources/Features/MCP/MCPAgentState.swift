@@ -18,21 +18,40 @@ enum MCPAgentState {
 
     // MARK: - Body parsing (PURE)
 
-    /// Parse the hook POST body. Returns nil on missing/blank `tty`, missing/unknown
-    /// `state`, non-object JSON, or a body that does not decode as UTF-8 JSON.
-    /// `prompt`/`tool`/`message` are optional; `prompt`/`message` are truncated to
-    /// `maxStringLen` (default 2000) so an enormous prompt can't bloat the payload.
-    /// `state` strings accepted: "working", "waiting", "idle" (case-insensitive).
+    /// Parse the hook POST body. Returns nil on missing/unknown `state`, non-object
+    /// JSON, a body that does not decode as UTF-8 JSON, OR a body carrying NEITHER a
+    /// non-blank `tty` NOR a non-blank `nonce` (a body must identify its surface by one
+    /// or the other). `prompt`/`tool`/`message` are optional; `prompt`/`message` are
+    /// truncated to `maxStringLen` (default 2000) so an enormous prompt can't bloat the
+    /// payload. `state` strings accepted: "working", "waiting", "idle" (case-insensitive).
+    ///
+    /// (cloud-hosts D6) A REMOTE box's hook can't name a LOCAL tty, so it POSTs a
+    /// `{nonce, state}` body with NO `tty`; the `/agent-state` route resolves the nonce
+    /// to a surface via `RemoteAgentIdentity`. The local tty-walk path is kept as the
+    /// fallback (a body with a `tty` and no `nonce`).
     static func parse(_ body: Data, maxStringLen: Int = 2000) -> AgentStatePayload? {
         guard !body.isEmpty,
               let obj = try? JSONSerialization.jsonObject(with: body),
               let dict = obj as? [String: Any]
         else { return nil }
 
-        // tty: required, non-blank.
-        guard let ttyRaw = dict["tty"] as? String else { return nil }
-        let tty = ttyRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tty.isEmpty else { return nil }
+        // tty: OPTIONAL now (the nonce path carries none). When present it must be
+        // non-blank to count as an identifier.
+        let tty: String? = {
+            guard let raw = dict["tty"] as? String else { return nil }
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : t
+        }()
+
+        // nonce: OPTIONAL correlation id (cloud-hosts). Non-blank to count.
+        let nonce: String? = {
+            guard let raw = dict["nonce"] as? String else { return nil }
+            let n = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return n.isEmpty ? nil : n
+        }()
+
+        // A body must identify its surface by a tty OR a nonce — reject one with neither.
+        guard tty != nil || nonce != nil else { return nil }
 
         // state: required, one of working/waiting/idle (case-insensitive).
         guard let stateRaw = dict["state"] as? String,
@@ -53,7 +72,8 @@ enum MCPAgentState {
             state: state,
             prompt: optionalString("prompt", cap: maxStringLen),
             tool: optionalString("tool", cap: 256),
-            message: optionalString("message", cap: maxStringLen))
+            message: optionalString("message", cap: maxStringLen),
+            nonce: nonce)
     }
 
     // MARK: - tty normalization + match (PURE)

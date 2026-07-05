@@ -384,6 +384,9 @@ final class RemoteTunnelController {
             // Bump the respawn generation so any scheduled respawn is superseded/cancelled.
             respawnGeneration[hostName] = (respawnGeneration[hostName] ?? 0) + 1
             respawnAttempts[hostName] = 0
+            // The tunnel is going away — a cached project listing is now stale.
+            projectCache[hostName] = nil
+            projectFetchInFlight.remove(hostName)
             return (masterProcesses.removeValue(forKey: hostName),
                     forwarderProcesses.removeValue(forKey: hostName))
         }
@@ -406,6 +409,10 @@ final class RemoteTunnelController {
             masterProcesses[hostName] = nil
             let fwd = forwarderProcesses.removeValue(forKey: hostName)
             fwd?.terminate()
+            // The connection dropped — invalidate the cached project listing so a
+            // respawn re-fetches against the fresh tunnel (stale-while-revalidate).
+            projectCache[hostName] = nil
+            projectFetchInFlight.remove(hostName)
 
             guard (wanted[hostName] ?? 0) > 0, let entry = hostEntries[hostName] else {
                 return Decision(respawn: false, entry: nil, opts: nil, timeout: 0, delay: 0, gen: 0)
@@ -485,6 +492,188 @@ final class RemoteTunnelController {
             return false
         }
         return proc.terminationStatus == 0
+    }
+
+    // MARK: - Remote project listing (P2, cloud-hosts)
+
+    /// One cached remote project listing for a host.
+    struct CachedProjects: Equatable, Sendable {
+        let paths: [String]
+        let fetchedAt: Date
+    }
+
+    /// Freshness of a cache entry for the stale-while-revalidate scheme.
+    enum CacheFreshness: Equatable, Sendable { case miss, fresh, stale }
+
+    /// TTL for the project-list cache. A hit within the TTL is served without a
+    /// re-fetch; an older hit is STILL served (stale-while-revalidate) while a
+    /// background refresh runs — the same short-TTL shape as the web monitor's
+    /// ~1s `/api/surfaces` cache.
+    static let projectCacheTTL: TimeInterval = 1.0
+
+    /// (PURE, unit-tested) The stale-while-revalidate decision: classify a cache
+    /// entry (nil ⇒ `.miss`) against `now`. `<= ttl` is `.fresh` (boundary is
+    /// fresh); older is `.stale` (still served, triggers a revalidate). Mirrors
+    /// the pure-schedule style of `respawnDelay` / `AgentPreviewTile` backoff.
+    static func cacheFreshness(
+        entry: CachedProjects?,
+        now: Date,
+        ttl: TimeInterval = projectCacheTTL
+    ) -> CacheFreshness {
+        guard let entry else { return .miss }
+        return now.timeIntervalSince(entry.fetchedAt) <= ttl ? .fresh : .stale
+    }
+
+    /// (PURE, unit-tested) Split NUL-delimited `find -print0` output into paths,
+    /// dropping empty elements (a trailing NUL yields none). Also used for the
+    /// `ls` fallback (which this file re-joins with NULs).
+    static func parseNulPaths(_ data: Data) -> [String] {
+        data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }.filter { !$0.isEmpty }
+    }
+
+    /// Fired (host name) whenever a host's project cache is refreshed, so a live
+    /// palette can recompute its rows. Subscribers should `.receive(on:)` main.
+    let projectsDidUpdate = PassthroughSubject<String, Never>()
+
+    /// Per-host project cache + in-flight coalescing set (guarded by `stateQueue`).
+    private var projectCache: [String: CachedProjects] = [:]
+    private var projectFetchInFlight: Set<String> = []
+
+    /// Synchronous cache read for the palette — NEVER blocks and NEVER spawns
+    /// `ssh`. Returns the cached paths + their freshness, or nil on a cold miss.
+    /// A stale hit is still returned (stale-while-revalidate); the caller shows it
+    /// and separately calls `ensureProjects` to revalidate. `now` is injectable
+    /// for tests.
+    func cachedProjects(hostName: String, now: Date = Date()) -> (paths: [String], freshness: CacheFreshness)? {
+        stateQueue.sync {
+            let f = Self.cacheFreshness(entry: projectCache[hostName], now: now)
+            guard f != .miss, let entry = projectCache[hostName] else { return nil }
+            return (entry.paths, f)
+        }
+    }
+
+    /// Kick a background project fetch for `host` if the cache is cold or stale
+    /// (stale-while-revalidate). Non-blocking; coalesces concurrent fetches per
+    /// host (a second call while one is in flight is a no-op). `bases` are the
+    /// remote BASE dirs to scan (host-relative — `~`/vars are expanded ON THE BOX
+    /// by the login shell, NOT laptop-side).
+    func ensureProjects(host: RemoteHostEntry, bases: [String]) {
+        let shouldFetch: Bool = stateQueue.sync {
+            if projectFetchInFlight.contains(host.name) { return false }
+            if Self.cacheFreshness(entry: projectCache[host.name], now: Date()) == .fresh { return false }
+            projectFetchInFlight.insert(host.name)
+            return true
+        }
+        guard shouldFetch else { return }
+        probeQueue.async { [weak self] in
+            guard let self else { return }
+            let paths = self.runFindProjects(host: host, bases: bases)
+            self.stateQueue.sync {
+                self.projectCache[host.name] = CachedProjects(paths: paths, fetchedAt: Date())
+                self.projectFetchInFlight.remove(host.name)
+            }
+            self.projectsDidUpdate.send(host.name)
+        }
+    }
+
+    /// (P2) List the immediate subdirectories of each `base` on `host`, over the
+    /// supervisor-owned ControlMaster socket, and refresh the cache. Async — the
+    /// blocking `ssh` runs on the probe queue. This is the awaitable seam; the
+    /// palette uses the fire-and-forget `ensureProjects` instead.
+    func listProjects(host: RemoteHostEntry, bases: [String]) async -> [String] {
+        await withCheckedContinuation { (cont: CheckedContinuation<[String], Never>) in
+            probeQueue.async { [weak self] in
+                guard let self else { cont.resume(returning: []); return }
+                let paths = self.runFindProjects(host: host, bases: bases)
+                self.stateQueue.sync {
+                    self.projectCache[host.name] = CachedProjects(paths: paths, fetchedAt: Date())
+                    self.projectFetchInFlight.remove(host.name)
+                }
+                self.projectsDidUpdate.send(host.name)
+                cont.resume(returning: paths)
+            }
+        }
+    }
+
+    /// Drop a host's cached project listing (called on tunnel drop/reconnect so a
+    /// stale box's dirs are never shown against a fresh connection). Idempotent.
+    func invalidateProjects(hostName: String) {
+        stateQueue.sync {
+            projectCache[hostName] = nil
+            projectFetchInFlight.remove(hostName)
+        }
+    }
+
+    /// Blocking worker: run the remote `find` (with an `ls` fallback) for each
+    /// base over the existing ControlMaster, combine + dedupe + sort by displayed
+    /// name. MUST run off-main (spawns `ssh`). Empty on any failure (no master, no
+    /// ssh) — best-effort like the rest of the supervisor.
+    private func runFindProjects(host: RemoteHostEntry, bases: [String]) -> [String] {
+        guard let ssh = Self.resolveSSH(), let cp = try? controlPath(for: host) else { return [] }
+        var seen = Set<String>()
+        var out: [String] = []
+        for base in bases where !base.isEmpty {
+            let raw = Self.runRemoteList(ssh: ssh, controlPath: cp, target: host.sshTarget, base: base)
+            for p in Self.parseNulPaths(raw) where seen.insert(p).inserted { out.append(p) }
+        }
+        return out.sorted {
+            ($0 as NSString).lastPathComponent
+                .localizedCaseInsensitiveCompare(($1 as NSString).lastPathComponent) == .orderedAscending
+        }
+    }
+
+    /// Run the remote directory listing over the supervisor's ControlMaster
+    /// (`ControlMaster=no` reuses it, never spawns a competing master). PRIMARY:
+    /// `find -L <base> -mindepth 1 -maxdepth 1 -type d -print0` — POSIX-portable,
+    /// follows symlinks, dirs only, NUL-delimited (the symlink-follow the local
+    /// Swift `isProjectDirectory` gives us, encoded remotely). FALLBACK on a
+    /// find failure: `ls -1p <base>`, keeping only `/`-suffixed (directory)
+    /// entries, re-joined as NUL-delimited absolute paths (best-effort; no
+    /// symlink follow). Returns NUL-joined bytes for `parseNulPaths`.
+    private static func runRemoteList(ssh: String, controlPath: String, target: String, base: String) -> Data {
+        let common = [
+            "-o", "ControlPath=\(controlPath)",
+            "-o", "ControlMaster=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+        ]
+        if let d = runSSHCapture(ssh: ssh, args: common + [
+            target,
+            "find", "-L", base, "-mindepth", "1", "-maxdepth", "1", "-type", "d", "-print0",
+        ]), !d.isEmpty {
+            return d
+        }
+        guard let ls = runSSHCapture(ssh: ssh, args: common + [target, "ls", "-1p", base]) else {
+            return Data()
+        }
+        let text = String(decoding: ls, as: UTF8.self)
+        var joined = Data()
+        let prefix = base.hasSuffix("/") ? base : base + "/"
+        for line in text.split(separator: "\n") where line.hasSuffix("/") {
+            let name = line.dropLast()
+            guard !name.isEmpty else { continue }
+            joined.append(Data((prefix + name).utf8))
+            joined.append(0)
+        }
+        return joined
+    }
+
+    /// Spawn `ssh` with `args`, capture stdout, and return it only on a clean
+    /// exit (nil otherwise). stdout is drained BEFORE `waitUntilExit` so a large
+    /// listing can't deadlock on a full pipe buffer.
+    private static func runSSHCapture(ssh: String, args: [String]) -> Data? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ssh)
+        proc.arguments = args
+        proc.environment = tunnelEnvironment()
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        proc.standardInput = FileHandle.nullDevice
+        do { try proc.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0 ? data : nil
     }
 
     /// Resolve the LOCAL forwarded-socket path for a host: the user's explicit pin (tilde

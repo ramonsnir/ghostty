@@ -239,4 +239,154 @@ struct MCPAgentStateTests {
             token: "", peerFailureCount: 0)
         #expect(d == .notFound)
     }
+
+    // MARK: - (cloud-hosts M3/D6) nonce body parse — no tty
+
+    @Test func parseAcceptsNonceBodyWithNoTTY() {
+        // A REMOTE box's hook carries a nonce and NO tty; parse must accept it.
+        let body = Data(#"{"nonce":"abc123","state":"waiting"}"#.utf8)
+        let p = MCPAgentState.parse(body)
+        #expect(p?.tty == nil)
+        #expect(p?.nonce == "abc123")
+        #expect(p?.state == .waiting)
+    }
+
+    @Test func parseAcceptsNonceWithFields() {
+        let body = Data(#"{"nonce":"n1","state":"working","tool":"Bash","prompt":"go"}"#.utf8)
+        let p = MCPAgentState.parse(body)
+        #expect(p?.nonce == "n1")
+        #expect(p?.tool == "Bash")
+        #expect(p?.prompt == "go")
+    }
+
+    @Test func parseTrimsNonceAndTreatsBlankAsAbsent() {
+        #expect(MCPAgentState.parse(Data(#"{"nonce":"  n2 ","state":"idle"}"#.utf8))?.nonce == "n2")
+        // A blank nonce AND no tty ⇒ neither identifier ⇒ rejected.
+        #expect(MCPAgentState.parse(Data(#"{"nonce":"   ","state":"idle"}"#.utf8)) == nil)
+    }
+
+    @Test func parseRejectsBodyWithNeitherTTYNorNonce() {
+        #expect(MCPAgentState.parse(Data(#"{"state":"working"}"#.utf8)) == nil)
+    }
+
+    @Test func parseKeepsTTYFallbackWhenBothPresent() {
+        // A body with both a tty and a nonce parses both; the handler prefers nonce.
+        let p = MCPAgentState.parse(Data(#"{"tty":"ttys004","nonce":"n3","state":"idle"}"#.utf8))
+        #expect(p?.tty == "ttys004")
+        #expect(p?.nonce == "n3")
+    }
+
+    // MARK: - (cloud-hosts M1/D6) RemoteAgentIdentity nonce map
+
+    @Test func remoteAgentIdentityRegistersAndResolves() {
+        let map = RemoteAgentIdentity.shared
+        let nonce = RemoteAgentIdentity.mintNonce()
+        let sid = UUID()
+        map.register(nonce: nonce, surfaceID: sid, hostName: "cloud-1", sessionID: 0)
+        #expect(map.resolveSurfaceID(nonce: nonce) == sid)
+        let id = map.resolve(nonce: nonce)
+        #expect(id?.hostName == "cloud-1")
+        // Backfill the host-assigned session id once "Attached" lands.
+        map.recordAttached(nonce: nonce, sessionID: 4242)
+        #expect(map.resolve(nonce: nonce)?.sessionID == 4242)
+        map.remove(nonce: nonce)
+        #expect(map.resolveSurfaceID(nonce: nonce) == nil)
+    }
+
+    @Test func mintNonceIsHexAndUnique() {
+        let a = RemoteAgentIdentity.mintNonce()
+        let b = RemoteAgentIdentity.mintNonce()
+        #expect(a != b)
+        #expect(a.count == 32)
+        #expect(a.allSatisfy { $0.isHexDigit })
+    }
+
+    // MARK: - (cloud-hosts M3/D6) capability-token route scoping
+
+    @Test func capabilityTokenAuthorizesAgentStateOnly() {
+        // A per-box capability token (NOT the master) is accepted for /agent-state.
+        let d = MCPServer.decideRoute(
+            method: "POST", path: "/agent-state",
+            headers: ["x-ghostty-token": "box-token"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "master-token-value", peerFailureCount: 0,
+            capabilityTokens: ["box-token"])
+        #expect(d == .agentState)
+    }
+
+    @Test func capabilityTokenRejectedForMCPSpawn() {
+        // THE security crux (D6): a box's capability token must NEVER drive /mcp
+        // (spawn/input). It is rejected even though it is a VALID ingest credential.
+        let d = MCPServer.decideRoute(
+            method: "POST", path: "/mcp",
+            headers: ["x-ghostty-token": "box-token"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "master-token-value", peerFailureCount: 0,
+            capabilityTokens: ["box-token"])
+        #expect(d == .unauthorized)
+    }
+
+    @Test func masterTokenStillDrivesMCP() {
+        // The master token retains full access to /mcp (unchanged).
+        let d = MCPServer.decideRoute(
+            method: "POST", path: "/mcp",
+            headers: ["x-ghostty-token": "master-token-value"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "master-token-value", peerFailureCount: 0,
+            capabilityTokens: ["box-token"])
+        #expect(d == .mcp)
+    }
+
+    @Test func unknownTokenIsUnauthorizedEvenWithCapabilitySet() {
+        let d = MCPServer.decideRoute(
+            method: "POST", path: "/agent-state",
+            headers: ["x-ghostty-token": "neither"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "master-token-value", peerFailureCount: 0,
+            capabilityTokens: ["box-token"])
+        #expect(d == .unauthorized)
+    }
+
+    @Test func emptyCapabilitySetRejectsAnyBoxToken() {
+        // Fail-closed default: with NO capability tokens provisioned, a box token is
+        // simply an unknown token (401), never accepted.
+        let d = MCPServer.decideRoute(
+            method: "POST", path: "/agent-state",
+            headers: ["x-ghostty-token": "box-token"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "master-token-value", peerFailureCount: 0,
+            capabilityTokens: [])
+        #expect(d == .unauthorized)
+    }
+
+    // MARK: - (cloud-hosts M3/D6) allowed-hosts (tailnet FQDN)
+
+    @Test func allowedHostAcceptsTailnetFQDN() {
+        // A tailnet MagicDNS Host is 403'd by default (rebinding guard)…
+        let base = MCPServer.decideRoute(
+            method: "POST", path: "/agent-state",
+            headers: ["host": "my-mac.tail1234.ts.net:8765"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "", peerFailureCount: 0)
+        #expect(base == .forbiddenHost)
+        // …but accepted when added to the allowed-host set.
+        let allowed = MCPServer.decideRoute(
+            method: "POST", path: "/agent-state",
+            headers: ["host": "my-mac.tail1234.ts.net:8765"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "", peerFailureCount: 0,
+            allowedHosts: ["my-mac.tail1234.ts.net"])
+        #expect(allowed == .agentState)
+    }
+
+    @Test func allowedHostStillGatesPort() {
+        // The allow-list matches the host but the port must still be the configured one.
+        let d = MCPServer.decideRoute(
+            method: "POST", path: "/agent-state",
+            headers: ["host": "my-mac.tail1234.ts.net:9999"],
+            configuredHost: "127.0.0.1", configuredPort: 8765,
+            token: "", peerFailureCount: 0,
+            allowedHosts: ["my-mac.tail1234.ts.net"])
+        #expect(d == .forbiddenHost)
+    }
 }

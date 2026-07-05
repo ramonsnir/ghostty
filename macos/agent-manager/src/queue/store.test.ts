@@ -458,6 +458,90 @@ test("reconcile: mixed — active + prune + adopt in one pass", () => {
 });
 
 // ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 4 Q2) Cross-host identity pair-keying in reconcile +
+// pre-migration (no-hostName) back-compat.
+// ---------------------------------------------------------------------------
+
+test("reconcile: two hosts, SAME numeric sessionID — no false match, each keeps ITS host's surface", () => {
+  // Records on two boxes that happen to share session id 5.
+  const recA = asgn({ key: "K-A", sessionID: 5, hostName: "cloud-1", surfaceUUID: "stale-a" });
+  const recB = asgn({ key: "K-B", sessionID: 5, hostName: "cloud-2", surfaceUUID: "stale-b" });
+  const liveA = live({ sessionID: 5, hostName: "cloud-1", surfaceUUID: "fresh-a", queueKey: "K-A" });
+  const liveB = live({ sessionID: 5, hostName: "cloud-2", surfaceUUID: "fresh-b", queueKey: "K-B" });
+  const plan = reconcile([recA, recB], [liveA, liveB], 9999, 30000);
+
+  // BOTH stay active — no cross-host collision — each matched to ITS OWN host's surface.
+  assert.deepEqual(plan.actions.map((x) => x.kind).sort(), ["active", "active"]);
+  const byKey = new Map(plan.kept.map((k) => [k.key, k]));
+  assert.equal(byKey.get("K-A")!.surfaceUUID, "fresh-a");
+  assert.equal(byKey.get("K-A")!.hostName, "cloud-1");
+  assert.equal(byKey.get("K-B")!.surfaceUUID, "fresh-b");
+  assert.equal(byKey.get("K-B")!.hostName, "cloud-2");
+});
+
+test("reconcile: a record on cloud-1 does NOT match a same-id surface on cloud-2 (prunes, no wrong-host adopt)", () => {
+  // recA (cloud-1, id 5) has no cloud-1 surface; a DIFFERENT box (cloud-2, id 5) is live.
+  const recA = asgn({ key: "K-A", sessionID: 5, hostName: "cloud-1", sinceMs: 1000 });
+  const liveB = live({ sessionID: 5, hostName: "cloud-2", surfaceUUID: "u-b", queueKey: "K-B", queueName: "q" });
+  const plan = reconcile([recA], [liveB], 1000 + 30001, 30000);
+  const kinds = plan.actions.map((x) => x.kind).sort();
+  // recA prunes (its cloud-1 session is gone) and liveB adopts as its OWN (cloud-2) assignment.
+  assert.deepEqual(kinds, ["adopt", "prune"]);
+  const adopt = plan.actions.find((x) => x.kind === "adopt");
+  assert.ok(adopt && adopt.kind === "adopt");
+  if (adopt.kind === "adopt") {
+    assert.equal(adopt.assignment.key, "K-B");
+    assert.equal(adopt.assignment.hostName, "cloud-2");
+  }
+});
+
+test("reconcile: a LOCAL record (no hostName) matches a local surface (bare-number/local wire) — back-compat", () => {
+  // Pre-migration record: no hostName field at all (⇒ "local"). Live surface likewise local.
+  const rec = asgn({ key: "K-A", sessionID: 7, surfaceUUID: "stale" }); // hostName omitted
+  const liveLocal = live({ sessionID: 7, surfaceUUID: "fresh", queueKey: "K-A" }); // hostName omitted ⇒ local
+  const plan = reconcile([rec], [liveLocal], 9999, 30000);
+  assert.equal(plan.actions.length, 1);
+  const a = plan.actions[0];
+  assert.equal(a.kind, "active");
+  if (a.kind === "active") assert.equal(a.assignment.surfaceUUID, "fresh");
+});
+
+test("reconcile: adopting a remote orphan records its host on the assignment", () => {
+  const orphan = live({ sessionID: 9, hostName: "cloud-1", surfaceUUID: "o", queueKey: "K-o", queueName: "q" });
+  const plan = reconcile([], [orphan], 1, 30000);
+  const a = plan.actions[0];
+  assert.equal(a.kind, "adopt");
+  if (a.kind === "adopt") assert.equal(a.assignment.hostName, "cloud-1");
+});
+
+test("serialize/parse: a hostName sibling round-trips; a LOCAL record OMITS it (byte-identical)", () => {
+  // A remote record keeps its host across serialize→parse.
+  const remote = asgn({ key: "K-r", sessionID: 3, hostName: "cloud-1" });
+  const parsed = parseStore(serializeStore([remote]));
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].hostName, "cloud-1");
+
+  // A local record (no host / "local") serializes WITHOUT a hostName field — byte-identical to
+  // the pre-migration store — and parses back with hostName undefined.
+  const localRec = asgn({ key: "K-l", sessionID: 4 });
+  const text = serializeStore([localRec]);
+  assert.equal(text.includes("hostName"), false, "local record must not emit a hostName field");
+  assert.equal(parseStore(text)[0].hostName, undefined);
+});
+
+test("parseStore: a PRE-MIGRATION record with NO hostName parses (defaults local via undefined)", () => {
+  // Hand-written legacy store: records lack hostName entirely.
+  const legacy = JSON.stringify({
+    version: 1,
+    records: [{ queueName: "q", key: "K-1", sessionID: 42, gridSlot: 0, state: "RUNNING", sinceMs: 0, hero: false }],
+  });
+  const recs = parseStore(legacy);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].hostName, undefined); // ⇒ "local" at every read site
+  assert.equal(recs[0].sessionID, 42);
+});
+
+// ---------------------------------------------------------------------------
 // Cross-restart dedup wiring: activeSetFromKept feeds selectCandidates.
 // ---------------------------------------------------------------------------
 
