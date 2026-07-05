@@ -1422,7 +1422,46 @@ class BaseTerminalController: NSWindowController,
         // window.
         sourceController.removeSurfaceNode(sourceNode)
         replaceSurfaceTree(newTree)
+
+        // (ramon fork / Agent Queue, COMPACT grid §12) Re-tile the destination tab into the
+        // most compact grid for its new pane count, with the moved pane last. This is what
+        // makes a 4-pane tab settle as 2×2 instead of 3-columns-plus-one — the incremental
+        // BSP above can't restructure, so we rebuild the whole tab. Focus-preserving.
+        retileCompactGrid(
+            order: Array(surfaceTree).filter { $0 !== source } + [source],
+            focus: nil, maxCols: maxCols ?? 0, maxRows: maxRows ?? 0)
         return true
+    }
+
+    /// (ramon fork / Agent Queue, COMPACT grid §12) Re-tile THIS controller's tab into the
+    /// most compact balanced grid for its current pane count (see `SplitTree.compactGrid`),
+    /// laying the panes out in `order` (row-major; typically the tab's existing leaves with a
+    /// freshly added/moved pane appended last). A pure whole-tree rebuild installed via
+    /// `replaceSurfaceTree`, reusing the same `SurfaceView` leaves — so panes only re-position,
+    /// they are never recreated. Moves focus to `focus` when non-nil, otherwise leaves focus
+    /// untouched (the packer/move path must not steal focus).
+    ///
+    /// NO-OP unless a grid cap is set (`maxCols > 0 || maxRows > 0`) — this is a queue-only
+    /// affordance, so a plain user split (which passes no caps) is never reshuffled. Also a
+    /// no-op for ≤1 pane, or if `order` doesn't exactly cover this tab's current leaves (a
+    /// stale/foreign view slipped in) — a defensive guard so we never drop or duplicate a pane.
+    func retileCompactGrid(
+        order: [Ghostty.SurfaceView], focus: Ghostty.SurfaceView?, maxCols: Int, maxRows: Int
+    ) {
+        guard maxCols > 0 || maxRows > 0 else { return }
+        guard order.count > 1 else { return }
+
+        // Only rebuild when `order` is exactly the set of this tab's current leaves — same
+        // count, every one present, no dupes. Otherwise leave the tree alone.
+        let current = Array(surfaceTree)
+        guard order.count == current.count else { return }
+        let currentIDs = Set(current.map(\.id))
+        let orderIDs = Set(order.map(\.id))
+        guard orderIDs == currentIDs, orderIDs.count == order.count else { return }
+
+        let newTree = surfaceTree.compactGrid(
+            leaves: order, maxCols: maxCols, maxRows: maxRows)
+        replaceSurfaceTree(newTree, moveFocusTo: focus, undoAction: focus == nil ? nil : "New Split")
     }
 
     // MARK: Appearance

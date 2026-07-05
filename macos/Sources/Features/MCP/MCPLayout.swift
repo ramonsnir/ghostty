@@ -531,6 +531,10 @@ enum MCPLayout {
             newDir = dir
         }
 
+        // (ramon fork / COMPACT grid §12) Capture the tab's leaf order BEFORE the split so we
+        // can re-tile with the new pane appended LAST (keeps a stable, row-major fill order).
+        let orderBefore = Array(controller.surfaceTree)
+
         revealIfZoomedAway(controller, target)
         var config = Ghostty.SurfaceConfiguration()
         if let cwd { config.workingDirectory = cwd }
@@ -538,6 +542,17 @@ enum MCPLayout {
         config.environmentVariables = env
         guard let newView = controller.newSplit(
             at: target, direction: newDir, baseConfig: config) else { return nil }
+
+        // (ramon fork / Agent Queue, COMPACT grid §12) With a grid cap set, rebuild the tab
+        // into the most compact grid for its NEW pane count so 4 panes settle as 2×2 (not
+        // 3-columns-plus-one), 5 as 3×2-with-one-missing, etc. The incremental `largestLeafSplit`
+        // above only chose where to birth the pane; this fixes the whole-tab layout. Keeps the
+        // freshly-spawned pane focused.
+        if balanced {
+            controller.retileCompactGrid(
+                order: orderBefore + [newView], focus: newView,
+                maxCols: maxCols ?? 0, maxRows: maxRows ?? 0)
+        }
         return identity(of: newView)
     }
 

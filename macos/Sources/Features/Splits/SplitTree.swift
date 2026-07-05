@@ -373,6 +373,81 @@ extension SplitTree {
         return (fallback.view, aspect(fallback.bounds))
     }
 
+    /// (ramon fork / Agent Queue, COMPACT grid §12) The per-row pane counts for laying
+    /// `count` panes out as the most COMPACT (square-ish) grid constrained to at most
+    /// `maxCols` columns — the fewest rows that fit within `maxCols`, then the panes
+    /// balanced across those rows (front-loaded, so earlier rows are full). Row-major.
+    /// PURE.
+    ///
+    /// This is the "feels human" rule the incremental BSP can't express: rather than
+    /// filling columns first and wrapping (which lands 4 panes as 3-columns-plus-one),
+    /// it targets `rows = ceil(count / maxCols)` and then `cols = ceil(count / rows)`, so
+    /// the layout is as square as the column cap allows. Examples (maxCols 3):
+    /// `1→[1]`, `2→[2]`, `3→[3]`, `4→[2,2]`, `5→[3,2]`, `6→[3,3]`, `7→[3,2,2]`.
+    ///
+    /// `maxCols ≤ 0` means "unbounded columns" ⇒ a single row of `count`. `maxRows > 0`
+    /// caps the row count (defensive; the caller's per-tab cap already keeps
+    /// `count ≤ maxCols*maxRows`, so this only bites a misconfigured call). Returns `[]`
+    /// for `count ≤ 0`.
+    static func compactGridRowCounts(count: Int, maxCols: Int, maxRows: Int) -> [Int] {
+        guard count > 0 else { return [] }
+        let cols = maxCols > 0 ? maxCols : count
+        var rows = Int((Double(count) / Double(cols)).rounded(.up))
+        rows = Swift.max(1, rows)
+        if maxRows > 0 { rows = Swift.min(rows, maxRows) }
+        rows = Swift.max(1, rows)
+        // Distribute `count` panes into `rows` rows, front-loaded: the first `extra`
+        // rows get one more than the rest, so earlier rows are the full ones.
+        let base = count / rows
+        let extra = count % rows
+        return (0..<rows).map { $0 < extra ? base + 1 : base }
+    }
+
+    /// (ramon fork / Agent Queue, COMPACT grid §12) Rebuild a balanced grid tree from
+    /// `leaves` taken IN ORDER (row-major), laid out as EQUAL-height rows of EQUAL-width
+    /// columns per `compactGridRowCounts(count:maxCols:maxRows:)`. The result reuses the
+    /// SAME leaf views (only their tree position changes), so the caller installs it via
+    /// `replaceSurfaceTree` to re-tile a tab in place. Resets the zoom state. PURE.
+    ///
+    /// Empty `leaves` ⇒ an empty tree. A single leaf ⇒ that leaf as the root. The leaf
+    /// order is preserved by construction, so repeatedly rebuilding from the tree's own
+    /// `leaves()` (with any new pane appended last) is stable and idempotent.
+    func compactGrid(leaves: [ViewType], maxCols: Int, maxRows: Int) -> Self {
+        guard !leaves.isEmpty else { return .init(root: nil, zoomed: nil) }
+        guard leaves.count > 1 else { return .init(root: .leaf(view: leaves[0]), zoomed: nil) }
+
+        let rowCounts = Self.compactGridRowCounts(
+            count: leaves.count, maxCols: maxCols, maxRows: maxRows)
+
+        // Build each row as a left-to-right chain of equal-width columns, then stack the
+        // rows top-to-bottom as equal-height bands.
+        var rowNodes: [Node] = []
+        var idx = 0
+        for c in rowCounts {
+            let rowLeaves = leaves[idx..<(idx + c)].map { Node.leaf(view: $0) }
+            idx += c
+            rowNodes.append(Self.equalChain(Array(rowLeaves), direction: .horizontal))
+        }
+        let root = Self.equalChain(rowNodes, direction: .vertical)
+        return .init(root: root, zoomed: nil)
+    }
+
+    /// (ramon fork / COMPACT grid §12 helper) Combine `nodes` into a single balanced
+    /// chain of equal-size children along `direction`, first child at the top/left. PURE.
+    ///
+    /// In the rendered layout (`SplitView`) the `.left` child is the TOP (vertical) or
+    /// LEFT (horizontal) side and occupies `ratio` of the space; the `.right` child gets
+    /// the remaining `(1-ratio)`. So the first child takes `1/n` and the rest recursively
+    /// split the remaining `(n-1)/n` — giving `n` equal bands top-to-bottom (or columns
+    /// left-to-right) in list order. The rule is the SAME for both directions.
+    /// `nodes` must be non-empty.
+    private static func equalChain(_ nodes: [Node], direction: Direction) -> Node {
+        guard nodes.count > 1 else { return nodes[0] }
+        let n = Double(nodes.count)
+        let rest = equalChain(Array(nodes[1...]), direction: direction)
+        return .split(.init(direction: direction, ratio: 1.0 / n, left: nodes[0], right: rest))
+    }
+
     /// Equalize all splits in the tree so that each split's ratio is based on the
     /// relative weight (number of leaves) of its children.
     func equalized() -> Self {

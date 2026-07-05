@@ -667,7 +667,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   multi-tab overflow (`largestLeafSplit` MUST use real pixel bounds) that is **grid-CONSTRAINED** —
   the template `grid.cols`/`grid.rows` are threaded as HARD caps (sidecar → MCP → `largestLeafSplit`)
   so a tab never exceeds `cols` columns / `rows` rows (e.g. on an ultrawide a 3×2 grid now stacks a
-  2nd row instead of a 4th column); caps ≤0/absent = byte-identical pure-aspect back-compat. The dashboard shows per-queue
+  2nd row instead of a 4th column); caps ≤0/absent = byte-identical pure-aspect back-compat. On top
+  of the cap, each expansion (spawn/adopt/demote-repack/`packMove`) **RE-TILES the whole tab into
+  the most COMPACT grid for its pane count** (`SplitTree.compactGridRowCounts` +
+  `compactGrid` → `BaseTerminalController.retileCompactGrid` via `replaceSurfaceTree`): 3→3 columns,
+  **4→2×2** (not 3-columns-plus-one), 5→3×2-with-one-empty, 6→3×2 — front-loaded row-major. Because
+  the append-only split tree can't restructure in place, this **reshuffles** live panes on a
+  count-boundary crossing (chosen tradeoff); it reuses the SAME `SurfaceView` leaves (no pane
+  recreated) and no-ops without a cap / ≤1 pane / a stale leaf set. `equalChain` uses `ratio=1/n`
+  first-child-top-left (the `SplitView`/`spatialSlots` convention, NOT the inverted Y-up
+  `calculateViewBounds`). **CONTRACTION (agent finishes → pane closes) is left to Ghostty's
+  binary-tree reflow** — the ask was expansion. Pure Swift; no Zig/host/sidecar change (caps already
+  plumbed). The dashboard shows per-queue
   health + a backlog dependency DAG; cap and concurrency are editable live. A per-split **📌 KEEP
   pin** (dashboard tile; template default `keepOnComplete`) **exempts a completed split from
   auto-close** so you can do manual work in it — held in DONE_PENDING (slot kept, like

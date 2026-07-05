@@ -113,7 +113,7 @@ shell the engine just runs.
   },
   "concurrency": 3,                          // max simultaneous agents (TOTAL across tabs; may exceed one grid — see below)
   "maxItems": 200,                           // hard ceiling on total lifetime dispatches
-  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // PANES PER TAB = cols×rows; if concurrency exceeds it, extra agents OVERFLOW to new tabs (e.g. concurrency 9 + 3×2 grid = 6 in tab 1 + 3 in tab 2). Panes auto-tile as a balanced split; `fill` / col-vs-row is IGNORED
+  "grid": { "cols": 3, "rows": 3, "fill": "columns" },  // PANES PER TAB = cols×rows; if concurrency exceeds it, extra agents OVERFLOW to new tabs (e.g. concurrency 9 + 3×2 grid = 6 in tab 1 + 3 in tab 2). `cols` is a COLUMN CAP: panes auto-tile as the most COMPACT grid within it — 3→3 columns, 4→2×2, 5→3×2 (one cell empty), 6→3×2 — so adding a pane may reshuffle the tab. `fill` is IGNORED
   // NOTE: there is NO `quitWhenEmpty` — a run is removed only by an explicit Stop/Abort.
   // An empty `list` just means "nothing actionable now"; the run keeps polling. (A `quitWhenEmpty`
   // key here is silently ignored — it was removed after it abandoned live agents on a restart.)
@@ -625,6 +625,11 @@ cleared on completion. (This mirrors the work-item reconcile's `sessionID`-keyed
   consumes a regular concurrency slot nor counts against `max-total` ("2–3 heroes **plus** 10 other
   agents"). **`maxItems`, however, DOES bound heroes** — the queue's lifetime dispatch budget is a
   single total counter spent by both pools, so heroes can't push total launches past `maxItems`.
+- **Tabs tile as a compact grid** — within a tab the panes lay out as the most compact grid the
+  template `grid.cols` cap allows: 3 → 3 columns, **4 → 2×2** (not 3-columns-plus-one), 5 → 3×2
+  with one cell empty, 6 → 3×2. Because the underlying split tree can't restructure in place,
+  adding a pane may **reshuffle** the tab (e.g. the 4th agent moves the 3rd down into a new row).
+  Contraction (an agent finishing) is left to the tree's natural reflow.
 - **Tabs stay packed** — as agents finish unevenly and tabs fragment (e.g. 3 + 1 + 1 panes
   spread across three tabs), the queue **continuously consolidates**: when a whole tab's panes
   fit into an earlier tab's free space, it moves them there and closes the emptied tab (over a
@@ -1430,6 +1435,54 @@ or host change** (pure Swift + TS).
   `mcp.test.ts` (client sends caps when positive, omits when undefined/≤0), `grid.test.ts`
   (`gridCap == cols*rows` consistency). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig
   change.**
+
+### COMPACT re-tile — 4 panes settle as 2×2, not 3-columns-plus-one (§12)
+
+- **The problem the grid-constrained BSP still had.** `largestLeafSplit` places ONE pane at a
+  time and the split tree is APPEND-ONLY (a new pane can only split an existing leaf — the tree
+  can't restructure). So once 3 panes are a row of 3 columns (the shape we WANT for 3), adding a
+  4th can only split a column → "3 columns, one stacked", never a **2×2**. Filling columns first
+  and wrapping "feels robotic" for 4; a 2×2 is what a human draws. Getting BOTH "3 → 3 columns"
+  AND "4 → 2×2" as resting shapes is mathematically impossible without MOVING an existing pane —
+  the append-only tree provably can't reach 2×2 from a 3-column row by adding one leaf.
+- **The fix — rebuild the WHOLE tab into the most compact grid on each expansion.** After a queue
+  dispatch (spawn) OR a queue move (adopt / demote-repack / `packMove`) lands a pane in a grid
+  tab, the tab is re-tiled to the COMPACT grid for its new pane count. Shapes (default 3-col cap):
+  `2→[2]`, `3→[3]`, **`4→[2,2]`**, `5→[3,2]`, `6→[3,3]`, `7→[3,2,2]` (row-major, front-loaded — the
+  first rows are the full ones, so the "missing" cell is bottom-right). This DOES reshuffle live
+  panes when the count crosses a boundary (adding the 4th pane moves the 3rd down into a new row);
+  that reshuffle is the deliberate, chosen tradeoff (the append-only tree offers no alternative).
+- **The math** (`SplitTree.compactGridRowCounts(count:maxCols:maxRows:)`, PURE): `rows =
+  ceil(count / maxCols)`, then balance across those rows front-loaded (`base = count/rows`, the
+  first `count % rows` rows get `base+1`). This targets the fewest rows that fit the column cap,
+  then the squarest column count — NOT "fill maxCols then wrap". `maxCols ≤ 0` ⇒ one unbounded
+  row; `maxRows > 0` caps the row count (defensive — the caller's per-tab `cols*rows` cap already
+  keeps `count ≤ cols*rows`, spilling to a new tab first).
+- **The rebuild** (`SplitTree.compactGrid(leaves:maxCols:maxRows:)`, PURE): slice the ordered
+  leaves row-major per the row counts, build each row as an equal-width left→right chain and stack
+  the rows as equal-height bands, all via `equalChain` (each split's `ratio = 1/n`, first child at
+  top/left — the `SplitView`/`spatialSlots` convention, where `.left` = top/left occupies `ratio`;
+  ⚠️ NOT the inverted Y-up `calculateViewBounds` convention). The result **REUSES the same
+  `SurfaceView` leaves** — only their tree position changes — so `BaseTerminalController.retile`
+  installs it via `replaceSurfaceTree` (a pane never gets recreated; its `.client` mirror/PTY is
+  untouched). Leaf order is preserved by construction (`Array(tree) == input`), so re-tiling from
+  the tab's own `leaves()` with the new pane appended LAST is stable + idempotent.
+- **Wiring / scope.** `MCPLayout.newSplitCommand` (balanced arm): capture the tab's leaf order
+  BEFORE the split, then `controller.retileCompactGrid(order: before + [newView], focus: newView,
+  …)` after. `BaseTerminalController.moveSurfaceIntoThisTab`: `retileCompactGrid(order:
+  existing.filter{≠source} + [source], focus: nil, …)` after the insert (focus-preserving, like
+  the packer). `retileCompactGrid` NO-OPs unless a cap is set (`maxCols>0||maxRows>0`, so a plain
+  user split — which passes no caps — is NEVER reshuffled), ≤1 pane, or if `order` doesn't exactly
+  cover the tab's current leaves (a defensive same-set guard so a pane can't be dropped or
+  duplicated). **CONTRACTION (an agent finishing → its pane auto-closing) is intentionally LEFT to
+  Ghostty's existing binary-tree reflow** — the ask was about EXPANDING, and reshuffling survivors
+  every time one completes would be more jarring than helpful. Pure Swift; **no Zig/host/protocol/
+  sidecar change** (the caps were already plumbed to spawn/move). Wiring: `SplitTree.swift`
+  (`compactGridRowCounts` + `compactGrid` + `equalChain`), `BaseTerminalController.swift`
+  (`retileCompactGrid` + calls in `moveSurfaceIntoThisTab`), `MCPLayout.swift` (spawn arm). Tests:
+  `SplitTreeTests` (`compactGrid*`: row-count spec 1–9 + edges, 4→2×2 equal quadrants, 5→3-over-2
+  exact rects, 3→3-columns, 6→two-rows-of-three, row-major order preserved, idempotent, single/
+  empty, zoom reset). **GUI relaunch only; no host restart.**
 
 ### Continuous packing — `packMove` (§12)
 

@@ -1489,4 +1489,164 @@ struct SplitTreeTests {
         #expect(pick?.view === a)
         #expect(pick?.direction == .right)
     }
+
+    // MARK: - compactGrid (Agent Queue §12 compact/balanced re-tile)
+
+    /// The rows of a tree's leaves, top-to-bottom then left-to-right, using the SAME
+    /// spatial convention (`spatial(within:)`, Y-down: top has the smaller minY) that the
+    /// real renderer uses. Each inner array is one row's leaves in left-to-right order.
+    private func gridShape(
+        _ tree: SplitTree<MockView>, within bounds: CGSize
+    ) -> [[MockView]] {
+        guard let root = tree.root else { return [] }
+        let leaves: [(MockView, CGRect)] = root.spatial(within: bounds).slots.compactMap {
+            guard case .leaf(let v) = $0.node else { return nil }
+            return (v, $0.bounds)
+        }
+        let eps: CGFloat = 0.5
+        var ys: [CGFloat] = []
+        for (_, r) in leaves where !ys.contains(where: { abs($0 - r.minY) < eps }) {
+            ys.append(r.minY)
+        }
+        ys.sort() // ascending ⇒ top (smaller y) first
+        return ys.map { y in
+            leaves.filter { abs($0.1.minY - y) < eps }
+                .sorted { $0.1.minX < $1.1.minX }
+                .map { $0.0 }
+        }
+    }
+
+    /// Compare a leaf rect with a small tolerance — equal-thirds ratios (`1/3`) land at
+    /// `399.99…`, not exactly `400`, so exact `CGRect ==` is float-fragile.
+    private func expectRect(
+        _ got: CGRect?, x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat,
+        tol: CGFloat = 0.1, _ label: Comment? = nil
+    ) {
+        guard let got else { #expect(Bool(false), label ?? "rect is nil"); return }
+        #expect(abs(got.minX - x) < tol, label)
+        #expect(abs(got.minY - y) < tol, label)
+        #expect(abs(got.width - w) < tol, label)
+        #expect(abs(got.height - h) < tol, label)
+    }
+
+    @Test func compactGridRowCountsMatchesSpec() {
+        // The heart of the feature: the "feels human" grid for the default 3-col cap.
+        func rc(_ n: Int) -> [Int] {
+            SplitTree<MockView>.compactGridRowCounts(count: n, maxCols: 3, maxRows: 3)
+        }
+        #expect(rc(1) == [1])
+        #expect(rc(2) == [2])
+        #expect(rc(3) == [3])
+        #expect(rc(4) == [2, 2]) // 2×2, NOT 3-columns-plus-one
+        #expect(rc(5) == [3, 2]) // 3×2 with one missing
+        #expect(rc(6) == [3, 3])
+        #expect(rc(7) == [3, 2, 2])
+        #expect(rc(8) == [3, 3, 2])
+        #expect(rc(9) == [3, 3, 3])
+    }
+
+    @Test func compactGridRowCountsEdgeCases() {
+        // count ≤ 0 ⇒ empty; maxCols ≤ 0 ⇒ a single unbounded row; maxRows caps rows.
+        #expect(SplitTree<MockView>.compactGridRowCounts(count: 0, maxCols: 3, maxRows: 3) == [])
+        #expect(SplitTree<MockView>.compactGridRowCounts(count: -2, maxCols: 3, maxRows: 3) == [])
+        #expect(SplitTree<MockView>.compactGridRowCounts(count: 5, maxCols: 0, maxRows: 0) == [5])
+        // 2-col cap: 4 ⇒ 2×2, 5 ⇒ [3,2] (front-loaded), 3 ⇒ [2,1].
+        #expect(SplitTree<MockView>.compactGridRowCounts(count: 4, maxCols: 2, maxRows: 0) == [2, 2])
+        #expect(SplitTree<MockView>.compactGridRowCounts(count: 3, maxCols: 2, maxRows: 0) == [2, 1])
+    }
+
+    @Test func compactGridFourPanesIsTwoByTwo() {
+        // The reported annoyance: 4 panes must be 2×2, equal quadrants — not 3 columns + 1.
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView()
+        let tree = SplitTree(view: a).compactGrid(leaves: [a, b, c, d], maxCols: 3, maxRows: 3)
+        let bounds = CGSize(width: 1200, height: 1000)
+        let shape = gridShape(tree, within: bounds)
+        #expect(shape.map(\.count) == [2, 2])
+        #expect(shape[0] == [a, b])
+        #expect(shape[1] == [c, d])
+        // Equal quadrants.
+        let rects = leafRects(tree, within: bounds)
+        expectRect(rects[ObjectIdentifier(a)], x: 0, y: 0, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(b)], x: 600, y: 0, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(c)], x: 0, y: 500, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(d)], x: 600, y: 500, w: 600, h: 500)
+    }
+
+    @Test func compactGridFivePanesIsThreeOverTwo() {
+        // 5 ⇒ top row of 3 (equal thirds), bottom row of 2 (equal halves), one cell "missing".
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView(), e = MockView()
+        let tree = SplitTree(view: a).compactGrid(
+            leaves: [a, b, c, d, e], maxCols: 3, maxRows: 3)
+        let bounds = CGSize(width: 1200, height: 1000)
+        let shape = gridShape(tree, within: bounds)
+        #expect(shape.map(\.count) == [3, 2])
+        #expect(shape[0] == [a, b, c])
+        #expect(shape[1] == [d, e])
+        let rects = leafRects(tree, within: bounds)
+        expectRect(rects[ObjectIdentifier(a)], x: 0, y: 0, w: 400, h: 500)
+        expectRect(rects[ObjectIdentifier(c)], x: 800, y: 0, w: 400, h: 500)
+        expectRect(rects[ObjectIdentifier(d)], x: 0, y: 500, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(e)], x: 600, y: 500, w: 600, h: 500)
+    }
+
+    @Test func compactGridThreePanesIsThreeColumns() {
+        // 3 ⇒ a single row of 3 equal columns (the shape the user wants kept for 3).
+        let a = MockView(), b = MockView(), c = MockView()
+        let tree = SplitTree(view: a).compactGrid(leaves: [a, b, c], maxCols: 3, maxRows: 3)
+        let bounds = CGSize(width: 1200, height: 900)
+        #expect(gridShape(tree, within: bounds).map(\.count) == [3])
+        let rects = leafRects(tree, within: bounds)
+        expectRect(rects[ObjectIdentifier(a)], x: 0, y: 0, w: 400, h: 900)
+        expectRect(rects[ObjectIdentifier(b)], x: 400, y: 0, w: 400, h: 900)
+        expectRect(rects[ObjectIdentifier(c)], x: 800, y: 0, w: 400, h: 900)
+    }
+
+    @Test func compactGridSixPanesIsTwoRowsOfThree() {
+        let views = (0..<6).map { _ in MockView() }
+        let tree = SplitTree(view: views[0]).compactGrid(leaves: views, maxCols: 3, maxRows: 3)
+        let shape = gridShape(tree, within: CGSize(width: 1200, height: 1000))
+        #expect(shape.map(\.count) == [3, 3])
+        #expect(shape[0] == Array(views[0..<3]))
+        #expect(shape[1] == Array(views[3..<6]))
+    }
+
+    @Test func compactGridPreservesLeafOrderRowMajor() {
+        // The tree's own DFS leaf order must equal the input order (so re-tiling from
+        // leaves() + a new pane is stable and never scrambles panes).
+        let views = (0..<7).map { _ in MockView() }
+        let tree = SplitTree(view: views[0]).compactGrid(leaves: views, maxCols: 3, maxRows: 3)
+        #expect(Array(tree) == views)
+    }
+
+    @Test func compactGridIsIdempotent() {
+        // Rebuilding from the tree's own leaves yields the identical shape (no drift).
+        let views = (0..<5).map { _ in MockView() }
+        let bounds = CGSize(width: 1200, height: 1000)
+        let once = SplitTree(view: views[0]).compactGrid(leaves: views, maxCols: 3, maxRows: 3)
+        let twice = once.compactGrid(leaves: Array(once), maxCols: 3, maxRows: 3)
+        #expect(gridShape(once, within: bounds).map(\.count)
+            == gridShape(twice, within: bounds).map(\.count))
+        #expect(Array(once) == Array(twice))
+        #expect(leafRects(once, within: bounds) == leafRects(twice, within: bounds))
+    }
+
+    @Test func compactGridSingleAndEmpty() {
+        let a = MockView()
+        let single = SplitTree(view: a).compactGrid(leaves: [a], maxCols: 3, maxRows: 3)
+        #expect(!single.isSplit)
+        #expect(Array(single) == [a])
+        let empty = SplitTree(view: a).compactGrid(leaves: [], maxCols: 3, maxRows: 3)
+        #expect(empty.isEmpty)
+    }
+
+    @Test func compactGridResetsZoom() throws {
+        // A whole-tree rebuild must clear any prior zoom (like `inserting`).
+        let a = MockView(), b = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = SplitTree(root: tree.root, zoomed: tree.root)
+        #expect(tree.zoomed != nil)
+        let rebuilt = tree.compactGrid(leaves: [a, b], maxCols: 3, maxRows: 3)
+        #expect(rebuilt.zoomed == nil)
+    }
 }
