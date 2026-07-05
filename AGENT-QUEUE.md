@@ -559,6 +559,14 @@ switch). A running scheduled split carries a teal recurring-clock glyph on its d
 (distinct from the hero purple star). Pausing is per-schedule (or all at once); a paused schedule
 never fires, but **Run-now still works** so you can kick one off ad hoc.
 
+**Its dashboard TILE hides the work-item-only controls.** A scheduled scan is a queue-owned tile,
+but it is **not a keyed work item**, so the tile omits the 📌 **KEEP pin** and the **Promote/Demote
+to Hero** buttons — both act on a work-item key/assignment a schedule doesn't have (the keep pin in
+particular sends `set_keep{key:""}`, which the controller drops on its `!key.isEmpty` guard, so the
+pin looked live but "wouldn't click"). Keep is meaningless for a schedule anyway — its lifecycle is
+cadence-driven, not per-completion. The generic **Close** (force-close — which for a schedule *is*
+its completion) and **Hide** buttons remain, since both are surface-UUID based.
+
 Schedules bypass the `concurrency` / `agent-queue-max-total` / `maxItems` caps (they're maintenance,
 not throughput), but they **do occupy the grid** (overflowing to a new row/tab when full, like a
 work item). Cadence + pause state persist in the per-run store and survive a sidecar/GUI restart;

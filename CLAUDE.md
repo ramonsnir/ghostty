@@ -924,7 +924,12 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   vacation switch) + a **teal recurring-clock tile glyph** (distinct from hero purple). Cadence + pause persist in the per-run store and survive a restart (a still-open
   scheduled split is re-adopted, no re-dispatch). **A scheduled surface carries `queueName` +
   `schedule`/`scheduleId` annotation but NO `queueKey`, so the work-item reconcile leaves it alone**
-  (it only adopts keyed surfaces) — the schedule pass tracks it separately. **Restart re-adoption
+  (it only adopts keyed surfaces) — the schedule pass tracks it separately. **The schedule TILE
+  hides the work-item-only controls** (`AgentPreviewTile` gates them on `!isSchedule`): the 📌 KEEP
+  pin and Promote/Demote-to-Hero act on a work-item key/assignment a schedule lacks — the keep pin
+  sent `set_keep{key:""}` which the controller drops on `!key.isEmpty` ("the pin wouldn't click"),
+  and keep is meaningless for a cadence-driven schedule. Generic Close (which for a schedule IS its
+  completion) + Hide remain (surface-UUID based). **Restart re-adoption
   is TWO-SIGNAL (fixed the "running status didn't survive a restart" bug):** steady-state liveness
   is the `scheduleId` annotation echoed by `list_surfaces`, but a GUI restart WIPES the in-memory
   annotation → a surviving scan comes back with no `scheduleId` → naively read as completed
@@ -953,7 +958,7 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   (`HookSnapshotEntry.scheduleId` + `pauseSchedule`/`resumeSchedule`/`runScheduleNow`/`pauseAllSchedules`
   + `surfaceID(forSchedule:scheduleID:)` for the focus button),
   `QueueCommandBridge.swift` (4 `Action` cases + `scheduleId` + `QueueStatus.ScheduleStatus`),
-  `AgentPreviewTile.swift` (teal glyph), `AgentDashboardView.swift` (Schedules lane + `onFocusSchedule`). Tests: sidecar
+  `AgentPreviewTile.swift` (teal glyph + `!isSchedule` gate hiding the KEEP pin & Promote/Demote-to-Hero), `AgentDashboardView.swift` (Schedules lane + `onFocusSchedule`). Tests: sidecar
   `queue/schedule.test.ts` (cron/skip matrix), `templates`/`store`/`commands`/`runner`/`mcp`/`status`
   `.test.ts`; Swift `MCPAnnotationTests`/`MCPServerTests`/`QueuePaletteTests`. Fork-only, template-only
   — keep the `schedules[]` in your queue JSON under `~/.config/ghostty-ramon/agent-manager/queues/`.

@@ -365,12 +365,16 @@ struct AgentPreviewTile: View {
                     .foregroundStyle(Self.scheduleTeal)
                     .dashboardTooltip("Scheduled scan")
             }
-            // (keep) The 📌 pin toggle — queue tiles only. Shown PERSISTENTLY when kept (so
-            // a pinned split is obvious without hovering) and on hover otherwise. Filled +
-            // accent when kept; outline + secondary when not. Clicking flips the keep state
-            // (optimistic; the supervisor's set_keep confirms it). It's the "exempt this
-            // split from auto-close so I can keep working" control.
-            if isQueueOwned && (isKept || hovering) {
+            // (keep) The 📌 pin toggle — queue WORK-ITEM tiles only. Shown PERSISTENTLY when
+            // kept (so a pinned split is obvious without hovering) and on hover otherwise.
+            // Filled + accent when kept; outline + secondary when not. Clicking flips the keep
+            // state (optimistic; the supervisor's set_keep confirms it). It's the "exempt this
+            // split from auto-close so I can keep working" control. HIDDEN on a schedule tile:
+            // a schedule has NO queueKey, so `set_keep{run,key:"",…}` is dropped by the
+            // controller's `!key.isEmpty` guard (the pin looked live but "wouldn't click"); and
+            // keep is meaningless for a schedule anyway — its lifecycle is cadence-driven, not
+            // per-completion. `!isSchedule` gates it out.
+            if isQueueOwned && !isSchedule && (isKept || hovering) {
                 Button { onKeep(!isKept) } label: {
                     Image(systemName: isKept ? "pin.fill" : "pin")
                         .font(.caption2)
@@ -393,12 +397,14 @@ struct AgentPreviewTile: View {
                     .disabled(queueRuns.isEmpty)
                     .dashboardTooltip(queueRuns.isEmpty ? "Adopt (no queue running)" : "Adopt into queue")
                 }
-                // (hero) Promote / demote — queue-owned agent tiles only (a hero is tracked by
-                // a queue). "Promote to Hero" ejects the split into its own tab + flips the
-                // hero bit; on a hero it's "Demote" (back to a regular tracked item, stays in
+                // (hero) Promote / demote — queue-owned WORK-ITEM agent tiles only (a hero is a
+                // tracked work item). "Promote to Hero" ejects the split into its own tab + flips
+                // the hero bit; on a hero it's "Demote" (back to a regular tracked item, stays in
                 // its tab). A purple star(.slash) reads as the hero identity, distinct from the
-                // red destructive Close and the keep 📌 pin.
-                if isQueueOwned, entry.agent != nil {
+                // red destructive Close and the keep 📌 pin. HIDDEN on a schedule tile: a schedule
+                // is not a keyed work item (no assignment to promote/demote), so `!isSchedule`
+                // gates it out — Close + Hide remain (both are generic, surface-UUID based).
+                if isQueueOwned, !isSchedule, entry.agent != nil {
                     Button { isHero ? onDemoteFromHero() : onPromoteToHero() } label: {
                         Image(systemName: isHero ? "star.slash" : "star")
                             .font(.caption2)
