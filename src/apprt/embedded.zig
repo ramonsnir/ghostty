@@ -460,6 +460,12 @@ pub const Surface = struct {
     /// reserved name "local".
     host_name: ?[:0]const u8 = null,
 
+    /// (ramon fork / cloud-hosts) Per-attempt `.client` redial connection
+    /// ceiling, in SECONDS, carried from `Options.pty_host_connect_timeout_s`
+    /// so the core `Surface.init` threads it into `Client.Config.connect_timeout_s`.
+    /// A plain scalar (no ownership). 0 ⇒ the compiled-in default ceiling.
+    pty_host_connect_timeout_s: u32 = 0,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -531,6 +537,12 @@ pub const Surface = struct {
         /// extern layout additive with the C header; zero-initialized callers
         /// get null.
         host_name: ?[*:0]const u8 = null,
+
+        /// (ramon fork / cloud-hosts) Per-attempt `.client` redial connection
+        /// ceiling, in SECONDS. NOT a protocol field. 0 (the default) ⇒ the
+        /// compiled-in default ceiling. Appended last to keep the extern layout
+        /// additive with the C header; zero-initialized callers get 0.
+        pty_host_connect_timeout_s: u32 = 0,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -554,6 +566,9 @@ pub const Surface = struct {
             // `.client` backend role (false => attach; true + non-zero session_id
             // => mirror).
             .mirror = opts.mirror,
+            // (cloud-hosts) Per-attempt redial connection ceiling (seconds); a
+            // plain scalar the core Surface.init threads into Client.Config.
+            .pty_host_connect_timeout_s = opts.pty_host_connect_timeout_s,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1770,6 +1785,31 @@ pub const CAPI = struct {
     /// safe to call from the apprt/main thread.
     export fn ghostty_surface_session_id(surface: *Surface) u64 {
         return surface.core_surface.sessionId();
+    }
+
+    // ghostty_client_state_s — (ramon fork / cloud-hosts) the surface's `.client`
+    // connection state + the TOO_OLD version data. `state` is `termio.Client.State`
+    // (enum(c_int)), ABI-compatible with the C `ghostty_client_state_e`.
+    const ClientStateInfo = extern struct {
+        state: termio.Client.State,
+        host_major: u16,
+        host_minor: u16,
+        gui_major: u16,
+        gui_minor: u16,
+    };
+
+    /// (ramon fork / cloud-hosts) Read the surface's `.client` connection state
+    /// (for the macOS reconnect overlay) + the version data the `too_old`
+    /// directional message needs. GUI-lib-only; a `.exec` surface reports `.ok`.
+    /// Lock-free (reads atomics), safe to call from the apprt/main thread.
+    export fn ghostty_surface_client_state(surface: *Surface) ClientStateInfo {
+        return .{
+            .state = surface.core_surface.clientState(),
+            .host_major = surface.core_surface.clientHostMajor(),
+            .host_minor = surface.core_surface.clientHostMinor(),
+            .gui_major = host_protocol.PROTOCOL_VERSION_MAJOR,
+            .gui_minor = host_protocol.PROTOCOL_VERSION_MINOR,
+        };
     }
 
     /// Returns true if the surface process has exited.

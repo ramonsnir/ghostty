@@ -1069,6 +1069,20 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS, for a
+        // REMOTE (`pty-remote-host`) split's mid-session redial AND the tunnel
+        // supervisor's ssh-master respawn (REG-T3). `0` (the default) ⇒ use the
+        // compiled-in default. Same non-optional-UInt32 rule as `agentQueueHeroMax`
+        // above — a `UInt32?` reads back nil and silently returns the default.
+        var ptyRemoteConnectTimeout: UInt32 {
+            let defaultValue: UInt32 = 0
+            guard let config = self.config else { return defaultValue }
+            var v: UInt32 = defaultValue
+            let key = "pty-remote-connect-timeout"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // MARK: - Config knowledge (fork: MCP "knowledge" tools)
 
         /// One config key's documentation, used by the MCP `describe_config_key`

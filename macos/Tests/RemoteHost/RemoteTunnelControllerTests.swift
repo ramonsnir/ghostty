@@ -81,6 +81,112 @@ struct RemoteTunnelControllerTests {
         #expect(RemoteTunnelController.backoff(forAttempt: -1) > 0)
     }
 
+    // MARK: - Respawn backoff (J1) — mirrors AgentMirrorReconnectTests
+
+    @Test func backoffQuickBurstThenSteadyMinute() {
+        // Quick exponential burst 1,2,4,8,16,30 then the steady 60s cadence.
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 0) == 1)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 1) == 2)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 2) == 4)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 3) == 8)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 4) == 16)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 5) == 30)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 6) == 60)
+    }
+
+    @Test func backoffSettlesAtSteadyIntervalForever() {
+        // Never gives up: every attempt past the quick burst clamps to the steady cadence.
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 6) == 60)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 50) == 60)
+        #expect(RemoteTunnelController.respawnDelay(forAttempt: 10_000) == 60)
+    }
+
+    @Test func backoffNeverNegativeOrZero() {
+        for a in -3...12 {
+            #expect(RemoteTunnelController.respawnDelay(forAttempt: a) > 0)
+        }
+    }
+
+    // MARK: - Connect-timeout ceiling (REG-T3)
+
+    @Test func connectTimeoutMsMapsZeroToCompiledDefault() {
+        // 0 ⇒ the compiled-in default seconds; a positive value passes through (×1000).
+        #expect(RemoteTunnelController.connectTimeoutMs(0)
+                == RemoteTunnelController.defaultConnectTimeoutSeconds * 1000)
+        #expect(RemoteTunnelController.connectTimeoutMs(15) == 15_000)
+        #expect(RemoteTunnelController.connectTimeoutMs(1) == 1_000)
+    }
+
+    // MARK: - Teardown cancels a live probe loop (J1, D7 last-surface-closes)
+
+    @Test func teardownCancelsInFlightProbeLoop() async throws {
+        // A never-handshaking acceptor keeps the probe loop retrying forever; teardown()
+        // (what the last releaseTunnel calls) bumps the probe generation so the loop's
+        // isCurrent gate fails and it exits — no readiness ever fires, before or after.
+        let acceptor = try FakeHostSocket(mode: .acceptThenClose)
+        defer { acceptor.stop() }
+        let controller = RemoteTunnelController.shared
+        let host = "test-teardown-\(UUID().uuidString.prefix(6))"
+
+        controller.startProbing(hostName: host, socketPath: acceptor.path, probeTimeoutMs: 300)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        #expect(controller.currentReadiness(for: host) == nil)  // reachable-but-no-ack ≠ ready
+
+        controller.teardown(hostName: host)
+        // Still nil after teardown, and no leaked loop can flip it later.
+        try await Task.sleep(nanoseconds: 500_000_000)
+        #expect(controller.currentReadiness(for: host) == nil)
+    }
+
+    // MARK: - Surface refcount + respawn gate wiring (J1, D7)
+
+    /// A surface create/close PAIR must increment then zero the want-count (`wanted`),
+    /// and the never-give-up respawn gate must be armed EXACTLY while a surface still
+    /// wants the host. This proves the J1 machinery is WIRED: the refcount `retainTunnel`
+    /// bumps (which `SurfaceView.subscribeRemoteReadiness` now calls, and
+    /// `SurfaceView.deinit` releases) is the SAME count `handleMasterExit` gates the
+    /// respawn on — so a hard tunnel drop while a surface is alive schedules a respawn
+    /// instead of looping on `.unreachable` forever. Uses the non-spawning `noteRetain`/
+    /// `noteRelease` seams (the single source of truth behind retain/release) so the test
+    /// never launches ssh.
+    @Test func retainReleasePairTracksWantCountAndArmsRespawn() {
+        let controller = RemoteTunnelController.shared
+        let name = "test-refcount-\(UUID().uuidString.prefix(6))"
+        let entry = RemoteHostEntry(
+            name: name,
+            sshTarget: "user@\(name).invalid",
+            remoteSocketPath: "/tmp/ghostty-host.sock",
+            localSocketPath: nil)
+
+        // Before any surface: nobody wants it, so a master exit would NOT respawn.
+        #expect(controller.wantedCount(for: name) == 0)
+        #expect(!controller.wouldRespawnOnMasterExit(hostName: name))
+
+        // Surface #1 created: count → 1, and it is the FIRST (bring-up) surface. The
+        // respawn gate is now ARMED purely because a surface wants the host — this is the
+        // exact `wanted[host] > 0` condition the dead-code review flagged as never true.
+        #expect(controller.noteRetain(host: entry, connectTimeout: 0))
+        #expect(controller.wantedCount(for: name) == 1)
+        #expect(controller.wouldRespawnOnMasterExit(hostName: name))
+
+        // Surface #2 for the same host: NOT first; count → 2.
+        #expect(!controller.noteRetain(host: entry, connectTimeout: 0))
+        #expect(controller.wantedCount(for: name) == 2)
+
+        // Close one surface: count → 1, NOT the last (no teardown), respawn still armed.
+        #expect(!controller.noteRelease(hostName: name))
+        #expect(controller.wantedCount(for: name) == 1)
+        #expect(controller.wouldRespawnOnMasterExit(hostName: name))
+
+        // Close the LAST surface: count → 0 (the last-surface teardown trigger) and the
+        // respawn gate CLOSES — a master exit no longer respawns (the intended-stop case).
+        #expect(controller.noteRelease(hostName: name))
+        #expect(controller.wantedCount(for: name) == 0)
+        #expect(!controller.wouldRespawnOnMasterExit(hostName: name))
+
+        controller.teardown(hostName: name)  // clean shared singleton state
+    }
+
     @Test func shortHashIsStableEightHex() {
         let a = RemoteTunnelController.shortHash("cloud-1")
         let b = RemoteTunnelController.shortHash("cloud-1")

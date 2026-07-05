@@ -207,6 +207,24 @@ extension Ghostty {
                     Rectangle().fill(ghostty.config.backgroundColor)
                     AwaitingRemoteHostView(hostName: host)
                 }
+
+                // (ramon fork / cloud-hosts, K1/L1) The reconnect / version / unreachable
+                // overlay for a REMOTE `.client` surface. Draws a named, actionable banner
+                // OVER the frozen, dimmed last frame so a dropped / version-refused /
+                // unreachable remote split is NEVER a silent blank pane (design rule
+                // §"never a silent blank pane"). Mounted only for a resolved remote host
+                // (a local surface always reports `.ok`, so this would be inert overhead);
+                // it polls the lock-free `clientStateInfo` accessor. `pendingRemoteHost`
+                // (pre-dial) and this overlay (post-dial) never both show: while pending,
+                // `surface == nil` ⇒ `clientStateInfo` is `.ok` ⇒ no banner.
+                if let host = surfaceView.hostName,
+                   !host.isEmpty,
+                   host.lowercased() != "local" {
+                    ReconnectStateOverlay(
+                        surfaceView: surfaceView,
+                        hostName: host,
+                        backgroundColor: ghostty.config.backgroundColor)
+                }
                 #endif
 
                 // If we're part of a split view and don't have focus, we put a semi-transparent
@@ -312,6 +330,113 @@ extension Ghostty {
             .padding()
         }
     }
+
+    #if canImport(AppKit)
+    /// (ramon fork / cloud-hosts, K1/L1) Overlay that renders the `.client` connection
+    /// state for a REMOTE surface OVER the frozen, dimmed last frame. Polls the
+    /// lock-free `SurfaceView.clientStateInfo` accessor on a modest cadence (the state
+    /// is host-fed and pushed only into a core atomic, so there is no notification to
+    /// observe — a timer poll is the analog of the other host-fed per-surface reads).
+    /// The state→(title, body, severity) mapping is the pure, unit-tested
+    /// `Ghostty.SurfaceView.reconnectBanner`; this view only handles presentation.
+    struct ReconnectStateOverlay: View {
+        @ObservedObject var surfaceView: SurfaceView
+        let hostName: String
+        let backgroundColor: Color
+
+        @State private var info: Ghostty.ClientStateInfo = .init()
+
+        /// Poll cadence (seconds). Matches the coarse, human-perceptible granularity of
+        /// the other host-fed per-surface reads (e.g. the dashboard mirror's
+        /// `processExited` poll); a dropped tunnel does not need sub-second latency.
+        private static let pollInterval: UInt64 = 750_000_000
+
+        private var banner: Ghostty.ReconnectBanner? {
+            Ghostty.SurfaceView.reconnectBanner(info: info, host: hostName)
+        }
+
+        var body: some View {
+            ZStack {
+                if let banner {
+                    // Dim the frozen last frame. A transient reconnect is gentle so the
+                    // (still-current) content stays readable; a loud error dims harder.
+                    Rectangle()
+                        .fill(backgroundColor)
+                        .opacity(banner.severity == .transient ? 0.4 : 0.65)
+                        .allowsHitTesting(false)
+
+                    ReconnectBannerCard(banner: banner)
+                        .transition(.opacity)
+                }
+            }
+            .task {
+                // Poll the lock-free host-fed state (no notification pushes it into
+                // Swift), the same shape as the dashboard mirror's `processExited` poll.
+                info = surfaceView.clientStateInfo
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: Self.pollInterval)
+                    let next = surfaceView.clientStateInfo
+                    if next != info { info = next }
+                }
+            }
+        }
+    }
+
+    /// The banner card body for `ReconnectStateOverlay`. A transient reconnect shows a
+    /// small spinner + subtle text; an `info`/`loud` state shows an icon, a bold title,
+    /// and the actionable body, tinted by severity.
+    struct ReconnectBannerCard: View {
+        let banner: Ghostty.ReconnectBanner
+
+        private var accent: Color {
+            switch banner.severity {
+            case .transient: return .gray
+            case .info: return .orange
+            case .loud: return .red
+            }
+        }
+
+        private var iconName: String {
+            switch banner.severity {
+            case .transient: return "arrow.triangle.2.circlepath"
+            case .info: return "moon.zzz"
+            case .loud: return "exclamationmark.triangle.fill"
+            }
+        }
+
+        var body: some View {
+            HStack(alignment: .top, spacing: 10) {
+                if banner.severity == .transient {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: iconName)
+                        .font(.title2)
+                        .foregroundStyle(accent)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(banner.title)
+                        .font(.headline)
+                    Text(banner.body)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: 360, alignment: .leading)
+                }
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(.background)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(accent.opacity(banner.severity == .transient ? 0.25 : 0.5),
+                                          lineWidth: 1))
+                    .shadow(radius: 6)
+            )
+            .padding()
+        }
+    }
+    #endif
 
     // This is the resize overlay that shows on top of a surface to show the current
     // size during a resize operation.
@@ -735,6 +860,16 @@ extension Ghostty {
         /// the registry (D3/D4). Forwarded into `ghostty_surface_config_s.host_name`.
         var hostName: String?
 
+        /// (ramon fork / cloud-hosts, REG-T2/REG-T3) Per-attempt connection ceiling,
+        /// in SECONDS, for this surface's `.client` mid-session redial. Set from
+        /// `pty-remote-connect-timeout` (`Ghostty.Config.ptyRemoteConnectTimeout`)
+        /// ONLY when dialing a REMOTE host; `0` (the default) ⇒ the core's compiled-in
+        /// default ceiling. NOT a protocol/wire field. Forwarded into
+        /// `ghostty_surface_config_s.pty_host_connect_timeout_s`, which the core
+        /// `Surface.init` threads into `Client.Config.connect_timeout_s`. NOT persisted
+        /// (re-applied from config on the deferred remote dial, like `ptyHostSocket`).
+        var ptyHostConnectTimeoutS: UInt32 = 0
+
         /// (ramon fork / Agent Dashboard, Layer 3) When true and the `.client`
         /// termio backend is in use together with a non-zero `sessionID`, the
         /// surface becomes a READ-ONLY render mirror of the host session
@@ -819,6 +954,12 @@ extension Ghostty {
             // (ramon fork / Agent Dashboard) Read-only render mirror of a host
             // session. Default false => byte-identical attach/spawn behavior.
             config.mirror = mirror
+
+            // (ramon fork / cloud-hosts, REG-T2) Per-attempt `.client` redial
+            // connection ceiling in SECONDS (0 ⇒ compiled default). A plain scalar,
+            // only set for a remote host; the core threads it into
+            // Client.Config.connect_timeout_s. NOT a protocol/wire field.
+            config.pty_host_connect_timeout_s = ptyHostConnectTimeoutS
 
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in

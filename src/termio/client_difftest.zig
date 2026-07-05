@@ -3039,3 +3039,633 @@ test "client resolveSocketPath prefers the per-surface socket over the global" {
         Client.resolveSocketPath(per, null).?,
     );
 }
+
+// =============================================================================
+// (cloud-hosts / Phase 2) Reconnect subsystem — pure decision helpers + the
+// HelloAck/version-classify + reattach-miss handleFrame arms. These cover every
+// deterministic decision the redial rests on; the full IO-thread redial state
+// machine (async + backoff timer + read-thread respawn) is driven END-TO-END
+// against a real xev loop + a framed host stub by the "Reconnect INTEGRATION
+// tests" at the bottom of this file (drop→redial→reattach round-trip).
+// =============================================================================
+
+// (I1/D2) The reconnect backoff schedule: quick exponential burst for the first
+// RECONNECT_QUICK_ATTEMPTS, then a steady cadence forever, and NEVER 0 (a 0 would
+// busy-spin the redial). Mirrors the macOS AgentPreviewTile backoff shape.
+test "client reconnectDelayMs quick burst then steady forever, never zero" {
+    try testing.expectEqual(@as(u64, 1_000), Client.reconnectDelayMs(0));
+    try testing.expectEqual(@as(u64, 2_000), Client.reconnectDelayMs(1));
+    try testing.expectEqual(@as(u64, 4_000), Client.reconnectDelayMs(2));
+    try testing.expectEqual(@as(u64, 8_000), Client.reconnectDelayMs(3));
+    try testing.expectEqual(@as(u64, 16_000), Client.reconnectDelayMs(4));
+    // 5th quick step caps at 30s (min(32s,30s)); then steady 60s forever.
+    try testing.expectEqual(@as(u64, 30_000), Client.reconnectDelayMs(5));
+    try testing.expectEqual(@as(u64, 60_000), Client.reconnectDelayMs(6));
+    try testing.expectEqual(@as(u64, 60_000), Client.reconnectDelayMs(7));
+    try testing.expectEqual(@as(u64, 60_000), Client.reconnectDelayMs(1000));
+    // Never a busy spin.
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) try testing.expect(Client.reconnectDelayMs(i) > 0);
+}
+
+// (REG-T2) The per-attempt connection ceiling: 0 => compiled default; else N*1000.
+test "client connectTimeoutMs maps 0 to the compiled default" {
+    // 0 => DEFAULT_CONNECT_TIMEOUT_S (10s) in ms.
+    try testing.expectEqual(@as(u64, 10_000), Client.connectTimeoutMs(0));
+    try testing.expectEqual(@as(u64, 5_000), Client.connectTimeoutMs(5));
+    try testing.expectEqual(@as(u64, 15_000), Client.connectTimeoutMs(15));
+}
+
+// (D4) The redial Attach-id gate: reattach to the LIVE host id when we have one;
+// else the configured/persisted id; else a FRESH spawn (null) — NEVER a blind
+// re-Attach that would spawn+orphan a second session on a 0-id drop.
+test "client reattachId prefers the live id, else configured, else fresh" {
+    // Live (host-assigned) id present => reattach to it (even over a stale config).
+    try testing.expectEqual(@as(?u64, 9), Client.reattachId(9, null));
+    try testing.expectEqual(@as(?u64, 9), Client.reattachId(9, 7));
+    // No live id but a persisted/config id => reattach to that (restored surface
+    // that dropped before its first Attached arrived).
+    try testing.expectEqual(@as(?u64, 7), Client.reattachId(0, 7));
+    // No live id AND no configured id => FRESH spawn (null), NOT a blind re-Attach.
+    try testing.expectEqual(@as(?u64, null), Client.reattachId(0, null));
+}
+
+// (G2/H2/D1) Drop classification: before any HelloAck => cannot_handshake
+// (ambiguous, retryable); after a handshake => reconnecting for a reconnect
+// client, else leave the state (local single-shot keeps the frozen last frame).
+test "client classifyDrop distinguishes before/after handshake + local vs reconnect" {
+    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(true, false));
+    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(false, false));
+    try testing.expectEqual(@as(?Client.State, .reconnecting), Client.classifyDrop(true, true));
+    // local / single-shot, after a handshake: leave the state (no redial, no
+    // busy-loop, frozen last frame persists).
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(false, true));
+}
+
+// (H1/H2) A HelloAck with a MATCHING major records the version + marks the
+// handshake seen and leaves the state OK; a MISMATCHED major => too_old.
+test "client hello_ack records version + classifies too_old on major mismatch" {
+    const alloc = testing.allocator;
+
+    // Matching major: ack_seen set, version recorded, state stays .ok.
+    {
+        var client = try Client.init(alloc, .{});
+        defer client.deinit();
+        try testing.expectEqual(Client.State.ok, client.clientState());
+        const ack: protocol.HelloAck = .{
+            .protocol_version_major = protocol.PROTOCOL_VERSION_MAJOR,
+            .protocol_version_minor = protocol.PROTOCOL_VERSION_MINOR +% 1,
+            .host_pid = 1,
+            .host_start_epoch = 2,
+        };
+        const payload = try ack.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .hello_ack, payload);
+        try testing.expect(client.ack_seen.load(.acquire));
+        try testing.expectEqual(protocol.PROTOCOL_VERSION_MAJOR, client.hostMajor());
+        try testing.expectEqual(protocol.PROTOCOL_VERSION_MINOR +% 1, client.hostMinor());
+        // A MINOR gap is NEVER an error — degrades gracefully, state stays .ok.
+        try testing.expectEqual(Client.State.ok, client.clientState());
+    }
+
+    // Mismatched major: too_old (confident, actionable), version still recorded.
+    {
+        var client = try Client.init(alloc, .{});
+        defer client.deinit();
+        const ack: protocol.HelloAck = .{
+            .protocol_version_major = protocol.PROTOCOL_VERSION_MAJOR + 1,
+            .protocol_version_minor = 0,
+            .host_pid = 1,
+            .host_start_epoch = 2,
+        };
+        const payload = try ack.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .hello_ack, payload);
+        try testing.expect(client.ack_seen.load(.acquire));
+        try testing.expectEqual(@as(u16, protocol.PROTOCOL_VERSION_MAJOR + 1), client.hostMajor());
+        try testing.expectEqual(Client.State.too_old, client.clientState());
+    }
+}
+
+// (I2/D4) A reattach MISS (the host handed back a DIFFERENT session id than we
+// requested) becomes the visible session_ended state and does NOT adopt the
+// returned fresh id (session_id stays unset); a MATCHING id stores + stays OK; a
+// FRESH surface (no requested id) stores the assigned id + stays OK.
+test "client attached reattach-miss -> session_ended, no fresh-id adoption" {
+    const alloc = testing.allocator;
+
+    // REMOTE (reconnect=true): requested 5, host returns 9 => session_ended, id
+    // NOT stored (stays 0). The `session_ended` overlay is mounted only for a
+    // remote surface, so the miss is surfaced there.
+    {
+        var client = try Client.init(alloc, .{ .session_id = 5, .reconnect = true });
+        defer client.deinit();
+        const att: protocol.Attached = .{ .session_id = 9, .cols = 80, .rows = 24 };
+        const payload = try att.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .attached, payload);
+        try testing.expectEqual(Client.State.session_ended, client.clientState());
+        // Did NOT adopt the fresh id.
+        try testing.expectEqual(@as(u64, 0), client.session_id.load(.acquire));
+    }
+
+    // LOCAL (reconnect=false): requested 5, host returns 9 => the miss is NOT
+    // gated to `session_ended` (local has no overlay — that would be a silent
+    // dead pane). Phase-1 semantics preserved: ADOPT the host's fresh id (9) and
+    // go `.ok`, yielding a usable fresh shell (local host-restart behavior).
+    {
+        var client = try Client.init(alloc, .{ .session_id = 5 });
+        defer client.deinit();
+        const att: protocol.Attached = .{ .session_id = 9, .cols = 80, .rows = 24 };
+        const payload = try att.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .attached, payload);
+        try testing.expectEqual(@as(u64, 9), client.session_id.load(.acquire));
+        try testing.expectEqual(Client.State.ok, client.clientState());
+    }
+
+    // Requested 5, host returns 5 (a real reattach hit) => store + state .ok.
+    // (Hit path is identical for local and remote; use a remote client here.)
+    {
+        var client = try Client.init(alloc, .{ .session_id = 5, .reconnect = true });
+        defer client.deinit();
+        const att: protocol.Attached = .{ .session_id = 5, .cols = 80, .rows = 24 };
+        const payload = try att.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .attached, payload);
+        try testing.expectEqual(@as(u64, 5), client.session_id.load(.acquire));
+        try testing.expectEqual(Client.State.ok, client.clientState());
+    }
+
+    // Fresh surface (no requested id) => store the assigned id, no session_ended.
+    {
+        var client = try Client.init(alloc, .{});
+        defer client.deinit();
+        const att: protocol.Attached = .{ .session_id = 42, .cols = 80, .rows = 24 };
+        const payload = try att.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .attached, payload);
+        try testing.expectEqual(@as(u64, 42), client.session_id.load(.acquire));
+        try testing.expectEqual(Client.State.ok, client.clientState());
+    }
+}
+
+// (I1/D2.4) The redial machinery is ARMED only for a reconnect client. A
+// `reconnect=false` (local/single-shot) client leaves it null so its read thread
+// can NEVER trigger a redial; a `reconnect=true` client arms it. Both tear down
+// cleanly (no leak, no double-free) — exercises the connectAndAttach arm + the
+// sentinel-guarded ThreadData.deinit without needing a running loop.
+test "client reconnect machinery armed iff Config.reconnect (clean teardown)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    inline for (.{ false, true }) |reconnect| {
+        var listener = try TestListener.init(alloc);
+        defer listener.deinit(alloc);
+        try listener.start();
+
+        var loop = try xev.Loop.init(.{});
+        defer loop.deinit();
+
+        var client = try Client.init(alloc, .{
+            .socket_path = listener.path,
+            .reconnect = reconnect,
+        });
+        defer client.deinit();
+
+        var td: termio.Termio.ThreadData = undefined;
+        td.alloc = alloc;
+        td.loop = &loop;
+        td.backend = .{ .client = undefined };
+        try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+        // The read thread's drop-wakeup pointer is set ONLY for a reconnect client.
+        if (reconnect) {
+            try testing.expect(client.reconnect_async != null);
+            try testing.expect(td.backend.client.reconnect_async != null);
+        } else {
+            try testing.expect(client.reconnect_async == null);
+            try testing.expect(td.backend.client.reconnect_async == null);
+        }
+
+        // Clean teardown (a quit does NOT trigger a redial): join + release the
+        // xev handles + free the pools with no leak/double-free.
+        client.threadExit(&td);
+        td.backend.deinit(alloc);
+        listener.joinAccept();
+    }
+}
+
+// =============================================================================
+// (cloud-hosts / Phase 2) Reconnect INTEGRATION tests — the drop→redial→reattach
+// round-trip against a real xev loop + a framed multi-connection host stub. Where
+// the decision-helper tests above (reconnectDelayMs/reattachId/classifyDrop/
+// hello_ack/attached-miss) pin the pure logic, THESE drive the whole IO-thread
+// state machine end-to-end: `connectAndAttach` → read-thread EOF drop →
+// `reconnectAsyncCallback`/`beginRedial`/`teardownConnection` →
+// `scheduleReconnect` (backoff `xev.Timer`) → `attemptReconnect` →
+// `redialReattach`, and assert the host observes a reattach Attach carrying the
+// SAME (live) session id, that the backoff timer gated the redial, that a
+// mid-backoff quit tears down cleanly with NO second dial, that a `local`/
+// single-shot client never redials, and that a drop with an OUTSTANDING queued
+// write reconnects without a double-close/UAF of the write_stream/pools.
+//
+// The full redial rests on the backoff timer, so these spend ~1s of wall time.
+
+/// A framed, MULTI-CONNECTION host stub for the redial round-trip. Unlike the
+/// bare `TestListener` (drain-only), it speaks the REAL wire codec: each accepted
+/// connection is read until the client's `.attach` frame is decoded, then it
+/// replies `HelloAck` + `Attached{attached_session_id}`. The FIRST connection is
+/// the "live" session that then DROPS (closed) — either immediately, or (with
+/// `hold_first`) only after the test signals `drop_first`, so a test can queue an
+/// outstanding write while conn #1 is still healthy. Every SUBSEQUENT connection
+/// is a reattach: its `Attach.session_id` is captured into `reattach_session_id`
+/// (an atomic, -1 sentinel = none yet, -2 = a fresh/null attach) and the
+/// connection is left OPEN so the reconnected client stays `.ok`.
+const RedialHost = struct {
+    tmp: testing.TmpDir,
+    path: []u8,
+    listen_fd: posix.fd_t,
+    thread: ?std.Thread = null,
+
+    attached_session_id: u64,
+    hold_first: bool,
+
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    drop_first: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    accept_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// The reattach connection's Attach.session_id: -1 = none captured yet, -2 =
+    /// a fresh (null) attach, else the requested id.
+    reattach_session_id: std.atomic.Value(i64) = std.atomic.Value(i64).init(-1),
+
+    /// Reattach connections are left open; their fds are stored here and closed by
+    /// `stop` AFTER the accept thread is joined (no cross-thread fd race).
+    open_conns: [8]posix.fd_t = undefined,
+    open_count: usize = 0,
+
+    fn init(alloc: std.mem.Allocator, attached_session_id: u64, hold_first: bool) !RedialHost {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(dir_path);
+        const path = try std.fmt.allocPrint(alloc, "{s}/r.sock", .{dir_path});
+        errdefer alloc.free(path);
+
+        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        errdefer posix.close(fd);
+        posix.unlink(path) catch {};
+
+        var addr: posix.sockaddr.un = undefined;
+        addr.family = posix.AF.UNIX;
+        if (path.len >= addr.path.len) return error.PathTooLong;
+        @memcpy(addr.path[0..path.len], path);
+        addr.path[path.len] = 0;
+        try posix.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        try posix.listen(fd, 4);
+
+        return .{
+            .tmp = tmp,
+            .path = path,
+            .listen_fd = fd,
+            .attached_session_id = attached_session_id,
+            .hold_first = hold_first,
+        };
+    }
+
+    fn start(self: *RedialHost) !void {
+        self.thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+    }
+
+    fn acceptLoop(self: *RedialHost) void {
+        var idx: usize = 0;
+        while (!self.stopped.load(.acquire)) {
+            const conn = posix.accept(self.listen_fd, null, null, 0) catch return;
+            _ = self.accept_count.fetchAdd(1, .release);
+            self.handleConn(conn, idx);
+            idx += 1;
+        }
+    }
+
+    fn handleConn(self: *RedialHost, conn: posix.fd_t, idx: usize) void {
+        // Drain the client's Hello+Attach; for a reattach (idx>=1) capture the id.
+        self.readUntilAttach(conn, idx);
+
+        // Reply with a matching-major HelloAck (client stays .ok) + Attached.
+        self.writeFrame(conn, .hello_ack, protocol.HelloAck{ .host_pid = 1, .host_start_epoch = 1 });
+        self.writeFrame(conn, .attached, protocol.Attached{
+            .session_id = self.attached_session_id,
+            .cols = 80,
+            .rows = 24,
+        });
+
+        if (idx == 0) {
+            // The "live" session. Optionally hold it open until the test has queued
+            // an outstanding write, then DROP it (close) to trigger the redial.
+            if (self.hold_first) {
+                while (!self.drop_first.load(.acquire) and !self.stopped.load(.acquire)) {
+                    std.Thread.sleep(2 * std.time.ns_per_ms);
+                }
+            }
+            posix.close(conn);
+        } else {
+            // A reattach: leave it OPEN so the reconnected client stays .ok. Closed
+            // by `stop` after join.
+            if (self.open_count < self.open_conns.len) {
+                self.open_conns[self.open_count] = conn;
+                self.open_count += 1;
+            } else {
+                posix.close(conn);
+            }
+        }
+    }
+
+    fn readUntilAttach(self: *RedialHost, conn: posix.fd_t, idx: usize) void {
+        const alloc = testing.allocator;
+        var reader: protocol.FrameReader = .{};
+        defer reader.deinit(alloc);
+        var buf: [512]u8 = undefined;
+        var iters: usize = 0;
+        while (iters < 200) : (iters += 1) {
+            const n = posix.read(conn, &buf) catch return;
+            if (n == 0) return;
+            reader.push(alloc, buf[0..n]) catch return;
+            while (reader.next(alloc) catch return) |frame| {
+                if (frame.tag == .attach) {
+                    var att = protocol.Attach.decode(alloc, frame.payload) catch return;
+                    defer att.deinit(alloc);
+                    if (idx >= 1) {
+                        self.reattach_session_id.store(
+                            if (att.session_id) |sid| @intCast(sid) else -2,
+                            .release,
+                        );
+                    }
+                    return; // handshake read complete for this connection
+                }
+            }
+        }
+    }
+
+    fn writeFrame(self: *RedialHost, conn: posix.fd_t, tag: protocol.FrameType, frame: anytype) void {
+        _ = self;
+        const alloc = testing.allocator;
+        const bytes = protocol.encodeFrame(alloc, tag, frame) catch return;
+        defer alloc.free(bytes);
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const w = posix.write(conn, bytes[off..]) catch return;
+            if (w == 0) break;
+            off += w;
+        }
+    }
+
+    fn stop(self: *RedialHost, alloc: std.mem.Allocator) void {
+        self.stopped.store(true, .release);
+        if (self.listen_fd >= 0) {
+            posix.close(self.listen_fd); // unblocks a pending accept()
+            self.listen_fd = -1;
+        }
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        var i: usize = 0;
+        while (i < self.open_count) : (i += 1) posix.close(self.open_conns[i]);
+        self.open_count = 0;
+        alloc.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+/// A non-null, aligned, NEVER-DEREFERENCED `*termio.Termio` for the redial
+/// integration tests. `attemptReconnect` forwards `td.reconnect_io.?` to the
+/// respawned read thread, whose `threadMainPosix` does `_ = io;` — so the pointer
+/// must be a well-defined non-null value (a bare `undefined` would make the `.?`
+/// on the optional UB) but is otherwise inert.
+fn redialIoSentinel() *termio.Termio {
+    return @ptrFromInt(@alignOf(termio.Termio));
+}
+
+test "client reconnect (remote) redials + reattaches with the SAME session id, backoff applied" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    // conn #1 hands out session id 7 then drops immediately (hold_first=false).
+    var host = try RedialHost.init(alloc, 7, false);
+    defer host.stop(alloc);
+    try host.start();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    // reconnect=true (a resolved REMOTE .attach). session_id null (fresh), so the
+    // ONLY id the redial can reattach with is the host-ASSIGNED live id (7) — this
+    // is what proves it reattaches to the same session rather than fresh-spawning.
+    var client = try Client.init(alloc, .{ .socket_path = host.path, .reconnect = true });
+    defer client.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, redialIoSentinel());
+
+    const started = std.time.milliTimestamp();
+
+    // Pump the loop until the host captures the reattach Attach (conn #2) or a
+    // deadline. `.no_wait` flushes writes + fires the backoff `xev.Timer` once its
+    // ~1s deadline elapses; the short sleeps let the read/host threads progress.
+    var reattach: i64 = -1;
+    const deadline = started + 8000;
+    while (std.time.milliTimestamp() < deadline) {
+        loop.run(.no_wait) catch break;
+        reattach = host.reattach_session_id.load(.acquire);
+        if (reattach != -1) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    const elapsed = std.time.milliTimestamp() - started;
+
+    // Reattached with the SAME (host-assigned live) id — NOT a fresh spawn (-2).
+    try testing.expectEqual(@as(i64, 7), reattach);
+    // The client kept 7 as its live session id across the redial.
+    try testing.expectEqual(@as(u64, 7), client.session_id.load(.acquire));
+    // Backoff APPLIED: a reattach cannot precede the first ~1s backoff step
+    // (reconnectDelayMs(0) == 1000). A generous floor avoids flakiness while still
+    // proving the timer gated the redial (not an instant busy-reconnect).
+    try testing.expect(elapsed >= 800);
+
+    // Clean teardown of the live conn #2 (no leak / double-free under testing.allocator).
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+}
+
+test "client reconnect quit-pipe honored MID-BACKOFF (clean teardown, no second dial)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var host = try RedialHost.init(alloc, 7, false);
+    defer host.stop(alloc);
+    try host.start();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client = try Client.init(alloc, .{ .socket_path = host.path, .reconnect = true });
+    defer client.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, redialIoSentinel());
+
+    // Pump only until the drop is seen + the backoff timer is scheduled — i.e. the
+    // state is `.reconnecting` — bounded WELL under the ~1s backoff so the reconnect
+    // timer has NOT fired (no conn #2 yet).
+    const deadline = std.time.milliTimestamp() + 700;
+    while (std.time.milliTimestamp() < deadline) {
+        loop.run(.no_wait) catch break;
+        if (client.clientState() == .reconnecting) break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(Client.State.reconnecting, client.clientState());
+
+    // A clean quit MID-BACKOFF: threadExit + ThreadData.deinit stop the loop side
+    // and release the (still-pending) backoff timer. No crash, no leak/double-free
+    // (testing.allocator), and — since the loop is never run again — the redial
+    // NEVER fires: the host saw exactly ONE connection (conn #1).
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+
+    // Give any (erroneously-live) reconnect a chance to dial, then assert it did not.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), host.accept_count.load(.acquire));
+}
+
+test "client local (reconnect=false) NEVER redials after a handshake drop" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var host = try RedialHost.init(alloc, 7, false);
+    defer host.stop(alloc);
+    try host.start();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    // reconnect defaults to false (local / single-shot). A persisted session id 5
+    // is present but MUST NOT drive a redial.
+    var client = try Client.init(alloc, .{ .socket_path = host.path, .session_id = 5 });
+    defer client.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, redialIoSentinel());
+
+    // The redial machinery is NOT armed for a local client.
+    try testing.expect(client.reconnect_async == null);
+    try testing.expect(td.backend.client.reconnect_async == null);
+
+    // Pump past the handshake + drop + WELL past the first backoff step (>1s). A
+    // reconnect client would have dialed conn #2 by now; a local one must NOT.
+    const deadline = std.time.milliTimestamp() + 1500;
+    while (std.time.milliTimestamp() < deadline) {
+        loop.run(.no_wait) catch break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    // Exactly ONE connection ever — the local client never re-dialed.
+    try testing.expectEqual(@as(usize, 1), host.accept_count.load(.acquire));
+
+    // The read thread exited on the drop; threadExit (gated on read_thread_live)
+    // still closes the socket fd exactly once. No double-close / no leak.
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+}
+
+test "client reconnect drops with an OUTSTANDING queued write: reattaches, no double-close/UAF" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    // hold_first: conn #1 stays open after the handshake reply until the test has
+    // queued an outstanding write, THEN drops — so a write completion is in flight
+    // ACROSS `teardownConnection` (the exact stale-completion hazard writeCallback's
+    // fd guard defends, and the pools/queue the teardown leaves intact).
+    var host = try RedialHost.init(alloc, 7, true);
+    defer host.stop(alloc);
+    try host.start();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    var client = try Client.init(alloc, .{ .socket_path = host.path, .reconnect = true });
+    defer client.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, redialIoSentinel());
+
+    // Pump until the handshake lands (live session id 7 + state .ok); conn #1 is
+    // HELD open by the host, so the client is healthy at this point.
+    const d1 = std.time.milliTimestamp() + 3000;
+    while (std.time.milliTimestamp() < d1) {
+        loop.run(.no_wait) catch break;
+        if (client.session_id.load(.acquire) == 7 and client.clientState() == .ok) break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u64, 7), client.session_id.load(.acquire));
+
+    // Queue an OUTSTANDING input write while healthy: it enqueues on the loop (its
+    // write completion may still be pending when the drop tears the old fd down).
+    try client.queueWrite(alloc, &td, "echo outstanding\n", false);
+
+    // NOW drop conn #1. The redial must (a) let the in-flight write completion fire
+    // through writeCallback's stale-fd guard (reclaim its pool slots, ignore the old
+    // fd — no spurious re-trip), and (b) rebuild the connection WITHOUT double-closing
+    // the write_stream/fd or UAF'ing the pools (teardownConnection leaves them intact).
+    host.drop_first.store(true, .release);
+
+    // Pump until the reattach lands on conn #2 (past the ~1s backoff), or a deadline.
+    var reattach: i64 = -1;
+    const d2 = std.time.milliTimestamp() + 8000;
+    while (std.time.milliTimestamp() < d2) {
+        loop.run(.no_wait) catch break;
+        reattach = host.reattach_session_id.load(.acquire);
+        if (reattach != -1) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    // Reattached to the SAME live session id across the drop-with-outstanding-write.
+    try testing.expectEqual(@as(i64, 7), reattach);
+
+    // Clean teardown: testing.allocator fails the test on ANY pool leak / double-free,
+    // and a write_stream/fd double-close or a pool UAF would crash here — so a green
+    // teardown is the no-double-close/UAF assertion for the outstanding-write path.
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+}
+
+// (REG stale-completion guard primitive) `streamFd` recovers the fd a write
+// completion was issued on, so writeCallback can tell a STALE completion (old,
+// torn-down fd) from the LIVE connection's (current `read_thread_fd`) and only
+// trip a redial for the latter. Two independent fds MUST yield distinct
+// `streamFd` values — the property the guard's `streamFd(s) == read_thread_fd`
+// comparison relies on. (On this xev backend `Stream.deinit` does not close the
+// fd, so the pipe fds are closed separately — no double-close.)
+test "client streamFd distinguishes two streams' fds (stale-completion guard)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const p1 = try posix.pipe();
+    defer posix.close(p1[0]);
+    defer posix.close(p1[1]);
+    const p2 = try posix.pipe();
+    defer posix.close(p2[0]);
+    defer posix.close(p2[1]);
+
+    var s1 = xev.Stream.initFd(p1[1]);
+    defer s1.deinit();
+    var s2 = xev.Stream.initFd(p2[1]);
+    defer s2.deinit();
+
+    try testing.expectEqual(p1[1], Client.streamFd(s1));
+    try testing.expectEqual(p2[1], Client.streamFd(s2));
+    try testing.expect(Client.streamFd(s1) != Client.streamFd(s2));
+}

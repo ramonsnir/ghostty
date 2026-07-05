@@ -942,16 +942,18 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `SegmentedPool fuzz` / `SegmentedPool deterministic grow-while-outstanding repro` tests). Callers
   unchanged. **See `PTYHOST.md` → "Write-request pool grow corruption".**
 
-- **Cloud-hosted terminals (Phase 1: multi-host client + registry + launch + identity)**
-  (fork-only, macOS, OFF by default; config `pty-remote-host` / `pty-remote-ssh-options`,
-  actions `new_split_on_host` / `new_tab_on_host`) — lets *some* splits/tabs run their shell
+- **Cloud-hosted terminals (Phases 1–2 + Phase-3 L1: multi-host client + registry + launch +
+  identity + reconnect subsystem + loud version-mismatch)**
+  (fork-only, macOS, OFF by default; config `pty-remote-host` / `pty-remote-ssh-options` /
+  `pty-remote-connect-timeout`, actions `new_split_on_host` / `new_tab_on_host`) — lets *some*
+  splits/tabs run their shell
   on a **remote** `ghostty-host` box, reached over an SSH unix-socket forward (`ssh -L`), mixed
   with local splits in the same window. The `.client` dials a *local* forwarded socket and is
   essentially unaware it is remote; SSH is the whole auth/encryption story (no networked host,
   no new protocol). Reattach is by a stable `(host, session_id)` identity across a GUI restart.
-  **Phase 1 scope = multi-host CLIENT + REGISTRY + LAUNCH + IDENTITY only** (no mid-session
-  redial state machine, no cross-host session namespacing, no Linux `proc_info` arm — those are
-  Phase 2+; see `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md`). Load-bearing gotchas: (1)
+  **Phase 1 = multi-host CLIENT + REGISTRY + LAUNCH + IDENTITY** (no cross-host session
+  namespacing, no Linux `proc_info` arm — those are Phase 4; see `CLOUD-HOSTS-DESIGN.md` /
+  `CLOUD-HOSTS-IMPL-PLAN.md`). Load-bearing gotchas: (1)
   **the `pty-remote-host` line grammar is parsed ENTIRELY macOS-side** — the Zig key is a
   `RepeatableString` storing each line verbatim; `RemoteHostRegistry` owns the grammar
   (`<name> = <ssh-target> : <remote-socket> [ : <local-socket>]`; reserved name `local` = the
@@ -998,12 +1000,82 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `Binding new_split_on_host`, `client probeHost*`/`resolveSocketPath` (`client_difftest.zig`);
   Swift `RemoteHostRegistryTests`/`RemoteTunnelControllerTests`/`RemoteHostPaletteTests`,
   `SurfaceViewAppKitTests` (resolveHost/persist), `MCPServerTests` (`hostName` emit +
-  `cloud-hosts` gate). Fork-only — keep `pty-remote-host` / `pty-remote-ssh-options` in
+  `cloud-hosts` gate). Fork-only — keep `pty-remote-host` / `pty-remote-ssh-options` /
+  `pty-remote-connect-timeout` in
   `~/.config/ghostty-ramon/config`. **GUI relaunch + a lib/xcframework rebuild (new config keys +
-  the `ghostty_probe_host` / `new_split_on_host` C exports); NO host restart** (the new C exports
-  are never compiled into `ghostty-host`). **See `CLOUD-HOSTS-DESIGN.md` (design/rationale) +
+  the `ghostty_probe_host` / `new_split_on_host` / `ghostty_surface_client_state` C exports); NO
+  host restart** (none of these C exports / the redial machine / the surface Options field are
+  ever compiled into `ghostty-host`).
+
+  **Phase 2 (Reconnect subsystem) + Phase-3 L1 (loud version mismatch) — GUI-lib-only, no host
+  restart.** A remote forwarded socket dies on every sleep / WiFi roam / Tailscale reconnect while
+  the remote session stays alive, so a remote `.attach` now opts into a mid-session redial —
+  **local stays byte-for-byte single-shot** (the KeepAlive host is ≈always up, and a dropped local
+  host can't restore RAM-only sessions). Pieces: **(a)** an opt-in `termio.Client.Config.reconnect`
+  (auto-set true in `Surface.init` ONLY for a resolved REMOTE `.attach` surface — a per-surface
+  socket override present + role `.attach`; `local`/nil host + all `.mirror`s stay false and inert).
+  **(b)** an **IO-thread xev redial state machine** — the write path is IO-thread-owned + read
+  UNLOCKED by `queueWrite`, so the read thread (or a failed `writeCallback`, the ONLY timely signal
+  a BLACK-HOLED tunnel gives) merely sets the `.reconnecting` hold-gate + `notify()`s a thread-safe
+  `xev.Async`, then exits; the async callback runs the whole teardown→rebuild→respawn→
+  re-`Hello`/`Attach` on the loop thread. Backoff is an **`xev.Timer` on the loop, NEVER a bare
+  `sleep`** (`reconnectDelayMs`: quick burst 1,2,4,8,16,30s then steady 60s forever, always > 0; a
+  clean quit stops the loop + cancels the timer); a per-attempt handshake **watchdog** timer
+  (ceiling = `connect_timeout_s`, 0 ⇒ compiled `DEFAULT_CONNECT_TIMEOUT_S`=10s) re-triggers the
+  redial when a connect goes silent WITHOUT a read-side EOF. Reattach (not re-spawn) via pure
+  `reattachId` (LIVE host id → configured id → fresh spawn, never a blind double-Attach). **(c)**
+  the read thread's `onAttachDrop` replaces the old EOF **busy-loop** — every `.attach` drop
+  (EOF / read-error / fatal push/decode/handleFrame / poll-error / a NEW `POLLHUP`-without-`POLLIN`
+  check) exits the loop CLEANLY and classifies a state. **(d)** five named
+  states (`termio.Client.State` ⇄ C `ghostty_client_state_e` ⇄ Swift `ClientState`): `reconnecting`,
+  `session_ended` (reattach returned a different id ⇒ host restarted — **GATED on `config.reconnect`,
+  i.e. REMOTE `.attach` only:** the overlay that surfaces `session_ended` is mounted only for a
+  remote surface, so a LOCAL reattach-miss instead falls through and ADOPTs the fresh id — Phase-1
+  behavior — rather than becoming a silent dead pane), `cannot_handshake` (EOF
+  before any `HelloAck` — ambiguous, the real major-mismatch close path), `too_old` (decoded a
+  `HelloAck` with a mismatched MAJOR — confident + DIRECTIONAL "host X.Y vs GUI A.B, redeploy"),
+  `unreachable` (tunnel dial failed); `ok` = normal / local / `.exec`. A MINOR gap is NEVER
+  `too_old` — the host gates new frames on `negotiated_minor` and withholds them (degrades). A
+  failed `writeCallback` also trips `.reconnecting` (write-error trip) — but ONLY when the failed
+  completion's own fd (`streamFd(s)`) matches the live `read_thread_fd`, so a STALE error completion
+  from a torn-down connection (the pools/queue are left intact across teardown to drain) can't
+  spuriously tear down an already-reconnected healthy session (drain-order-independent). **(e)** the lock-free
+  `ghostty_surface_client_state` accessor + `SurfaceView.clientStateInfo` feed the
+  `ReconnectStateOverlay` (K1/L1) — a named, actionable banner over the frozen, dimmed last frame,
+  so a dropped / version-refused / unreachable remote split is never a silent blank pane; the pure
+  `reconnectBanner` maps state → (title, body, severity). **(f)** `RemoteTunnelController` is the
+  **single-owner** tunnel supervisor: a surface refcount (`retainTunnel`/`releaseTunnel`, tear down
+  on the last close), a never-give-up ssh-master **respawn** on master exit (`respawnDelay` same
+  burst→60s shape, generation-token cancellable, healthy-run budget reset), and `ssh -O check`
+  (health) / `ssh -O exit` (stale-control clean before respawn). **(g)** `pty-remote-connect-timeout`
+  (fork-only `u32`, seconds, 0 ⇒ compiled default) — the per-attempt dial+handshake ceiling for
+  BOTH the core redial and the controller's respawn/probe; threaded surface-side via the additive
+  `ghostty_surface_config_s.pty_host_connect_timeout_s` C field → `Client.Config.connect_timeout_s`
+  (NOT a protocol/wire field; re-applied on the deferred remote dial, like `ptyHostSocket`).
+  **Phase-3 L3 (`hello_nack{reason}`) is DEFERRED** — a host protocol change (session loss),
+  needs a scheduled MINOR bump. Wiring — core: `src/termio/Client.zig` (`State`,
+  `Config.reconnect`/`connect_timeout_s`, `reconnectDelayMs`/`connectTimeoutMs`/`reattachId`/
+  `classifyDrop`, the `reconnect_*` `ThreadData` machinery + `beginRedial`/`teardownConnection`/
+  `attemptReconnect`/`redialReattach`/watchdog, `hello_ack` + reattach-miss arms, `onAttachDrop`),
+  `src/Surface.zig` (`reconnect`/`connect_timeout_s` threading + `clientState`/`clientHostMajor/Minor`),
+  `src/apprt/embedded.zig` (`Options.pty_host_connect_timeout_s` + `ghostty_surface_client_state`),
+  `include/ghostty.h` (`ghostty_client_state_e`/`_s` + the accessor + the surface-config field),
+  `src/config/Config.zig` (`pty-remote-connect-timeout` + parse test), `src/host/protocol.zig`
+  (append-only `FrameType` tag-order pin test). macOS: `RemoteTunnelController.swift`
+  (refcount/respawn/`ssh -O check`/`connectTimeoutMs`), `Ghostty.Config.swift`
+  (`ptyRemoteConnectTimeout`), `SurfaceView.swift` (`ReconnectStateOverlay`/`ReconnectBannerCard` +
+  `SurfaceConfiguration.ptyHostConnectTimeoutS` + `withCValue`), `SurfaceView_AppKit.swift`
+  (`clientStateInfo` + pure `reconnectBanner` + `subscribeRemoteReadiness` timeout carriage +
+  `ClientState`/`ClientStateInfo`/`ReconnectBanner`/`ReconnectSeverity` value types),
+  `MCPKnowledge.swift` (`pty-remote-connect-timeout` reader + `cloud-hosts` configKeys). Tests: Zig
+  `client reconnectDelayMs`/`connectTimeoutMs`/`reattachId`/`classifyDrop`/`hello_ack …too_old`/
+  `attached reattach-miss …`/`reconnect machinery armed iff Config.reconnect` (`client_difftest.zig`),
+  `pty-remote-connect-timeout parse` (`Config.zig`), the protocol tag-order pin; Swift
+  `reconnectBanner`/`ClientStateInfo`/connect-timeout carriage (`SurfaceViewAppKitTests`),
+  `ptyRemoteConnectTimeout` (`ConfigTests`), respawn backoff + `connectTimeoutMs` + teardown-cancels
+  (`RemoteTunnelControllerTests`). **See `CLOUD-HOSTS-DESIGN.md` (design/rationale) +
   `CLOUD-HOSTS-IMPL-PLAN.md` (build-ready spec: Cross-cutting decisions D1–D7, the C-ABI ledger,
-  phase/task breakdown).**
+  phase/task breakdown) + `PTYHOST.md` (→ Cloud-hosts Phase 2 redial subsection).**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
@@ -1012,7 +1084,7 @@ reserves a real grid slot…`). **Cadence — completion-anchored
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-ssh-options`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-ssh-options`, `pty-remote-connect-timeout` (a `u32`, seconds; `0` = compiled default). (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

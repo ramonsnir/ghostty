@@ -77,6 +77,7 @@ enum MCPKnowledge {
         // RepeatableString registry lines join like agent-queue-templates-dir.
         ("pty-remote-host", { $0.ptyRemoteHostLines.joined(separator: ", ") }),
         ("pty-remote-ssh-options", { $0.ptyRemoteSshOptions ?? "" }),
+        ("pty-remote-connect-timeout", { String($0.ptyRemoteConnectTimeout) }),
         // --- high-signal upstream keys ---
         ("bell-features", { describeBellFeatures($0.bellFeatures) }),
         ("background-opacity", { String($0.backgroundOpacity) }),
@@ -242,11 +243,11 @@ enum MCPKnowledge {
         "cloud-hosts": FeatureSpec(
             name: "Cloud-hosted terminals",
             summary: "Mix local and remote (cloud-box) splits in one window. A remote split runs its shell on a ghostty-host on another machine, reached over an SSH-forwarded unix socket, and reattaches by (host, session id) across a GUI restart. Configure named remote hosts in pty-remote-host; new_split_on_host / new_tab_on_host (and the host picker palette) open a split on a chosen host.",
-            configKeys: ["pty-remote-host", "pty-remote-ssh-options"],
+            configKeys: ["pty-remote-host", "pty-remote-ssh-options", "pty-remote-connect-timeout"],
             enableSteps: [
                 "Deploy ghostty-host on the remote box and make it reachable over SSH (see CLOUD-HOSTS-DESIGN.md → Deployment).",
                 "Add one pty-remote-host line per box in ~/.config/ghostty-ramon/config: `pty-remote-host = cloud-1 = user@cloud-1.example.ts.net : ~/.ghostty-ramon-host.sock`.",
-                "Optionally set pty-remote-ssh-options for extra ssh flags applied to every tunnel.",
+                "Optionally set pty-remote-ssh-options for extra ssh flags applied to every tunnel, and pty-remote-connect-timeout (seconds) to bound each reconnect/respawn attempt.",
                 "Relaunch Ghostty, then open a remote split via the host picker (New Split on Host…) or bind new_split_on_host:<name> / new_tab_on_host:<name>.",
             ],
             docPath: "CLOUD-HOSTS-DESIGN.md"),

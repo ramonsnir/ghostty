@@ -112,6 +112,64 @@ const invalid_pin: terminal.PageList.Pin = .{
 /// Mirrors `Exec`/`backend.zig`.
 const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
+/// (ramon fork / cloud-hosts) Compiled-in per-attempt connection ceiling, in
+/// SECONDS, used when `Config.connect_timeout_s` is 0. Bounds each reconnect
+/// attempt's handshake wait; NOT a protocol field.
+const DEFAULT_CONNECT_TIMEOUT_S: u32 = 10;
+
+/// (ramon fork / cloud-hosts) Reconnect backoff schedule (D2/D7 "quick burst →
+/// steady cadence forever"), mirroring the macOS `AgentPreviewTile`
+/// mirror-reconnect shape. `reconnectDelayMs(attempt)` returns the wait BEFORE
+/// attempt N (0-indexed): a quick exponential burst for the first
+/// `RECONNECT_QUICK_ATTEMPTS`, then a steady cadence forever. The per-attempt
+/// CONNECTION ceiling (how long each dial+handshake may take) is a separate
+/// knob (`Config.connect_timeout_s`); this is the inter-attempt gap.
+const RECONNECT_QUICK_ATTEMPTS: u32 = 6;
+const RECONNECT_STEADY_MS: u64 = 60_000;
+
+/// Pure backoff schedule so the burst→steady shape is unit-testable in
+/// isolation (see `client_difftest.zig`), exactly like the Swift
+/// `mirrorReconnectDelay`. Quick burst 1s,2s,4s,8s,16s,30s for the first
+/// `RECONNECT_QUICK_ATTEMPTS` attempts, then a steady `RECONNECT_STEADY_MS`
+/// cadence forever. Always > 0 (never a busy spin).
+pub fn reconnectDelayMs(attempt: u32) u64 {
+    if (attempt >= RECONNECT_QUICK_ATTEMPTS) return RECONNECT_STEADY_MS;
+    // 1s, 2s, 4s, 8s, 16s, then cap the last quick step at 30s.
+    const shifted: u64 = @as(u64, 1000) << @intCast(attempt);
+    return @min(shifted, 30_000);
+}
+
+/// (ramon fork / cloud-hosts) Resolve the per-attempt connection ceiling (ms)
+/// from `Config.connect_timeout_s`: 0 ⇒ `DEFAULT_CONNECT_TIMEOUT_S`. Pure so the
+/// 0-means-default mapping is unit-testable.
+pub fn connectTimeoutMs(connect_timeout_s: u32) u64 {
+    const s: u64 = if (connect_timeout_s == 0) DEFAULT_CONNECT_TIMEOUT_S else connect_timeout_s;
+    return s * 1000;
+}
+
+/// (ramon fork / cloud-hosts / D4) The Attach session id a REDIAL sends. Pure so
+/// the reattach-vs-fresh gate is unit-testable in isolation. `live` is the
+/// host-ASSIGNED id (`session_id.load`, 0 = never attached); `configured` is the
+/// persisted/spawn id from `Config.session_id`. Reattach to the LIVE id when we
+/// have one; else fall back to the configured id; if BOTH are 0/null this is a
+/// FRESH spawn (null) — NEVER a blind re-Attach that would spawn+orphan a second
+/// session.
+pub fn reattachId(live: u64, configured: ?u64) ?u64 {
+    return if (live != 0) live else configured;
+}
+
+/// (ramon fork / cloud-hosts / G2+H2) Classify an `.attach` drop into the
+/// surface-visible state to set (null ⇒ leave the current state). Pure so the D1
+/// before/after-handshake distinction is unit-testable. A drop BEFORE any
+/// HelloAck is the ambiguous `.cannot_handshake` (starting up / down /
+/// incompatible-major); after a handshake a reconnect client goes
+/// `.reconnecting` while a `local`/single-shot client leaves its state (the
+/// frozen last frame persists — today's behavior, minus the busy-loop).
+pub fn classifyDrop(reconnect: bool, handshaked: bool) ?State {
+    if (!handshaked) return .cannot_handshake;
+    return if (reconnect) .reconnecting else null;
+}
+
 /// General-purpose allocator. Owns the mirror pools + reader buffer.
 gpa: Allocator,
 
@@ -258,6 +316,41 @@ mirror_ended: bool = false,
 /// before the first frame arrives).
 at_prompt: std.atomic.Value(bool) = .init(false),
 
+/// (ramon fork / cloud-hosts) Surface-visible connection state for the `.attach`
+/// role (see `State`). Lock-free atomic: WRITTEN by the read thread (drop
+/// classification) + the IO-thread redial machine, READ unlocked by `queueWrite`
+/// (hold/drop on `.reconnecting`) on the input hot path AND by the Swift
+/// accessor `ghostty_surface_client_state`. Never set under `.mirror`. Default
+/// `.ok` (normal). `setClientState` also wakes the renderer so the K1 overlay
+/// repaints. NOTE: an atomic (not renderMutex) precisely so `queueWrite` reads
+/// it without the heavy per-keystroke lock — identical reasoning to `session_id`.
+client_state: std.atomic.Value(State) = .init(.ok),
+
+/// (ramon fork / cloud-hosts) True once a `HelloAck` has been decoded on the
+/// CURRENT connection (H1). Lock-free atomic so the read thread's drop path can
+/// read it (acquire) to distinguish "EOF before ack" (=> `.cannot_handshake`)
+/// from "EOF after ack" (=> `.reconnecting`/`.session_ended`) without taking
+/// renderMutex. Written (release) by `handleFrame`'s `.hello_ack` arm and reset
+/// to false by the redial machine before it re-dials. Never set under `.mirror`.
+ack_seen: std.atomic.Value(bool) = .init(false),
+
+/// (ramon fork / cloud-hosts) The host's advertised protocol version from the
+/// last decoded `HelloAck` (H1), for the D1 `too_old` directional message
+/// ("host X.Y vs this GUI A.B"). Lock-free atomics so the Swift accessor reads
+/// them alongside `client_state`; meaningful only once `ack_seen`. 0 before any
+/// ack.
+host_major: std.atomic.Value(u16) = .init(0),
+host_minor: std.atomic.Value(u16) = .init(0),
+
+/// (ramon fork / cloud-hosts) Pointer to the IO-thread redial wakeup async
+/// (lives in `ThreadData`, whose address is stable for the thread lifetime).
+/// Set by `connectAndAttach` ONLY for a reconnect-enabled client; `null` for a
+/// `local`/single-shot client (so its read thread never triggers a redial).
+/// The read thread's drop path and `writeCallback` `notify()` it (thread-safe)
+/// to wake the IO thread's redial state machine. Read-only after
+/// `connectAndAttach` (never reassigned), so racing reads are safe.
+reconnect_async: ?*xev.Async = null,
+
 // --- Slice B1: cached host selection text ---
 //
 // The host owns the real terminal + scrollback, so under .client the GUI's
@@ -344,6 +437,34 @@ pub const ChildExited = struct {
 ///             Reachable ONLY under pty-host (a non-zero session_id present).
 pub const Role = enum { attach, mirror };
 
+/// (ramon fork / cloud-hosts) Surface-visible connection state for the `.attach`
+/// role — the state channel the macOS overlay (K1) renders so a dropped/failed
+/// remote split is NEVER a silent blank pane (design rule §564-566). Backed by
+/// `c_int` so it maps 1:1 to the C `ghostty_client_state_e` enum the accessor
+/// (`ghostty_surface_client_state`) returns; the field is an atomic so the
+/// UNLOCKED IO-thread reader in `queueWrite` (hold/drop on `.reconnecting`) and
+/// the Swift accessor both read it lock-free (same discipline as `session_id`).
+/// `.mirror` never uses this channel (it uses `markMirrorEnded`).
+///
+/// The redial machinery treats `.reconnecting` as the "hold outbound frames"
+/// gate. `.ok` is the normal connected/attached state (the default). The
+/// remaining variants are the D1 version-classification + drop states:
+///   .session_ended     — the host handed back a DIFFERENT session id on
+///                        reattach (host restarted; the prior session is gone).
+///   .cannot_handshake  — connected but EOF before any HelloAck (ambiguous:
+///                        starting up / down / incompatible-major). Retryable.
+///   .too_old           — decoded a HelloAck whose MAJOR ≠ the GUI's major
+///                        (a confident, actionable incompatibility).
+///   .@"unreachable"    — `connectUnix` failed (tunnel/host down). Retryable.
+pub const State = enum(c_int) {
+    ok = 0,
+    reconnecting = 1,
+    session_ended = 2,
+    cannot_handshake = 3,
+    too_old = 4,
+    @"unreachable" = 5,
+};
+
 /// Configuration for the client backend: how to reach the ptyhost.
 pub const Config = struct {
     /// AF_UNIX socket path of the ptyhost. The caller's slice is borrowed only
@@ -419,6 +540,13 @@ pub const Config = struct {
     /// value. Declared now for a stable Config ABI; the redial state machine
     /// that consumes it lands in a later phase (no behavior today).
     reconnect: bool = false,
+
+    /// (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS,
+    /// for the opt-in redial (only meaningful when `reconnect` is true). Bounds
+    /// how long each reconnect attempt's dial+handshake may take before the
+    /// backoff schedules the next; NOT a protocol field, never sent on the wire.
+    /// `0` ⇒ `DEFAULT_CONNECT_TIMEOUT_S`. A SCALAR copied by value.
+    connect_timeout_s: u32 = 0,
 };
 
 /// Forward-map a surface-config host session id (a `u64` carried from the
@@ -748,6 +876,43 @@ pub fn connectAndAttach(
         client_td.write_buf_pool.deinit(alloc);
     }
 
+    // (cloud-hosts / I1) Arm the OPT-IN redial machinery on the loop, BEFORE the
+    // Hello send so any later failure unwinds it. Only a resolved REMOTE host
+    // opts in (`Config.reconnect`); a `local`/nil host leaves these null + inert,
+    // so the single-shot path is byte-for-byte unchanged. The async is the read
+    // thread's / writeCallback's wakeup into the IO-thread redial state machine;
+    // the timers drive the backoff + the handshake watchdog. All redial steps run
+    // on THIS IO thread (the loop thread), so the write_stream/pool/fd ownership
+    // never crosses threads (D2): the only cross-thread signals are the
+    // thread-safe `async.notify()` + the `client_state`/`session_id` atomics.
+    //
+    // These errdefers are at FUNCTION scope (declared here, before the arming
+    // block) so they fire for a failure ANYWHERE after this point — the arming
+    // `try`s themselves AND the later Hello send / read-thread spawn — and are
+    // safe no-ops when nothing was armed (the optionals are null). An
+    // intra-block-scoped errdefer would NOT cover the post-block failures.
+    errdefer if (client_td.reconnect_async) |*a| a.deinit();
+    errdefer if (client_td.reconnect_timer) |*t| t.deinit();
+    errdefer if (client_td.reconnect_watchdog) |*t| t.deinit();
+    if (self.config.reconnect) {
+        client_td.reconnect_client = self;
+        client_td.reconnect_alloc = alloc;
+        client_td.reconnect_io = io;
+        client_td.reconnect_async = try xev.Async.init();
+        client_td.reconnect_timer = try xev.Timer.init();
+        client_td.reconnect_watchdog = try xev.Timer.init();
+        client_td.reconnect_async.?.wait(
+            loop,
+            &client_td.reconnect_async_c,
+            ThreadData,
+            client_td,
+            reconnectAsyncCallback,
+        );
+        // Expose the async to the read thread (a stable pointer into the
+        // thread-lifetime ThreadData) so its drop path can wake this machine.
+        self.reconnect_async = &client_td.reconnect_async.?;
+    }
+
     // Send the Attach frame to (re)attach or spawn a session BEFORE spawning
     // the read thread. This is NOT a synchronous socket write: sendFrameRaw
     // (like sendFrame) only ENQUEUES the write on client_td's single-producer
@@ -839,6 +1004,7 @@ pub fn connectAndAttach(
         .{ self, fd, io, pipe[0] },
     );
     client_td.read_thread = read_thread;
+    client_td.read_thread_live = true;
     read_thread.setName("io-client-reader") catch {};
 }
 
@@ -846,6 +1012,14 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
     _ = self;
     std.debug.assert(td.backend == .client);
     const client = &td.backend.client;
+
+    // (cloud-hosts) If a redial tore the connection down and the loop stopped
+    // before it re-dialed, there is no live read thread and the socket fd / quit
+    // pipe were already closed by `teardownConnection` (read_thread_live=false,
+    // fds set to -1). Skip the join/close then — otherwise we would double-join a
+    // finished thread and double-close a closed fd. In the steady case
+    // (read_thread_live=true) this is byte-for-byte the original teardown.
+    if (!client.read_thread_live) return;
 
     // Tell the read thread to quit. BrokenPipe means it already closed, which
     // is exactly what we wanted.
@@ -858,6 +1032,7 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
     };
 
     client.read_thread.join();
+    client.read_thread_live = false;
 
     // Close the socket fd. The write_stream wraps the same fd; we close it
     // exactly once here (write_stream.deinit in ThreadData.deinit does not
@@ -865,6 +1040,7 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
     // via the subprocess, not the stream). Closing the connected socket tears
     // down our side of the connection.
     posix.close(client.read_thread_fd);
+    client.read_thread_fd = -1;
 }
 
 pub fn focusGained(
@@ -1132,6 +1308,33 @@ pub fn markMirrorEnded(self: *Client) void {
     _ = self.markMirrorEndedLocked();
 }
 
+/// (ramon fork / cloud-hosts) Set the surface-visible connection state (see
+/// `State`) and wake the renderer so the K1 overlay repaints. Lock-free store
+/// (release) — the readers (`queueWrite`, the Swift accessor) load-acquire; no
+/// renderMutex, mirroring `session_id`. Callable from any thread (the read
+/// thread on drop-classification, the IO thread in the redial machine). The
+/// renderer wakeup is a cheap cross-thread signal (no-op when null, i.e. in
+/// standalone/decode tests that bypass `threadEnter`).
+pub fn setClientState(self: *Client, state: State) void {
+    self.client_state.store(state, .release);
+    if (self.renderer_wakeup) |*w| w.notify() catch {};
+}
+
+/// (ramon fork / cloud-hosts) Read the surface-visible connection state. Lock-free.
+pub fn clientState(self: *const Client) State {
+    return self.client_state.load(.acquire);
+}
+
+/// (ramon fork / cloud-hosts) The host's advertised protocol MAJOR/MINOR from the
+/// last decoded HelloAck, for the `too_old` directional overlay message. Lock-free;
+/// 0 before any ack.
+pub fn hostMajor(self: *const Client) u16 {
+    return self.host_major.load(.acquire);
+}
+pub fn hostMinor(self: *const Client) u16 {
+    return self.host_minor.load(.acquire);
+}
+
 /// Get information about the process(es) attached to the backend.
 ///
 /// The client does not own a local process (the host does), so this always
@@ -1284,12 +1487,40 @@ pub fn handleFrame(
             // never false-matches, so a differing id reliably means "miss." Surface
             // it (a blank fresh shell presented as if it were the restored session
             // is the sharpest "lost work" edge) instead of silently swapping ids.
-            if (self.config.session_id) |requested| {
-                if (requested != 0 and att.session_id != requested) {
-                    log.warn(
-                        "reattach miss: requested session_id={d} not found on host; spawned fresh session_id={d} (prior session closed or host restarted)",
-                        .{ requested, att.session_id },
-                    );
+            //
+            // ⚠️ GATED ON `config.reconnect` (i.e. a REMOTE `.attach` surface only).
+            // The `session_ended` state is only ever surfaced to the user by the
+            // ReconnectStateOverlay, which is mounted ONLY for a remote surface
+            // (SurfaceView's `host != "local"` gate). A LOCAL `.client` attach has
+            // NO overlay, so setting `session_ended` + returning WITHOUT adopting
+            // the fresh id would leave the pane a silent, unexplained frozen blank
+            // with `session_id` pinned to the dead id (the host ignores writes to
+            // it). Local therefore keeps the Phase-1 semantics below: fall through
+            // and ADOPT the host's fresh session id, yielding a usable fresh shell
+            // (the local pty-host restart-across-GUI-restart behavior). `.mirror`
+            // never reaches this arm (it subscribes with a known id, no Attach) and
+            // never sets `reconnect`, so `reconnect` cleanly discriminates a remote
+            // reattach from a local attach here.
+            if (self.config.reconnect) {
+                if (self.config.session_id) |requested| {
+                    if (requested != 0 and att.session_id != requested) {
+                        // I2 (D4): reattach MISS. The host handed back a DIFFERENT
+                        // id, so our persisted session was gone (closed, or the host
+                        // restarted) and the host spawned a FRESH one. This is now
+                        // the VISIBLE `session_ended` state (was a bare log.warn) — a
+                        // blank fresh shell presented as the restored session is the
+                        // sharpest "lost work" edge. Do NOT adopt the returned fresh
+                        // id (leave session_id at its prior value): keeping the
+                        // mismatched id means we never silently drive the wrong
+                        // session, and the overlay shows "session ended" instead of a
+                        // mystery pane.
+                        log.warn(
+                            "reattach miss: requested session_id={d} not found on host; host spawned fresh session_id={d} (prior session closed or host restarted)",
+                            .{ requested, att.session_id },
+                        );
+                        self.setClientState(.session_ended);
+                        return;
+                    }
                 }
             }
             // Atomic store (even though we hold the guard mutex here): the
@@ -1297,6 +1528,10 @@ pub fn handleFrame(
             // against this store, not against the mutex. Independent of the
             // Slice 3d shared-mutex change — the lock-free path is untouched.
             self.session_id.store(att.session_id, .release);
+            // (cloud-hosts) A successful (re)attach is the "connected" edge:
+            // clear any transient reconnecting/unreachable state so the K1 overlay
+            // drops. `.mirror` never uses this channel (it subscribes, no Attach).
+            if (self.config.role != .mirror) self.setClientState(.ok);
         },
 
         .child_exited => {
@@ -1445,6 +1680,31 @@ pub fn handleFrame(
             var fp = try protocol.ForegroundPid.decode(alloc, payload);
             defer fp.deinit(alloc);
             self.fg_pid.store(fp.pid, .release);
+        },
+
+        .hello_ack => {
+            // H1 (Phase 2b / cloud-hosts): the host's handshake reply, previously
+            // swallowed by the `else` below. Record the host's advertised protocol
+            // version + mark the handshake seen (both lock-free atomics so the read
+            // thread's drop-classification path can distinguish EOF-before-ack from
+            // EOF-after-ack without renderMutex). `host_pid`/`host_start_epoch` are
+            // decoded (validating the frame) but not modeled here.
+            const ack = try protocol.HelloAck.decode(alloc, payload);
+            self.host_major.store(ack.protocol_version_major, .release);
+            self.host_minor.store(ack.protocol_version_minor, .release);
+            self.ack_seen.store(true, .release);
+            // H2 (D1): a MAJOR mismatch is a confident, actionable incompatibility
+            // (the host would have CLOSED before this ack on a major mismatch, so a
+            // decoded ack with a differing major means a skewed/forged peer — treat
+            // it loudly). A MINOR gap is NEVER an error: the host gates new frames
+            // on the negotiated minor and simply withholds them, so a
+            // too-old-by-minor host degrades gracefully. `.mirror` never uses this
+            // state channel.
+            if (self.config.role != .mirror and
+                ack.protocol_version_major != protocol.PROTOCOL_VERSION_MAJOR)
+            {
+                self.setClientState(.too_old);
+            }
         },
 
         // Everything else is either a request-direction frame (the GUI sends
@@ -1770,7 +2030,16 @@ fn sendFrame(
     tag: protocol.FrameType,
     frame: anytype,
 ) !void {
-    _ = self;
+    // (cloud-hosts / D2.1) While a redial is in flight, the write_stream is being
+    // torn down + rebuilt on THIS same IO thread (the redial async/timer callbacks
+    // run on the loop, interleaved with mailbox-driven sends), so a session-mutating
+    // send here would queue onto a dead/rebuilding stream. HOLD/DROP it: the redial
+    // re-sends Hello+Attach via `sendFrameRaw` (which bypasses this gate), and
+    // buffered input during a drop is intentionally discarded (a reconnect is not a
+    // paste buffer). A `local`/non-reconnect client never enters `.reconnecting`
+    // (only the redial machine sets it, and it is gated on `Config.reconnect`), so
+    // this is a byte-for-byte no-op on the single-shot path.
+    if (self.client_state.load(.acquire) == .reconnecting) return;
     std.debug.assert(td.backend == .client);
     try sendFrameRaw(&td.backend.client, td.loop, td.alloc, tag, frame);
 }
@@ -1811,11 +2080,27 @@ fn sendFrameRaw(
     }
 }
 
+/// (ramon fork / cloud-hosts, REG stale-completion guard) Recover the fd a write
+/// completion was issued on, from the `xev.Stream` the write callback receives.
+/// The library reconstructs that stream from the completion's own op fd
+/// (`Self.initFd(op.fd)` in `queueWrite`'s callback shim), so it identifies the
+/// exact connection the write belonged to — even across a redial that reassigned
+/// `td.write_stream` to a new fd. For the dynamic backend the fd lives inside the
+/// (untagged) backend union; we read it under the SAME `xev.backend` the stream
+/// was `initFd`'d with, so the active field always matches (never a mis-read).
+/// `pub` for the guard-primitive unit test (`client_difftest.zig`).
+pub fn streamFd(s: xev.Stream) posix.fd_t {
+    if (comptime !xev.dynamic) return s.fd;
+    return switch (xev.backend) {
+        inline else => |tag| @field(s.backend, @tagName(tag)).fd,
+    };
+}
+
 fn writeCallback(
     client_: ?*ThreadData,
     _: *xev.Loop,
     _: *xev.Completion,
-    _: xev.Stream,
+    s: xev.Stream,
     _: xev.WriteBuffer,
     r: xev.WriteError!usize,
 ) xev.CallbackAction {
@@ -1824,6 +2109,37 @@ fn writeCallback(
     client.write_buf_pool.put();
     _ = r catch |err| {
         log.err("client write error: {}", .{err});
+        // I3 (D2.5): a write error is the ONLY timely signal a BLACK-HOLED tunnel
+        // gives — the socket stays open (no read-side EOF) for ~ServerAlive×Count,
+        // but writes fail. So trip the redial from here too (not just the read
+        // thread's EOF path): set the hold gate + wake the IO-thread redial
+        // machine. Both are no-ops for a `local`/single-shot client
+        // (`reconnect_client`/`reconnect_async` null ⇒ nothing armed), preserving
+        // the byte-for-byte single-shot path. The redial coalesces (reconnect_async
+        // duplicate triggers are ignored while a redial is in flight), so the read
+        // thread's EOF path firing too is harmless. We run on the IO/loop thread
+        // here, so touching `reconnect_client` is same-thread safe.
+        //
+        // ⚠️ STALE-COMPLETION GUARD (REG): the write pools + queue are LEFT INTACT
+        // across `teardownConnection` (a pending completion from the pre-drop
+        // connection must be allowed to fire + reclaim its slot), so an ERROR
+        // completion for the OLD fd can arrive on the loop thread AFTER
+        // `attemptReconnect` has already rebuilt a HEALTHY connection (cleared
+        // `redial_in_flight`, set `.ok`). Tripping the redial from such a stale
+        // error would tear down the freshly-reconnected session (redial_in_flight
+        // is false again, so the async callback would start a SECOND redial). So
+        // only the CURRENT connection's write errors may trip a redial: the
+        // completion carries the fd it was issued on (`streamFd(s)`), which we
+        // compare against the live `read_thread_fd` (both `read_thread_fd` and this
+        // callback are IO/loop-thread only). A mismatch ⇒ the completion belongs to
+        // a torn-down connection ⇒ ignore it (its pool slots were already reclaimed
+        // above). This makes correctness independent of xev's drain ordering.
+        if (client.reconnect_client) |c| {
+            if (streamFd(s) == client.read_thread_fd) {
+                c.setClientState(.reconnecting);
+                if (client.reconnect_async) |*a| a.notify() catch {};
+            }
+        }
         return .disarm;
     };
     return .disarm;
@@ -1925,9 +2241,258 @@ pub fn probeHost(alloc: Allocator, path: []const u8, timeout_ms: u32) ProbeResul
     }
 }
 
+// --- (cloud-hosts / I1) IO-thread redial state machine ---
+//
+// The write path (write_stream + write_queue + the two SegmentedPools + the
+// socket fd) is owned by the IO/xev-loop thread and read UNLOCKED by
+// `queueWrite`/`focusGained` (via the `session_id` atomic). Tearing it down +
+// rebuilding it from the READ thread would be a cross-thread lifecycle UAF AND
+// an illegal concurrent xev-loop submission (D2). So the redial runs ENTIRELY on
+// the IO thread: the read thread (or `writeCallback`) only sets the
+// `.reconnecting` hold-gate + `notify()`s `reconnect_async` (both thread-safe),
+// then exits. The async callback runs the state machine on the loop thread,
+// where it is serialized with `queueWrite`/`writeCallback` (all IO-thread), so
+// the write side never races. The backoff is an `xev.Timer` on the loop (NOT a
+// bare sleep — D2.3): a clean quit stops the loop, cancelling the timer. Gated
+// entirely on `Config.reconnect`, so a `local`/single-shot client never arms any
+// of this and is byte-for-byte unchanged.
+
+fn reconnectAsyncCallback(
+    td_: ?*ThreadData,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch return .rearm;
+    const td = td_ orelse return .rearm;
+    const self = td.reconnect_client orelse return .rearm;
+    // Coalesce: the read-thread EOF path AND writeCallback can both notify for
+    // one drop; only one redial runs. Stay armed (`.rearm`) so the NEXT drop
+    // (after we successfully reconnect) re-triggers.
+    if (td.redial_in_flight) return .rearm;
+    td.redial_in_flight = true;
+    self.beginRedial(td, loop);
+    return .rearm;
+}
+
+fn beginRedial(self: *Client, td: *ThreadData, loop: *xev.Loop) void {
+    // Ensure the hold gate is set (the read thread usually set it; a
+    // writeCallback-triggered redial may run first).
+    self.setClientState(.reconnecting);
+    self.teardownConnection(td);
+    self.scheduleReconnect(td, loop);
+}
+
+/// Tear down the OLD read side + fd on the IO thread. Safe because `queueWrite`/
+/// `sendFrame` are gated on `.reconnecting` (no concurrent unlocked reader
+/// touches `write_stream`), and this runs on the loop thread (serialized with
+/// `writeCallback`). Leaves `td` in a consistent "no live read thread" state
+/// (sentinels -1) so `threadExit`/`ThreadData.deinit` never double-close.
+fn teardownConnection(self: *Client, td: *ThreadData) void {
+    // Signal + join the old read thread. The quit-pipe signal ALSO covers the
+    // D2.5 black-holed case (writeCallback tripped the redial while the socket's
+    // read side never EOFs) — without it, join() would hang the IO thread.
+    if (td.read_thread_live) {
+        _ = posix.write(td.read_thread_pipe, "x") catch {};
+        td.read_thread.join();
+        td.read_thread_live = false;
+    }
+    // Close the old quit pipe + socket fd (sentinel -1 so threadExit/deinit don't
+    // double-close). We deliberately do NOT deinit `write_stream` here: on this
+    // xev backend `Stream.deinit` is a no-op that never closes the fd (see
+    // threadExit), and `attemptReconnect` reassigns `td.write_stream` over the new
+    // fd — so the single `write_stream.deinit()` in `ThreadData.deinit` still runs
+    // exactly once at final teardown.
+    if (td.read_thread_pipe >= 0) {
+        posix.close(td.read_thread_pipe);
+        td.read_thread_pipe = -1;
+    }
+    if (td.read_thread_fd >= 0) {
+        posix.close(td.read_thread_fd);
+        td.read_thread_fd = -1;
+    }
+    self.socket_fd = null;
+    // The old connection's partial-frame buffer is stale; start the new
+    // connection with a clean reader + un-seen handshake.
+    self.reader.deinit(self.gpa);
+    self.reader = .{};
+    self.ack_seen.store(false, .release);
+    // The write_req_pool / write_buf_pool / write_queue are LEFT INTACT: a
+    // still-in-flight write completion from before the drop fires on THIS loop
+    // thread (serialized with the redial), runs `writeCallback` (which ignores
+    // the stream, put()s its pool slots, disarms) and drains the queue. Freeing
+    // the pools here would UAF such a pending completion; resetting the queue
+    // could strand it. Because `sendFrame` is gated on `.reconnecting`, no NEW
+    // sends were queued during the gap, so the queue is drained by the time we
+    // clear the gate.
+}
+
+fn scheduleReconnect(self: *Client, td: *ThreadData, loop: *xev.Loop) void {
+    _ = self;
+    if (td.reconnect_timer) |*timer| {
+        timer.run(
+            loop,
+            &td.reconnect_timer_c,
+            reconnectDelayMs(td.reconnect_attempt),
+            ThreadData,
+            td,
+            reconnectTimerCallback,
+        );
+    }
+}
+
+fn reconnectTimerCallback(
+    td_: ?*ThreadData,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // A clean quit stops the loop, cancelling the backoff timer — do nothing.
+        error.Canceled => return .disarm,
+        else => {}, // any other timer error: fall through and try to reconnect.
+    };
+    const td = td_ orelse return .disarm;
+    const self = td.reconnect_client orelse return .disarm;
+    self.attemptReconnect(td, loop);
+    return .disarm;
+}
+
+/// One reconnect attempt on the IO thread. On success: rebuild the write stream
+/// over a fresh fd + quit pipe, respawn the read thread, re-send Hello+Attach,
+/// clear the gate. On failure: surface `.@"unreachable"` and reschedule the next
+/// attempt (never gives up — the backoff is quick-burst → steady cadence forever).
+fn attemptReconnect(self: *Client, td: *ThreadData, loop: *xev.Loop) void {
+    td.reconnect_attempt += 1;
+
+    const fd = connectUnix(self.config.socket_path) catch {
+        self.setClientState(.@"unreachable");
+        self.scheduleReconnect(td, loop);
+        return;
+    };
+    const pipe = internal_os.pipe() catch {
+        posix.close(fd);
+        self.setClientState(.@"unreachable");
+        self.scheduleReconnect(td, loop);
+        return;
+    };
+
+    // Install the new connection on the IO-thread-owned write side.
+    td.write_stream = xev.Stream.initFd(fd);
+    td.read_thread_fd = fd;
+    td.read_thread_pipe = pipe[1];
+    self.socket_fd = fd;
+
+    // Respawn the read thread on the new fd + quit pipe.
+    const read_thread = std.Thread.spawn(
+        .{},
+        ReadThread.threadMainPosix,
+        .{ self, fd, td.reconnect_io.?, pipe[0] },
+    ) catch {
+        posix.close(fd);
+        posix.close(pipe[0]);
+        posix.close(pipe[1]);
+        td.read_thread_fd = -1;
+        td.read_thread_pipe = -1;
+        self.socket_fd = null;
+        self.setClientState(.@"unreachable");
+        self.scheduleReconnect(td, loop);
+        return;
+    };
+    td.read_thread = read_thread;
+    td.read_thread_live = true;
+    read_thread.setName("io-client-reader") catch {};
+
+    // Re-handshake + (re)attach. Hello then Attach (the host serializes on its
+    // handshake gate — same ordering as connectAndAttach). These use
+    // `sendFrameRaw` directly, which BYPASSES the `.reconnecting` send gate.
+    self.redialReattach(td, loop) catch {
+        // The just-opened connection is already broken; the new read thread's
+        // EOF/error path re-triggers a redial. Leave `.reconnecting` set.
+        return;
+    };
+
+    // Connected + handshake/attach enqueued. Clear the coalescing flag, reset the
+    // backoff budget, and flip the gate to `.ok` so input flows again. The read
+    // thread's `.hello_ack`/`.attached` arms finalize classification (too_old /
+    // session_ended / ok).
+    td.redial_in_flight = false;
+    td.reconnect_attempt = 0;
+    self.setClientState(.ok);
+
+    // Arm the per-attempt handshake WATCHDOG (REG-T2): if no HelloAck arrives
+    // within `Config.connect_timeout_s`, the connection is a black-holed tunnel
+    // (connected, then silent, no read-side EOF) — the watchdog re-triggers the
+    // redial. Guard on the completion state (the established Thread.zig pattern):
+    // don't re-arm an already-active watchdog from a prior attempt (it will fire
+    // and re-check the CURRENT `ack_seen`, which teardownConnection reset).
+    if (td.reconnect_watchdog) |*wd| {
+        if (td.reconnect_watchdog_c.state() != .active) {
+            wd.run(
+                loop,
+                &td.reconnect_watchdog_c,
+                connectTimeoutMs(self.config.connect_timeout_s),
+                ThreadData,
+                td,
+                reconnectWatchdogCallback,
+            );
+        }
+    }
+}
+
+fn reconnectWatchdogCallback(
+    td_: ?*ThreadData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch return .disarm; // cancelled by loop-stop on a clean quit
+    const td = td_ orelse return .disarm;
+    const self = td.reconnect_client orelse return .disarm;
+    // The handshake completed in time — nothing to do.
+    if (self.ack_seen.load(.acquire)) return .disarm;
+    // Connected but never handshook AND never EOF'd (a black-holed tunnel):
+    // surface the ambiguous state + wake the redial machine. If a redial is
+    // already in flight this coalesces (harmless); otherwise it re-dials.
+    self.setClientState(.cannot_handshake);
+    if (td.reconnect_async) |*a| a.notify() catch {};
+    return .disarm;
+}
+
+fn redialReattach(self: *Client, td: *ThreadData, loop: *xev.Loop) !void {
+    const alloc = td.reconnect_alloc;
+    try sendFrameRaw(td, loop, alloc, .hello, protocol.Hello{});
+    // D4 reattach gate (pure `reattachId`): reattach to the LIVE host-assigned id
+    // if we have one; else the configured/persisted id; else a FRESH spawn (null).
+    const attach_id = reattachId(self.session_id.load(.acquire), self.config.session_id);
+    try sendFrameRaw(td, loop, alloc, .attach, protocol.Attach{
+        .session_id = attach_id,
+        .working_directory = self.config.working_directory,
+        .initial_input = self.config.initial_input,
+    });
+}
+
 // --- read thread ---
 
 const ReadThread = struct {
+    /// (cloud-hosts / G1+G2+H2) The `.attach` read loop hit a genuine drop (EOF /
+    /// read-error / fatal decode / POLLHUP). Classify it into a surface-visible
+    /// state and, for a reconnect-enabled client, wake the IO-thread redial
+    /// machine; then the caller RETURNS (exits the loop cleanly — the fix for the
+    /// old busy-loop that re-polled a peer-closed socket forever). A
+    /// `local`/single-shot client never redials.
+    fn onAttachDrop(client: *Client) void {
+        const handshaked = client.ack_seen.load(.acquire);
+        // Pure classification (unit-tested): before-ack => cannot_handshake;
+        // after-ack => reconnecting for a reconnect client, else leave the state.
+        if (classifyDrop(client.config.reconnect, handshaked)) |s| client.setClientState(s);
+        // Wake the IO-thread redial machine ONLY for a reconnect client (a
+        // `local`/single-shot client leaves `reconnect_async` null — never redials).
+        if (client.config.reconnect) {
+            if (client.reconnect_async) |a| a.notify() catch {};
+        }
+    }
+
     /// Blocking recv loop, symmetric with `Exec.ReadThread.threadMainPosix`.
     /// Reads from the socket, pushes bytes into the client's FrameReader, and
     /// drains complete frames through `handleFrame`. Polls the quit pipe so
@@ -1965,9 +2530,11 @@ const ReadThread = struct {
         // silence (see MIRROR_POLL_TIMEOUT_MS: an idle-but-alive agent sends zero
         // frames, so silence must not be treated as death). It polls with a FINITE
         // timeout (not poll(-1)) only to stay responsive to the quit pipe; on a
-        // timeout wake it simply re-loops. The .attach role keeps poll(-1) + its
-        // existing EOF/error handling byte-for-byte unchanged: every mirror-specific
-        // branch below is gated on `is_mirror`.
+        // timeout wake it simply re-loops. The `.attach` role uses poll(-1); its
+        // drop handling now routes through `onAttachDrop` (G1) — every drop path
+        // (EOF/error/decode-fatal/POLLHUP) classifies a surface-visible state and
+        // exits the loop CLEANLY (no busy-loop), triggering the redial when the
+        // client opted in. Every mirror-specific branch below is gated on `is_mirror`.
         const is_mirror = client.config.role == .mirror;
         const poll_timeout: i32 = if (is_mirror) MIRROR_POLL_TIMEOUT_MS else -1;
 
@@ -1977,44 +2544,45 @@ const ReadThread = struct {
                 const n = posix.read(fd, &buf) catch |err| switch (err) {
                     error.NotOpenForReading, error.InputOutput => {
                         log.info("client reader exiting", .{});
-                        // Layer 2 (mirror role): a genuine session-gone on a mirror
-                        // (conn dropped / host died). Signal the terminated state.
-                        if (is_mirror) client.markMirrorEnded();
+                        // A genuine session-gone: a mirror signals the terminated
+                        // state; an `.attach` classifies + (if reconnect) redials.
+                        if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
                         return;
                     },
                     error.WouldBlock => break,
                     else => {
                         log.err("client reader error err={}", .{err});
-                        if (is_mirror) client.markMirrorEnded();
+                        if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
                         return;
                     },
                 };
                 if (n == 0) {
-                    // EOF. Under .attach this is the existing reattach/disconnect
-                    // break; under a mirror it is genuine session-gone -> signal.
-                    if (is_mirror) {
-                        client.markMirrorEnded();
-                        return;
-                    }
-                    break;
+                    // EOF (the peer closed the socket). G1: under `.attach` this is
+                    // a DROP — exit the read loop CLEANLY (do NOT `break` + re-poll,
+                    // which busy-looped forever on the POLLHUP-delivered
+                    // readable-but-empty socket) and classify + (if reconnect)
+                    // trigger the redial. Under a mirror it is genuine session-gone.
+                    if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
+                    return;
                 }
 
                 // Push + drain complete frames into the mirror.
                 client.reader.push(client.gpa, buf[0..n]) catch |err| {
                     log.err("client reader push failed err={}", .{err});
-                    // Layer 2 (mirror role): a fatal push failure ends this read
-                    // thread; for a mirror that is session-gone, so signal the
-                    // terminated state (symmetric with the EOF/read-error paths).
-                    if (is_mirror) client.markMirrorEnded();
+                    // A fatal push failure ends this read thread: a mirror signals
+                    // terminated; an `.attach` classifies + (if reconnect) redials.
+                    if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
                     return;
                 };
                 while (true) {
                     const frame = client.reader.next(client.gpa) catch |err| {
                         log.err("client frame decode failed err={}", .{err});
-                        // Layer 2 (mirror role): a fatal decode failure (e.g.
-                        // error.InvalidFrame from a corrupt frame) ends this read
-                        // thread; for a mirror that is session-gone, so signal it.
-                        if (is_mirror) client.markMirrorEnded();
+                        // A fatal decode failure (e.g. error.InvalidFrame from a
+                        // corrupt frame) ends this read thread: a mirror signals
+                        // terminated; an `.attach` classifies + (if reconnect)
+                        // redials — the decode-fatal `.attach` path previously
+                        // returned SILENTLY with no surface signal (grounding #3).
+                        if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
                         return;
                     } orelse break;
                     client.handleFrame(
@@ -2023,11 +2591,11 @@ const ReadThread = struct {
                         frame.payload,
                     ) catch |err| {
                         log.err("client handleFrame failed err={}", .{err});
-                        // Layer 2 (mirror role): a fatal handleFrame failure (e.g.
-                        // error.InvalidFrame via the mouse/kitty intToEnum guards on
-                        // a corrupt mode_frame) ends this read thread; for a mirror
-                        // that is session-gone, so signal the terminated state.
-                        if (is_mirror) client.markMirrorEnded();
+                        // A fatal handleFrame failure (e.g. error.InvalidFrame via
+                        // the mouse/kitty intToEnum guards on a corrupt mode_frame)
+                        // ends this read thread: a mirror signals terminated; an
+                        // `.attach` classifies + (if reconnect) redials.
+                        if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
                         return;
                     };
                 }
@@ -2035,16 +2603,29 @@ const ReadThread = struct {
 
             _ = posix.poll(&pollfds, poll_timeout) catch |err| {
                 log.warn("client reader poll failed, exiting err={}", .{err});
-                // Layer 2 (mirror role): a poll() error (rare) ends this read thread
-                // just like EOF / read-error / fatal-decode; for a mirror that is
-                // session-gone, so signal the terminated state (symmetric with the
-                // other read-thread exit paths — otherwise the tile would freeze on
-                // its last frame and never declare "ended").
-                if (is_mirror) client.markMirrorEnded();
+                // A poll() error (rare) ends this read thread just like EOF /
+                // read-error / fatal-decode: a mirror signals terminated; an
+                // `.attach` classifies + (if reconnect) redials.
+                if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
                 return;
             };
 
             if (pollfds[1].revents & posix.POLL.IN != 0) return;
+
+            // (cloud-hosts / G1) POLLHUP/POLLERR on the socket WITHOUT POLLIN = the
+            // peer closed/errored with no more buffered data. Treat it as a drop
+            // and exit cleanly rather than loop back into a read that would just
+            // return EOF. If POLLIN is ALSO set we fall through to the read loop
+            // above so any final buffered frames are drained first (then the next
+            // read returns 0 and the EOF path fires). For a mirror this is genuine
+            // session-gone.
+            const sock_revents = pollfds[0].revents;
+            if (sock_revents & posix.POLL.IN == 0 and
+                sock_revents & (posix.POLL.HUP | posix.POLL.ERR) != 0)
+            {
+                if (is_mirror) client.markMirrorEnded() else onAttachDrop(client);
+                return;
+            }
 
             // Layer 2 (mirror role): a poll TIMEOUT (no socket activity) is NOT a
             // session-gone signal — an idle-but-alive agent legitimately sends no
@@ -2075,12 +2656,60 @@ pub const ThreadData = struct {
     read_thread_pipe: posix.fd_t,
     read_thread_fd: posix.fd_t,
 
+    /// (cloud-hosts) True while a live read thread owns `read_thread_fd`/`_pipe`.
+    /// Set by `connectAndAttach`/`attemptReconnect` after the spawn, cleared by
+    /// `threadExit`/`teardownConnection` after the join. Guards `threadExit`'s
+    /// join/close so an in-flight-redial teardown state (read thread already
+    /// joined, fds set to -1) is not double-torn-down.
+    read_thread_live: bool = false,
+
+    // --- (cloud-hosts / I1) opt-in redial machinery ---
+    // Null / inert for a `local`/single-shot client (`Config.reconnect == false`),
+    // so that path is byte-for-byte unchanged. All fields are touched ONLY on the
+    // IO/loop thread (no atomics needed among them); the cross-thread signal is
+    // `reconnect_async.notify()` from the read thread / writeCallback plus the
+    // `Client.client_state`/`session_id` atomics.
+    reconnect_async: ?xev.Async = null,
+    reconnect_async_c: xev.Completion = .{},
+    reconnect_timer: ?xev.Timer = null,
+    reconnect_timer_c: xev.Completion = .{},
+    /// (cloud-hosts / REG-T2) Handshake watchdog: after a successful reconnect
+    /// (fd connected, reader respawned, Hello+Attach enqueued) this fires at the
+    /// per-attempt ceiling (`Config.connect_timeout_s`); if no HelloAck was seen
+    /// by then it re-triggers the redial — the ONLY signal for a black-holed
+    /// tunnel that connected but then went silent WITHOUT a read-side EOF.
+    reconnect_watchdog: ?xev.Timer = null,
+    reconnect_watchdog_c: xev.Completion = .{},
+    /// 0-indexed attempt counter driving `reconnectDelayMs`; reset to 0 on a
+    /// successful reconnect.
+    reconnect_attempt: u32 = 0,
+    /// True between "drop detected" and "reconnected"; coalesces duplicate
+    /// triggers (read-thread EOF + writeCallback for one drop).
+    redial_in_flight: bool = false,
+    /// Back-pointers set by `connectAndAttach` so the loop callbacks can drive a
+    /// full redial. Meaningful only when `reconnect_async != null`.
+    reconnect_client: ?*Client = null,
+    reconnect_alloc: Allocator = undefined,
+    reconnect_io: ?*termio.Termio = null,
+
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        // Close the quit-pipe write end (the read end, read_thread_fd, is
-        // closed in threadExit alongside the reader-thread teardown). This
-        // mirrors Exec.ThreadData.deinit, which closes its read_thread_pipe
-        // here; without it each threadEnter->threadExit cycle leaks one fd.
-        posix.close(self.read_thread_pipe);
+        // Close the quit-pipe write end IF still open (the read end,
+        // read_thread_fd, is closed in threadExit / teardownConnection). A redial
+        // teardown may have already closed it + set the sentinel -1, so guard the
+        // close to avoid a double-close. This mirrors Exec.ThreadData.deinit
+        // (which closes read_thread_pipe here); without it each
+        // threadEnter->threadExit cycle leaks one fd.
+        if (self.read_thread_pipe >= 0) {
+            posix.close(self.read_thread_pipe);
+            self.read_thread_pipe = -1;
+        }
+
+        // (cloud-hosts) Release the redial handles. The loop has stopped by the
+        // time deinit runs, so their completions will not fire; deiniting xev
+        // handles post-loop is the established pattern (see Thread.deinit).
+        if (self.reconnect_async) |*a| a.deinit();
+        if (self.reconnect_timer) |*t| t.deinit();
+        if (self.reconnect_watchdog) |*t| t.deinit();
 
         self.write_req_pool.deinit(alloc);
         self.write_buf_pool.deinit(alloc);

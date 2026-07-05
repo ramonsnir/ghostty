@@ -23,7 +23,11 @@ import os
 ///     the readiness value so a lagging host can be surfaced at readiness time (D1; full
 ///     mid-session classification is Phase 2).
 ///
-/// Phase-1 does NOT auto-respawn the master or redial mid-session (Phase 2, task J1).
+/// Phase 2 (task J1) is now WIRED: surfaces `retainTunnel`/`releaseTunnel` (the
+/// refcount), so a master exit while a surface still wants the host schedules a
+/// never-give-up `respawn`, and the last surface's release tears the tunnel down.
+/// (`ensureTunnel` remains the one-shot bring-up used by the first retain + each
+/// respawn; a bare `ensureTunnel` with no retain stays one-shot — Phase-1 behavior.)
 final class RemoteTunnelController {
     /// The single owner (D7). All state below is shared through this instance.
     static let shared = RemoteTunnelController()
@@ -68,6 +72,37 @@ final class RemoteTunnelController {
     private static let backoffSchedule: [TimeInterval] = [0.5, 1, 2, 4, 8]
     private static let steadyBackoff: TimeInterval = 15
 
+    /// (Phase 2, J1) ssh-master RESPAWN backoff — a quick exponential burst
+    /// (1,2,4,8,16,30) then a STEADY once-a-minute cadence FOREVER (never give up while a
+    /// surface still wants the host). This is a BYTE-FOR-BYTE copy of
+    /// `AgentPreviewTile.mirrorReconnectDelay` (task J1) — NOT the `AgentManagerController`
+    /// give-up backoff (which stands down after `restartMaxAttempts`).
+    static let respawnQuickAttempts = 6
+    static let respawnSteadyDelay: TimeInterval = 60
+    /// A master that ran at least this long before exiting resets its respawn budget, so a
+    /// LATER transient drop gets a full quick-burst again (mirrors `mirrorStableSeconds`).
+    static let respawnHealthyRunInterval: TimeInterval = 15
+    /// (REG-T3) Compiled-in per-attempt connection ceiling (seconds) when
+    /// `pty-remote-connect-timeout` is unset (0). Mirrors the core client's
+    /// `DEFAULT_CONNECT_TIMEOUT_S`.
+    static let defaultConnectTimeoutSeconds: UInt32 = 10
+
+    /// Map a `pty-remote-connect-timeout` seconds value to the per-attempt probe/handshake
+    /// ceiling in ms (REG-T3). `0` ⇒ the compiled default. PURE + unit-testable.
+    static func connectTimeoutMs(_ seconds: UInt32) -> UInt32 {
+        let s = seconds == 0 ? defaultConnectTimeoutSeconds : seconds
+        return s &* 1000
+    }
+
+    /// The ssh-master respawn delay (seconds) for a 0-based `attempt`: a quick exponential
+    /// burst 1,2,4,8,16,30 then a STEADY `respawnSteadyDelay` (60s) forever. PURE + static
+    /// for unit testing (mirrors `AgentPreviewTile.mirrorReconnectDelay`).
+    static func respawnDelay(forAttempt attempt: Int) -> TimeInterval {
+        let a = max(attempt, 0)
+        if a >= respawnQuickAttempts { return respawnSteadyDelay }
+        return min(Double(1 << a), 30.0)
+    }
+
     // MARK: - State (guarded by stateQueue)
 
     private let stateQueue = DispatchQueue(label: "com.mitchellh.ghostty-ramon.remote-tunnel.state")
@@ -79,10 +114,31 @@ final class RemoteTunnelController {
     private var masterProcesses: [String: Process] = [:]
     private var forwarderProcesses: [String: Process] = [:]
 
+    // --- Supervision (J1): surface refcount + never-give-up respawn ---
+    /// How many live surfaces still want each host. The tunnel is torn down (respecting
+    /// ControlPersist) when this reaches 0 (single owner — D7). Retain on surface create,
+    /// release on surface close.
+    private var wanted: [String: Int] = [:]
+    /// The last-used bring-up params, remembered so a respawn can reconstruct the tunnel
+    /// without the caller re-supplying them.
+    private var hostEntries: [String: RemoteHostEntry] = [:]
+    private var hostSSHOptions: [String: String?] = [:]
+    private var hostConnectTimeout: [String: UInt32] = [:]
+    /// Per-host respawn attempt counter (drives `respawnDelay`); reset by a healthy run.
+    private var respawnAttempts: [String: Int] = [:]
+    /// Monotonic per-host token; a bump (teardown, or a newer exit) cancels a pending
+    /// scheduled respawn so it can't double-spawn.
+    private var respawnGeneration: [String: Int] = [:]
+
     /// The probe blocks up to `timeout_ms`, so it MUST run off the main thread.
     private let probeQueue = DispatchQueue(
         label: "com.mitchellh.ghostty-ramon.remote-tunnel.probe",
         attributes: .concurrent)
+    /// Serial queue for respawn scheduling/execution (backoff `asyncAfter` + the actual
+    /// re-spawn). SEPARATE from `stateQueue` so respawn work can take `stateQueue.sync`
+    /// critical sections (via `ensureTunnel`) without serial-queue reentrancy.
+    private let supervisionQueue = DispatchQueue(
+        label: "com.mitchellh.ghostty-ramon.remote-tunnel.supervision")
 
     private init() {}
 
@@ -209,6 +265,13 @@ final class RemoteTunnelController {
         sshOptions: String? = nil,
         probeTimeoutMs: UInt32 = defaultProbeTimeoutMs
     ) {
+        // Remember the bring-up params so an auto-respawn (J1) can reconstruct the tunnel
+        // without the caller re-supplying them.
+        stateQueue.sync {
+            hostEntries[host.name] = host
+            hostSSHOptions[host.name] = sshOptions
+        }
+
         let socketPath: String
         do {
             socketPath = try resolveForwardedSocketPath(for: host)
@@ -240,17 +303,188 @@ final class RemoteTunnelController {
         startProbing(hostName: host.name, socketPath: socketPath, probeTimeoutMs: probeTimeoutMs)
     }
 
-    /// Tear down a host's tunnel: cancel probing, ask the master to exit its forwards,
-    /// and terminate both processes. Best-effort (Phase 1; the last-surface-closes trigger
-    /// is a Phase-2 concern).
+    // MARK: - Surface refcount + last-surface teardown (J1, D7)
+
+    /// A surface for `host` was created. Increment the want-count (single owner — D7) and,
+    /// on the first surface, bring the tunnel up (which arms auto-respawn). Idempotent for
+    /// N surfaces: only the first spawns; the rest just bump the refcount. `connectTimeout`
+    /// is the `pty-remote-connect-timeout` seconds value (0 ⇒ compiled default), used as
+    /// the per-attempt handshake ceiling (REG-T3) for both the initial probe and respawns.
+    func retainTunnel(
+        host: RemoteHostEntry,
+        sshOptions: String? = nil,
+        connectTimeout: UInt32 = 0
+    ) {
+        if noteRetain(host: host, connectTimeout: connectTimeout) {
+            ensureTunnel(
+                host: host,
+                sshOptions: sshOptions,
+                probeTimeoutMs: Self.connectTimeoutMs(connectTimeout))
+        }
+    }
+
+    /// The refcount bump behind `retainTunnel` — the SINGLE source of truth, extracted
+    /// so it can be exercised WITHOUT spawning `ssh` (that is `ensureTunnel`'s job,
+    /// gated on the `first` return below). Bumps the surface want-count and REMEMBERS the
+    /// entry + connect timeout so a later master-exit respawn (and the respawn gate,
+    /// `wouldRespawnOnMasterExit`) can reconstruct the bring-up. Returns whether this is
+    /// the FIRST surface wanting the host (the one that triggers bring-up).
+    @discardableResult
+    func noteRetain(host: RemoteHostEntry, connectTimeout: UInt32) -> Bool {
+        stateQueue.sync {
+            let n = (wanted[host.name] ?? 0) + 1
+            wanted[host.name] = n
+            hostEntries[host.name] = host
+            hostConnectTimeout[host.name] = connectTimeout
+            return n == 1
+        }
+    }
+
+    /// The refcount drop behind `releaseTunnel` — extracted (like `noteRetain`) so the
+    /// zero-crossing (the last-surface teardown trigger) is testable without side
+    /// effects. Returns whether the count hit 0.
+    @discardableResult
+    func noteRelease(hostName: String) -> Bool {
+        stateQueue.sync {
+            let n = max((wanted[hostName] ?? 0) - 1, 0)
+            wanted[hostName] = n
+            return n == 0
+        }
+    }
+
+    /// Current surface want-count for `host` (0 if none). Test observability for the
+    /// refcount that gates bring-up + last-surface teardown (D7).
+    func wantedCount(for hostName: String) -> Int {
+        stateQueue.sync { wanted[hostName] ?? 0 }
+    }
+
+    /// Whether a master-exit for `host` WOULD schedule a never-give-up respawn: the host
+    /// is still wanted by ≥1 surface AND its bring-up params are remembered. Mirrors the
+    /// gate inside `handleMasterExit` (extracted so it is test-observable without a real
+    /// ssh master). This is the exact predicate the J1 respawn depends on, and it is armed
+    /// only because a surface retained the tunnel (`wanted > 0`).
+    func wouldRespawnOnMasterExit(hostName: String) -> Bool {
+        stateQueue.sync { (wanted[hostName] ?? 0) > 0 && hostEntries[hostName] != nil }
+    }
+
+    /// A surface for `hostName` closed. Decrement the want-count; when it reaches 0, tear
+    /// the tunnel down (the last-surface-closes trigger — D7). ControlPersist bounds the
+    /// master's linger even if a terminate races.
+    func releaseTunnel(hostName: String) {
+        if noteRelease(hostName: hostName) { teardown(hostName: hostName) }
+    }
+
+    /// Tear down a host's tunnel: cancel probing + any pending respawn, ask the master to
+    /// exit its forwards, and terminate both processes. Zeroes the want-count so the
+    /// terminationHandler's respawn gate declines (the intended-stop case).
     func teardown(hostName: String) {
         stopProbing(hostName: hostName)
         let (master, forwarder) = stateQueue.sync {
-            (masterProcesses.removeValue(forKey: hostName),
-             forwarderProcesses.removeValue(forKey: hostName))
+            wanted[hostName] = 0
+            // Bump the respawn generation so any scheduled respawn is superseded/cancelled.
+            respawnGeneration[hostName] = (respawnGeneration[hostName] ?? 0) + 1
+            respawnAttempts[hostName] = 0
+            return (masterProcesses.removeValue(forKey: hostName),
+                    forwarderProcesses.removeValue(forKey: hostName))
         }
         forwarder?.terminate()
         master?.terminate()
+    }
+
+    // MARK: - Auto-respawn + health (J1)
+
+    /// ssh-master exited (runs on the supervision queue). Clear the dead handles; if a
+    /// surface still wants this host, schedule a never-give-up respawn with the
+    /// `respawnDelay` backoff (a healthy run first resets the budget). A generation token
+    /// makes the scheduled respawn cancellable by a teardown or a newer exit.
+    private func handleMasterExit(hostName: String, status: Int32, startedAt: Date) {
+        let ranFor = Date().timeIntervalSince(startedAt)
+        struct Decision { var respawn: Bool; var entry: RemoteHostEntry?; var opts: String?
+                          var timeout: UInt32; var delay: TimeInterval; var gen: Int }
+        let d: Decision = stateQueue.sync {
+            // Drop the dead master + its now-orphaned forwarder.
+            masterProcesses[hostName] = nil
+            let fwd = forwarderProcesses.removeValue(forKey: hostName)
+            fwd?.terminate()
+
+            guard (wanted[hostName] ?? 0) > 0, let entry = hostEntries[hostName] else {
+                return Decision(respawn: false, entry: nil, opts: nil, timeout: 0, delay: 0, gen: 0)
+            }
+            if ranFor >= Self.respawnHealthyRunInterval { respawnAttempts[hostName] = 0 }
+            let attempt = respawnAttempts[hostName] ?? 0
+            respawnAttempts[hostName] = attempt + 1
+            let gen = (respawnGeneration[hostName] ?? 0) + 1
+            respawnGeneration[hostName] = gen
+            return Decision(
+                respawn: true,
+                entry: entry,
+                opts: hostSSHOptions[hostName] ?? nil,
+                timeout: hostConnectTimeout[hostName] ?? 0,
+                delay: Self.respawnDelay(forAttempt: attempt),
+                gen: gen)
+        }
+        guard d.respawn, let entry = d.entry else { return }
+        logger.notice("remote host \(hostName, privacy: .public) master exited (status \(status, privacy: .public)) — respawning in \(d.delay, privacy: .public)s")
+        supervisionQueue.asyncAfter(deadline: .now() + d.delay) { [weak self] in
+            guard let self else { return }
+            let current = self.stateQueue.sync {
+                self.respawnGeneration[hostName] == d.gen && (self.wanted[hostName] ?? 0) > 0
+            }
+            guard current else { return }
+            self.respawn(entry: entry, sshOptions: d.opts, connectTimeout: d.timeout)
+        }
+    }
+
+    /// Clean the stale multiplex + forwarded sockets, then bring the tunnel back up. Runs
+    /// on the supervision queue; `ensureTunnel` re-resolves ssh, recreates the forwarded
+    /// socket, respawns master+forwarder, and restarts probing (re-fires readiness).
+    private func respawn(entry: RemoteHostEntry, sshOptions: String?, connectTimeout: UInt32) {
+        cleanStaleControl(host: entry)
+        ensureTunnel(
+            host: entry,
+            sshOptions: sshOptions,
+            probeTimeoutMs: Self.connectTimeoutMs(connectTimeout))
+    }
+
+    /// Best-effort `ssh -O exit` on the (possibly still-persisting) master + unlink of the
+    /// stale ControlPath, so a respawn binds a fresh multiplex socket instead of colliding
+    /// with a half-dead one.
+    private func cleanStaleControl(host: RemoteHostEntry) {
+        guard let ssh = Self.resolveSSH(), let cp = try? controlPath(for: host) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ssh)
+        proc.arguments = ["-O", "exit", "-o", "ControlPath=\(cp)", host.sshTarget]
+        proc.environment = Self.tunnelEnvironment()
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            // No live master to ask — fall through to the unlink.
+        }
+        try? FileManager.default.removeItem(atPath: cp)
+    }
+
+    /// `ssh -O check`: is the master's multiplex socket alive and accepting? Exit 0 ⇒ yes.
+    /// A synchronous liveness probe (blocks briefly); call off the main thread.
+    func checkMasterHealth(host: RemoteHostEntry) -> Bool {
+        guard let ssh = Self.resolveSSH(), let cp = try? controlPath(for: host) else { return false }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ssh)
+        proc.arguments = ["-O", "check", "-o", "ControlPath=\(cp)", host.sshTarget]
+        proc.environment = Self.tunnelEnvironment()
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return false
+        }
+        return proc.terminationStatus == 0
     }
 
     /// Resolve the LOCAL forwarded-socket path for a host: the user's explicit pin (tilde
@@ -291,14 +525,20 @@ final class RemoteTunnelController {
         return String(format: "%08x", UInt32(truncatingIfNeeded: h))
     }
 
+    /// The ssh ControlPath (multiplex socket) for a host — a short filename under the 0700
+    /// tunnel dir so it stays well under `sun_path`. Used by spawn, `ssh -O check`
+    /// (health), and `ssh -O exit` (stale-cleanup before respawn).
+    func controlPath(for host: RemoteHostEntry) throws -> String {
+        try tunnelDir().appendingPathComponent("\(Self.shortHash(host.name)).cp").path
+    }
+
     private func spawnTunnel(
         host: RemoteHostEntry,
         ssh: String,
         localSocket: String,
         sshOptions: String?
     ) throws {
-        let controlPath = try tunnelDir()
-            .appendingPathComponent("\(Self.shortHash(host.name)).cp").path
+        let controlPath = try self.controlPath(for: host)
         // Best-effort cleanup of a stale forwarded socket (the host unlinks-and-rebinds;
         // ssh -L refuses to bind onto an existing path).
         try? FileManager.default.removeItem(atPath: localSocket)
@@ -322,6 +562,19 @@ final class RemoteTunnelController {
         ] + extra + [host.sshTarget]
         master.environment = env
         master.standardInput = FileHandle.nullDevice
+
+        // (J1) Auto-respawn on master exit — crash, network drop, or a ControlPersist
+        // timeout. Fires on an arbitrary thread; hop to the supervision queue. Respawn is
+        // gated inside `handleMasterExit` on the host still being `wanted` (>0), so a bare
+        // `ensureTunnel` (no `retainTunnel`) stays one-shot (Phase-1 behavior).
+        let startedAt = Date()
+        master.terminationHandler = { [weak self] proc in
+            guard let self else { return }
+            self.supervisionQueue.async {
+                self.handleMasterExit(
+                    hostName: host.name, status: proc.terminationStatus, startedAt: startedAt)
+            }
+        }
 
         // Forwarder reuses the master (ControlMaster=no) and owns the -L unix→unix forward.
         // StreamLocalBindMask=0177 ⇒ the forwarded socket is 0600.

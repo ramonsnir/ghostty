@@ -239,8 +239,10 @@ while local splits use the global host. A paired additive `host_name` field
 duped/freed like `socket_path`) records the **identity label** of the host this surface runs
 on; nil ⇒ the reserved name `local`. Together `(host_name, session_id)` is the reattach/persistence
 key across a GUI restart (the session_id is a RANDOM non-zero u64 minted host-side by
-`allocSessionId`; `0` = "no session"). `Client.Config.reconnect` is declared (default false)
-for the Phase-2 redial state machine but has NO behavior yet.
+`allocSessionId`; `0` = "no session"). `Client.Config.reconnect` (default false) now DRIVES the
+Phase-2 redial state machine (see the next subsection); the GUI auto-sets it true ONLY for a
+resolved REMOTE `.attach` surface (a per-surface socket override present + role `.attach`), so a
+`local`/nil host and all mirrors stay `reconnect=false`.
 
 **Deferred dial for a RESTORED/launched REMOTE surface.** The `.client` connect is single-shot
 (no retry — `connectAndAttach`), so a remote surface must NOT eagerly dial: its SSH tunnel may
@@ -255,6 +257,68 @@ is never compiled into `ghostty-host`. `hostName` is persisted in the surface ar
 non-local surface; `ptyHostSocket` is NOT persisted (re-resolved from `hostName` on restore).
 Full design + wiring: `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md` and the CLAUDE.md
 cloud-hosts summary bullet.
+
+**Cloud-hosts (Phase 2) — mid-session redial for REMOTE hosts ONLY.** Phase 2 REVERSES the
+deliberate single-shot decision **for remote hosts only** — a `local`/nil host stays
+**byte-for-byte single-shot** (the KeepAlive LaunchAgent is ≈always up, and a dropped local host
+can't restore RAM-only sessions anyway; `reconnect=false` ⇒ none of the machinery below is armed).
+A remote forwarded socket, by contrast, vanishes on every sleep / WiFi roam / Tailscale reconnect
+while the remote session is perfectly alive, so a remote `.attach` opts into a redial machine:
+
+- **Surface-visible state channel (`termio.Client.State`, five states).** Backed by `enum(c_int)`
+  so it maps 1:1 to the C `ghostty_client_state_e` the macOS overlay reads via the lock-free
+  `ghostty_surface_client_state` accessor: `ok` (normal / `.exec` / local), `reconnecting` (drop
+  in flight — also the "hold outbound frames" gate), `session_ended` (reattach returned a
+  DIFFERENT session id ⇒ host restarted, prior session gone), `cannot_handshake` (connected but
+  EOF before any `HelloAck` — ambiguous: starting up / down / incompatible), `too_old` (decoded a
+  `HelloAck` with a mismatched MAJOR — confident + directional), `unreachable` (the `connectUnix`
+  dial failed). Stored in a `std.atomic.Value` (not renderMutex), written by the read thread's
+  drop classification + the redial machine, read UNLOCKED by `queueWrite`/`sendFrame` (hold/drop
+  on `.reconnecting`) and by the Swift accessor. `setClientState` also wakes the renderer so the
+  overlay repaints.
+- **The redial runs ENTIRELY on the IO/xev-loop thread.** The write path (write_stream + queue +
+  the two `SegmentedPool`s + the socket fd) is IO-thread-owned and read unlocked by `queueWrite`,
+  so tearing it down + rebuilding it from the READ thread would be a cross-thread UAF + an illegal
+  concurrent xev submission. Instead the read thread (or a failed `writeCallback` — the ONLY
+  timely signal a BLACK-HOLED tunnel gives) merely sets the `.reconnecting` hold-gate and
+  `notify()`s a thread-safe `xev.Async` (`reconnect_async`), then exits. The async callback runs
+  the state machine on the loop thread (serialized with `queueWrite`/`writeCallback`):
+  `teardownConnection` (join the old read thread via its quit pipe, close the old fd + pipe with
+  `-1` sentinels so `threadExit`/`deinit` never double-close, reset the reader + `ack_seen`) →
+  `scheduleReconnect` → `attemptReconnect` (fresh `connectUnix` + pipe, rebuild `write_stream`,
+  respawn the read thread, re-`Hello`+`Attach` via `sendFrameRaw` which BYPASSES the
+  `.reconnecting` gate). **⚠️ Stale-completion guard in `writeCallback`:** the write pools + queue
+  are LEFT INTACT across `teardownConnection` (a pending completion from the pre-drop connection
+  must fire to reclaim its slot), so an ERROR completion for the OLD fd can land AFTER a redial has
+  already rebuilt a healthy connection — tripping the redial from it would tear that healthy
+  session down. So `writeCallback` trips the redial ONLY when the completion's own fd
+  (`streamFd(s)`, recovered from the `xev.Stream` the callback receives) equals the live
+  `read_thread_fd`; a stale completion (torn-down fd) is ignored, making correctness independent of
+  xev's completion-drain ordering rather than resting on the ≥1s backoff usually draining old-fd
+  errors first.
+- **Reattach, not re-spawn (`reattachId`).** The redial's `Attach` reattaches to the LIVE
+  host-assigned id if we have one, else the configured/persisted id, else a FRESH spawn (null) —
+  NEVER a blind re-Attach that would spawn+orphan a second session. The host's
+  known-vs-returned-id check (the `.attached` arm) flips the state to `session_ended` on a miss
+  (and does NOT adopt the fresh id), or `.ok` on a hit. **⚠️ The `session_ended`-on-miss arm is
+  GATED on `Config.reconnect` — i.e. a REMOTE `.attach` surface ONLY.** The overlay that makes
+  `session_ended` visible is mounted only for a remote surface, so a LOCAL `.client` attach must
+  NOT take that path (it would leave a silent, unexplained dead pane with `session_id` pinned to
+  the gone id). A local reattach-miss instead keeps Phase-1 semantics: fall through and ADOPT the
+  host's fresh id → a usable fresh shell (the local host-restart-across-GUI-restart behavior).
+- **The backoff is an `xev.Timer` on the loop — NEVER a bare `sleep` (settled OQ7).** `reconnectDelayMs`
+  is a quick exponential burst (1,2,4,8,16,30s) for the first `RECONNECT_QUICK_ATTEMPTS`, then a
+  steady 60s cadence FOREVER (never gives up while the surface wants the host), always > 0. A
+  clean quit stops the loop, which cancels the timer (the callback sees `error.Canceled`); the
+  read thread `poll()`s its quit self-pipe (Darwin has no eventfd). A per-attempt **handshake
+  watchdog** (`xev.Timer`, ceiling = `Config.connect_timeout_s`, 0 ⇒ compiled
+  `DEFAULT_CONNECT_TIMEOUT_S`=10s) fires if no `HelloAck` arrives after a connect — the only
+  detector for a tunnel that connected then went silent WITHOUT a read-side EOF — and re-triggers
+  the redial. The per-attempt ceiling is the fork config `pty-remote-connect-timeout`.
+- **GUI-only.** `Client.zig`, the surface Options field, the probe, and the state accessor are NOT
+  compiled into `ghostty-host` — so this is a lib/xcframework rebuild + GUI relaunch, **no host
+  restart / no session loss.** Full wiring + tests: `CLOUD-HOSTS-DESIGN.md` /
+  `CLOUD-HOSTS-IMPL-PLAN.md` and the CLAUDE.md cloud-hosts bullet.
 
 ### The mirror (the central decision)
 

@@ -733,6 +733,23 @@ pub fn init(
                 // pair. Client.init DUPES it, so the borrowed slice need not
                 // outlive this call. `null` ⇒ "local" (today's behavior).
                 .host_name = req_host_name,
+                // (cloud-hosts / D2.4) Opt into the mid-session redial state
+                // machine ONLY for a resolved REMOTE host — signalled by a
+                // per-surface socket override (`per_surface_sock`), which the GUI
+                // supplies ONLY for a cloud split's forwarded socket (a local
+                // split / dashboard mirror uses the global `pty-host` scalar, so
+                // `per_surface_sock` is null there). Also gate on the `.attach`
+                // role: a `.mirror` NEVER redials via this machine (it self-heals
+                // via the macOS AgentPreviewTile backoff). So `local`/nil host and
+                // mirrors stay byte-for-byte single-shot (reconnect=false).
+                .reconnect = per_surface_sock != null and client_role == .attach,
+                // (cloud-hosts / REG-T2) Per-attempt redial connection ceiling
+                // (seconds); 0 ⇒ the compiled-in default. Read defensively so
+                // apprts without the field compile to 0.
+                .connect_timeout_s = if (@hasField(
+                    @TypeOf(rt_surface.*),
+                    "pty_host_connect_timeout_s",
+                )) rt_surface.pty_host_connect_timeout_s else 0,
                 // SLICE 11 (cwd-inherit): pass the SAME working-directory the
                 // `.exec` arm passes to `Exec.init` below (line ~718). The GUI
                 // already computes the new tab's cwd into
@@ -1186,6 +1203,32 @@ pub fn needsConfirmQuit(self: *Surface) bool {
 pub fn sessionId(self: *Surface) u64 {
     return switch (self.io.backend) {
         .client => |*c| c.session_id.load(.acquire),
+        .exec => 0,
+    };
+}
+
+/// (ramon fork / cloud-hosts) The `.client` surface's surface-visible connection
+/// state (see `termio.Client.State`) for the macOS reconnect overlay. `.exec`
+/// (and a `.client` that never classified) reports `.ok`. Lock-free.
+pub fn clientState(self: *Surface) termio.Client.State {
+    return switch (self.io.backend) {
+        .client => |*c| c.clientState(),
+        .exec => .ok,
+    };
+}
+
+/// (ramon fork / cloud-hosts) The host's advertised protocol MAJOR/MINOR from the
+/// last HelloAck (for the `too_old` directional overlay message); 0 for `.exec`
+/// or before any handshake. Lock-free.
+pub fn clientHostMajor(self: *Surface) u16 {
+    return switch (self.io.backend) {
+        .client => |*c| c.hostMajor(),
+        .exec => 0,
+    };
+}
+pub fn clientHostMinor(self: *Surface) u16 {
+    return switch (self.io.backend) {
+        .client => |*c| c.hostMinor(),
         .exec => 0,
     };
 }

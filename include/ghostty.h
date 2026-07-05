@@ -523,6 +523,13 @@ typedef struct {
   // NULL (the default) ⇒ the reserved name "local". Appended last so the ABI
   // stays additive; zero-initialized callers get NULL.
   const char* host_name;
+  // (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS, for
+  // this surface's `.client` mid-session redial (only consulted for a resolved
+  // REMOTE host whose redial is opt-in). NOT a protocol field — never sent on
+  // the wire; it only bounds each reconnect attempt of the backoff. 0 (the
+  // default) ⇒ the compiled-in default ceiling. Appended last so the ABI stays
+  // additive; zero-initialized callers get 0.
+  uint32_t pty_host_connect_timeout_s;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -555,6 +562,41 @@ typedef struct {
   uint16_t major;
   uint16_t minor;
 } ghostty_host_probe_s;
+
+// (ramon fork / cloud-hosts) Surface-visible `.client` connection state — the
+// state channel the macOS reconnect overlay renders so a dropped/failed remote
+// split is never a silent blank pane. `OK` is the normal connected state (and
+// the value for a `.exec` surface). The rest are the drop / version-refuse
+// states (see termio.Client.State):
+//   RECONNECTING     — dropped; the redial machine is retrying.
+//   SESSION_ENDED    — the host handed back a DIFFERENT session id on reattach
+//                      (the host restarted; the prior session is gone).
+//   CANNOT_HANDSHAKE — connected but EOF before any HelloAck (ambiguous:
+//                      starting up / down / incompatible-major). Retryable.
+//   TOO_OLD          — decoded a HelloAck whose MAJOR != the GUI's major
+//                      (a confident, actionable incompatibility — redeploy the host).
+//   UNREACHABLE      — the connect() (tunnel dial) failed. Retryable.
+typedef enum {
+  GHOSTTY_CLIENT_STATE_OK = 0,
+  GHOSTTY_CLIENT_STATE_RECONNECTING = 1,
+  GHOSTTY_CLIENT_STATE_SESSION_ENDED = 2,
+  GHOSTTY_CLIENT_STATE_CANNOT_HANDSHAKE = 3,
+  GHOSTTY_CLIENT_STATE_TOO_OLD = 4,
+  GHOSTTY_CLIENT_STATE_UNREACHABLE = 5,
+} ghostty_client_state_e;
+
+// (ramon fork / cloud-hosts) The `.client` connection state plus the version
+// data the TOO_OLD directional message needs. `host_major`/`host_minor` are the
+// host's advertised protocol version from the last HelloAck (meaningful once a
+// handshake happened; 0 otherwise); `gui_major`/`gui_minor` are this GUI's
+// compiled protocol version. See ghostty_surface_client_state.
+typedef struct {
+  ghostty_client_state_e state;
+  uint16_t host_major;
+  uint16_t host_minor;
+  uint16_t gui_major;
+  uint16_t gui_minor;
+} ghostty_client_state_s;
 
 // Config types
 
@@ -1264,6 +1306,11 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_session_id(ghostty_surface_t);
+// (ramon fork / cloud-hosts) Read the surface's `.client` connection state + the
+// TOO_OLD version data (see ghostty_client_state_s). GUI-lib-only; a `.exec`
+// surface always reports OK. Lock-free (reads atomics), so it is safe to call
+// from the apprt/main thread (the K1 reconnect overlay polls it).
+GHOSTTY_API ghostty_client_state_s ghostty_surface_client_state(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);

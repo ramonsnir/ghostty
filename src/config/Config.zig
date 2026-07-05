@@ -3075,6 +3075,18 @@ keybind: Keybinds = .{},
 // apprt reads this via the `ptyRemoteSSHOptions` Swift getter.
 @"pty-remote-ssh-options": ?[:0]const u8 = null,
 
+/// (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS, for a
+/// REMOTE (`pty-remote-host`) split's mid-session redial. This is NOT a protocol
+/// field and is never sent on the wire — it only bounds each reconnect attempt
+/// of the `.client` backend's opt-in redial state machine (the per-attempt cap
+/// of the quick-burst→steady backoff). `0` (the default) ⇒ the compiled-in
+/// default (`termio.Client` `DEFAULT_CONNECT_TIMEOUT_S`). A `local`/nil host
+/// never redials, so this key has no effect there. Threaded to the core
+/// `Surface.init` via the per-surface `pty_host_connect_timeout_s` C field →
+/// `Client.Config.connect_timeout_s`. This is a fork-only key, so keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
+@"pty-remote-connect-timeout": u32 = 0,
+
 /// Sets the reporting format for OSC sequences that request color information.
 /// Ghostty currently supports OSC 10 (foreground), OSC 11 (background), and
 /// OSC 4 (256 color palette) queries, and by default the reported values
@@ -11997,6 +12009,46 @@ test "pty-remote-ssh-options parse" {
             "-J jump.example.ts.net -i ~/.ssh/id_ed25519",
             cfg.@"pty-remote-ssh-options".?,
         );
+    }
+}
+
+test "pty-remote-connect-timeout parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default is 0 (= use the compiled-in per-attempt ceiling).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(@as(u32, 0), cfg.@"pty-remote-connect-timeout");
+    }
+
+    // Explicit positive value parses.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-connect-timeout=15",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(@as(u32, 15), cfg.@"pty-remote-connect-timeout");
+    }
+
+    // Round-trips through clone (the Config copy path).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-connect-timeout=7",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+
+        var cfg2 = try cfg.clone(alloc);
+        defer cfg2.deinit();
+        try testing.expectEqual(@as(u32, 7), cfg2.@"pty-remote-connect-timeout");
     }
 }
 

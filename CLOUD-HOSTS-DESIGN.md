@@ -1,18 +1,28 @@
 # Cloud-hosted terminals — some splits run on a remote host over SSH
 
-Status: **Phase 1 implemented.** This remains the DESIGN doc (rationale + full plan of
-record); the build-ready spec is `CLOUD-HOSTS-IMPL-PLAN.md`. Phase 1 landed the multi-host
-`.client` client + registry + launch + `(host, session_id)` identity: the `pty-remote-host`
-/ `pty-remote-ssh-options` config keys, a per-surface socket override (`ghostty_surface_config_s.pty_host_socket`
-/ `host_name` + `Client.Config.host_name`), the GUI-lib-only `ghostty_probe_host` Hello→HelloAck
-handshake probe, the `new_split_on_host` / `new_tab_on_host` actions + host-picker palette,
-`RemoteHostRegistry` + `RemoteTunnelController` (SSH unix-socket tunnel supervisor with a
-handshake-gated readiness signal), restored-remote-surface `hostName` persistence + deferred
-dial-on-readiness, and the `MCPLayout`/`MCPKnowledge` surfacing. Phases 2+ (redial state
-machine, cross-host session namespacing, Linux `proc_info` arm) are not yet built. It is
-grounded in the code at HEAD (citations are `file:symbol` / `file:line`), and every claim
-about *current* behavior was verified against the source unless explicitly marked
-"unverified".
+Status: **Phases 1 + 2 implemented; Phase 3 L1 implemented (L3 deferred).** This remains the
+DESIGN doc (rationale + full plan of record); the build-ready spec is `CLOUD-HOSTS-IMPL-PLAN.md`.
+Phase 1 landed the multi-host `.client` client + registry + launch + `(host, session_id)`
+identity: the `pty-remote-host` / `pty-remote-ssh-options` config keys, a per-surface socket
+override (`ghostty_surface_config_s.pty_host_socket` / `host_name` + `Client.Config.host_name`),
+the GUI-lib-only `ghostty_probe_host` Hello→HelloAck handshake probe, the `new_split_on_host` /
+`new_tab_on_host` actions + host-picker palette, `RemoteHostRegistry` + `RemoteTunnelController`
+(SSH unix-socket tunnel supervisor with a handshake-gated readiness signal),
+restored-remote-surface `hostName` persistence + deferred dial-on-readiness, and the
+`MCPLayout`/`MCPKnowledge` surfacing. **Phase 2 (Reconnect subsystem)** added the opt-in
+IO-thread redial state machine in `termio.Client` (per-surface `Config.reconnect`, auto-set for a
+remote `.attach` surface; `xev.Async` wakeup → backoff `xev.Timer` → read-thread respawn +
+re-`Hello`/`Attach`, per-attempt handshake watchdog; NEVER a bare `sleep`), the five-state
+surface-visible connection channel (`ghostty_surface_client_state`), the `RemoteTunnelController`
+single-owner never-give-up ssh-master respawn supervisor, and the `pty-remote-connect-timeout`
+per-attempt ceiling. **Phase 3 L1** added the `HelloAck` version read + the directional `too_old`
+overlay + the `ReconnectStateOverlay` banners. **L3 (`hello_nack`) is DEFERRED** (host protocol
+change ⇒ session loss ⇒ needs a scheduled MINOR bump); cross-host session namespacing + the Linux
+`proc_info` arm (Phase 4) are not yet built. **All of Phases 2–3 are GUI-lib-only — the redial
+machine, surface Options, probe, and state accessor are NOT compiled into `ghostty-host`, so no
+host restart / no session loss.** It is grounded in the code at HEAD (citations are `file:symbol`
+/ `file:line`), and every claim about *current* behavior was verified against the source unless
+explicitly marked "unverified".
 
 ---
 
@@ -103,18 +113,23 @@ This is the load-bearing constraint for the reconnect subsystem. Confirmed:
 - `connectAndAttach` (`Client.zig:653`) calls `connectUnix` once (`Client.zig:661`); on any
   error it unwinds via errdefers and returns the error — there is **no loop, no backoff, no
   re-dial**.
-- The read thread `ReadThread.threadMainPosix` (`Client.zig:1813`) polls the socket; it does
-  **not** reconnect. **⚠️ Corrected behavior (the design originally overstated the `.attach`
-  teardown):** on a read **error** the `.attach` role `return`s/tears down (`:1856-1868`) but
-  pushes **NO** surface message; on a clean **EOF (n==0)** the `.attach` role just `break`s the
-  inner loop and re-polls (`:1870-1877`), and because the outer `poll()` uses timeout `-1` and
-  checks only the quit pipe `pollfds[1]` (`:1925`) — never the socket's `POLLHUP` — a
-  peer-closed socket **busy-loops** (read 0 → break → poll returns immediately → read 0 …). All
-  session-gone signalling (synthetic `child_exited` via `markMirrorEnded`, `Client.zig:1085`) is
-  **`is_mirror`-gated** (`:1849,1860,1866,1874,…`), so "the surface shows an error" is a
-  **mirror-only** behavior — a `.attach` transport drop surfaces nothing today. Phase 2 must add
-  explicit `.attach` EOF/`POLLHUP`/error teardown + a named surface state before any redial loop
-  can hook it.
+- The read thread `ReadThread.threadMainPosix` polls the socket; the *connect* is still
+  single-shot (the read thread never re-dials — a drop hands off to the IO-thread redial
+  machine). **⚠️ Corrected behavior at design time (the design originally overstated the
+  `.attach` teardown):** on a read **error** the `.attach` role `return`ed but pushed **NO**
+  surface message; on a clean **EOF (n==0)** the `.attach` role just `break`ed the inner loop and
+  re-polled, and because the outer `poll()` used timeout `-1` and checked only the quit pipe —
+  never the socket's `POLLHUP` — a peer-closed socket **busy-looped** (read 0 → break → poll
+  returns immediately → read 0 …). All session-gone signalling (synthetic `child_exited` via
+  `markMirrorEnded`) was **`is_mirror`-gated**, so a `.attach` transport drop surfaced nothing.
+  **✅ Phase 2 FIXED this:** every `.attach` drop path — EOF, read-error, fatal push/decode/
+  `handleFrame`, poll-error, and a NEW `POLLHUP`/`POLLERR`-without-`POLLIN` check — now routes
+  through `ReadThread.onAttachDrop`, which classifies a surface-visible `Client.State` (the pure
+  `classifyDrop`: `cannot_handshake` before any `HelloAck`, else `reconnecting` for a reconnect
+  client / leave-state for local single-shot) and `return`s to exit the loop **cleanly** (no
+  busy-loop), then wakes the IO-thread redial machine for a reconnect client. A `local`/
+  single-shot client (`Config.reconnect == false`) never redials and simply keeps its frozen last
+  frame — today's local behavior, minus the busy-loop.
 - `CLAUDE.md` ("App Nap opt-out") documents the rationale explicitly: *"the host connection is
   opened from per-surface IO threads at surface creation and is single-shot (no retry — see
   `src/termio/Client.zig` `connectAndAttach`)"*, and that a reconnect was **deliberately
@@ -424,11 +439,14 @@ single-shot (the KeepAlive LaunchAgent assumption is still valid locally — do 
 ### Reconnecting UX (never a silent blank pane)
 
 While redialing, draw a **reconnecting overlay** on the split (frozen last frame dimmed + a
-"Reconnecting to cloud-1…" banner), reusing the mirror-ended/dimming machinery
-(`markMirrorEnded`, declared at `Client.zig:1085`; the self-locking wrapper delegates to
-`markMirrorEndedLocked` at `:1052`). Distinguish three terminal states visibly:
-"reconnecting" (transient), "session ended" (child exited / unknown id after host restart),
-and "host unreachable / version mismatch" (loud error, see fleet versioning).
+"Reconnecting to cloud-1…" banner). **✅ IMPLEMENTED** as a dedicated SwiftUI
+`ReconnectStateOverlay` (NOT a reuse of the mirror-ended `markMirrorEnded` path — that stays
+mirror-only): it polls the lock-free `ghostty_surface_client_state` accessor and renders the pure
+`reconnectBanner(state)` over the dimmed frame. The design's original three states became **five**
+(see the design rule under "Fleet versioning"): `reconnecting` (transient), `session_ended`
+(reattach returned a different id after host restart), `cannot_handshake` (EOF before ack —
+ambiguous), `too_old` (decoded-ack MAJOR mismatch — loud + directional), `unreachable` (tunnel
+dial failed).
 
 ---
 
@@ -544,25 +562,33 @@ Today the GUI does **not** inspect versions and a mismatch is only a socket clos
 above). With a *fleet* of independently-deployed hosts (some cloud boxes will lag the laptop's
 host build), this becomes the dominant failure mode and **must be loud**.
 
-- **Each peer declares its supported version window.** The `Hello`/`HelloAck` already carry
-  `major` + `minor` (`protocol.zig:462,497`). Add a *minimum required major/minor* to the
-  handshake (either additional Hello fields — additive, minor-gated — or interpret the existing
-  major as the compat key it already is). The host already refuses a wrong major
-  (`Server.zig:1142`).
-- **The GUI MUST read `HelloAck` and validate the negotiated version** (it does not today). On
-  the client read of `HelloAck`, compare host major/minor against the GUI's requirement; on
-  incompatibility, transition the surface to a **loud, actionable error state** rather than a
-  blank/generic-connect-fail pane:
-  > `cloud-1: ghostty-host is too old (host protocol 1.2, this GUI needs ≥ 1.4). Redeploy
-  > ghostty-host on cloud-1 (see CLOUD-HOSTS-DESIGN.md → Deployment).`
-- **The host side should also surface a reason on refuse.** Today it closes silently
-  (`Server.zig:1146`). Optionally add a tiny `hello_nack{reason}` frame (additive; the GUI must
-  negotiate its awareness so an old GUI never receives an unknown tag — the same
-  minor-gating discipline). Simpler alternative that needs no host change: the GUI infers
-  "version refused" from *"connected, sent Hello, got an immediate EOF with no HelloAck"* and
-  shows the actionable message; a genuine connect failure (no socket) is a *different* message
-  ("tunnel down / host unreachable"). Prefer the no-host-change inference unless a
-  `hello_nack` is cheap to add during a scheduled host bump.
+- **The version requirement is the GUI's COMPILED constants** — NOT a new shipped-on-the-wire
+  version window. The `Hello`/`HelloAck` already carry `major` + `minor`; the GUI compares the
+  host's advertised `HelloAck` major/minor against its own compiled
+  `protocol.PROTOCOL_VERSION_MAJOR`/`MINOR` (no additional Hello fields were added). The host
+  already refuses a wrong major (`Server.zig:1142`, closes without an ack). **The MAJOR is the
+  only incompatibility axis; a MINOR gap degrades gracefully** — the host gates every new
+  host→GUI frame on the per-connection `negotiated_minor` and simply WITHHOLDS a frame the peer's
+  minor doesn't support, so a too-old-by-minor host is never an error (never `too_old`).
+- **✅ IMPLEMENTED (L1): the GUI reads + validates `HelloAck`.** The `hello_ack` arm in
+  `Client.handleFrame` (previously swallowed by the `else`) decodes the ack, records the host's
+  advertised major/minor into lock-free atomics (for the directional message), marks the
+  handshake `ack_seen`, and — for a non-mirror role — sets the surface state to **`too_old`**
+  ONLY on a MAJOR mismatch. The `ReconnectStateOverlay` renders that as a loud, actionable,
+  DIRECTIONAL banner over the frozen frame:
+  > `ghostty-host on cloud-1 is too old — host protocol 1.2, but this GUI needs major 3 (it
+  > speaks 3.4). Redeploy ghostty-host on cloud-1 (see CLOUD-HOSTS-DESIGN.md → Deployment).`
+  Because the host CLOSES before the ack on a real major mismatch, the *normal* major-mismatch
+  path is actually EOF-before-ack ⇒ the ambiguous, retryable **`cannot_handshake`** state (its
+  copy claims NO specific version — distinguishing it from the confident `too_old`, which only
+  fires if a skewed/forged peer sends an ack despite a differing major). A failed tunnel dial is
+  the distinct **`unreachable`**.
+- **The host side surfacing a reason on refuse (`hello_nack`) is DEFERRED (L3).** Today it
+  closes silently (`Server.zig:1146`). A tiny additive `hello_nack{reason}` frame would make the
+  refuse explicit, but it is a **host protocol change**, and rebuilding `ghostty-host` ends every
+  live RAM-only session — so it must ride a *scheduled* MINOR bump, not this phase. The shipped
+  behavior is the no-host-change inference above (EOF-before-ack ⇒ `cannot_handshake`;
+  decoded-ack major mismatch ⇒ `too_old`; connect failure ⇒ `unreachable`).
 - **Reuse the existing non-destructive reload discipline** (`CLAUDE.md` "First-launch-setup" →
   reload identity): a MAJOR bump is a breaking fleet event; treat the fleet like the colleague
   fleet — bump `host_reload_epoch` / minor first so peers record identity, and never leave a
@@ -570,8 +596,14 @@ host build), this becomes the dominant failure mode and **must be loud**.
   exactly what the loud error prevents.
 
 **Design rule for this doc's whole feature:** any connect/handshake/version failure resolves to
-one of three *named, actionable* surface states — **reconnecting**, **session ended**, **host
-unreachable / too old** — never an unexplained blank pane.
+a *named, actionable* surface state — never an unexplained blank pane. The implementation
+(`termio.Client.State` ⇄ C `ghostty_client_state_e` ⇄ Swift `ClientState`) splits the original
+"three states" into **five**: **reconnecting** (transient, drop in flight), **session_ended**
+(host restarted → reattach returned a different id), **cannot_handshake** (connected but EOF
+before any `HelloAck` — ambiguous: starting up / down / incompatible), **too_old** (decoded a
+`HelloAck` with a mismatched MAJOR — confident + directional), **unreachable** (the tunnel dial
+failed). `ok` is the sixth, normal, no-overlay value (and the value a `.exec`/local surface
+always reports).
 
 ---
 
@@ -755,12 +787,24 @@ Build a rendering + reconnecting remote split **before** any agent-ecosystem wor
   `new_split_on_host` + palette. Tunnel supervisor **basic** (bring-up on first surface, no
   auto-respawn yet). Deliverable: mix local + cloud splits in one window; cloud split survives
   a **GUI restart** (reattach by `(host, session_id)`).
-- **Phase 2 — Reconnect subsystem.** Layer-1 respawn/keepalive/readiness + Layer-2 redial loop +
-  reconnecting overlay. Deliverable: cloud split survives **sleep / WiFi roam / Tailscale
-  reconnect** without a manual restart.
-- **Phase 3 — Loud fleet versioning.** GUI reads/validates `HelloAck`; the three named error
-  states; (optional) `hello_nack`. Deliverable: an old cloud host shows an actionable message,
-  never a blank pane.
+- **Phase 2 — Reconnect subsystem. ✅ IMPLEMENTED.** Layer-1 ssh-master respawn/readiness
+  (`RemoteTunnelController` single-owner supervisor: surface refcount + never-give-up
+  `respawnDelay` backoff + `ssh -O check`/`ssh -O exit` health/clean) + Layer-2 IO-thread redial
+  state machine (`termio.Client`: opt-in `Config.reconnect`, `xev.Async` wakeup → backoff
+  `xev.Timer` → read-thread respawn + re-`Hello`/`Attach`, per-attempt handshake watchdog) +
+  the reconnect overlay (`ReconnectStateOverlay` over the frozen, dimmed last frame). Local
+  stays byte-for-byte single-shot (`reconnect=false`). Deliverable: cloud split survives
+  **sleep / WiFi roam / Tailscale reconnect** without a manual restart.
+- **Phase 3 — Loud fleet versioning. L1 ✅ IMPLEMENTED; L3 DEFERRED.** The GUI now reads +
+  validates `HelloAck` (the `hello_ack` arm in `Client.handleFrame` records the host's advertised
+  major/minor and sets the **directional `too_old`** state on a MAJOR mismatch); the named error
+  states (`too_old` / `cannot_handshake` / `unreachable` / `session_ended`) render as actionable
+  banners (L1, `reconnectBanner`). **L3 (a `hello_nack{reason}` frame) is DEFERRED** — it is a
+  host protocol change, and rebuilding the host ends every live RAM-only session, so it must ride
+  a *scheduled* MINOR bump (not shipped in this phase). Until then a version refuse is inferred
+  (host closes before `HelloAck` ⇒ the ambiguous `cannot_handshake`; a decoded-ack major mismatch
+  ⇒ the confident `too_old`). Deliverable: an old cloud host shows an actionable message, never a
+  blank pane.
 - **Phase 4 — Cross-host agent ecosystem.** Env self-ID injection, hook self-ID branch, MCP over
   tailnet, `(host, session)` correlation in dashboard/queue/manager, Linux `/proc` port for
   `foreground_pid`/`process_info`, per-queue `host`, claude/node/billing docs. Deliverable: an
@@ -792,8 +836,10 @@ Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend t
 6. **Billing visibility** — a cloud agent bills the box's Claude account, invisible to the
    laptop's `get_haiku_usage`. Do we want a cross-host usage aggregation, or is per-box
    accounting acceptable? (Recommend: acceptable for v1; document it.)
-7. **App-Nap + redial** — confirm the redial backoff uses a poll/eventfd wait (not a bare
-   `sleep`) so a backgrounded IO thread still redials and still honors the quit pipe.
+7. **App-Nap + redial** — ✅ SETTLED: poll on the read thread's quit self-pipe. The backoff is
+   an `xev.Timer` on the IO loop (NEVER a bare `sleep`), so a clean quit stops the loop and
+   cancels the timer; the read thread `poll()`s its quit self-pipe (Darwin has no eventfd), so a
+   backgrounded IO thread still redials and still honors the quit signal.
 8. **Sudden multi-host id collision** — two hosts *can* mint the same random u64. `(host,
    session_id)` disambiguates for reattach, but any place that ever keys on the bare u64 across
    hosts (audit `MCPLayout`, the sidecar store) must be found and switched to the pair.
@@ -815,10 +861,12 @@ facts:
   (per-surface override wins), reading `rt_surface.pty_host_socket` / `rt_surface.host_name`
   (via `@hasField`) and threading `host_name` into `Client.Config`.
 - **`.attach` EOF behavior:** the doc claimed a `.attach` EOF "tears down the read thread and the
-  surface shows an error." Corrected: on EOF the `.attach` role `break`s and re-polls (busy-loops,
-  no `POLLHUP` check); on read error it returns but pushes NO surface message; all session-gone
-  signalling is `is_mirror`-gated. So the reconnect-UX work must ADD `.attach` teardown +
-  signalling from scratch (plan Phase 2, task G).
+  surface shows an error." Corrected: at design time, on EOF the `.attach` role `break`ed and
+  re-polled (busy-looped, no `POLLHUP` check); on read error it returned but pushed NO surface
+  message; all session-gone signalling was `is_mirror`-gated. **✅ Phase 2 ADDED the `.attach`
+  teardown + signalling from scratch** (task G): every drop (EOF / read-error / fatal decode /
+  poll-error / `POLLHUP`) now routes through `ReadThread.onAttachDrop`, exits the loop cleanly
+  (no busy-loop), classifies a surface-visible `Client.State`, and wakes the IO-thread redial.
 - **`markMirrorEnded` line:** declared at `Client.zig:1085` (self-locking wrapper → `:1052`
   `markMirrorEndedLocked`), not `:1066` (that's inside the doc-comment).
 - **Linux portability:** `foreground_pid` ALREADY works on Linux (`pty.zig:274-282` `tcgetpgrp`);
@@ -832,13 +880,17 @@ facts:
 
 Open-question dispositions (full rationale + `planImpact` in the plan): OQ1 → RepeatableString
 `pty-remote-host`, Swift-side grammar, no new C API. OQ2 → GUI reads/validates HelloAck now
-(no host change); a MAJOR mismatch is an AMBIGUOUS retryable "cannot handshake" state (never an
-inferred "too old"); `hello_nack` deferred to a scheduled MINOR bump. OQ3 → per-queue `host`
+(no host change), against its COMPILED `PROTOCOL_VERSION_MAJOR`/`MINOR` (no new Hello fields). A
+MINOR gap DEGRADES (host withholds frames on `negotiated_minor`, never an error). The host's real
+major-mismatch close path is EOF-before-ack ⇒ the AMBIGUOUS retryable `cannot_handshake` state; a
+DECODED-ack MAJOR mismatch ⇒ the confident, directional `too_old` (L1 shipped). `hello_nack` (L3)
+deferred to a scheduled MINOR bump (host rebuild = session loss). OQ3 → per-queue `host`
 (provider laptop-side, agent cloud-side). OQ4 → BOTH `pty-remote-project-directory` bases + cached
 `ssh find` over the ControlMaster. OQ5 → Phases 0–2 ship with ZERO host changes; only
 `proc_info.zig` needs a Linux arm (Phase 4). OQ6 → per-box billing, docs-only (`get_haiku_usage`
 never tracked work-agent spend). OQ7 → `poll()` on the read thread's quit self-pipe (Darwin has no
-eventfd), settled. OQ8 → namespace by host LAPTOP-SIDE only (no protocol change); exhaustive site
+eventfd); the redial backoff is an `xev.Timer` on the IO loop (never a bare `sleep`), cancelled
+when a clean quit stops the loop. Settled + IMPLEMENTED. OQ8 → namespace by host LAPTOP-SIDE only (no protocol change); exhaustive site
 list (incl. the dashboard `AgentStateStore`/`manualOrder` stores, `AgentPreviewTile` `.id`/dial,
 and WebMonitor `routeStream` the original note missed) is in the plan (§D3, tasks Q3–Q4).
 

@@ -277,6 +277,10 @@ pty-host = /Users/you/.ghostty-ramon-host.sock
 # pty-remote-host = cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock
 # Extra ssh flags applied to every tunnel (jump host, identity file, port, …):
 # pty-remote-ssh-options = -J jump.example.ts.net -i ~/.ssh/id_ed25519
+# Per-attempt connection ceiling (SECONDS) for a remote split's mid-session
+# redial + the tunnel supervisor's ssh-master respawn. 0 (the default) = the
+# compiled-in default (10s). Only affects REMOTE hosts (local never redials).
+# pty-remote-connect-timeout = 30
 
 # --- Web monitor (fork-only) -------------------------------------------------
 # GUI-embedded HTTP server: watch/drive splits from a phone over Tailscale.
