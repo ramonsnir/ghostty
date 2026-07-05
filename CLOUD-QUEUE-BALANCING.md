@@ -1,6 +1,17 @@
 # Per-queue multi-host load balancing — a queue's `host` becomes a weighted host POOL
 
-Status: **DESIGN + build-ready plan (Phase 5 of cloud-hosts).** Cloud-hosts Phases 1–4 are
+Status: **IMPLEMENTED — v1 (concurrency-only), sidecar + docs.** Phase 5.0 (pure selector +
+config/validate), 5.1 (placement wired into dispatch + schedule + the down-host degrade), and 5.2
+(the `hostCapacity` attribution + per-host status rows) are done in `macos/agent-manager/src/queue/`
+(`hostpool.ts` NEW + `types.ts`/`templates.ts`/`runner.ts`/`status.ts`/`../mcp.ts`), fully unit-tested
+(`hostpool.test.ts` + additions to `templates`/`status`/`runner`/`mcp` `.test.ts`). Per-host
+**`maxItems`** is honored by the selector for forward-compat but NOT yet enforced in the runner
+(v1 = concurrency-only; the persisted per-host counter is the deferred v1.1 / Phase 5.3 item, along
+with the `hosts[]` readiness hint from `RemoteTunnelController.handshaked` and the Swift `hostCapacity`
+decode/render). See AGENT-QUEUE.md → "Multi-host load balancing" + "Implementation notes → Multi-host
+load balancing" for the shipped wiring + tests.
+
+Cloud-hosts Phases 1–4 are
 implemented + committed at this checkout — a per-queue scalar `host` already places an Agent Queue's
 AGENT splits on ONE remote box (provider laptop-side, agent cloud-side), with `Assignment.hostName`
 persisted + re-adopted by the `(hostName, sessionID)` pair. This doc turns that single `host` field
@@ -225,7 +236,12 @@ The build MUST fix this. Three changes, NONE needing a new wire (v1 minimum), + 
    the host.
 
 **The per-run host cooldown is the load-bearing mitigation for the "down-host magnet" blocker** (model on
-the existing item-level `run.cooldown`, `:933`/`:972-974`). **RECOMMENDED enhancement (v1.1, still no
+the existing item-level `run.cooldown`, `:933`/`:972-974`). **⚠️ The cooldown NEVER cools `"local"`** — in
+a scalar/local pool `"local"` is the sole host AND is itself in `selectHost`'s `exclude` set, so cooling it
+would make `selectHost` return null for EVERY item (and schedule) and freeze the whole run for the backoff
+window. BOTH spawn-throw catches guard this identically (`if (templateHost !== "local")`): `dispatchOne`'s
+rollback AND `dispatchSchedule`'s catch — a transient LOCAL schedule spawn error must just defer the sweep,
+not wedge work-item dispatch or mis-attribute `hostCapacity`. **RECOMMENDED enhancement (v1.1, still no
 host/protocol change):** a `hosts[]` readiness array from `RemoteTunnelController.handshaked` forwarded on
 the EXISTING `report_queue_status` path, letting `selectHost` pre-emptively `exclude` an unhandshaked box
 (a Swift→sidecar wire on an existing report — NOT a new tool/protocol). v1 works via cooldown +

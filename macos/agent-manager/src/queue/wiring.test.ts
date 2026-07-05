@@ -224,6 +224,38 @@ test("loadTemplateAtPath: an absent path is a not-found LoadResult (no throw)", 
   assert.equal(res.ok, false);
 });
 
+test("loadTemplateAtPath: a hosts[] POOL with a REMOTE box routes remoteTemplateDir into agent.command's {templateDir}", () => {
+  // (cloud-hosts Phase 5) A pool-only template's scalar `host` defaults "local", so the
+  // {templateDir} routing must key off the NORMALIZED pool (any remote host), NOT the scalar.
+  const root = tmpTree();
+  try {
+    const remote = "/home/user/git/proj/.queues";
+    const obj = {
+      name: "pool-remote",
+      hosts: [{ name: "local", maxConcurrent: 1 }, { name: "cloud-a", maxConcurrent: 2 }],
+      workdir: "~/git/proj",
+      agentWorkdir: "/home/user/git/proj",
+      remoteTemplateDir: remote,
+      agent: { command: "{templateDir}/agent.sh" },
+      provider: {
+        list: { command: ["{templateDir}/list.sh"], keyField: "id" },
+        status: { command: ["status", "{key}"], doneStates: ["done"] },
+      },
+    };
+    const path = join(root, "pool.json");
+    writeFileSync(path, JSON.stringify(obj), "utf8");
+    const res = loadTemplateAtPath(path);
+    assert.ok(res.ok, res.ok ? "" : res.errors.join("; "));
+    if (!res.ok) return;
+    // agent.command (runs ON THE BOX) → the REMOTE dir (the pool has a cloud host).
+    assert.equal(res.template.agent.command, `${remote}/agent.sh`);
+    // The provider (runs LAPTOP-side) → the laptop dir.
+    assert.deepEqual(res.template.provider.list.command, [join(dirname(path), "list.sh")]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // --- makeFileRunFactory (threads the resolved path onto the run, §3) --------
 
 test("makeFileRunFactory: the produced run carries templatePath + templateDir", () => {

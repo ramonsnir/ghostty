@@ -252,6 +252,7 @@ export class McpClient {
       heroMax: status.heroMax,     // (hero) fleet-wide agent-queue-hero-max (0 = disabled)
       heroActive: status.heroActive, // (hero) fleet-wide live-hero count (heroActiveGlobal)
       schedules: status.schedules, // (schedules) the Schedules-lane rows
+      hosts: status.hosts,         // (cloud-hosts Phase 5) per-host pool rows (name/active/maxConcurrent)
     });
   }
 

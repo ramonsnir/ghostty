@@ -378,6 +378,56 @@ What the split means:
   CLOUD-HOSTS-DESIGN.md → Linux). The cloud agent bills the box's own Claude account (see
   AGENT-MANAGER.md → billing scope).
 
+## Multi-host load balancing — `host` becomes a weighted host POOL (cloud-hosts Phase 5)
+
+*(fork-only, cloud-hosts Phase 5; sidecar + GUI-lib only, NO host/protocol change.)* A single queue
+can declare a **POOL of hosts** and let the supervisor **spread its agents across them by capacity**.
+Instead of the scalar `host`, give the template a **`hosts[]`** array; each entry carries a per-host
+**`maxConcurrent`** (concurrent-agent cap — the PRIMARY knob) plus an optional **`weight`**
+(a capacity-independent bias) and an optional **`maxItems`** (per-host lifetime budget, forward-compat):
+
+```jsonc
+{
+  "name": "backlog",
+  "hosts": [
+    { "name": "local",   "maxConcurrent": 2 },
+    { "name": "cloud-a",  "maxConcurrent": 4, "weight": 1 },
+    { "name": "cloud-b",  "maxConcurrent": 4, "weight": 2 }
+  ],
+  "agentWorkdir": "/home/user/git/project-a",
+  "remoteTemplateDir": "/home/user/git/project-a/.ghostty/queues",
+  "concurrency": 8, "maxItems": 40
+}
+```
+
+- **Placement = weighted-LEAST-LOADED.** Each new agent goes to the pool host that minimizes
+  `activeOnHost / (maxConcurrent × weight)` among hosts with a free slot (a deterministic argmin;
+  ties resolve to the FIRST-DECLARED host). `maxConcurrent` is the primary knob (a bigger box gets
+  proportionally more agents); `weight` (default 1) biases placement toward a box *beyond* its raw
+  slot count (weight 2 halves its per-slot cost). It is NOT round-robin — placement is a pure
+  function of current occupancy, which is reconstructed for free every sweep from the persisted
+  per-agent host, so a GUI/sidecar **restart re-derives identical placements** (no rotation cursor).
+- **`maxConcurrent` is FLEET-WIDE** (a box is shared): if two queues each declare `maxConcurrent: 3`
+  for the same box, the box holds **3** agents total, not 6. It counts EVERY physical pane on the box
+  (regular + hero + schedule).
+- **A full / down pool makes the item WAIT** with a clear **`hostCapacity`** reason (surfaced in the
+  dashboard's "N waiting" dropdown + backlog tooltip), computed only *after* the item's other gates
+  (concurrency / maxItems / hero) clear — so you're never told to bump `maxItems` when the real block
+  is a full box. The item is never silently dropped or double-dispatched.
+- **A down box degrades gracefully.** A spawn to a down box (or a remote deferred-dial that never
+  attaches) is rolled back and the box is put on a short **cooldown**, so the next sweep routes the
+  (still-listed) item to a healthy box. A stuck REMOTE session-0 does **not** disable the whole run
+  (only a genuine *laptop* no-pty-host does).
+- **Heroes + schedules pick a host by the SAME selector.** A hero counts against a box's
+  `maxConcurrent` but its promotion never blocks; a schedule counts against `maxConcurrent` but
+  bypasses throughput caps and simply DEFERS a sweep when every box is full.
+- **Back-compat is byte-identical.** Omit `hosts[]` and the scalar `host` (default `"local"`) is used
+  as a single UNBOUNDED-capacity pool — the only limiter stays `concurrency`/`agent-queue-max-total`/
+  `maxItems`, exactly as before. `hosts[]` WINS over `host` when both are present.
+- **Precondition (DOC-ONLY, unenforced):** the working set (repo / `agentWorkdir` / `{templateDir}`)
+  must exist on EVERY pool host — the same layout on each box. There is no filesystem preflight; a
+  wrong-cwd box surfaces only as a spawn failure (→ down-host cooldown) or a stuck session.
+
 ## Starting / controlling a queue
 
 - **Start:** the `start_agent_queue` keybind action (bind it in your fork config, e.g.
@@ -2115,3 +2165,70 @@ or host change** (pure Swift + TS).
   **restart re-adopt-by-sessionID + re-stamp**), `mcp.test.ts` (coerce whitelist), `status.test.ts`;
   Swift `MCPAnnotationTests` (parse + merge), `MCPServerTests` (`scheduleId` emit), `QueuePaletteTests`
   (command round-trip + status decode).
+
+### Multi-host load balancing — a weighted host POOL (cloud-hosts Phase 5)
+
+The scalar `host` becomes an OPTIONAL weighted **`hosts[]`** pool, and the supervisor spreads a
+queue's agents across it by **weighted-least-loaded** placement. **Sidecar + GUI-lib only — NO host /
+protocol / wire change:** placement is chosen from the ALREADY-persisted per-agent host
+(`Assignment.hostName`, Phase 4) and delivered through the EXISTING `spawn_split_command` `host` arg;
+the only new wire field is an ADDITIVE `hosts[]` array on the already-forwarded `report_queue_status`.
+
+- **The pure selector** lives in `queue/hostpool.ts` (NEW): `HostSpec {name, weight?, maxConcurrent,
+  maxItems?}` + `HostLoad {active, lifetime}` + `normalizeHostPool(t)` (scalar/omitted `host` → a
+  single `+Infinity`-cap entry; `hosts[]` → those entries, weight defaulted to 1) + `selectHost(pool,
+  load, {exclude?})` → `argmin(active / (maxConcurrent × weight))` over free-slot candidates, STRICT
+  `<` tie-break in DECLARATION ORDER (a function of ONLY pool order + the load map — so a post-restart
+  sweep re-derives identical placements, **no persisted cursor**). A `+Infinity`-cap entry (scalar
+  back-compat) scores 0 and always wins its singleton. `null` ⇒ no host has a free slot ⇒ the item
+  WAITS. `maxItems` per-host is honored by the selector (forward-compat) but the runner passes
+  `lifetime = 0` in v1 (**v1 = concurrency-only**; per-host lifetime needs a persisted counter,
+  deferred to v1.1 — no store change, so restart occupancy rides `Assignment.hostName`).
+- **Fleet-wide occupancy** — `totalActiveOnHostRegistry(registry): Map<string, HostLoad>`
+  (`runner.ts`, modeled on `totalHeroActiveRegistry`) folds EVERY run's `active` (`occupiesSlot`) +
+  `scheduleActive` by `hostName ?? "local"` (every physical pane — the box's CPU ignores the grid).
+  Seeded ONCE per sweep into a mutable `hostActive` map (beside `globalRemaining`/`heroRemaining`),
+  threaded runOne → dispatchCandidates → dispatchOne / scheduleSweep → dispatchSchedule, and
+  INCREMENTED at each synchronous seat (`bumpHostLoad`) so **within-sweep greedy** placement (dispatch
+  N sees N−1) never overshoots `maxConcurrent`.
+- **dispatchOne (the sibling PLACEMENT gate, AFTER the count gates):** `selectHost(normalizeHostPool(t),
+  hostActive, {exclude: activeHostCooldown(run, now)})` replaces `templateHost = t.host`; `null` ⇒
+  return false BEFORE any seat/latch/counter mutation (mirrors the `slot === null` early return), so a
+  full pool never over-burns `maxItems` or double-dispatches. The chosen host flows unchanged to the
+  record (`hostName`) + the spawn `host` arg.
+- **Down-host degrade (the #1 risk — "least-loaded routes to the emptiest, and a DOWN box looks
+  emptiest"):** on a spawn THROW, `dispatchOne`'s existing rollback also `unbumpHostLoad`s + puts the
+  host on a bounded **`run.hostCooldown`** (`DEFAULT_HOST_COOLDOWN_MS` ≈2 min; `selectHost` excludes
+  cooling hosts), leaving the (un-latched, uncooled) item to fail OVER to a healthy box next sweep. A
+  remote deferred-dial to a down box instead "succeeds" with session-0 → the `no-pty-host` reconcile
+  prune is now **host-scoped** (`runOne`): a `local` session-0 still self-disables the whole run (§2
+  unchanged), but a REMOTE one cools the host + releases the burned lifetime slot + frees the item and
+  does NOT disable the run.
+- **`hostCapacity` attribution (`status.ts`, the gate↔attribution mirror):** a new
+  `"hostCapacity"` `BlockReason`, pushed by `blockReasonsFor` ONLY when the item cleared its OTHER
+  pool gates (nothing else pushed) AND `anyHostHasFreeSlot === false`. `reportQueueStatus` feeds
+  `anyHostHasFreeSlot` from the SAME `selectHost` + `totalActiveOnHostRegistry` the dispatcher uses
+  (so the mirror can't drift) + a per-host `hosts[]` (`{name, active, maxConcurrent|null}`) echoed to
+  the report and forwarded in `mcp.ts`.
+- **Heroes + schedules** pick a host by the SAME `selectHost` (both count against `maxConcurrent`); a
+  hero's promotion never re-places (never blocks), and a schedule DEFERS a sweep (no block reason)
+  when every host is full.
+- **Back-compat:** a scalar/local queue normalizes to one `+Infinity`-cap entry → `selectHost` always
+  returns it, `anyHostHasFreeSlot` always true, no `host` arg on the spawn — byte-identical. `hosts[]`
+  is whitelisted in `validateTemplate` via the new pure `validateHostPool` (name req, `maxConcurrent`
+  positive int, `weight > 0`, `maxItems` positive int, name-dedup) — omission would silently drop the
+  pool (the `validateProviderList`/`coerceQueueCommands` chokepoint lesson).
+
+Wiring: `queue/hostpool.ts` (NEW: `HostSpec`/`HostLoad`/`normalizeHostPool`/`selectHost`),
+`queue/types.ts` (`QueueTemplate.hosts?` + `"hostCapacity"` BlockReason), `queue/templates.ts`
+(`validateHostPool` + whitelist), `queue/runner.ts` (`totalActiveOnHostRegistry`/`bumpHostLoad`/
+`unbumpHostLoad`/`hostCooldownUntil`/`activeHostCooldown` + `run.hostCooldown` + `hostActive`
+threading + dispatchOne/dispatchSchedule selectHost + host-scoped no-pty-host prune + report inputs),
+`queue/status.ts` (`HostStatus` + `hosts`/`anyHostHasFreeSlot` inputs + `hostCapacity` push),
+`mcp.ts` (`report_queue_status` `hosts` forward). Tests: `queue/hostpool.test.ts` (NEW — weighting /
+cap-skip / all-full→null / greedy sequence / tie-break determinism / scalar back-compat / cooldown-
+skip / maxItems-exhaustion), `queue/templates.test.ts` (`validateHostPool`), `queue/status.test.ts`
+(`hostCapacity` attribution + `hosts` echo), `queue/runner.test.ts` (greedy spread / full-pool WAIT +
+`hostCapacity` / fleet-wide cap across two queues / down-host spawn-throw fail-over + cooldown /
+remote session-0 cools host + no self-disable / local session-0 still self-disables / scalar
+byte-identical / `totalActiveOnHostRegistry` fold), `mcp.test.ts` (`hosts` wire forward).

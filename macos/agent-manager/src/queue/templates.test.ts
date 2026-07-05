@@ -708,6 +708,85 @@ test("validateTemplate: a non-string host / empty agentWorkdir => error (not sil
   assert.equal(validateTemplate(badWd).ok, false);
 });
 
+// ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) validateHostPool.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: hosts absent => no pool (the scalar host is used as a single-entry pool)", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.hosts, undefined);
+});
+
+test("validateTemplate: a hosts[] POOL is WHITELISTED (not dropped) with weight defaulted to 1", () => {
+  const obj = goodTemplateObj();
+  obj.hosts = [
+    { name: "local", maxConcurrent: 2 },
+    { name: "cloud-a", maxConcurrent: 4, weight: 2, maxItems: 10 },
+  ];
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  if (!r.ok) return;
+  assert.deepEqual(r.template.hosts, [
+    { name: "local", weight: 1, maxConcurrent: 2 },
+    { name: "cloud-a", weight: 2, maxConcurrent: 4, maxItems: 10 },
+  ]);
+  // The scalar `host` still defaults to "local" alongside the pool (kept for back-compat).
+  assert.equal(r.template.host, "local");
+});
+
+test("validateTemplate: hosts entry needs name + positive maxConcurrent", () => {
+  const noName = goodTemplateObj();
+  noName.hosts = [{ maxConcurrent: 2 }];
+  assert.equal(validateTemplate(noName).ok, false);
+  const noCap = goodTemplateObj();
+  noCap.hosts = [{ name: "cloud-a" }];
+  assert.equal(validateTemplate(noCap).ok, false);
+  const zeroCap = goodTemplateObj();
+  zeroCap.hosts = [{ name: "cloud-a", maxConcurrent: 0 }];
+  assert.equal(validateTemplate(zeroCap).ok, false);
+  const negCap = goodTemplateObj();
+  negCap.hosts = [{ name: "cloud-a", maxConcurrent: -1 }];
+  assert.equal(validateTemplate(negCap).ok, false);
+});
+
+test("validateTemplate: hosts weight must be > 0 when present (0 divides by zero)", () => {
+  const zeroW = goodTemplateObj();
+  zeroW.hosts = [{ name: "cloud-a", maxConcurrent: 2, weight: 0 }];
+  assert.equal(validateTemplate(zeroW).ok, false);
+  const negW = goodTemplateObj();
+  negW.hosts = [{ name: "cloud-a", maxConcurrent: 2, weight: -1 }];
+  assert.equal(validateTemplate(negW).ok, false);
+});
+
+test("validateTemplate: hosts maxItems must be a positive int when present", () => {
+  const badMax = goodTemplateObj();
+  badMax.hosts = [{ name: "cloud-a", maxConcurrent: 2, maxItems: 0 }];
+  assert.equal(validateTemplate(badMax).ok, false);
+});
+
+test("validateTemplate: a DUPLICATE host name in the pool is rejected", () => {
+  const dup = goodTemplateObj();
+  dup.hosts = [
+    { name: "cloud-a", maxConcurrent: 2 },
+    { name: "cloud-a", maxConcurrent: 4 },
+  ];
+  const r = validateTemplate(dup);
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(r.errors.some((e) => e.includes("duplicated")), r.errors.join("; "));
+});
+
+test("validateTemplate: hosts must be a non-empty array (not-array / empty => error)", () => {
+  const notArr = goodTemplateObj();
+  notArr.hosts = { name: "cloud-a", maxConcurrent: 2 };
+  assert.equal(validateTemplate(notArr).ok, false);
+  const empty = goodTemplateObj();
+  empty.hosts = [];
+  assert.equal(validateTemplate(empty).ok, false);
+});
+
 /** A token template that ALSO targets a remote host, for the two-dir routing test. */
 function remoteTokenTemplate(): QueueTemplate {
   const obj: Record<string, unknown> = {

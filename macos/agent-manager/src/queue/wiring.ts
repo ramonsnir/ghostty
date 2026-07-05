@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { RunFactory } from "./commands.js";
+import { normalizeHostPool } from "./hostpool.js";
 import type { Exec, ExecOptions, ExecResult } from "./provider.js";
 import {
   loadActiveRuns as loadActiveRunRecords,
@@ -239,10 +240,18 @@ export function loadTemplateAtPath(path: string): LoadResult {
     // `agent.command`. A local run (or no remoteTemplateDir) uses the laptop dir on both sides
     // (byte-identical to the prior single-dir substitution).
     const laptopDir = dirname(path);
-    const tHost = res.template.host ?? "local";
-    const isRemote = tHost !== "local" && tHost.length > 0;
+    // (cloud-hosts Phase 5) "Remote" for the `agent.command` `{templateDir}` routing = ANY host in
+    // the NORMALIZED pool is non-local (covers both the scalar `host` and a `hosts[]` pool — a
+    // pool-only template's scalar `host` defaults "local", so keying off it alone would wrongly
+    // route the LAPTOP dir into agent.command for a cloud pool). A LOCAL-only queue uses the laptop
+    // dir on both sides (byte-identical). (Per-entry dirs for a MIXED pool remain a v1.1 non-goal —
+    // the single load-time substitution can't diverge per dispatch; templates that mix local + cloud
+    // should deliver the dir via the per-dispatch `GHOSTTY_QUEUE_TEMPLATE_DIR` env instead.)
+    const anyRemote = normalizeHostPool(res.template).some(
+      (h) => h.name !== "local" && h.name.length > 0,
+    );
     const agentDir =
-      isRemote && res.template.remoteTemplateDir !== undefined
+      anyRemote && res.template.remoteTemplateDir !== undefined
         ? res.template.remoteTemplateDir
         : laptopDir;
     res.template = substituteTemplateDir(res.template, laptopDir, agentDir);

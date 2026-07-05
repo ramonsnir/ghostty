@@ -405,6 +405,10 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
       heroMax: 2,
       heroActive: 1,
       schedules: [],
+      hosts: [
+        { name: "local", active: 1, maxConcurrent: 2 },
+        { name: "cloud-a", active: 3, maxConcurrent: 4 },
+      ],
     }),
   );
   assert.equal(method, "tools/call");
@@ -423,6 +427,11 @@ test("reportQueueStatus: encodes report_queue_status + forwards the fields (maxI
   // (hero) the fleet-wide globals are forwarded on the wire.
   assert.equal(args.heroMax, 2);
   assert.equal(args.heroActive, 1);
+  // (cloud-hosts Phase 5) the per-host pool rows are forwarded on the wire.
+  assert.deepEqual(args.hosts, [
+    { name: "local", active: 1, maxConcurrent: 2 },
+    { name: "cloud-a", active: 3, maxConcurrent: 4 },
+  ]);
 });
 
 test("reportQueueGraph: encodes report_queue_graph + forwards backlog + nodes", async () => {

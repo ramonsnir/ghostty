@@ -76,6 +76,23 @@ export interface QueueStatusReport {
    *  lane (see AGENT-QUEUE.md → Schedules). Empty when the template declares none. Built by the
    *  runner (the cron math lives with the run state) and echoed here unchanged. */
   schedules: ScheduleStatus[];
+  /** (cloud-hosts Phase 5) The queue's per-HOST pool rows: each declared pool host's name, its
+   *  fleet-wide live-agent count, and this queue's declared `maxConcurrent` (null = unbounded, for
+   *  the implicit scalar/local single-entry pool). Mirrors `heroMax`/`heroActive` being globals —
+   *  built by the runner from the normalized pool + the fleet load map. A scalar/local queue emits
+   *  a single `{name:"local", active, maxConcurrent:null}` row. Empty [] for a legacy build. */
+  hosts: HostStatus[];
+}
+
+/** (cloud-hosts Phase 5) One pool host's live status for the dashboard (per-box active/cap). */
+export interface HostStatus {
+  /** Registry host name ("local" = the laptop pty-host). */
+  name: string;
+  /** Fleet-wide live agents on this host right now (across every queue). */
+  active: number;
+  /** This queue's declared concurrent-agent cap on this host; `null` = unbounded (the implicit
+   *  scalar/local single-entry pool, whose only limiter is concurrency/max-total/maxItems). */
+  maxConcurrent: number | null;
 }
 
 /** (schedules) One schedule's live status for the dashboard Schedules lane. */
@@ -160,6 +177,16 @@ export interface QueueStatusInputs {
    *  assignments ∪ `list` items with a truthy `heroField`. Used to mark `next`/`running`/`held`
    *  refs so the dashboard dropdowns show a hero glyph. Defaults empty (legacy/present:false). */
   heroKeys?: ReadonlySet<string>;
+  // ----- (cloud-hosts Phase 5) multi-host inputs -----
+  /** Whether ANY host in the queue's pool has a free slot right now (fed from the SAME `selectHost`
+   *  + fleet load map the dispatcher uses, minus down-host cooldowns). When `false`, a waiting item
+   *  that cleared its OTHER gates is attributed a `hostCapacity` block reason. OMITTED (undefined)
+   *  ⇒ no `hostCapacity` attribution (legacy build / a scalar/local unbounded pool always has room,
+   *  so the runner passes `true`). NEVER attributes `hostCapacity` unless this is explicitly false. */
+  anyHostHasFreeSlot?: boolean;
+  /** The per-host pool rows (name + fleet active + declared cap), echoed to the report. [] = a
+   *  legacy build / no pool declared. */
+  hosts?: HostStatus[];
 }
 
 /**
@@ -189,6 +216,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       heroMax: input.heroMax ?? 0,
       heroActive: input.heroActive ?? 0,
       schedules: input.schedules ?? [],
+      hosts: input.hosts ?? [],
     };
   }
 
@@ -271,6 +299,15 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
       if (input.regularGlobalRemaining !== undefined && input.regularGlobalRemaining <= 0)
         reasons.push("globalConcurrency");
     }
+    // (cloud-hosts Phase 5) hostCapacity is attributed LAST and ONLY when the item cleared its
+    // OTHER pool gates (nothing pushed above) but NO pool host has a free slot — so the operator is
+    // never told to bump maxItems/concurrency when the real block is a full/down box. Applies to
+    // BOTH pools (a regular past its 3 gates, a hero past heroSlots). Never fires unless
+    // `anyHostHasFreeSlot` is explicitly false (omitted/legacy ⇒ no attribution; a scalar/local
+    // unbounded pool always has room ⇒ the runner passes true).
+    if (reasons.length === 0 && input.anyHostHasFreeSlot === false) {
+      reasons.push("hostCapacity");
+    }
     return reasons.length > 0 ? reasons : undefined;
   };
   // A waiting ref carries its block reasons (when blocked). Only `next` (waiting) items get them.
@@ -298,6 +335,7 @@ export function queueStatusReport(input: QueueStatusInputs): QueueStatusReport {
     heroMax: input.heroMax ?? 0,
     heroActive: input.heroActive ?? 0,
     schedules: input.schedules ?? [],
+    hosts: input.hosts ?? [],
   };
 }
 

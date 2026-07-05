@@ -14,6 +14,7 @@ import { statSync, readFileSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 
 import { gridCap, MAX_QUEUE_TABS } from "./grid.js";
+import type { HostSpec } from "./hostpool.js";
 import { CronParseError, parseCron } from "./schedule.js";
 import type {
   AgentSpec,
@@ -164,6 +165,12 @@ export function validateTemplate(obj: unknown): ValidateResult {
   const host = optNonEmptyStringOrDefault(rec.host, "local", "host", errors);
   const agentWorkdir = optNonEmptyString(rec.agentWorkdir, "agentWorkdir", errors);
   const remoteTemplateDir = optNonEmptyString(rec.remoteTemplateDir, "remoteTemplateDir", errors);
+  // (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) The OPTIONAL weighted host
+  // POOL. MUST be whitelisted HERE or the loader silently drops it (the `validateProviderList`/
+  // `coerceQueueCommands` chokepoint lesson) → placement would fall back to the scalar `host` and
+  // the pool would never spread. Absent ⇒ undefined (the scalar `host` is used as a single-entry
+  // pool). Scalar `host` is STILL honored either way (kept above for back-compat).
+  const hosts = validateHostPool(rec.hosts, errors);
   const params = validateParams(rec.params, errors);
   // (schedules) The recurring scan agents. Validated for shape + a parseable cron; the
   // `promptFile` field is RESOLVED to `prompt` later, in the file loader (which knows the
@@ -186,6 +193,7 @@ export function validateTemplate(obj: unknown): ValidateResult {
   const template: QueueTemplate = {
     name,
     host,
+    ...(hosts !== undefined ? { hosts } : {}),
     ...(agentWorkdir !== undefined ? { agentWorkdir } : {}),
     ...(remoteTemplateDir !== undefined ? { remoteTemplateDir } : {}),
     workdir,
@@ -267,6 +275,64 @@ function validateSchedules(v: unknown, errors: string[]): ScheduleSpec[] {
     if (command !== undefined) spec.command = command;
     if (hasPrompt) spec.prompt = (r.prompt as string).trim();
     if (hasPromptFile) spec.promptFile = (r.promptFile as string).trim();
+    out.push(spec);
+  });
+  return out;
+}
+
+/**
+ * (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) Validate the OPTIONAL weighted
+ * host `hosts[]` POOL. PURE. Modeled on `validateSchedules` (+ the `validateProviderList` heroField
+ * chokepoint lesson — an un-whitelisted field is silently dropped). Rules:
+ *   - absent ⇒ `undefined` (no pool — the scalar `host` is used as a single-entry pool).
+ *   - not an array, or an EMPTY array ⇒ an error (a declared-but-empty pool is a typo, not "local").
+ *   - each entry: `name` REQUIRED non-empty string; `maxConcurrent` REQUIRED positive int (the
+ *     PRIMARY knob); `weight` OPTIONAL positive number (default 1; `<= 0` rejected — it would
+ *     divide by zero); `maxItems` OPTIONAL positive int (v1 forward-compat, honored by the
+ *     selector's candidacy but not yet enforced in the runner).
+ *   - DEDUP `name` with a Set (a repeated box would double-seat) — mirrors validateSchedules.
+ * Returns the built specs (weight defaulted to 1) or `undefined` (absent / any error, so the
+ * template bails on `errors.length`). Reserved name `local` is allowed (the laptop pty-host).
+ */
+function validateHostPool(v: unknown, errors: string[]): HostSpec[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    errors.push("hosts must be an array of {name,maxConcurrent,weight?,maxItems?}");
+    return undefined;
+  }
+  if (v.length === 0) {
+    errors.push("hosts must be a non-empty array when present (omit it for a single-host queue)");
+    return undefined;
+  }
+  const out: HostSpec[] = [];
+  const seen = new Set<string>();
+  v.forEach((raw, i) => {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      errors.push(`hosts[${i}] must be an object {name,maxConcurrent,…}`);
+      return;
+    }
+    const r = raw as Record<string, unknown>;
+    const name = reqNonEmptyString(r.name, `hosts[${i}].name`, errors);
+    const maxConcurrent = posInt(r.maxConcurrent, `hosts[${i}].maxConcurrent`, errors);
+    let weight: number | undefined;
+    if (r.weight !== undefined) {
+      if (typeof r.weight === "number" && Number.isFinite(r.weight) && r.weight > 0) {
+        weight = r.weight;
+      } else {
+        errors.push(`hosts[${i}].weight must be a positive number`);
+      }
+    }
+    let maxItems: number | undefined;
+    if (r.maxItems !== undefined) {
+      maxItems = posInt(r.maxItems, `hosts[${i}].maxItems`, errors);
+    }
+    if (name !== undefined) {
+      if (seen.has(name)) errors.push(`hosts[${i}].name "${name}" is duplicated`);
+      seen.add(name);
+    }
+    if (name === undefined || maxConcurrent === undefined) return;
+    const spec: HostSpec = { name, weight: weight ?? 1, maxConcurrent };
+    if (maxItems !== undefined) spec.maxItems = maxItems;
     out.push(spec);
   });
   return out;

@@ -1172,6 +1172,40 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   (`AGENT-QUEUE.md` per-queue host, `AGENT-DASHBOARD.md` nonce/pair-keying, `MCP-SERVER.md` security
   model, `AGENT-MANAGER.md` billing scope).**
 
+- **Cloud-hosted terminals — Phase 5: per-queue MULTI-HOST load balancing (a queue's `host` becomes a
+  weighted host POOL).** (fork-only, macOS; sidecar + GUI-lib only, **NO host / protocol / wire /
+  Zig / Swift change** — the pool is a per-queue TEMPLATE field, not a Ghostty config key.) An Agent
+  Queue template can declare a **`hosts[]`** pool (`{name, maxConcurrent, weight?, maxItems?}`) and the
+  deterministic supervisor spreads the queue's AGENT splits across the boxes by **weighted-LEAST-
+  LOADED** placement: each new agent goes to `argmin(activeOnHost / (maxConcurrent × weight))` among
+  hosts with a free slot (NOT round-robin, NO persisted cursor — occupancy is derived LIVE from the
+  already-persisted `Assignment.hostName`, so a restart re-derives identical placements). `maxConcurrent`
+  is the PRIMARY knob and is **fleet-wide** (two queues each declaring `maxConcurrent:3` for one box cap
+  it at 3 total, not 6); `weight` (default 1) is an optional bias; per-host `maxItems` is honored by the
+  selector but **v1 is concurrency-only** (persisted per-host lifetime deferred to v1.1). A full/down
+  pool makes the item **WAIT** with a new **`hostCapacity`** BlockReason (computed only after the
+  concurrency/maxItems/hero gates clear — never misattributed), never a silent drop or double-dispatch
+  (respects the `dispatched` latch); a down box is **attempt-then-rollback + host-cooldown** so the item
+  fails over to a healthy box next sweep, and a stuck REMOTE session-0 cools the host WITHOUT disabling
+  the run (only a genuine LOCAL no-pty-host still self-disables §2). Placement is greedy WITHIN a sweep
+  (a shared `hostActive` load map bumped at each synchronous seat). Heroes + schedules pick a host by
+  the SAME selector (both count against `maxConcurrent`; a hero's promotion never blocks, a schedule
+  DEFERS when full). Scalar `host` (default `"local"`) stays valid = a single UNBOUNDED-capacity pool
+  ⇒ **byte-identical** to the pre-pool behavior; `hosts[]` WINS over `host` when both are set and is
+  whitelisted in `validateTemplate` (the field-drop chokepoint) via a new pure `validateHostPool`.
+  Wiring: sidecar `queue/hostpool.ts` (NEW — `HostSpec`/`HostLoad`/`normalizeHostPool`/`selectHost`),
+  `queue/types.ts` (`QueueTemplate.hosts?` + `"hostCapacity"` BlockReason), `queue/templates.ts`
+  (`validateHostPool`), `queue/runner.ts` (`totalActiveOnHostRegistry`/`bumpHostLoad`/`activeHostCooldown`
+  + `run.hostCooldown` + `hostActive` threading + dispatchOne/dispatchSchedule `selectHost` +
+  host-scoped no-pty-host prune + report inputs), `queue/status.ts` (`HostStatus` +
+  `anyHostHasFreeSlot`/`hosts` inputs + `hostCapacity` push), `mcp.ts` (`report_queue_status` `hosts`
+  forward). Tests: sidecar `queue/hostpool.test.ts` (NEW) + additions to `queue/templates`/`status`/
+  `runner` + `mcp` `.test.ts`. **The Swift `hostCapacity` decode/render + the `hosts[]` readiness hint
+  + persisted per-host `maxItems` are the deferred v1.1 (Phase 5.3) items.** Fork-only, template-only —
+  keep the `hosts[]` in your queue JSON under `~/.config/ghostty-ramon/agent-manager/queues/`. **GUI
+  relaunch + rebuilt sidecar `dist`; NO Zig/lib/host change.** See `CLOUD-QUEUE-BALANCING.md` (design +
+  build plan) + `AGENT-QUEUE.md` (→ Multi-host load balancing / Implementation notes).
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.

@@ -45,6 +45,7 @@ import {
   type Exec,
 } from "./provider.js";
 import { lowestFreeSlot, splitPlan, gridCap, MAX_QUEUE_TABS, packMove } from "./grid.js";
+import { normalizeHostPool, selectHost, type HostLoad } from "./hostpool.js";
 import {
   ConcurrencyBudget,
   closeSequencePlan,
@@ -85,6 +86,7 @@ import {
   type QueueStatusReport,
   type QueueGraphReport,
   type ScheduleStatus,
+  type HostStatus,
 } from "./status.js";
 import { parseSessionKey, sessionKey } from "./types.js";
 import type {
@@ -109,6 +111,16 @@ export const DEFAULT_PENDING_GRACE_MS = 30_000;
 /** Bounded wait for the child to EXIT during the close sequence (§10). On timeout the
  *  loop force-closes anyway (the gate already established done+stably-idle). */
 export const DEFAULT_AWAIT_EXITED_MS = 10_000;
+
+/**
+ * (cloud-hosts Phase 5) The per-run HOST cooldown window: how long a pool host is EXCLUDED from
+ * `selectHost` after a spawn to it fails (down tunnel) or a remote deferred-dial session-0 stays
+ * unattached past grace. ≈2 min, mirroring the item-level `DEFAULT_COOLDOWN_MS`, so a persistently
+ * dead box is quarantined (work routes to a live box) rather than re-hammered every sweep — the
+ * load-bearing mitigation for the "least-loaded routes to the emptiest, and a DOWN box looks
+ * emptiest" magnet. Cleared when it expires (dropped each sweep, like the item cooldown).
+ */
+export const DEFAULT_HOST_COOLDOWN_MS = 120_000;
 
 /**
  * One running queue. Holds the supervisor's OWNED, in-memory run state — the SINGLE
@@ -146,6 +158,12 @@ export interface QueueRun {
   active: Map<string, Assignment>;
   /** Per-key cooldown `until` timestamps (§6). */
   cooldown: Map<string, number>;
+  /** (cloud-hosts Phase 5) Per-HOST cooldown `until` timestamps: a pool host EXCLUDED from
+   *  `selectHost` for a backoff window after a spawn to it failed (down tunnel) or a remote
+   *  deferred-dial session-0 stayed unattached past grace. Mirrors `cooldown` (per-key) but keyed
+   *  by hostName — the down-host quarantine so least-loaded doesn't keep routing to a dead box.
+   *  NOT persisted (transient, like `cooldown`; rebuilt on the next failure after a restart). */
+  hostCooldown: Map<string, number>;
   /** (§7.1) The DISPATCHED LATCH: every work-item key dispatched and not yet re-armed.
    *  `selectCandidates` SUPPRESSES any key in here — a re-dispatch is BLOCKED ENTIRELY
    *  (not merely time-cooled like `cooldown`) until a SUCCESSFUL `list` no longer reports
@@ -340,6 +358,7 @@ export function makeQueueRun(
     concurrencyLive: opts.concurrencyLive,
     active: new Map<string, Assignment>(),
     cooldown: new Map<string, number>(),
+    hostCooldown: new Map<string, number>(),
     dispatched: new Set<string>(),
     keep: new Map<string, boolean>(),
     keepDirty: new Set<string>(),
@@ -645,6 +664,14 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
   // no NEW hero dispatches until it drains under the cap.
   let heroRemaining = Math.max(0, deps.heroMax - totalHeroActiveRegistry(deps.registry));
 
+  // (cloud-hosts Phase 5) The FLEET-WIDE per-host live-agent load map, seeded ONCE per sweep from
+  // the reconciled active sets (mirrors the globalRemaining/heroRemaining seed), then MUTATED
+  // GREEDILY in place as each run's dispatchOne/dispatchSchedule seats an agent — so placement N
+  // sees N−1's host, spreading agents by capacity within a single sweep (never a stale snapshot
+  // that would resolve every candidate to the same argmin host and overshoot `maxConcurrent`).
+  // Shared by reference across all runs this sweep (a box is fleet-wide).
+  const hostActive = totalActiveOnHostRegistry(deps.registry);
+
   let registryChanged = false;
   // Iterate a SNAPSHOT of the entries so we can safely delete from the registry mid-loop.
   for (const [name, run] of [...deps.registry.entries()]) {
@@ -659,7 +686,7 @@ export async function runQueueSweep(deps: QueueDeps): Promise<void> {
         log(`run "${name}" ABORTED — all assignments force-closed, run removed`);
         continue;
       }
-      const disp = await runOne(run, surfaces, deps, globalRemaining, heroRemaining);
+      const disp = await runOne(run, surfaces, deps, globalRemaining, heroRemaining, hostActive);
       globalRemaining = Math.max(0, globalRemaining - disp.regular);
       heroRemaining = Math.max(0, heroRemaining - disp.hero);
       // DRAIN removal: a stopping run with nothing left OCCUPYING a slot is removed
@@ -752,6 +779,9 @@ async function abortRun(run: QueueRun, surfaces: Surface[], deps: QueueDeps): Pr
   // with no heroes (the hero lifetime counter is left as-is / irrelevant once the run is
   // dropped from the registry).
   run.hero.clear();
+  // (cloud-hosts Phase 5) Drop the down-host cooldowns too — an aborted run is gone; a fresh
+  // start begins with no host quarantines.
+  run.hostCooldown.clear();
   // Clear the durable assignment store so a restart won't re-adopt the closed panes.
   persistStore(run.storeIO, [], run.lifetimeDispatched, [], {}, []);
 }
@@ -835,6 +865,60 @@ export function totalHeroActiveRegistry(registry: RunRegistry): number {
   return n;
 }
 
+/** (cloud-hosts Phase 5) The FLEET-WIDE per-host occupancy load map, keyed by hostName
+ *  (`?? "local"`), for `selectHost`. PURE. Folds EVERY run's slot-occupying work-item panes
+ *  (`run.active`, `occupiesSlot`) AND live schedule panes (`run.scheduleActive`) across the whole
+ *  registry — counting every PHYSICAL pane (regular + hero + schedule), because per-host
+ *  `maxConcurrent` bounds the BOX's real load (CPU/RAM), which ignores the grid/attention
+ *  abstraction. Fleet-wide because a box is shared across queues (same argument as the fleet-wide
+ *  `agent-queue-hero-max`; per-run counting would seat 6 on a box two queues each declare cap 3
+ *  for). `lifetime` is 0 in v1 (per-host `maxItems` is concurrency-only — see HostSpec.maxItems). */
+export function totalActiveOnHostRegistry(registry: RunRegistry): Map<string, HostLoad> {
+  const load = new Map<string, HostLoad>();
+  const bump = (host: string): void => {
+    const cur = load.get(host) ?? { active: 0, lifetime: 0 };
+    load.set(host, { active: cur.active + 1, lifetime: cur.lifetime });
+  };
+  for (const r of registry.values()) {
+    for (const a of r.active.values()) {
+      if (occupiesSlot(a)) bump(a.hostName ?? "local");
+    }
+    for (const act of r.scheduleActive.values()) bump(act.hostName ?? "local");
+  }
+  return load;
+}
+
+/** (cloud-hosts Phase 5) Increment ONE host's live-agent count in a mutable fleet load map (the
+ *  greedy within-sweep seat: dispatch N sees N−1's placement). PURE-ish (mutates the passed map). */
+function bumpHostLoad(load: Map<string, HostLoad>, host: string): void {
+  const cur = load.get(host) ?? { active: 0, lifetime: 0 };
+  load.set(host, { active: cur.active + 1, lifetime: cur.lifetime });
+}
+
+/** (cloud-hosts Phase 5) Decrement ONE host's live-agent count (a spawn-failure rollback undoing a
+ *  greedy seat). Floored at 0. PURE-ish (mutates the passed map). */
+function unbumpHostLoad(load: Map<string, HostLoad>, host: string): void {
+  const cur = load.get(host);
+  if (cur === undefined) return;
+  load.set(host, { active: Math.max(0, cur.active - 1), lifetime: cur.lifetime });
+}
+
+/** (cloud-hosts Phase 5) The `until` timestamp for a host entering the down-host cooldown at
+ *  `nowMs`. PURE. Mirrors `cooldownUntil` (per-key). */
+function hostCooldownUntil(nowMs: number): number {
+  return nowMs + DEFAULT_HOST_COOLDOWN_MS;
+}
+
+/** (cloud-hosts Phase 5) The set of pool hosts still cooling at `nowMs` — passed as `selectHost`'s
+ *  `exclude` so a recently-failed/down box isn't re-picked until its backoff elapses. PURE. */
+function activeHostCooldown(run: QueueRun, nowMs: number): Set<string> {
+  const out = new Set<string>();
+  for (const [host, until] of run.hostCooldown) {
+    if (nowMs < until) out.add(host);
+  }
+  return out;
+}
+
 /**
  * Drive ONE run for a sweep: (1) reconcile store ⇄ live surfaces (always, BEFORE
  * dispatch); (2) advance each active assignment's state from provider status + the
@@ -847,6 +931,7 @@ async function runOne(
   deps: QueueDeps,
   globalRemaining: number,
   heroRemaining: number,
+  hostActive: Map<string, HostLoad>,
 ): Promise<{ regular: number; hero: number }> {
   const nowMs = deps.now();
   const t = run.template;
@@ -934,16 +1019,33 @@ async function runOne(
       run.idleAnchor.delete(action.assignment.key);
       run.closeAwait.delete(action.assignment.key);
     } else if (action.kind === "prune" && action.reason === "no-pty-host") {
-      // §2 DEFERRED BACKSTOP: a dispatched surface stayed sessionID 0 past the grace
-      // window (it's live but the host never attached) → genuinely no pty-host. Disable
-      // the run so it dispatches nothing further (the feature is a documented no-op
-      // without pty-host), and cool the key so it isn't immediately re-dispatched.
-      run.disabled = true;
-      run.cooldown.set(action.assignment.key, cooldownUntil(nowMs));
-      errlog(
-        `run "${run.runName}": ${action.assignment.key} surface never attached a host session ` +
-          `(no pty-host, §2) — supervisor self-DISABLED for this run`,
-      );
+      // §2 DEFERRED BACKSTOP: a dispatched surface stayed sessionID 0 past the grace window
+      // (it's live but the host never attached). (cloud-hosts Phase 5) HOST-SCOPE the response:
+      const host = action.assignment.hostName ?? "local";
+      if (host === "local") {
+        // LOCAL: genuinely no pty-host on the laptop → self-DISABLE the whole run (the feature is
+        // a documented no-op without pty-host, §2). Cool the key so it isn't re-dispatched.
+        run.disabled = true;
+        run.cooldown.set(action.assignment.key, cooldownUntil(nowMs));
+        errlog(
+          `run "${run.runName}": ${action.assignment.key} surface never attached a host session ` +
+            `(no pty-host, §2) — supervisor self-DISABLED for this run`,
+        );
+      } else {
+        // REMOTE: a deferred-dial to a DOWN box "succeeds" with a placeholder session-0 surface,
+        // so a stuck remote session-0 is a HOST failure, NOT a laptop no-pty-host — it must NOT
+        // wedge the whole run. COOL THE HOST (selectHost routes elsewhere next sweep), RELEASE the
+        // burned lifetime slot + drop the latch, and leave the KEY UNCOOLED so it fails over to a
+        // healthy box promptly (mirrors the spawn-throw rollback in dispatchOne). See
+        // CLOUD-QUEUE-BALANCING.md → "The down-host failure mode".
+        run.hostCooldown.set(host, hostCooldownUntil(nowMs));
+        run.dispatched.delete(action.assignment.key);
+        if (run.lifetimeDispatched > 0) run.lifetimeDispatched -= 1;
+        errlog(
+          `run "${run.runName}": ${action.assignment.key} remote host "${host}" never attached a ` +
+            `session (down tunnel) — host cooled + item freed to fail over (run NOT disabled)`,
+        );
+      }
     }
   }
   persistRun(run);
@@ -972,6 +1074,11 @@ async function runOne(
   for (const key of [...run.cooldown.keys()]) {
     if (cooldownExpired(run.cooldown, key, nowMs)) run.cooldown.delete(key);
   }
+  // (cloud-hosts Phase 5) Drop expired HOST cooldowns too — a quarantined box is re-eligible for
+  // `selectHost` once its backoff window elapses.
+  for (const [host, until] of [...run.hostCooldown]) {
+    if (nowMs >= until) run.hostCooldown.delete(host);
+  }
 
   // --- 4) DISPATCH new candidates (SUPPRESSED on the very first sweep) -------------
   // reconciledOnce is set true above THIS sweep, but the SUPPRESSION applies to the
@@ -998,7 +1105,7 @@ async function runOne(
     // new dispatch fills the packed layout's low tabs rather than a stray fragment. One merge
     // per sweep; a no-op once the layout is minimal. Best-effort (never throws into the sweep).
     await packRun(run, deps);
-    dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining, heroRemaining);
+    dispatched = await dispatchCandidates(run, deps, nowMs, globalRemaining, heroRemaining, hostActive);
   }
 
   // --- 4.25) SCHEDULES: fire + track the recurring scan agents (see queue/schedule.ts).
@@ -1006,7 +1113,7 @@ async function runOne(
   // during drain, and a restart re-adopts a still-open scheduled split); NEW dispatch only
   // when the run is armed + enabled + not paused/draining (the same gate as work dispatch).
   const canDispatchSchedules = wasArmed && !run.disabled && !run.paused && !run.draining;
-  await scheduleSweep(run, deps, nowMs, surfaces, canDispatchSchedules);
+  await scheduleSweep(run, deps, nowMs, surfaces, canDispatchSchedules, hostActive);
 
   // --- 4.5) REFRESH the backlog GRAPH (optional `provider.graph`), throttled to listMs.
   // Independent of dispatch (runs even while paused/draining/disabled) so the grooming
@@ -1139,6 +1246,21 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
   // PLUS the §7.1 dispatch latch — those keys are NOT eligible to dispatch, so showing
   // them as "waiting" would mislead. This mirrors `selectCandidates`' own skips.
   const exclude = new Set<string>([...run.active.keys(), ...run.dispatched]);
+  // (cloud-hosts Phase 5) Whether ANY host in this run's pool has a free slot right now — fed to
+  // the SAME `selectHost` the dispatcher uses over the SAME fleet-wide load map (+ this run's host
+  // cooldowns), so the `hostCapacity` attribution can't drift from the actual placement gate. Also
+  // the per-host active/cap rows for the dashboard (mirrors heroMax/heroActive being globals). A
+  // scalar/local single-entry pool is unbounded (`selectHost` always returns it), so
+  // `anyHostHasFreeSlot` is always true there and `hostCapacity` never fires — byte-identical.
+  const pool = normalizeHostPool(run.template);
+  const hostLoad = totalActiveOnHostRegistry(deps.registry);
+  const anyHostHasFreeSlot =
+    selectHost(pool, hostLoad, { exclude: activeHostCooldown(run, deps.now()) }) !== null;
+  const hosts: HostStatus[] = pool.map((h) => ({
+    name: h.name,
+    active: hostLoad.get(h.name)?.active ?? 0,
+    maxConcurrent: Number.isFinite(h.maxConcurrent) ? h.maxConcurrent : null,
+  }));
   // (hero) The per-sweep gate ROOM feeding `blockReasons` — the SAME primitives
   // `dispatchCandidates` gates on, so the report attributes exactly why a waiting item is
   // stuck. `heroMax`/`heroActive` are fleet-wide globals; the three regular-pool remainders
@@ -1176,6 +1298,10 @@ async function reportQueueStatus(run: QueueRun, deps: QueueDeps): Promise<void> 
     nextLimit: 25,
     // (schedules) The Schedules-lane rows (next-run / last-run / paused / running).
     schedules: scheduleStatuses(run),
+    // (cloud-hosts Phase 5) Multi-host: whether a pool host has room (drives the `hostCapacity`
+    // block-reason attribution, pushed only after the other gates clear) + the per-host rows.
+    anyHostHasFreeSlot,
+    hosts,
   });
   try {
     await deps.client.reportQueueStatus(report);
@@ -1540,6 +1666,7 @@ async function dispatchCandidates(
   nowMs: number,
   globalRemaining: number,
   heroRemaining: number,
+  hostActive: Map<string, HostLoad>,
 ): Promise<{ regular: number; hero: number }> {
   const t = run.template;
 
@@ -1673,13 +1800,13 @@ async function dispatchCandidates(
     for (const item of heroCandidates) {
       if (!deps.budget.tryAcquire()) break;
       acquired += 1;
-      const ok = await dispatchOne(run, item, deps, deps.now(), true);
+      const ok = await dispatchOne(run, item, deps, deps.now(), true, hostActive);
       if (ok) hero += 1;
     }
     for (const item of regularCandidates) {
       if (!deps.budget.tryAcquire()) break;
       acquired += 1;
-      const ok = await dispatchOne(run, item, deps, deps.now(), false);
+      const ok = await dispatchOne(run, item, deps, deps.now(), false, hostActive);
       if (ok) regular += 1;
     }
   } finally {
@@ -1711,6 +1838,7 @@ async function dispatchOne(
   deps: QueueDeps,
   nowMs: number,
   isHero: boolean,
+  hostActive: Map<string, HostLoad>,
 ): Promise<boolean> {
   const t = run.template;
 
@@ -1748,7 +1876,19 @@ async function dispatchOne(
   // host, the AGENT split's cwd + template dir are the HOST-RELATIVE ones (never the laptop
   // paths), and the spawn carries the `host` name (the GUI resolves it to a forwarded socket).
   // The PROVIDER commands (queueProviderEnv / cwd) stay laptop-side (adopt option (b)).
-  const templateHost = t.host ?? "local";
+  //
+  // (cloud-hosts Phase 5) WEIGHTED-LEAST-LOADED PLACEMENT — the SIBLING placement gate, AFTER the
+  // concurrency/max-total/maxItems/hero gates already admitted this item (see dispatchCandidates).
+  // Pick the pool host that minimizes `activeOnHost / (maxConcurrent × weight)` among hosts with a
+  // free slot, reading the LIVE fleet load map (greedy within-sweep) and EXCLUDING down hosts on
+  // cooldown. `null` ⇒ NO host has a free slot ⇒ the item WAITS: return false BEFORE any seat /
+  // latch / lifetime-counter mutation (mirrors the `slot === null` early return above), so a full/
+  // down pool never over-burns `maxItems` or double-dispatches — the item is re-evaluated next
+  // sweep and the report attributes `hostCapacity`. A scalar/local single-entry pool is unbounded,
+  // so selectHost always returns it (byte-identical to the pre-pool single-host path).
+  const pool = normalizeHostPool(t);
+  const templateHost = selectHost(pool, hostActive, { exclude: activeHostCooldown(run, nowMs) });
+  if (templateHost === null) return false; // full/down pool → WAIT (no side effects)
   const isRemote = templateHost !== "local" && templateHost.length > 0;
   const agentCwd = isRemote && t.agentWorkdir !== undefined ? t.agentWorkdir : t.workdir;
   const agentTemplateDir =
@@ -1772,6 +1912,11 @@ async function dispatchOne(
   run.active.set(item.key, pending);
   if (isHero) run.hero.add(item.key);
   run.lifetimeDispatched += 1;
+  // (cloud-hosts Phase 5) GREEDY within-sweep seat: bump the chosen host's live-agent count in the
+  // shared fleet load map SYNCHRONOUSLY (before the spawn await), so a later candidate this sweep
+  // sees this placement and `selectHost` spreads by capacity instead of stacking every pick on the
+  // same argmin box. Rolled back below if the spawn itself fails.
+  bumpHostLoad(hostActive, templateHost);
   // LATCH the key (§7.1): once dispatched it is SUPPRESSED from re-dispatch until a
   // successful `list` no longer reports it (it left the actionable set) and it later
   // returns — so a kill BEFORE the agent claims (the item still in the list) is never
@@ -1866,8 +2011,22 @@ async function dispatchOne(
     // Roll back the §7.1 latch too: nothing actually launched, so the key must stay
     // eligible to retry on the next list (mirrors the lifetime-counter rollback).
     run.dispatched.delete(item.key);
+    // (cloud-hosts Phase 5) DOWN-HOST handling: a spawn to this host failed (a down tunnel throws
+    // here; a down remote deferred-dial instead "succeeds" with session-0 and is caught by the
+    // no-pty-host prune branch in runOne — same rollback shape). Undo the greedy seat bump + put
+    // the host on a bounded COOLDOWN so `selectHost` routes the (still-listed, un-latched) item to
+    // ANOTHER host next sweep — the load-bearing "down box looks emptiest" magnet mitigation. The
+    // key is left UNCOOLED so it fails over promptly. Never lost, never double-dispatched.
+    // SCALAR/LOCAL back-compat: only a REAL remote host is cooled (mirrors the runOne
+    // session-0 prune branch). Cooling "local" — the sole host of a scalar/local pool, and
+    // itself in the exclude set — would make selectHost return null for EVERY item and freeze
+    // the whole local queue for the cooldown window; a transient local spawn error must instead
+    // leave the key un-latched to retry next sweep (pre-Phase-5 behavior). unbumpHostLoad stays
+    // unconditional because bumpHostLoad ran unconditionally.
+    unbumpHostLoad(hostActive, templateHost);
+    if (templateHost !== "local") run.hostCooldown.set(templateHost, hostCooldownUntil(nowMs));
     persistRun(run);
-    errlog(`run "${run.runName}": spawn ${item.key} failed: ${msg(err)}`);
+    errlog(`run "${run.runName}": spawn ${item.key} on host "${templateHost}" failed: ${msg(err)} — host cooled, item fails over`);
     return false;
   }
 
@@ -1968,6 +2127,7 @@ async function scheduleSweep(
   nowMs: number,
   surfaces: Surface[],
   canDispatch: boolean,
+  hostActive: Map<string, HostLoad>,
 ): Promise<void> {
   const specs = run.template.schedules;
   if (specs.length === 0 && run.schedules.size === 0) return; // fast no-op
@@ -2152,7 +2312,7 @@ async function scheduleSweep(
       }
       if (!due) continue;
       run.scheduleRunNow.delete(id);
-      const ok = await dispatchSchedule(run, spec, deps, nowMs);
+      const ok = await dispatchSchedule(run, spec, deps, nowMs, hostActive);
       if (ok) changed = true;
     }
   }
@@ -2174,8 +2334,20 @@ async function dispatchSchedule(
   spec: ScheduleSpec,
   deps: QueueDeps,
   nowMs: number,
+  hostActive: Map<string, HostLoad>,
 ): Promise<boolean> {
   const t = run.template;
+
+  // (cloud-hosts Phase 5) A schedule's scan agent uses the box's CPU/RAM, so it COUNTS against the
+  // host's `maxConcurrent` (via the fleet load map) and picks its host by the SAME weighted-least-
+  // loaded `selectHost` as work agents — but it BYPASSES per-host `maxItems` (v1: maxItems is
+  // concurrency-only anyway) and, when NO host has a free slot, simply DEFERS this sweep (returns
+  // false with no side effects — single-flight tolerates the delay; a schedule is its own lane, so
+  // there is no waiting/held/`hostCapacity` block reason). Scalar/local pool ⇒ always its one host.
+  const scheduleHost = selectHost(normalizeHostPool(t), hostActive, {
+    exclude: activeHostCooldown(run, nowMs),
+  });
+  if (scheduleHost === null) return false; // all pool hosts full → defer
 
   // Combined grid occupancy: work-item slots (run.active) + other live schedules' slots, with a
   // slot→UUID map so a balanced split anchors on a real pane (schedules aren't in run.active, so
@@ -2228,9 +2400,10 @@ async function dispatchSchedule(
   const command = `${prefix} ${spec.command ?? t.agent.command}`;
   const env = scheduleEnv;
 
-  // (cloud-hosts O4/Q3) A schedule runs on the SAME host as its queue's work agents, so it lands
-  // beside them in the grid — spawn it on `t.host` with the host-relative cwd when remote.
-  const templateHost = t.host ?? "local";
+  // (cloud-hosts O4/Q3/Phase 5) A schedule lands beside its queue's work agents in the grid —
+  // spawn it on the `selectHost`-chosen pool host (`scheduleHost`) with the host-relative cwd when
+  // remote (matches the work-agent placement path).
+  const templateHost = scheduleHost;
   const isRemote = templateHost !== "local" && templateHost.length > 0;
   const agentCwd = isRemote && t.agentWorkdir !== undefined ? t.agentWorkdir : t.workdir;
 
@@ -2258,7 +2431,15 @@ async function dispatchSchedule(
     }
     spawned = await deps.client.spawnSplitCommand(spawnArgs);
   } catch (err) {
-    errlog(`run "${run.runName}": schedule "${spec.id}" spawn failed: ${msg(err)}`);
+    // (cloud-hosts Phase 5) A down chosen host throws here — COOL it so the next schedule dispatch
+    // routes elsewhere (the seat-bump below never ran, so nothing to unbump). Defer this sweep.
+    // SCALAR/LOCAL back-compat: only a REAL remote host is cooled (mirrors dispatchOne's rollback
+    // at the top of this file). Cooling "local" — the sole host of a scalar/local pool, and itself
+    // in selectHost's exclude set — would make selectHost return null for EVERY item and freeze the
+    // whole run's work-item AND schedule dispatch for the cooldown window; a transient local spawn
+    // error must instead just defer this sweep (the single-flight gate re-arms next sweep).
+    if (templateHost !== "local") run.hostCooldown.set(templateHost, hostCooldownUntil(nowMs));
+    errlog(`run "${run.runName}": schedule "${spec.id}" spawn on host "${templateHost}" failed: ${msg(err)} — host cooled`);
     return false;
   }
 
@@ -2272,6 +2453,9 @@ async function dispatchSchedule(
     // recognizes THIS box's session across a restart.
     ...(isRemote ? { hostName: templateHost } : {}),
   });
+  // (cloud-hosts Phase 5) GREEDY seat: count this scheduled scan against its host's live load so a
+  // later work item / schedule this sweep sees the occupied slot (a schedule uses the box's CPU).
+  bumpHostLoad(hostActive, templateHost);
   // Persist the sessionID (+ host) immediately so a GUI restart before the next sweep can still
   // re-adopt this scan by its stable (host, sessionID) pair (scheduleSweep also backfills it, but a
   // spawn's sessionId is known here). Persisted by the caller's persistRun when `changed` is set.

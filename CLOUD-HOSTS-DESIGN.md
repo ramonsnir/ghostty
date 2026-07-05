@@ -964,7 +964,13 @@ MINOR gap DEGRADES (host withholds frames on `negotiated_minor`, never an error)
 major-mismatch close path is EOF-before-ack ⇒ the AMBIGUOUS retryable `cannot_handshake` state; a
 DECODED-ack MAJOR mismatch ⇒ the confident, directional `too_old` (L1 shipped). `hello_nack` (L3)
 deferred to a scheduled MINOR bump (host rebuild = session loss). OQ3 → per-queue `host`
-(provider laptop-side, agent cloud-side). OQ4 → BOTH `pty-remote-project-directory` bases + cached
+(provider laptop-side, agent cloud-side). **Phase 5 REFINES OQ3: the per-queue `host` is now a
+weighted host POOL** (`hosts[]`) the supervisor spreads a queue's agents across by weighted-least-
+loaded placement (`argmin(active / (maxConcurrent × weight))`), with a FLEET-WIDE per-host
+`maxConcurrent` cap, a `hostCapacity` block reason when the pool is full, and down-host cooldown
+degrade — sidecar + GUI-lib only, NO host/protocol change (placement rides the already-persisted
+`Assignment.hostName` + the existing `spawn_split_command` `host` arg). Scalar `host` stays a valid
+single-entry pool. See CLOUD-QUEUE-BALANCING.md + AGENT-QUEUE.md → "Multi-host load balancing". OQ4 → BOTH `pty-remote-project-directory` bases + cached
 `ssh find` over the ControlMaster. OQ5 → Phases 0–2 ship with ZERO host changes; only
 `proc_info.zig` needs a Linux arm (Phase 4). OQ6 → per-box billing, docs-only (`get_haiku_usage`
 never tracked work-agent spend). OQ7 → `poll()` on the read thread's quit self-pipe (Darwin has no

@@ -23,10 +23,13 @@ import {
   packRun,
   projectLiveSurfaces,
   totalHeroActiveRegistry,
+  totalActiveOnHostRegistry,
   DEFAULT_PENDING_GRACE_MS,
+  DEFAULT_HOST_COOLDOWN_MS,
   type QueueDeps,
   type QueueRun,
 } from "./runner.js";
+import { selectHost, normalizeHostPool } from "./hostpool.js";
 import { ConcurrencyBudget as QueueBudget } from "./supervisor.js";
 import type { QueueCommand, RunFactory, RunRegistry } from "./commands.js";
 import type { QueueStatusReport, QueueGraphReport } from "./status.js";
@@ -3916,4 +3919,328 @@ test("runQueueSweep: a LOCAL (pre-migration, no host) schedule still re-adopts b
   await runQueueSweep(deps);
   assert.equal(run.scheduleActive.has("s1"), true, "re-adopted the local scan");
   assert.equal(run.scheduleActive.get("s1")!.uuid, "sch-1");
+});
+
+// ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) weighted-least-loaded
+// placement across a per-queue host POOL. See CLOUD-QUEUE-BALANCING.md.
+// ---------------------------------------------------------------------------
+
+/** Count spawn `host` args (undefined = a local pick) into a `{host: count}` tally. */
+function hostTally(spawns: Array<Record<string, unknown>>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const s of spawns) {
+    const h = (s.host as string | undefined) ?? "local";
+    out[h] = (out[h] ?? 0) + 1;
+  }
+  return out;
+}
+
+test("totalActiveOnHostRegistry: folds work-item + schedule occupancy by hostName (restart reconstruction)", () => {
+  // Occupancy is a PURE function of run.active (rebuilt from the persisted Assignment.hostName each
+  // sweep) + run.scheduleActive — so a post-restart sweep re-derives the SAME load map and thus the
+  // SAME placement, with no persisted selection state.
+  const run = makeQueueRun(tmpl(), memStore());
+  const asgn = (key: string, host: string | undefined, state: AssignmentState = "RUNNING"): Assignment => ({
+    queueName: run.runName, key, sessionID: 1, gridSlot: 0, state, sinceMs: 0, hero: false,
+    ...(host !== undefined ? { hostName: host } : {}),
+  });
+  run.active.set("A", asgn("A", "cloud-a"));
+  run.active.set("B", asgn("B", "cloud-a"));
+  run.active.set("C", asgn("C", "cloud-b"));
+  run.active.set("D", asgn("D", undefined)); // local (omitted hostName)
+  run.active.set("E", asgn("E", "cloud-a", "EXITED")); // EXITED → does NOT occupy a slot
+  run.scheduleActive.set("s1", { uuid: "u", sessionID: 9, gridSlot: 1, hostName: "cloud-b" });
+  const reg: RunRegistry = new Map([[run.template.name, run]]);
+  const load = totalActiveOnHostRegistry(reg);
+  assert.equal(load.get("cloud-a")!.active, 2); // A,B (E excluded)
+  assert.equal(load.get("cloud-b")!.active, 2); // C + the schedule
+  assert.equal(load.get("local")!.active, 1); // D
+  // The pure selector on this reconstructed map is deterministic (restart-identical placement).
+  const pool = normalizeHostPool({ hosts: [{ name: "cloud-a", maxConcurrent: 4 }, { name: "cloud-b", maxConcurrent: 4 }] });
+  assert.equal(selectHost(pool, load), "cloud-a"); // 2/4 == 2/4 tie → first-declared
+});
+
+test("runQueueSweep: a two-host pool SPREADS agents by capacity within ONE sweep (greedy)", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      hosts: [{ name: "cloud-a", maxConcurrent: 2 }, { name: "cloud-b", maxConcurrent: 2 }],
+      concurrency: 4,
+    }),
+    store,
+  );
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }, { id: "K-2" }, { id: "K-3" }, { id: "K-4" }]),
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch all 4 across the pool
+
+  assert.equal(fake.calls.spawn.length, 4, "all four dispatched in one sweep");
+  // Greedy least-loaded: A,B,A,B → 2 on each box (never overshoots maxConcurrent 2).
+  assert.deepEqual(hostTally(fake.calls.spawn), { "cloud-a": 2, "cloud-b": 2 });
+  assert.deepEqual(
+    fake.calls.spawn.map((s) => s.host),
+    ["cloud-a", "cloud-b", "cloud-a", "cloud-b"],
+    "the pick sequence is weighted-least-loaded (recomputed after each greedy seat)",
+  );
+});
+
+test("runQueueSweep: a FULL pool makes the item WAIT with NO side effects (no over-burn of maxItems)", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ hosts: [{ name: "cloud-a", maxConcurrent: 1 }], concurrency: 5 }),
+    store,
+  );
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }, { id: "K-2" }]),
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch: only K-1 fits (cap 1); K-2 WAITS
+  now += 5000;
+  await runQueueSweep(deps); // still full → K-2 still waits (no re-dispatch, no counter drift)
+
+  assert.equal(fake.calls.spawn.length, 1, "only ONE agent fit the single-slot host");
+  assert.equal(fake.calls.spawn[0].host, "cloud-a");
+  assert.equal(run.lifetimeDispatched, 1, "the waiting item never burned a lifetime slot");
+  assert.equal(run.dispatched.has("K-2"), false, "the waiting item is NOT latched (stays dispatchable)");
+  assert.equal(run.disabled, false, "a full pool never disables the run");
+  // The health report attributes the wait to hostCapacity (NOT maxItems/concurrency — those have room).
+  const last = fake.calls.reports.at(-1)!;
+  const k2 = last.next.find((n) => n.key === "K-2");
+  assert.deepEqual(k2?.blockReasons, ["hostCapacity"]);
+});
+
+test("runQueueSweep: per-host maxConcurrent is FLEET-WIDE (two queues sharing a box cap at 3, not 6)", async () => {
+  const storeA = memStore();
+  const storeB = memStore();
+  const runA = makeQueueRun(
+    tmpl({ name: "q1", hosts: [{ name: "cloud-a", maxConcurrent: 3 }], concurrency: 5 }),
+    storeA,
+  );
+  const runB = makeQueueRun(
+    tmpl({ name: "q2", hosts: [{ name: "cloud-a", maxConcurrent: 3 }], concurrency: 5 }),
+    storeB,
+  );
+  // Each queue's provider list has its OWN keys (the shared fake returns the same JSON to both,
+  // but that's fine — reconcile filters by run name and the keys differ per intent below). Use a
+  // single fake whose list returns four items; both runs pull the same list, but the FLEET host
+  // cap bounds the total regardless.
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }, { id: "K-2" }, { id: "K-3" }, { id: "K-4" }]),
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [runA, runB], () => now, 8); // maxTotal 8 (does NOT bind; host cap 3 does)
+  await runQueueSweep(deps); // arm both
+  now += 5000;
+  await runQueueSweep(deps); // dispatch — the FLEET host cap must cap cloud-a at 3 total
+  now += 5000;
+  await runQueueSweep(deps); // still full fleet-wide → no more
+
+  assert.equal(fake.calls.spawn.length, 3, "cloud-a is capped at 3 across BOTH queues (not 3+3)");
+  assert.deepEqual(hostTally(fake.calls.spawn), { "cloud-a": 3 });
+});
+
+test("runQueueSweep: a DOWN host (spawn throws) fails the item OVER to a healthy host + cools the down box", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      hosts: [{ name: "cloud-a", maxConcurrent: 2 }, { name: "cloud-b", maxConcurrent: 2 }],
+      concurrency: 4,
+    }),
+    store,
+  );
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }]),
+    // The FIRST spawn (to cloud-a, the tie-break winner) throws (down tunnel).
+    spawnThrowsAt: new Set([0]),
+    spawns: [{ id: "x", sessionId: 0 }, { id: "sp-2", sessionId: 900 }],
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch → picks cloud-a → spawn THROWS → rollback + cool cloud-a
+
+  assert.equal(fake.calls.spawn[0].host, "cloud-a", "first attempt went to cloud-a");
+  assert.equal(run.active.has("K-1"), false, "the failed dispatch left NO active record");
+  assert.equal(run.lifetimeDispatched, 0, "the failed spawn rolled back the lifetime counter");
+  assert.equal(run.dispatched.has("K-1"), false, "the item is un-latched (stays dispatchable)");
+  assert.equal(run.hostCooldown.has("cloud-a"), true, "the down host is cooled");
+  assert.equal(run.disabled, false, "a down remote host NEVER disables the run");
+
+  now += 5000;
+  await runQueueSweep(deps); // K-1 fails OVER to cloud-b (cloud-a still cooling)
+  assert.equal(fake.calls.spawn.length, 2, "one retry");
+  assert.equal(fake.calls.spawn[1].host, "cloud-b", "re-routed to the healthy host");
+  assert.equal(run.active.get("K-1")!.hostName, "cloud-b");
+  assert.equal(run.lifetimeDispatched, 1, "only the SUCCESSFUL dispatch counts");
+});
+
+test("runQueueSweep: a REMOTE session-0 that never attaches past grace cools the host + does NOT self-disable the run", async () => {
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({
+      hosts: [{ name: "cloud-a", maxConcurrent: 2 }],
+      agentWorkdir: "/home/user/git/proj",
+      concurrency: 1,
+    }),
+    store,
+  );
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }]),
+    spawns: [{ id: "sp-1", sessionId: 0 }], // deferred-dial placeholder: "succeeds" with session 0
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → cloud-a; spawn returns session 0
+  assert.equal(run.active.get("K-1")!.hostName, "cloud-a");
+  assert.equal(run.lifetimeDispatched, 1);
+
+  // The surface stays LIVE but its session STAYS 0 past the grace window (host never attached).
+  spec.surfaces = [surface({ id: "sp-1", sessionID: 0, hostName: "cloud-a" })];
+  now += DEFAULT_PENDING_GRACE_MS + 5000;
+  await runQueueSweep(deps); // reconcile prunes the stuck remote session-0
+
+  assert.equal(run.disabled, false, "a stuck REMOTE session-0 must NOT wedge the whole run");
+  assert.equal(run.hostCooldown.has("cloud-a"), true, "the unreachable host is cooled");
+  assert.equal(run.lifetimeDispatched, 0, "the burned lifetime slot is released");
+  assert.equal(run.dispatched.has("K-1"), false, "the item is freed to fail over to a healthy host");
+});
+
+test("runQueueSweep: a LOCAL session-0 past grace STILL self-disables the run (§2 unchanged)", async () => {
+  // The host-scoping of the self-disable is REMOTE-only — a genuine laptop no-pty-host still disables.
+  const store = memStore();
+  const run = makeQueueRun(tmpl({ concurrency: 1 }), store); // scalar/local pool
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }]),
+    spawns: [{ id: "sp-1", sessionId: 0 }],
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch → local, session 0
+  spec.surfaces = [surface({ id: "sp-1", sessionID: 0 })]; // local, stays session 0
+  now += DEFAULT_PENDING_GRACE_MS + 5000;
+  await runQueueSweep(deps);
+  assert.equal(run.disabled, true, "a LOCAL no-pty-host still self-disables the run");
+});
+
+test("runQueueSweep: a scalar/local queue's spawn-throw does NOT cool 'local' + re-dispatches next sweep", async () => {
+  // Regression: pre-Phase-5 a local spawn failure left the key un-latched/un-cooled and retried
+  // immediately. Cooling "local" (the sole host of a scalar pool, itself in the exclude set) would
+  // freeze the whole local queue for the cooldown window — selectHost would return null for every item.
+  const store = memStore();
+  const run = makeQueueRun(tmpl({ concurrency: 1 }), store); // no hosts[] → scalar local pool
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }]),
+    spawnThrowsAt: new Set([0]), // the first (local) spawn throws transiently
+    spawns: [{ id: "x", sessionId: 0 }, { id: "sp-2", sessionId: 500 }],
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch K-1 → local spawn THROWS → rollback
+
+  assert.equal(fake.calls.spawn.every((s) => !("host" in s)), true, "no host arg on the local spawn");
+  assert.equal(run.hostCooldown.has("local"), false, "a transient LOCAL spawn error must NOT cool 'local'");
+  assert.equal(run.active.has("K-1"), false, "the failed dispatch left NO active record");
+  assert.equal(run.lifetimeDispatched, 0, "the failed spawn rolled back the lifetime counter");
+  assert.equal(run.dispatched.has("K-1"), false, "the item is un-latched (stays dispatchable)");
+  assert.equal(run.disabled, false, "a transient local spawn error never disables the run");
+
+  now += 5000;
+  await runQueueSweep(deps); // K-1 re-dispatches IMMEDIATELY (local not frozen behind a cooldown)
+  assert.equal(fake.calls.spawn.length, 2, "K-1 retried next sweep");
+  assert.equal(run.active.has("K-1"), true, "the retry seated K-1");
+  assert.equal(run.lifetimeDispatched, 1, "only the SUCCESSFUL dispatch counts");
+});
+
+test("runQueueSweep: a scalar/local SCHEDULE spawn-throw does NOT cool 'local' + never freezes work dispatch", async () => {
+  // Regression (dispatchSchedule twin of the dispatchOne guard above): a transient LOCAL schedule
+  // spawn failure must NOT cool "local" — the sole host of a scalar/local pool is itself in
+  // selectHost's exclude set, so cooling it would make selectHost return null for EVERY work item
+  // (and every schedule), freezing the whole run for the cooldown window AND mis-attributing
+  // hostCapacity to waiting work items.
+  const store = memStore();
+  const run = makeQueueRun(
+    tmpl({ concurrency: 1, schedules: [{ id: "s1", cron: "* * * * *", prompt: "scan", closeOnComplete: true }] }),
+    store,
+  ); // no hosts[] → scalar local pool
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: "[]", // no work items yet — sweep 2's only spawn is the schedule's
+    spawnThrowsAt: new Set([0]), // the first (schedule) spawn throws transiently
+    spawns: [{ id: "x", sessionId: 0 }, { id: "sp-2", sessionId: 500 }],
+  };
+  const fake = makeQueueFake(spec);
+  const M = 60_000; // whole-minute clock so `* * * * *` fires deterministically
+  let now = 100 * M;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  await runQueueSweep(deps); // sweep 1: ARM (dispatch-suppressed)
+  assert.equal(fake.calls.spawn.length, 0, "first sweep arms, does not dispatch");
+
+  now = 101 * M;
+  await runQueueSweep(deps); // sweep 2: schedule DUE → local spawn THROWS → catch
+  assert.equal(fake.calls.spawn.length, 1, "the schedule attempted exactly one (local) spawn");
+  assert.equal(fake.calls.spawn.every((s) => !("host" in s)), true, "no host arg on the local schedule spawn");
+  assert.equal(run.hostCooldown.has("local"), false, "a transient LOCAL schedule spawn error must NOT cool 'local'");
+  assert.equal(run.scheduleActive.has("s1"), false, "the failed schedule dispatch left NO live record");
+  assert.equal(run.disabled, false, "a transient local schedule spawn error never disables the run");
+
+  // A work item now appears — it MUST dispatch (proving "local" was never frozen behind a cooldown).
+  spec.listJson = JSON.stringify([{ id: "K-1" }]);
+  now = 102 * M;
+  await runQueueSweep(deps); // sweep 3: K-1 dispatches (local reachable), schedule re-attempts too
+  assert.equal(run.active.has("K-1"), true, "the work item dispatched — local not frozen by the schedule throw");
+  const last = fake.calls.reports.at(-1)!;
+  assert.equal(last.next.some((n) => (n.blockReasons ?? []).includes("hostCapacity")), false,
+    "no work item is mis-attributed hostCapacity after a local schedule spawn throw");
+});
+
+test("runQueueSweep: a scalar/local queue is byte-identical (no host arg, unbounded, never hostCapacity)", async () => {
+  const store = memStore();
+  const run = makeQueueRun(tmpl({ concurrency: 3 }), store); // no hosts[] → scalar local pool
+  const spec: QueueFakeSpec = {
+    surfaces: [],
+    listJson: JSON.stringify([{ id: "K-1" }, { id: "K-2" }, { id: "K-3" }]),
+  };
+  const fake = makeQueueFake(spec);
+  let now = 1_000_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // dispatch all 3 (unbounded local host, bounded only by concurrency)
+  assert.equal(fake.calls.spawn.length, 3);
+  assert.equal(fake.calls.spawn.every((s) => !("host" in s)), true, "no host arg on any local spawn");
+  const last = fake.calls.reports.at(-1)!;
+  assert.equal(last.next.some((n) => (n.blockReasons ?? []).includes("hostCapacity")), false,
+    "an unbounded local pool never attributes hostCapacity");
+  // The per-host row reflects the single local box (unbounded cap → null).
+  assert.deepEqual(last.hosts, [{ name: "local", active: 3, maxConcurrent: null }]);
 });

@@ -8,6 +8,8 @@
 // array, JSON over stdout); item fields reach the agent as ENV VARS, never spliced
 // into a shell line. NOTHING here is Linear/Git/issue-key aware.
 
+import type { HostSpec } from "./hostpool.js";
+
 // ---------------------------------------------------------------------------
 // Queue template (§5) — the team-specific policy layer, authored as JSON.
 // ---------------------------------------------------------------------------
@@ -274,8 +276,21 @@ export interface QueueTemplate {
    *  split is placed on `host`. When `host !== "local"` the agent's cwd + template dir are the
    *  HOST-RELATIVE `agentWorkdir` / `remoteTemplateDir` (NOT laptop-expanded). See CLOUD-HOSTS.
    *  OPTIONAL in the type (validateTemplate ALWAYS sets it to "local" when the JSON omits it);
-   *  every runtime read defaults `?? "local"`, so a test/template literal without `host` is local. */
+   *  every runtime read defaults `?? "local"`, so a test/template literal without `host` is local.
+   *
+   *  (ramon fork / cloud-hosts, Phase 5) When the template declares a `hosts[]` POOL, that pool
+   *  is authoritative for PLACEMENT (see `hosts`); this scalar `host` remains the single-entry
+   *  fallback (and the pre-pool wire) so a template with only `host` is a single-entry pool. */
   host?: string;
+  /** (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) The weighted host POOL the
+   *  supervisor spreads this queue's AGENT splits across by CAPACITY (see CLOUD-QUEUE-BALANCING.md
+   *  + queue/hostpool.ts). When present + non-empty it is authoritative for placement (each new
+   *  agent goes to `argmin(activeOnHost / (maxConcurrent × weight))` among hosts with a free slot);
+   *  a full/down pool makes the item WAIT with a `hostCapacity` block reason. ABSENT ⇒ the scalar
+   *  `host` is used as a single UNBOUNDED-capacity pool (byte-identical to the pre-pool behavior).
+   *  Runtime code reads the NORMALIZED pool (`normalizeHostPool(template)`), never this field or
+   *  the scalar directly, so a half-migration can't silently route everything to `local`. */
+  hosts?: HostSpec[];
   /** (ramon fork / cloud-hosts, Phase 4 O1) The agent split's cwd WHEN `host !== "local"` — an
    *  ABSOLUTE path ON THE BOX (host-relative). NOT `~`-expanded against the LAPTOP home (the box's
    *  home differs); passed through verbatim. Absent ⇒ the agent split falls back to `workdir`
@@ -333,12 +348,18 @@ export interface QueueTemplate {
  *   - "maxItems"          — the run's lifetime dispatch budget is exhausted.
  *   - "queueConcurrency"  — the run's `concurrency` slots are all occupied.
  *   - "globalConcurrency" — the fleet-wide `agent-queue-max-total` is exhausted.
- *   - "heroSlots"         — a HERO item and the fleet-wide `agent-queue-hero-max` is full. */
+ *   - "heroSlots"         — a HERO item and the fleet-wide `agent-queue-hero-max` is full.
+ *   - "hostCapacity"      — (cloud-hosts Phase 5) the item cleared its OTHER gates but NO host in
+ *                           the queue's pool has a free slot (every box is at its `maxConcurrent`,
+ *                           or down + on cooldown). Computed only AFTER the concurrency/maxItems/
+ *                           hero gates clear, so the operator is never told to bump `maxItems`
+ *                           when the real block is a full/down box. */
 export type BlockReason =
   | "maxItems"
   | "queueConcurrency"
   | "globalConcurrency"
-  | "heroSlots";
+  | "heroSlots"
+  | "hostCapacity";
 
 // ---------------------------------------------------------------------------
 // Work item (§5) — the genericity-boundary unit a provider emits.
