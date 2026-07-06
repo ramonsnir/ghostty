@@ -66,6 +66,26 @@ is responsive and shows scrollback. Verified live and by host integration tests.
   required field) — keep changes additive+optional and `minimumVersion` low. (This is
   the macOS state-restoration schema version — unrelated to the host *protocol*
   version negotiated in `Hello`.)
+- **Reattach is gated by macOS state restoration — the fork forces it on when
+  pty-host is active (fork-only, issue #5).** The reattach id lives in the macOS
+  window-state archive (`sessionID`, above), so a GUI quit/relaunch only recovers
+  live sessions if macOS actually *writes and restores* that archive. Whether it
+  does on a clean quit is governed by `NSQuitAlwaysKeepsWindows`, which the fork
+  derives from `window-save-state`: `always → true`, `never → false`, `default →`
+  (historically) remove the override and defer to the macOS **"Close windows when
+  quitting an application"** system preference — which is *checked-by-default* in
+  modern macOS (= don't restore). So under `window-save-state = default` (the
+  fork's own default, and what the seeded colleague config leaves it at while
+  enabling `pty-host`) the whole "sessions survive a GUI quit/relaunch" promise
+  **silently** hinged on an invisible system checkbox. Fix: `AppDelegate`
+  (`quitAlwaysKeepsWindows(windowSaveState:ptyHostActive:)`) now forces
+  `NSQuitAlwaysKeepsWindows = true` for the `default` case **whenever `pty-host`
+  is set**, so reattach no longer depends on the system pref. An explicit
+  `window-save-state = never` is still honored (opt-out even under pty-host), and
+  a non-pty-host build is unchanged (`default → nil`, defer to system). Wiring:
+  `macos/Sources/App/macOS/AppDelegate.swift`
+  (`quitAlwaysKeepsWindows` + `ghosttyConfigDidChange`); test
+  `macos/Tests/App/AppDelegateTests.swift`.
 - **Connect failure (host down / bad socket) → visible error, never a silent local
   fallback.** The IO thread paints an error into the surface
   (`src/termio/Thread.zig`); it never quietly forks a local shell, so a degraded

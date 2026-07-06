@@ -1238,18 +1238,54 @@ class AppDelegate: NSObject,
         NSApp.dockTile.display()
     }
 
+    /// Decide the `NSQuitAlwaysKeepsWindows` value from the resolved
+    /// `window-save-state` config and whether the pty-host backend is active.
+    ///
+    /// macOS state restoration is what carries a window's split tree AND each
+    /// surface's host `sessionID` across a GUI quit/relaunch, and reattaching by
+    /// that `sessionID` is exactly how the pty-host backend recovers a live
+    /// session. Whether macOS bothers to persist & restore that archive on a
+    /// clean quit is gated by `NSQuitAlwaysKeepsWindows`:
+    ///   • `true`  → always restore (`window-save-state = always`)
+    ///   • `false` → never restore  (`window-save-state = never`)
+    ///   • `nil`   → remove the override; defer to the macOS "Close windows when
+    ///               quitting an application" system preference.
+    ///
+    /// With `window-save-state = default` the fork historically returned `nil`,
+    /// silently deferring pty-host session survival to that hidden system pref —
+    /// which is checked-by-default in modern macOS (= don't restore). So a
+    /// colleague on the seeded fork config, which enables `pty-host` but never
+    /// sets `window-save-state`, saw every surface spawn fresh on relaunch with
+    /// no warning (issue #5). When the pty-host backend is active we therefore
+    /// force restoration on for the `default` case, so the "sessions survive a
+    /// GUI quit/relaunch" promise no longer hinges on an invisible setting. An
+    /// explicit `always`/`never` is always honored (a user who set `never` has
+    /// opted out, even under pty-host).
+    static func quitAlwaysKeepsWindows(
+        windowSaveState: String,
+        ptyHostConfigured: Bool
+    ) -> Bool? {
+        switch windowSaveState {
+        case "never": return false
+        case "always": return true
+        default: return ptyHostConfigured ? true : nil
+        }
+    }
+
     private func ghosttyConfigDidChange(config: Ghostty.Config) {
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)
 
-        // Depending on the "window-save-state" setting we have to set the NSQuitAlwaysKeepsWindows
-        // configuration. This is the only way to carefully control whether macOS invokes the
-        // state restoration system.
-        switch config.windowSaveState {
-        case "never": UserDefaults.ghostty.setValue(false, forKey: "NSQuitAlwaysKeepsWindows")
-        case "always": UserDefaults.ghostty.setValue(true, forKey: "NSQuitAlwaysKeepsWindows")
-        case "default": fallthrough
-        default: UserDefaults.ghostty.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
+        // Depending on the "window-save-state" setting (and whether the pty-host
+        // backend is active — see issue #5) we set the NSQuitAlwaysKeepsWindows
+        // configuration. This is the only way to carefully control whether macOS
+        // invokes the state restoration system.
+        switch Self.quitAlwaysKeepsWindows(
+            windowSaveState: config.windowSaveState,
+            ptyHostConfigured: config.ptyHost != nil
+        ) {
+        case .some(let keep): UserDefaults.ghostty.setValue(keep, forKey: "NSQuitAlwaysKeepsWindows")
+        case .none: UserDefaults.ghostty.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
         }
 
         // Sync our auto-update settings. If SUEnableAutomaticChecks (in our Info.plist) is
