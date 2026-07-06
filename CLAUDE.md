@@ -116,9 +116,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   async classify; if you FOCUS the split (dismissing its bell) and then BLUR it before the
   classify finishes, the late `set_attention(true)` lands on the now-unfocused surface, sails
   past guard (2), and re-lights attention on a tab you were done with (the "I have to go back
-  and dismiss it AGAIN" annoyance). Fix: the sustained-focus clear
-  (`scheduleBellClearOnSustainedFocus`, which re-checks `bellIsFocused`) posts a new
-  `.ghosttyBellDismissed` notification → `MCPEventBus` emits a **`bell_dismissed`** event
+  and dismiss it AGAIN" annoyance). Fix: any dismissal posts a new `.ghosttyBellDismissed`
+  notification — the sustained-focus clear (`scheduleBellClearOnSustainedFocus`, which re-checks
+  `bellIsFocused`) AND the external clears `resetBell()`/`resetAttention()` (the web-monitor
+  `/bell`+`/attention` buttons and the dashboard tile 🔔, which race a classify identically) —
+  → `MCPEventBus` emits a **`bell_dismissed`** event
   (new `EventType`; added to the `wait_for_event` enum + `knownTypes` whitelist in
   `MCPTools`). The sidecar's dedicated `bellDismissReactiveLoop` (armed under the same
   `bellFilter` gate as `bellReactiveLoop`, anti-spins past the 0.5s coalesce window) calls
@@ -134,7 +136,8 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   rate-limit WATCHDOG (`maybeSignalAlert`) does NOT ride the bell path or this guard, so a
   genuine "needs you" still fires right after a dismissal. Diagnostics record a suppressed
   promotion as `classify`/`decision:"dismissed"`. Wiring: GUI `GhosttyPackage.swift`
-  (`.ghosttyBellDismissed`), `SurfaceView_AppKit.swift` (post from the debounced clear),
+  (`.ghosttyBellDismissed`), `SurfaceView_AppKit.swift` (post from the debounced clear +
+  `resetBell`/`resetAttention`),
   `MCPEventBus.swift` (`bellDismissed` + observer), `MCPTools.swift` (whitelist); sidecar
   `index.ts` (`bellDismissGen`/`bellAbort` on `LoopDeps` + `dismissGenAtStart`/
   `bellDismissedSinceStart` + `bellPromote` guard + `handleBellDismissed` +

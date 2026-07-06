@@ -983,6 +983,12 @@ extension Ghostty {
                     .removeDeliveredNotifications(withIdentifiers: Array(notificationIdentifiers))
                 self.notificationIdentifiers = []
             }
+            // (ramon fork / Bell Attention v2) An explicit external clear (web-monitor
+            // /bell button, dashboard tile 🔔) is a dismissal too — same focus-then-blur
+            // race as the sustained-focus clear: a bell that rang while unfocused may have
+            // an in-flight Haiku classify that would re-promote after you cleared it from
+            // the phone. Emit the dismissal so the sidecar cancels/aborts that classify.
+            NotificationCenter.default.post(name: .ghosttyBellDismissed, object: self)
         }
 
         /// (ramon fork / Bell Attention v2) Clear the sticky promoted `attentionNeeded`
@@ -994,6 +1000,10 @@ extension Ghostty {
         func resetAttention() {
             attentionNeeded = false
             invalidateBellRestorableState()
+            // (ramon fork / Bell Attention v2) See `resetBell`: an external attention clear
+            // (web-monitor /attention button, dashboard tile) is a dismissal — cancel/abort
+            // any in-flight classify so it can't re-raise attention after the phone cleared it.
+            NotificationCenter.default.post(name: .ghosttyBellDismissed, object: self)
         }
 
         /// (ramon fork) Mark this surface's window restorable state dirty whenever the
