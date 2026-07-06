@@ -280,6 +280,9 @@ export type SummarizeFn = (
     /** (floor hardening) Validity predicate over a WARM reply; false ⇒ fall back to the
      *  cold one-shot (see model.ts). Only consulted on the warm path. */
     isUsable?: (raw: string) => boolean;
+    /** (dismissal-abort) Optional AbortController for THIS call — aborted by a
+     *  `bell_dismissed` event to terminate the in-flight Haiku call (see model.ts). */
+    abortController?: AbortController;
   },
 ) => Promise<string>;
 
@@ -434,6 +437,20 @@ export interface LoopDeps {
    *  (where `view.bell`/`list_surfaces.bell` is never set, so the poll backstop above is
    *  blind). Drained into `forcedBell` at the start of each sweep. */
   pendingBellIds: Set<string>;
+  /** (bell-attention v2 / dismissal-abort) Per-surface DISMISSAL GENERATION, keyed by
+   *  surface id. Bumped each time the GUI reports a `bell_dismissed` event (the user
+   *  focused the surface and its sticky bell/attention was cleared). A bell classify
+   *  captures this value at START and refuses to promote if it CHANGED by the time it
+   *  finishes — the deterministic guard against the focus-then-blur double-trigger race
+   *  (a classify that outlives the dismissal must NOT re-light attention). Cleaned up
+   *  alongside `lastBySession` when a surface dies. */
+  bellDismissGen: Map<string, number>;
+  /** (bell-attention v2 / dismissal-abort) The in-flight bell classify's AbortController,
+   *  keyed by surface id, so a `bell_dismissed` event can TERMINATE the still-running Haiku
+   *  call (saving the wasted spend). Best-effort: the dismissal-generation guard above is the
+   *  correctness backstop; aborting is the cost optimization the user asked for. Set at
+   *  classify start, cleared in `finally`. */
+  bellAbort: Map<string, AbortController>;
   /** Adaptive RATE-LIMIT BACKOFF state (account-WIDE, not per-session). When the
    *  summarizer's own model calls keep failing — its account is rate-limited / returns
    *  no usable summary — `failureStreak` rises and `nextProbeMs` pushes the next probe
@@ -477,6 +494,27 @@ async function summarizeOne(
   const { client, overrides, cfg } = deps;
   const bellRang = opts.bellRang === true;
   const prev = deps.lastBySession.get(surface.id);
+
+  // (bell-attention v2 / dismissal-abort) Capture the surface's DISMISSAL GENERATION at
+  // classify START. A `bell_dismissed` event (the user focused the surface, clearing its
+  // sticky bell/attention) BUMPS this generation; if it changed by the time this classify
+  // finishes, the bell was already acknowledged and we must NOT promote — otherwise a
+  // classify that outlives a focus-then-blur re-lights attention on a tab the user was done
+  // with. `bellDismissedSinceStart()` is the deterministic guard, consulted in every promote
+  // branch AND inside `bellPromote` (the async-TOCTOU chokepoint). Only meaningful for a
+  // bell-triggered classify; the continuous summarizer never promotes off this path.
+  const dismissGenAtStart = bellRang
+    ? deps.bellDismissGen.get(surface.id) ?? 0
+    : 0;
+  const bellDismissedSinceStart = (): boolean =>
+    bellRang && (deps.bellDismissGen.get(surface.id) ?? 0) !== dismissGenAtStart;
+
+  // (bell-attention v2 / dismissal-abort) An AbortController for THIS bell classify's Haiku
+  // call, registered so a `bell_dismissed` event can TERMINATE the in-flight call (saving the
+  // spend). Best-effort — the generation guard above is the correctness backstop. Cleared in
+  // `finally`. Not armed for the continuous summarizer (it has no dismissal semantics).
+  const bellAbort = bellRang ? new AbortController() : undefined;
+  if (bellAbort) deps.bellAbort.set(surface.id, bellAbort);
 
   // Record a spent ATTEMPT: advance the per-session debounce clock (atMs) so a
   // FAILED or UNPARSEABLE attempt is throttled exactly like a successful one. Both
@@ -551,6 +589,10 @@ async function summarizeOne(
       // (see model.ts). Mirrors the parse check below, so a hollow/garbage warm reply
       // can't silently skip the surface without the cold floor firing.
       isUsable: (r) => parseSummary(r) !== null,
+      // (bell-attention v2 / dismissal-abort) Let a `bell_dismissed` event abort THIS
+      // in-flight Haiku call. Aborting throws below → the catch's fail-open path, which the
+      // generation guard then suppresses (no promotion for an already-dismissed bell).
+      abortController: bellAbort,
     });
     const parsed = parseSummary(raw);
     if (!parsed) {
@@ -564,11 +606,13 @@ async function summarizeOne(
         recordDiag("classify", {
           surface: surface.id,
           verdict: "unparseable",
-          decision: "promote",
+          // Dismissed mid-classify ⇒ the promotion is suppressed (record it honestly).
+          decision: bellDismissedSinceStart() ? "dismissed" : "promote",
           reason: "unparseable classify (fail-open)",
           durationMs: durMs(),
         });
-        await bellPromote(deps, surface, "unparseable classify (fail-open)");
+        await bellPromote(
+          deps, surface, "unparseable classify (fail-open)", dismissGenAtStart);
       }
       return "fail";
     }
@@ -602,7 +646,13 @@ async function summarizeOne(
           : parsed.attention === false
             ? "false"
             : "omitted";
-      const decision = parsed.attention !== false ? "promote" : "ignore";
+      // Model wants a promotion, but the user dismissed the bell mid-classify ⇒ suppress.
+      const wouldPromote = parsed.attention !== false;
+      const decision = !wouldPromote
+        ? "ignore"
+        : bellDismissedSinceStart()
+          ? "dismissed"
+          : "promote";
       recordDiag("classify", {
         surface: surface.id,
         verdict,
@@ -610,7 +660,7 @@ async function summarizeOne(
         reason: parsed.summary,
         durationMs: durMs(),
       });
-      if (parsed.attention !== false) await bellPromote(deps, surface, parsed.summary);
+      if (wouldPromote) await bellPromote(deps, surface, parsed.summary, dismissGenAtStart);
     }
     log(`surface ${surface.id}: "${parsed.summary}"`);
     return "ok";
@@ -635,7 +685,9 @@ async function summarizeOne(
       recordDiag("classify", {
         surface: surface.id,
         verdict: "error",
-        decision: "promote",
+        // A dismissal mid-classify (which itself ABORTS the call → lands here) must not
+        // promote — record "dismissed" so an abort-caused error isn't read as a real error.
+        decision: bellDismissedSinceStart() ? "dismissed" : "promote",
         reason: "classify error (fail-open)",
         // The real failure — so a fail-open promotion caused by the classifier's OWN
         // account being rate-limited (vs. some other error) is visible in the trace.
@@ -643,11 +695,16 @@ async function summarizeOne(
         errorKind: what,
         durationMs: durMs(),
       });
-      await bellPromote(deps, surface, "classify error (fail-open)");
+      await bellPromote(deps, surface, "classify error (fail-open)", dismissGenAtStart);
     }
     return "fail";
   } finally {
     deps.budget.release();
+    // (bell-attention v2 / dismissal-abort) Release the abort registration for THIS
+    // classify — only if it is still ours (a later classify may have re-registered).
+    if (bellAbort && deps.bellAbort.get(surface.id) === bellAbort) {
+      deps.bellAbort.delete(surface.id);
+    }
   }
 }
 
@@ -665,8 +722,27 @@ function alertReason(alert: string): string {
  * suppresses (the user's "only an explicit filter can ignore a bell"). The GUI clears
  * attention on focus; `set_attention` is idempotent. Self-isolating: a tool failure is
  * logged, never thrown into the sweep.
+ *
+ * (bell-attention v2 / dismissal-abort) `dismissGenAtStart` is the surface's dismissal
+ * generation captured when the classify began. This is the AUTHORITATIVE chokepoint: if the
+ * generation CHANGED (a `bell_dismissed` event arrived — the user focused + acknowledged the
+ * bell while this classify was running), we refuse the promotion. Checking here (synchronously,
+ * right before the `set_attention` call) also covers the async gap between the caller's own
+ * pre-check and this await. Every promote branch funnels through here, so a single guard
+ * closes the focus-then-blur double-trigger race for all fail-open paths.
  */
-async function bellPromote(deps: LoopDeps, surface: Surface, reason: string): Promise<void> {
+async function bellPromote(
+  deps: LoopDeps,
+  surface: Surface,
+  reason: string,
+  dismissGenAtStart: number,
+): Promise<void> {
+  if ((deps.bellDismissGen.get(surface.id) ?? 0) !== dismissGenAtStart) {
+    log(
+      `surface ${surface.id}: bell dismissed during classify -> promotion suppressed (${reason})`,
+    );
+    return;
+  }
   try {
     await deps.client.setAttention(surface.id, true, reason);
     log(`surface ${surface.id}: bell promoted -> attention needed (${reason})`);
@@ -677,6 +753,31 @@ async function bellPromote(deps: LoopDeps, surface: Surface, reason: string): Pr
       }`,
     );
   }
+}
+
+/**
+ * (bell-attention v2 / dismissal-abort) Handle a GUI `bell_dismissed` event for one surface:
+ * the user focused it and its sticky bell/attention was cleared, so any bell classify for it
+ * is now MOOT. Three effects, all idempotent + cheap:
+ *   1. Drop it from `pendingBellIds` — cancels a QUEUED (not-yet-run) classify.
+ *   2. BUMP the dismissal generation — a classify already running captured the old value at
+ *      start, so `bellPromote`'s chokepoint now refuses its (late) promotion. This is the
+ *      deterministic guard; it works even if the abort below is a no-op.
+ *   3. ABORT the in-flight Haiku call (best-effort) — terminates the wasted evaluation.
+ * Exported for tests. Never throws.
+ */
+export function handleBellDismissed(deps: LoopDeps, id: string): void {
+  deps.pendingBellIds.delete(id);
+  deps.bellDismissGen.set(id, (deps.bellDismissGen.get(id) ?? 0) + 1);
+  const ac = deps.bellAbort.get(id);
+  if (ac) {
+    try {
+      ac.abort();
+    } catch {
+      /* aborting a settled controller is a no-op; never let it escape */
+    }
+  }
+  log(`surface ${id}: bell dismissed -> classify cancelled/aborted`);
 }
 
 /**
@@ -830,6 +931,14 @@ export async function runSweep(deps: LoopDeps): Promise<void> {
   }
   for (const id of [...deps.alertBySession.keys()]) {
     if (!liveIds.has(id)) deps.alertBySession.delete(id);
+  }
+  // (bell-attention v2 / dismissal-abort) Prune the dismissal-generation + abort maps for
+  // dead surfaces (a live map entry for a closed surface would leak, though harmlessly).
+  for (const id of [...deps.bellDismissGen.keys()]) {
+    if (!liveIds.has(id)) deps.bellDismissGen.delete(id);
+  }
+  for (const id of [...deps.bellAbort.keys()]) {
+    if (!liveIds.has(id)) deps.bellAbort.delete(id);
   }
 
   // (bell-attention) Decide which surfaces get a FORCED classify this sweep (bellRang).
@@ -1116,6 +1225,8 @@ async function main(): Promise<void> {
     bellFilter,
     bellSeenBySession: new Map<string, boolean>(),
     pendingBellIds: new Set<string>(),
+    bellDismissGen: new Map<string, number>(),
+    bellAbort: new Map<string, AbortController>(),
     summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     summarizerConfigDir,
   };
@@ -1318,6 +1429,38 @@ async function main(): Promise<void> {
     }
   };
 
+  // (bell-attention v2 / dismissal-abort) BELL-DISMISS-REACTIVE loop: long-poll
+  // wait_for_event(bell_dismissed) and immediately CANCEL/ABORT the classify for the
+  // dismissed surface (handleBellDismissed), so a bell the user just focused-and-cleared
+  // can't re-light attention after they blur. Separate from `bellReactiveLoop` so that
+  // hot path stays byte-identical; both are armed under the same `bellFilter` gate. Like
+  // the queue-reactive loop it ANTI-SPINS past the server's 0.5s coalesce window after
+  // handling an event, so the same event in the ring can't immediately re-resolve. NEVER
+  // exits on error (fail-open: re-arms after a short backoff).
+  const bellDismissReactiveLoop = async (): Promise<void> => {
+    while (!stopped) {
+      let ev: { id: string; type: string } | null;
+      try {
+        ev = await deps.client.waitForEvent({
+          types: ["bell_dismissed"],
+          timeoutMs: BELL_WAIT_MS,
+        });
+      } catch (err) {
+        errlog(`bell-dismiss wait failed: ${err instanceof Error ? err.message : String(err)}`);
+        await sleep(BELL_WAIT_RETRY_MS);
+        continue;
+      }
+      if (stopped) return;
+      if (ev) {
+        handleBellDismissed(deps, ev.id);
+        // ANTI-SPIN past the GUI's 0.5s coalesce window so this same dismiss event can't
+        // immediately re-resolve the next wait_for_event (mirrors queueReactiveLoop).
+        await sleep(QUEUE_REACTIVE_MIN_INTERVAL_MS);
+      }
+      // ev === null ⇒ park timeout; just loop and re-park.
+    }
+  };
+
   // INDEPENDENT queue loop (ramon fork / Agent Queue): the deterministic supervisor
   // runs on its OWN self-paced timer, NOT inside `tick`/`runSweep`. This decouples the
   // latency-sensitive queue (dispatch/track/close) from the slow LLM summarizer pass —
@@ -1395,6 +1538,8 @@ async function main(): Promise<void> {
   if (deps.bellFilter && typeof deps.client.waitForEvent === "function") {
     log("bell-attention: event-driven classify ENABLED (wait_for_event)");
     void bellReactiveLoop();
+    // (dismissal-abort) Its twin: cancel/abort a classify when the user dismisses the bell.
+    void bellDismissReactiveLoop();
   }
   // The 5s CONTINUOUS summarizer poll runs ONLY when agent-manager is enabled (the expensive
   // path). `await` it so main() stays alive on the summarizer's timer; when it's off, the

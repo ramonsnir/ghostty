@@ -399,6 +399,12 @@ export interface WarmRunRequest {
   configDir?: string;
   /** costUsd is token-bucket; mode is set to "warm". */
   onUsage?: (u: HaikuUsage) => void;
+  /** (bell-attention v2 / dismissal-abort) Optional caller signal. When it aborts (a
+   *  `bell_dismissed` event), the per-call fork's resume query is aborted too — terminating
+   *  the wasted spend. Linked to the internal deadline AbortController in `forkResumeGC`;
+   *  an abort via THIS signal (vs. the timeout) rethrows as a plain error → cold-path
+   *  semantics, which the caller's dismissal guard then suppresses. */
+  externalSignal?: AbortSignal;
 }
 
 export class WarmBase {
@@ -614,6 +620,14 @@ export class WarmBase {
       timedOut = true;
       ac.abort();
     }, this.d.timeoutMs ?? WARMBASE_CALL_TIMEOUT_MS);
+    // (dismissal-abort) Link the caller's signal to this call's controller so a
+    // `bell_dismissed` cancels the resume query. `timedOut` stays false (only the timer
+    // sets it), so an external abort takes the NON-timeout error path → rethrown plain →
+    // cold semantics, suppressed by the caller's dismissal guard. Idempotent if already aborted.
+    if (req.externalSignal) {
+      if (req.externalSignal.aborted) ac.abort();
+      else req.externalSignal.addEventListener("abort", () => ac.abort(), { once: true });
+    }
     try {
       const q = this.d.seam.query({
         prompt: req.user,

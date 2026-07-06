@@ -105,15 +105,46 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   dial down with explicit `no-*`); promotion is FAIL-OPEN (only a confident `attention===false`
   suppresses — do NOT use the lax `coerceBool`); promotion is EVENT-DRIVEN and must NOT depend
   on `view.bell`; the GUI never auto-sets `attentionNeeded` (only the sidecar via
-  `set_attention`). **A truly focused surface (`bellIsFocused`) is NEVER promoted** — two
-  guards close the "random bell from a healthy session" delayed-promotion race: (1)
+  `set_attention`). **A truly focused surface (`bellIsFocused`) is NEVER promoted** — three
+  guards close the delayed-promotion + focus-then-blur double-trigger races: (1)
   `MCPEventBus` skips emitting the `.bell` event for a focused surface, so the sidecar spends
   NO Haiku classify on it; (2) `SurfaceView.ghosttyAttentionDidChange` ignores a late
   `set_attention(true)` while focused (a clear always applies — this also covers the
   poll-driven rate-limit watchdog, which bypasses the bell event). Same mechanism as the Agent
-  Manager's rate-limit watchdog. **See
+  Manager's rate-limit watchdog. **(3) DISMISSAL-ABORT (fork-only, sidecar-side) closes the
+  focus-then-blur race guard (2) alone can't** — a bell that rang while UNFOCUSED starts an
+  async classify; if you FOCUS the split (dismissing its bell) and then BLUR it before the
+  classify finishes, the late `set_attention(true)` lands on the now-unfocused surface, sails
+  past guard (2), and re-lights attention on a tab you were done with (the "I have to go back
+  and dismiss it AGAIN" annoyance). Fix: the sustained-focus clear
+  (`scheduleBellClearOnSustainedFocus`, which re-checks `bellIsFocused`) posts a new
+  `.ghosttyBellDismissed` notification → `MCPEventBus` emits a **`bell_dismissed`** event
+  (new `EventType`; added to the `wait_for_event` enum + `knownTypes` whitelist in
+  `MCPTools`). The sidecar's dedicated `bellDismissReactiveLoop` (armed under the same
+  `bellFilter` gate as `bellReactiveLoop`, anti-spins past the 0.5s coalesce window) calls
+  `handleBellDismissed`: (a) drops the id from `pendingBellIds` (cancels a QUEUED classify),
+  (b) BUMPS a per-surface `bellDismissGen` — a running classify captured the old value at
+  START, so `bellPromote` (the single chokepoint all fail-open branches funnel through)
+  REFUSES to promote once it changed (the deterministic guard), and (c) ABORTS the in-flight
+  Haiku call via an `AbortController` threaded through both the COLD
+  (`SummarizeRequest.abortController` → SDK `options.abortController`) and WARM
+  (`WarmRunRequest.externalSignal` linked to the fork's deadline controller in `forkResumeGC`)
+  model paths (best-effort cost saving; the generation guard is the correctness backstop even
+  if the abort no-ops — an aborted call throws → fail-open → suppressed by the guard). The
+  rate-limit WATCHDOG (`maybeSignalAlert`) does NOT ride the bell path or this guard, so a
+  genuine "needs you" still fires right after a dismissal. Diagnostics record a suppressed
+  promotion as `classify`/`decision:"dismissed"`. Wiring: GUI `GhosttyPackage.swift`
+  (`.ghosttyBellDismissed`), `SurfaceView_AppKit.swift` (post from the debounced clear),
+  `MCPEventBus.swift` (`bellDismissed` + observer), `MCPTools.swift` (whitelist); sidecar
+  `index.ts` (`bellDismissGen`/`bellAbort` on `LoopDeps` + `dismissGenAtStart`/
+  `bellDismissedSinceStart` + `bellPromote` guard + `handleBellDismissed` +
+  `bellDismissReactiveLoop` + pruning), `model.ts` + `warmbase.ts` (abort threading). Tests:
+  sidecar `index.test.ts` (cancel/abort/bump; suppress-mid-classify parsed + fail-open;
+  new-bell-after-dismiss still promotes; pruning), Swift `MCPServerTests.swift`
+  (`dispatchWaitForEventBellDismissedType`). GUI relaunch + rebuilt sidecar `dist`; no
+  host/Zig change. **See
   `BELL-ATTENTION.md` (→ Implementation notes) for the vocabulary table, launch gating, per-tier
-  consumer routing, wiring + tests.** GUI relaunch + rebuilt sidecar `dist`; no host change.
+  consumer routing, dismissal-abort, wiring + tests.** GUI relaunch + rebuilt sidecar `dist`; no host change.
 
 - `bell-features-focused: BellFeatures` (fork-only config key) — a second bell-feature
   set governing the bell when the ringing surface is **truly in focus**: focused split

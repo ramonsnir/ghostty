@@ -302,6 +302,8 @@ function makeLoopDeps(client: McpClient): LoopDeps {
     bellFilter: false,
     bellSeenBySession: new Map(),
     pendingBellIds: new Set(),
+    bellDismissGen: new Map(),
+    bellAbort: new Map(),
     summarizerBackoff: { failureStreak: 0, nextProbeMs: 0 },
     // queue intentionally OMITTED → the queue pass is a no-op.
   };
