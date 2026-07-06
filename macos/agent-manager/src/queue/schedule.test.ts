@@ -157,6 +157,45 @@ test("intraday 9/13/17: Friday overrun crosses the weekend to Monday", () => {
 });
 
 // ---------------------------------------------------------------------------
+// computeNextStart — 12h CAP on the required rest (the weekend-manual-run fix)
+// ---------------------------------------------------------------------------
+
+test("12h cap: weekday-daily, a weekend manual run does NOT cancel Monday (the reported bug)", () => {
+  // `0 9 * * 1-5`. The firing before Mon 09:00 is FRI 09:00, so the gap into Monday is 72h and
+  // the UNCAPPED half was 36h — a Sunday 10:00 manual run (only ~23h before Monday) sat inside
+  // that window and skipped Monday to Tuesday. With the 12h cap, requiredRest = min(36h, 12h) =
+  // 12h, and 23h > 12h → Monday 09:00 runs as it should.
+  const c = parseCron("0 9 * * 1-5");
+  assert.equal(new Date(2024, 2, 3).getDay(), 0); // Sunday 2024-03-03
+  const state: ScheduleState = { armedAt: 0, lastCompletionAt: at(2024, 3, 3, 10, 0) };
+  assert.equal(computeNextStart(c, state), at(2024, 3, 4, 9, 0)); // Mon 09:00 (NOT skipped)
+});
+
+test("12h cap: a run finishing <12h before the next firing is STILL skipped (long gap)", () => {
+  // Same weekday-daily long gap, but the completion is only 11h before Monday 09:00 (Sun 22:00).
+  // 11h ≤ the 12h cap → Monday IS skipped; Tuesday 09:00 (35h of rest) is then accepted.
+  const c = parseCron("0 9 * * 1-5");
+  const state: ScheduleState = { armedAt: 0, lastCompletionAt: at(2024, 3, 3, 22, 0) };
+  assert.equal(computeNextStart(c, state), at(2024, 3, 5, 9, 0)); // Tue 09:00 (Monday skipped)
+});
+
+test("12h cap: EXACTLY 12h before the firing still skips (strictly-greater comparator kept)", () => {
+  // Completion exactly 12h before Monday 09:00 (Sun 21:00). requiredRest = 12h, and 12h is NOT
+  // strictly > 12h → Monday is skipped. Pins the boundary against the cap.
+  const c = parseCron("0 9 * * 1-5");
+  const state: ScheduleState = { armedAt: 0, lastCompletionAt: at(2024, 3, 3, 21, 0) };
+  assert.equal(computeNextStart(c, state), at(2024, 3, 5, 9, 0)); // Tue 09:00
+});
+
+test("12h cap does NOT change short cadences (gap/2 already < 12h): 04:30 hourly still skips to 06:00", () => {
+  // The cap is min(gap/2, 12h); for an hourly cron gap/2 = 30min < 12h, so the cap is inert and
+  // the existing half-gap boundary behavior is preserved (04:30 finish → 05:00 skipped → 06:00).
+  const c = parseCron("0 * * * *");
+  const state: ScheduleState = { armedAt: 0, lastCompletionAt: at(2024, 3, 4, 4, 30) };
+  assert.equal(computeNextStart(c, state), at(2024, 3, 4, 6, 0));
+});
+
+// ---------------------------------------------------------------------------
 // No backfill + isDue
 // ---------------------------------------------------------------------------
 

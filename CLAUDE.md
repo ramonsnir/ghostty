@@ -923,9 +923,15 @@ slots ARE restored from the store, so only the schedule's was lost → the tab o
 reserves a real grid slot…`). **Cadence — completion-anchored
   with a half-of-local-gap skip:** the `cron` is a 5-field LOCAL-time expression; the next run is
   computed from **when the previous run's split CLOSED** (a long run pushes the next out), and the
-  next cron firing is SKIPPED if it lands within half the local cadence of the last completion
-  (`A > C + (A − prevFiring)/2`, strictly greater — pins the boundary; never-ran uses the arm
-  anchor with NO skip). No backfill of missed firings (down/paused ⇒ fire once, re-anchor).
+  next cron firing is SKIPPED if it lands within half the local cadence of the last completion,
+  **that required rest CAPPED at 12h** (`A > C + min((A − prevFiring)/2, 12h)`, strictly greater —
+  pins the boundary; never-ran uses the arm anchor with NO skip). The 12h cap fixes the "no Monday
+  run after a weekend manual run" bug: a weekday-daily's Fri→Mon cron gap is 72h so the uncapped
+  half was 36h, and a Sunday manual run (~23h before Mon 9am) wrongly cancelled Monday — the cap
+  means a run finished ≥12h before a firing is never skipped; short cadences are unaffected (half
+  already < 12h). `MAX_SKIP_REST_MS` in `schedule.ts`. The dashboard "next in …" is the post-skip
+  `computeNextStart` value, so it never shows a to-be-skipped firing (a change between looks = a
+  completion re-anchored). No backfill of missed firings (down/paused ⇒ fire once, re-anchor).
   **Single-flight** (never two runs of one schedule at once — structural, a new run arms only after
   the current closes). **Completion = the split closing, by ANY cause** (agent exits + `closeOnComplete`
   auto-closes it, OR you close it) — NO hook/idle dependency, so it works for **Codex** too; a
