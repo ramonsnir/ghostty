@@ -20,11 +20,16 @@
 //    next one out. Single-flight is therefore structural: the runner only computes a
 //    next start once the current run has completed; while a scheduled split is open,
 //    nothing new is armed.
-//  * HALF-OF-LOCAL-GAP SKIP: the next start is the first cron firing `A` (strictly
-//    after completion `C`) such that `A > C + (A − prevFiring)/2`, where `prevFiring`
-//    is the cron firing immediately before `A` (the local cadence leading into `A`).
-//    So a run that finishes deep into a cycle SKIPS the immediately-next firing to
-//    preserve at least half-a-gap of rest. Worked examples in schedule.test.ts.
+//  * HALF-OF-LOCAL-GAP SKIP (capped at 12h): the next start is the first cron firing
+//    `A` (strictly after completion `C`) such that `A > C + min((A − prevFiring)/2, 12h)`,
+//    where `prevFiring` is the cron firing immediately before `A` (the local cadence
+//    leading into `A`). So a run that finishes deep into a cycle SKIPS the immediately-next
+//    firing to preserve rest — but the required rest is CAPPED at 12h, so a run that
+//    finished ≥12h before a firing is never skipped. The cap matters when the cron gap
+//    balloons across a gap in the schedule (e.g. a weekday-daily's Fri→Mon gap is 72h, so
+//    the uncapped half was 36h — a weekend manual/catch-up run then cancelled Monday even
+//    with ~23h of rest). Short cadences are unaffected (gap/2 < 12h). Worked examples in
+//    schedule.test.ts.
 //  * NEVER-RAN: a schedule that has never completed fires at its first cron firing
 //    at-or-after its ARM time (when it was first enabled/loaded) — NO skip (arming is
 //    not a run; applying the skip here would wrongly delay a freshly-enabled daily
@@ -246,6 +251,16 @@ export function prevBefore(cron: ParsedCron, beforeMs: number): number {
 // against a pathological cron anyway).
 const MAX_SKIP_ITERS = 4096;
 
+// CAP on the "half the local gap" rest requirement. The skip enforces "wait at least half a
+// cadence after a run before the next firing", but the cadence GAP balloons across gaps in the
+// cron schedule — for a weekday-daily schedule (`0 9 * * 1-5`) the firing before Monday 9am is
+// FRIDAY 9am, so the gap into Monday is 72h and half is 36h. A manual (or catch-up) run over the
+// weekend then sat inside that 36h window and CANCELLED Monday's scheduled run — even though it
+// had ~23h of rest. Cap the required rest at 12h so a run that finished at least 12h before the
+// upcoming firing is NEVER skipped, regardless of how inflated the cron gap is. Short cadences
+// are unaffected (their gap/2 is already < 12h); only long-gap cases stop over-skipping.
+const MAX_SKIP_REST_MS = 12 * 60 * 60 * 1000; // 12 hours
+
 /** The persisted per-schedule timing state. `armedAt` = when the schedule was first
  *  enabled/loaded (ms; the never-ran anchor). `lastCompletionAt` = when its most
  *  recent run's split CLOSED (ms; undefined ⇒ never ran). `paused` = user muted it
@@ -268,7 +283,7 @@ export interface ScheduleState {
  * The ms-since-epoch at which the NEXT run of this schedule should start. PURE +
  * deterministic. See the module header for the model:
  *   - never ran (no `lastCompletionAt`) → first firing at-or-after `armedAt`, NO skip;
- *   - ran → the half-of-local-gap skip from `lastCompletionAt`.
+ *   - ran → the half-of-local-gap skip (capped at 12h) from `lastCompletionAt`.
  * The runner treats the schedule as DUE when `now >= computeNextStart(...)`. Because
  * the result depends only on persisted anchors (not a volatile `now`), it is stable
  * across sweeps until the schedule next completes.
@@ -280,13 +295,15 @@ export function computeNextStart(cron: ParsedCron, state: ScheduleState): number
     // firing at or after armedAt, since firings land on minute boundaries).
     return nextAfter(cron, armedAt - 1);
   }
-  // Completed: skip forward to the first firing that leaves at least half the local
-  // gap of rest after completion.
+  // Completed: skip forward to the first firing that leaves enough rest after completion —
+  // at least half the local gap, but CAPPED at 12h (MAX_SKIP_REST_MS) so a weekend-inflated
+  // gap can't cancel a firing a completion already cleared by ≥12h.
   let a = nextAfter(cron, lastCompletionAt);
   for (let i = 0; i < MAX_SKIP_ITERS; i++) {
     const prev = prevBefore(cron, a);
     const gap = a - prev;
-    if (a - lastCompletionAt > gap / 2) return a;
+    const requiredRest = Math.min(gap / 2, MAX_SKIP_REST_MS);
+    if (a - lastCompletionAt > requiredRest) return a;
     a = nextAfter(cron, a);
   }
   return a;

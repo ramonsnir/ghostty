@@ -543,9 +543,17 @@ steps supported; day-of-week `0`/`7` = Sunday). The next run is computed from **
 run's split closed**, not a fixed grid — so a long run pushes the next one out — and the next cron
 firing is **skipped if it lands within half the local cadence** of the last completion (so a scan
 that overran deep into a cycle waits a full further cycle rather than firing right on its heels).
-Missed firings while the sidecar/GUI was down (or the schedule was paused) are **not** replayed —
-the next due run fires once, then re-anchors. **Single-flight:** a schedule never has two runs at
-once (a new run is armed only after the current one closes).
+**That "half the cadence" rest is CAPPED at 12 hours:** a run that finished at least 12h before a
+firing is never skipped. The cap matters when the cron gap balloons across a gap in the schedule —
+e.g. a weekday-daily's Friday→Monday gap is 72h, so the uncapped half was 36h, and a weekend manual
+or catch-up run (only ~23h before Monday 9am) would wrongly cancel Monday's run. With the cap the
+required rest is `min(half the cadence, 12h)`, so short cadences are unaffected (their half is
+already < 12h) and only long-gap cases stop over-skipping. Missed firings while the sidecar/GUI was
+down (or the schedule was paused) are **not** replayed — the next due run fires once, then
+re-anchors. **Single-flight:** a schedule never has two runs at once (a new run is armed only after
+the current one closes). The dashboard's **"next in …"** always shows this post-skip value
+(`computeNextStart`), so it never displays a firing that will be skipped — if it changes between
+looks, a completion re-anchored the schedule.
 
 **Completion = the split closing** — by any cause: the agent exits and (with `closeOnComplete`)
 the split is auto-closed, *or* you close it yourself. No hook/idle dependency, so it works for
@@ -2023,8 +2031,13 @@ or host change** (pure Swift + TS).
   "Schedules" above). NO config key + NO new MCP tool + NO Zig/host change — GUI relaunch +
   rebuilt sidecar `dist`. Cadence is PURE (`queue/schedule.ts`): a vendored 5-field cron parser
   (`parseCron`/`nextAfter`/`prevBefore`, LOCAL time) + `computeNextStart(cron, state)` implementing
-  the completion-anchored **half-of-local-gap skip** (`A > C + (A − prevFiring)/2`, strictly
-  greater; never-ran uses the arm anchor with NO skip). The runner's `scheduleSweep` (runner.ts,
+  the completion-anchored **half-of-local-gap skip, CAPPED at 12h**
+  (`A > C + min((A − prevFiring)/2, MAX_SKIP_REST_MS=12h)`, strictly greater; never-ran uses the arm
+  anchor with NO skip). The cap stops a weekend-inflated cron gap (Fri→Mon = 72h ⇒ uncapped half 36h)
+  from cancelling a firing a completion already cleared by ≥12h — the "no Monday run after a weekend
+  manual run" bug; short cadences are unaffected (half already < 12h). `nextRunAt` in the status
+  report is this same post-skip value, so the dashboard "next in …" never shows a to-be-skipped
+  firing. The runner's `scheduleSweep` (runner.ts,
   called every sweep from `runOne`) arms/prunes cadence state, tracks liveness via **two signals**
   (the `scheduleId` annotation echoed by `list_surfaces` OR the persisted `activeSessionID` matched
   against the live surfaces — `liveSurfaceFor(id)`), detects completion only when a tracked schedule
