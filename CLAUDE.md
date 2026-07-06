@@ -1001,6 +1001,28 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `SegmentedPool fuzz` / `SegmentedPool deterministic grow-while-outstanding repro` tests). Callers
   unchanged. **See `PTYHOST.md` → "Write-request pool grow corruption".**
 
+- **PTY-host reattach no longer silently gated by macOS window-save-state (fork-only,
+  macOS, GUI-only; on by default when pty-host is set — an explicit `window-save-state =
+  never` still opts out).** The pty-host promise "sessions
+  survive a GUI quit/relaunch" depends on macOS actually persisting+restoring the window
+  archive on quit (it carries each surface's host `sessionID`, the reattach key). Whether
+  macOS does so on a clean quit is gated by `NSQuitAlwaysKeepsWindows`, which the fork
+  derives from `window-save-state`: `always→true`, `never→false`, `default→` (historically)
+  REMOVE the override and defer to the macOS **"Close windows when quitting an application"**
+  system pref — checked-by-default in modern macOS (= don't restore). Since the fork's own
+  default is `default` and the seeded colleague config enables `pty-host` WITHOUT setting
+  `window-save-state`, the whole reattach feature **silently** hinged on an invisible system
+  checkbox — a colleague (or Ramon on a machine whose shared config lacks `window-save-state
+  = always`) saw every surface spawn fresh on relaunch with NO warning (issue #5). Fix: a
+  pure `AppDelegate.quitAlwaysKeepsWindows(windowSaveState:ptyHostActive:)` forces
+  `NSQuitAlwaysKeepsWindows = true` for the `default` case whenever `pty-host` is set, so
+  reattach no longer depends on the system pref; explicit `never` still opts out (even under
+  pty-host), and a non-pty-host build is behaviorally unchanged (`default→nil`, defer to system). No
+  Zig/host change (no host restart) — GUI relaunch only. Wiring:
+  `macos/Sources/App/macOS/AppDelegate.swift` (`quitAlwaysKeepsWindows` + `ghosttyConfigDidChange`),
+  `ForkSetup.swift` (seed pty-host comment). Tests: `macos/Tests/App/AppDelegateTests.swift`
+  (`quitAlwaysKeepsWindows` matrix). **See `PTYHOST.md` → "Always" caveats.**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.

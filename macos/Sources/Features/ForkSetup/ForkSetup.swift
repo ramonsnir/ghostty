@@ -1300,6 +1300,10 @@ enum ForkSetup {
     # LaunchAgent on first launch), so sessions SURVIVE A GUI QUIT/RELAUNCH.
     # NOTE: this takes effect on the SECOND launch — the first launch installs the
     # host and runs the in-process backend; relaunch once for hosted sessions.
+    # Session survival needs macOS to restore windows on quit (the window archive
+    # carries each surface's host session id); with pty-host set, the fork forces
+    # that on automatically, so you do NOT need `window-save-state = always`. Set
+    # `window-save-state = never` only if you deliberately want NO reattach.
     pty-host = __HOME__/.ghostty-ramon-host.sock
 
     # --- Web monitor (fork-only, OFF by default) ---------------------------------
