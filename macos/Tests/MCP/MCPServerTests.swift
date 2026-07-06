@@ -830,6 +830,20 @@ struct MCPServerTests {
         }
     }
 
+    // (ramon fork / Bell Attention v2 dismissal-abort) The bell-dismissal wake type is an
+    // accepted wait_for_event filter type, so the sidecar's bell-dismiss loop can park on it
+    // and cancel/abort an in-flight classify when the user focuses+dismisses a bell.
+    @Test func dispatchWaitForEventBellDismissedType() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let args: [String: Any] = ["filter": ["types": ["bell_dismissed"]]]
+        switch MCPTools.dispatch(name: "wait_for_event", arguments: args, server: server) {
+        case .waitForEvent(let spec):
+            #expect(spec.types == ["bell_dismissed"])
+        default:
+            Issue.record("expected .waitForEvent for bell_dismissed")
+        }
+    }
+
     // An unknown filter type still fails fast (guards the whitelist that the wake type joined).
     @Test func dispatchWaitForEventUnknownTypeRejected() {
         let server = MCPServer(listen: "127.0.0.1:8765", token: "")

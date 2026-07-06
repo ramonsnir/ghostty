@@ -95,7 +95,15 @@ final class MCPEventBus {
     // sidecar's queue-reactive long-poll wakes an immediate supervisor sweep instead of
     // waiting out the in-flight sweep + the 5s poll gap. Its wire value is `queue_command`
     // (snake_case, matching the tool's type whitelist).
-    enum EventType: String { case bell, exited, prompt, queueCommand = "queue_command" }
+    // (ramon fork / Bell Attention v2) `bellDismissed` fires when a surface's sticky bell /
+    // attention is cleared by SUSTAINED FOCUS (the user acknowledged it), so the bell-reactive
+    // long-poll can cancel/abort an in-flight classify for that surface and refuse a late
+    // promotion. Wire value `bell_dismissed` (snake_case, matching the tool whitelist).
+    enum EventType: String {
+        case bell, exited, prompt
+        case queueCommand = "queue_command"
+        case bellDismissed = "bell_dismissed"
+    }
 
     struct Event {
         let id: UUID
@@ -116,6 +124,7 @@ final class MCPEventBus {
     private var lastPrompt: [UUID: Bool] = [:]
     private var pollTimer: Timer?
     private var bellObserver: NSObjectProtocol?
+    private var bellDismissObserver: NSObjectProtocol?
 
     // MARK: - Coalescing ring + waiter registry (server serial queue)
 
@@ -192,6 +201,22 @@ final class MCPEventBus {
                 self.record(Event(id: view.id, type: .bell, ts: Date()))
             }
 
+            // (ramon fork / Bell Attention v2) A surface's bell / attention was dismissed
+            // by sustained focus. Surface it as a `bell_dismissed` event so the sidecar's
+            // bell-reactive loop can cancel/abort a still-running classify for it and refuse
+            // a late promotion. Emitted unconditionally (unlike the ring, no focus gate) —
+            // it fires precisely because the surface just became focused, and a dismiss for
+            // a surface with no in-flight classify is a cheap no-op sidecar-side.
+            self.bellDismissObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name.ghosttyBellDismissed,
+                object: nil,
+                queue: .main
+            ) { [weak self] note in
+                guard let self else { return }
+                guard let view = note.object as? Ghostty.SurfaceView else { return }
+                self.record(Event(id: view.id, type: .bellDismissed, ts: Date()))
+            }
+
             // 250ms poll for processExited / needsConfirmQuit transitions.
             let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
                 self?.pollTransitions()
@@ -211,6 +236,10 @@ final class MCPEventBus {
             if let obs = self.bellObserver {
                 NotificationCenter.default.removeObserver(obs)
                 self.bellObserver = nil
+            }
+            if let obs = self.bellDismissObserver {
+                NotificationCenter.default.removeObserver(obs)
+                self.bellDismissObserver = nil
             }
         }
     }

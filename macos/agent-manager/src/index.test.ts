@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   runSweep,
   classifyBellNow,
+  handleBellDismissed,
   makeCoalescedRunner,
   parseParentPid,
   parseNonNegativeInt,
@@ -127,6 +128,8 @@ interface DepsSpec {
   bellFilter?: boolean;
   bellsSeen?: Map<string, boolean>;
   pendingBells?: Set<string>;
+  dismissGen?: Map<string, number>;
+  bellAbort?: Map<string, AbortController>;
   budgetMax?: number;
   backoff?: { failureStreak: number; nextProbeMs: number };
 }
@@ -154,6 +157,8 @@ function makeDeps(spec: DepsSpec): {
     bellFilter: spec.bellFilter ?? false,
     bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
     pendingBellIds: spec.pendingBells ?? new Set<string>(),
+    bellDismissGen: spec.dismissGen ?? new Map<string, number>(),
+    bellAbort: spec.bellAbort ?? new Map<string, AbortController>(),
     summarizerBackoff: spec.backoff ?? { failureStreak: 0, nextProbeMs: 0 },
   };
   return { deps, summarizeCalls };
@@ -920,6 +925,101 @@ test("bell-attention: dead-surface bell records are pruned each sweep", async ()
   await runSweep(deps);
 
   assert.equal(deps.bellSeenBySession.has("s1"), false, "stale bell record dropped");
+});
+
+// ---------------------------------------------------------------------------
+// Bell-attention v2 DISMISSAL-ABORT: a bell the user focused+dismissed must NOT
+// re-light attention if its async classify outlives the dismissal (the focus-then-blur
+// double-trigger race). handleBellDismissed cancels a queued classify, bumps a per-surface
+// dismissal generation (the deterministic promote guard), and aborts the in-flight call.
+// ---------------------------------------------------------------------------
+
+test("bell-attention/dismiss: handleBellDismissed cancels the queued classify, bumps gen, aborts in-flight", () => {
+  const fake = makeFakeClient({ surfaces: [] });
+  const { deps } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    bellFilter: true,
+    pendingBells: new Set(["s1"]),
+  });
+  const ac = new AbortController();
+  deps.bellAbort.set("s1", ac);
+
+  handleBellDismissed(deps, "s1");
+
+  assert.equal(deps.pendingBellIds.has("s1"), false, "queued classify cancelled (pending drained)");
+  assert.equal(deps.bellDismissGen.get("s1"), 1, "dismissal generation bumped");
+  assert.equal(ac.signal.aborted, true, "in-flight Haiku call aborted");
+});
+
+test("bell-attention/dismiss: a bell dismissed DURING its classify is NOT promoted", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  // Simulate the user focusing + dismissing WHILE the (async) Haiku call is in flight:
+  // the summarize fn fires the dismissal, then returns a promote verdict. The captured
+  // start-generation now differs from the bumped one, so bellPromote must suppress.
+  const holder: { deps?: LoopDeps } = {};
+  const dismissMidClassify: SummarizeFn = async () => {
+    handleBellDismissed(holder.deps!, "s1");
+    return '{"summary":"Needs you: approve?","attention":true}';
+  };
+  const { deps } = makeDeps({ fake, summarize: dismissMidClassify, last, bellFilter: true });
+  holder.deps = deps;
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 0, "dismissed mid-classify ⇒ promotion suppressed");
+});
+
+test("bell-attention/dismiss: an unparseable (fail-open) reply is ALSO suppressed after a dismiss", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const holder: { deps?: LoopDeps } = {};
+  const dismissThenJunk: SummarizeFn = async () => {
+    handleBellDismissed(holder.deps!, "s1");
+    return "not json"; // fail-open would normally promote — but it was dismissed
+  };
+  const { deps } = makeDeps({ fake, summarize: dismissThenJunk, last, bellFilter: true });
+  holder.deps = deps;
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 0, "fail-open promotion is suppressed by the dismissal");
+});
+
+test("bell-attention/dismiss: a NEW bell AFTER a dismissal still promotes (generation matches)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  // A prior dismissal already bumped the generation to 3; this fresh classify captures 3 at
+  // start and nothing dismisses it during the call, so it promotes normally.
+  const { deps } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    last,
+    bellFilter: true,
+    dismissGen: new Map([["s1", 3]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "a fresh bell (no dismiss since start) still promotes");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
+test("bell-attention/dismiss: dismiss maps are pruned for dead surfaces each sweep", async () => {
+  const fake = makeFakeClient({ surfaces: [] }); // s1 gone
+  const { deps } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    bellFilter: true,
+    dismissGen: new Map([["s1", 2]]),
+    bellAbort: new Map([["s1", new AbortController()]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(deps.bellDismissGen.has("s1"), false, "stale dismiss-generation dropped");
+  assert.equal(deps.bellAbort.has("s1"), false, "stale abort controller dropped");
 });
 
 // ---------------------------------------------------------------------------

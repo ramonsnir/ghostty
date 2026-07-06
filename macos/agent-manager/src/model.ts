@@ -90,6 +90,12 @@ export interface SummarizeRequest {
    *  falls THROUGH to the cold one-shot (the floor). Only consulted on the warm path;
    *  the cold reply is returned verbatim (the caller validates it as before). */
   isUsable?: (raw: string) => boolean;
+  /** (bell-attention v2 / dismissal-abort) Optional AbortController for THIS call. Forwarded
+   *  to the SDK `query` (`options.abortController`) on the COLD path and, as its signal, into
+   *  `warm.run` on the WARM path so a `bell_dismissed` event can TERMINATE the in-flight Haiku
+   *  call and stop the wasted spend. Aborting makes the query throw; the caller's fail-open
+   *  path then suppresses the (moot) promotion via its dismissal-generation guard. */
+  abortController?: AbortController;
 }
 
 /** The query() function signature we depend on — injectable for tests. */
@@ -120,6 +126,8 @@ export async function summarize(
         model: req.model ?? SUMMARIZER_MODEL,
         configDir: req.configDir,
         onUsage: req.onUsage,
+        // (dismissal-abort) Let a dismissal abort the warm fork's resume query too.
+        externalSignal: req.abortController?.signal,
       });
       // FLOOR HARDENING: a warm call can SUCCEED yet return an UNUSABLE reply (e.g.
       // unparseable — the symptom of the resume-systemPrompt bug). That is NOT a
@@ -169,6 +177,9 @@ export async function summarize(
       ...(req.configDir
         ? { env: { ...process.env, CLAUDE_CONFIG_DIR: req.configDir } }
         : {}),
+      // (dismissal-abort) Forward the caller's AbortController so a `bell_dismissed` event
+      // can cancel this in-flight call. Omitted when absent (the summarizer never sets it).
+      ...(req.abortController ? { abortController: req.abortController } : {}),
     },
   });
 

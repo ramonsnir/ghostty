@@ -111,6 +111,19 @@ surface (focused split + key window + active app — the same `bellIsFocused` ru
    already cleared attention, re-lighting a split you're actively watching. Guard 1 stops
    most bell promotions at the source; guard 2 also covers the watchdog (which bypasses the
    bell event entirely) and the race where focus lands mid-classify.
+3. **Cancel/abort on dismissal (the focus-then-blur race).** Guard 2 only suppresses a
+   promotion that arrives *while the surface is still focused*. But you can **focus a split
+   (dismissing its bell) and then blur it** before the async classify finishes — then the late
+   `set_attention(true)` lands on a now-*unfocused* surface, sails past guard 2, and re-lights
+   attention on a tab you were done with (the "I have to go back and dismiss it again" bug). So
+   a **sustained-focus dismissal** (the same debounced clear in guard-2's clear path) emits a
+   **`bell_dismissed`** MCP event, and the sidecar's dedicated dismiss loop reacts: it (a)
+   drops the surface from the queued-classify set, (b) **bumps a per-surface dismissal
+   generation** — a classify captured the old value at start, so `bellPromote` refuses to
+   promote once it changed (the deterministic guard), and (c) **aborts the in-flight Haiku
+   call** (an `AbortController` threaded through both the cold and warm model paths) to stop
+   the wasted spend. Rate-limit/**watchdog** alerts are *not* affected — they don't ride the
+   bell path, so a genuine "needs you" still fires even right after you dismissed a bell.
 
 ## Surviving a GUI restart (fork-only, always on)
 
@@ -397,6 +410,48 @@ Not unit-tested: `bellIsFocused` depends on live `NSApp`/window state (like
 `bellFeaturesForCurrentFocus` itself, also untested) — verified by build + the existing
 MCP/WebMonitor/Config suites staying green.
 
+### Dismissal-abort (the focus-then-blur double-trigger race)
+
+Guard 2 only helps while the surface is *still focused* when the late `set_attention(true)`
+arrives. The leaky case is **focus-then-blur**: a bell rings while a split is unfocused → a
+`.bell` event starts an async Haiku classify (~1–2s, longer under load); the user focuses the
+split (the sustained-focus debounce clears the bell ~0.5s later) and then **blurs** it before
+the classify finishes; the promotion then lands on the now-unfocused surface, passes guard 2,
+and re-lights attention on a tab they were done with. Closed by a third mechanism (**sidecar
+abort**, no extra GUI suppression):
+
+- **GUI emits a dismissal event.** The debounced sustained-focus clear
+  (`scheduleBellClearOnSustainedFocus`, which already re-checks `bellIsFocused`) posts
+  `.ghosttyBellDismissed` (object = the `SurfaceView`). `MCPEventBus` observes it and
+  `record`s a **`bell_dismissed`** event (new `EventType`, wire value `bell_dismissed`), the
+  clean "the user acknowledged this surface's bell" signal — never a transient restore focus.
+- **Sidecar reacts (`handleBellDismissed`).** A dedicated `bellDismissReactiveLoop` long-polls
+  `wait_for_event(bell_dismissed)` (armed under the same `bellFilter` gate as the bell loop,
+  anti-spins past the 0.5s coalesce window like the queue loop) and, per event: (1) drops the
+  id from `pendingBellIds` — cancels a *queued* classify; (2) **bumps `bellDismissGen[id]`** —
+  a running classify captured the old generation at start via `dismissGenAtStart`, and
+  `bellPromote` (the single chokepoint every fail-open branch funnels through) refuses to
+  `set_attention` once it differs; (3) **`abort()`s `bellAbort[id]`** — the classify's
+  `AbortController`, threaded into the model call so a `bell_dismissed` terminates the
+  in-flight Haiku call (best-effort cost saving; the generation guard is the correctness
+  backstop even if the abort is a no-op).
+- **Abort plumbing.** `SummarizeRequest.abortController` (and the `SummarizeFn` request type)
+  forward the controller to the SDK `query`'s `options.abortController` on the **cold** path;
+  on the **warm** path `WarmRunRequest.externalSignal` links it to the per-call fork's internal
+  deadline `AbortController` in `forkResumeGC`. An abort throws → the caller's fail-open catch
+  → `bellPromote` → suppressed by the generation guard (so an abort never leaks a promotion).
+- **Watchdog untouched.** `maybeSignalAlert` (the rate-limit watchdog) does NOT ride the bell
+  path or this guard, so a genuine "needs you" alert still fires even right after a dismissal.
+- **Diagnostics.** A suppressed promotion records a `classify` event with `decision:"dismissed"`
+  (instead of `promote`), so the trace stays honest and jq "promote" counts aren't inflated.
+- **Cleanup.** `bellDismissGen`/`bellAbort` are pruned for dead surfaces in `runSweep` alongside
+  `lastBySession`/`alertBySession`/`bellSeenBySession`.
+
+Tested in `index.test.ts` (dismiss cancels/aborts/bumps; a dismiss mid-classify suppresses both
+the parsed-`attention:true` AND the unparseable fail-open promotion; a NEW bell after a dismissal
+still promotes; dead-surface pruning) and `MCPServerTests.swift`
+(`dispatchWaitForEventBellDismissedType`).
+
 ### Persisted across GUI restart (`SurfaceView` Codable)
 
 `bell` + `attentionNeeded` are persisted in `SurfaceView`'s `Codable` so they survive a GUI
@@ -520,11 +575,24 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
   `macos/Tests/BellDiagnostics/BellDiagnosticsTests.swift`.
 - **sidecar** — `macos/agent-manager/src/{index,summarizer,mcp,prompts}.ts` (`coerceAttention`,
   `pendingBellIds`/`bellReactiveLoop`, `makeCoalescedRunner`, `waitForEvent`/`parseWaitForEvent`).
+- **dismissal-abort** — GUI: `Ghostty/GhosttyPackage.swift` (`.ghosttyBellDismissed`
+  Notification.Name), `Surface View/SurfaceView_AppKit.swift` (post `.ghosttyBellDismissed` from
+  the debounced sustained-focus clear), `MCP/MCPEventBus.swift` (`EventType.bellDismissed` +
+  the `bellDismissObserver` → `record(.bellDismissed)`), `MCP/MCPTools.swift` (`bell_dismissed`
+  in the `wait_for_event` enum + `knownTypes`). Sidecar: `index.ts`
+  (`LoopDeps.bellDismissGen`/`bellAbort`, `dismissGenAtStart`/`bellDismissedSinceStart` +
+  abort wiring in `summarizeOne`, `bellPromote`'s generation chokepoint, `handleBellDismissed`,
+  `bellDismissReactiveLoop` + arming, dead-surface pruning), `model.ts`
+  (`SummarizeRequest.abortController` → cold `options.abortController` + warm `externalSignal`),
+  `warmbase.ts` (`WarmRunRequest.externalSignal` linked to the fork's deadline controller).
 
 ### Tests
 
-- sidecar `node --test` (fail-open + `parseWaitForEvent` + coalesce + event-driven promote).
-- Swift `ConfigTests`/`WebMonitorServerTests`/`AgentDashboardTests`.
+- sidecar `node --test` (fail-open + `parseWaitForEvent` + coalesce + event-driven promote;
+  **dismissal-abort**: cancel/abort/bump, suppress-mid-classify (parsed + fail-open), new-bell-
+  after-dismiss still promotes, dead-surface pruning).
+- Swift `ConfigTests`/`WebMonitorServerTests`/`AgentDashboardTests`/`MCPServerTests`
+  (`dispatchWaitForEventBellDismissedType`).
 - Zig `attention-features` + `BellFeatures bit positions`.
 
 **GUI relaunch + rebuilt sidecar `dist`; no host change.**

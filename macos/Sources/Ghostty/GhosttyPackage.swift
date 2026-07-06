@@ -360,6 +360,14 @@ extension Notification.Name {
     /// Ring the bell
     static let ghosttyBellDidRing = Notification.Name("com.mitchellh.ghostty.ghosttyBellDidRing")
 
+    /// (ramon fork / Bell Attention v2) A surface's sticky bell / attention was
+    /// DISMISSED because the user actually focused it (the sustained-focus clear, NOT a
+    /// transient restore focus). Object is the SurfaceView, mirroring `ghosttyBellDidRing`.
+    /// The MCP event bus surfaces this as a `bell_dismissed` event so the Agent Manager
+    /// sidecar can cancel/abort an in-flight bell classify for that surface and refuse a
+    /// late promotion — closing the focus-then-blur double-trigger race.
+    static let ghosttyBellDismissed = Notification.Name("com.mitchellh.ghostty.ghosttyBellDismissed")
+
     /// The active selection changed
     static let ghosttySelectionDidChange = Notification.Name("com.mitchellh.ghostty.ghosttySelectionDidChange")
 

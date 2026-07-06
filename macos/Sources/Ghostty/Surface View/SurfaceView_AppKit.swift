@@ -950,6 +950,20 @@ extension Ghostty {
                 self.attentionNeeded = false
                 // Persist the cleared state so it doesn't resurrect on next restart.
                 self.invalidateBellRestorableState()
+
+                // (ramon fork / Bell Attention v2) Announce the DISMISSAL so the MCP
+                // event bus emits a `bell_dismissed` event. This is the ONLY sanctioned
+                // "the user acknowledged this surface's bell" signal — a real, sustained
+                // focus (re-checked `bellIsFocused` above), never a transient restore
+                // focus. The Agent Manager sidecar consumes it to cancel/abort an
+                // in-flight bell classify for this surface and refuse a late promotion,
+                // closing the focus-then-blur double-trigger race: a bell that rang while
+                // this split was unfocused starts an async Haiku classify; if the user
+                // focuses (dismissing it here) and then blurs before that classify
+                // finishes, the promotion would otherwise land on the now-unfocused
+                // surface and re-light attention on a tab they were done with.
+                NotificationCenter.default.post(
+                    name: .ghosttyBellDismissed, object: self)
             }
             bellClearWorkItem = work
             DispatchQueue.main.asyncAfter(
