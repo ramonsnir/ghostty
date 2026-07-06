@@ -116,7 +116,9 @@ surface (focused split + key window + active app — the same `bellIsFocused` ru
    (dismissing its bell) and then blur it** before the async classify finishes — then the late
    `set_attention(true)` lands on a now-*unfocused* surface, sails past guard 2, and re-lights
    attention on a tab you were done with (the "I have to go back and dismiss it again" bug). So
-   a **sustained-focus dismissal** (the same debounced clear in guard-2's clear path) emits a
+   a **dismissal** — the sustained-focus clear OR an explicit acknowledgment via
+   `resetBell()`/`resetAttention()` (the web-monitor / dashboard clear-from-the-phone buttons) —
+   emits a
    **`bell_dismissed`** MCP event, and the sidecar's dedicated dismiss loop reacts: it (a)
    drops the surface from the queued-classify set, (b) **bumps a per-surface dismissal
    generation** — a classify captured the old value at start, so `bellPromote` refuses to
@@ -420,11 +422,15 @@ the classify finishes; the promotion then lands on the now-unfocused surface, pa
 and re-lights attention on a tab they were done with. Closed by a third mechanism (**sidecar
 abort**, no extra GUI suppression):
 
-- **GUI emits a dismissal event.** The debounced sustained-focus clear
-  (`scheduleBellClearOnSustainedFocus`, which already re-checks `bellIsFocused`) posts
-  `.ghosttyBellDismissed` (object = the `SurfaceView`). `MCPEventBus` observes it and
-  `record`s a **`bell_dismissed`** event (new `EventType`, wire value `bell_dismissed`), the
-  clean "the user acknowledged this surface's bell" signal — never a transient restore focus.
+- **GUI emits a dismissal event.** Any explicit acknowledgment of a surface's bell posts
+  `.ghosttyBellDismissed` (object = the `SurfaceView`): the debounced sustained-focus clear
+  (`scheduleBellClearOnSustainedFocus`, which already re-checks `bellIsFocused`) AND the external
+  clears `resetBell()` / `resetAttention()` (the web-monitor `/bell` + `/attention` buttons and
+  the dashboard tile 🔔 — a phone/laptop acknowledgment races a classify exactly the same way).
+  `MCPEventBus` observes it and `record`s a **`bell_dismissed`** event (new `EventType`, wire value
+  `bell_dismissed`), the clean "the user acknowledged this surface's bell" signal — never a
+  transient restore focus. (A dashboard tile that clears both calls `resetBell`+`resetAttention`
+  → two events; harmless, the generation just bumps twice.)
 - **Sidecar reacts (`handleBellDismissed`).** A dedicated `bellDismissReactiveLoop` long-polls
   `wait_for_event(bell_dismissed)` (armed under the same `bellFilter` gate as the bell loop,
   anti-spins past the 0.5s coalesce window like the queue loop) and, per event: (1) drops the
@@ -577,7 +583,8 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
   `pendingBellIds`/`bellReactiveLoop`, `makeCoalescedRunner`, `waitForEvent`/`parseWaitForEvent`).
 - **dismissal-abort** — GUI: `Ghostty/GhosttyPackage.swift` (`.ghosttyBellDismissed`
   Notification.Name), `Surface View/SurfaceView_AppKit.swift` (post `.ghosttyBellDismissed` from
-  the debounced sustained-focus clear), `MCP/MCPEventBus.swift` (`EventType.bellDismissed` +
+  the debounced sustained-focus clear AND from `resetBell()`/`resetAttention()` — the web-monitor /
+  dashboard external clears), `MCP/MCPEventBus.swift` (`EventType.bellDismissed` +
   the `bellDismissObserver` → `record(.bellDismissed)`), `MCP/MCPTools.swift` (`bell_dismissed`
   in the `wait_for_event` enum + `knownTypes`). Sidecar: `index.ts`
   (`LoopDeps.bellDismissGen`/`bellAbort`, `dismissGenAtStart`/`bellDismissedSinceStart` +
