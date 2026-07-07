@@ -423,11 +423,12 @@ colleague clones the repo somewhere else. Two portability hooks fix that:
   - **KEEP note** — adopting **follows the template's `keepOnComplete`** (it does NOT force-keep):
     on `status=done` the adopted split **auto-closes like any tracked item unless its 📌 KEEP pin
     is set**, so pin it first (or the template defaults to keep) if you want to keep working in it.
-  Adopt **always succeeds** — at capacity (the queue at concurrency / its grid full) the moved
-  split **overflows into a new grid row / tab** (the same multi-tab packing the queue uses). It
-  occupies a concurrency slot but is **not** counted as a freshly-launched agent (no
-  `lifetimeDispatched` bump — it's an existing agent, not a new one). If the template defines a
-  `claim` step, adopt fires it for the key (same as a normal dispatch).
+  Adopt **always succeeds** — the split lands in the tab that holds the run's **lowest free grid
+  slot** (a later tab, or a reused hole — NOT always the first tab), and when **every tab is full**
+  it **overflows into its own new tab** rather than over-packing an existing one (the same slot→tab
+  placement a normal dispatch uses). It occupies a concurrency slot but is **not** counted as a
+  freshly-launched agent (no `lifetimeDispatched` bump — it's an existing agent, not a new one). If
+  the template defines a `claim` step, adopt fires it for the key (same as a normal dispatch).
 - **Promote a running split to a HERO (and demote back):** any tracked queue split has a
   **Promote…** control on its dashboard tile that flips it into the [hero pool](#hero-agents-a-separate-attention-bounded-pool)
   — it moves out of the fungible-throughput accounting into the fleet-wide `agent-queue-hero-max`
@@ -437,8 +438,10 @@ colleague clones the repo somewhere else. Two portability hooks fix that:
   *new* heroes dispatch until live heroes drain back under `agent-queue-hero-max`. A hero tile's
   **Demote** flips it back to a regular tracked item (accounting + marker) AND re-packs the split
   back into the run's BSP grid (symmetric with promote's eject), so a promote→demote round-trip
-  doesn't strand a plain regular in the hero's dedicated tab. With no seated regular anchor (the
-  run's only pane) there's nothing to pack into, so it stays in its own tab.
+  doesn't strand a plain regular in the hero's dedicated tab. The re-pack targets the tab holding
+  the run's **lowest free slot** (a full grid overflows into a fresh tab — never over-packing an
+  existing one). With no seated pane (the run's only pane) there's nothing to pack into, so it
+  stays in its own tab.
 
 ## Hero agents (a separate, attention-bounded pool)
 
@@ -945,8 +948,14 @@ or host change** (pure Swift + TS).
   `runPromote`/`runDemote`, like `runAdopt`).** `runPromote` **ejects** the split into its own new
   tab via the `move_split_to_new_tab` keybind (out of the BSP grid; the grid slot is reassigned to a
   `-1` ejected sentinel so the packer + next dispatch's occupied-set ignore it) and re-stamps the
-  hero annotation; `runDemote` drops the hero annotation. Side effects are best-effort (a failed
-  eject is logged; the split stays put but is still a hero — the run-level set is authoritative).
+  hero annotation; `runDemote` drops the hero annotation AND **re-packs the split into the run's grid
+  via the shared `planGridMoveForRun`/`moveExistingIntoRunGrid`** (see "Placing a MOVED split") — so
+  it lands in the tab holding the run's lowest free slot (a full grid overflows to a fresh tab), NOT
+  always tab 0, and its `gridSlot` is reset to that slot so it re-enters occupancy. It passes its own
+  surface as `excludeUUID` so its current slot (a reconcile-adopted hero can be seated at `0`, not the
+  `-1` sentinel) isn't counted against the free-slot search. Side effects are best-effort (a failed
+  eject/move is logged; the split stays put but is still accounted — the run-level set is
+  authoritative).
 - **HERO dispatch opens its OWN tab (`dispatchOne`).** A hero-classified dispatch SKIPS `splitPlan`
   entirely (`const sp = isHero ? undefined : splitPlan(...)`) and spawns with the same `firstTab` +
   `windowAnchorUUID` shape an overflow tab uses (single terminal, anchored on a live pane so it
@@ -1166,17 +1175,43 @@ or host change** (pure Swift + TS).
   real Haiku work runs in the sweep's post-`applyCommands` SIDE-EFFECT loop.
 - **Runner side effects (`runner.ts runAdopt`).** After `applyCommands` + its persist + the snappy
   report loop, `runQueueSweep` re-iterates the drained `commands`: `adopt` → `runAdopt`, `infer_key`
-  → `runInferKey`. `runAdopt`: re-checks the dedup against the LIVE `run.active`; resolves the run's
-  first SEATED anchor pane (`firstSeatedUUID`) and `moveSurfaceIntoTab({sourceUUID, targetAnchorUUID,
-  balanced, maxCols, maxRows})` — REUSING the existing cross-window move + grid-cap overflow (LOCKED
-  #5: at capacity the split overflows to a new grid row/tab; adopt always succeeds); if the run has
-  NO seated pane it does NOT move (the adopted split becomes the run's seed). **On a MOVE failure it
-  ROLLS BACK the latch** (`run.dispatched.delete(key)` + persist) so the item stays dispatchable.
-  Then it stamps the annotation (`queueKey`/`queueName`/`queueUrl` + `keep = effectiveKeep(run, key)`
-  — FOLLOWS the template, NOT a forced true), fires the provider `claim` (consistent with
-  `dispatchOne`), and persists the latch. It NEVER writes `run.active` (reconcile is its sole owner)
-  and never spawns, so the adopted pane occupies a concurrency slot WITHOUT bumping
-  `lifetimeDispatched`.
+  → `runInferKey`. `runAdopt`: re-checks the dedup against the LIVE `run.active`; then places the
+  split via the **shared `planGridMoveForRun` + `moveExistingIntoRunGrid`** (see "Placing a MOVED
+  split" below) — the SAME `gridOccupancy`→`lowestFreeSlot`→`splitPlan` contract `dispatchOne` uses,
+  so the split lands in the tab that holds the run's **lowest free slot** (NOT always tab 0), and a
+  FULL grid **ejects it into its own overflow tab** (`move_split_to_new_tab`) rather than over-packing
+  an existing tab. If the run has NO seated pane it does NOT move (the adopted split becomes the run's
+  seed). **On a BALANCED-split MOVE failure it ROLLS BACK the latch** (`run.dispatched.delete(key)` +
+  persist) so the item stays dispatchable; the overflow eject is best-effort and never rolls back
+  (the source is adopted by annotation regardless). Then it stamps the annotation
+  (`queueKey`/`queueName`/`queueUrl` + `keep = effectiveKeep(run, key)` — FOLLOWS the template, NOT a
+  forced true), fires the provider `claim` (consistent with `dispatchOne`), and persists the latch. It
+  NEVER writes `run.active` (reconcile is its sole owner) and never spawns, so the adopted pane
+  occupies a concurrency slot WITHOUT bumping `lifetimeDispatched`.
+- **Placing a MOVED split — shared `planGridMoveForRun` / `moveExistingIntoRunGrid` (adopt + demote).**
+  Moving an EXISTING split into a run's grid (a human-adopted surface, or a demoted hero re-entering
+  the grid) must make the SAME slot→tab decision a fresh `dispatchOne` makes, or it over-packs. **The
+  bug this fixed:** both paths formerly anchored on the run's *lowest slot* (always TAB 0 — adopt via
+  `firstSeatedUUID`, demote via the first pane in map-iteration order) and relied on
+  `move_surface_into_tab`'s `maxCols`/`maxRows` caps to "overflow". But the GUI's `largestLeafSplit`
+  cap has a **defensive fallback that STILL over-packs a full tab** — it assumes the *caller* already
+  spilled to a new tab (which `dispatchOne` does via `splitPlan`, but adopt/demote did not). So
+  adopting/demoting into a run whose tab 0 was full added a **7th pane to that full 3×2 tab** instead
+  of using a later tab's free slot. Fix: the pure `planGridMoveForRun(run, excludeUUID?)` runs the
+  dispatch contract — `gridOccupancy(run, excludeUUID)` → `lowestFreeSlot` (cap =
+  `effectiveConcurrency + scheduleActive.size`, `?? occupied.size` for the over-capacity overflow) →
+  `splitPlan` — returning `null` (no seated pane → leave the source as the seed), `{newTab:true, slot}`
+  (all tabs full → eject to an overflow tab), or `{newTab:false, anchorUUID, slot}` (balanced-split
+  into the tab **holding the free slot**, so `largestLeafSplit` never hits its over-pack fallback). The
+  async `moveExistingIntoRunGrid` executes it: balanced → `moveSurfaceIntoTab` (throws on failure — the
+  caller decides fatality); newTab → reuse the hero-promote `perform_action move_split_to_new_tab` eject
+  (best-effort, never throws — an already-isolated source no-ops). `excludeUUID` drops the MOVING pane
+  from occupancy — REQUIRED for demote, where a hero adopted via reconcile carries a real `gridSlot` (0),
+  NOT the promote sentinel `-1`, so `gridOccupancy`'s `gridSlot >= 0` filter wouldn't skip it. Wiring:
+  `queue/runner.ts` (`planGridMoveForRun`/`moveExistingIntoRunGrid` + `gridOccupancy` `excludeUUID`
+  param; `runAdopt`/`runDemote` route through it). Tests: `runner.test.ts` (`runAdopt: anchors on the
+  tab that has a FREE slot…`, `runAdopt: a FULL grid overflows into a new tab (eject)…`, `hero: DEMOTE
+  re-packs into the tab with a free slot across MULTIPLE tabs…`).
 - **Reuse of reconcile's orphan-adoption (NOT a parallel path).** `store.ts reconcile` already
   folds a live surface carrying `queueKey`+`queueName` with no matching record into the run as a
   RUNNING assignment (fresh `sinceMs`, lowest-free grid slot). So "adopt" = stamp the annotation +

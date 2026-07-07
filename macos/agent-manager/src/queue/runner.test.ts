@@ -2738,6 +2738,94 @@ test("runAdopt: no seated anchor → no move, but annotation is still stamped (s
   assert.equal(ann!.ann.queueKey, "SEED-1");
 });
 
+test("runAdopt: anchors on the tab that has a FREE slot, not always tab 0 (multi-tab placement)", async () => {
+  // The reported bug: a run spread across TWO tabs (grid 2x1 = 2 panes/tab). Tab 0 is FULL
+  // (slots 0,1); tab 1 holds slot 2 with slot 3 free. Adopt must anchor the move on the pane in
+  // TAB 1 (slot 2) — the tab that has the free slot — NOT on tab 0's pane (which would over-pack
+  // it into a 3rd pane past cols*rows).
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const t = tmpl({ concurrency: 4, grid: { cols: 2, rows: 1, fill: "columns" } }); // capPerTab 2
+  const run = makeQueueRun(t, memStore());
+  seat(run, "R-0", "u-tab0-a", 0); // tab 0
+  seat(run, "R-1", "u-tab0-b", 1); // tab 0 — now FULL
+  seat(run, "R-2", "u-tab1-a", 2); // tab 1 — slot 3 free
+  let now = 6_300_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    takeCommands: commandsOnce([
+      { action: "adopt", run: "backlog", key: "ADOPT-T", surfaceUUID: "free-uuid" },
+    ]),
+  });
+
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.moveIntoTab.length, 1, "moved once (balanced split into an existing tab)");
+  assert.equal(fake.calls.moveIntoTab[0].sourceUUID, "free-uuid");
+  assert.equal(fake.calls.moveIntoTab[0].targetAnchorUUID, "u-tab1-a",
+    "anchored on the tab-1 pane (the tab with the free slot), NOT tab 0");
+  assert.ok(run.dispatched.has("ADOPT-T"), "still latched");
+});
+
+test("runAdopt: a FULL grid overflows into a new tab (eject), never over-packing an existing tab", async () => {
+  // grid 2x1, concurrency 2 → the ONE tab is full at slots 0,1. Adopting a 3rd must NOT balanced-
+  // split the full tab; it ejects the source into its own overflow tab (move_split_to_new_tab).
+  const fake = makeQueueFake({ surfaces: [], listJson: "[]" });
+  const t = tmpl({ concurrency: 2, grid: { cols: 2, rows: 1, fill: "columns" } }); // capPerTab 2, full
+  const run = makeQueueRun(t, memStore());
+  seat(run, "R-0", "u-a", 0);
+  seat(run, "R-1", "u-b", 1); // the only tab is now FULL
+  let now = 6_400_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    takeCommands: commandsOnce([
+      { action: "adopt", run: "backlog", key: "ADOPT-OVF", surfaceUUID: "free-uuid" },
+    ]),
+  });
+
+  await runQueueSweep(deps);
+
+  assert.equal(fake.calls.moveIntoTab.length, 0, "NO balanced split — the full tab is never over-packed");
+  const eject = fake.calls.perform.find((p) => p.id === "free-uuid" && p.action === "move_split_to_new_tab");
+  assert.ok(eject, "the source was ejected into its own overflow tab");
+  assert.ok(run.dispatched.has("ADOPT-OVF"), "still latched (adopt succeeds via annotation)");
+  const ann = fake.calls.annotate.find((a) => a.id === "free-uuid");
+  assert.ok(ann, "annotation stamped so reconcile folds it in");
+});
+
+test("hero: DEMOTE re-packs into the tab with a free slot across MULTIPLE tabs (not always tab 0)", async () => {
+  // A run spread across two tabs (grid 2x1): tab 0 FULL (R-0 slot 0, R-1 slot 1), tab 1 has R-2
+  // (slot 2, slot 3 free), plus a hero H-1 in its own tab (slot -1). Demoting H-1 must re-pack it
+  // into TAB 1 (anchored on R-2), the tab with the free slot — not over-pack tab 0.
+  // Back every record with a live surface (matched by UUID) so the sweep's reconcile keeps them.
+  const fake = makeQueueFake({
+    surfaces: [
+      queueSurface({ id: "u-tab0-a", sessionID: 940, agentState: "working", queueKey: "R-0", queueName: "backlog" }),
+      queueSurface({ id: "u-tab0-b", sessionID: 941, agentState: "working", queueKey: "R-1", queueName: "backlog" }),
+      queueSurface({ id: "u-tab1-a", sessionID: 942, agentState: "working", queueKey: "R-2", queueName: "backlog" }),
+      queueSurface({ id: "u-h1", sessionID: 943, agentState: "working", queueKey: "H-1", queueName: "backlog" }),
+    ],
+    listJson: "[]",
+  });
+  const t = tmpl({ concurrency: 4, grid: { cols: 2, rows: 1, fill: "columns" } }); // capPerTab 2
+  const run = makeQueueRun(t, memStore());
+  run.active.set("R-0", seatedAsgn("R-0", "u-tab0-a", 0));
+  run.active.set("R-1", seatedAsgn("R-1", "u-tab0-b", 1)); // tab 0 FULL
+  run.active.set("R-2", seatedAsgn("R-2", "u-tab1-a", 2)); // tab 1, slot 3 free
+  run.active.set("H-1", { ...seatedAsgn("H-1", "u-h1", -1), hero: true }); // hero, own tab
+  run.hero.add("H-1");
+  let now = 9_400_000;
+  const deps = makeQueueDeps(fake, [run], () => now, 8, {
+    heroMax: 2,
+    takeCommands: commandsOnce([{ action: "demote", run: "backlog", surfaceUUID: "u-h1", key: "H-1" }]),
+  });
+
+  await runQueueSweep(deps);
+
+  const move = fake.calls.moveIntoTab.find((m) => m.sourceUUID === "u-h1");
+  assert.ok(move, "demote re-packed H-1 via moveSurfaceIntoTab");
+  assert.equal(move!.targetAnchorUUID, "u-tab1-a", "anchored on the tab-1 pane with the free slot, NOT tab 0");
+  assert.equal(run.active.get("H-1")!.gridSlot, 3, "H-1's grid slot reset to the lowest free slot (3, tab 1)");
+  assert.ok(!run.hero.has("H-1"), "H-1 left the hero pool");
+});
+
 test("adopt + reconcile: the annotated surface is folded in as a RUNNING assignment, no lifetime bump", () => {
   // The pure reconcile path the runner relies on: a live surface (non-zero sessionID) carrying
   // queueKey+queueName with NO matching record is adopted as RUNNING.

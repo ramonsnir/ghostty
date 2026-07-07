@@ -2249,17 +2249,27 @@ async function dispatchSchedule(
  *  item's OR a schedule's — must see both pools. Seeing only `run.active` let a work item land on
  *  a schedule's slot and balanced-split its tab PAST `cols*rows` (the "7th split in a 3×2 tab"
  *  bug) instead of overflowing to a new tab. `occupied` includes PENDING (not-yet-seated) panes
- *  via `occupiesSlot`; `slotUUID` carries only seated panes (a UUID exists). */
-function gridOccupancy(run: QueueRun): { occupied: Set<number>; slotUUID: Map<number, string> } {
+ *  via `occupiesSlot`; `slotUUID` carries only seated panes (a UUID exists).
+ *
+ *  `excludeUUID` drops one surface from the occupancy — used by `planGridMoveForRun` so a MOVING
+ *  pane (a demoted hero) doesn't count its OWN current slot against the free-slot search. This is
+ *  necessary because a hero adopted via reconcile carries a real `gridSlot` (0), not the promote
+ *  sentinel `-1`, so it wouldn't be skipped by the `gridSlot >= 0` filter alone. */
+function gridOccupancy(
+  run: QueueRun,
+  excludeUUID?: string,
+): { occupied: Set<number>; slotUUID: Map<number, string> } {
   const occupied = new Set<number>();
   const slotUUID = new Map<number, string>();
   for (const a of run.active.values()) {
+    if (excludeUUID !== undefined && a.surfaceUUID === excludeUUID) continue;
     if (a.gridSlot >= 0 && occupiesSlot(a)) {
       occupied.add(a.gridSlot);
       if (a.surfaceUUID !== undefined) slotUUID.set(a.gridSlot, a.surfaceUUID);
     }
   }
   for (const act of run.scheduleActive.values()) {
+    if (excludeUUID !== undefined && act.uuid === excludeUUID) continue;
     if (act.gridSlot >= 0) {
       occupied.add(act.gridSlot);
       slotUUID.set(act.gridSlot, act.uuid);
@@ -2284,8 +2294,8 @@ function seatedAtSlot(run: QueueRun, slotIndex: number): Assignment | undefined 
 }
 
 /** The first SEATED (has a `surfaceUUID`) anchor pane ANYWHERE in a run — the lowest occupied
- *  slot's UUID. Used by `runAdopt` to address the run's grid tab for the move. Returns
- *  `undefined` when the run has no seated pane (empty/all-unseated run). PURE. */
+ *  slot's UUID. Used by `dispatchOne` to anchor a HERO's own new tab on the run's window.
+ *  Returns `undefined` when the run has no seated pane (empty/all-unseated run). PURE. */
 function firstSeatedUUID(run: QueueRun): string | undefined {
   let best: { slot: number; uuid: string } | undefined;
   for (const a of run.active.values()) {
@@ -2296,19 +2306,126 @@ function firstSeatedUUID(run: QueueRun): string | undefined {
   return best?.uuid;
 }
 
+/** A placement plan for an EXISTING split moving INTO the run's grid — the shared return of
+ *  `planGridMoveForRun`. `newTab:false` ⇒ balanced-split into the tab holding `anchorUUID`;
+ *  `newTab:true` ⇒ give the source its own overflow tab. `slot` is the assigned grid slot. */
+interface GridMovePlan {
+  slot: number;
+  newTab: boolean;
+  anchorUUID?: string;
+}
+
+/**
+ * (adopt / demote) Decide how to place an EXISTING split — a human-adopted surface, or a demoted
+ * hero re-entering the grid — into the run's BSP grid, making the SAME slot→tab decision a fresh
+ * `dispatchOne` makes. So a moved-in pane lands exactly where a dispatched one would, INCLUDING
+ * multi-tab overflow.
+ *
+ * THE BUG THIS FIXES: the old adopt/demote paths anchored on the run's LOWEST slot (always TAB 0)
+ * and relied on `move_surface_into_tab`'s grid caps to overflow. But `largestLeafSplit`'s cap has
+ * a DEFENSIVE fallback that still over-packs a full tab — it assumes the CALLER already spilled to
+ * a new tab (which `dispatchOne` does via `splitPlan`, but adopt/demote did not). So adopting into
+ * a run whose tab 0 was full added a 7th pane to that full tab instead of using a later tab's free
+ * slot. Routing through `gridOccupancy`+`lowestFreeSlot`+`splitPlan` — the exact dispatch contract
+ * — is what keeps every placement path in agreement.
+ *
+ * Occupancy comes from `gridOccupancy(run, excludeUUID)`. `excludeUUID` drops the moving pane so
+ * it never counts its own slot against the free-slot search — REQUIRED for demote, where the hero
+ * may be seated at a real slot (adopted via reconcile ⇒ `gridSlot 0`, NOT the promote sentinel
+ * `-1`). Adopt passes no exclude (the adopted surface isn't in `run.active` yet). Returns:
+ *   - null                              → no seated/addressable pane in the run: leave the source
+ *                                         where it is (it seeds the grid; reconcile slots it).
+ *   - {slot, newTab:false, anchorUUID}  → balanced split into the tab that HOLDS the lowest free
+ *                                         slot (never a full tab, so no over-pack).
+ *   - {slot, newTab:true}               → every existing tab is full → the source gets its OWN
+ *                                         overflow tab rather than over-packing an existing one.
+ * PURE.
+ */
+function planGridMoveForRun(run: QueueRun, excludeUUID?: string): GridMovePlan | null {
+  const { occupied, slotUUID } = gridOccupancy(run, excludeUUID);
+  // The run's TOTAL pane budget across all its tabs, widened by live schedules exactly like
+  // dispatchOne. `?? occupied.size` hands out an overflow slot when every budgeted slot is taken:
+  // adopt is allowed to exceed capacity ("adopt always succeeds"), and a demoted hero must land
+  // somewhere too.
+  const cap = effectiveConcurrency(run) + run.scheduleActive.size;
+  const slot = lowestFreeSlot(occupied, cap) ?? occupied.size;
+  const sp = splitPlan(occupied, slot, gridCap(run.template.grid.cols, run.template.grid.rows));
+  if (sp.firstTab === true) return null; // no seated pane yet → the source seeds the grid
+  if (sp.newTab === true) return { slot, newTab: true };
+  const anchorUUID = slotUUID.get(sp.anchorSlotIndex);
+  if (anchorUUID === undefined) return null; // defensive: no seated pane to address the tab
+  return { slot, newTab: false, anchorUUID };
+}
+
+/**
+ * (adopt / demote) EXECUTE a `planGridMoveForRun` plan for `sourceUUID`.
+ *
+ * THROWS only when a BALANCED split fails — the caller decides whether that's fatal (adopt rolls
+ * back its dispatch latch so the item stays dispatchable; demote just logs and leaves the split
+ * put). The overflow EJECT (`newTab`) is BEST-EFFORT: an already-isolated source no-ops and a
+ * failure is swallowed, because the source is tracked by its annotation regardless and must never
+ * be over-packed into a full tab.
+ */
+async function moveExistingIntoRunGrid(
+  run: QueueRun,
+  sourceUUID: string,
+  plan: GridMovePlan,
+  deps: QueueDeps,
+): Promise<void> {
+  const t = run.template;
+  if (plan.newTab) {
+    // Every existing tab is full → give the source its OWN new tab. Reuse the SAME
+    // `move_split_to_new_tab` eject hero-promote uses (focus-then-act, GUI-side). Best-effort: an
+    // already-isolated source no-ops; a failure leaves it in place (still tracked by annotation),
+    // so this NEVER throws — the caller must not roll back an adoption on an overflow miss.
+    if (deps.client.performAction !== undefined) {
+      try {
+        await deps.client.performAction(sourceUUID, "move_split_to_new_tab");
+      } catch (err) {
+        errlog(`run "${run.runName}": overflow eject ${sourceUUID} failed: ${msg(err)} — left in place`);
+      }
+    } else {
+      errlog(`run "${run.runName}": overflow eject ${sourceUUID} — perform_action unavailable; left in place`);
+    }
+    return;
+  }
+  // Balanced split into the tab that holds the lowest free slot. Grid caps keep the tab within
+  // cols×rows; because the anchor tab has a free slot BY CONSTRUCTION, largestLeafSplit never hits
+  // its over-pack fallback. A missing capability is best-effort (reconcile still adopts by
+  // annotation) rather than a hard failure.
+  if (deps.client.moveSurfaceIntoTab === undefined) {
+    errlog(`run "${run.runName}": move ${sourceUUID} — move_surface_into_tab unavailable; left in place`);
+    return;
+  }
+  await deps.client.moveSurfaceIntoTab({
+    sourceUUID,
+    targetAnchorUUID: plan.anchorUUID!,
+    balanced: true,
+    maxCols: t.grid.cols,
+    maxRows: t.grid.rows,
+  });
+}
+
 /**
  * (adopt) Perform the SIDE EFFECTS of an `adopt` command: physically MOVE the human-created
  * split into the run's grid tab, STAMP the queue annotation (so reconcile folds it in next
  * sweep), FIRE the provider claim, and PERSIST the latch. The reducer (`applyCommand`) already
  * added the latch SYNCHRONOUSLY (before this `await`) — the crux that blocks a second dispatch.
  *
- * Ordering / correctness (LOCKED FORCED CORRECTNESS): the only ROLLBACK is a MOVE failure (the
- * split never entered the grid → the item must stay dispatchable, so we clear the latch). The
- * annotation/claim are best-effort; reconcile's existing orphan-adoption (store.ts) folds the
- * annotated surface in next sweep as a RUNNING assignment — relying on its non-zero-`sessionID`
- * precondition (guaranteed under the queue's pty-host HARD DEP). NEVER writes `run.active`
- * (reconcile is its single owner) — this writes only `run.dispatched` + the annotation, so it
- * occupies a concurrency slot WITHOUT incrementing `lifetimeDispatched` (no new agent launched).
+ * Placement (`planGridMoveForRun`): the split goes into the tab that holds the run's LOWEST FREE
+ * slot — NOT always tab 0. A full grid overflows into a fresh tab. (The old path anchored on tab 0
+ * and let `move_surface_into_tab`'s caps "overflow", but that fallback over-packs a full tab —
+ * see `planGridMoveForRun`. This routes through the same slot→tab contract as `dispatchOne`.)
+ *
+ * Ordering / correctness (LOCKED FORCED CORRECTNESS): the only ROLLBACK is a BALANCED-split
+ * failure (the split never entered the grid → the item must stay dispatchable, so we clear the
+ * latch). An overflow eject is best-effort and never rolls back (the source is adopted by
+ * annotation regardless). The annotation/claim are best-effort; reconcile's existing
+ * orphan-adoption (store.ts) folds the annotated surface in next sweep as a RUNNING assignment —
+ * relying on its non-zero-`sessionID` precondition (guaranteed under the queue's pty-host HARD
+ * DEP). NEVER writes `run.active` (reconcile is its single owner) — this writes only
+ * `run.dispatched` + the annotation, so it occupies a concurrency slot WITHOUT incrementing
+ * `lifetimeDispatched` (no new agent launched).
  */
 async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   const name = cmd.run;
@@ -2333,31 +2450,21 @@ async function runAdopt(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   // roll back, and reconcile would still fold an annotated surface in).
   const t = run.template;
 
-  // MOVE the split into the run's grid tab, anchored on a seated pane. If the run has NO
-  // seated pane (empty/all-unseated run), DO NOT move — the adopted split becomes the run's
-  // seed (reconcile gives it slot 0 next sweep). Overflow at capacity (LOCKED #5) is handled
-  // by `move_surface_into_tab` honoring maxCols/maxRows (multi-tab overflow packing).
-  const anchorUUID = firstSeatedUUID(run);
-  if (anchorUUID !== undefined) {
-    if (deps.client.moveSurfaceIntoTab === undefined) {
-      errlog(`run "${name}": adopt ${key} — move_surface_into_tab unavailable; leaving split in place (reconcile still adopts)`);
-    } else {
-      try {
-        await deps.client.moveSurfaceIntoTab({
-          sourceUUID: uuid,
-          targetAnchorUUID: anchorUUID,
-          balanced: true,
-          maxCols: t.grid.cols,
-          maxRows: t.grid.rows,
-        });
-      } catch (err) {
-        // MOVE failed → ROLL BACK the latch (the adoption did not happen, so the item must
-        // stay dispatchable), persist, and return.
-        run.dispatched.delete(key);
-        persistRun(run);
-        errlog(`run "${name}": adopt ${key} move failed: ${msg(err)} — latch rolled back, item stays free`);
-        return;
-      }
+  // MOVE the split into the tab that holds the run's LOWEST FREE grid slot (a full grid overflows
+  // into a fresh tab), via the shared dispatch-parity placement. If the run has NO seated pane
+  // (empty/all-unseated run), `planGridMoveForRun` returns null — DO NOT move; the adopted split
+  // becomes the run's seed (reconcile gives it a slot next sweep).
+  const plan = planGridMoveForRun(run);
+  if (plan !== null) {
+    try {
+      await moveExistingIntoRunGrid(run, uuid, plan, deps);
+    } catch (err) {
+      // A BALANCED split failed → ROLL BACK the latch (the adoption did not enter the grid, so the
+      // item must stay dispatchable), persist, and return. (An overflow eject never throws.)
+      run.dispatched.delete(key);
+      persistRun(run);
+      errlog(`run "${name}": adopt ${key} move failed: ${msg(err)} — latch rolled back, item stays free`);
+      return;
     }
   }
 
@@ -2493,11 +2600,14 @@ async function runPromote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
  * RE-PACK the split back into the run's BSP grid — symmetric with promote's eject. A promoted
  * split lives in its OWN tab with gridSlot -1; leaving it there on demote stranded a plain
  * regular in a dedicated tab (the "normal agent in a dedicated tab" report). We now move it into
- * a seated regular anchor's grid tab via the SAME balanced `moveSurfaceIntoTab` the packer/adopt
- * use (multi-tab overflow honored) and reset its gridSlot so it re-enters occupancy. Best-effort:
- * with no grid anchor (the run's only pane) there's nothing to pack into, so it stays put; a
- * failed move logs and leaves it in place. Mutates `run.active` in place (hero bit + gridSlot) —
- * the established pattern (see packRun) — then persists.
+ * the tab that holds the run's LOWEST FREE slot (a full grid overflows into a fresh tab) via the
+ * shared dispatch-parity placement (`planGridMoveForRun`), and reset its gridSlot so it re-enters
+ * occupancy. (The old path anchored on an ARBITRARY seated pane — whichever came first in map
+ * order, usually tab 0 — so demoting into a run whose tab 0 was full over-packed that tab; the
+ * shared helper anchors on the tab with the free slot, matching `dispatchOne`.) Best-effort: with
+ * no seated pane (the demoted split is the run's only pane) there's nothing to pack into, so it
+ * stays put; a failed move logs and leaves it in place. Mutates `run.active` in place (hero bit +
+ * gridSlot) — the established pattern (see packRun) — then persists.
  */
 async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   const name = cmd.run;
@@ -2518,34 +2628,20 @@ async function runDemote(cmd: QueueCommand, deps: QueueDeps): Promise<void> {
   if (asgn !== undefined && asgn.hero) asgn.hero = false;
 
   // RE-PACK the split back into the run's BSP grid — symmetric with promote's eject (the split
-  // was ejected to its OWN tab on promote and given gridSlot -1). Find a SEATED regular anchor
-  // already in the grid + the lowest free slot, then MOVE it there via the SAME balanced
-  // cross-tab move the packer/adopt use (multi-tab overflow honored by maxCols/maxRows). On a
-  // successful move, reset gridSlot so the item re-enters occupancy accounting. Best-effort:
-  // with NO anchor (the demoted split is the run's only pane) there is no grid to pack into, so
-  // it just stays in its own tab; a failed move logs and leaves it in place (still demoted).
+  // was ejected to its OWN tab on promote and given gridSlot -1, which `gridOccupancy` skips, so
+  // it is EXCLUDED from the placement occupancy below). Route through the shared dispatch-parity
+  // placement: it targets the tab holding the run's lowest free slot and overflows into a fresh
+  // tab when the grid is full — never over-packing an existing tab. On a successful move, reset
+  // gridSlot so the item re-enters occupancy accounting. Best-effort: with NO seated pane (the
+  // demoted split is the run's only pane) `planGridMoveForRun` returns null and it stays put; a
+  // failed balanced move logs and leaves it in place (still demoted).
   let repacked = false;
-  if (asgn !== undefined && asgn.surfaceUUID !== undefined && deps.client.moveSurfaceIntoTab !== undefined) {
-    const occupied = new Set<number>();
-    let anchor: string | undefined;
-    for (const a of run.active.values()) {
-      if (a.surfaceUUID === asgn.surfaceUUID) continue;
-      if (a.gridSlot >= 0 && occupiesSlot(a)) {
-        occupied.add(a.gridSlot);
-        if (anchor === undefined && a.surfaceUUID !== undefined) anchor = a.surfaceUUID;
-      }
-    }
-    const slot = anchor !== undefined ? lowestFreeSlot(occupied, effectiveConcurrency(run)) : null;
-    if (anchor !== undefined && slot !== null) {
+  if (asgn !== undefined && asgn.surfaceUUID !== undefined) {
+    const plan = planGridMoveForRun(run, asgn.surfaceUUID);
+    if (plan !== null) {
       try {
-        await deps.client.moveSurfaceIntoTab({
-          sourceUUID: asgn.surfaceUUID,
-          targetAnchorUUID: anchor,
-          balanced: true,
-          maxCols: run.template.grid.cols,
-          maxRows: run.template.grid.rows,
-        });
-        asgn.gridSlot = slot;
+        await moveExistingIntoRunGrid(run, asgn.surfaceUUID, plan, deps);
+        asgn.gridSlot = plan.slot;
         repacked = true;
       } catch (err) {
         errlog(`run "${name}": demote re-pack ${key ?? uuid} failed: ${msg(err)} — split stays in its own tab`);

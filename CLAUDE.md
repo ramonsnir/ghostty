@@ -772,8 +772,9 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
 - **Adopt a free split into a queue** (fork-only, macOS) — a dashboard tile **Adopt…** button (on
   a NON-queue CLI-agent tile; disabled when no queue is running) pulls a human-created split into a
   running Agent Queue so the supervisor tracks it like a dispatched item: it MOVES the split into
-  the run's grid tab (reusing `move_surface_into_tab`, overflowing to a new row/tab at capacity —
-  adopt always succeeds), **LATCHES the key at adopt time** (`run.dispatched.add(key)`, the crux
+  the tab holding the run's LOWEST FREE grid slot (a later tab / reused hole — **NOT always tab 0**;
+  a FULL grid ejects it into its own new tab, never over-packing an existing one — adopt always
+  succeeds), **LATCHES the key at adopt time** (`run.dispatched.add(key)`, the crux
   that blocks a SECOND dispatch for a still-`list`ed item), follows the template's `keepOnComplete`
   (the 📌 KEEP pin protects an adopted split from auto-close on `status=done` — NOT a forced keep),
   fires the provider `claim`, and lets `reconcile`'s EXISTING orphan-adoption fold the annotated
@@ -847,10 +848,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `maxItems` slot (which would let the queue over-launch — a shipped bug, now fixed) nor double-counts;
   marking it a hero frees only its regular CONCURRENCY slot. **`demote`** flips it back (re-enters the
   regular pool for future accounting, also counter-neutral) AND **RE-PACKS the split back into the run's
-  BSP grid** (symmetric with promote's eject — `runDemote` finds a seated regular anchor + the lowest
-  free slot and MOVES the split into that grid tab via the same balanced `moveSurfaceIntoTab` the
-  packer/adopt use, resetting `gridSlot` so it re-enters occupancy). Best-effort: with NO grid anchor
-  (the demoted split is the run's only pane) there's nothing to pack into, so it stays in its own tab.
+  BSP grid** (symmetric with promote's eject — `runDemote` uses the SHARED `planGridMoveForRun`/
+  `moveExistingIntoRunGrid` to move the split into the tab holding the run's LOWEST FREE slot — **NOT
+  always tab 0**; a full grid overflows to a fresh tab, never over-packing — resetting `gridSlot` so it
+  re-enters occupancy). Best-effort: with NO seated pane (the demoted split is the run's only pane)
+  there's nothing to pack into, so it stays in its own tab.
   **This closes the "a normal agent in a dedicated tab" gap** — a promote→demote round-trip previously
   left the (now-regular) split stranded in the hero's dedicated tab with `gridSlot -1`; it now returns
   to the grid. (Earlier this re-pack was a documented non-goal; that is reversed.) NOTE: the promote

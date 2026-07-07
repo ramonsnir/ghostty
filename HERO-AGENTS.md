@@ -61,10 +61,11 @@ property** that changes four things: *slot accounting, lifecycle, layout, and no
    scope turned out smaller than feared). Demotion reclassifies accounting, drops the marker,
    **and re-packs the split back into the run's BSP grid** — symmetric with promote's eject, so
    a promote→demote round-trip returns the split to the grid rather than stranding a plain
-   regular in the hero's dedicated tab. It packs into a seated regular anchor's tab (multi-tab
-   overflow honored); with no anchor (the run's only pane) there's nothing to pack into, so it
-   stays put. (This re-pack was originally a non-goal; reversed once "a normal agent in a
-   dedicated tab" turned out to be the stranded-demote state.)
+   regular in the hero's dedicated tab. It packs into the tab holding the run's **lowest free
+   slot** (the same slot→tab placement a fresh dispatch uses — a full grid overflows into a new
+   tab, never over-packing an existing one); with no seated pane (the run's only pane) there's
+   nothing to pack into, so it stays put. (This re-pack was originally a non-goal; reversed once
+   "a normal agent in a dedicated tab" turned out to be the stranded-demote state.)
 
 4. **Keep-by-default.** A hero is **never** auto-closed — `effectiveKeep` is forced true for a
    hero regardless of template/📌, so it holds in `DONE_PENDING` forever. Heroes often want a
