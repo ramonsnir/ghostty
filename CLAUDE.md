@@ -451,7 +451,12 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   actions `toggle_agent_dashboard` + `hide_dashboard_split` + `spotlight_dashboard_split`) — a sidebar
   `NSPanel` with a live natively-rendered preview of every split running a CLI agent (Claude/Codex)
   across all tabs/windows; click to jump, Hide to declutter, bell auto-unhides; `agent-dashboard-pin`
-  floats + activates the panel (so Rectangle can move it). Live previews need `pty-host` (each tile
+  floats + activates the panel (so Rectangle can move it). The default first-run frame is a FIXED
+  `AgentDashboardController.defaultWidth` = **757 pt** wide (clamped to the screen width on a narrower
+  display) × full height, top-right of the widest screen — a flat width, NOT the old ~40%-of-screen
+  fraction that colleagues found uselessly wide on large externals; a user-resized frame still wins
+  via the `setFrameAutosaveName` restore, so this only affects a first run / no saved frame. Live
+  previews need `pty-host` (each tile
   mounts a read-only mirror `SurfaceView`). Load-bearing gotchas: agent detection is HOST-GATED on
   the minor-4 `foreground_pid` frame (finds nothing until the host is rebuilt; `proc_listchildpids`
   is unreliable — use `proc_listpids`); the smart bottom-anchor footer-trim must test the Unicode

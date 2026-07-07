@@ -118,8 +118,11 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   visible title bar ("Agent Dashboard") and a standard-window subrole, so a window manager
   (Rectangle Pro) can target it by title. Drag it by its title bar / background; resize it;
   its frame and open/closed state are remembered across launches (per fork identity's
-  UserDefaults). The default first-run frame is the right ~40% × full height of your widest
-  screen.
+  UserDefaults). The default first-run frame is a fixed **757 pt wide** (clamped to the
+  screen width on a narrower display) × full height, anchored to the right of your widest
+  screen. It's a flat width rather than a fraction of the screen so it isn't uselessly wide
+  on a large external display. Once you resize it, that frame is what's restored — the
+  default only applies to a first run / a machine with no saved dashboard frame.
 - **Rows** are full-width cards stacked vertically: a header (`agent badge · title · bell
   dot · Hide (eye-slash)`), the live preview (showing the agent's **latest rows** — bottom-anchored,
   the top is clipped), and a footer (`cwd · "needs input"` pill when ringing). They sort
