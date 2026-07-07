@@ -2181,12 +2181,19 @@ final class AgentDashboardController: NSWindowController {
 
     // MARK: - Default frame
 
+    /// Fixed default width, in points. A flat value (not a screen fraction) so
+    /// the panel isn't uselessly wide on a large external display — colleagues
+    /// reported the old ~40%-of-screen default was too wide to be useful. Clamped
+    /// to the visible width below so it can't overrun a narrow screen. Only the
+    /// FIRST-run frame; a user-resized frame is restored from the autosave.
+    static let defaultWidth: CGFloat = 757
+
     private static func defaultFrame() -> NSRect {
-        // Top-right quadrant of the widest screen: ~40% width × full height.
+        // Top-right of the widest screen: fixed default width × full height.
         let screen = NSScreen.screens.max(by: { $0.frame.width < $1.frame.width })
             ?? NSScreen.main
         let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
-        let width = vis.width * 0.40
+        let width = min(Self.defaultWidth, vis.width)
         return NSRect(x: vis.maxX - width, y: vis.minY, width: width, height: vis.height)
     }
 }
