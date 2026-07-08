@@ -513,6 +513,27 @@ test("parseGraphOutput: priorityLabel kept only when a non-empty string", () => 
   assert.equal(out[3].priorityLabel, undefined);
 });
 
+test("parseGraphOutput: blockedLabels carried only when present (absent → undefined, [] preserved)", () => {
+  const out = parseGraphOutput(
+    JSON.stringify({
+      nodes: [
+        // present with entries (non-strings dropped) → the gating subset
+        { key: "A-1", labels: ["Design needed", "backend"], blockedLabels: ["Design needed", 3] },
+        // present but EMPTY → kept as [] (means "no label is a blocking reason")
+        { key: "A-2", labels: ["backend"], blockedLabels: [] },
+        // ABSENT → undefined (provider doesn't distinguish; canvas falls back to labels)
+        { key: "A-3", labels: ["backend"] },
+        // non-array → undefined (treated as absent)
+        { key: "A-4", blockedLabels: "Design needed" },
+      ],
+    }),
+  );
+  assert.deepEqual(out[0].blockedLabels, ["Design needed"]);
+  assert.deepEqual(out[1].blockedLabels, []);
+  assert.equal(out[2].blockedLabels, undefined);
+  assert.equal(out[3].blockedLabels, undefined);
+});
+
 test("parseGraphOutput: hero is set only when the node's hero === true", () => {
   const out = parseGraphOutput(
     JSON.stringify({

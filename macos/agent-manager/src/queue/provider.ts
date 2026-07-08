@@ -287,6 +287,12 @@ export function parseGraphOutput(stdout: string): GraphNode[] {
     if (priorityLabel !== undefined && priorityLabel.length > 0) {
       node.priorityLabel = priorityLabel;
     }
+    // (ramon fork) The blocking-label SUBSET, carried through ONLY when the provider emitted
+    // the key — so the canvas can tell "no blocking labels" (present-but-empty) from "provider
+    // doesn't distinguish" (absent → fall back to `labels`). Non-string entries are dropped.
+    if (Array.isArray(rec.blockedLabels)) {
+      node.blockedLabels = asStringArray(rec.blockedLabels);
+    }
     // (hero) The provider graph script MAY mark a node a hero directly (queue-defined, like
     // `done`). The sidecar additionally OR's in list-/promotion-known heroes in refreshGraph.
     if (rec.hero === true) node.hero = true;

@@ -104,8 +104,18 @@ export interface GraphNode {
   /** Provider-declared TERMINAL flag (done/canceled/duplicate/…): excluded from the
    *  backlog count and dimmed in the canvas. The SCRIPT decides (mirrors status doneStates). */
   done: boolean;
-  /** Free-form labels (e.g. "Design needed", "Customer input"). */
+  /** Free-form labels (e.g. "Design needed", "backend", "Customer input") — the FULL
+   *  display set, rendered as pills on the node card. NOT all of these necessarily block:
+   *  a tracker's labels are a mix of gating markers (e.g. "Design needed") and purely
+   *  informational tags (area/team). Use `blockedLabels` for the "why isn't this actionable"
+   *  tooltip. */
   labels: string[];
+  /** (ramon fork) The SUBSET of labels that are genuine BLOCKING reasons — the human
+   *  "why this item isn't actionable yet" (e.g. only the "* needed" labels). The canvas's
+   *  "Blocked on:" tooltip lists THESE, not every label. OPTIONAL: absent (undefined) ⇒ the
+   *  provider doesn't distinguish, and the canvas falls back to `labels` (legacy behavior);
+   *  present-but-empty ⇒ NO label is a blocking reason (labels are display-only). */
+  blockedLabels?: string[];
   /** Keys of items that BLOCK this one — the DAG's dependency edges. */
   blockedBy: string[];
   /** GENERIC priority MARK (e.g. "Urgent", "High"): a provider-chosen display string the
