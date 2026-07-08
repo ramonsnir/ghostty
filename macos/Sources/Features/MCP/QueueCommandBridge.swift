@@ -499,8 +499,13 @@ struct QueueGraph: Equatable, Sendable {
         let stateType: String?
         /// Provider-declared TERMINAL flag — excluded from `backlog`, dimmed in the canvas.
         let done: Bool
-        /// Free-form labels (e.g. "Design needed").
+        /// Free-form labels (e.g. "Design needed", "backend") — the FULL display set, shown
+        /// as pills. A mix of gating markers and informational tags; see `blockedLabels`.
         let labels: [String]
+        /// (ramon fork) The SUBSET of `labels` that are genuine BLOCKING reasons — what the
+        /// "Blocked on:" tooltip lists. nil ⇒ the provider didn't distinguish (fall back to
+        /// `labels`, legacy behavior); [] ⇒ NO label is a blocking reason (display-only).
+        let blockedLabels: [String]?
         /// Keys that BLOCK this node — the DAG edges (may reference keys outside the set).
         let blockedBy: [String]
         /// GENERIC priority MARK (e.g. "Urgent", "High") the canvas renders as a prominent
@@ -549,11 +554,18 @@ struct QueueGraphPayload {
                 let opt: (String) -> String? = { k in
                     (entry[k] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 }
+                // (ramon fork) blockedLabels: nil when the key is ABSENT (provider doesn't
+                // distinguish → canvas falls back to `labels`); the parsed array when present
+                // (incl. []). Distinguishing absent-vs-empty is the whole point, so DON'T use
+                // the []-defaulting `strings` helper here.
+                let blockedLabels: [String]? = (entry["blockedLabels"] as? [Any])
+                    .map { $0.compactMap { $0 as? String } }
                 nodes.append(QueueGraph.Node(
                     key: key, title: opt("title"), url: opt("url"),
                     state: opt("state"), stateType: opt("stateType"),
                     done: (entry["done"] as? Bool) ?? false,
-                    labels: strings("labels"), blockedBy: strings("blockedBy"),
+                    labels: strings("labels"), blockedLabels: blockedLabels,
+                    blockedBy: strings("blockedBy"),
                     priorityLabel: opt("priorityLabel"),
                     hero: (entry["hero"] as? Bool) ?? false))
             }

@@ -740,6 +740,18 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   vertically CENTERS a short column within the tallest one (`centersByKey`) to cut arrow slant
   (board height/window sizing unchanged). `columns` (raw input order) is retained for geometry.
   Wiring: `QueueBacklogCanvas.swift`; tests `QueueBacklogTests` (`crossingCount`/`orderedColumns`).
+  **A node's "Blocked on:" tooltip lists only BLOCKING labels, not every label (fixed 2026-07-08):**
+  `GraphNode.blockedLabels?: string[]` is the gating SUBSET of `labels[]` (the full pill set is a mix
+  of gating markers like "Design needed" and informational area/team tags); `NodeCard.cardHelp` uses
+  `blockedLabels ?? labels` so informational tags stop showing up as bogus "Blocked on:" reasons.
+  Three-way, load-bearing end-to-end: **absent** → nil/undefined → fall back to `labels` (legacy,
+  non-`blockedLabels` providers unchanged); **present-but-empty** → no label blocks; **present** →
+  that subset. Provider-decided (GENERIC, like `done`/`priorityLabel`); the Linear `noetive-graph.py`
+  emits the `" needed"`-suffix labels (mirrors the `list` provider's `has_blocking_label`). Wiring:
+  sidecar `types.ts` (`GraphNode.blockedLabels?`) + `provider.ts` (`parseGraphOutput`, present-only),
+  Swift `QueueCommandBridge.swift` (`QueueGraph.Node.blockedLabels: [String]?` + absent-vs-empty parse)
+  + `QueueBacklogCanvas.swift` (`cardHelp`). Tests: sidecar `provider.test.ts`, Swift `MCPServerTests`
+  (`queueGraphPayloadBlockedLabelsAbsentVsEmptyVsPresent`). GUI relaunch + rebuilt sidecar `dist`.
   **Shared templates across a repo (fork-only):** `agent-queue-templates-dir` is now a
   **RepeatableString SEARCH LIST**, not a scalar — the effective path is the built-in default
   (`~/.config/ghostty-ramon/agent-manager/queues`, ALWAYS first) + each configured dir, deduped

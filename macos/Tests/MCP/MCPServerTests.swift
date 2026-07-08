@@ -1289,6 +1289,34 @@ struct MCPServerTests {
         #expect(g?.nodes.last?.blockedBy.isEmpty == true)
         #expect(g?.nodes.last?.priorityLabel == nil)
         #expect(g?.nodes.last?.hero == false)
+        // blockedLabels absent on both nodes here ⇒ nil (canvas falls back to `labels`).
+        #expect(n?.blockedLabels == nil)
+        #expect(g?.nodes.last?.blockedLabels == nil)
+    }
+
+    @Test func queueGraphPayloadBlockedLabelsAbsentVsEmptyVsPresent() {
+        // The whole point: distinguish "provider didn't say" (absent → nil, tooltip falls back
+        // to `labels`) from "no label blocks" (present-but-empty → []) from a real subset.
+        let g = QueueGraphPayload.fromArguments([
+            "queueName": "Q",
+            "nodes": [
+                // present with entries (non-strings dropped) → the gating subset only
+                ["key": "A-1", "labels": ["Design needed", "backend"],
+                 "blockedLabels": ["Design needed", 3]],
+                // present but EMPTY → [] (labels are display-only, none block)
+                ["key": "A-2", "labels": ["backend"], "blockedLabels": [String]()],
+                // ABSENT → nil (fall back to labels)
+                ["key": "A-3", "labels": ["backend"]],
+                // non-array → nil (treated as absent)
+                ["key": "A-4", "blockedLabels": "Design needed"],
+            ],
+        ])?.graph
+        #expect(g?.nodes.count == 4)
+        #expect(g?.nodes[0].blockedLabels == ["Design needed"])
+        #expect(g?.nodes[0].labels == ["Design needed", "backend"])
+        #expect(g?.nodes[1].blockedLabels == [])
+        #expect(g?.nodes[2].blockedLabels == nil)
+        #expect(g?.nodes[3].blockedLabels == nil)
     }
 
     @Test func queueGraphPayloadRejectsMissingNameAndDropsKeylessNodes() {

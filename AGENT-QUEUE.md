@@ -1747,6 +1747,29 @@ or host change** (pure Swift + TS).
   columns + applyQueueGraph + `crossingCount`/`orderedColumns` reduces-crossings/
   never-worse/preserves-layers/deterministic). **GUI relaunch + rebuilt sidecar `dist`; no host/Zig change.**
 
+- **`blockedLabels` — the "Blocked on:" tooltip lists only BLOCKING labels, not every label
+  (fixed 2026-07-08).** A backlog node's `labels[]` is the FULL display set (rendered as pills)
+  and is a MIX of gating markers (e.g. "Design needed") and purely informational tags (area/team
+  labels the tracker doesn't gate on). The node card's hover tooltip (`NodeCard.cardHelp` in
+  `QueueBacklogCanvas.swift`) used to list EVERY label under "Blocked on:", so an informational
+  tag showed up as a bogus blocking reason. Fix: a new OPTIONAL `GraphNode.blockedLabels?: string[]`
+  carries the SUBSET that actually blocks; the tooltip uses `node.blockedLabels ?? node.labels`
+  (fall back to `labels` when the provider doesn't distinguish, so non-`blockedLabels` providers
+  are unchanged). The three-way distinction is load-bearing and preserved end-to-end: **absent**
+  (key not emitted) ⇒ `nil`/`undefined` → fall back to `labels` (legacy); **present-but-empty** ⇒
+  `[]` → NO label is a blocking reason (labels are display-only); **present with entries** ⇒ that
+  subset. `parseGraphOutput` (TS) sets it only when `rec.blockedLabels` is an array;
+  `QueueGraphPayload.fromArguments` (Swift) maps `nil` when the key is absent (deliberately NOT the
+  `[]`-defaulting `strings` helper). The provider decides which labels block (STAYS GENERIC — like
+  `done`/`stateType`/`priorityLabel`); the Linear `noetive-graph.py` emits the `" needed"`-suffix
+  labels (mirroring the `list` provider's `has_blocking_label`), keeping area tags as pills only.
+  Wiring: sidecar — `types.ts` (`GraphNode.blockedLabels?`), `provider.ts` (`parseGraphOutput`
+  present-only parse); Swift — `QueueCommandBridge.swift` (`QueueGraph.Node.blockedLabels: [String]?`
+  + absent-vs-empty parse), `QueueBacklogCanvas.swift` (`cardHelp` uses `blockedLabels ?? labels`).
+  Tests: sidecar `provider.test.ts` (`blockedLabels carried only when present…`), Swift
+  `MCPServerTests` (`queueGraphPayloadBlockedLabelsAbsentVsEmptyVsPresent`). **GUI relaunch +
+  rebuilt sidecar `dist`; no host/Zig change.**
+
 #### HIGH/URGENT PRIORITY MARK on backlog nodes
 
 - **HIGH/URGENT PRIORITY MARK on backlog nodes (generic; provider-decided).** A backlog

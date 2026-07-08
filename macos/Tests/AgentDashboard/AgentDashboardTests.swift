@@ -2561,7 +2561,7 @@ struct AgentQueueHealthTests {
     /// sibling `QueueBacklogTests` suite, not this one).
     private func graphNode(_ key: String, title: String? = nil, url: String? = nil) -> QueueGraph.Node {
         .init(key: key, title: title, url: url, state: nil, stateType: nil,
-              done: false, labels: [], blockedBy: [], priorityLabel: nil)
+              done: false, labels: [], blockedLabels: nil, blockedBy: [], priorityLabel: nil)
     }
 
     @Test func runNamesForAdoptEmptyWhenNoQueuePresent() {
@@ -2627,10 +2627,11 @@ struct AgentQueueHealthTests {
 struct QueueBacklogTests {
     private func node(
         _ key: String, done: Bool = false, blockedBy: [String] = [],
-        labels: [String] = [], stateType: String? = nil, priorityLabel: String? = nil
+        labels: [String] = [], blockedLabels: [String]? = nil,
+        stateType: String? = nil, priorityLabel: String? = nil
     ) -> QueueGraph.Node {
         .init(key: key, title: nil, url: nil, state: nil, stateType: stateType,
-              done: done, labels: labels, blockedBy: blockedBy,
+              done: done, labels: labels, blockedLabels: blockedLabels, blockedBy: blockedBy,
               priorityLabel: priorityLabel)
     }
 
