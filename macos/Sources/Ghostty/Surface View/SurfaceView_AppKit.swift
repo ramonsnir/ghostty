@@ -2731,11 +2731,22 @@ extension Ghostty.SurfaceView {
 /// Caches a value for some period of time, evicting it automatically when that time expires.
 /// We use this to cache our surface content. This probably should be extracted some day
 /// to a more generic helper.
+///
+/// This type is thread-safe. `get()` is called from AppKit's accessibility thread (the
+/// `accessibility*` overrides on `SurfaceView`), which is NOT the main thread, while the
+/// expiry `Task` clears the value from a background Swift-Concurrency executor. Without
+/// synchronization those two threads race on `value`/`expiryTask`, corrupting the stored
+/// value's refcount and aborting the process in the Swift runtime (SIGABRT). A lock around
+/// every access to the mutable state closes that race.
 class CachedValue<T> {
     private var value: T?
     private let fetch: () -> T
     private let duration: Duration
     private var expiryTask: Task<Void, Never>?
+
+    /// Guards `value` and `expiryTask`. Held only for cheap field reads/writes, never
+    /// across `fetch()` (which may be expensive, e.g. a full screen read).
+    private let lock = NSLock()
 
     init(duration: Duration, fetch: @escaping () -> T) {
         self.duration = duration
@@ -2743,31 +2754,56 @@ class CachedValue<T> {
     }
 
     deinit {
+        // No other references can exist during deinit, so the lock isn't needed here.
         expiryTask?.cancel()
     }
 
     func get() -> T {
+        // Fast path: return the cached value if we have one.
+        lock.lock()
         if let value {
+            lock.unlock()
             return value
         }
+        lock.unlock()
 
-        // We don't have a value (or it expired). Fetch and store.
+        // Cache miss. Fetch OUTSIDE the lock so a slow fetch doesn't block other
+        // threads (notably the accessibility thread and the expiry task).
         let result = fetch()
-        let now = ContinuousClock.now
-        let expires = now + duration
-        self.value = result
+        let expires = ContinuousClock.now + duration
 
-        // Schedule a task to clear the value
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Another thread may have populated the cache while we were fetching. If so,
+        // prefer the existing value + its already-scheduled expiry task and drop ours,
+        // so there's still exactly one expiry task per fill (matching the original).
+        if let existing = value {
+            return existing
+        }
+
+        value = result
+
+        // Schedule a task to clear the value. `clear()` re-takes the lock, so it can
+        // never race a concurrent `get()`.
+        expiryTask?.cancel()
         expiryTask = Task { [weak self] in
             do {
                 try await Task.sleep(until: expires)
-                self?.value = nil
-                self?.expiryTask = nil
+                self?.clear()
             } catch {
                 // Task was cancelled, do nothing
             }
         }
 
         return result
+    }
+
+    /// Clears the cached value and expiry task under the lock.
+    private func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        value = nil
+        expiryTask = nil
     }
 }
