@@ -1203,9 +1203,6 @@ GHOSTTY_API void ghostty_app_update_config(ghostty_app_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
-// (ramon fork) Set the "app is quitting" gate at applicationWillTerminate so a
-// window-close-marked pty-host session detaches (kept for reattach) on quit.
-GHOSTTY_API void ghostty_app_set_quitting(bool);
 
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
@@ -1219,10 +1216,10 @@ GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_session_id(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
-// (ramon fork) Mark/unmark this surface's pty-host session for destruction on
-// teardown (a deliberate user close vs the default detach-for-reattach).
-GHOSTTY_API void ghostty_surface_set_close_session(ghostty_surface_t);
-GHOSTTY_API void ghostty_surface_keep_session(ghostty_surface_t);
+// (ramon fork) Commit a deliberate close of this surface's pty-host session:
+// send a live host Close frame that DESTROYS it (vs the default detach-for-
+// reattach on teardown). Called at the undo-commit boundary of a user close.
+GHOSTTY_API void ghostty_surface_close_session_now(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);

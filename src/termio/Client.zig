@@ -238,15 +238,6 @@ images: imagepkg.State = .empty,
 /// are random non-zero u64s (`allocSessionId` in `src/host/Server.zig`).
 session_id: std.atomic.Value(u64) = .init(0),
 
-/// (ramon fork) Deliberate-close flag. Set true from the GUI (via
-/// `requestCloseSession`) when the USER explicitly closes this surface, so
-/// `threadExit` sends a host Close that DESTROYS the session — vs a GUI
-/// quit/relaunch, which leaves it false so the host PARKS the session for
-/// reattach. Written on the apprt/main thread, read on the io thread at
-/// `threadExit`; store-release / load-acquire make the handoff race-free
-/// (same atomic discipline as `session_id`/`at_prompt`).
-close_session: std.atomic.Value(bool) = .init(false),
-
 /// Set on `.child_exited`.
 child_exited: ?ChildExited = null,
 
@@ -808,35 +799,8 @@ pub fn connectAndAttach(
     read_thread.setName("io-client-reader") catch {};
 }
 
-/// (ramon fork) Set true by `ghostty_app_set_quitting` at
-/// `applicationWillTerminate` (the point of no return). While true,
-/// `threadExit` NEVER sends Close — every session detaches for reattach, even
-/// ones a window-close path already marked. This is a BELT: the primary
-/// last-window-close -> detach guarantee is the mark-time
-/// `windowCloseTriggersAppTermination()` check on the Swift side, which does
-/// not depend on teardown-vs-willTerminate ordering.
-var app_quitting: std.atomic.Value(bool) = .init(false);
-
-/// (ramon fork) Process-global quit gate setter (see `app_quitting`).
-pub fn setQuitting(v: bool) void {
-    app_quitting.store(v, .release);
-}
-
-/// (ramon fork) Mark this session for host-side DESTRUCTION on teardown. Only a
-/// `.attach` client ever marks — a `.mirror` (read-only dashboard preview) must
-/// never destroy the real session (defense-in-depth: `threadExit` re-checks the
-/// role, and the host `handleClose` refuses a render-only subscriber too).
-pub fn requestCloseSession(self: *Client) void {
-    if (self.config.role != .attach) return;
-    self.close_session.store(true, .release);
-}
-
-/// (ramon fork) Undo the mark (Undo restored the closed surface).
-pub fn keepSession(self: *Client) void {
-    self.close_session.store(false, .release);
-}
-
 pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
+    _ = self;
     std.debug.assert(td.backend == .client);
     const client = &td.backend.client;
 
@@ -852,70 +816,38 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
 
     client.read_thread.join();
 
-    // (ramon fork) Deliberate-close: send a host Close so the session is
-    // DESTROYED (vs a bare socket drop, which detaches + parks for reattach).
-    // Four gates, all required: (i) never a mirror, (ii) the GUI marked this a
-    // deliberate close, (iii) the app is not quitting (a quit/last-window-quit
-    // must detach), (iv) we are actually attached (session_id assigned). The
-    // read thread is joined, so we own the fd and this synchronous write is the
-    // last thing before we close it (the async xev write path is dead here —
-    // the loop has already stopped when threadExit runs).
-    if (self.config.role == .attach and
-        self.close_session.load(.acquire) and
-        !app_quitting.load(.acquire))
-    {
-        const sid = self.session_id.load(.acquire);
-        if (sid != 0) self.sendCloseSync(client.read_thread_fd, sid);
-    }
-
     // Close the socket fd. The write_stream wraps the same fd; we close it
     // exactly once here (write_stream.deinit in ThreadData.deinit does not
     // close on this xev backend's Stream — see Exec, which closes the pty fds
     // via the subprocess, not the stream). Closing the connected socket tears
-    // down our side of the connection.
+    // down our side of the connection. (ramon fork) A bare socket drop makes the
+    // host DETACH (park) the session — the correct default for GUI quit/relaunch
+    // + reattach. A DELIBERATE close destroys the session via `closeSession` (a
+    // live Close frame at the undo-commit boundary), NOT here — see Feature A.
     posix.close(client.read_thread_fd);
 }
 
-/// (ramon fork) Synchronously frame + write a `protocol.Close` for `session_id`
-/// on `fd`. Called from `threadExit` AFTER the read thread is joined (so we own
-/// the fd) and BEFORE the fd is closed. Best-effort: every failure is logged +
-/// swallowed — the host's idle reaper is the backstop.
+/// (ramon fork) Send a host `Close` frame over the LIVE connection, DESTROYING
+/// the session (the host `handleClose` stops the child + frees the session).
+/// Runs on the io thread via the `.close_session` termio message, which
+/// `Surface.closeSessionNow` queues from the GUI at the undo-commit boundary of
+/// a DELIBERATE close (split/tab/window). Decoupled from `threadExit` on
+/// purpose: a closed `.client` surface is RETAINED past the undo window (the
+/// reattach machinery holds it), so its teardown is not a reliable
+/// close-commit hook — a live frame is. This is the Feature-A fix.
 ///
-/// SIGPIPE is ignored process-wide (`src/global.zig`), so a write to a
-/// peer-closed socket returns EPIPE (caught below) rather than a process signal
-/// — no `SO_NOSIGPIPE` needed, and it must be AVOIDED: on a peer-closed socket
-/// `setsockopt` returns EINVAL, which Zig's `posix.setsockopt` maps to
-/// `unreachable` (a process abort). The fd is left O_NONBLOCK (the read thread
-/// set it in `threadMainPosix`), so a wedged host yields `WouldBlock` (caught)
-/// instead of hanging teardown; no `SO_SNDTIMEO` (same EINVAL/abort hazard).
-///
-/// Best-effort caveat, landing in the SAFE (detach) direction: if a prior ASYNC
-/// frame was only partially flushed before the loop stopped, or a full send
-/// buffer truncates this write, the host's FrameReader may desync and drop the
-/// connection — a bare socket drop = DETACH (session parked for reattach), never
-/// a lost shell, and the idle reaper still collects a truly-orphaned session.
-fn sendCloseSync(self: *Client, fd: posix.fd_t, session_id: u64) void {
-    // No setsockopt here (see the doc comment): SIGPIPE is globally ignored, and
-    // SO_NOSIGPIPE/SO_SNDTIMEO both EINVAL on a peer-closed socket -> Zig's
-    // posix.setsockopt maps EINVAL to `unreachable` -> abort. The fd stays
-    // O_NONBLOCK (set by the read thread) so the write can't hang teardown.
-    const framed = protocol.encodeFrame(self.gpa, .close, protocol.Close{
-        .session_id = session_id,
-    }) catch |err| {
-        log.warn("failed to encode Close on teardown err={}", .{err});
-        return;
-    };
-    defer self.gpa.free(framed);
-
-    var off: usize = 0;
-    while (off < framed.len) {
-        const n = posix.write(fd, framed[off..]) catch |err| {
-            log.warn("failed to send Close on teardown err={}", .{err});
-            return; // EPIPE / WouldBlock / etc. — host idle reaper is the backstop
-        };
-        if (n == 0) break; // peer gone
-        off += n;
-    }
+/// A `.mirror` (read-only dashboard preview) NEVER destroys the real session,
+/// and an unattached client (`session_id == 0`) has nothing to close. The host
+/// additionally refuses a Close from a render-only subscriber (defense in
+/// depth). Same fire-and-forget write path as `reset`/`clearScreen`.
+pub fn closeSession(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+) !void {
+    if (self.config.role != .attach) return;
+    const sid = self.session_id.load(.acquire);
+    if (sid == 0) return;
+    try self.sendFrame(td, .close, protocol.Close{ .session_id = sid });
 }
 
 pub fn focusGained(

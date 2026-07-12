@@ -785,12 +785,6 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // (ramon fork) Point of no return for a quit. Flip the process-global
-        // quit gate so any pty-host session a window-close path already marked
-        // for destruction DETACHES instead (kept alive for reattach). Belt
-        // behind the mark-time last-window-close guard.
-        ghostty_app_set_quitting(true)
-
         // (ramon fork) Stop the embedded web monitor if running.
         webMonitor?.stop()
 

@@ -161,21 +161,21 @@ class BaseTerminalController: NSWindowController,
     /// re-applied).
     enum CloseMarkPhase { case set, undo, redo }
 
-    /// (ramon fork) The exact (view, close) mark operations a close-lifecycle
-    /// PHASE must apply to its closing leaves. THE single decision every mark /
-    /// clear site funnels through (`applyCloseMark` below), so the set/undo/redo
-    /// sites can't drift and a recorder test can observe the whole mark -> clear
-    /// -> re-mark sequence with a `MockView`, no live controller/surface needed.
+    /// (ramon fork) The exact (view, close) operations a close-lifecycle PHASE
+    /// applies to its closing leaves. THE single decision every schedule /
+    /// cancel site funnels through (`applyCloseMark` below), so the set/undo/redo
+    /// sites can't drift and a recorder test can observe the whole
+    /// schedule -> cancel -> re-schedule sequence with a `MockView`, no live
+    /// controller/surface needed.
     ///
-    /// - `.set` / `.redo`: MARK (close=true) every leaf NOT already reparented by
-    ///   a move (`heldElsewhere` false) — flag it for pty-host session destruction
-    ///   on teardown. `.redo` re-applies the same marks the undo cleared.
-    /// - `.undo`: CLEAR (close=false) EVERY closing leaf UNCONDITIONALLY — the
+    /// - `.set` / `.redo`: close=true for every leaf NOT already reparented by a
+    ///   move (`heldElsewhere` false) — (re)schedule its deliberate-close commit.
+    ///   `.redo` re-schedules the commits the undo cancelled.
+    /// - `.undo`: close=false for EVERY closing leaf UNCONDITIONALLY — the
     ///   `heldElsewhere` filter is deliberately NOT applied. This is the
-    ///   DATA-LOSS-safe direction: an undo restores a LIVE session, and a live
-    ///   session that keeps a stale close-mark would be DESTROYED on a later
-    ///   teardown. Clearing a never-set mark is a safe no-op (`keepCloseSession`
-    ///   is idempotent), so over-clearing is always correct.
+    ///   DATA-LOSS-safe direction: an undo restores a LIVE session, whose pending
+    ///   destroy-commit must be CANCELLED. Cancelling a never-scheduled commit is
+    ///   a safe no-op, so over-cancelling is always correct.
     /// - A MOVE carries `nil` closing views ⇒ NO operation in ANY phase (the
     ///   reparented live view is never touched).
     static func closeMarkOperations<V>(
@@ -210,31 +210,62 @@ class BaseTerminalController: NSWindowController,
         deliberateClose ? leaves() : nil
     }
 
-    /// (ramon fork) Mark each leaf's pty-host session for DESTRUCTION on teardown
-    /// (a deliberate close), skipping any leaf a MOVE already reparented into
-    /// another controller. Applies each mark directly to the leaf's session.
+    /// (ramon fork) Schedule each leaf's pty-host session for DESTRUCTION at the
+    /// undo-commit boundary (a deliberate close), skipping any leaf a MOVE
+    /// already reparented into another controller. See `applyCloseMark`.
     func markLeavesForClose(_ leaves: [Ghostty.SurfaceView]) {
         applyCloseMark(.set, leaves)
     }
 
+    /// (ramon fork) Pending deliberate-close COMMITS, keyed by the closing
+    /// SurfaceView's identity. A commit is a main-queue timer scheduled at the
+    /// undo-commit boundary (`closeCommitDelay` past `undoExpiration`, i.e. after
+    /// ⌘Z can no longer fire); on fire it sends a LIVE host Close that DESTROYS
+    /// the session. This replaces the old "mark an atomic consumed at teardown"
+    /// approach, which never fired on a `.client` close because a closed surface
+    /// is retained past the undo window (so `threadExit` never ran). The work
+    /// item strong-captures the view so the surface stays alive until the Close
+    /// is sent, then releases it.
+    private var pendingCloseCommits: [ObjectIdentifier: DispatchWorkItem] = [:]
+
+    /// (ramon fork) Delay from now to the deliberate-close COMMIT: the undo
+    /// window plus a small margin so the commit fires strictly AFTER the undo
+    /// action expires (⌘Z can no longer race it). Pure + tested.
+    static func closeCommitDelay(_ undo: Duration) -> TimeInterval {
+        let c = undo.components
+        let seconds = Double(c.seconds) + Double(c.attoseconds) / 1e18
+        return max(0, seconds) + 0.5
+    }
+
     /// (ramon fork) Apply a close-lifecycle PHASE to `closingViews` via the pure
-    /// `closeMarkOperations` decision, applying each resulting op directly to the
-    /// leaf's pty-host session. `nil` closingViews (a move) is a no-op. This is
-    /// the ONE place the set/undo/redo sites (and the tab/window fan-out via
-    /// `markLeavesForClose`) mark or clear a session, so they can't diverge. The
-    /// per-phase decision itself is the pure, generic `closeMarkOperations`,
-    /// unit-tested directly with a `MockView` in `CloseSessionLifecycleTests`.
+    /// `closeMarkOperations` decision. This is the ONE place the set/undo/redo
+    /// sites (and the tab/window fan-out via `markLeavesForClose`) schedule or
+    /// cancel a session's deliberate-close commit, so they can't diverge:
+    ///   • `.set`/`.redo` (op.close==true): (re)schedule a commit timer per leaf.
+    ///   • `.undo` (op.close==false): CANCEL the pending commit — ⌘Z restored a
+    ///     LIVE session, which must stay alive + reattachable.
+    /// A re-mark for a view first cancels any stale pending commit. `nil`
+    /// closingViews (a move) yields no ops. The per-phase decision itself is the
+    /// pure, generic `closeMarkOperations`, unit-tested with a `MockView`.
     func applyCloseMark(_ phase: CloseMarkPhase, _ closingViews: [Ghostty.SurfaceView]?) {
-        for op in Self.closeMarkOperations(
+        let ops = Self.closeMarkOperations(
             phase,
             closingViews: closingViews,
             heldElsewhere: { Self.viewHeldByAnotherController($0, excluding: self) }
-        ) {
-            if op.close {
-                op.view.surfaceModel?.markCloseSession()
-            } else {
-                op.view.surfaceModel?.keepCloseSession()
+        )
+        let delay = Self.closeCommitDelay(undoExpiration)
+        for op in ops {
+            let key = ObjectIdentifier(op.view)
+            // A re-mark OR an undo always supersedes any pending commit first.
+            pendingCloseCommits.removeValue(forKey: key)?.cancel()
+            guard op.close else { continue } // .undo: cancel only, never schedule.
+            let view = op.view
+            let item = DispatchWorkItem { [weak self] in
+                self?.pendingCloseCommits.removeValue(forKey: key)
+                view.surfaceModel?.closeSessionNow()
             }
+            pendingCloseCommits[key] = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
     }
 

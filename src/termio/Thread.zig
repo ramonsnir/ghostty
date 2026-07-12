@@ -334,6 +334,7 @@ fn drainMailbox(
             .selection_clear => try io.selectionClear(data),
             .selection_point => |v| try io.selectionPoint(data, v),
             .reset => try io.reset(data),
+            .close_session => try io.closeSession(data),
             .start_synchronized_output => self.startSynchronizedOutput(cb),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,
             .focused => |v| try io.focusGained(data, v),

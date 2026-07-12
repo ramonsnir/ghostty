@@ -689,6 +689,17 @@ pub fn reset(self: *Termio, td: *ThreadData) !void {
     self.renderer_state.terminal.fullReset();
 }
 
+/// (ramon fork) Deliberate-close commit. Under .client, forward a host `Close`
+/// frame that DESTROYS the session (see `Client.closeSession`). Under .exec
+/// this is a no-op: an exec surface owns a real local subprocess that is reaped
+/// by its own teardown, so there is no host session to destroy.
+pub fn closeSession(self: *Termio, td: *ThreadData) !void {
+    switch (self.backend) {
+        .client => |*client| return try client.closeSession(td),
+        .exec => {},
+    }
+}
+
 /// Slice B2: route a word/line/all select-point to the backend. .exec is a
 /// no-op (the Surface drives the local terminal selection directly); .client
 /// sends a `selection_point` frame so the host runs selectWord/selectLine/

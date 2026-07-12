@@ -1043,9 +1043,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// leaves no other terminal window AND the app quits after its last window
     /// closes — i.e. this explicit close TRIGGERS termination, so it must DETACH
     /// (keep sessions alive for reattach), not destroy them. A STATELESS
-    /// prediction at mark time (NOT a mutable "is terminating" flag, which a
-    /// cancelled quit could poison), and — unlike the send-time app_quitting belt
-    /// — independent of teardown-vs-willTerminate ordering.
+    /// prediction at schedule time (NOT a mutable "is terminating" flag, which a
+    /// cancelled quit could poison), and independent of teardown ordering (the
+    /// deferred commit timer never fires on quit — process death preempts it).
     private func windowCloseTriggersAppTermination() -> Bool {
         guard let appDelegate = NSApp.delegate as? AppDelegate else { return false }
         let closing = Set(window?.tabGroup?.windows ?? [window].compactMap { $0 })
@@ -1246,10 +1246,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let undoManager = appDelegate?.undoManager
         // (ramon fork) If closing ALL terminal windows quits the app, every
         // window must DETACH its pty-host sessions (keep alive for reattach) —
-        // uniformly at MARK time, not relying on the app_quitting belt + undo
-        // retention to defer threadExit past willTerminate. Each per-window
-        // `windowCloseTriggersAppTermination()` sees siblings still open for the
-        // first N-1 windows, so it would otherwise MARK them for destroy; force
+        // uniformly at SCHEDULE time. (Process death on quit would also preempt
+        // any pending commit timer, but scheduling nothing is cleaner.) Each
+        // per-window `windowCloseTriggersAppTermination()` sees siblings still
+        // open for the first N-1 windows, so it would otherwise schedule a
+        // destroy; force
         // `markLeaves: false` across the whole batch instead. When the app does
         // NOT quit after last window closes, close-all IS a genuine deliberate
         // destroy of all sessions, so we mark normally.

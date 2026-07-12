@@ -22,7 +22,6 @@ const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
 const host_protocol = @import("../host/protocol.zig");
-const termio = @import("../termio.zig");
 
 const log = std.log.scoped(.embedded_window);
 
@@ -1593,15 +1592,6 @@ pub const CAPI = struct {
         return v.hasGlobalKeybinds();
     }
 
-    /// (ramon fork) Set the process-global "app is quitting" gate. Called at
-    /// macOS `applicationWillTerminate` (the point of no return) so that any
-    /// pty-host session a window-close path already marked for destruction
-    /// DETACHES instead (kept alive for reattach). Belt behind the Swift
-    /// mark-time last-window-close guard. See `termio.Client.setQuitting`.
-    export fn ghostty_app_set_quitting(quitting: bool) void {
-        termio.Client.setQuitting(quitting);
-    }
-
     /// Update the color scheme of the app.
     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
         const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
@@ -1694,18 +1684,13 @@ pub const CAPI = struct {
         return surface.core_surface.child_exited;
     }
 
-    /// (ramon fork) Mark this surface's pty-host session for DESTRUCTION on
-    /// teardown — a DELIBERATE user close (close split/tab/window). Without
-    /// this the default teardown detaches (parks the session for reattach).
-    /// No-op on `.exec` / a `.mirror` client. See `Surface.requestCloseSession`.
-    export fn ghostty_surface_set_close_session(surface: *Surface) void {
-        surface.core_surface.requestCloseSession();
-    }
-
-    /// (ramon fork) Undo `ghostty_surface_set_close_session` (Undo restored the
-    /// surface, so it must detach on teardown, not be destroyed).
-    export fn ghostty_surface_keep_session(surface: *Surface) void {
-        surface.core_surface.keepSession();
+    /// (ramon fork) Commit a DELIBERATE close of this surface's pty-host session:
+    /// send a live host `Close` frame that DESTROYS the session (vs the
+    /// detach-on-teardown default that parks it for reattach). The GUI calls this
+    /// at the undo-commit boundary of a user close (split/tab/window) — see
+    /// `Surface.closeSessionNow`. No-op on `.exec` / a `.mirror` client.
+    export fn ghostty_surface_close_session_now(surface: *Surface) void {
+        surface.core_surface.closeSessionNow();
     }
 
     /// Returns true if the surface has a selection.

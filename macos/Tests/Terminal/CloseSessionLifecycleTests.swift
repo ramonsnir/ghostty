@@ -191,4 +191,17 @@ struct CloseSessionLifecycleTests {
         #expect(TerminalController.shouldMarkLeavesOnClose(
             isMoveEmptiedSource: true, triggersAppTermination: true) == false)
     }
+
+    // MARK: commit-delay boundary (Feature A)
+
+    @Test func closeCommitDelayIsUndoWindowPlusMargin() {
+        // The deliberate-close commit fires strictly AFTER the undo window so ⌘Z
+        // can no longer race it: undo-seconds + a fixed 0.5s margin, floored at 0.
+        func approx(_ a: TimeInterval, _ b: TimeInterval) -> Bool { abs(a - b) < 1e-6 }
+        #expect(approx(BaseTerminalController.closeCommitDelay(.seconds(30)), 30.5))
+        #expect(approx(BaseTerminalController.closeCommitDelay(.seconds(0)), 0.5))
+        #expect(approx(BaseTerminalController.closeCommitDelay(.milliseconds(500)), 1.0))
+        // A degenerate negative duration floors to 0 before the margin.
+        #expect(approx(BaseTerminalController.closeCommitDelay(.seconds(-5)), 0.5))
+    }
 }

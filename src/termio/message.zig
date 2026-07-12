@@ -55,6 +55,12 @@ pub const Message = union(enum) {
     /// sends a `reset` frame so the host runs fullReset on its real terminal.
     reset: void,
 
+    /// (ramon fork) Deliberate-close commit: under .client the Client sends a
+    /// host `Close` frame that DESTROYS the session (vs the detach-on-teardown
+    /// default). Queued by `Surface.closeSessionNow` at the undo-commit boundary
+    /// of a user close. No-op under .exec (its subprocess dies with teardown).
+    close_session: void,
+
     /// Scroll the viewport
     scroll_viewport: terminal.Terminal.ScrollViewport,
 

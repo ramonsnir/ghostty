@@ -1120,65 +1120,69 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   the session). "Deliberate" = close split (`ctrl+a>x`/`close_surface`), close tab (tab X /
   `close_tab` / close-others), close window (red button / `close_window`),
   and the confirm-free fast path (Agent-Queue auto-close / AppleScript / App-Intent /
-  dead-process close). **Mechanism:** a per-`Client` atomic `close_session` (store-release
-  apprt / load-acquire io); `Client.threadExit` — after the read thread joins, before
-  `posix.close(fd)` — does a SYNCHRONOUS framed `Close` (`sendCloseSync`, `SO_NOSIGPIPE` +
-  `SO_SNDTIMEO` + cleared `O_NONBLOCK`, best-effort) iff FOUR gates hold: `role == .attach`
-  (a `.mirror` dashboard preview NEVER closes), `close_session` set, `!app_quitting`,
-  `session_id != 0`. The async xev write path is dead at teardown (loop stopped), hence the
-  blocking write; `handleClose` is idempotent (unknown/already-removed id = no-op), so a
-  Close racing the child's own exit is safe. **The last-window-close → DETACH guarantee is a
-  MARK-TIME prediction, NOT the send-time belt:** `TerminalController.windowCloseTriggersApp‑
-  Termination()` (pure `windowCloseWouldTerminate(shouldQuitAfterLastWindowClosed:remaining‑
-  TerminalWindowCount:)` = quit-after-last-window AND no other terminal window remains) makes
-  A3 mark NOTHING when a close would terminate the app — stateless, ordering-independent. The
-  process-global `app_quitting` gate (`ghostty_app_set_quitting(true)` at
-  `applicationWillTerminate`) is defense-in-depth (cmd+Q never marks — its path doesn't route
-  through `closeSurface`/`close*Immediately`). **Mark plumbing:** centralized in
-  `BaseTerminalController.replaceSurfaceTree(closingViews:)` (threaded from
-  `removeSurfaceNode(deliberateClose:)`, forwarded to `super` by the `TerminalController.re‑
-  placeSurfaceTree` override) so `close→undo→redo` re-marks; the override's **empty-tree
-  branch is MOVES-ONLY** (root closes route to closeTab/closeWindow) and closes the emptied
-  tab via `closeTabImmediately(markLeaves: TerminalController.moveEmptiedSourceMarksLeaves)`
-  — a NAMED, tested `false` constant (the sole protection for the reparented live view;
-  a regression flipping it fails a test) — never marking it. Tab
-  (A2 `closeTabImmediately(markLeaves:)`) + window (A3 `closeWindowImmediately(markLeaves:)`,
-  whose mark decision runs through the pure `shouldMarkLeavesOnClose(isMoveEmptiedSource:
-  triggersAppTermination:)`) closes fan the mark to EVERY leaf incl. **zoom-hidden**
-  (`root.leaves()`); their redo re-marks by re-invoking `close*Immediately()`, and the
-  `with: undoState` restore clears the mark. **ALL marking funnels through ONE place** —
-  `applyCloseMark(_ phase:_:)` runs the pure, generic, per-phase decision
-  `closeMarkOperations(_:closingViews:heldElsewhere:)` (`.set`/`.redo` mark non-held leaves,
-  `.undo` clears every closing leaf UNCONDITIONALLY = the data-loss-safe direction, a move
-  `nil` = no-op) through the single overridable `setCloseSessionHook` seam (default = the
-  real C exports), and a recorder + `MockView` test drives `.set → .undo → .redo` through
-  `closeMarkOperations` to observe the mark → clear → re-mark ordering with NO live
-  controller/surface. **EXCLUDED — moves + mirrors never mark:**
-  `move_split_to_new_tab`/`pull_marked_split`/`merge_tabs`/`swap_split`/queue pack-adopt-
-  promote-demote/cross-window-drop/`retileCompactGrid` pass `deliberateClose: false` (→
-  `closingViews == nil`) and hit `markLeaves: false` on a source-empty; the
-  `viewHeldByAnotherController` backstop skips any leaf already held elsewhere; `.mirror` is
-  triple-gated. Undo retains the live view until expiry (a wrongly-marked Close is preempted
-  by process death on a real quit; `close→undo` clears it first). Fork-only, GUI relaunch, no
-  host restart. Wiring: core `src/termio/Client.zig`, `src/Surface.zig`,
-  `src/apprt/embedded.zig` + `include/ghostty.h` (`ghostty_surface_set_close_session` /
-  `_keep_session` / `ghostty_app_set_quitting`); macOS `Ghostty.Surface.swift`,
-  `AppDelegate.swift` (`shouldQuitAfterLastWindowClosed` +
-  `applicationWillTerminate` gate), `BaseTerminalController.swift`, `TerminalController.swift`.
-  `closeAllWindowsImmediately` forces `markLeaves: false` across the batch when the
-  close-all quits the app, so every window DETACHES uniformly at mark time (not relying on
-  teardown-vs-willTerminate timing). Tests: Zig `client_difftest.zig` (deliberate→Close;
-  mirror/unattached/quitting/unmarked→none; peer-close swallow) + `src/host/test.zig` (Close
-  idempotency); Swift `macos/Tests/Terminal/CloseSessionLifecycleTests.swift`
-  (`leavesToMarkForClose` + `closingLeaves` move-exclusion; `closeMarkOperations`
-  recorder-seam mark → clear → re-mark ordering + move-never-marks + held-elsewhere filter;
+  dead-process close). **⚠️ The obvious hook — send Close at `Client.threadExit` (teardown)
+  — DOES NOT WORK and was reverted:** a closed `.client` `SurfaceView` is RETAINED past the
+  undo window (AppKit + reattach machinery), so `threadExit` never runs at the close-commit
+  point (verified LIVE — session alive minutes after close). `threadExit` fires reliably only
+  on QUIT (where we DETACH), so Close is sent over the **LIVE** connection at the **undo-commit
+  boundary**, decoupled from teardown. **Mechanism:** a payload-less `.close_session` termio
+  message (`Message.zig` → `Thread.zig` dispatch → `Termio.closeSession` → `Client.closeSession`)
+  sends a framed `Close` on the LIVE write stream (same fire-and-forget path as `reset`), gated
+  `role==.attach` (a `.mirror` dashboard preview NEVER closes) + `session_id!=0`; `.exec` no-op;
+  `handleClose` idempotent (unknown/already-removed id = no-op, so a Close racing the child's
+  own exit is safe); `threadExit` is now plain detach-only (NEVER sends Close — locked by a
+  test). `Surface.closeSessionNow` queues the message; C export
+  `ghostty_surface_close_session_now`. **Commit timing (Swift):** the GUI SCHEDULES the send,
+  not at the gesture but at the undo-commit boundary — `BaseTerminalController.applyCloseMark`
+  keeps a per-view `pendingCloseCommits` (`[ObjectIdentifier: DispatchWorkItem]`):
+  `.set`/`.redo` (re)schedule a main-queue timer at `closeCommitDelay(undoExpiration)` (undo
+  window + 0.5s margin, fires strictly AFTER ⌘Z can no longer race) →
+  `view.surfaceModel?.closeSessionNow()`; `.undo` CANCELS the pending commit (⌘Z restored a
+  LIVE session); a re-mark supersedes a stale one; the work item strong-captures the view so
+  the surface lives until the Close is sent. On a real quit the process exits before the timer
+  fires ⇒ DETACH (no `app_quitting` belt needed — process death is the backstop). **The
+  last-window-close → DETACH guarantee is a MARK-TIME prediction:**
+  `TerminalController.windowCloseTriggersAppTermination()` (pure `windowCloseWouldTerminate(
+  shouldQuitAfterLastWindowClosed:remainingTerminalWindowCount:)` = quit-after-last-window AND
+  no other terminal window remains) makes A3 schedule NOTHING when a close would terminate.
+  **Schedule plumbing:** centralized in `replaceSurfaceTree(closingViews:)` (threaded from
+  `removeSurfaceNode(deliberateClose:)`, forwarded to `super` by the `TerminalController`
+  override) so `close→undo→redo` re-schedules; the override's **empty-tree branch is
+  MOVES-ONLY** (root closes route to closeTab/closeWindow) and closes the emptied tab via
+  `closeTabImmediately(markLeaves: moveEmptiedSourceMarksLeaves)` — a NAMED, tested `false`
+  constant (sole protection for the reparented live view; `viewHeldByAnotherController` can't
+  yet catch it) — never scheduling it. Tab (A2) + window (A3, decision via pure
+  `shouldMarkLeavesOnClose(isMoveEmptiedSource:triggersAppTermination:)`) closes fan the
+  schedule to EVERY leaf incl. **zoom-hidden** (`root.leaves()`); redo re-schedules,
+  `with: undoState` restore cancels. **ALL of it funnels through `applyCloseMark`** running
+  the pure per-phase `closeMarkOperations(_:closingViews:heldElsewhere:)` (`.set`/`.redo`
+  close=true for non-held leaves, `.undo` close=false for every closing leaf UNCONDITIONALLY =
+  data-loss-safe, move `nil` = no-op); a recorder + `MockView` test drives `.set→.undo→.redo`
+  to observe schedule→cancel→re-schedule with NO live controller. **EXCLUDED — moves + mirrors
+  never commit:** `move_split_to_new_tab`/`pull_marked_split`/`merge_tabs`/`swap_split`/queue
+  pack-adopt-promote-demote/cross-window-drop/`retileCompactGrid` pass `deliberateClose: false`
+  (`closingViews == nil`) + hit `markLeaves: false` on a source-empty; `viewHeldByAnother‑
+  Controller` skips a leaf held elsewhere; a `.mirror` is double-gated (`Client.closeSession`
+  role gate + host render-only refusal). `closeAllWindowsImmediately` forces `markLeaves: false`
+  across the batch when close-all quits, so every window DETACHES uniformly. Undo retains the
+  live view until expiry; `close→undo` cancels the pending commit first, and process death on a
+  real quit preempts it. Fork-only, GUI relaunch, no host restart. Wiring: core `src/termio/
+  {Message,Thread,Termio,Client}.zig`, `src/Surface.zig`, `src/apprt/embedded.zig` +
+  `include/ghostty.h` (`ghostty_surface_close_session_now`); macOS `Ghostty.Surface.swift`,
+  `AppDelegate.swift` (`shouldQuitAfterLastWindowClosed`), `BaseTerminalController.swift`
+  (`pendingCloseCommits`/`closeCommitDelay`/`applyCloseMark`/`closeMarkOperations`/…),
+  `TerminalController.swift`. Tests: Zig `client_difftest.zig` (deliberate→LIVE Close;
+  mirror/unattached→none; plain teardown→none) + `src/host/test.zig` (Close idempotency);
+  Swift `macos/Tests/Terminal/CloseSessionLifecycleTests.swift`
+  (`leavesToMarkForClose` + `closingLeaves` move-exclusion; `closeMarkOperations` recorder
+  schedule→cancel→re-schedule + move-never-commits + held-elsewhere filter;
   `moveEmptiedSourceMarksLeaves` == false; `shouldMarkLeavesOnClose` matrix;
-  `windowCloseWouldTerminate` matrix; zoom-hidden leaf enumeration). Two accepted caveats
-  (both err toward SAFE detach): a non-terminal auxiliary window open at last-terminal-close
-  makes `windowCloseTriggersAppTermination` over-predict termination (harmless session-park
-  leak); the Quick Terminal's ROOT surface is never destroyed on a deliberate close (its
-  `closeSurface` override animates out / empties directly, bypassing the mark path). **See
-  `PTYHOST.md` → "Session lifecycle".**
+  `windowCloseWouldTerminate` matrix; `closeCommitDelay` boundary; zoom-hidden enumeration).
+  Two accepted caveats (both err toward SAFE detach): a non-terminal auxiliary window open at
+  last-terminal-close makes `windowCloseTriggersAppTermination` over-predict termination
+  (harmless session-park leak); the Quick Terminal's ROOT surface is never destroyed on a
+  deliberate close (its `closeSurface` override animates out / empties directly, bypassing the
+  schedule path). **See `PTYHOST.md` → "Session lifecycle".**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
