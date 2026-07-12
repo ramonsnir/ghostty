@@ -228,6 +228,23 @@ struct ConfigTests {
         #expect(app.config.mcpToken == "deadbeefcafe")
     }
 
+    // (ramon fork / Feature B) `windowSaveState` is PINNED to "always" — the
+    // getter no longer reads `window-save-state` from the config, so macOS
+    // window-state restoration (which carries each surface's host sessionID for
+    // pty-host reattach) is unconditional. The key stays DEFINED in the core so
+    // the shared/upstream config still parses it, but an explicit
+    // `window-save-state = never` NO LONGER opts out on the fork.
+    @Test func windowSaveStateIsAlwaysByDefault() throws {
+        let config = try TemporaryConfig("")
+        #expect(config.windowSaveState == "always")
+    }
+
+    @Test func windowSaveStateIgnoresNeverAndStaysAlways() throws {
+        // The value is pinned: even the strongest opt-out is ignored.
+        let config = try TemporaryConfig("window-save-state = never")
+        #expect(config.windowSaveState == "always")
+    }
+
     @Test func defaultConfigIsLoaded() throws {
         let config = try TemporaryConfig("")
         #expect(config.optionalAutoUpdateChannel != nil) // release or tip

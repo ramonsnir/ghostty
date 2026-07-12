@@ -129,6 +129,126 @@ class BaseTerminalController: NSWindowController,
         ghostty.config.undoTimeout
     }
 
+    /// (ramon fork) Test seam: sets/clears a leaf's deliberate-close flag on its
+    /// pty-host session. Defaults to the real libghostty path. Every mark/clear —
+    /// close (set), undo (clear), redo (re-mark), and the tab/window fan-out —
+    /// funnels through `applyCloseMark`, whose per-phase decision is the pure,
+    /// generic `closeMarkOperations` (unit-tested with a recorder + `MockView` in
+    /// `CloseSessionLifecycleTests`, so the mark -> clear -> re-mark ordering and
+    /// the MOVE-never-marks rule are observable without a live surface). A plain
+    /// overridable hook, NOT an init-injected dependency. See the close-session
+    /// lifecycle (Feature A).
+    var setCloseSessionHook: @MainActor (Ghostty.SurfaceView, Bool) -> Void = { view, close in
+        if close {
+            view.surfaceModel?.markCloseSession()
+        } else {
+            view.surfaceModel?.keepCloseSession()
+        }
+    }
+
+    /// (ramon fork) True when `v` is held by a DIFFERENT live controller's tree —
+    /// i.e. a MOVE reparented it into another tab/window, so its session is alive
+    /// elsewhere and must NOT be marked for close. Mirrors the marked-surface
+    /// held-elsewhere scan in `surfaceTreeDidChange`. Defense-in-depth: the
+    /// primary move-safety is that moves pass `closingViews == nil` /
+    /// `markLeaves: false`.
+    static func viewHeldByAnotherController(
+        _ v: Ghostty.SurfaceView,
+        excluding: BaseTerminalController
+    ) -> Bool {
+        NSApp.windows
+            .compactMap { $0.windowController as? BaseTerminalController }
+            .contains { $0 !== excluding && $0.surfaceTree.contains(v) }
+    }
+
+    /// (ramon fork) Pure decision: which of `leaves` to mark for close — every
+    /// leaf NOT held elsewhere by a move. Generic + injected predicate so it is
+    /// unit-testable with a mock view (no live controller/surface). See
+    /// `AgentDashboardTests`/close-session tests.
+    static func leavesToMarkForClose<V>(
+        _ leaves: [V],
+        heldElsewhere: (V) -> Bool
+    ) -> [V] {
+        leaves.filter { !heldElsewhere($0) }
+    }
+
+    /// (ramon fork) The phase of the close/undo/redo cycle a mark operation
+    /// belongs to. `set` = the deliberate close; `undo` = the close was undone
+    /// (the live views are restored); `redo` = the undo was itself undone (close
+    /// re-applied).
+    enum CloseMarkPhase { case set, undo, redo }
+
+    /// (ramon fork) The exact (view, close) mark operations a close-lifecycle
+    /// PHASE must apply to its closing leaves. THE single decision every mark /
+    /// clear site funnels through (`applyCloseMark` below), so the set/undo/redo
+    /// sites can't drift and a recorder test can observe the whole mark -> clear
+    /// -> re-mark sequence with a `MockView`, no live controller/surface needed.
+    ///
+    /// - `.set` / `.redo`: MARK (close=true) every leaf NOT already reparented by
+    ///   a move (`heldElsewhere` false) — flag it for pty-host session destruction
+    ///   on teardown. `.redo` re-applies the same marks the undo cleared.
+    /// - `.undo`: CLEAR (close=false) EVERY closing leaf UNCONDITIONALLY — the
+    ///   `heldElsewhere` filter is deliberately NOT applied. This is the
+    ///   DATA-LOSS-safe direction: an undo restores a LIVE session, and a live
+    ///   session that keeps a stale close-mark would be DESTROYED on a later
+    ///   teardown. Clearing a never-set mark is a safe no-op (`keepCloseSession`
+    ///   is idempotent), so over-clearing is always correct.
+    /// - A MOVE carries `nil` closing views ⇒ NO operation in ANY phase (the
+    ///   reparented live view is never touched).
+    static func closeMarkOperations<V>(
+        _ phase: CloseMarkPhase,
+        closingViews: [V]?,
+        heldElsewhere: (V) -> Bool
+    ) -> [(view: V, close: Bool)] {
+        guard let closingViews else { return [] }
+        switch phase {
+        case .set, .redo:
+            return leavesToMarkForClose(closingViews, heldElsewhere: heldElsewhere)
+                .map { (view: $0, close: true) }
+        case .undo:
+            return closingViews.map { (view: $0, close: false) }
+        }
+    }
+
+    /// (ramon fork) Pure decision behind `removeSurfaceNode`'s PRIMARY
+    /// move-exclusion: a DELIBERATE close carries its leaves as `closingViews`
+    /// (so `replaceSurfaceTree` marks them for destruction); a MOVE removal
+    /// (`deliberateClose == false` — the default, used by move_split_to_new_tab /
+    /// pull_marked_split / merge_tabs / swap_split / drag-drop / queue retile)
+    /// carries `nil`, so NOTHING is ever marked and the reparented live view's
+    /// session is never destroyed. This is the invariant most likely to regress
+    /// silently, so it is extracted here to be unit-testable without a live
+    /// controller. (`viewHeldByAnotherController` is the defense-in-depth backstop
+    /// on top of this.)
+    static func closingLeaves<V>(
+        deliberateClose: Bool,
+        leaves: @autoclosure () -> [V]
+    ) -> [V]? {
+        deliberateClose ? leaves() : nil
+    }
+
+    /// (ramon fork) Mark each leaf's pty-host session for DESTRUCTION on teardown
+    /// (a deliberate close), skipping any leaf a MOVE already reparented into
+    /// another controller. Routes through `setCloseSessionHook` (the test seam).
+    func markLeavesForClose(_ leaves: [Ghostty.SurfaceView]) {
+        applyCloseMark(.set, leaves)
+    }
+
+    /// (ramon fork) Apply a close-lifecycle PHASE to `closingViews` via the pure
+    /// `closeMarkOperations` decision, routing every resulting op through the
+    /// `setCloseSessionHook` seam. `nil` closingViews (a move) is a no-op. This is
+    /// the ONE place the set/undo/redo sites (and the tab/window fan-out via
+    /// `markLeavesForClose`) mark or clear a session, so they can't diverge.
+    func applyCloseMark(_ phase: CloseMarkPhase, _ closingViews: [Ghostty.SurfaceView]?) {
+        for op in Self.closeMarkOperations(
+            phase,
+            closingViews: closingViews,
+            heldElsewhere: { Self.viewHeldByAnotherController($0, excluding: self) }
+        ) {
+            setCloseSessionHook(op.view, op.close)
+        }
+    }
+
     /// The undo manager for this controller is the undo manager of the window,
     /// which we set via the delegate method.
     override var undoManager: ExpiringUndoManager? {
@@ -519,7 +639,11 @@ class BaseTerminalController: NSWindowController,
 
         // If the child process is not alive, then we exit immediately
         guard withConfirmation else {
-            removeSurfaceNode(node)
+            // (ramon fork) A1a — deliberate close (fast path): destroy the
+            // pty-host session. Reaches removeSurfaceNode only for a NON-root
+            // node (TerminalController.closeSurface routes root closes to
+            // closeTab/closeWindow), so this never empties the tree.
+            removeSurfaceNode(node, deliberateClose: true)
             return
         }
 
@@ -533,7 +657,10 @@ class BaseTerminalController: NSWindowController,
             informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
         ) { [weak self] in
             if let self {
-                self.removeSurfaceNode(node)
+                // (ramon fork) A1b — deliberate close (confirmed): destroy the
+                // pty-host session. Runs only AFTER the user confirms, so a
+                // cancelled confirm never marks.
+                self.removeSurfaceNode(node, deliberateClose: true)
             }
         }
     }
@@ -580,7 +707,13 @@ class BaseTerminalController: NSWindowController,
     /// This also updates the undo manager to support restoring this node.
     ///
     /// This does no confirmation and assumes confirmation is already done.
-    private func removeSurfaceNode(_ node: SplitTree<Ghostty.SurfaceView>.Node) {
+    private func removeSurfaceNode(
+        _ node: SplitTree<Ghostty.SurfaceView>.Node,
+        // (ramon fork) true only for a DELIBERATE close (close_surface / the
+        // withConfirmation:false fast path); false (the default) for a MOVE
+        // removal, which reparents a live view and must NOT destroy its session.
+        deliberateClose: Bool = false
+    ) {
         // Move focus if the closed surface was focused and we have a next target
         let nextFocus: Ghostty.SurfaceView? = if node.contains(
             where: { $0 == focusedSurface }
@@ -598,7 +731,13 @@ class BaseTerminalController: NSWindowController,
             // This is a weird workaround, since `resignFirstResponder` wasn't called on `focusedSurface` after drag,
             // but the first responder became the window itself.
             moveFocusTo: nextFocus ?? focusedSurface,
-            undoAction: "Close Terminal"
+            undoAction: "Close Terminal",
+            // (ramon fork) Deliberate close ⇒ carry the closing leaves so
+            // replaceSurfaceTree marks them for destruction (and re-marks on
+            // redo); a move passes nil ⇒ never marks.
+            closingViews: Self.closingLeaves(
+                deliberateClose: deliberateClose,
+                leaves: node.leaves())
         )
     }
 
@@ -606,11 +745,22 @@ class BaseTerminalController: NSWindowController,
         _ newTree: SplitTree<Ghostty.SurfaceView>,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
-        undoAction: String? = nil
+        undoAction: String? = nil,
+        // (ramon fork) Leaves whose pty-host sessions should be DESTROYED on
+        // teardown (a deliberate close). nil for a move / any non-close caller.
+        closingViews: [Ghostty.SurfaceView]? = nil
     ) {
         // Setup our new split tree
         let oldTree = surfaceTree
         surfaceTree = newTree
+
+        // (ramon fork) Deliberate close: mark HERE, not at the call site — so
+        // every close -> undo -> redo cycle re-marks (the redo closure below
+        // re-invokes this fn with the same closingViews). Moves pass nil ⇒ never
+        // mark (applyCloseMark no-ops on nil). viewHeldByAnotherController (inside
+        // applyCloseMark's .set) skips a leaf a move already reparented elsewhere.
+        applyCloseMark(.set, closingViews)
+
         if let newView {
             DispatchQueue.main.async {
                 Ghostty.moveFocus(to: newView, from: oldView)
@@ -628,6 +778,11 @@ class BaseTerminalController: NSWindowController,
             expiresAfter: undoExpiration
         ) { target in
             target.surfaceTree = oldTree
+            // (ramon fork) Undo restored the closed views — clear the mark so
+            // their (LIVE) sessions detach, not get destroyed, if torn down later.
+            // .undo clears EVERY closing leaf unconditionally; nil (a move) is a
+            // no-op. See closeMarkOperations for the data-loss-safe rationale.
+            target.applyCloseMark(.undo, closingViews)
             if let oldView {
                 DispatchQueue.main.async {
                     Ghostty.moveFocus(to: oldView, from: target.focusedSurface)
@@ -642,7 +797,10 @@ class BaseTerminalController: NSWindowController,
                     newTree,
                     moveFocusTo: newView,
                     moveFocusFrom: target.focusedSurface,
-                    undoAction: undoAction)
+                    undoAction: undoAction,
+                    // (ramon fork) Re-mark on REDO (fixes the redo-bypass: the
+                    // nested redo closure re-runs this fn directly).
+                    closingViews: closingViews)
             }
         }
     }

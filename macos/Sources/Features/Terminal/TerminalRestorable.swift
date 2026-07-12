@@ -135,15 +135,9 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             return
         }
 
-        // If our configuration is "never" then we never restore the state
-        // no matter what. Note its safe to use "ghostty.config" directly here
-        // because window restoration is only ever invoked on app start so we
-        // don't have to deal with config reloads.
-        if appDelegate.ghostty.config.windowSaveState == "never" {
-            AppDelegate.logger.warning("skip restoration: window-save-state=never")
-            completionHandler(nil, nil)
-            return
-        }
+        // (ramon fork) Restoration is unconditional — `window-save-state` is no
+        // longer consulted (Ghostty.Config.windowSaveState is pinned to "always"),
+        // so we never skip restoration and always proceed to decode.
 
         // Decode the state. If we can't decode the state, then we can't restore.
         guard let state = TerminalRestorableState(coder: state) else {

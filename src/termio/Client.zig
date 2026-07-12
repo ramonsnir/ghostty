@@ -238,6 +238,15 @@ images: imagepkg.State = .empty,
 /// are random non-zero u64s (`allocSessionId` in `src/host/Server.zig`).
 session_id: std.atomic.Value(u64) = .init(0),
 
+/// (ramon fork) Deliberate-close flag. Set true from the GUI (via
+/// `requestCloseSession`) when the USER explicitly closes this surface, so
+/// `threadExit` sends a host Close that DESTROYS the session — vs a GUI
+/// quit/relaunch, which leaves it false so the host PARKS the session for
+/// reattach. Written on the apprt/main thread, read on the io thread at
+/// `threadExit`; store-release / load-acquire make the handoff race-free
+/// (same atomic discipline as `session_id`/`at_prompt`).
+close_session: std.atomic.Value(bool) = .init(false),
+
 /// Set on `.child_exited`.
 child_exited: ?ChildExited = null,
 
@@ -799,8 +808,35 @@ pub fn connectAndAttach(
     read_thread.setName("io-client-reader") catch {};
 }
 
+/// (ramon fork) Set true by `ghostty_app_set_quitting` at
+/// `applicationWillTerminate` (the point of no return). While true,
+/// `threadExit` NEVER sends Close — every session detaches for reattach, even
+/// ones a window-close path already marked. This is a BELT: the primary
+/// last-window-close -> detach guarantee is the mark-time
+/// `windowCloseTriggersAppTermination()` check on the Swift side, which does
+/// not depend on teardown-vs-willTerminate ordering.
+var app_quitting: std.atomic.Value(bool) = .init(false);
+
+/// (ramon fork) Process-global quit gate setter (see `app_quitting`).
+pub fn setQuitting(v: bool) void {
+    app_quitting.store(v, .release);
+}
+
+/// (ramon fork) Mark this session for host-side DESTRUCTION on teardown. Only a
+/// `.attach` client ever marks — a `.mirror` (read-only dashboard preview) must
+/// never destroy the real session (defense-in-depth: `threadExit` re-checks the
+/// role, and the host `handleClose` refuses a render-only subscriber too).
+pub fn requestCloseSession(self: *Client) void {
+    if (self.config.role != .attach) return;
+    self.close_session.store(true, .release);
+}
+
+/// (ramon fork) Undo the mark (Undo restored the closed surface).
+pub fn keepSession(self: *Client) void {
+    self.close_session.store(false, .release);
+}
+
 pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
-    _ = self;
     std.debug.assert(td.backend == .client);
     const client = &td.backend.client;
 
@@ -816,12 +852,94 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
 
     client.read_thread.join();
 
+    // (ramon fork) Deliberate-close: send a host Close so the session is
+    // DESTROYED (vs a bare socket drop, which detaches + parks for reattach).
+    // Four gates, all required: (i) never a mirror, (ii) the GUI marked this a
+    // deliberate close, (iii) the app is not quitting (a quit/last-window-quit
+    // must detach), (iv) we are actually attached (session_id assigned). The
+    // read thread is joined, so we own the fd and this synchronous write is the
+    // last thing before we close it (the async xev write path is dead here —
+    // the loop has already stopped when threadExit runs).
+    if (self.config.role == .attach and
+        self.close_session.load(.acquire) and
+        !app_quitting.load(.acquire))
+    {
+        const sid = self.session_id.load(.acquire);
+        if (sid != 0) self.sendCloseSync(client.read_thread_fd, sid);
+    }
+
     // Close the socket fd. The write_stream wraps the same fd; we close it
     // exactly once here (write_stream.deinit in ThreadData.deinit does not
     // close on this xev backend's Stream — see Exec, which closes the pty fds
     // via the subprocess, not the stream). Closing the connected socket tears
     // down our side of the connection.
     posix.close(client.read_thread_fd);
+}
+
+/// (ramon fork) Synchronously frame + write a `protocol.Close` for `session_id`
+/// on `fd`, blocking (bounded). Called from `threadExit` AFTER the read thread
+/// is joined (so we own the fd) and BEFORE the fd is closed. Best-effort: every
+/// failure is logged + swallowed — the host's idle reaper is the backstop.
+/// Refuses SIGPIPE (`SO_NOSIGPIPE`) so a peer-closed socket returns EPIPE
+/// instead of aborting the process, and bounds a wedged host with `SO_SNDTIMEO`.
+///
+/// Two best-effort caveats, both landing in the SAFE (detach) direction:
+///   (a) If a prior ASYNC frame was only partially flushed before the loop
+///       stopped, appending this synchronous Close mid-frame can desync the
+///       host's FrameReader. Worst case the host drops the connection, which is
+///       a bare socket drop = DETACH (session parked for reattach), never a lost
+///       shell — and the idle reaper still collects a truly-orphaned session.
+///   (b) `SO_SNDTIMEO` is the bound on the O_NONBLOCK-cleared write; if the
+///       platform swallows that setsockopt AND the host send buffer is full, the
+///       write could block longer than intended. We accept this: the host is a
+///       local KeepAlive LaunchAgent whose recv loop drains promptly, so a full
+///       send buffer at teardown is not an observed condition.
+fn sendCloseSync(self: *Client, fd: posix.fd_t, session_id: u64) void {
+    // Never take SIGPIPE if the host already closed its end (EPIPE is caught
+    // below), and bound the write so a wedged host can't hang teardown.
+    const on: c_int = 1;
+    posix.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.NOSIGPIPE,
+        std.mem.asBytes(&on),
+    ) catch {};
+    const tv = posix.timeval{ .sec = 0, .usec = 250_000 }; // 250ms send timeout
+    posix.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.SNDTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+
+    // Clear O_NONBLOCK (the read thread set it in threadMainPosix; that thread
+    // is joined, so we own the fd) so the tiny frame writes in one shot,
+    // bounded by SO_SNDTIMEO above.
+    if (posix.fcntl(fd, posix.F.GETFL, 0)) |flags| {
+        _ = posix.fcntl(
+            fd,
+            posix.F.SETFL,
+            flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
+        ) catch {};
+    } else |_| {}
+
+    const framed = protocol.encodeFrame(self.gpa, .close, protocol.Close{
+        .session_id = session_id,
+    }) catch |err| {
+        log.warn("failed to encode Close on teardown err={}", .{err});
+        return;
+    };
+    defer self.gpa.free(framed);
+
+    var off: usize = 0;
+    while (off < framed.len) {
+        const n = posix.write(fd, framed[off..]) catch |err| {
+            log.warn("failed to send Close on teardown err={}", .{err});
+            return; // EPIPE / EAGAIN(timeout) / etc. — reaper is the backstop
+        };
+        if (n == 0) break; // peer gone
+        off += n;
+    }
 }
 
 pub fn focusGained(

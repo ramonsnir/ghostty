@@ -3679,6 +3679,104 @@ test "host socket integration: render-only conn close is DROPPED, session surviv
     std.Thread.sleep(50 * std.time.ns_per_ms);
 }
 
+test "host socket integration: Close is idempotent (unknown / already-removed id is a safe no-op)" {
+    // (ramon fork) The GUI now sends a host Close on a deliberate surface close.
+    // A Close can race the child's own exit (the session is auto-reaped when the
+    // child dies) or a prior Close, so handleClose must tolerate an unknown /
+    // already-removed session_id (fetchRemove miss -> `entry orelse return`).
+    // This drives: (a) Close for a NEVER-existent id, and (b) a DOUBLE Close of
+    // a real session — then proves the server is still healthy by spawning a
+    // fresh session and getting an `.attached`.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/hclsidem.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    const server = try Server.init(alloc, sock_path);
+    defer server.deinit();
+    try server.start();
+
+    const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client);
+    try connectUnix(client, sock_path);
+    setRecvTimeout(client);
+
+    var rdr: ClientReader = .{};
+    defer rdr.deinit(alloc);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(alloc);
+
+    try clientSend(alloc, client, .hello, protocol.Hello{ .identity_bundle_id = "test.clsidem" });
+    {
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+
+    // (a) Close a NEVER-existent session id — must be a silent no-op (no crash,
+    // connection stays usable).
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = 0xDEAD_BEEF });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Spawn a real session so we have a valid id to double-close.
+    try clientSend(alloc, client, .attach, protocol.Attach{ .session_id = null });
+    var session_id: u64 = 0;
+    {
+        var i: usize = 0;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr, alloc, client, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                session_id = a.session_id;
+                break;
+            }
+        }
+        try testing.expect(session_id != 0);
+    }
+
+    // (b) Close it TWICE. The first tears it down; the second finds nothing
+    // (fetchRemove miss) and returns cleanly.
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try clientSend(alloc, client, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // PROVE the server survived every stray Close: a fresh attach still works.
+    const client2 = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(client2);
+    try connectUnix(client2, sock_path);
+    setRecvTimeout(client2);
+    var rdr2: ClientReader = .{};
+    defer rdr2.deinit(alloc);
+    try clientSend(alloc, client2, .hello, protocol.Hello{ .identity_bundle_id = "test.clsidem2" });
+    {
+        const tag = (try pollNext(&rdr2, alloc, client2, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+    try clientSend(alloc, client2, .attach, protocol.Attach{ .session_id = null });
+    {
+        var i: usize = 0;
+        var ok = false;
+        while (i < FRAME_SCAN_ITERS) : (i += 1) {
+            const tag = (try pollNext(&rdr2, alloc, client2, &payload, 4)) orelse continue;
+            if (tag == .attached) {
+                const a = try protocol.Attached.decode(alloc, payload.items);
+                try testing.expect(a.session_id != 0);
+                ok = true;
+                break;
+            }
+        }
+        try testing.expect(ok);
+    }
+
+    // Tidy: close the fresh session.
+    try clientSend(alloc, client2, .close, protocol.Close{ .session_id = session_id });
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+}
+
 test "host socket integration: dual-role conn (attached + subscribe_render) KEEPS full mutation rights (Layer 1)" {
     // The gate's correctness hinge: Conn.isRenderOnlySubscriber returns false for a
     // conn that is on BOTH subscribed AND subscribed_render (a real GUI that also

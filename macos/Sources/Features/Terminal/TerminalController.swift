@@ -243,12 +243,26 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         _ newTree: SplitTree<Ghostty.SurfaceView>,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
-        undoAction: String? = nil
+        undoAction: String? = nil,
+        // (ramon fork) forwarded to super so a deliberate NON-root split close
+        // still marks (and re-marks on redo).
+        closingViews: [Ghostty.SurfaceView]? = nil
     ) {
         // We have a special case if our tree is empty to close our tab immediately.
         // This makes it so that undo is handled properly.
+        //
+        // (ramon fork) This empty branch is reached ONLY by MOVE removals: a
+        // deliberate split close of a ROOT node is intercepted by
+        // closeSurface(_:withConfirmation:) and routed to closeTab/closeWindow,
+        // and a non-root removal never empties the tree — so closingViews is
+        // always nil here. We pass markLeaves:false so closeTabImmediately's own
+        // A2 self-mark does NOT flag the moved (still-live) view: at this instant
+        // the reparented view is NOT yet held by the destination controller (the
+        // destination install runs AFTER this removal), so the
+        // viewHeldByAnotherController backstop can't catch it — markLeaves:false
+        // is the guarantee.
         if newTree.isEmpty {
-            closeTabImmediately()
+            closeTabImmediately(markLeaves: Self.moveEmptiedSourceMarksLeaves)
             return
         }
 
@@ -256,7 +270,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             newTree,
             moveFocusTo: newView,
             moveFocusFrom: oldView,
-            undoAction: undoAction)
+            undoAction: undoAction,
+            closingViews: closingViews)
     }
 
     // MARK: Terminal Creation
@@ -847,15 +862,25 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         closeWindow(nil)
     }
 
-    func closeTabImmediately(registerRedo: Bool = true) {
+    func closeTabImmediately(registerRedo: Bool = true, markLeaves: Bool = true) {
         guard let window = window else { return }
         guard let tabGroup = window.tabGroup,
                 tabGroup.windows.count > 1 else {
-            closeWindowImmediately()
+            closeWindowImmediately(markLeaves: markLeaves)
             return
         }
 
         cancelPendingInitialPresentation()
+
+        // (ramon fork) A2 — deliberate tab close destroys this tab's pty-host
+        // sessions (all leaves, incl. zoom-hidden). markLeaves is false ONLY when
+        // reached via the replaceSurfaceTree override's empty branch (a MOVE
+        // emptied the source tab), so a reparented view is never marked. Closing
+        // one of several tabs never triggers app termination, so no termination
+        // guard is needed here.
+        if markLeaves {
+            markLeavesForClose(surfaceTree.root?.leaves() ?? [])
+        }
 
         // Undo
         if let undoManager, let undoState {
@@ -972,12 +997,23 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// Closes the current window (including any other tabs) immediately and without
     /// confirmation. This will setup proper undo state so the action can be undone.
-    func closeWindowImmediately() {
+    func closeWindowImmediately(markLeaves: Bool = true) {
         guard let window = window else { return }
 
         cancelPendingInitialPresentation()
 
         registerUndoForCloseWindow()
+
+        // (ramon fork) A3 — deliberate window close destroys every leaf's
+        // pty-host session across the whole tab group (incl. zoom-hidden splits).
+        // Gated by markLeaves (false only via the move empty-branch path) AND by
+        // the mark-time last-window guard: if this close TRIGGERS app termination
+        // (no other terminal window remains and the app quits after last window),
+        // we DETACH instead (keep sessions for reattach). Each controller's own
+        // leaves are marked BEFORE its tree is emptied below.
+        let doMark = Self.shouldMarkLeavesOnClose(
+            isMoveEmptiedSource: !markLeaves,
+            triggersAppTermination: windowCloseTriggersAppTermination())
 
         if let tabGroup = window.tabGroup, tabGroup.windows.count > 1 {
             tabGroup.windows.forEach { window in
@@ -985,6 +1021,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 // This prevents unnecessary undos registered since AppKit may
                 // process them on later ticks so we can't just disable undo registration.
                 if let controller = window.windowController as? TerminalController {
+                    if doMark {
+                        controller.markLeavesForClose(
+                            controller.surfaceTree.root?.leaves() ?? [])
+                    }
                     controller.cancelPendingInitialPresentation()
                     controller.surfaceTree = .init()
                 }
@@ -992,8 +1032,73 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 window.close()
             }
         } else {
+            if doMark {
+                markLeavesForClose(surfaceTree.root?.leaves() ?? [])
+            }
             window.close()
         }
+    }
+
+    /// (ramon fork) True when closing THIS window (and its tab-group siblings)
+    /// leaves no other terminal window AND the app quits after its last window
+    /// closes — i.e. this explicit close TRIGGERS termination, so it must DETACH
+    /// (keep sessions alive for reattach), not destroy them. A STATELESS
+    /// prediction at mark time (NOT a mutable "is terminating" flag, which a
+    /// cancelled quit could poison), and — unlike the send-time app_quitting belt
+    /// — independent of teardown-vs-willTerminate ordering.
+    private func windowCloseTriggersAppTermination() -> Bool {
+        guard let appDelegate = NSApp.delegate as? AppDelegate else { return false }
+        let closing = Set(window?.tabGroup?.windows ?? [window].compactMap { $0 })
+        // NOTE (ramon fork): "remaining" counts only terminal windows, not a
+        // Settings/About auxiliary window. macOS terminates only when ALL windows
+        // are gone, so if such an auxiliary is open at last-terminal-close this
+        // OVER-predicts termination and we DETACH a session that could have been
+        // destroyed (a session-park leak that clears on the next reattach/host
+        // restart). This only ever errs toward SAFE detach — never toward wrongly
+        // killing a live session — so it is left as-is deliberately.
+        let remaining = NSApp.windows.filter { w in
+            (w.windowController is BaseTerminalController) && !closing.contains(w)
+        }
+        return Self.windowCloseWouldTerminate(
+            shouldQuitAfterLastWindowClosed: appDelegate.shouldQuitAfterLastWindowClosed,
+            remainingTerminalWindowCount: remaining.count)
+    }
+
+    /// (ramon fork) Pure decision behind `windowCloseTriggersAppTermination`: an
+    /// explicit window close triggers app termination — and so must DETACH its
+    /// pty-host sessions rather than destroy them — exactly when the app quits
+    /// after its last window closes AND no other terminal window remains open.
+    /// Extracted (with injected inputs) so it is unit-testable without NSApp.
+    static func windowCloseWouldTerminate(
+        shouldQuitAfterLastWindowClosed: Bool,
+        remainingTerminalWindowCount: Int
+    ) -> Bool {
+        shouldQuitAfterLastWindowClosed && remainingTerminalWindowCount == 0
+    }
+
+    /// (ramon fork) The named, tested value for the `replaceSurfaceTree`
+    /// empty-tree branch's `markLeaves:` argument. Its ONLY caller is a MOVE that
+    /// emptied the source tab, and at that instant the reparented view is NOT yet
+    /// held by the destination controller (the destination install runs AFTER the
+    /// removal), so the `viewHeldByAnotherController` backstop CANNOT catch it —
+    /// this `false` is the SOLE protection against destroying a moved-away live
+    /// session. Flipping it to `true` would silently kill moved sessions; a
+    /// regression is caught by `CloseSessionLifecycleTests`.
+    static let moveEmptiedSourceMarksLeaves = false
+
+    /// (ramon fork) Pure decision: should a tab/window close MARK its leaves for
+    /// pty-host session destruction? It marks iff BOTH (a) this is NOT a
+    /// move-empties-source close (a reparented live view must never be destroyed —
+    /// see `moveEmptiedSourceMarksLeaves`) AND (b) the close does NOT trigger app
+    /// termination (a last-window close DETACHES for reattach —
+    /// see `windowCloseWouldTerminate`). Extracted so `closeWindowImmediately`'s
+    /// combination logic is unit-testable without a live controller/NSApp; a
+    /// regression dropping either guard fails `CloseSessionLifecycleTests`.
+    static func shouldMarkLeavesOnClose(
+        isMoveEmptiedSource: Bool,
+        triggersAppTermination: Bool
+    ) -> Bool {
+        !isMoveEmptiedSource && !triggersAppTermination
     }
 
     /// Registers undo for closing window(s), handling both single windows and tab groups.
@@ -1137,9 +1242,20 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     static private func closeAllWindowsImmediately() {
-        let undoManager = (NSApp.delegate as? AppDelegate)?.undoManager
+        let appDelegate = NSApp.delegate as? AppDelegate
+        let undoManager = appDelegate?.undoManager
+        // (ramon fork) If closing ALL terminal windows quits the app, every
+        // window must DETACH its pty-host sessions (keep alive for reattach) —
+        // uniformly at MARK time, not relying on the app_quitting belt + undo
+        // retention to defer threadExit past willTerminate. Each per-window
+        // `windowCloseTriggersAppTermination()` sees siblings still open for the
+        // first N-1 windows, so it would otherwise MARK them for destroy; force
+        // `markLeaves: false` across the whole batch instead. When the app does
+        // NOT quit after last window closes, close-all IS a genuine deliberate
+        // destroy of all sessions, so we mark normally.
+        let triggersTermination = appDelegate?.shouldQuitAfterLastWindowClosed ?? false
         undoManager?.beginUndoGrouping()
-        all.forEach { $0.closeWindowImmediately() }
+        all.forEach { $0.closeWindowImmediately(markLeaves: !triggersTermination) }
         undoManager?.setActionName("Close All Windows")
         undoManager?.endUndoGrouping()
     }
@@ -1158,6 +1274,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     convenience init(_ ghostty: Ghostty.App, with undoState: UndoState) {
         self.init(ghostty, withSurfaceTree: undoState.surfaceTree)
+
+        // (ramon fork) This is the undo-restore entry for a tab/window close.
+        // The restored leaves were marked for destruction by A2/A3; clear that
+        // mark (via the same applyCloseMark funnel / seam) so they detach — not
+        // get destroyed — if torn down again later. The tab/window REDO re-marks
+        // by re-invoking closeTabImmediately()/closeWindowImmediately().
+        applyCloseMark(.undo, surfaceTree.root?.leaves() ?? [])
 
         // Show the window and restore its frame
         showWindow(nil)

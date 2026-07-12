@@ -1260,6 +1260,24 @@ pub fn mirrorSourceGrid(self: *Surface) ?termio.Client.MirrorGrid {
     };
 }
 
+/// (ramon fork) Mark this surface's pty-host session for DESTRUCTION on
+/// teardown (a deliberate user close). No-op on `.exec` (a real subprocess is
+/// reaped by its own teardown). See `Client.requestCloseSession`.
+pub fn requestCloseSession(self: *Surface) void {
+    switch (self.io.backend) {
+        .client => |*c| c.requestCloseSession(),
+        .exec => {},
+    }
+}
+
+/// (ramon fork) Undo a deliberate-close mark (Undo restored the surface).
+pub fn keepSession(self: *Surface) void {
+    switch (self.io.backend) {
+        .client => |*c| c.keepSession(),
+        .exec => {},
+    }
+}
+
 /// Layer 2: the decision childExited makes on its FIRST branch — whether this
 /// surface is a read-only mirror (dims, never closes) vs a real attach/exec
 /// surface (runs the normal close/show-exited flow). Extracted as a pure predicate

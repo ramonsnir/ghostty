@@ -237,8 +237,11 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   system beep, Web Push). Back-compat both ways: `decodeIfPresent ?? false` (pre-fork/`.exec`
   archives read false) + gated `if bell`/`if attentionNeeded` encode (healthy surface's
   archive byte-identical). Focusing a restored surface clears both via `focusDidChange`,
-  exactly as at runtime; rides the existing `window-save-state` restoration (off ⇒ nothing
-  persists). **⚠️ Correct Codable is NOT enough on its own:** macOS restoration is
+  exactly as at runtime; rides the same macOS window-state restoration that carries the
+  split tree — which the fork now forces ON UNCONDITIONALLY (see the "PTY-host reattach
+  forces … restoration ON" bullet: `Ghostty.Config.windowSaveState` is pinned to `"always"`),
+  so there is no longer an "off ⇒ nothing persists" state to worry about — the bell/attention
+  markers always persist. **⚠️ Correct Codable is NOT enough on its own:** macOS restoration is
   dirty-tracked, so every `bell`/`attentionNeeded` mutation must call
   `invalidateBellRestorableState()` (`window?.invalidateRestorableState()`) or AppKit re-saves
   the STALE blob from the last surface-tree change and the markers vanish on restart anyway —
@@ -1081,27 +1084,101 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   (`cachesWithinDuration`/`refetchesAfterExpiry` + the `concurrentGetAndExpiryDoesNotRace` 20k-iteration
   concurrent stress reproducer).
 
-- **PTY-host reattach no longer silently gated by macOS window-save-state (fork-only,
-  macOS, GUI-only; on by default when pty-host is set — an explicit `window-save-state =
-  never` still opts out).** The pty-host promise "sessions
-  survive a GUI quit/relaunch" depends on macOS actually persisting+restoring the window
-  archive on quit (it carries each surface's host `sessionID`, the reattach key). Whether
-  macOS does so on a clean quit is gated by `NSQuitAlwaysKeepsWindows`, which the fork
-  derives from `window-save-state`: `always→true`, `never→false`, `default→` (historically)
-  REMOVE the override and defer to the macOS **"Close windows when quitting an application"**
-  system pref — checked-by-default in modern macOS (= don't restore). Since the fork's own
-  default is `default` and the seeded colleague config enables `pty-host` WITHOUT setting
-  `window-save-state`, the whole reattach feature **silently** hinged on an invisible system
-  checkbox — a colleague (or Ramon on a machine whose shared config lacks `window-save-state
-  = always`) saw every surface spawn fresh on relaunch with NO warning (issue #5). Fix: a
-  pure `AppDelegate.quitAlwaysKeepsWindows(windowSaveState:ptyHostActive:)` forces
-  `NSQuitAlwaysKeepsWindows = true` for the `default` case whenever `pty-host` is set, so
-  reattach no longer depends on the system pref; explicit `never` still opts out (even under
-  pty-host), and a non-pty-host build is behaviorally unchanged (`default→nil`, defer to system). No
-  Zig/host change (no host restart) — GUI relaunch only. Wiring:
-  `macos/Sources/App/macOS/AppDelegate.swift` (`quitAlwaysKeepsWindows` + `ghosttyConfigDidChange`),
+- **PTY-host reattach forces macOS window-state restoration ON UNCONDITIONALLY (fork-only,
+  macOS, GUI-only; always on for every identity/build; an explicit `window-save-state = never`
+  NO LONGER opts out).** The pty-host promise "sessions survive a GUI quit/relaunch" depends
+  on macOS actually persisting+restoring the window archive on quit (it carries each surface's
+  host `sessionID`, the reattach key). Whether macOS does so on a clean quit is gated by
+  `NSQuitAlwaysKeepsWindows`, which the fork historically derived from `window-save-state`
+  (`always→true`, `never→false`, `default→` REMOVE the override and defer to the macOS
+  **"Close windows when quitting an application"** system pref — checked-by-default in modern
+  macOS = don't restore). Since the fork's own default is `default`, the whole reattach feature
+  **silently** hinged on an invisible system checkbox — a colleague saw every surface spawn
+  fresh on relaunch with NO warning (issue #5). Fix (supersedes the earlier pty-host-gated
+  behavior): restoration is now UNCONDITIONAL. `Ghostty.Config.windowSaveState` is hardcoded to
+  `"always"` (the value is no longer read — the `window-save-state` key stays defined in
+  `src/config/Config.zig` ONLY so the shared/upstream config still parses it),
+  `AppDelegate.quitAlwaysKeepsWindows()` is a constant `true` (always sets
+  `NSQuitAlwaysKeepsWindows = true`), and the `willEncodeRestorableState` /
+  `didDecodeRestorableState` / `TerminalRestorable.restoreWindow` guards that once skipped on
+  `"never"` are removed (always encode / always decode). ⚠️ Accepted trade-off: NO config escape
+  hatch — `window-save-state = never` is silently ignored, for every identity/build (incl.
+  non-pty-host). No Zig/host change (no host restart) — GUI relaunch only. Wiring:
+  `macos/Sources/Ghostty/Ghostty.Config.swift` (getter → `"always"`),
+  `macos/Sources/App/macOS/AppDelegate.swift` (`quitAlwaysKeepsWindows` collapsed to `true` +
+  `ghosttyConfigDidChange` + `willEncode`/`didDecode`),
+  `macos/Sources/Features/Terminal/TerminalRestorable.swift` (skip-branch removed),
   `ForkSetup.swift` (seed pty-host comment). Tests: `macos/Tests/App/AppDelegateTests.swift`
-  (`quitAlwaysKeepsWindows` matrix). **See `PTYHOST.md` → "Always" caveats.**
+  (`alwaysReturnsTrue`). **See `PTYHOST.md` → "Always" caveats.**
+
+- **Deliberate close destroys the pty-host session (fork-only, GUI-lib-side; the host
+  already implements the `Close` frame + `handleClose`, so NO host rebuild/restart — live
+  RAM-only sessions survive the deploy).** The default `.client` teardown DETACHES on any
+  bare socket drop (GUI quit / crash / SIGKILL / macOS window-restore transient) → the host
+  PARKS the session for reattach; that is what makes reattach work but would leak a shell
+  forever on a genuine close. Fix: a DELIBERATE close now sends `protocol.Close` (destroys
+  the session). "Deliberate" = close split (`ctrl+a>x`/`close_surface`), close tab (tab X /
+  `close_tab` / close-others), close window (red button / `close_window`),
+  and the confirm-free fast path (Agent-Queue auto-close / AppleScript / App-Intent /
+  dead-process close). **Mechanism:** a per-`Client` atomic `close_session` (store-release
+  apprt / load-acquire io); `Client.threadExit` — after the read thread joins, before
+  `posix.close(fd)` — does a SYNCHRONOUS framed `Close` (`sendCloseSync`, `SO_NOSIGPIPE` +
+  `SO_SNDTIMEO` + cleared `O_NONBLOCK`, best-effort) iff FOUR gates hold: `role == .attach`
+  (a `.mirror` dashboard preview NEVER closes), `close_session` set, `!app_quitting`,
+  `session_id != 0`. The async xev write path is dead at teardown (loop stopped), hence the
+  blocking write; `handleClose` is idempotent (unknown/already-removed id = no-op), so a
+  Close racing the child's own exit is safe. **The last-window-close → DETACH guarantee is a
+  MARK-TIME prediction, NOT the send-time belt:** `TerminalController.windowCloseTriggersApp‑
+  Termination()` (pure `windowCloseWouldTerminate(shouldQuitAfterLastWindowClosed:remaining‑
+  TerminalWindowCount:)` = quit-after-last-window AND no other terminal window remains) makes
+  A3 mark NOTHING when a close would terminate the app — stateless, ordering-independent. The
+  process-global `app_quitting` gate (`ghostty_app_set_quitting(true)` at
+  `applicationWillTerminate`) is defense-in-depth (cmd+Q never marks — its path doesn't route
+  through `closeSurface`/`close*Immediately`). **Mark plumbing:** centralized in
+  `BaseTerminalController.replaceSurfaceTree(closingViews:)` (threaded from
+  `removeSurfaceNode(deliberateClose:)`, forwarded to `super` by the `TerminalController.re‑
+  placeSurfaceTree` override) so `close→undo→redo` re-marks; the override's **empty-tree
+  branch is MOVES-ONLY** (root closes route to closeTab/closeWindow) and closes the emptied
+  tab via `closeTabImmediately(markLeaves: TerminalController.moveEmptiedSourceMarksLeaves)`
+  — a NAMED, tested `false` constant (the sole protection for the reparented live view;
+  a regression flipping it fails a test) — never marking it. Tab
+  (A2 `closeTabImmediately(markLeaves:)`) + window (A3 `closeWindowImmediately(markLeaves:)`,
+  whose mark decision runs through the pure `shouldMarkLeavesOnClose(isMoveEmptiedSource:
+  triggersAppTermination:)`) closes fan the mark to EVERY leaf incl. **zoom-hidden**
+  (`root.leaves()`); their redo re-marks by re-invoking `close*Immediately()`, and the
+  `with: undoState` restore clears the mark. **ALL marking funnels through ONE place** —
+  `applyCloseMark(_ phase:_:)` runs the pure, generic, per-phase decision
+  `closeMarkOperations(_:closingViews:heldElsewhere:)` (`.set`/`.redo` mark non-held leaves,
+  `.undo` clears every closing leaf UNCONDITIONALLY = the data-loss-safe direction, a move
+  `nil` = no-op) through the single overridable `setCloseSessionHook` seam (default = the
+  real C exports), and a recorder + `MockView` test drives `.set → .undo → .redo` through
+  `closeMarkOperations` to observe the mark → clear → re-mark ordering with NO live
+  controller/surface. **EXCLUDED — moves + mirrors never mark:**
+  `move_split_to_new_tab`/`pull_marked_split`/`merge_tabs`/`swap_split`/queue pack-adopt-
+  promote-demote/cross-window-drop/`retileCompactGrid` pass `deliberateClose: false` (→
+  `closingViews == nil`) and hit `markLeaves: false` on a source-empty; the
+  `viewHeldByAnotherController` backstop skips any leaf already held elsewhere; `.mirror` is
+  triple-gated. Undo retains the live view until expiry (a wrongly-marked Close is preempted
+  by process death on a real quit; `close→undo` clears it first). Fork-only, GUI relaunch, no
+  host restart. Wiring: core `src/termio/Client.zig`, `src/Surface.zig`,
+  `src/apprt/embedded.zig` + `include/ghostty.h` (`ghostty_surface_set_close_session` /
+  `_keep_session` / `ghostty_app_set_quitting`); macOS `Ghostty.Surface.swift`,
+  `AppDelegate.swift` (`shouldQuitAfterLastWindowClosed` +
+  `applicationWillTerminate` gate), `BaseTerminalController.swift`, `TerminalController.swift`.
+  `closeAllWindowsImmediately` forces `markLeaves: false` across the batch when the
+  close-all quits the app, so every window DETACHES uniformly at mark time (not relying on
+  teardown-vs-willTerminate timing). Tests: Zig `client_difftest.zig` (deliberate→Close;
+  mirror/unattached/quitting/unmarked→none; peer-close swallow) + `src/host/test.zig` (Close
+  idempotency); Swift `macos/Tests/Terminal/CloseSessionLifecycleTests.swift`
+  (`leavesToMarkForClose` + `closingLeaves` move-exclusion; `closeMarkOperations`
+  recorder-seam mark → clear → re-mark ordering + move-never-marks + held-elsewhere filter;
+  `moveEmptiedSourceMarksLeaves` == false; `shouldMarkLeavesOnClose` matrix;
+  `windowCloseWouldTerminate` matrix; zoom-hidden leaf enumeration). Two accepted caveats
+  (both err toward SAFE detach): a non-terminal auxiliary window open at last-terminal-close
+  makes `windowCloseTriggersAppTermination` over-predict termination (harmless session-park
+  leak); the Quick Terminal's ROOT surface is never destroyed on a deliberate close (its
+  `closeSurface` override animates out / empties directly, bypassing the mark path). **See
+  `PTYHOST.md` → "Session lifecycle".**
 
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)

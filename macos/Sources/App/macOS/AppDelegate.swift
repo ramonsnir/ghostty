@@ -95,6 +95,13 @@ class AppDelegate: NSObject,
     /// This is the current configuration from the Ghostty configuration that we need.
     private var derivedConfig: DerivedConfig = DerivedConfig()
 
+    /// (ramon fork) Whether the app quits when its last window closes — drives
+    /// the deliberate-close-vs-detach decision for a last-window close (see
+    /// `TerminalController.windowCloseTriggersAppTermination`).
+    var shouldQuitAfterLastWindowClosed: Bool {
+        derivedConfig.shouldQuitAfterLastWindowClosed
+    }
+
     /// The ghostty global state. Only one per process.
     let ghostty: Ghostty.App
 
@@ -778,6 +785,12 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // (ramon fork) Point of no return for a quit. Flip the process-global
+        // quit gate so any pty-host session a window-close path already marked
+        // for destruction DETACHES instead (kept alive for reattach). Belt
+        // behind the mark-time last-window-close guard.
+        ghostty_app_set_quitting(true)
+
         // (ramon fork) Stop the embedded web monitor if running.
         webMonitor?.stop()
 
@@ -1238,55 +1251,30 @@ class AppDelegate: NSObject,
         NSApp.dockTile.display()
     }
 
-    /// Decide the `NSQuitAlwaysKeepsWindows` value from the resolved
-    /// `window-save-state` config and whether the pty-host backend is active.
+    /// Decide the `NSQuitAlwaysKeepsWindows` value.
     ///
-    /// macOS state restoration is what carries a window's split tree AND each
-    /// surface's host `sessionID` across a GUI quit/relaunch, and reattaching by
-    /// that `sessionID` is exactly how the pty-host backend recovers a live
-    /// session. Whether macOS bothers to persist & restore that archive on a
-    /// clean quit is gated by `NSQuitAlwaysKeepsWindows`:
-    ///   • `true`  → always restore (`window-save-state = always`)
-    ///   • `false` → never restore  (`window-save-state = never`)
-    ///   • `nil`   → remove the override; defer to the macOS "Close windows when
-    ///               quitting an application" system preference.
-    ///
-    /// With `window-save-state = default` the fork historically returned `nil`,
-    /// silently deferring pty-host session survival to that hidden system pref —
-    /// which is checked-by-default in modern macOS (= don't restore). So a
-    /// colleague on the seeded fork config, which enables `pty-host` but never
-    /// sets `window-save-state`, saw every surface spawn fresh on relaunch with
-    /// no warning (issue #5). When the pty-host backend is active we therefore
-    /// force restoration on for the `default` case, so the "sessions survive a
-    /// GUI quit/relaunch" promise no longer hinges on an invisible setting. An
-    /// explicit `always`/`never` is always honored (a user who set `never` has
-    /// opted out, even under pty-host).
-    static func quitAlwaysKeepsWindows(
-        windowSaveState: String,
-        ptyHostConfigured: Bool
-    ) -> Bool? {
-        switch windowSaveState {
-        case "never": return false
-        case "always": return true
-        default: return ptyHostConfigured ? true : nil
-        }
+    /// (ramon fork) macOS state restoration is what carries a window's split tree
+    /// AND each surface's host `sessionID` across a GUI quit/relaunch, and
+    /// reattaching by that `sessionID` is exactly how the pty-host backend recovers
+    /// a live session. The fork now forces restoration UNCONDITIONALLY on
+    /// (`window-save-state` is no longer consulted — `Ghostty.Config.windowSaveState`
+    /// is pinned to `"always"`), so pty-host reattach never depends on the config
+    /// key or the hidden macOS "Close windows when quitting an application" system
+    /// preference. An explicit `window-save-state = never` NO LONGER opts out.
+    static func quitAlwaysKeepsWindows() -> Bool {
+        return true
     }
 
     private func ghosttyConfigDidChange(config: Ghostty.Config) {
         // Update the config we need to store
         self.derivedConfig = DerivedConfig(config)
 
-        // Depending on the "window-save-state" setting (and whether the pty-host
-        // backend is active — see issue #5) we set the NSQuitAlwaysKeepsWindows
-        // configuration. This is the only way to carefully control whether macOS
-        // invokes the state restoration system.
-        switch Self.quitAlwaysKeepsWindows(
-            windowSaveState: config.windowSaveState,
-            ptyHostConfigured: config.ptyHost != nil
-        ) {
-        case .some(let keep): UserDefaults.ghostty.setValue(keep, forKey: "NSQuitAlwaysKeepsWindows")
-        case .none: UserDefaults.ghostty.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
-        }
+        // (ramon fork) Force macOS state restoration on unconditionally so pty-host
+        // reattach never hinges on `window-save-state` / the hidden system pref
+        // (see quitAlwaysKeepsWindows). This is the only way to carefully control
+        // whether macOS invokes the state restoration system.
+        UserDefaults.ghostty.setValue(
+            Self.quitAlwaysKeepsWindows(), forKey: "NSQuitAlwaysKeepsWindows")
 
         // Sync our auto-update settings. If SUEnableAutomaticChecks (in our Info.plist) is
         // explicitly false (NO), auto-updates are disabled. Otherwise, we use the behavior
@@ -1383,8 +1371,7 @@ class AppDelegate: NSObject,
     }
 
     func application(_ app: NSApplication, willEncodeRestorableState coder: NSCoder) {
-        guard ghostty.config.windowSaveState != "never" else { return }
-
+        // (ramon fork) Restoration is unconditional — always encode.
         // Encode our quick terminal state if we have it.
         switch quickTerminalControllerState {
         case .initialized(let controller) where controller.restorable:
@@ -1402,9 +1389,9 @@ class AppDelegate: NSObject,
     func application(_ app: NSApplication, didDecodeRestorableState coder: NSCoder) {
         Self.logger.debug("application will restore window state")
 
-        // Decode our quick terminal state.
-        if ghostty.config.windowSaveState != "never",
-            let state = QuickTerminalRestorableState(coder: coder) {
+        // Decode our quick terminal state. (ramon fork) Restoration is
+        // unconditional — always attempt the decode.
+        if let state = QuickTerminalRestorableState(coder: coder) {
             quickTerminalControllerState = .pendingRestore(state)
         }
     }

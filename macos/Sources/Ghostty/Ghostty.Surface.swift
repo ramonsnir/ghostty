@@ -118,6 +118,21 @@ extension Ghostty {
             ghostty_surface_session_id(surface)
         }
 
+        /// (ramon fork) Mark this surface's pty-host session for DESTRUCTION on
+        /// teardown — a deliberate user close (close split/tab/window). Without
+        /// it the default teardown detaches the session (parks it for reattach).
+        /// No-op on `.exec` / a `.mirror` (enforced in the core).
+        @MainActor
+        func markCloseSession() {
+            ghostty_surface_set_close_session(surface)
+        }
+
+        /// (ramon fork) Undo `markCloseSession` (Undo restored the surface).
+        @MainActor
+        func keepCloseSession() {
+            ghostty_surface_keep_session(surface)
+        }
+
         /// Send a mouse button event to the terminal.
         ///
         /// This sends a complete mouse button event including the button state (press/release),

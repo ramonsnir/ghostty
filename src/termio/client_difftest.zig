@@ -1670,6 +1670,188 @@ test "client resize emits a Resize frame whose host reconstruction == source Siz
     try testing.expectEqual(r.rows, reconstructed.grid().rows);
 }
 
+// =============================================================================
+// (ramon fork) Close-session lifecycle (Feature A). threadExit sends a host
+// Close frame ONLY on a DELIBERATE close (close_session set) of an ATTACHED
+// (session_id != 0) non-mirror client while the app is NOT quitting. Every
+// other teardown detaches (bare socket drop, byte-identical to prior behavior).
+// These reuse the TestListener capture harness (like the Resize wire test): the
+// synchronous Close write in threadExit is the ONLY thing on the wire here (the
+// Attach is enqueued on an xev loop we never pump), so a `.close` frame in the
+// capture proves the send fired.
+// =============================================================================
+
+/// Drive the full connect -> threadExit lifecycle against a capturing listener
+/// and return true iff a `.close` frame for `expect_sid` reached the wire. The
+/// caller pre-sets `session_id` / `close_session` / role on `client`.
+fn closeSentOnTeardown(
+    alloc: std.mem.Allocator,
+    client: *Client,
+    listener: *TestListener,
+    expect_sid: u64,
+) !bool {
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(alloc);
+    try listener.startCapturing(alloc, &captured);
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+    // Teardown: writes the quit byte, joins the read thread, then (if gated)
+    // performs the synchronous Close write, then closes the socket (=> EOF for
+    // the capture thread).
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+    listener.joinAccept();
+
+    var reader: protocol.FrameReader = .{};
+    defer reader.deinit(alloc);
+    try reader.push(alloc, captured.items);
+    while (try reader.next(alloc)) |frame| {
+        if (frame.tag == .close) {
+            var close = try protocol.Close.decode(alloc, frame.payload);
+            defer close.deinit(alloc);
+            if (close.session_id == expect_sid) return true;
+        }
+    }
+    return false;
+}
+
+test "client close lifecycle: deliberate close of attached session sends Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(4242, .release);
+    client.requestCloseSession(); // .attach => sets close_session
+
+    try testing.expect(try closeSentOnTeardown(alloc, &client, &listener, 4242));
+}
+
+test "client close lifecycle: mirror role NEVER sends Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    // A mirror requires a non-zero config session_id (subscribe_render target).
+    var client = try Client.init(alloc, .{
+        .socket_path = listener.path,
+        .role = .mirror,
+        .session_id = 7,
+    });
+    defer client.deinit();
+    // Force the flag on directly (requestCloseSession refuses a mirror) so we
+    // prove the threadExit role gate (i) — not just the setter — suppresses it.
+    client.session_id.store(7, .release);
+    client.close_session.store(true, .release);
+
+    try testing.expect(!(try closeSentOnTeardown(alloc, &client, &listener, 7)));
+}
+
+test "client close lifecycle: unattached (session_id==0) sends no Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    // No .attached frame arrives, so session_id stays 0 (the unattached
+    // sentinel); gate (iv) suppresses the Close.
+    client.requestCloseSession();
+
+    try testing.expect(!(try closeSentOnTeardown(alloc, &client, &listener, 0)));
+}
+
+test "client close lifecycle: app quitting detaches even when marked" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    // NOTE: `app_quitting` is PROCESS-GLOBAL (one atomic for the whole binary),
+    // so this test mutates state other tests share. It is safe because Zig runs
+    // the tests in a suite SEQUENTIALLY in one process and the `defer` below
+    // resets the gate before the next test runs — no test observes it set unless
+    // it sets it itself. If tests ever run concurrently this defer-reset would no
+    // longer isolate them; that is the only ordering dependency here.
+    Client.setQuitting(true);
+    defer Client.setQuitting(false); // process-global; reset for other tests
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(555, .release);
+    client.requestCloseSession();
+
+    try testing.expect(!(try closeSentOnTeardown(alloc, &client, &listener, 555)));
+}
+
+test "client close lifecycle: default (unmarked) teardown detaches, no Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(9, .release);
+    // close_session left at its default (false) => bare socket drop => detach.
+
+    try testing.expect(!(try closeSentOnTeardown(alloc, &client, &listener, 9)));
+}
+
+test "client close lifecycle: peer-closed socket swallows Close write (no SIGPIPE)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+    // Hold the accepted fd WITHOUT draining so the test can close the peer end
+    // BEFORE threadExit's synchronous Close write, forcing EPIPE on that write.
+    try listener.startHolding();
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(123, .release);
+    client.requestCloseSession();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+    // Publish + close the server side so the client's socket peer is gone.
+    listener.joinAccept();
+    if (listener.accepted_fd) |peer| posix.close(peer);
+
+    // threadExit's sendCloseSync writes to a peer-closed socket. SO_NOSIGPIPE
+    // means EPIPE is RETURNED (caught + swallowed), never a process SIGPIPE.
+    // Reaching the assertion at all proves it did not abort.
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+
+    try testing.expect(true);
+}
+
 test "client scrollViewport/jumpToPrompt SEND frames (Slice 7), not a local scroll" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
