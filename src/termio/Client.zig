@@ -877,52 +877,28 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
 }
 
 /// (ramon fork) Synchronously frame + write a `protocol.Close` for `session_id`
-/// on `fd`, blocking (bounded). Called from `threadExit` AFTER the read thread
-/// is joined (so we own the fd) and BEFORE the fd is closed. Best-effort: every
-/// failure is logged + swallowed — the host's idle reaper is the backstop.
-/// Refuses SIGPIPE (`SO_NOSIGPIPE`) so a peer-closed socket returns EPIPE
-/// instead of aborting the process, and bounds a wedged host with `SO_SNDTIMEO`.
+/// on `fd`. Called from `threadExit` AFTER the read thread is joined (so we own
+/// the fd) and BEFORE the fd is closed. Best-effort: every failure is logged +
+/// swallowed — the host's idle reaper is the backstop.
 ///
-/// Two best-effort caveats, both landing in the SAFE (detach) direction:
-///   (a) If a prior ASYNC frame was only partially flushed before the loop
-///       stopped, appending this synchronous Close mid-frame can desync the
-///       host's FrameReader. Worst case the host drops the connection, which is
-///       a bare socket drop = DETACH (session parked for reattach), never a lost
-///       shell — and the idle reaper still collects a truly-orphaned session.
-///   (b) `SO_SNDTIMEO` is the bound on the O_NONBLOCK-cleared write; if the
-///       platform swallows that setsockopt AND the host send buffer is full, the
-///       write could block longer than intended. We accept this: the host is a
-///       local KeepAlive LaunchAgent whose recv loop drains promptly, so a full
-///       send buffer at teardown is not an observed condition.
+/// SIGPIPE is ignored process-wide (`src/global.zig`), so a write to a
+/// peer-closed socket returns EPIPE (caught below) rather than a process signal
+/// — no `SO_NOSIGPIPE` needed, and it must be AVOIDED: on a peer-closed socket
+/// `setsockopt` returns EINVAL, which Zig's `posix.setsockopt` maps to
+/// `unreachable` (a process abort). The fd is left O_NONBLOCK (the read thread
+/// set it in `threadMainPosix`), so a wedged host yields `WouldBlock` (caught)
+/// instead of hanging teardown; no `SO_SNDTIMEO` (same EINVAL/abort hazard).
+///
+/// Best-effort caveat, landing in the SAFE (detach) direction: if a prior ASYNC
+/// frame was only partially flushed before the loop stopped, or a full send
+/// buffer truncates this write, the host's FrameReader may desync and drop the
+/// connection — a bare socket drop = DETACH (session parked for reattach), never
+/// a lost shell, and the idle reaper still collects a truly-orphaned session.
 fn sendCloseSync(self: *Client, fd: posix.fd_t, session_id: u64) void {
-    // Never take SIGPIPE if the host already closed its end (EPIPE is caught
-    // below), and bound the write so a wedged host can't hang teardown.
-    const on: c_int = 1;
-    posix.setsockopt(
-        fd,
-        posix.SOL.SOCKET,
-        posix.SO.NOSIGPIPE,
-        std.mem.asBytes(&on),
-    ) catch {};
-    const tv = posix.timeval{ .sec = 0, .usec = 250_000 }; // 250ms send timeout
-    posix.setsockopt(
-        fd,
-        posix.SOL.SOCKET,
-        posix.SO.SNDTIMEO,
-        std.mem.asBytes(&tv),
-    ) catch {};
-
-    // Clear O_NONBLOCK (the read thread set it in threadMainPosix; that thread
-    // is joined, so we own the fd) so the tiny frame writes in one shot,
-    // bounded by SO_SNDTIMEO above.
-    if (posix.fcntl(fd, posix.F.GETFL, 0)) |flags| {
-        _ = posix.fcntl(
-            fd,
-            posix.F.SETFL,
-            flags & ~@as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
-        ) catch {};
-    } else |_| {}
-
+    // No setsockopt here (see the doc comment): SIGPIPE is globally ignored, and
+    // SO_NOSIGPIPE/SO_SNDTIMEO both EINVAL on a peer-closed socket -> Zig's
+    // posix.setsockopt maps EINVAL to `unreachable` -> abort. The fd stays
+    // O_NONBLOCK (set by the read thread) so the write can't hang teardown.
     const framed = protocol.encodeFrame(self.gpa, .close, protocol.Close{
         .session_id = session_id,
     }) catch |err| {
@@ -935,7 +911,7 @@ fn sendCloseSync(self: *Client, fd: posix.fd_t, session_id: u64) void {
     while (off < framed.len) {
         const n = posix.write(fd, framed[off..]) catch |err| {
             log.warn("failed to send Close on teardown err={}", .{err});
-            return; // EPIPE / EAGAIN(timeout) / etc. — reaper is the backstop
+            return; // EPIPE / WouldBlock / etc. — host idle reaper is the backstop
         };
         if (n == 0) break; // peer gone
         off += n;

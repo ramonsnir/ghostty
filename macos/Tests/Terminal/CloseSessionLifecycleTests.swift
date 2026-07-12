@@ -99,11 +99,10 @@ struct CloseSessionLifecycleTests {
     // MARK: closeMarkOperations — the recorder seam (mark -> clear -> re-mark)
 
     // A recorder that "applies" the phase ops exactly as the shipped
-    // `applyCloseMark` does (running `closeMarkOperations` through the
-    // `setCloseSessionHook` sink), but records (id, close) instead of touching a
-    // live surface. This is the seam the doc comment on `setCloseSessionHook`
-    // refers to: it proves the full deliberate-close -> undo -> redo ordering
-    // without a live controller/surface.
+    // `applyCloseMark` does (running the pure `closeMarkOperations` decision),
+    // but records (id, close) instead of touching a live surface's session. This
+    // proves the full deliberate-close -> undo -> redo ordering, and the
+    // MOVE-never-marks rule, without a live controller/surface.
     private func record(
         _ phases: [(BaseTerminalController.CloseMarkPhase, [MockView]?)],
         heldElsewhere: (MockView) -> Bool = { _ in false }

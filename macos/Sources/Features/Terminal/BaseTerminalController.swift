@@ -129,23 +129,6 @@ class BaseTerminalController: NSWindowController,
         ghostty.config.undoTimeout
     }
 
-    /// (ramon fork) Test seam: sets/clears a leaf's deliberate-close flag on its
-    /// pty-host session. Defaults to the real libghostty path. Every mark/clear —
-    /// close (set), undo (clear), redo (re-mark), and the tab/window fan-out —
-    /// funnels through `applyCloseMark`, whose per-phase decision is the pure,
-    /// generic `closeMarkOperations` (unit-tested with a recorder + `MockView` in
-    /// `CloseSessionLifecycleTests`, so the mark -> clear -> re-mark ordering and
-    /// the MOVE-never-marks rule are observable without a live surface). A plain
-    /// overridable hook, NOT an init-injected dependency. See the close-session
-    /// lifecycle (Feature A).
-    var setCloseSessionHook: @MainActor (Ghostty.SurfaceView, Bool) -> Void = { view, close in
-        if close {
-            view.surfaceModel?.markCloseSession()
-        } else {
-            view.surfaceModel?.keepCloseSession()
-        }
-    }
-
     /// (ramon fork) True when `v` is held by a DIFFERENT live controller's tree —
     /// i.e. a MOVE reparented it into another tab/window, so its session is alive
     /// elsewhere and must NOT be marked for close. Mirrors the marked-surface
@@ -229,23 +212,29 @@ class BaseTerminalController: NSWindowController,
 
     /// (ramon fork) Mark each leaf's pty-host session for DESTRUCTION on teardown
     /// (a deliberate close), skipping any leaf a MOVE already reparented into
-    /// another controller. Routes through `setCloseSessionHook` (the test seam).
+    /// another controller. Applies each mark directly to the leaf's session.
     func markLeavesForClose(_ leaves: [Ghostty.SurfaceView]) {
         applyCloseMark(.set, leaves)
     }
 
     /// (ramon fork) Apply a close-lifecycle PHASE to `closingViews` via the pure
-    /// `closeMarkOperations` decision, routing every resulting op through the
-    /// `setCloseSessionHook` seam. `nil` closingViews (a move) is a no-op. This is
+    /// `closeMarkOperations` decision, applying each resulting op directly to the
+    /// leaf's pty-host session. `nil` closingViews (a move) is a no-op. This is
     /// the ONE place the set/undo/redo sites (and the tab/window fan-out via
-    /// `markLeavesForClose`) mark or clear a session, so they can't diverge.
+    /// `markLeavesForClose`) mark or clear a session, so they can't diverge. The
+    /// per-phase decision itself is the pure, generic `closeMarkOperations`,
+    /// unit-tested directly with a `MockView` in `CloseSessionLifecycleTests`.
     func applyCloseMark(_ phase: CloseMarkPhase, _ closingViews: [Ghostty.SurfaceView]?) {
         for op in Self.closeMarkOperations(
             phase,
             closingViews: closingViews,
             heldElsewhere: { Self.viewHeldByAnotherController($0, excluding: self) }
         ) {
-            setCloseSessionHook(op.view, op.close)
+            if op.close {
+                op.view.surfaceModel?.markCloseSession()
+            } else {
+                op.view.surfaceModel?.keepCloseSession()
+            }
         }
     }
 

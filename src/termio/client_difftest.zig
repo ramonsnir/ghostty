@@ -1843,9 +1843,11 @@ test "client close lifecycle: peer-closed socket swallows Close write (no SIGPIP
     listener.joinAccept();
     if (listener.accepted_fd) |peer| posix.close(peer);
 
-    // threadExit's sendCloseSync writes to a peer-closed socket. SO_NOSIGPIPE
-    // means EPIPE is RETURNED (caught + swallowed), never a process SIGPIPE.
-    // Reaching the assertion at all proves it did not abort.
+    // threadExit's sendCloseSync writes to a peer-closed socket. SIGPIPE is
+    // ignored process-wide (src/global.zig) so the write returns EPIPE (caught
+    // + swallowed), never a process SIGPIPE; and sendCloseSync no longer calls
+    // setsockopt, which would EINVAL->abort on this peer-closed fd. Reaching the
+    // assertion at all proves it did not abort.
     client.threadExit(&td);
     td.backend.deinit(alloc);
 
