@@ -483,6 +483,23 @@ struct MCPServerTests {
         #expect(d["hidden"] as? Bool == true)
     }
 
+    // fork: foregroundPid emits when set (it bridges a live surface to its host
+    // session pid for orphan-session cleanup) and is OMITTED when nil.
+    @Test func surfacesJSONDataEmitsForegroundPidWhenSet() {
+        var row = MCPLayout.SurfaceRow(
+            id: "ABC", title: "claude", pwd: "/tmp",
+            window: 0, tab: 0, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: true, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: "bash", command: "bash claude-pool", foregroundPid: 12345,
+            idleSeconds: nil, agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 1)
+        #expect(MCPLayout.surfacesJSONData([row])[0]["foregroundPid"] as? Int == 12345)
+        // nil => omitted (honest absence)
+        row.foregroundPid = nil
+        #expect(MCPLayout.surfacesJSONData([row])[0]["foregroundPid"] == nil)
+    }
+
     // fork: the three optional fields are OMITTED (not null/empty) when unknown.
     @Test func surfacesJSONDataOmitsNilProcessFields() {
         let row = MCPLayout.SurfaceRow(
