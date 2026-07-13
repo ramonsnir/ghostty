@@ -76,6 +76,11 @@ enum MCPLayout {
         /// fork: the focused foreground COMMAND line (e.g. "claude --resume"), or
         /// nil if unknown. Same backend/host-gating semantics as `processName`.
         let command: String?
+        /// fork: the focused FOREGROUND process pid (host-resolved), or nil if
+        /// unknown. Same backend/host-gating semantics as `command`. Bridges a
+        /// live surface to its host session-leader (orphan-session cleanup diff).
+        /// Defaulted so existing `SurfaceRow(...)` call sites (tests) still compile.
+        var foregroundPid: Int? = nil
         /// fork: seconds since this surface's screen last changed; ~0 while a TUI
         /// repaints/works, growing while it waits for input; nil when unknown /
         /// unsupported backend. Coarse: a TUI that repaints on a timer never idles.
@@ -191,6 +196,7 @@ enum MCPLayout {
                     exited: exited, atPrompt: atPrompt,
                     processName: view.foregroundProcessName,
                     command: view.foregroundCommand,
+                    foregroundPid: view.foregroundPid,
                     idleSeconds: view.idleSeconds,
                     agentState: hook?.agentState,
                     lastPrompt: hook?.lastPrompt,
@@ -224,6 +230,7 @@ enum MCPLayout {
             // rather than empty strings / sentinel numbers.
             if let n = $0.processName { d["processName"] = n }
             if let c = $0.command { d["command"] = c }
+            if let fp = $0.foregroundPid { d["foregroundPid"] = fp }
             if let idle = $0.idleSeconds { d["idleSeconds"] = idle }
             // fork / Agent Manager: agent-* fields are omitted when unknown.
             if let s = $0.agentState { d["agentState"] = s }

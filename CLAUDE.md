@@ -396,8 +396,10 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   approve prompts) — plus `get_haiku_usage` (Agent Manager budget query, see that bullet). Built entirely on existing libghostty/Swift abstractions — the only Zig
   change is two default-null config keys, so enabling/changing it is a GUI relaunch, never a host
   restart. COPIES the web monitor, never depends on it. Load-bearing gotchas: same NATIVE-keycode
-  input rule; `processName`/`command` are HOST-GATED (absent until the host is a minor-3 build);
-  `read_surface` is VIEWPORT-ONLY by design (no `mode` param — don't re-add one); `atPrompt` rides
+  input rule; `processName`/`command`/`foregroundPid` (the last bridges a live `list_surfaces`
+  row to its host session pid — orphan-session cleanup diff) are HOST-GATED (absent until the
+  host is a minor-3 build); `read_surface` is VIEWPORT-ONLY by design (no `mode` param — don't
+  re-add one); `atPrompt` rides
   the coarse `needsConfirmQuit` bit, not OSC 133. Durable registration via a committed `.mcp.json`
   + the shim on PATH at `~/.local/bin/ghostty-mcp` (token read from `~/.config/ghostty-ramon/local`).
   **See `MCP-SERVER.md` (→ Implementation notes) for the tool list, transport, port offset,
@@ -1764,14 +1766,23 @@ NEVER run `osascript -e 'quit app "Ghostty"'` — the fork and the official buil
 both *named* "Ghostty", so it's ambiguous and can quit the user's real, working
 Ghostty.
 
-**Also never quit the installed Release fork (`com.mitchellh.ghostty-ramon`) — it
-normally hosts the shell Claude Code is running in, so quitting it (even by
-bundle id) terminates this session mid-task.** The three identities exist
-specifically so iteration doesn't touch the host:
+**Avoid casually quitting the installed Release fork (`com.mitchellh.ghostty-ramon`)
+— it normally hosts the shell Claude Code is running in. But be accurate about
+why: under pty-host a GUI quit is a DETACH, not a kill. The shell + `claude`
+survive on `ghostty-host` and REATTACH on relaunch (the installed build forces
+`NSQuitAlwaysKeepsWindows` on, so reattach is reliable), so a DELIBERATE
+quit+relaunch to pick up a new build is non-destructive and THIS session
+continues across it — it does NOT "terminate the session mid-task." The real
+caution is that reattach is reliable-not-GUARANTEED: a rare connect-race /
+App-Nap edge case can leave the session alive-but-orphaned (the `claude` process
+is fine on the host, but its GUI view is lost until re-found). So don't quit it
+without a reason, and prefer letting the user drive the relaunch — but a planned
+relaunch (e.g. to activate a deployed GUI change) is expected and safe.** The
+three identities exist specifically so iteration doesn't touch the host:
 
 | Identity | Bundle id | Path | Safe to quit/launch? |
 |---|---|---|---|
-| Release (installed) | `com.mitchellh.ghostty-ramon` | `/Applications/Ghostty (ramon).app` | **No** — usually hosts this session |
+| Release (installed) | `com.mitchellh.ghostty-ramon` | `/Applications/Ghostty (ramon).app` | Quit = DETACH (survives + reattaches on relaunch); don't quit casually, but a planned relaunch is fine |
 | ReleaseLocal | `com.mitchellh.ghostty-ramon.local` | `macos/build/ReleaseLocal/Ghostty.app` | Yes |
 | Debug | `com.mitchellh.ghostty-ramon.debug` | `macos/build/Debug/Ghostty.app` | Yes |
 

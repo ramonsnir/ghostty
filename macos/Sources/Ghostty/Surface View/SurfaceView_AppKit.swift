@@ -189,6 +189,17 @@ extension Ghostty {
             return s.isEmpty ? nil : s
         }
 
+        // fork: the focused FOREGROUND process pid the HOST resolved (e.g. the
+        // claude-pool bash / claude / shell), or nil if unknown (0). Same backend
+        // + host-gating semantics as `foregroundProcessName`. Bridges a live
+        // surface to its host session-leader (walk the ppid chain up to the
+        // `login` child of `ghostty-host`) — used for orphan-session cleanup.
+        var foregroundPid: Int? {
+            guard let surface = self.surface else { return nil }
+            let pid = ghostty_surface_foreground_pid(surface)
+            return pid == 0 ? nil : Int(pid)
+        }
+
         // fork: seconds since this surface's screen last changed, or nil when
         // unknown / unsupported backend. ~0 while a TUI repaints (working); grows
         // while it waits for input. A coarse heuristic: a TUI that repaints on a

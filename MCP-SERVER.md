@@ -148,10 +148,13 @@ positional encounter-order indices, **not** durable — only `id` is).
 
 **Discover / read**
 - **`list_surfaces`** — all live panes: `id`, title, pwd, window/tab/split position, focus,
-  bell, exited, `atPrompt` (coarse, see caveat), and three optional fields (omitted when
-  unknown): `processName` / `command` (the foreground process + full command line, e.g.
-  `claude` / `claude --resume`) and `idleSeconds` (seconds since the screen last changed).
-  See Known limits for `processName`/`command`'s host-restart requirement and the
+  bell, exited, `atPrompt` (coarse, see caveat), and four optional fields (omitted when
+  unknown): `processName` / `command` / `foregroundPid` (the foreground process, its full
+  command line, and its host-resolved pid — e.g. `claude` / `claude --resume` / `61140`) and
+  `idleSeconds` (seconds since the screen last changed). `foregroundPid` bridges a live
+  surface to its host session-leader (walk its ppid chain up to the `login` child of
+  `ghostty-host`) — the exact-diff basis for finding orphaned/detached host sessions. See
+  Known limits for `processName`/`command`/`foregroundPid`'s host-restart requirement and the
   `idleSeconds` TUI nuance.
 - **`read_surface {id}`** — text of the **visible screen** (viewport). *Scrollback/history
   is not exposed* — see Known limits. To see output that scrolled off, `scroll` it into
