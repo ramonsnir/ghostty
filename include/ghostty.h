@@ -1216,6 +1216,10 @@ GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_session_id(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+// (ramon fork) Commit a deliberate close of this surface's pty-host session:
+// send a live host Close frame that DESTROYS it (vs the default detach-for-
+// reattach on teardown). Called at the undo-commit boundary of a user close.
+GHOSTTY_API void ghostty_surface_close_session_now(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);

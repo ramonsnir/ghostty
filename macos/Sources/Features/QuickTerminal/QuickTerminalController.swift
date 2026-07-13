@@ -312,6 +312,14 @@ class QuickTerminalController: BaseTerminalController {
 
         // If its the root then we just animate out. We never actually allow
         // the surface to fully close.
+        //
+        // (ramon fork / close-session lifecycle) This override is why a deliberate
+        // close of the quick terminal's single ROOT surface never destroys its
+        // pty-host session: a live root animates out (no teardown) and a
+        // process-exited root empties the tree DIRECTLY (never via
+        // removeSurfaceNode(deliberateClose:), so no leaf is ever marked). Only a
+        // NON-root split close routes to super and destroys that split's session,
+        // which is the intended deliberate-close behavior.
         animateOut()
     }
 

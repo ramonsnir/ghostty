@@ -237,12 +237,12 @@ extension Ghostty {
         }
 
         var windowSaveState: String {
-            guard let config = self.config else { return "" }
-            var v: UnsafePointer<Int8>?
-            let key = "window-save-state"
-            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return "" }
-            guard let ptr = v else { return "" }
-            return String(cString: ptr)
+            // (ramon fork) Window-state restoration is unconditionally ON so pty-host
+            // reattach never depends on `window-save-state` / the macOS "close windows
+            // when quitting" pref. The shared config's key is still parsed by the core
+            // (upstream/official Ghostty honors it), the fork just no longer consults the
+            // value. An explicit `window-save-state = never` NO LONGER opts out.
+            return "always"
         }
 
         // (ramon fork) Web monitor listen address (addr:port); empty = disabled.

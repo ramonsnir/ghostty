@@ -1684,6 +1684,15 @@ pub const CAPI = struct {
         return surface.core_surface.child_exited;
     }
 
+    /// (ramon fork) Commit a DELIBERATE close of this surface's pty-host session:
+    /// send a live host `Close` frame that DESTROYS the session (vs the
+    /// detach-on-teardown default that parks it for reattach). The GUI calls this
+    /// at the undo-commit boundary of a user close (split/tab/window) — see
+    /// `Surface.closeSessionNow`. No-op on `.exec` / a `.mirror` client.
+    export fn ghostty_surface_close_session_now(surface: *Surface) void {
+        surface.core_surface.closeSessionNow();
+    }
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();

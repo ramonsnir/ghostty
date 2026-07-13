@@ -118,6 +118,17 @@ extension Ghostty {
             ghostty_surface_session_id(surface)
         }
 
+        /// (ramon fork) Commit a DELIBERATE close: send a live host Close frame
+        /// that DESTROYS this surface's pty-host session (vs the default
+        /// detach-for-reattach on teardown). The controller calls this at the
+        /// undo-commit boundary of a user close (split/tab/window) — see
+        /// `BaseTerminalController.applyCloseMark`. No-op on `.exec` / a `.mirror`
+        /// (enforced in the core).
+        @MainActor
+        func closeSessionNow() {
+            ghostty_surface_close_session_now(surface)
+        }
+
         /// Send a mouse button event to the terminal.
         ///
         /// This sends a complete mouse button event including the button state (press/release),

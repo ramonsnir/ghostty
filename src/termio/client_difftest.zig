@@ -1670,6 +1670,155 @@ test "client resize emits a Resize frame whose host reconstruction == source Siz
     try testing.expectEqual(r.rows, reconstructed.grid().rows);
 }
 
+// =============================================================================
+// (ramon fork) Close-session lifecycle (Feature A). `Client.closeSession` sends
+// a host Close frame — over the LIVE connection — ONLY for an ATTACHED
+// (session_id != 0) non-mirror client. The GUI calls it (via the
+// `.close_session` termio message) at the undo-commit boundary of a DELIBERATE
+// close. A bare teardown (`threadExit`) NEVER sends Close: it detaches (socket
+// drop), so a GUI quit/relaunch parks the session for reattach. These reuse the
+// TestListener capture harness (like the scrollViewport SEND-frame test).
+// =============================================================================
+
+// (ramon fork) Drive `client.closeSession` over a LIVE connection and return
+// whether a `Close` frame carrying `expect_sid` reached the wire. Mirrors the
+// scrollViewport/jumpToPrompt SEND-frame test: connect, call the send path,
+// pump the loop to flush the async write, then tear down and parse the capture.
+// (Close is a live frame now — NOT a teardown side effect — because a closed
+// .client surface is retained past the undo window; see `Client.closeSession`.)
+fn closeFrameSent(
+    alloc: std.mem.Allocator,
+    client: *Client,
+    listener: *TestListener,
+    expect_sid: u64,
+) !bool {
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(alloc);
+    try listener.startCapturing(alloc, &captured);
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+    try client.closeSession(&td);
+
+    var pumps: usize = 0;
+    while (pumps < 16) : (pumps += 1) try loop.run(.no_wait);
+
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+    listener.joinAccept();
+
+    var reader: protocol.FrameReader = .{};
+    defer reader.deinit(alloc);
+    try reader.push(alloc, captured.items);
+    while (try reader.next(alloc)) |frame| {
+        if (frame.tag == .close) {
+            var close = try protocol.Close.decode(alloc, frame.payload);
+            defer close.deinit(alloc);
+            if (close.session_id == expect_sid) return true;
+        }
+    }
+    return false;
+}
+
+test "client close lifecycle: deliberate close of an attached session sends a live Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(4242, .release);
+
+    // .attach + attached (session_id!=0) => closeSession sends a Close frame.
+    try testing.expect(try closeFrameSent(alloc, &client, &listener, 4242));
+}
+
+test "client close lifecycle: mirror role NEVER sends Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    // A mirror requires a non-zero config session_id (subscribe_render target).
+    var client = try Client.init(alloc, .{
+        .socket_path = listener.path,
+        .role = .mirror,
+        .session_id = 7,
+    });
+    defer client.deinit();
+    client.session_id.store(7, .release);
+
+    // closeSession's role gate refuses a read-only mirror, so NO Close reaches
+    // the wire even though the session id is set.
+    try testing.expect(!(try closeFrameSent(alloc, &client, &listener, 7)));
+}
+
+test "client close lifecycle: unattached (session_id==0) sends no Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    // No .attached frame arrives in the fixture, so session_id stays 0 (the
+    // unattached sentinel); closeSession's session_id!=0 gate suppresses it.
+
+    try testing.expect(!(try closeFrameSent(alloc, &client, &listener, 0)));
+}
+
+test "client close lifecycle: plain teardown (no closeSession) never sends Close" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    var listener = try TestListener.init(alloc);
+    defer listener.deinit(alloc);
+
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(alloc);
+    try listener.startCapturing(alloc, &captured);
+
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var client = try Client.init(alloc, .{ .socket_path = listener.path });
+    defer client.deinit();
+    client.session_id.store(9, .release);
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+    // No closeSession call: a bare teardown must DETACH (socket drop), never
+    // send a Close. This locks the invariant that Close is NEVER a teardown
+    // side effect (a GUI quit/relaunch must park the session for reattach).
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+    listener.joinAccept();
+
+    var reader: protocol.FrameReader = .{};
+    defer reader.deinit(alloc);
+    try reader.push(alloc, captured.items);
+    var saw_close = false;
+    while (try reader.next(alloc)) |frame| {
+        if (frame.tag == .close) saw_close = true;
+    }
+    try testing.expect(!saw_close);
+}
+
 test "client scrollViewport/jumpToPrompt SEND frames (Slice 7), not a local scroll" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;

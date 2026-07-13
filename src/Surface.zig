@@ -1260,6 +1260,18 @@ pub fn mirrorSourceGrid(self: *Surface) ?termio.Client.MirrorGrid {
     };
 }
 
+/// (ramon fork) Commit a DELIBERATE close: queue a `.close_session` message so
+/// the io thread sends a host `Close` frame that DESTROYS the pty-host session
+/// (see `Client.closeSession`). Called by the GUI at the undo-commit boundary of
+/// a user close (split/tab/window) — over the LIVE connection, NOT at teardown,
+/// because a closed `.client` surface is retained past the undo window. No-op on
+/// `.exec` (`Termio.closeSession` ignores it) and on a readonly mirror
+/// (`queueIo` suppresses it). Undo simply never calls this (the GUI cancels the
+/// pending commit), so the session stays alive + reattachable.
+pub fn closeSessionNow(self: *Surface) void {
+    self.queueIo(.{ .close_session = {} }, .unlocked);
+}
+
 /// Layer 2: the decision childExited makes on its FIRST branch — whether this
 /// surface is a read-only mirror (dims, never closes) vs a real attach/exec
 /// surface (runs the normal close/show-exited flow). Extracted as a pure predicate

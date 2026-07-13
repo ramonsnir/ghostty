@@ -820,8 +820,34 @@ pub fn threadExit(self: *Client, td: *termio.Termio.ThreadData) void {
     // exactly once here (write_stream.deinit in ThreadData.deinit does not
     // close on this xev backend's Stream — see Exec, which closes the pty fds
     // via the subprocess, not the stream). Closing the connected socket tears
-    // down our side of the connection.
+    // down our side of the connection. (ramon fork) A bare socket drop makes the
+    // host DETACH (park) the session — the correct default for GUI quit/relaunch
+    // + reattach. A DELIBERATE close destroys the session via `closeSession` (a
+    // live Close frame at the undo-commit boundary), NOT here — see Feature A.
     posix.close(client.read_thread_fd);
+}
+
+/// (ramon fork) Send a host `Close` frame over the LIVE connection, DESTROYING
+/// the session (the host `handleClose` stops the child + frees the session).
+/// Runs on the io thread via the `.close_session` termio message, which
+/// `Surface.closeSessionNow` queues from the GUI at the undo-commit boundary of
+/// a DELIBERATE close (split/tab/window). Decoupled from `threadExit` on
+/// purpose: a closed `.client` surface is RETAINED past the undo window (the
+/// reattach machinery holds it), so its teardown is not a reliable
+/// close-commit hook — a live frame is. This is the Feature-A fix.
+///
+/// A `.mirror` (read-only dashboard preview) NEVER destroys the real session,
+/// and an unattached client (`session_id == 0`) has nothing to close. The host
+/// additionally refuses a Close from a render-only subscriber (defense in
+/// depth). Same fire-and-forget write path as `reset`/`clearScreen`.
+pub fn closeSession(
+    self: *Client,
+    td: *termio.Termio.ThreadData,
+) !void {
+    if (self.config.role != .attach) return;
+    const sid = self.session_id.load(.acquire);
+    if (sid == 0) return;
+    try self.sendFrame(td, .close, protocol.Close{ .session_id = sid });
 }
 
 pub fn focusGained(
