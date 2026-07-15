@@ -640,7 +640,14 @@ extension Ghostty {
         /// Impure (reads the global config); the pure decision is `resolveHost`.
         private static func remoteHostRegistry() -> [String: RemoteHostEntry] {
             guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return [:] }
-            return RemoteHostRegistry.parse(lines: appDelegate.ghostty.config.ptyRemoteHostLines)
+            let config = appDelegate.ghostty.config
+            // (Phase 6) This is the ONE resolver that feeds the tunnel supervisor
+            // (`retainTunnel`), so it MUST pass the `pty-remote-host-command` lines — that is
+            // how a per-host transport-command override reaches the controller (the
+            // name-only palette / layout callers keep the single-argument builder).
+            return RemoteHostRegistry.parse(
+                lines: config.ptyRemoteHostLines,
+                commandLines: config.ptyRemoteHostCommandLines)
         }
 
         /// Bring the tunnel for `host` up on demand and subscribe to its readiness.

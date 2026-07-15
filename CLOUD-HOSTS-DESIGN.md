@@ -311,6 +311,79 @@ The `ssh` target (`cloud-1`) is a tailnet name. Two auth options, both fine:
 Either way the forwarded socket **never leaves the cloud box's loopback namespace** — only the
 SSH stream crosses the network (encrypted).
 
+#### Per-host transport-command override (single-forward mode) — Phase 6 ✅
+
+Some boxes are **not** reachable by a plain `ssh <target>`. A common case is a box reached only
+through a **wrapper** — e.g. a Cloud-Workstations-style `gcloud workstations ssh` launcher — that
+is exposed as a **shell FUNCTION** and spins up its OWN gateway tunnel *per invocation*. That model
+breaks two of the default transport's assumptions: a shell function **cannot be `execve`'d**, and a
+per-invocation gateway has no stable connection to multiplex, so the `ControlMaster` + `ssh -O
+check` / `ssh -O exit` machinery does not fit at all.
+
+Phase 6 adds an optional per-host **transport-command override** for exactly this case. A new
+fork-only key `pty-remote-host-command = <name> = <command template>` (a `RepeatableString`) binds a
+custom transport onto the matching `pty-remote-host` name. When a host has an override the tunnel
+supervisor switches to **single-forward mode**:
+
+- It runs **ONE long-lived forward process** built from the command, appending the forward +
+  keepalive itself:
+  ```
+  <command> -N -L <localSock>:<remoteSock> \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+      -o ExitOnForwardFailure=yes -o StreamLocalBindMask=0177
+  ```
+- **No `ControlMaster`, no `-M`, no `ssh -O check`/`-O exit`.** There is nothing to multiplex — the
+  single process *is* the transport. The health check and stale-control cleanup that the default
+  `ssh` path performs are guarded OFF for a command-mode host.
+- The command runs through the user's **LOGIN + INTERACTIVE shell** (`<shell> -ilc '<cmd> …'`) so a
+  shell **function** resolves — the same `-lc` → `-ilc` login-shell escalation the fork already uses
+  to probe `node`/`claude` on a colleague's PATH (`AgentManagerController.probeExecutableViaLoginShell`).
+  Command mode goes straight to `-ilc` because a function is only defined for an interactive shell.
+- The **remote socket path still comes from the `pty-remote-host` line**; when an override exists the
+  ssh-target field of that line is just a human LABEL (the override command is what actually dials).
+  The **local** forwarded socket stays under the existing 0700 short dir (its `sun_path` length is
+  checked, as in the default path); `StreamLocalBindMask=0177` is passed best-effort (honored by the
+  underlying OpenSSH).
+
+Crucially, **only the spawn changes.** The supervisor's readiness signal is already the
+transport-agnostic `ghostty_probe_host` socket handshake on the local forwarded socket (a full
+Hello→HelloAck round-trip, not a bare connect), and its respawn is already the transport-agnostic
+never-give-up backoff that watches the forward process's exit. Both are reused UNCHANGED — the single
+forward process is tracked in the same slot the ControlMaster occupies, so the shared respawn drives
+it as-is.
+
+**Teardown is the ONE spot the shared path is NOT enough.** The tracked process is the interactive
+shell (`-ilc`), and an interactive shell commonly IGNORES SIGTERM — so the default `Process.terminate()`
+(SIGTERM) can be a no-op, leaking the shell, its `ssh -N` forward, and any per-invocation gateway after
+the last surface releases the tunnel (there is no ControlMaster to `ssh -O exit`). So command-mode
+teardown instead force-kills the whole **process GROUP**: the shell leads its own group because an
+INTERACTIVE (`-i`) login shell self-`setpgid`s during job-control init (it self-leads even without a
+controlling tty). The post-spawn `setpgid(pid, pid)` in `spawnCommandTunnel` is only a best-effort
+belt-and-suspenders that is EXPECTED to FAIL with EACCES — Foundation.Process `posix_spawn`s, so by the
+time `run()` returns the child has already exec'd and a parent can no longer change its pgid — so it is
+NOT the load-bearing mechanism (guarded by the `commandModeTransportProcessIsItsOwnGroupLeader` test).
+Teardown SIGTERMs then (after a short grace) SIGKILLs `kill(-pid, …)` — reaping the ssh child + gateway
+too — plus SIGKILLs the shell pid itself. `kill(-pid, …)` is SAFE even if the shell never became a
+leader (there is then no group with that id → ESRCH no-op; it can never reach the GUI's own group). The forward process's exit
+handler also SIGKILLs the group to reap orphans before a respawn, and command-mode teardown unlinks the
+forwarded local socket so a leaked forward can't hold the path across a respawn.
+
+A host **without** an override uses the default `ssh` ControlMaster path **byte-identically**
+(back-compat): the registry builder defaults the command list to empty, so `transportCommand == nil`
+and every non-override code path is unchanged.
+
+Because a wrapper command usually carries a real target / cluster / region identifier, keep the real
+value in the **untracked** `~/.config/ghostty-ramon/local` and use a neutral placeholder
+(`my-ssh-wrapper` / `cloud-1`) in tracked config, e.g.:
+
+```
+# ~/.config/ghostty-ramon/local (untracked)
+pty-remote-host         = cloud-1 = cloud-1 : /run/user/1000/ghostty-host.sock
+pty-remote-host-command = cloud-1 = my-ssh-wrapper cloud-1 --
+```
+
+No host or protocol change (GUI-lib + config-key only).
+
 ### Multi-host client + `(host, session_id)` identity
 
 Introduce a small **host registry** in the GUI: an ordered set of named hosts, each with a
@@ -364,6 +437,12 @@ pty-remote-host = big-gpu = user@big-gpu.tailnet.ts.net : /run/user/1000/ghostty
   list itself.
 - Two more optional scalars: `pty-remote-ssh-options` (extra `ssh` args appended verbatim) and
   `pty-remote-connect-timeout` (seconds; feeds the reconnect backoff cap).
+- (Phase 6) An optional repeatable `pty-remote-host-command = <name> = <command template>` binds a
+  per-host TRANSPORT-COMMAND override onto the matching `pty-remote-host` entry: the tunnel then
+  runs one long-lived forward through that command in a login+interactive shell (no ControlMaster),
+  for a box reachable only through a wrapper (e.g. a gateway / launcher shell function). The
+  command usually carries a real target/identifier, so keep the real value in the untracked
+  `~/.config/ghostty-ramon/local` and use a neutral placeholder in tracked config.
 
 Keeping these in `~/.config/ghostty-ramon/config` is mandatory (an official Ghostty shares
 `~/.config/ghostty/config` and would error on the unknown keys — the fork's standing rule).
@@ -854,8 +933,38 @@ Build a rendering + reconnecting remote split **before** any agent-ecosystem wor
   agent cloud-side) + `pty-remote-project-directory`; and the claude/node/billing docs. NO new MCP
   tool (count stays 26 — `spawn_split_command` gained an optional `host` arg). Deliverable: an agent
   on a cloud box shows in the dashboard/queue with correct state.
+- **Phase 6 — Per-host transport-command override (single-forward transport). ✅ IMPLEMENTED.**
+  A new fork-only `pty-remote-host-command = <name> = <command template>` key lets a box that is
+  reachable ONLY through a wrapper (e.g. a gateway / launcher exposed as a shell
+  FUNCTION that spins its own gateway per invocation) use a CUSTOM transport instead of the default
+  `ssh` ControlMaster. When a `pty-remote-host` name has a matching command override, the tunnel
+  supervisor runs **ONE long-lived forward process** built from the command through the user's
+  **LOGIN + INTERACTIVE shell** (`<shell> -ilc '<command> -N -L <local>:<remote> -o
+  ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o
+  StreamLocalBindMask=0177'`) so a shell function resolves — **NO ControlMaster, NO `ssh -O
+  check`/`-O exit`, NO `-M`**. Readiness is the SAME `ghostty_probe_host` socket handshake and
+  respawn is the SAME never-give-up process-exit watch (both already transport-agnostic), so ONLY
+  the spawn changes. The remote socket path still comes from the `pty-remote-host` line (its
+  ssh-target field becomes just a label when an override exists); the local socket stays under the
+  0700 short dir (sun_path length-checked). A host WITHOUT an override uses the default `ssh`
+  ControlMaster path BYTE-IDENTICALLY. GUI-lib + config-key only — NO host / protocol / wire
+  change. Wiring: `src/config/Config.zig` (`pty-remote-host-command: RepeatableString` + parse
+  test — added Phase 6); macOS `Ghostty.Config.swift` (`ptyRemoteHostCommandLines`),
+  `RemoteHostRegistry.swift` (`RemoteHostEntry.transportCommand` + `parseCommand`/`parseCommands`
+  + the two-arg `parse(lines:commandLines:)` builder), `RemoteTunnelController.swift` (pure
+  `singleForwardArgv` + `loginShell` + `spawnCommandTunnel` (best-effort `setpgid` no-op + the
+  interactive-shell self-led process group it actually relies on) +
+  the `ensureTunnel` command branch + `forceKillCommandProcess` (process-GROUP teardown for the
+  SIGTERM-ignoring interactive shell + forwarded-socket unlink) + the
+  `cleanStaleControl`/`checkMasterHealth` command-mode guards), `SurfaceView_AppKit.swift`
+  (`remoteHostRegistry()` passes the command lines — the one resolver that feeds `retainTunnel`),
+  `MCPKnowledge.swift` (reader + cloud-hosts `configKeys`). Tests: Zig `pty-remote-host-command
+  parse`; Swift `RemoteHostRegistryTests` (command parse/pairing) + `RemoteTunnelControllerTests`
+  (`singleForwardArgv*` / command-mode-no-ControlMaster / `commandModeTransportProcessIsItsOwnGroupLeader`,
+  the process-group-teardown leadership invariant). Deliverable: a wrapper-only box works.
 
-Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend to agents.
+Ship Phases 0–2 as the "cloud terminals" MVP; Phases 3–4 harden and extend to agents; Phase 6 adds
+custom transports for wrapper-only boxes.
 
 ---
 

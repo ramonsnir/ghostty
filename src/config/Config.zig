@@ -3063,6 +3063,37 @@ keybind: Keybinds = .{},
 /// `ghostty_config_string_list_s`).
 @"pty-remote-host": RepeatableString = .{},
 
+/// (ramon fork / cloud-hosts) Per-host TRANSPORT-COMMAND override: run the
+/// tunnel through a custom command instead of the default `ssh` ControlMaster.
+/// Some boxes are reachable ONLY through a wrapper (e.g. a `gcloud`-style
+/// workstation launcher exposed as a shell FUNCTION) that spins up its OWN
+/// gateway per invocation, so the default ControlMaster + `ssh -O check` model
+/// does not fit. When a `pty-remote-host` name has a command override here, the
+/// tunnel supervisor runs ONE long-lived forward process built from this command
+/// (NO ControlMaster, NO `-O check`/`-O exit`); readiness is still the socket
+/// handshake-probe and respawn is still the never-give-up process-exit watch, so
+/// only the transport spawn changes. Repeatable — each entry binds one
+/// `pty-remote-host` name to one command template. The line grammar is parsed
+/// ENTIRELY macOS-side (this key stores each line verbatim; the fork owns the
+/// grammar):
+///
+///     pty-remote-host-command = <name> = <command template>
+///
+/// e.g. `cloud-1 = my-ssh-wrapper cloud-1 --`. `<name>` must match a `pty-remote-host`
+/// entry — when a command override exists the `pty-remote-host` line's
+/// ssh-target field becomes just a label; the remote socket path still comes
+/// from that line. The command runs through the user's LOGIN + INTERACTIVE shell
+/// (so a shell FUNCTION resolves), and the supervisor appends the forward +
+/// keepalive (`-N -L <local>:<remote> -o ServerAliveInterval=15 …`). Because a
+/// custom command usually carries a real target/identifier, keep the real value
+/// in the untracked `~/.config/ghostty-ramon/local` and use a neutral
+/// placeholder in the tracked config. This is a fork-only key, so keep it in
+/// `~/.config/ghostty-ramon/config` (an official Ghostty would error on it).
+/// Reuses the `project-directory` RepeatableString plumbing (the macOS apprt
+/// reads it via the `ptyRemoteHostCommandLines` Swift getter over
+/// `ghostty_config_string_list_s`).
+@"pty-remote-host-command": RepeatableString = .{},
+
 /// (ramon fork / cloud-hosts) Extra `ssh` command-line options passed to the
 /// tunnel supervisor when it opens the SSH unix-socket forward for a
 /// `pty-remote-host` box (e.g. a jump host, an identity file, a custom port).
@@ -12033,6 +12064,88 @@ test "pty-remote-host: RepeatableString parse" {
         try testing.expectEqual(@as(usize, 2), cv.len);
         try testing.expectEqualStrings("cloud-1 = a : b", std.mem.sliceTo(cv.items[0], 0));
         try testing.expectEqualStrings("cloud-2 = c : d", std.mem.sliceTo(cv.items[1], 0));
+    }
+}
+
+test "pty-remote-host-command: RepeatableString parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default: empty list.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"pty-remote-host-command".list.items.len,
+        );
+    }
+
+    // Single entry — the whole line is stored verbatim (grammar is parsed
+    // macOS-side by the fork's tunnel supervisor, not here).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host-command=cloud-1 = my-ssh-wrapper cloud-1 --",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const items = cfg.@"pty-remote-host-command".list.items;
+        try testing.expectEqual(@as(usize, 1), items.len);
+        try testing.expectEqualStrings(
+            "cloud-1 = my-ssh-wrapper cloud-1 --",
+            items[0],
+        );
+    }
+
+    // Two entries, order preserved.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host-command=cloud-1 = wrapper-a cloud-1 --",
+            "--pty-remote-host-command=cloud-2 = wrapper-b cloud-2 --",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const items = cfg.@"pty-remote-host-command".list.items;
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expectEqualStrings("cloud-1 = wrapper-a cloud-1 --", items[0]);
+        try testing.expectEqualStrings("cloud-2 = wrapper-b cloud-2 --", items[1]);
+    }
+
+    // Empty value resets the list.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host-command=cloud-1 = wrapper-a cloud-1 --",
+            "--pty-remote-host-command=",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(
+            @as(usize, 0),
+            cfg.@"pty-remote-host-command".list.items.len,
+        );
+    }
+
+    // C-list view (mirrors `RepeatableString cval`).
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{
+            "--pty-remote-host-command=cloud-1 = a b",
+            "--pty-remote-host-command=cloud-2 = c d",
+        } };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        const cv = cfg.@"pty-remote-host-command".cval();
+        try testing.expectEqual(@as(usize, 2), cv.len);
+        try testing.expectEqualStrings("cloud-1 = a b", std.mem.sliceTo(cv.items[0], 0));
+        try testing.expectEqualStrings("cloud-2 = c d", std.mem.sliceTo(cv.items[1], 0));
     }
 }
 

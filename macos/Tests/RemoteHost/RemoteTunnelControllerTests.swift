@@ -212,6 +212,116 @@ struct RemoteTunnelControllerTests {
                 == ["-J", "jump.example.ts.net", "-i", "~/.ssh/id"])
     }
 
+    // MARK: - (Phase 6) Command-mode single-forward transport
+
+    /// The PURE argv builder wraps the command in the user's LOGIN + INTERACTIVE shell
+    /// (`-ilc`, so a shell FUNCTION resolves), APPENDS the `-N -L <local>:<remote>` forward +
+    /// keepalive + bind-mask, and substitutes the socket placeholders — WITHOUT spawning.
+    @Test func singleForwardArgvWrapsCommandInInteractiveLoginShellWithForward() {
+        let argv = RemoteTunnelController.singleForwardArgv(
+            shell: "/bin/zsh",
+            command: "gcp_ssh cloud-1 --",
+            localSocket: "/tmp/grt/abc.sock",
+            remoteSocket: "~/.ghostty-ramon-host.sock")
+
+        // argv[0] is the shell, argv[1] is the interactive-login flag, argv[2] the script.
+        #expect(argv.count == 3)
+        #expect(argv[0] == "/bin/zsh")
+        #expect(argv[1] == "-ilc")
+
+        let script = argv[2]
+        // The custom command leads, verbatim.
+        #expect(script.hasPrefix("gcp_ssh cloud-1 -- "))
+        // The forward is APPENDED with both socket placeholders substituted.
+        #expect(script.contains("-N -L /tmp/grt/abc.sock:~/.ghostty-ramon-host.sock"))
+        // Keepalive + fail-fast + best-effort bind-mask are all present.
+        #expect(script.contains("-o ServerAliveInterval=15"))
+        #expect(script.contains("-o ServerAliveCountMax=3"))
+        #expect(script.contains("-o ExitOnForwardFailure=yes"))
+        #expect(script.contains("-o StreamLocalBindMask=0177"))
+    }
+
+    /// A command-mode transport must NOT emit ANY ControlMaster / `-O check` / `-O exit` /
+    /// `-M` flags — those belong ONLY to the default `ssh` path. Readiness is the SAME
+    /// socket-probe (`ghostty_probe_host`) used by every host, so no ssh-multiplex liveness
+    /// concept applies (the ControlMaster health check short-circuits to false WITHOUT
+    /// spawning `ssh`).
+    @Test func commandModeEmitsNoControlMasterOrControlFlags() {
+        let argv = RemoteTunnelController.singleForwardArgv(
+            shell: "/bin/zsh",
+            command: "gcp_ssh cloud-1 --",
+            localSocket: "/tmp/grt/abc.sock",
+            remoteSocket: "/run/gr.sock")
+        let script = argv[2]
+        #expect(!script.contains("ControlMaster"))
+        #expect(!script.contains("ControlPath"))
+        #expect(!script.contains("ControlPersist"))
+        #expect(!script.contains("-O check"))
+        #expect(!script.contains("-O exit"))
+        // `-M` (master) must not appear as its own token.
+        #expect(!script.split(separator: " ").contains("-M"))
+
+        // The `ssh -O check` health path is guarded OFF for a command-mode host: it returns
+        // false immediately, WITHOUT spawning ssh (proving the ControlMaster path is skipped).
+        let entry = RemoteHostEntry(
+            name: "cmd-\(UUID().uuidString.prefix(6))",
+            sshTarget: "label-only",
+            remoteSocketPath: "/run/gr.sock",
+            localSocketPath: nil,
+            transportCommand: "gcp_ssh cloud-1 --")
+        #expect(RemoteTunnelController.shared.checkMasterHealth(host: entry) == false)
+    }
+
+    /// Command-mode teardown reaps the whole process GROUP with `kill(-pid, …)`, which ONLY
+    /// works if the spawned transport shell is its OWN process-group leader (pgid == pid). The
+    /// post-`run()` `setpgid(pid,pid)` in `spawnCommandTunnel` is a best-effort no-op
+    /// (Foundation.Process `posix_spawn`s, so the child has already exec'd → EACCES); the ACTUAL
+    /// leadership comes from the INTERACTIVE (`-i`) login shell self-leading its group during
+    /// job-control init (even without a controlling tty). This guards that load-bearing
+    /// assumption end-to-end: it spawns the SAME interactive-login shell with the SAME detached
+    /// stdin `spawnCommandTunnel` uses and asserts the shell leads its own group. If it ever
+    /// regresses (e.g. dropping `-i`, or a shell that no longer self-leads), the group-kill
+    /// silently degrades to an ESRCH no-op and every teardown would leak the `ssh -N` forward +
+    /// gateway — this test fails first.
+    @Test func commandModeTransportProcessIsItsOwnGroupLeader() throws {
+        let shell = RemoteTunnelController.loginShell()
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        // Same interactive-login invocation (`-ilc`) + detached stdin as `spawnCommandTunnel`.
+        proc.arguments = ["-ilc", "sleep 5"]
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try proc.run()
+        let pid = proc.processIdentifier
+        defer {
+            // Reap via the exact group-kill teardown relies on, then the pid, then wait.
+            kill(-pid, SIGKILL)
+            kill(pid, SIGKILL)
+            proc.waitUntilExit()
+        }
+        // The shell self-`setpgid`s during job-control init; poll briefly for it to settle.
+        var pgid = getpgid(pid)
+        for _ in 0..<100 where pgid != pid {
+            usleep(20_000) // 20ms, up to ~2s total
+            pgid = getpgid(pid)
+        }
+        #expect(
+            pgid == pid,
+            "command-mode transport shell must lead its own process group so kill(-pid) reaps the ssh forward + gateway; got pgid=\(pgid) pid=\(pid)")
+    }
+
+    @Test func loginShellPrefersSHELLEnvOrFallsBackToZsh() {
+        let shell = RemoteTunnelController.loginShell()
+        // Either the env's SHELL or the zsh fallback — never empty.
+        #expect(!shell.isEmpty)
+        if let env = ProcessInfo.processInfo.environment["SHELL"] {
+            #expect(shell == env)
+        } else {
+            #expect(shell == "/bin/zsh")
+        }
+    }
+
     // MARK: - waitForReadiness
 
     /// Poll the controller's synchronous readiness snapshot until it's set or the timeout

@@ -1027,6 +1027,24 @@ extension Ghostty {
             return buffer.compactMap { $0.map { String(cString: $0) } }
         }
 
+        // (ramon fork / cloud-hosts) Raw `pty-remote-host-command` lines — one per host with
+        // a per-host TRANSPORT-COMMAND override, each the VERBATIM value after the config
+        // key's first `=` (e.g. `cloud-1 = my-ssh-wrapper cloud-1 --`). This getter does NOT parse
+        // the `<name> = <command template>` grammar — that is
+        // `RemoteHostRegistry.parseCommand(line:)`, which pairs each command to its
+        // `pty-remote-host` entry (the ssh-target then becomes just a label; the remote
+        // socket path still comes from the `pty-remote-host` line). A byte-for-byte copy of
+        // the `ptyRemoteHostLines` RepeatableString reader.
+        var ptyRemoteHostCommandLines: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-host-command"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
         // (ramon fork / cloud-hosts) Raw `pty-remote-project-directory` lines — one per
         // configured base, each the VERBATIM value after the config key's first `=` (e.g.
         // `cloud-1 = ~/git`). This getter does NOT parse the `<name> = <base>` grammar —

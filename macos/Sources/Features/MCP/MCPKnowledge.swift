@@ -76,6 +76,7 @@ enum MCPKnowledge {
         // (ramon fork / cloud-hosts) the remote-host registry + ssh options. The
         // RepeatableString registry lines join like agent-queue-templates-dir.
         ("pty-remote-host", { $0.ptyRemoteHostLines.joined(separator: ", ") }),
+        ("pty-remote-host-command", { $0.ptyRemoteHostCommandLines.joined(separator: ", ") }),
         ("pty-remote-project-directory", { $0.remoteProjectDirectories.joined(separator: ", ") }),
         ("pty-remote-ssh-options", { $0.ptyRemoteSshOptions ?? "" }),
         ("pty-remote-connect-timeout", { String($0.ptyRemoteConnectTimeout) }),
@@ -247,11 +248,12 @@ enum MCPKnowledge {
         "cloud-hosts": FeatureSpec(
             name: "Cloud-hosted terminals",
             summary: "Mix local and remote (cloud-box) splits in one window. A remote split runs its shell on a ghostty-host on another machine, reached over an SSH-forwarded unix socket, and reattaches by (host, session id) across a GUI restart. Configure named remote hosts in pty-remote-host; new_split_on_host / new_tab_on_host (and the host picker palette) open a split on a chosen host.",
-            configKeys: ["pty-remote-host", "pty-remote-project-directory", "pty-remote-ssh-options", "pty-remote-connect-timeout", "pty-remote-capability-token", "pty-remote-mcp-allowed-host"],
+            configKeys: ["pty-remote-host", "pty-remote-host-command", "pty-remote-project-directory", "pty-remote-ssh-options", "pty-remote-connect-timeout", "pty-remote-capability-token", "pty-remote-mcp-allowed-host"],
             enableSteps: [
                 "Deploy ghostty-host on the remote box and make it reachable over SSH (see CLOUD-HOSTS-DESIGN.md → Deployment).",
                 "Add one pty-remote-host line per box in ~/.config/ghostty-ramon/config: `pty-remote-host = cloud-1 = user@cloud-1.example.ts.net : ~/.ghostty-ramon-host.sock`.",
                 "Optionally set pty-remote-ssh-options for extra ssh flags applied to every tunnel, and pty-remote-connect-timeout (seconds) to bound each reconnect/respawn attempt.",
+                "If a box is reachable only through a wrapper command (e.g. a gateway / launcher exposed as a shell function), add a matching pty-remote-host-command = <name> = <command template> line; the tunnel then runs one long-lived forward through your login+interactive shell (no ControlMaster). Keep the real command in ~/.config/ghostty-ramon/local.",
                 "Optionally add pty-remote-project-directory = <host> = <base> lines so the project palette (Open Project…) offers that box's subdirectories of <base>, opening a tab that runs on the host.",
                 "For a cloud AGENT to show up in the dashboard/queue: add a per-box pty-remote-capability-token (a random secret, in ~/.config/ghostty-ramon/local) and provision the SAME value into a 0600 file on the box for its agent-state hook; set GHOSTTY_MCP_URL in the box's own environment (e.g. its systemd unit) to the laptop's tailnet /agent-state URL, and either front the MCP port with `tailscale serve` or add the laptop's FQDN via pty-remote-mcp-allowed-host.",
                 "Relaunch Ghostty, then open a remote split via the host picker (New Split on Host…) or bind new_split_on_host:<name> / new_tab_on_host:<name>.",

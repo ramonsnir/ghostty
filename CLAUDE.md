@@ -1206,6 +1206,61 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   relaunch + rebuilt sidecar `dist`; NO Zig/lib/host change.** See `CLOUD-QUEUE-BALANCING.md` (design +
   build plan) + `AGENT-QUEUE.md` (→ Multi-host load balancing / Implementation notes).
 
+- **Cloud-hosted terminals — Phase 6: per-host TRANSPORT-COMMAND override (single-forward transport
+  mode)** (fork-only, macOS; GUI-lib + config-key only — NO host / protocol / wire change). New
+  fork-only key `pty-remote-host-command = <name> = <command template>` (a **RepeatableString**;
+  doc begins `(ramon fork / cloud-hosts)`) binds a CUSTOM transport onto a matching `pty-remote-host`
+  name, for a box reachable ONLY through a wrapper (e.g. a gateway / launcher exposed
+  as a shell FUNCTION that spins its OWN gateway per invocation, so the default ControlMaster +
+  `ssh -O check` model does not fit). When a host has an override, `RemoteTunnelController.ensureTunnel`
+  spawns **ONE long-lived forward process** built from the command through the user's **LOGIN +
+  INTERACTIVE shell** (`<shell> -ilc '<command> -N -L <local>:<remote> -o ServerAliveInterval=15 -o
+  ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StreamLocalBindMask=0177'`) so a shell function
+  resolves — **NO ControlMaster, NO `ssh -O check`/`-O exit`, NO `-M`** (the `-lc`→`-ilc` login-shell
+  pattern mirrors `AgentManagerController.probeExecutableViaLoginShell`; command mode uses `-ilc` since
+  a function needs interactive). Readiness is the SAME `ghostty_probe_host` socket handshake and respawn
+  the SAME never-give-up process-exit watch (both already transport-agnostic) — ONLY the spawn changes;
+  the single process is tracked in the `masterProcesses` slot so the shared `handleMasterExit` respawn +
+  `teardown` drive it UNCHANGED. The remote socket path still comes from the `pty-remote-host` line (its
+  ssh-target field becomes just a LABEL when an override exists); the local socket stays under the 0700
+  short dir (sun_path length-checked); `StreamLocalBindMask=0177` is best-effort. **A host WITHOUT an
+  override uses the default `ssh` ControlMaster path BYTE-IDENTICALLY** (the `parse(lines:commandLines:)`
+  builder defaults `commandLines` to `[]`, so `transportCommand == nil` and every non-override caller is
+  unchanged; the ONE resolver feeding `retainTunnel` — `SurfaceView_AppKit.remoteHostRegistry()` — passes
+  the command lines). The single-forward ARGV construction is a PURE, unit-testable
+  `RemoteTunnelController.singleForwardArgv(shell:command:localSocket:remoteSocket:)`; `cleanStaleControl`
+  / `checkMasterHealth` short-circuit for command-mode hosts (the ControlMaster `-O exit`/`-O check`
+  guard-off). **⚠️ Command-mode TEARDOWN can't just SIGTERM the shell** — an interactive shell (`-ilc`)
+  commonly IGNORES SIGTERM, so `Process.terminate()` alone leaks the shell + its `ssh -N` forward +
+  gateway. So `teardown`/`forceKillCommandProcess` SIGTERM→(grace)→SIGKILL the whole process GROUP
+  `kill(-pid,…)` (reaping the ssh child + gateway) plus SIGKILL the shell pid. **⚠️ Group leadership
+  (pgid==pid) is provided by the INTERACTIVE (`-i`) login shell self-`setpgid`ing during job-control
+  init (it self-leads even without a controlling tty) — NOT by the post-spawn `setpgid(pid,pid)`, which
+  is a best-effort no-op EXPECTED to fail EACCES (Foundation.Process `posix_spawn`s, so the child has
+  already exec'd by the time `run()` returns → a parent can't change its pgid).** The self-leadership
+  assumption is guarded by the `commandModeTransportProcessIsItsOwnGroupLeader` test; `kill(-pid,…)`
+  is SAFE if the shell never led a group (ESRCH no-op — can never hit the GUI's group). The exit handler
+  also SIGKILLs the group to reap orphans before respawn, and command-mode teardown unlinks the forwarded
+  socket (no ControlMaster to `ssh -O exit`) so a leaked forward can't hold the path across a respawn.
+  Because a custom command usually carries a real target/identifier, keep the real value in
+  the untracked `~/.config/ghostty-ramon/local` and a neutral placeholder in tracked config. Fork-only —
+  keep `pty-remote-host-command` in `~/.config/ghostty-ramon/config`. **GUI relaunch + a lib/xcframework
+  rebuild (the new config key); NO host restart** (the key never compiles into `ghostty-host`). Wiring:
+  core — `src/config/Config.zig` (`pty-remote-host-command: RepeatableString` + parse test); macOS —
+  `Ghostty.Config.swift` (`ptyRemoteHostCommandLines`), `RemoteHostRegistry.swift`
+  (`RemoteHostEntry.transportCommand` + `parseCommand`/`parseCommands` + two-arg
+  `parse(lines:commandLines:)`), `RemoteTunnelController.swift` (`singleForwardArgv`/`loginShell`/
+  `spawnCommandTunnel` with best-effort `setpgid` (no-op post-exec; the interactive shell self-leads its
+  group) + `ensureTunnel` command branch +
+  `forceKillCommandProcess` process-group teardown + `cleanStaleControl`/`checkMasterHealth` guards),
+  `SurfaceView_AppKit.swift` (`remoteHostRegistry()` passes command lines), `MCPKnowledge.swift` (reader
+  + cloud-hosts `configKeys` — both coverage guards). Tests: Zig `pty-remote-host-command: RepeatableString
+  parse`; Swift `RemoteHostRegistryTests` (`parseCommand*`/`builderPairsCommand*`) +
+  `RemoteTunnelControllerTests` (`singleForwardArgv*` / `commandModeEmitsNoControlMasterOrControlFlags` /
+  `commandModeTransportProcessIsItsOwnGroupLeader` — the group-leadership invariant the process-group
+  teardown depends on).
+  See `CLOUD-HOSTS-DESIGN.md` (→ Phase 6 / Config keys).
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.
@@ -1213,7 +1268,7 @@ reserves a real grid slot…`). **Cadence — completion-anchored
 - **Icon** defaults to `chalkboard` (`macos-icon` default in `src/config/Config.zig`); macOS swaps it per build at runtime so each identity is distinct at a glance — Release stays on `chalkboard`, ReleaseLocal becomes `paper`, Debug becomes `blueprint`. The swap fires only when the resolved icon is the fork default, so an explicit non-chalkboard `macos-icon` still wins. (`macos/Sources/Features/Custom App Icon/AppIcon.swift`)
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-project-directory` (a **RepeatableString** of `<host> = <base>` lines — the remote analog of `project-directory`; repeat for more hosts/bases), `pty-remote-ssh-options`, `pty-remote-connect-timeout` (a `u32`, seconds; `0` = compiled default), `pty-remote-capability-token` (a **RepeatableString** — per-box MCP `/agent-state` capability tokens the server accepts; a credential, keep in `local`), `pty-remote-mcp-allowed-host` (a **RepeatableString** — extra exact `Host`-header FQDNs the MCP server accepts, for tailnet ingest). (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`, `pty-remote-host` (a **RepeatableString** registry — repeat the key for more hosts), `pty-remote-host-command` (a **RepeatableString** of `<host> = <command template>` lines — a per-host single-forward transport-command override for wrapper-only boxes; the real value is a credential-ish target, keep in `local`), `pty-remote-project-directory` (a **RepeatableString** of `<host> = <base>` lines — the remote analog of `project-directory`; repeat for more hosts/bases), `pty-remote-ssh-options`, `pty-remote-connect-timeout` (a `u32`, seconds; `0` = compiled default), `pty-remote-capability-token` (a **RepeatableString** — per-box MCP `/agent-state` capability tokens the server accepts; a credential, keep in `local`), `pty-remote-mcp-allowed-host` (a **RepeatableString** — extra exact `Host`-header FQDNs the MCP server accepts, for tailnet ingest). (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`

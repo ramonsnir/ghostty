@@ -281,6 +281,19 @@ pty-host = /Users/you/.ghostty-ramon-host.sock
 # redial + the tunnel supervisor's ssh-master respawn. 0 (the default) = the
 # compiled-in default (10s). Only affects REMOTE hosts (local never redials).
 # pty-remote-connect-timeout = 30
+# Per-host TRANSPORT-COMMAND override (cloud-hosts Phase 6): for a box reachable
+# ONLY through a custom wrapper — e.g. a corporate `gcloud workstations ssh`-style
+# launcher exposed as a shell FUNCTION that spins its OWN tunnel per invocation — where the default `ssh`
+# ControlMaster + `ssh -O check` model does not fit. Repeatable; one line per
+# `<host> = <command template>`, where <host> matches a pty-remote-host name above.
+# The tunnel then runs ONE long-lived forward through that command in your LOGIN +
+# INTERACTIVE shell (so a shell function resolves), with the -N -L forward + keepalive
+# appended automatically — NO ControlMaster. When an override exists, the ssh-target
+# field of the pty-remote-host line becomes just a LABEL; only its remote-socket path
+# is used. The command usually carries a real target/identifier, so put the REAL value
+# in the untracked `local`, not here. See CLOUD-HOSTS-DESIGN.md → Transport.
+# pty-remote-host = cloud-1 = cloud-1 : /run/user/1000/ghostty-host.sock
+# pty-remote-host-command = cloud-1 = my-ssh-wrapper cloud-1 --
 # Per-host BASE project dirs for the host-aware project palette (cloud-hosts
 # Phase 4) — the remote analog of `project-directory`. Repeatable; one line per
 # `<host> = <base>`, where <host> matches a pty-remote-host name above. "Open

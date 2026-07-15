@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import Foundation
 import GhosttyKit
 import os
@@ -86,6 +87,9 @@ final class RemoteTunnelController {
     /// `pty-remote-connect-timeout` is unset (0). Mirrors the core client's
     /// `DEFAULT_CONNECT_TIMEOUT_S`.
     static let defaultConnectTimeoutSeconds: UInt32 = 10
+    /// (Phase 6) Grace between the SIGTERM and the SIGKILL escalation when force-killing a
+    /// COMMAND-mode transport — its interactive shell (`-ilc`) may ignore SIGTERM.
+    static let commandKillGraceSeconds: TimeInterval = 2
 
     /// Map a `pty-remote-connect-timeout` seconds value to the per-attempt probe/handshake
     /// ceiling in ms (REG-T3). `0` ⇒ the compiled default. PURE + unit-testable.
@@ -288,6 +292,23 @@ final class RemoteTunnelController {
             return
         }
 
+        // (Phase 6) COMMAND MODE: a per-host transport-command override runs ONE long-lived
+        // forward process through the user's login+interactive shell (no ControlMaster, no
+        // `ssh -O check`/`-O exit`). Readiness (the `ghostty_probe_host` socket handshake)
+        // and respawn (the never-give-up process-exit watch) are UNCHANGED — only the spawn
+        // differs. A host WITHOUT an override falls through to the default `ssh`
+        // ControlMaster path below, byte-identically.
+        if let command = host.transportCommand {
+            do {
+                try spawnCommandTunnel(host: host, command: command, localSocket: socketPath)
+            } catch {
+                logger.error("failed to bring up command tunnel for \(host.name, privacy: .public): \(String(describing: error), privacy: .public)")
+                return
+            }
+            startProbing(hostName: host.name, socketPath: socketPath, probeTimeoutMs: probeTimeoutMs)
+            return
+        }
+
         guard let ssh = Self.resolveSSH() else {
             logger.error("ssh not found for remote host \(host.name, privacy: .public)")
             return
@@ -379,7 +400,8 @@ final class RemoteTunnelController {
     /// terminationHandler's respawn gate declines (the intended-stop case).
     func teardown(hostName: String) {
         stopProbing(hostName: hostName)
-        let (master, forwarder) = stateQueue.sync {
+        let (master, forwarder, entry) = stateQueue.sync {
+            () -> (Process?, Process?, RemoteHostEntry?) in
             wanted[hostName] = 0
             // Bump the respawn generation so any scheduled respawn is superseded/cancelled.
             respawnGeneration[hostName] = (respawnGeneration[hostName] ?? 0) + 1
@@ -388,10 +410,47 @@ final class RemoteTunnelController {
             projectCache[hostName] = nil
             projectFetchInFlight.remove(hostName)
             return (masterProcesses.removeValue(forKey: hostName),
-                    forwarderProcesses.removeValue(forKey: hostName))
+                    forwarderProcesses.removeValue(forKey: hostName),
+                    hostEntries[hostName])
         }
-        forwarder?.terminate()
-        master?.terminate()
+        if let entry, entry.transportCommand != nil {
+            // (Phase 6) COMMAND MODE: the transport runs under an INTERACTIVE shell
+            // (`-ilc`, required so a shell function resolves), which commonly IGNORES
+            // SIGTERM — so `master?.terminate()` (SIGTERM) can be a no-op, leaking the
+            // shell + its `ssh -N` forward + any per-invocation gateway. Force the whole
+            // process GROUP down instead, and (there being no ControlMaster to
+            // `ssh -O exit`) unlink the forwarded local socket so a leaked forward can't
+            // hold the path across a later respawn.
+            if let master { forceKillCommandProcess(master) }
+            if let path = try? resolveForwardedSocketPath(for: entry) {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+        } else {
+            forwarder?.terminate()
+            master?.terminate()
+        }
+    }
+
+    /// (Phase 6) Force a COMMAND-mode transport process — and its whole process group — down.
+    /// An interactive shell commonly ignores SIGTERM, so `Process.terminate()` alone can leak
+    /// the shell's `ssh -N` forward + gateway. We SIGTERM then (after a grace) SIGKILL the
+    /// process GROUP led by the shell via `kill(-pid, …)`, reaping the ssh child + gateway,
+    /// and also SIGKILL the shell pid itself (SIGKILL can't be ignored). `kill(-pid, …)` is
+    /// SAFE even if the shell never became a group leader: there is then simply no group with
+    /// that id (ESRCH, a harmless no-op) — it can NEVER reach the GUI's own process group,
+    /// which has a different id. Group leadership is provided by the INTERACTIVE (`-i`) login
+    /// shell self-leading its group (the post-spawn `setpgid` in `spawnCommandTunnel` is a
+    /// best-effort no-op — EACCES post-exec), an assumption guarded by
+    /// `commandModeTransportProcessIsItsOwnGroupLeader`.
+    private func forceKillCommandProcess(_ proc: Process) {
+        let pid = proc.processIdentifier
+        guard pid > 0 else { proc.terminate(); return }
+        kill(-pid, SIGTERM)
+        proc.terminate()
+        supervisionQueue.asyncAfter(deadline: .now() + Self.commandKillGraceSeconds) {
+            kill(-pid, SIGKILL)
+            kill(pid, SIGKILL)
+        }
     }
 
     // MARK: - Auto-respawn + health (J1)
@@ -457,6 +516,10 @@ final class RemoteTunnelController {
     /// stale ControlPath, so a respawn binds a fresh multiplex socket instead of colliding
     /// with a half-dead one.
     private func cleanStaleControl(host: RemoteHostEntry) {
+        // (Phase 6) A command-mode host has NO ControlMaster — its single long-lived forward
+        // process IS the tunnel, so there is no multiplex socket to `ssh -O exit` or unlink.
+        // Skip entirely (the respawn just re-spawns the forward process).
+        guard host.transportCommand == nil else { return }
         guard let ssh = Self.resolveSSH(), let cp = try? controlPath(for: host) else { return }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ssh)
@@ -477,6 +540,10 @@ final class RemoteTunnelController {
     /// `ssh -O check`: is the master's multiplex socket alive and accepting? Exit 0 ⇒ yes.
     /// A synchronous liveness probe (blocks briefly); call off the main thread.
     func checkMasterHealth(host: RemoteHostEntry) -> Bool {
+        // (Phase 6) A command-mode host has no ControlMaster to `ssh -O check`; its liveness
+        // is the socket handshake-probe (`ghostty_probe_host`) instead, so this ControlMaster
+        // health check is not applicable and short-circuits to false WITHOUT spawning `ssh`.
+        guard host.transportCommand == nil else { return false }
         guard let ssh = Self.resolveSSH(), let cp = try? controlPath(for: host) else { return false }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ssh)
@@ -794,6 +861,109 @@ final class RemoteTunnelController {
             masterProcesses[host.name] = master
             forwarderProcesses[host.name] = forwarder
         }
+    }
+
+    // MARK: - Command-mode transport (Phase 6): a single long-lived forward process
+
+    /// (Phase 6) Bring up a COMMAND-mode tunnel: ONE long-lived process that runs the
+    /// per-host `command` through the user's LOGIN + INTERACTIVE shell (so a shell FUNCTION
+    /// — e.g. a wrapper / gateway launcher exposed as a function — resolves) with the forward + keepalive
+    /// APPENDED (see `singleForwardArgv`). NO ControlMaster and NO separate forwarder — this
+    /// single process IS the transport. It is tracked in `masterProcesses` (the "master"
+    /// slot) so the SHARED `handleMasterExit` respawn + `teardown` machinery drives it
+    /// UNCHANGED; `forwarderProcesses` stays empty for the host (a nil forwarder terminate is
+    /// a no-op). Readiness is armed by the caller (`startProbing`) exactly as in ssh mode.
+    private func spawnCommandTunnel(
+        host: RemoteHostEntry,
+        command: String,
+        localSocket: String
+    ) throws {
+        // Best-effort cleanup of a stale forwarded socket (an `ssh -L` refuses to bind onto
+        // an existing path; the remote host unlinks-and-rebinds its own end).
+        try? FileManager.default.removeItem(atPath: localSocket)
+
+        let argv = Self.singleForwardArgv(
+            shell: Self.loginShell(),
+            command: command,
+            localSocket: localSocket,
+            remoteSocket: host.remoteSocketPath)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: argv[0])
+        proc.arguments = Array(argv.dropFirst())
+        proc.environment = Self.tunnelEnvironment()
+        proc.standardInput = FileHandle.nullDevice
+
+        // (J1, reused) Auto-respawn on process exit — the transport command's gateway drop,
+        // a network blip, or a clean kill. Gated inside `handleMasterExit` on the host still
+        // being `wanted` (>0), same as the ssh-master path.
+        let startedAt = Date()
+        proc.terminationHandler = { [weak self] p in
+            guard let self else { return }
+            let exitedPid = p.processIdentifier
+            self.supervisionQueue.async {
+                // (Phase 6) Reap any orphaned forward/gateway left in the exited shell's
+                // process group before respawn/teardown (SIGKILL the group; a non-leader
+                // pid is a harmless ESRCH no-op, never the GUI's group).
+                if exitedPid > 0 { kill(-exitedPid, SIGKILL) }
+                self.handleMasterExit(
+                    hostName: host.name, status: p.terminationStatus, startedAt: startedAt)
+            }
+        }
+
+        try proc.run()
+
+        // (Phase 6) Command-mode teardown reaps the whole process GROUP via `kill(-pid, …)`,
+        // which requires the tracked shell to be its OWN process-group leader (pgid == pid).
+        // ⚠️ This `setpgid` is a best-effort belt-and-suspenders that is EXPECTED to FAIL with
+        // EACCES: Foundation.Process spawns via `posix_spawn`, so by the time `run()` returns
+        // the child has ALREADY exec'd, and a parent cannot change an exec'd child's pgid — so
+        // it is effectively a no-op here, NOT the load-bearing mechanism. The ACTUAL group
+        // leadership is provided by the INTERACTIVE (`-i`) login shell self-`setpgid`ing during
+        // job-control init (it self-leads its group even without a controlling tty). That
+        // assumption is guarded by `commandModeTransportProcessIsItsOwnGroupLeader`; if it ever
+        // regresses (e.g. dropping `-i`, or a shell that doesn't self-lead when interactive-
+        // without-tty), the group-kill degrades to a harmless ESRCH no-op and teardown falls
+        // back to SIGKILLing the shell pid + unlinking the socket (see `forceKillCommandProcess`).
+        let pid = proc.processIdentifier
+        if pid > 0 { setpgid(pid, pid) }
+
+        stateQueue.sync {
+            masterProcesses[host.name] = proc
+            // No ControlMaster forwarder in command mode.
+            forwarderProcesses[host.name] = nil
+        }
+    }
+
+    /// (Phase 6, PURE + unit-tested) Build the COMMAND-mode transport invocation argv WITHOUT
+    /// spawning. The custom `command` may be a shell FUNCTION, which only resolves in the
+    /// user's INTERACTIVE LOGIN shell — so the whole thing runs as
+    /// `<shell> -ilc '<command> <forward+keepalive>'`. The forward + keepalive are APPENDED
+    /// to the command (never string-spliced INTO it): `-N -L <local>:<remote>` plus the SSH
+    /// keepalive / fail-fast / bind-mask `-o`s. `StreamLocalBindMask=0177` is best-effort
+    /// (honored by the underlying OpenSSH). Deliberately emits NO ControlMaster / `-M` /
+    /// `-O check` / `-O exit` — those belong ONLY to the default `ssh` transport.
+    /// Returns the full argv (argv[0] is the shell); the spawner uses argv[0] as the
+    /// executable and the remainder as arguments.
+    static func singleForwardArgv(
+        shell: String,
+        command: String,
+        localSocket: String,
+        remoteSocket: String
+    ) -> [String] {
+        let forward = "\(command) -N -L \(localSocket):\(remoteSocket)"
+            + " -o ServerAliveInterval=15"
+            + " -o ServerAliveCountMax=3"
+            + " -o ExitOnForwardFailure=yes"
+            + " -o StreamLocalBindMask=0177"
+        return [shell, "-ilc", forward]
+    }
+
+    /// The user's login shell (from `$SHELL`, falling back to zsh) — the shell a COMMAND-mode
+    /// transport runs under so a shell FUNCTION resolves. Mirrors the shell resolution in
+    /// `probeViaLoginShell` / `AgentManagerController.probeExecutableViaLoginShell`.
+    static func loginShell() -> String {
+        ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
     }
 
     static func splitSSHOptions(_ options: String?) -> [String] {

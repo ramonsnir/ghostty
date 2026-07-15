@@ -24,6 +24,30 @@ struct RemoteHostEntry: Equatable, Sendable {
     /// derives one under a short 0700 dir (sun_path length is ~104 bytes — D7). Present
     /// only when the user pinned it in the config line's third field.
     let localSocketPath: String?
+
+    /// (ramon fork / cloud-hosts, Phase 6) Optional per-host TRANSPORT-COMMAND override
+    /// (from a matching `pty-remote-host-command` line). When present, the tunnel
+    /// supervisor runs ONE long-lived forward process built from this command through the
+    /// user's LOGIN + INTERACTIVE shell (so a shell FUNCTION resolves) — NO ControlMaster,
+    /// NO `ssh -O check`/`-O exit`. When nil (the common case) the host uses the default
+    /// `ssh` ControlMaster transport BYTE-IDENTICALLY. With an override present the
+    /// `sshTarget` field is only a label; `remoteSocketPath` still applies (it is the `-L`
+    /// forward's remote endpoint appended to the command).
+    let transportCommand: String?
+
+    init(
+        name: String,
+        sshTarget: String,
+        remoteSocketPath: String,
+        localSocketPath: String?,
+        transportCommand: String? = nil
+    ) {
+        self.name = name
+        self.sshTarget = sshTarget
+        self.remoteSocketPath = remoteSocketPath
+        self.localSocketPath = localSocketPath
+        self.transportCommand = transportCommand
+    }
 }
 
 /// (ramon fork / cloud-hosts) The SOLE home of the `pty-remote-host` line grammar
@@ -89,14 +113,60 @@ enum RemoteHostRegistry {
         )
     }
 
+    /// (Phase 6) Parse a single `pty-remote-host-command` line into a `(name, command)`
+    /// pair. Same name-split rule as `parse(line:)` — split on the **first `=`** only, trim
+    /// both sides — but the remainder is the WHOLE command template taken VERBATIM (NOT
+    /// field-split on ` : `): a transport command can itself contain `:`, `=`, and spaces
+    /// (e.g. `my-ssh-wrapper cloud-1 --`). Returns nil for the reserved `local` name (case-
+    /// insensitive) and for any malformed line (no `=`, empty name, or empty command).
+    static func parseCommand(line: String) -> (name: String, command: String)? {
+        guard let eq = line.firstIndex(of: "=") else { return nil }
+        let name = line[line.startIndex..<eq].trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+        guard name.lowercased() != "local" else { return nil }
+        let command = String(line[line.index(after: eq)...])
+            .trimmingCharacters(in: .whitespaces)
+        guard !command.isEmpty else { return nil }
+        return (name, command)
+    }
+
+    /// (Phase 6) Build the `name -> command` map from the raw `pty-remote-host-command`
+    /// lines. Malformed / reserved lines are skipped; on a duplicate name the LAST
+    /// occurrence wins (config-file layering). A command whose name has no matching
+    /// `pty-remote-host` line is simply never consumed by the builder below (there is no
+    /// host to attach it to — the remote socket path comes from the host line).
+    static func parseCommands(lines: [String]) -> [String: String] {
+        var map: [String: String] = [:]
+        for line in lines {
+            guard let (name, command) = parseCommand(line: line) else { continue }
+            map[name] = command
+        }
+        return map
+    }
+
     /// Build the `name -> entry` registry from the raw config lines. Malformed / reserved
     /// lines are skipped. On a duplicate name the LAST occurrence wins (later config
     /// lines override earlier ones, matching config-file layering).
-    static func parse(lines: [String]) -> [String: RemoteHostEntry] {
+    ///
+    /// (Phase 6) `commandLines` are the raw `pty-remote-host-command` lines; each is paired
+    /// by NAME onto the matching host entry as its `transportCommand`. `commandLines`
+    /// defaults to empty, so a single-argument `parse(lines:)` (the name/label-only callers)
+    /// stays BYTE-IDENTICAL — every entry then has `transportCommand == nil` and uses the
+    /// default `ssh` ControlMaster transport.
+    static func parse(
+        lines: [String],
+        commandLines: [String] = []
+    ) -> [String: RemoteHostEntry] {
+        let commands = parseCommands(lines: commandLines)
         var registry: [String: RemoteHostEntry] = [:]
         for line in lines {
-            guard let entry = parse(line: line) else { continue }
-            registry[entry.name] = entry
+            guard let base = parse(line: line) else { continue }
+            registry[base.name] = RemoteHostEntry(
+                name: base.name,
+                sshTarget: base.sshTarget,
+                remoteSocketPath: base.remoteSocketPath,
+                localSocketPath: base.localSocketPath,
+                transportCommand: commands[base.name])
         }
         return registry
     }
