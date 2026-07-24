@@ -972,6 +972,20 @@ extension Ghostty {
             return v
         }
 
+        // (ramon fork / Agent Manager) The rate-limit ATTENTION WATCHDOG (the bell-less
+        // "fake bell" the Haiku classify raises when an agent halts on Claude's
+        // usage-limit prompt). Default TRUE (matches the Zig default). The GUI forwards
+        // this to the sidecar as GHOSTTY_ALERT_WATCHDOG=1/0; off ⇒ the sidecar never
+        // promotes a surface via an `alert` tag (the per-bell path is unaffected).
+        // Defaults true on a missing config.
+        var agentManagerAlertWatchdog: Bool {
+            guard let config = self.config else { return true }
+            var v = true
+            let key = "agent-manager-alert-watchdog"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         // (ramon fork / Agent Manager) Absolute path to `node` for the sidecar;
         // nil/empty when unset (the controller falls back to a login-shell probe).
         var agentManagerNodePath: String? {

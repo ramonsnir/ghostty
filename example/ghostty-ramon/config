@@ -240,6 +240,12 @@ bell-features = system,audio,no-attention,no-title
 # default; listed for clarity): tab 🔔, surface border, dock bounce+badge,
 # dashboard unhide/float, web push, web-monitor indicator.
 attention-features = title,border,bounce,badge,dashboard,push,monitor
+# The rate-limit WATCHDOG — the one promotion that fires WITHOUT a real bell:
+# Haiku tags a surface `rate_limited` when it sees an agent halted on Claude's
+# usage-limit prompt, and the sidecar raises tier 2 for it. Default is `true`;
+# set false for no bell-less "fake bell" (a rate-limited agent is then surfaced
+# by its tile status instead). Does NOT affect per-bell promotion above.
+agent-manager-alert-watchdog = false
 
 # Diagnostics: trace the bell -> attention lifecycle to
 # ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl (GUI + sidecar). Off by

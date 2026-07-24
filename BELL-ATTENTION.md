@@ -222,8 +222,8 @@ jq -rs '... ' ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl   # (or just a
 
 All keys are **fork-only** — keep them in `~/.config/ghostty-ramon/config` (an official
 Ghostty sharing `~/.config/ghostty/config` would error on them). `bell-features` itself is
-upstream; `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, and
-`bell-diagnostics` are the fork additions.
+upstream; `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`,
+`agent-manager-alert-watchdog`, and `bell-diagnostics` are the fork additions.
 
 ```ini
 # Master switch: let the Agent Manager classify bells and promote the notable ones.
@@ -240,6 +240,12 @@ attention-features = title,border,bounce,badge,dashboard,push,monitor
 # (focused split + key window + active app). A promotion has no focused variant —
 # focusing a surface clears its attention.
 bell-features-focused = system,no-attention,no-title
+
+# Optional: the ONE promotion that happens WITHOUT a real bell — the Agent Manager's
+# rate-limit watchdog, which raises tier 2 when it sees an agent halted on Claude's
+# usage-limit prompt. Default true; set false to silence that "fake bell" only
+# (per-bell promotion above is unaffected). See AGENT-MANAGER.md.
+agent-manager-alert-watchdog = false
 ```
 
 ### ⚠️ Gotcha: the value is **additive over defaults**, not "reset to listed"
@@ -448,6 +454,9 @@ abort**, no extra GUI suppression):
   → `bellPromote` → suppressed by the generation guard (so an abort never leaks a promotion).
 - **Watchdog untouched.** `maybeSignalAlert` (the rate-limit watchdog) does NOT ride the bell
   path or this guard, so a genuine "needs you" alert still fires even right after a dismissal.
+  It is the one promotion that happens WITHOUT a real bell, and it has its own on/off key —
+  `agent-manager-alert-watchdog = false` silences it (and only it: per-bell promotion is
+  unaffected). See `AGENT-MANAGER.md` → "Attention bell on rate-limit".
 - **Diagnostics.** A suppressed promotion records a `classify` event with `decision:"dismissed"`
   (instead of `promote`), so the trace stays honest and jq "promote" counts aren't inflated.
 - **Cleanup.** `bellDismissGen`/`bellAbort` are pruned for dead surfaces in `runSweep` alongside
