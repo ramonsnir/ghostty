@@ -17,6 +17,7 @@ import {
   parseNonNegativeInt,
   shouldExitForParentDeath,
   parseLoopEnablement,
+  alertWatchdogEnabled,
   shouldEnableWarmBase,
   makeSummarizeFn,
   buildWarmBase,
@@ -126,6 +127,9 @@ interface DepsSpec {
    *  unchanged; set false to exercise queue-only / bell-only mode. */
   summarizerEnabled?: boolean;
   bellFilter?: boolean;
+  /** Defaults TRUE (the rate-limit attention watchdog is armed) so the existing alert
+   *  tests are unchanged; set false to exercise `agent-manager-alert-watchdog = false`. */
+  alertWatchdog?: boolean;
   bellsSeen?: Map<string, boolean>;
   pendingBells?: Set<string>;
   dismissGen?: Map<string, number>;
@@ -153,6 +157,7 @@ function makeDeps(spec: DepsSpec): {
     summarize,
     lastBySession: spec.last ?? new Map<string, LastSummary>(),
     alertBySession: spec.alerts ?? new Map<string, string>(),
+    alertWatchdog: spec.alertWatchdog ?? true,
     summarizerEnabled: spec.summarizerEnabled ?? true,
     bellFilter: spec.bellFilter ?? false,
     bellSeenBySession: spec.bellsSeen ?? new Map<string, boolean>(),
@@ -540,6 +545,49 @@ test("bell: model flags rate_limited => rings exactly once + records the tag", a
   assert.equal(deps.alertBySession.get("s1"), "rate_limited");
 });
 
+// (ramon fork / `agent-manager-alert-watchdog = false`) The watchdog is the ONLY thing
+// gated: the classify still runs and still annotates the tile, but the model's `alert`
+// verdict is ignored, so nothing is promoted to the loud attention tier WITHOUT a real
+// terminal bell.
+test("bell: watchdog OFF => a rate_limited verdict does NOT promote (summary still annotated)", async () => {
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: RATE_LIMIT_SCREEN },
+  });
+  const { deps, summarizeCalls } = makeDeps({
+    fake,
+    summarize: rateLimitedSummary,
+    alertWatchdog: false,
+  });
+
+  await runSweep(deps);
+
+  assert.equal(summarizeCalls.length, 1, "the classify itself is NOT gated");
+  assert.equal(fake.setCalls.length, 1, "the tile summary is still annotated");
+  assert.equal(fake.attentionCalls.length, 0, "no bell-less promotion");
+  assert.equal(deps.alertBySession.has("s1"), false, "no tag recorded (nothing to clear)");
+});
+
+test("bell: watchdog OFF does NOT gate a held tag's clear path either (map stays empty)", async () => {
+  // A pre-armed tag can only exist if the watchdog was on when the sidecar started, so with
+  // it off the loop must simply leave the map alone — no set_attention(false) either.
+  const fake = makeFakeClient({
+    surfaces: [makeSurface({ id: "s1", agentState: "working" })],
+    screens: { s1: "back to work" },
+  });
+  const { deps } = makeDeps({
+    fake,
+    summarize: noAlertSummary,
+    alertWatchdog: false,
+    alerts: new Map([["s1", "rate_limited"]]),
+  });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 0, "no un-promote call while OFF");
+  assert.equal(deps.alertBySession.get("s1"), "rate_limited", "tag left untouched");
+});
+
 test("bell: a held alert under idle-skip does not re-ring (no model call, stays armed)", async () => {
   const viewport = RATE_LIMIT_SCREEN;
   const surface = makeSurface({ id: "s1", agentState: "working", idleSeconds: 999 });
@@ -748,6 +796,25 @@ test("bell-attention: a rising bell on a debounced agent forces a classify + pro
 // is ALWAYS false and the rising-edge backstop can never fire. Promotion MUST instead come
 // from the bell-reactive loop's pendingBellIds (the wait_for_event signal, truthful on every
 // ring). Here s.bell is false but the id is pending ⇒ it must still force-classify + promote.
+// (ramon fork) The two promotion paths are INDEPENDENT: turning the bell-less rate-limit
+// watchdog off (`agent-manager-alert-watchdog = false`) must not touch per-bell promotion.
+test("bell-attention: alert-watchdog OFF still promotes a REAL bell (paths are independent)", async () => {
+  const { surface, last } = debouncedAgent({ bell: true });
+  const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
+  const { deps } = makeDeps({
+    fake,
+    summarize: attnTrue,
+    last,
+    bellFilter: true,
+    alertWatchdog: false,
+  });
+
+  await runSweep(deps);
+
+  assert.equal(fake.attentionCalls.length, 1, "per-bell promotion is unaffected");
+  assert.equal(fake.attentionCalls[0].on, true);
+});
+
 test("bell-attention: a pendingBellId forces a classify even when list_surfaces.bell is false (system,audio config)", async () => {
   const { surface, last } = debouncedAgent({ bell: false }); // never armed (sound-only)
   const fake = makeFakeClient({ surfaces: [surface], screens: { s1: "permission prompt" } });
@@ -1352,6 +1419,19 @@ test("classifyBellNow: listSurfaces failure falls back to enqueue+wake (never lo
   assert.equal(summarizeCalls.length, 0);
   assert.deepEqual([...deps.pendingBellIds], ["s1"], "enqueued despite the list failure");
   assert.equal(woke, 1);
+});
+
+// --- alertWatchdogEnabled: the rate-limit watchdog gate (ramon fork) ---------
+
+test("alertWatchdogEnabled: ON unless explicitly '0' (ABSENT is on, for back-compat)", () => {
+  // Absent ⇒ ON: an OLD GUI respawning this dist keeps the pre-flag behavior.
+  assert.equal(alertWatchdogEnabled({}), true);
+  assert.equal(alertWatchdogEnabled({ GHOSTTY_ALERT_WATCHDOG: "1" }), true);
+  // Only a literal "0" turns it off (the controller writes that for the config false).
+  assert.equal(alertWatchdogEnabled({ GHOSTTY_ALERT_WATCHDOG: "0" }), false);
+  // Anything else is NOT an off switch (fail toward the pre-flag behavior).
+  assert.equal(alertWatchdogEnabled({ GHOSTTY_ALERT_WATCHDOG: "false" }), true);
+  assert.equal(alertWatchdogEnabled({ GHOSTTY_ALERT_WATCHDOG: "" }), true);
 });
 
 // --- warm-base gate + summarize wiring (FLOOR: a flipped gate or mis-wired

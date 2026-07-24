@@ -29,6 +29,10 @@
 //                        respawns a new dist keeps summarizing.
 //   GHOSTTY_AGENT_QUEUE  "1" ⇒ arm the queue supervisor (gated on `agent-queue`);
 //                        absent ⇒ off. INDEPENDENT of GHOSTTY_SUMMARIZER.
+//   GHOSTTY_ALERT_WATCHDOG  "1"/ABSENT ⇒ the rate-limit ATTENTION WATCHDOG (the
+//                        bell-less "fake bell") is armed; "0" ⇒ the model's `alert`
+//                        verdict is ignored (gated on `agent-manager-alert-watchdog`).
+//                        Absent means ON for back-compat, like GHOSTTY_SUMMARIZER.
 //   GHOSTTY_AGENT_MANAGER=1  set by the controller (and inherited by the `claude`
 //                            subprocess the SDK spawns) so the agent-state hook
 //                            early-exits and the summarizer's own model activity
@@ -260,6 +264,21 @@ export function parseLoopEnablement(
  * WarmBase. Extracted so a regression that flips the gate condition is caught by
  * a unit test. PURE over its injected env + the two feature bools.
  */
+/**
+ * PURE gate for the RATE-LIMIT ATTENTION WATCHDOG (the bell-less "fake bell"), from the
+ * GUI's `agent-manager-alert-watchdog` config delivered as `GHOSTTY_ALERT_WATCHDOG`.
+ *
+ * ON unless explicitly "0". An ABSENT flag is ON for BACK-COMPAT — the watchdog used to
+ * be unconditional, so an OLD GUI that respawns this (new) dist without the flag keeps it;
+ * only a new GUI with the key set false writes the explicit "0" (the controller sets it
+ * both ways, mirroring `GHOSTTY_SUMMARIZER`).
+ */
+export function alertWatchdogEnabled(
+  env: Record<string, string | undefined>,
+): boolean {
+  return env.GHOSTTY_ALERT_WATCHDOG !== "0";
+}
+
 export function shouldEnableWarmBase(
   env: Record<string, string | undefined>,
   summarizerEnabled: boolean,
@@ -409,6 +428,14 @@ export interface LoopDeps {
    *  after the alert clears (the screen changes). Held on deps so a test can
    *  seed/inspect it; cleaned up alongside lastBySession when a surface dies. */
   alertBySession: Map<string, string>;
+  /** (ramon fork) Whether the RATE-LIMIT ATTENTION WATCHDOG is armed (mirrors the GUI's
+   *  `agent-manager-alert-watchdog` config, delivered via GHOSTTY_ALERT_WATCHDOG=1/0;
+   *  ABSENT ⇒ on, for back-compat). When false, `maybeSignalAlert` early-returns: an
+   *  `alert` tag from the model is IGNORED, so no surface is ever promoted to the loud
+   *  attention tier WITHOUT a real terminal bell. Everything else about the classify is
+   *  unchanged (same prompt, same summary/phase/needsUser annotation, same per-bell
+   *  promotion path — which is gated separately by `bellFilter`). */
+  alertWatchdog: boolean;
   /** Whether the CONTINUOUS summarizer pass runs (mirrors `agent-manager` /
    *  GHOSTTY_SUMMARIZER). When false, `runSweep` does NOT summarize the periodic due
    *  agents — only the cheap, INDEPENDENT per-bell FORCED pass below still runs (so
@@ -801,6 +828,15 @@ async function maybeSignalAlert(
   surface: Surface,
   alert: string | undefined,
 ): Promise<void> {
+  // (ramon fork) `agent-manager-alert-watchdog = false` ⇒ the watchdog is OFF: ignore the
+  // model's `alert` verdict entirely, so nothing is ever promoted to the loud attention
+  // tier WITHOUT a real terminal bell. Gated HERE (not in the prompt) deliberately: the
+  // system prompt stays byte-identical, so the warm-base systemHash — and thus the cached
+  // system prefix — is shared with the watchdog on, and flipping the key costs nothing.
+  // `alertBySession` therefore stays empty for this process; an attention ALREADY lit when
+  // you flipped the key is not cleared here (focus the split, or dismiss it from the
+  // dashboard / web monitor).
+  if (!deps.alertWatchdog) return;
   const edge = alertEdge(deps.alertBySession.get(surface.id), alert);
   if (edge === "ring") {
     // Record FIRST so a slow set_attention can't double-fire from an overlapping
@@ -1121,6 +1157,12 @@ async function main(): Promise<void> {
   // promotes (cheap, per-bell, fail-open) when the continuous summarizer is off.
   const bellFilter = process.env.GHOSTTY_BELL_FILTER === "1";
 
+  // (ramon fork) The RATE-LIMIT ATTENTION WATCHDOG — the bell-less "fake bell". ON unless
+  // the GUI explicitly says otherwise (`agent-manager-alert-watchdog = false` ⇒
+  // GHOSTTY_ALERT_WATCHDOG=0). Independent of both the summarizer gate and bellFilter: it
+  // rides whatever classify already runs, so turning it off changes nothing else.
+  const alertWatchdog = alertWatchdogEnabled(process.env);
+
   // Optional ACCOUNT routing (see account.ts). Default ⇒ inherit the ambient Claude Code
   // auth (works with no claude-accounts installed). When set, the model calls bill against
   // the configured account's CLAUDE_CONFIG_DIR. Relevant to ANY Haiku classify — the
@@ -1221,6 +1263,7 @@ async function main(): Promise<void> {
     summarize: makeSummarizeFn(defaultSummarize, warmBase),
     lastBySession: new Map<string, LastSummary>(),
     alertBySession: new Map<string, string>(),
+    alertWatchdog,
     summarizerEnabled,
     bellFilter,
     bellSeenBySession: new Map<string, boolean>(),
@@ -1231,6 +1274,7 @@ async function main(): Promise<void> {
     summarizerConfigDir,
   };
   if (bellFilter) log("bell-attention: bell promotion ENABLED");
+  if (!alertWatchdog) log("rate-limit attention watchdog DISABLED (agent-manager-alert-watchdog=false)");
 
   // The AGENT QUEUE SUPERVISOR. ENABLE GATE: only when `agent-queue` is on (the Swift
   // controller sets GHOSTTY_AGENT_QUEUE=1 + GHOSTTY_AGENT_QUEUE_TEMPLATES_DIRS (the full

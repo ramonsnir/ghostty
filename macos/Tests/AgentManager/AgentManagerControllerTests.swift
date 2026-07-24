@@ -307,6 +307,26 @@ struct AgentManagerControllerTests {
         #expect(out["PATH"] == "/usr/bin")
     }
 
+    // MARK: - applyAlertWatchdogEnv (the rate-limit "fake bell" watchdog)
+
+    /// Enabled ⇒ GHOSTTY_ALERT_WATCHDOG=1 (the pre-flag behavior), others untouched.
+    @Test func alertWatchdogEnvEnabledSetsFlag() {
+        let out = AgentManagerController.applyAlertWatchdogEnv(
+            into: ["PATH": "/usr/bin"], enabled: true)
+        #expect(out["GHOSTTY_ALERT_WATCHDOG"] == "1")
+        #expect(out["PATH"] == "/usr/bin")
+    }
+
+    /// Disabled ⇒ an EXPLICIT "0" (never stripped): the sidecar treats an ABSENT flag as
+    /// ON for back-compat, so only the explicit zero can silence the watchdog. Any stray
+    /// inherited "1" must lose to the config.
+    @Test func alertWatchdogEnvDisabledSetsZero() {
+        let out = AgentManagerController.applyAlertWatchdogEnv(
+            into: ["PATH": "/usr/bin", "GHOSTTY_ALERT_WATCHDOG": "1"], enabled: false)
+        #expect(out["GHOSTTY_ALERT_WATCHDOG"] == "0")
+        #expect(out["PATH"] == "/usr/bin")
+    }
+
     // MARK: - applyClaudePathEnv (colleague: route the summarizer at the system claude)
 
     /// A resolved path ⇒ GHOSTTY_CLAUDE_PATH is set (the sidecar passes it as the SDK's

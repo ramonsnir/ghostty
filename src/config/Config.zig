@@ -3369,6 +3369,27 @@ keybind: Keybinds = .{},
 /// restart) picks up a change. Fork-only — keep it in `~/.config/ghostty-ramon/config`.
 @"agent-manager-warm-base": bool = false,
 
+/// (ramon fork / Agent Manager) The RATE-LIMIT attention watchdog — the "fake bell"
+/// that pulls you back when an agent HALTS on Claude's usage/rate-limit prompt (which
+/// stops the agent WITHOUT ringing a terminal bell). When true (the default), the Agent
+/// Manager's per-tile Haiku classify doubles as this watchdog: whenever it judges a
+/// surface to be halted on that prompt RIGHT NOW it emits an `alert` tag, and the sidecar
+/// promotes that surface into the sticky loud ATTENTION tier via `set_attention` (🔔 tab
+/// title, amber border, dock badge, dashboard mark, Web Push — whatever
+/// `attention-features` routes), then un-promotes it once the agent resumes.
+///
+/// Set this to `false` to stop those bell-less promotions entirely: Haiku still
+/// summarizes every tile as usual, but no surface is ever promoted to "needs you"
+/// WITHOUT a real terminal bell. The per-bell promotion path is a different mechanism
+/// and is NOT affected (see `agent-manager-bell-filter`) — this key gates ONLY the
+/// watchdog. Note it does not retroactively clear an attention that is ALREADY lit:
+/// focus the split, or dismiss it from the dashboard / web monitor.
+///
+/// The GUI forwards the resolved value to the sidecar as `GHOSTTY_ALERT_WATCHDOG=1`/`0`;
+/// a GUI relaunch (no host restart) picks up a change. Fork-only — keep it in
+/// `~/.config/ghostty-ramon/config`.
+@"agent-manager-alert-watchdog": bool = true,
+
 /// (ramon fork) Listen address (`addr:port`) for the embedded web monitor, an
 /// in-app HTTP server that lets you view live terminal surfaces and send input
 /// from a phone. Empty/null (the default) DISABLES the server entirely.
@@ -11540,6 +11561,28 @@ test "agent-manager-warm-base: default off and parse" {
         try cfg.loadIter(alloc, &it);
         try cfg.finalize();
         try testing.expectEqual(true, cfg.@"agent-manager-warm-base");
+    }
+}
+
+test "agent-manager-alert-watchdog: default on and parse" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Default ON: the rate-limit watchdog keeps its pre-flag behavior.
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        try cfg.finalize();
+        try testing.expectEqual(true, cfg.@"agent-manager-alert-watchdog");
+    }
+
+    {
+        var cfg = try Config.default(alloc);
+        defer cfg.deinit();
+        var it: TestIterator = .{ .data = &.{"--agent-manager-alert-watchdog=false"} };
+        try cfg.loadIter(alloc, &it);
+        try cfg.finalize();
+        try testing.expectEqual(false, cfg.@"agent-manager-alert-watchdog");
     }
 }
 

@@ -68,6 +68,7 @@ enum MCPKnowledge {
         ("agent-manager-node-path", { $0.agentManagerNodePath ?? "" }),
         ("agent-manager-usage-tracking", { String($0.agentManagerUsageTracking) }),
         ("agent-manager-warm-base", { String($0.agentManagerWarmBase) }),
+        ("agent-manager-alert-watchdog", { String($0.agentManagerAlertWatchdog) }),
         ("agent-queue", { String($0.agentQueueEnabled) }),
         ("agent-queue-templates-dir", { $0.agentQueueTemplatesDirs.joined(separator: ", ") }),
         ("agent-queue-max-total", { String($0.agentQueueMaxTotal) }),
@@ -167,7 +168,7 @@ enum MCPKnowledge {
         "agent-manager": FeatureSpec(
             name: "Agent Manager",
             summary: "A Haiku status summarizer that annotates each Agent Dashboard tile with a live one-line semantic status. Read-only; never types into a session.",
-            configKeys: ["agent-manager", "agent-manager-node-path", "agent-manager-usage-tracking", "agent-manager-warm-base", "mcp-listen", "mcp-token"],
+            configKeys: ["agent-manager", "agent-manager-node-path", "agent-manager-usage-tracking", "agent-manager-warm-base", "agent-manager-alert-watchdog", "mcp-listen", "mcp-token"],
             enableSteps: [
                 "Set agent-manager = true in ~/.config/ghostty-ramon/config.",
                 "Set mcp-listen and mcp-token (the sidecar drives the MCP server).",
@@ -226,11 +227,12 @@ enum MCPKnowledge {
             docPath: "CLAUDE.md"),
         "bell": FeatureSpec(
             name: "Bell / Attention",
-            summary: "Two-tier bell handling. Every bell fires the bell-features set (or bell-features-focused when the ringing split is truly focused). A bell the Agent Manager's per-bell classify judges worth interrupting you for is PROMOTED and additionally fires the loud attention-features tier. bell-diagnostics writes a JSONL trace of why each bell did / didn't fire.",
-            configKeys: ["bell-features", "bell-features-focused", "attention-features", "agent-manager-bell-filter", "bell-diagnostics"],
+            summary: "Two-tier bell handling. Every bell fires the bell-features set (or bell-features-focused when the ringing split is truly focused). A bell the Agent Manager's per-bell classify judges worth interrupting you for is PROMOTED and additionally fires the loud attention-features tier. The Agent Manager also raises that loud tier WITHOUT a bell when it sees an agent halted on Claude's rate-limit prompt (agent-manager-alert-watchdog). bell-diagnostics writes a JSONL trace of why each bell did / didn't fire.",
+            configKeys: ["bell-features", "bell-features-focused", "attention-features", "agent-manager-bell-filter", "agent-manager-alert-watchdog", "bell-diagnostics"],
             enableSteps: [
                 "Tier-1 effects are always on — tune bell-features (out-of-focus) and bell-features-focused (in-focus) in ~/.config/ghostty-ramon/config.",
                 "For the loud ATTENTION tier, set agent-manager-bell-filter = true; promotion runs in the sidecar, so it also needs mcp-listen + mcp-token + node (see the agent-manager feature). Set attention-features to choose what the promoted tier does.",
+                "Set agent-manager-alert-watchdog = false to stop the bell-less rate-limit \"fake bell\" (nothing is promoted to the loud tier without a real terminal bell); the per-bell path above is unaffected.",
                 "Set bell-diagnostics = true to trace decisions to ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl (turn off when done — append-only).",
             ],
             docPath: "BELL-ATTENTION.md"),
