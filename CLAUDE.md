@@ -1616,8 +1616,29 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `hiddenAgents`, the hidden loop). The deeper `pickDescendChild` fix (prefer a known-agent child
   over an ambiguous helper) is DEFERRED: it links into `ghostty-host`, so it needs a Linux host
   rebuild + restart on the box, which would KILL the running cloud agents.
+  **(5) A GUI RESTART MARKED A LIVE CLOUD AGENT AS CRASHED (found live; the worst of the
+  five).** `SurfaceView.processExited` returned `true` whenever `self.surface == nil` — a
+  pre-cloud-hosts assumption that "no core surface ⇔ the child died". That stopped being true
+  in Phase 1: a restored/launched REMOTE surface DEFERS its `.client` dial until the tunnel
+  handshakes (`pendingRemoteHost` → `materializeClientSurface`), so it legitimately has NO
+  core surface for seconds while showing "Connecting to <host>…". In that window the GUI LIED
+  — `MCPLayout` emitted `exited: true` on the `list_surfaces` row → the sidecar's `nextState`
+  saw RUNNING+`exited` (`supervisor.ts`: `if (ctx.exited && (SPAWNED|RUNNING|QUEUED)) return
+  "EXITED"`) → the item was marked **EXITED: bell rung, slot freed, status-polling +
+  auto-close stopped** — while the agent was happily working on the box. It fired on EVERY GUI
+  restart that restored a cloud agent, and the `EXITED` record is STICKY by design (it holds
+  the key so a crashed item is never silently re-dispatched, and blocks re-adopt), so the item
+  stays untracked until its split is closed. Fix: the no-surface branch returns the PURE
+  `processExitedWithoutSurface(pendingRemoteHost:)` = `pendingRemoteHost == nil`, so a PENDING
+  remote surface reads NOT exited while local/`.exec` (nil pending) is byte-identical. The
+  hazard was already handled correctly 12 lines below in `clientStateInfo` (a
+  not-yet-materialized remote surface reports `.ok`) — `processExited` simply hadn't been
+  revisited. **Repairing an already-mis-marked item** means editing the run's persisted record
+  (`…/queues/.state/<run>.state.json`, `state: "EXITED"` → `"RUNNING"`) and relaunching so the
+  sidecar rehydrates it — there is no un-exit command.
   Wiring: core — `src/termio/Client.zig` (see the deliberate-close/`closing` note in the
-  Phase-2 bullet above). macOS — `AgentDashboardController.swift` (`isAgentSurface`/
+  Phase-2 bullet above). macOS — `SurfaceView_AppKit.swift` (`processExited` no-surface branch
+  + pure `processExitedWithoutSurface`), `AgentDashboardController.swift` (`isAgentSurface`/
   `displayAgentKind` + the four gates), `RemoteTunnelController.swift`
   (`livenessProbeInterval`/`livenessFailureThreshold`/`shouldTripLiveness`/
   `livenessGeneration`/`startLivenessMonitor`/`stopLivenessMonitor`/`isLivenessCurrent`/
@@ -1629,7 +1650,9 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   (`toolsListHasAllTools` count **27**, `dispatchAdoptSplitRejectsBadArguments`,
   `dispatchAdoptSplitAcceptsValidArgumentsAndTrims`), `AgentDashboardHookStateTests`
   (`hookStateAloneMakesAnEntryWhenTheDetectorMissed`, `detectedKindWinsOverTheHookImpliedOne`,
-  `plainShellIsStillNeverAnEntry`). **GUI relaunch + a lib/xcframework
+  `plainShellIsStillNeverAnEntry`, `hookSnapshotReportsAKindForAHookOnlyAgent`),
+  `SurfaceViewAppKitTests` (`pendingRemoteSurfaceIsNotExited`,
+  `noSurfaceAndNoPendingDialIsExited`). **GUI relaunch + a lib/xcframework
   rebuild (the Zig `closing` change); NO host restart.**
 
 ## Fork-identity / non-functional changes

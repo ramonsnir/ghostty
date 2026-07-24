@@ -53,6 +53,21 @@ struct SurfaceViewAppKitTests {
             localSocketPath: nil),
     ]
 
+    // (cloud-hosts) `surface == nil` is NOT "the child died" once a REMOTE surface can
+    // defer its dial. Reporting exited there made `list_surfaces` emit `exited: true` for a
+    // healthy cloud agent mid-restart, so the Agent Queue's `nextState` marked the item
+    // EXITED (bell rung, slot freed, tracking stopped) on EVERY GUI restart that restored a
+    // cloud agent. A PENDING remote surface must read as NOT exited.
+    @Test func pendingRemoteSurfaceIsNotExited() {
+        #expect(Ghostty.SurfaceView.processExitedWithoutSurface(pendingRemoteHost: "cloud-1") == false)
+        #expect(Ghostty.SurfaceView.processExitedWithoutSurface(pendingRemoteHost: "box") == false)
+    }
+
+    // Local / `.exec`: no surface and no pending dial ⇒ exited (unchanged behavior).
+    @Test func noSurfaceAndNoPendingDialIsExited() {
+        #expect(Ghostty.SurfaceView.processExitedWithoutSurface(pendingRemoteHost: nil) == true)
+    }
+
     @Test func nilHostResolvesLocal() {
         #expect(
             Ghostty.SurfaceView.resolveHost(nil, registry: Self.sampleRegistry)

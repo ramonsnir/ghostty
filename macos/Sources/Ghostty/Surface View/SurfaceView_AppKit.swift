@@ -164,9 +164,32 @@ extension Ghostty {
         }
 
         // Returns true if the process in this surface has exited.
+        //
+        // (ramon fork / cloud-hosts) ⚠️ `surface == nil` is NO LONGER equivalent to "the
+        // child died". A restored/launched REMOTE surface DEFERS its `.client` dial until
+        // the tunnel handshakes (`pendingRemoteHost` + `materializeClientSurface`), so it
+        // legitimately has NO core surface for seconds while showing the
+        // "Connecting to <host>…" placeholder. Reporting `true` there made the GUI LIE:
+        // `MCPLayout` emitted `exited: true` on the `list_surfaces` row → the Agent Queue
+        // sidecar's `nextState` saw RUNNING+exited → marked the item **EXITED** (bell rung,
+        // slot freed, status-polling + auto-close stopped) even though the agent was very
+        // much alive on the box. It fired on EVERY GUI restart that restored a cloud agent.
+        // So a PENDING remote surface reports NOT exited; only a surface with no core
+        // surface AND no pending remote dial (the `.exec`/local case — byte-identical to
+        // before) is treated as exited. Mirrors the same nil-handling `clientStateInfo`
+        // below already does deliberately.
         var processExited: Bool {
-            guard let surface = self.surface else { return true }
+            guard let surface = self.surface else {
+                return Self.processExitedWithoutSurface(pendingRemoteHost: pendingRemoteHost)
+            }
             return ghostty_surface_process_exited(surface)
+        }
+
+        /// PURE (unit-tested): with NO core surface, has the child exited? A surface still
+        /// awaiting its DEFERRED remote dial has not started one, so it is NOT exited;
+        /// anything else with no surface is (the pre-cloud-hosts local/`.exec` behavior).
+        static func processExitedWithoutSurface(pendingRemoteHost: String?) -> Bool {
+            pendingRemoteHost == nil
         }
 
         // (ramon fork / cloud-hosts, K1) The surface's `.client` connection state +
