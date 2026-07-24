@@ -61,6 +61,10 @@ final class AgentManagerController {
     /// to the sidecar as `GHOSTTY_WARMBASE=1`/`0`; default false (the cold path is the
     /// floor). Captured on main at init.
     private let warmBase: Bool
+    /// (ramon fork / Agent Manager) The rate-limit ATTENTION WATCHDOG (the bell-less
+    /// "fake bell"). Forwarded to the sidecar as `GHOSTTY_ALERT_WATCHDOG=1`/`0`; default
+    /// true. Captured on main at init.
+    private let alertWatchdog: Bool
     /// (Agent Queue Supervisor §8a/§15) Master enable for the sidecar's queue
     /// supervisor "pass 3". Captured on main at init. When true the controller
     /// arms the sidecar via `GHOSTTY_AGENT_QUEUE=1` (else pass 3 stays a no-op).
@@ -120,6 +124,7 @@ final class AgentManagerController {
         self.bellDiagnostics = ghostty.config.bellDiagnostics
         self.usageTracking = ghostty.config.agentManagerUsageTracking
         self.warmBase = ghostty.config.agentManagerWarmBase
+        self.alertWatchdog = ghostty.config.agentManagerAlertWatchdog
         self.agentQueueEnabled = ghostty.config.agentQueueEnabled
         self.agentQueueTemplatesDirs = ghostty.config.agentQueueTemplatesDirs
         self.agentQueueMaxTotal = ghostty.config.agentQueueMaxTotal
@@ -295,6 +300,7 @@ final class AgentManagerController {
         // alternate between two diverged snapshots.
         env = Self.applyParentPidEnv(into: env, pid: ProcessInfo.processInfo.processIdentifier)
         env = Self.applySummarizerEnv(into: env, enabled: enabled)
+        env = Self.applyAlertWatchdogEnv(into: env, enabled: alertWatchdog)
         env = Self.applyAgentQueueEnv(
             into: env,
             enabled: agentQueueEnabled,
@@ -337,6 +343,24 @@ final class AgentManagerController {
     static func applySummarizerEnv(into env: [String: String], enabled: Bool) -> [String: String] {
         var env = env
         env["GHOSTTY_SUMMARIZER"] = enabled ? "1" : "0"
+        return env
+    }
+
+    /// (ramon fork / Agent Manager) Layer the RATE-LIMIT ATTENTION WATCHDOG enable onto
+    /// the sidecar env (`agent-manager-alert-watchdog`). PURE + unit-tested. The watchdog
+    /// is the bell-less "fake bell": when Haiku judges a surface HALTED on Claude's
+    /// usage-limit prompt it emits an `alert` tag and the sidecar promotes the surface via
+    /// `set_attention`. Disabled ⇒ `maybeSignalAlert` early-returns, so no surface is ever
+    /// promoted without a REAL terminal bell (the per-bell promotion path, armed above by
+    /// `GHOSTTY_BELL_FILTER`, is a separate mechanism and is unaffected).
+    ///
+    /// Set EXPLICITLY both ways (like `applySummarizerEnv`, unlike `applyAgentQueueEnv`'s
+    /// strip): the sidecar treats an ABSENT flag as ON for BACK-COMPAT (the watchdog was
+    /// unconditional before this key existed, so an OLD GUI respawning a NEW `dist` keeps
+    /// it), which means only an explicit "0" can turn it off.
+    static func applyAlertWatchdogEnv(into env: [String: String], enabled: Bool) -> [String: String] {
+        var env = env
+        env["GHOSTTY_ALERT_WATCHDOG"] = enabled ? "1" : "0"
         return env
     }
 

@@ -678,7 +678,7 @@ feeds `LoopDeps.summarizerConfigDir`, which `summarizeOne` threads into the mode
 HOME/PATH/OAuth survive — only the config dir is re-pointed). SIDECAR-only: edit the file +
 restart the sidecar (the GUI respawns it; no app relaunch).
 
-### Attention bell on rate-limit (fork-only, sidecar-only, ZERO Swift/Zig/host change)
+### Attention bell on rate-limit (fork-only; config `agent-manager-alert-watchdog`, default ON)
 
 The summarizer doubles as an attention watchdog: when a session hits the Claude
 usage/rate-limit BLOCKING prompt ("Stop and wait for limit to reset / Ask your admin for
@@ -687,6 +687,27 @@ bell via the EXISTING MCP `signalAttention` tool (`client.signalAttention`, alre
 the Queue's leave-and-bell) — fanning out to the 🔔 tab title, dashboard aggregate, web
 monitor, and push, all off the one `.ghosttyBellDidRing` post. **No new MCP tool / no Swift
 / no host work** — the bell path already existed; this just triggers it.
+
+**TURNING IT OFF.** This is the one thing in the fork that raises the loud "needs you"
+attention tier **without a real terminal bell**, and Haiku is the sole judge of it — so if you
+don't want a bell-less fake bell (e.g. you'd rather see rate limits when you next look at the
+tile), set the fork-only key
+
+```
+agent-manager-alert-watchdog = false   # ~/.config/ghostty-ramon/config
+```
+
+The GUI forwards the resolved value to the sidecar as `GHOSTTY_ALERT_WATCHDOG=1`/`0`
+(`AgentManagerController.applyAlertWatchdogEnv`, set EXPLICITLY both ways so the config beats
+the sidecar's default-on) and `maybeSignalAlert` early-returns when it's off: the model's
+`alert` verdict is simply IGNORED. Everything else is unchanged — the same classify still runs
+on the same schedule with the same prompt (so the warm-base `systemHash` is shared either way,
+and flipping the key costs nothing), the tile still gets its summary/phase/needsUser
+annotation, and the **per-bell** promotion path (`agent-manager-bell-filter`) is a separate
+mechanism that is NOT affected. Costs a GUI relaunch (no host restart). Two caveats: it does
+NOT retroactively clear an attention that is already lit (focus the split, or dismiss it from
+the dashboard 🔔 / web monitor), and with the watchdog off a rate-limited agent is silent —
+nothing else detects that state.
 
 **HAIKU IS THE SOLE CLASSIFIER — NO regex/text match (deliberate, see below).** An
 extensible `alert?: string` field was added to the Haiku STRUCTURED OUTPUT contract
@@ -721,16 +742,24 @@ NOTE: this rate-limit watchdog is now ONE case of the general **Bell Attention v
 promotion mechanism (see `BELL-ATTENTION.md`) — the same fail-open classify +
 `set_attention`, here driven by a dedicated `alert` tag rather than a bell edge.
 
-Wiring: sidecar ONLY — `prompts.ts` (contract + `alert` rule), `summarizer.ts`
-(`ParsedSummary.alert` + `parseSummary` parse + `ALERT_RATE_LIMITED` + pure `alertEdge`),
-`index.ts` (`LoopDeps.alertBySession` + `maybeSignalAlert` edge handler on the success
-branch only + `alertReason` + dead-id prune + main init). Tests: `summarizer.test.ts`
+Wiring — the DETECTION is sidecar-only: `prompts.ts` (contract + `alert` rule),
+`summarizer.ts` (`ParsedSummary.alert` + `parseSummary` parse + `ALERT_RATE_LIMITED` + pure
+`alertEdge`), `index.ts` (`LoopDeps.alertBySession` + `maybeSignalAlert` edge handler on the
+success branch only + `alertReason` + dead-id prune + main init). The ON/OFF SWITCH adds the
+config plumbing: `src/config/Config.zig` (`agent-manager-alert-watchdog`, default true),
+`Ghostty.Config.swift` (`agentManagerAlertWatchdog`), `AgentManagerController.swift` (pure
+`applyAlertWatchdogEnv` → `GHOSTTY_ALERT_WATCHDOG`), `MCPKnowledge.swift` (reader + the
+agent-manager/bell `configKeys`), `index.ts` (pure `alertWatchdogEnabled` +
+`LoopDeps.alertWatchdog` + the `maybeSignalAlert` early return). Tests: `summarizer.test.ts`
 (`alertEdge` + `parseSummary` alert parsing) + `index.test.ts` (`bell:` group — ring-once,
 held-no-rering-under-idle-skip, recovery-clears, scrolled-up-text-inert,
 model-failure-leaves-untouched, model-alert-rings-regardless-of-text, changed-tag-rerings,
-failed-ring rollback, non-agent never rung, dead-id prune). **Rebuilt sidecar `dist` + a
-sidecar restart (kill the node child or relaunch the GUI) is enough; no host/Zig change, no
-GUI relaunch needed for the GUI itself.**
+failed-ring rollback, non-agent never rung, dead-id prune; plus `alertWatchdogEnabled` and the
+watchdog-OFF cases — no promotion / summary still annotated / held tag untouched / a REAL bell
+still promotes) + `Config.zig` (`agent-manager-alert-watchdog: default on and parse`) +
+`AgentManagerControllerTests.swift` (`alertWatchdogEnv*`). **The detection itself needs only a
+rebuilt sidecar `dist` + a sidecar restart; the new config key is Zig, so changing the KEY
+needs a lib/xcframework rebuild + GUI relaunch — no host restart either way.**
 
 ### Haiku usage / budget tracking (sidecar records, Swift MCP tool queries)
 

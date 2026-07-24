@@ -648,7 +648,28 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (default true) gates it, forwarded to the sidecar EXPLICITLY as `GHOSTTY_HAIKU_USAGE=1`/`0` by
   `AgentManagerController` so the config wins over the sidecar's default-on; set it `false` in
   `~/.config/ghostty-ramon/config` to disable (GUI relaunch; Zig/lib rebuild but NO host restart —
-  the host ignores the key). **See `AGENT-MANAGER.md` (→ Implementation notes) for the loop, cost
+  the host ignores the key). **Rate-limit WATCHDOG on/off (config `agent-manager-alert-watchdog`,
+  default ON):** the summarizer doubles as the rate-limit attention watchdog — Haiku emits an
+  `alert:"rate_limited"` tag when it judges an agent HALTED on Claude's usage-limit prompt and
+  `maybeSignalAlert` promotes that surface into the loud attention tier via `set_attention`. This
+  is the ONLY thing in the fork that raises "needs you" WITHOUT a real terminal bell, so it gets
+  its own kill switch: `agent-manager-alert-watchdog = false` makes `maybeSignalAlert`
+  EARLY-RETURN (the `alert` verdict is ignored), while the classify, its prompt, and the tile
+  annotation are byte-identical and the **per-bell** promotion path (`agent-manager-bell-filter`)
+  is untouched. Gated in the SIDECAR (not the prompt) deliberately, so the warm-base `systemHash`
+  is shared either way and flipping the key costs nothing. Forwarded EXPLICITLY both ways as
+  `GHOSTTY_ALERT_WATCHDOG=1`/`0` by the pure `AgentManagerController.applyAlertWatchdogEnv`
+  (ABSENT ⇒ ON in the sidecar, back-compat for an old GUI + a new `dist`). Caveats: it does NOT
+  clear an attention already lit (focus the split / dismiss from the dashboard 🔔 or web monitor),
+  and with it off NOTHING else detects a rate-limited agent. Wiring: `src/config/Config.zig`,
+  `Ghostty.Config.swift` (`agentManagerAlertWatchdog`), `AgentManagerController.swift`
+  (`applyAlertWatchdogEnv`), `MCPKnowledge.swift` (reader + agent-manager/bell `configKeys`),
+  `agent-manager/src/index.ts` (`alertWatchdogEnabled` + `LoopDeps.alertWatchdog` + the
+  `maybeSignalAlert` gate). Tests: `Config.zig` parse/default, `AgentManagerControllerTests`
+  (`alertWatchdogEnv*`), `index.test.ts` (`alertWatchdogEnabled` + watchdog-OFF: no promotion /
+  summary still annotated / held tag untouched / a REAL bell still promotes). GUI relaunch +
+  Zig/lib rebuild + rebuilt sidecar `dist`; NO host restart. **See `AGENT-MANAGER.md`
+  (→ Implementation notes) for the loop, cost
   controls, account routing, the rate-limit attention watchdog, the system-`claude`/esbuild bundle,
   Haiku usage/budget tracking, wiring + tests.**
 
@@ -1221,7 +1242,7 @@ reserves a real grid slot…`). **Cadence — completion-anchored
     that reproduces the broken state via xattrs, asserts detection, then self-heals it).
 - **Auto-update via Sparkle, pinned to the fork's OWN GitHub Releases feed** (was hard-disabled; re-enabled for colleague distribution). Sparkle starts normally but `UpdateDelegate.feedURLString` points at `github.com/ramonsnir/ghostty/releases/latest/download/appcast.xml`, never ghostty.org, so the fork is never replaced by an official build. Dev builds still don't auto-check (`Ghostty-Info.plist` ships `SUEnableAutomaticChecks=false`); the CI release build deletes that key. The committed `SUPublicEDKey` is the fork's OWN real public key (generated at enrollment via Sparkle `generate_keys`; public keys aren't secret), matching the `SPARKLE_PRIVATE_KEY` CI secret; CI re-injects `SPARKLE_PUBLIC_KEY` as belt-and-suspenders. (`UpdateController.hasPlaceholderUpdateKey` still guards the all-zero placeholder so a future placeholder build fails closed.) See "Distribution / sharing the fork" below. (`macos/Sources/Features/Update/{UpdateController,UpdateDelegate}.swift`)
 - **App Nap opt-out (fork-only, macOS; always on)** — `AppDelegate.applicationDidFinishLaunching` holds a process-lifetime `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` token (`appNapAssertion`) so macOS never naps/throttles the GUI while backgrounded or occluded. **Load-bearing for the `.client` backend:** the host connection is opened from per-surface IO threads at surface creation and is **single-shot (no retry — see `src/termio/Client.zig` `connectAndAttach`)**, so if the GUI is relaunched into the background with **no active display** (a remote restart while away), App Nap can suspend those threads before they connect to `ghostty-host`, leaving every restored surface permanently blank until a manual restart-while-present. This is exactly the 2026-06 weekend symptom ("restarted Ghostty remotely while away → monitor showed empty surfaces all weekend; restarting while at the Mac fixed it"). The `...AllowingIdleSystemSleep` option opts out of App Nap **without** preventing system/display sleep (it omits the idle-sleep-disable bits), so battery/sleep behavior is unchanged — we only decline to be napped (it also disables sudden/automatic termination, desirable for a terminal). Note: a connect-retry/reconnect in the `.client` backend was considered and **deliberately skipped** — the host is a KeepAlive LaunchAgent (≈always up, so connect rarely fails) and a dropped host can't restore RAM-only sessions anyway, so it was high-risk surgery on the most delicate lifecycle code for an unobserved failure mode. (`macos/Sources/App/macOS/AppDelegate.swift`)
-- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
+- **Config separation**: the fork additionally loads `~/.config/ghostty-ramon/config` on top of the shared `~/.config/ghostty/config`. Put fork-only keybinds **and fork-only config keys** there so an official Ghostty (which shares `~/.config/ghostty/config`) never errors on unknown actions or keys. Fork-only config keys so far: `project-directory`, `bell-features-focused`, `attention-features`, `agent-manager-bell-filter`, `bell-diagnostics`, `web-monitor-listen`, `web-monitor-token`, `mcp-listen`, `mcp-token`, `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`, `agent-dashboard-spotlight-seconds`, `agent-manager`, `agent-manager-node-path`, `agent-manager-usage-tracking`, `agent-manager-warm-base`, `agent-manager-alert-watchdog`, `agent-queue`, `agent-queue-templates-dir` (a **RepeatableString** search list — repeat the key for more dirs), `agent-queue-max-total`, `agent-queue-hero-max`. (`src/config/file_load.zig` `forkXdgPath`, `Config.zig` `loadDefaultFiles`)
 
 - **Config files & secrets** (tracked example copies): the repo keeps reference
   copies of both live config files under **`example/`** — `example/ghostty/config`
