@@ -1105,7 +1105,11 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   to upstream (the defect is upstream). Wiring: `macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift`
   (`CachedValue` lock + `clear()`). Tests: `macos/Tests/Ghostty/CachedValueTests.swift`
   (`cachesWithinDuration`/`refetchesAfterExpiry` + the `concurrentGetAndExpiryDoesNotRace` 20k-iteration
-  concurrent stress reproducer).
+  concurrent stress reproducer). **Test-robustness note:** `refetchesAfterExpiry` originally slept a
+  FIXED 80ms for a 20ms expiry, which flaked in FULL-suite runs (it passed in isolation) — Swift
+  Testing parallelizes cases, so the 20k-iteration stress test in the SAME suite saturates every
+  core and the background expiry clear lands late. It now POLLS `get()` up to a 5s ceiling instead,
+  so it is fast when idle and tolerant when loaded.
 
 - **PTY-host reattach forces macOS window-state restoration ON UNCONDITIONALLY (fork-only,
   macOS, GUI-only; always on for every identity/build; an explicit `window-save-state = never`

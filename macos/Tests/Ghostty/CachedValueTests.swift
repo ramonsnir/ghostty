@@ -25,9 +25,21 @@ struct CachedValueTests {
         }
 
         #expect(cached.get() == "value-1")
-        // Wait past the expiry so the background task clears the value.
-        try await Task.sleep(for: .milliseconds(80))
-        #expect(cached.get() == "value-2")
+        // The expiry clear runs on a BACKGROUND executor, so under load it can be scheduled
+        // well after the nominal 20ms — and this very suite also runs the 20k-iteration
+        // `concurrentGetAndExpiryDoesNotRace` stress test, which saturates every core while
+        // Swift Testing runs cases in parallel. A fixed 80ms margin therefore flaked
+        // repeatedly in FULL-suite runs while passing in isolation (a false alarm that cost
+        // three gate cycles). POLL up to a generous ceiling instead: still fast when idle,
+        // but tolerant when the machine is busy. Each `get()` either returns the still-cached
+        // value or triggers the refetch, so observing "value-2" is the real assertion.
+        var value = cached.get()
+        let deadline = Date().addingTimeInterval(5)
+        while value == "value-1", Date() < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+            value = cached.get()
+        }
+        #expect(value == "value-2")
     }
 
     /// Regression: `get()` runs on AppKit's accessibility thread (off the main thread)
