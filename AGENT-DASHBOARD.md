@@ -24,6 +24,15 @@ below); without it the panel degrades to metadata-only tiles.
 
 ---
 
+> **Cross-host agents (cloud-hosts):** a tile exists for a live split that is an agent by
+> EITHER signal — the local process detector matched a CLI agent, **or** Claude Code's own
+> agent-state hook has reported for it. The second is what makes a **box** agent visible: the
+> host-side `/proc` descent gives up when a launcher has more than one non-launcher child (an
+> account-pool wrapper spawns `claude` alongside a transient `sleep`), so detection alone never
+> classifies a pool-launched cloud agent. A hook report is proof of an agent, so the tile
+> appears with a hook-implied `claude` badge; a detected kind still wins when present. A plain
+> shell (neither signal) is still never shown.
+
 ## Quick start — the config
 
 Put this in `~/.config/ghostty-ramon/config` (fork-only file; the official Ghostty

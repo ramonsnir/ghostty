@@ -1355,6 +1355,51 @@ struct AgentDashboardHookStateTests {
         .init(tty: "ttys004", state: state, prompt: prompt, tool: tool, message: message)
     }
 
+    // (cloud-hardening) A CROSS-HOST agent's tile must exist even when the process
+    // DETECTOR never classified it. The host-side /proc descent gives up when a launcher
+    // has >1 non-launcher child — an account-pool wrapper has exactly that (`claude` plus a
+    // transient `sleep`) — so `agents[id]` stays nil forever for a box agent. Claude's own
+    // hook reporting state IS proof of an agent, so it must be sufficient on its own.
+    @Test func hookStateAloneMakesAnEntryWhenTheDetectorMissed() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        // NO applyAgents — mimics the failed cross-host descent.
+        #expect(model.entries.first(where: { $0.id == a }) == nil)
+        #expect(!model.isAgentSurface(a))
+
+        model.applyAgentState(a, payload(.working))
+        #expect(model.isAgentSurface(a))
+        let entry = model.entries.first(where: { $0.id == a })
+        #expect(entry != nil)
+        #expect(entry?.agentState == .working)
+        // A hook-implied kind keeps the badge + the hover controls that gate on non-nil.
+        #expect(entry?.agent?.command == "claude")
+    }
+
+    // The detector's kind still WINS when it did classify (we must not relabel a Codex
+    // agent as claude just because a hook fired).
+    @Test func detectedKindWinsOverTheHookImpliedOne() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents([a: AgentKind("codex")])
+        model.applyAgentState(a, payload(.working))
+        #expect(model.entries.first(where: { $0.id == a })?.agent?.command == "codex")
+        #expect(model.displayAgentKind(a)?.command == "codex")
+    }
+
+    // A plain shell (no detection, no hook) is still NEVER a tile — the "agent-only"
+    // guarantee that keeps spec §2.6 state-2 reachable.
+    @Test func plainShellIsStillNeverAnEntry() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        #expect(!model.isAgentSurface(a))
+        #expect(model.entries.isEmpty)
+        #expect(model.displayAgentKind(a) == nil)
+    }
+
     @Test func hookBackedInsertedOnFirstEvent() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()

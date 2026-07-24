@@ -1594,8 +1594,28 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   its working/waiting state and the queue can't auto-close it. (A machine-local
   `launch-on-box` helper in `~/.local/bin` — untracked, it carries a real host name — does
   spawn-then-optionally-adopt in one call.)
+  **(4) THE CROSS-HOST TILE WAS INVISIBLE (found live).** A box agent was adopted,
+  queue-tracked and reporting `agentState:"working"` — yet **no dashboard tile**. Cause: the
+  dashboard's `entries` builder HARD-FILTERED on `agents[id] != nil` (the local process
+  DETECTOR's map), and detection can never succeed for the pool-wrapper tree: the host-side
+  `/proc` descent (`descendToProgram` → `pickDescendChild`) deliberately declares **>1
+  non-launcher child AMBIGUOUS and gives up**, and a `claude-pool` wrapper has exactly that —
+  `claude` PLUS a transient `sleep`. Observed tree: `bash(noetive-agent.sh) → bash(claude-pool)
+  → {claude, sleep}`. So `agentKind` stayed nil and the surface was filtered out of the panel.
+  (Note `exec`-ing the pool would NOT fix it — the pool itself spawns that pair.) Fix (GUI-only,
+  no box-host restart, so a running cloud agent is not disturbed): `isAgentSurface(id)` =
+  `agents[id] != nil || agentStates[id] != nil` — Claude's own hook reporting state IS proof of
+  an agent, and it is the ONLY reliable cross-host signal. `displayAgentKind(id)` falls back to a
+  hook-implied `AgentKind("claude")` so the tile badge + the hover controls that gate on a
+  non-nil kind keep working, while a DETECTED kind still WINS (a Codex agent is never relabeled).
+  A plain shell (no detection, no hook) is STILL never a tile, so the "agent-only" guarantee +
+  spec §2.6 state-2 hold. Applied at all four gates (`liveAgentIDs`, `rebuildEntriesFromCurrentState`,
+  `hiddenAgents`, the hidden loop). The deeper `pickDescendChild` fix (prefer a known-agent child
+  over an ambiguous helper) is DEFERRED: it links into `ghostty-host`, so it needs a Linux host
+  rebuild + restart on the box, which would KILL the running cloud agents.
   Wiring: core — `src/termio/Client.zig` (see the deliberate-close/`closing` note in the
-  Phase-2 bullet above). macOS — `RemoteTunnelController.swift`
+  Phase-2 bullet above). macOS — `AgentDashboardController.swift` (`isAgentSurface`/
+  `displayAgentKind` + the four gates), `RemoteTunnelController.swift`
   (`livenessProbeInterval`/`livenessFailureThreshold`/`shouldTripLiveness`/
   `livenessGeneration`/`startLivenessMonitor`/`stopLivenessMonitor`/`isLivenessCurrent`/
   `livenessLoop`/`killTransportProcess` + `parsePgrepPids`/`reapOrphanedForwards`, the
@@ -1604,7 +1624,9 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   `RemoteTunnelControllerTests` (`RemoteTunnelHardeningTests`: liveness threshold matrix +
   interval sanity + `parsePgrepPids` self/parent/junk exclusion + empty), `MCPServerTests`
   (`toolsListHasAllTools` count **27**, `dispatchAdoptSplitRejectsBadArguments`,
-  `dispatchAdoptSplitAcceptsValidArgumentsAndTrims`). **GUI relaunch + a lib/xcframework
+  `dispatchAdoptSplitAcceptsValidArgumentsAndTrims`), `AgentDashboardHookStateTests`
+  (`hookStateAloneMakesAnEntryWhenTheDetectorMissed`, `detectedKindWinsOverTheHookImpliedOne`,
+  `plainShellIsStillNeverAnEntry`). **GUI relaunch + a lib/xcframework
   rebuild (the Zig `closing` change); NO host restart.**
 
 ## Fork-identity / non-functional changes

@@ -982,7 +982,35 @@ final class AgentDashboardModel: ObservableObject {
     /// agents. This is the agent-only universe the dashboard actually operates
     /// over (LOCKED "agent-only" decision): entries, the hidden chip count, and
     /// the Show popover are all derived from this, never from `liveIDs`.
-    var liveAgentIDs: Set<UUID> { Set(live.map(\.id).filter { agents[$0] != nil }) }
+    var liveAgentIDs: Set<UUID> { Set(live.map(\.id).filter { isAgentSurface($0) }) }
+
+    /// (ramon fork / cloud-hosts) Is this surface an AGENT for dashboard purposes?
+    ///
+    /// TWO INDEPENDENT signals, either sufficient:
+    ///  1. the local process DETECTOR matched a CLI agent (`agents[id] != nil`), and
+    ///  2. Claude Code's own agent-state HOOK has reported for this surface
+    ///     (`agentStates[id] != nil`).
+    ///
+    /// Signal 2 exists because signal 1 is unreliable for a CROSS-HOST agent. Detection
+    /// rests on the host-side `/proc` descent (`proc_info.descendToProgram`), which
+    /// deliberately GIVES UP when a launcher has more than one non-launcher child — and
+    /// an account-pool wrapper has exactly that: `claude` PLUS a transient `sleep`. So
+    /// `agents[id]` can stay nil forever while the agent is plainly running (adopted,
+    /// queue-tracked, and POSTing state). Only Claude Code runs that hook, so a report
+    /// IS proof of an agent; treating it as such is both more robust and more honest than
+    /// pattern-matching a process tree through an arbitrary wrapper.
+    func isAgentSurface(_ id: UUID) -> Bool {
+        agents[id] != nil || agentStates[id] != nil
+    }
+
+    /// The agent kind to display for `id`: the DETECTED kind when the process walk found
+    /// one, else a hook-implied `claude` (only Claude Code POSTs agent state). Keeps the
+    /// tile's badge + the hover controls that gate on a non-nil kind working for a
+    /// cross-host agent the detector could not classify.
+    func displayAgentKind(_ id: UUID) -> AgentKind? {
+        if let a = agents[id] { return a }
+        return agentStates[id] != nil ? AgentKind("claude") : nil
+    }
 
     /// (ramon fork / Hero Agents) The set of currently-live surface ids annotated as HEROES
     /// (`queueHero`). Drives the web monitor's purple-star mark + "Focus on heroes" filter,
@@ -1084,26 +1112,28 @@ final class AgentDashboardModel: ObservableObject {
     /// split is never offered in the Show popover.
     var hiddenAgents: [HiddenAgent] {
         live
-            .filter { hidden.contains($0.id) && agents[$0.id] != nil }
-            .map { HiddenAgent(id: $0.id, title: $0.title, agent: agents[$0.id]) }
+            .filter { hidden.contains($0.id) && isAgentSurface($0.id) }
+            .map { HiddenAgent(id: $0.id, title: $0.title, agent: displayAgentKind($0.id)) }
             .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
     private func rebuildEntriesFromCurrentState() {
-        // LOCKED "agent-only": a tile exists ONLY for a live split the detector
-        // matched as a CLI agent (`agents[id] != nil`). A plain shell / vim /
-        // any non-agent split is never rendered, so spec §2.6 state-2
-        // ("No CLI agents running.") is reachable whenever a terminal is open
-        // but no agent is detected.
+        // "agent-only": a tile exists ONLY for a live split that is an AGENT — either the
+        // detector matched a CLI agent OR Claude's own hook has reported state for it
+        // (`isAgentSurface`, which is what makes a CROSS-HOST agent visible: the /proc
+        // descent gives up on a pool wrapper's `claude`+`sleep` pair). A plain shell / vim
+        // / any non-agent split is still never rendered, so spec §2.6 state-2
+        // ("No CLI agents running.") remains reachable whenever a terminal is open but no
+        // agent is detected.
         let built: [AgentEntry] = live
-            .filter { agents[$0.id] != nil }
+            .filter { isAgentSurface($0.id) }
             .map { s in
                 AgentEntry(
                     id: s.id,
                     realView: s.view,
                     title: s.title,
                     pwd: s.pwd,
-                    agent: agents[s.id],
+                    agent: displayAgentKind(s.id),
                     bell: bells[s.id] ?? false,
                     attention: attention[s.id] ?? false,
                     hidden: hidden.contains(s.id),
@@ -1376,7 +1406,7 @@ final class AgentDashboardModel: ObservableObject {
     /// annotations are pruned only on vanish). Feeds the collapsed-section summary.
     private func hiddenCountByOrigin() -> [String: Int] {
         var out: [String: Int] = [:]
-        for s in live where hidden.contains(s.id) && agents[s.id] != nil {
+        for s in live where hidden.contains(s.id) && isAgentSurface(s.id) {
             let o: String
             if let q = annotations[s.id]?.queueName, !q.isEmpty { o = q }
             else { o = AgentDashboardModel.otherOrigin }
