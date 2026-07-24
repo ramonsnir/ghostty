@@ -1085,7 +1085,11 @@ final class AgentDashboardModel: ObservableObject {
                 lastPrompt: lastPrompt[id],
                 lastTool: lastTool[id],
                 notes: annotations[id]?.summary,
-                agentKind: agents[id]?.command,
+                // (cloud-hardening) Use the DISPLAY kind, not the raw detector map: the
+                // sidecar's agent detection keys off `agentKind`, so a cross-host agent the
+                // /proc descent could not classify would otherwise get NO Haiku status
+                // annotation even though its tile now exists. Hook-implied `claude` fills in.
+                agentKind: displayAgentKind(id)?.command,
                 hidden: hidden.contains(id),
                 queueKey: annotations[id]?.queueKey,
                 queueName: annotations[id]?.queueName,

@@ -1609,7 +1609,10 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   hook-implied `AgentKind("claude")` so the tile badge + the hover controls that gate on a
   non-nil kind keep working, while a DETECTED kind still WINS (a Codex agent is never relabeled).
   A plain shell (no detection, no hook) is STILL never a tile, so the "agent-only" guarantee +
-  spec §2.6 state-2 hold. Applied at all four gates (`liveAgentIDs`, `rebuildEntriesFromCurrentState`,
+  spec §2.6 state-2 hold. **`hookSnapshot` emits the DISPLAY kind too** — its `agentKind` feeds
+  MCP `list_surfaces`, and the Agent Manager SIDECAR keys its agent detection off that field, so
+  leaving it nil would give the cross-host tile NO Haiku status annotation even once it renders.
+  Applied at all four gates (`liveAgentIDs`, `rebuildEntriesFromCurrentState`,
   `hiddenAgents`, the hidden loop). The deeper `pickDescendChild` fix (prefer a known-agent child
   over an ambiguous helper) is DEFERRED: it links into `ghostty-host`, so it needs a Linux host
   rebuild + restart on the box, which would KILL the running cloud agents.

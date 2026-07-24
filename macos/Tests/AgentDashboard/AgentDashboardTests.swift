@@ -1400,6 +1400,21 @@ struct AgentDashboardHookStateTests {
         #expect(model.displayAgentKind(a) == nil)
     }
 
+    // (cloud-hardening) `hookSnapshot`'s agentKind feeds MCP `list_surfaces`, and the Agent
+    // Manager SIDECAR keys its agent detection off that field — so a cross-host agent the
+    // /proc descent could not classify must still report a kind, or its tile exists but gets
+    // NO Haiku status annotation.
+    @Test func hookSnapshotReportsAKindForAHookOnlyAgent() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.working))     // hook only — no applyAgents
+        #expect(model.hookSnapshot()[a]?.agentKind == "claude")
+        // A detected kind still wins here too.
+        model.applyAgents([a: AgentKind("codex")])
+        #expect(model.hookSnapshot()[a]?.agentKind == "codex")
+    }
+
     @Test func hookBackedInsertedOnFirstEvent() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
