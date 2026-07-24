@@ -360,13 +360,19 @@ struct MCPServerTests {
             "describe_config_key", "list_config_keys",
             // Agent Manager: Haiku usage/budget query.
             "get_haiku_usage",
+            // (cloud-hosts + Agent Queue) Scripted adopt — the no-click twin of the
+            // dashboard tile's "Adopt…" button. THE 27th tool.
+            "adopt_split",
         ]
-        // (adopt) The "Adopt a free split into a queue" feature added NO MCP tool: the
-        // adopt/infer_key queue commands ride the existing `take_queue_commands` tool, and
-        // the `queueKeySuggested` annotation field rides the existing
-        // `set_surface_annotation` tool — so the registered tool count stays 26.
+        // (adopt) The original "Adopt a free split into a queue" feature added NO MCP tool:
+        // the adopt/infer_key queue commands ride the existing `take_queue_commands` tool,
+        // and the `queueKeySuggested` annotation field rides the existing
+        // `set_surface_annotation` tool — which kept the count at 26.
+        // (cloud-hardening) `adopt_split` DID add one — 26 → 27 — because a SCRIPT has no
+        // way to enqueue a queue control command otherwise (the GUI posts the notification;
+        // the sidecar only ever DRAINS via take_queue_commands).
         #expect(names == expected)
-        #expect(tools.count == 26)
+        #expect(tools.count == 27)
         for tool in tools {
             let schema = tool["inputSchema"] as! [String: Any]
             #expect(schema["type"] as? String == "object")
@@ -668,6 +674,65 @@ struct MCPServerTests {
         switch MCPTools.dispatch(name: "nope", arguments: [:], server: server) {
         case .methodNotFound: break
         default: Issue.record("expected .methodNotFound")
+        }
+    }
+
+    // (cloud-hardening) `adopt_split` validates its args BEFORE touching the FIFO, and
+    // enqueues on the server's serial queue via `queue.async` — so it is AppKit-free and
+    // safe to dispatch straight from a tools/call handler (a nested `queue.sync` here would
+    // DEADLOCK, the trap `take_queue_commands` documents).
+    @Test func dispatchAdoptSplitRejectsBadArguments() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let uuid = UUID().uuidString
+        // Missing / empty run.
+        for args in [["key": "EX-1", "surfaceUUID": uuid],
+                     ["run": "", "key": "EX-1", "surfaceUUID": uuid],
+                     ["run": "   ", "key": "EX-1", "surfaceUUID": uuid]] {
+            switch MCPTools.dispatch(name: "adopt_split", arguments: args, server: server) {
+            case .invalidParams: break
+            default: Issue.record("expected .invalidParams for run=\(args["run"] ?? "<absent>")")
+            }
+        }
+        // Missing / empty key.
+        for args in [["run": "q", "surfaceUUID": uuid], ["run": "q", "key": " ", "surfaceUUID": uuid]] {
+            switch MCPTools.dispatch(name: "adopt_split", arguments: args, server: server) {
+            case .invalidParams: break
+            default: Issue.record("expected .invalidParams for a missing/blank key")
+            }
+        }
+        // Missing / malformed surfaceUUID (must be a real UUID, not any string).
+        for args in [["run": "q", "key": "EX-1"], ["run": "q", "key": "EX-1", "surfaceUUID": "not-a-uuid"]] {
+            switch MCPTools.dispatch(name: "adopt_split", arguments: args, server: server) {
+            case .invalidParams: break
+            default: Issue.record("expected .invalidParams for a bad surfaceUUID")
+            }
+        }
+    }
+
+    @Test func dispatchAdoptSplitAcceptsValidArgumentsAndTrims() {
+        let server = MCPServer(listen: "127.0.0.1:8765", token: "")
+        let uuid = UUID().uuidString
+        switch MCPTools.dispatch(
+            name: "adopt_split",
+            arguments: ["run": "  my-queue  ", "key": " EX-42 ", "surfaceUUID": uuid,
+                        "url": "https://example.com/EX-42"],
+            server: server
+        ) {
+        case .ok(let payload):
+            // Trimmed on the way in, so the sidecar matches the run/key exactly.
+            #expect(payload["run"] as? String == "my-queue")
+            #expect(payload["key"] as? String == "EX-42")
+            #expect(payload["ok"] as? Bool == true)
+        default: Issue.record("expected .ok for well-formed adopt_split args")
+        }
+        // `url` is optional — omitting it must still succeed.
+        switch MCPTools.dispatch(
+            name: "adopt_split",
+            arguments: ["run": "my-queue", "key": "EX-43", "surfaceUUID": uuid],
+            server: server
+        ) {
+        case .ok: break
+        default: Issue.record("expected .ok without a url")
         }
     }
 

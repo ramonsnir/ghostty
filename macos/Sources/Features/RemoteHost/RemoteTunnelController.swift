@@ -83,6 +83,25 @@ final class RemoteTunnelController {
     /// A master that ran at least this long before exiting resets its respawn budget, so a
     /// LATER transient drop gets a full quick-burst again (mirrors `mirrorStableSeconds`).
     static let respawnHealthyRunInterval: TimeInterval = 15
+
+    // --- Liveness watch (cloud-hardening) ---
+    /// How often a RETAINED, already-handshaked tunnel is re-probed. The transport
+    /// process exiting is caught for free by `handleMasterExit`, but a BLACK-HOLED
+    /// tunnel (laptop slept, WiFi roamed, gateway died) leaves `ssh` alive forever, so
+    /// nothing would respawn it. `checkMasterHealth` (`ssh -O check`) exists but has NO
+    /// production caller and is inapplicable to command mode, so this socket-handshake
+    /// probe — the SAME `ghostty_probe_host` used for readiness — is the transport-agnostic
+    /// liveness signal.
+    ///
+    /// ⚠️ Why we cannot just rely on ssh keepalives for command mode: a wrapper such as
+    /// `gcloud workstations ssh` injects its OWN `-o ServerAliveInterval=0` into the ssh
+    /// argv BEFORE our appended `-o ServerAliveInterval=15`, and OpenSSH takes the FIRST
+    /// value for a given option — so our keepalive is silently disabled and a dead tunnel
+    /// never self-terminates. This watch is what makes such a host recover.
+    static let livenessProbeInterval: TimeInterval = 30
+    /// Consecutive probe failures before the transport is declared dead. >1 so a single
+    /// transient blip (a slow gateway, a momentarily busy box) can't cause tunnel churn.
+    static let livenessFailureThreshold = 2
     /// (REG-T3) Compiled-in per-attempt connection ceiling (seconds) when
     /// `pty-remote-connect-timeout` is unset (0). Mirrors the core client's
     /// `DEFAULT_CONNECT_TIMEOUT_S`.
@@ -133,6 +152,9 @@ final class RemoteTunnelController {
     /// Monotonic per-host token; a bump (teardown, or a newer exit) cancels a pending
     /// scheduled respawn so it can't double-spawn.
     private var respawnGeneration: [String: Int] = [:]
+    /// (cloud-hardening) Monotonic per-host token; a bump (teardown, or a newer
+    /// handshake) cancels the in-flight liveness watch so only one runs per host.
+    private var livenessGeneration: [String: Int] = [:]
 
     /// The probe blocks up to `timeout_ms`, so it MUST run off the main thread.
     private let probeQueue = DispatchQueue(
@@ -237,6 +259,12 @@ final class RemoteTunnelController {
                         major: result.major,
                         minor: result.minor))
                     logger.info("remote host \(hostName, privacy: .public) handshaked (host protocol \(result.major).\(result.minor))")
+                    // (cloud-hardening) Now that the transport is proven up, watch it: a
+                    // BLACK-HOLED tunnel never exits on its own, so nothing else would
+                    // respawn it (especially in command mode, where a wrapper's injected
+                    // `-o ServerAliveInterval=0` beats our keepalive).
+                    startLivenessMonitor(
+                        hostName: hostName, socketPath: socketPath, timeoutMs: timeoutMs)
                 }
                 return
             }
@@ -400,6 +428,10 @@ final class RemoteTunnelController {
     /// terminationHandler's respawn gate declines (the intended-stop case).
     func teardown(hostName: String) {
         stopProbing(hostName: hostName)
+        // (cloud-hardening) Cancel the liveness watch too, or it could kill the transport
+        // of a host we deliberately tore down (and `wanted == 0` below would then make its
+        // exit handler skip the respawn — harmless, but the watch has no business running).
+        stopLivenessMonitor(hostName: hostName)
         let (master, forwarder, entry) = stateQueue.sync {
             () -> (Process?, Process?, RemoteHostEntry?) in
             wanted[hostName] = 0
@@ -559,6 +591,148 @@ final class RemoteTunnelController {
             return false
         }
         return proc.terminationStatus == 0
+    }
+
+    // MARK: - Liveness watch (cloud-hardening)
+
+    /// PURE: should `consecutiveFailures` failed liveness probes declare the transport
+    /// dead? Unit-tested so the threshold semantics (fail on the Nth, not the 1st) can't
+    /// drift.
+    static func shouldTripLiveness(consecutiveFailures: Int) -> Bool {
+        consecutiveFailures >= livenessFailureThreshold
+    }
+
+    /// Start (or restart) the liveness watch for a host that just handshaked. Cancels any
+    /// previous watch via a generation bump. Runs off the main thread on `probeQueue`.
+    ///
+    /// On `livenessFailureThreshold` CONSECUTIVE probe failures it force-kills the tracked
+    /// transport process, which fires the process's termination handler →
+    /// `handleMasterExit` → the EXISTING never-give-up respawn (with its backoff +
+    /// generation guard) → a fresh `startProbing` → on handshake, a fresh watch. So this
+    /// adds a detector, NOT a second recovery path.
+    private func startLivenessMonitor(
+        hostName: String,
+        socketPath: String,
+        timeoutMs: UInt32
+    ) {
+        let gen: Int = stateQueue.sync {
+            let g = (livenessGeneration[hostName] ?? 0) + 1
+            livenessGeneration[hostName] = g
+            return g
+        }
+        probeQueue.async { [weak self] in
+            self?.livenessLoop(
+                hostName: hostName, socketPath: socketPath,
+                timeoutMs: timeoutMs, generation: gen)
+        }
+    }
+
+    /// Cancel the in-flight liveness watch for a host (generation bump). Idempotent.
+    func stopLivenessMonitor(hostName: String) {
+        stateQueue.sync { livenessGeneration[hostName] = (livenessGeneration[hostName] ?? 0) + 1 }
+    }
+
+    private func isLivenessCurrent(_ hostName: String, _ generation: Int) -> Bool {
+        stateQueue.sync {
+            livenessGeneration[hostName] == generation && (wanted[hostName] ?? 0) > 0
+        }
+    }
+
+    private func livenessLoop(
+        hostName: String,
+        socketPath: String,
+        timeoutMs: UInt32,
+        generation: Int
+    ) {
+        var failures = 0
+        while isLivenessCurrent(hostName, generation) {
+            Thread.sleep(forTimeInterval: Self.livenessProbeInterval)
+            // Re-check AFTER the sleep: a teardown/newer handshake during the interval
+            // must win (and must not probe a socket we no longer own).
+            guard isLivenessCurrent(hostName, generation) else { return }
+
+            if Self.probe(socketPath: socketPath, timeoutMs: timeoutMs).handshaked {
+                failures = 0
+                continue
+            }
+            failures += 1
+            guard Self.shouldTripLiveness(consecutiveFailures: failures) else { continue }
+
+            logger.notice("remote host \(hostName, privacy: .public) liveness probe failed \(failures, privacy: .public)x — killing the transport so it respawns")
+            killTransportProcess(hostName: hostName)
+            // The termination handler drives the respawn (which restarts this watch on
+            // the next handshake), so this loop's job is done.
+            return
+        }
+    }
+
+    /// Force the tracked transport process for `hostName` to die so the shared
+    /// `handleMasterExit` respawn path runs. Command mode needs the process-GROUP kill
+    /// (its `-ilc` shell ignores SIGTERM — see `forceKillCommandProcess`); the default
+    /// `ssh` master responds to a plain terminate.
+    private func killTransportProcess(hostName: String) {
+        struct Target { var proc: Process?; var commandMode: Bool }
+        let t: Target = stateQueue.sync {
+            Target(
+                proc: masterProcesses[hostName],
+                commandMode: hostEntries[hostName]?.transportCommand != nil)
+        }
+        guard let proc = t.proc, proc.isRunning else { return }
+        if t.commandMode {
+            forceKillCommandProcess(proc)
+        } else {
+            proc.terminate()
+        }
+    }
+
+    // MARK: - Orphaned-forward reap (cloud-hardening)
+
+    /// PURE: parse `pgrep -f` output into pids, dropping anything in `excluding` (our own
+    /// pid, and its parent, so a reap can never target the GUI itself). Unit-tested.
+    static func parsePgrepPids(_ output: String, excluding: Set<Int32>) -> [Int32] {
+        output
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 > 1 && !excluding.contains($0) }
+    }
+
+    /// Kill any ORPHANED transport process still referencing `socketPath` in its argv.
+    ///
+    /// `masterProcesses` is in-memory only, so a GUI that crashed / was SIGKILLed (or lost
+    /// the clean-quit race) leaves its `ssh -N -L <socketPath>:…` — and, in command mode,
+    /// the login shell + any per-invocation gateway — running with nobody tracking them.
+    /// The socket FILE is already handled (the spawn unlinks and rebinds), but the orphan
+    /// processes accumulate across relaunches and can keep serving a stale forward. The
+    /// per-host forwarded socket path is deterministic, private to this app (under our 0700
+    /// dir) and appears verbatim in the forward's argv, so it is a precise reap key.
+    /// Best-effort: `pgrep` missing / no match / a kill failing are all silent no-ops.
+    private func reapOrphanedForwards(socketPath: String) {
+        let pgrep = "/usr/bin/pgrep"
+        guard FileManager.default.isExecutableFile(atPath: pgrep) else { return }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pgrep)
+        proc.arguments = ["-f", socketPath]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        proc.standardInput = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return
+        }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        let mine: Set<Int32> = [getpid(), getppid()]
+        let pids = Self.parsePgrepPids(String(decoding: data, as: UTF8.self), excluding: mine)
+        guard !pids.isEmpty else { return }
+        logger.notice("reaping \(pids.count, privacy: .public) orphaned forward process(es) holding \(socketPath, privacy: .public)")
+        for pid in pids {
+            // Group first (reaps a command-mode shell's ssh child + gateway), then the pid.
+            // A pid that never led a group makes `kill(-pid, …)` a harmless ESRCH no-op.
+            kill(-pid, SIGKILL)
+            kill(pid, SIGKILL)
+        }
     }
 
     // MARK: - Remote project listing (P2, cloud-hosts)
@@ -880,6 +1054,10 @@ final class RemoteTunnelController {
     ) throws {
         // Best-effort cleanup of a stale forwarded socket (an `ssh -L` refuses to bind onto
         // an existing path; the remote host unlinks-and-rebinds its own end).
+        // (cloud-hardening) FIRST reap any orphaned forward from a previous GUI that died
+        // without running teardown — unlinking the socket frees the NAME but leaves those
+        // processes (shell + ssh + gateway) running, accumulating across relaunches.
+        reapOrphanedForwards(socketPath: localSocket)
         try? FileManager.default.removeItem(atPath: localSocket)
 
         let argv = Self.singleForwardArgv(

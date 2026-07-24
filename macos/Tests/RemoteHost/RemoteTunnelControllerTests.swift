@@ -446,3 +446,51 @@ final class FakeHostSocket {
 
     enum SocketError: Error { case create, bind, listen, pathTooLong }
 }
+
+// MARK: - Liveness watch + orphan reap (cloud-hardening)
+
+@Suite("RemoteTunnel hardening")
+struct RemoteTunnelHardeningTests {
+    // The transport process exiting is caught for free; a BLACK-HOLED tunnel is not, and a
+    // wrapper (e.g. a Cloud-Workstations launcher) can inject `-o ServerAliveInterval=0`
+    // AHEAD of our `=15` — OpenSSH takes the FIRST value, so our keepalive is disabled and
+    // the dead tunnel never exits. Hence the periodic handshake probe. Threshold > 1 so one
+    // transient blip can't churn the tunnel.
+    @Test func livenessTripsOnlyAtTheThreshold() {
+        #expect(RemoteTunnelController.livenessFailureThreshold > 1)
+        for failures in 0..<RemoteTunnelController.livenessFailureThreshold {
+            #expect(RemoteTunnelController.shouldTripLiveness(consecutiveFailures: failures) == false)
+        }
+        #expect(RemoteTunnelController.shouldTripLiveness(
+            consecutiveFailures: RemoteTunnelController.livenessFailureThreshold) == true)
+        // Past the threshold stays tripped (no wrap-around / off-by-one).
+        #expect(RemoteTunnelController.shouldTripLiveness(
+            consecutiveFailures: RemoteTunnelController.livenessFailureThreshold + 5) == true)
+    }
+
+    @Test func livenessProbeIntervalIsSaneAndPositive() {
+        #expect(RemoteTunnelController.livenessProbeInterval > 0)
+        // Must be well under the steady respawn cadence so a dead tunnel is DETECTED
+        // long before we'd otherwise notice, but not so tight that it spams the box.
+        #expect(RemoteTunnelController.livenessProbeInterval <= RemoteTunnelController.respawnSteadyDelay)
+    }
+
+    // The reap key is a per-host, app-private socket path, but the SAFETY property is that
+    // it can never target this process or its parent — killing our own group would take the
+    // GUI down with it.
+    @Test func parsePgrepPidsExcludesSelfAndParentAndJunk() {
+        let out = "4242\n\(getpid())\n\(getppid())\n7\nnot-a-pid\n\n  9  \n1\n0\n-3\n"
+        let pids = RemoteTunnelController.parsePgrepPids(out, excluding: [getpid(), getppid()])
+        #expect(pids == [4242, 7, 9])
+        #expect(!pids.contains(getpid()))
+        #expect(!pids.contains(getppid()))
+        // pid 1 (launchd) and non-positive values are never reaped.
+        #expect(!pids.contains(1))
+        #expect(!pids.contains(0))
+    }
+
+    @Test func parsePgrepPidsEmptyOutputYieldsNothing() {
+        #expect(RemoteTunnelController.parsePgrepPids("", excluding: []).isEmpty)
+        #expect(RemoteTunnelController.parsePgrepPids("\n\n  \n", excluding: []).isEmpty)
+    }
+}

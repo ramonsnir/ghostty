@@ -1535,6 +1535,74 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   teardown depends on).
   See `CLOUD-HOSTS-DESIGN.md` (→ Phase 6 / Config keys).
 
+- **Cloud-hosted terminals — hardening: tunnel LIVENESS watch + orphan-forward REAP +
+  the `adopt_split` MCP tool** (fork-only, macOS; GUI-lib + Zig-client only — NO host /
+  protocol / wire change). Three fixes found by running a real cloud session, plus the
+  scripted-adopt entry point that makes "launch on a box, tracked by a local queue" work
+  without a click.
+  **(1) LIVENESS WATCH — the tunnel-never-recovers hole.** `handleMasterExit` only respawns
+  when the transport process EXITS, and `checkMasterHealth` (`ssh -O check`) had **NO
+  production caller at all** (only a test) and is inapplicable to command mode. So a
+  BLACK-HOLED tunnel (laptop slept, WiFi roamed, gateway died) left `ssh` alive forever →
+  nothing respawned it → the remote split could not reattach. **⚠️ And ssh keepalives can't
+  save it in command mode: a wrapper (e.g. a Cloud-Workstations launcher) injects its OWN
+  `-o ServerAliveInterval=0` into the ssh argv BEFORE our appended `=15`, and OpenSSH takes
+  the FIRST value for an option — so our keepalive is silently DISABLED and the dead tunnel
+  never self-terminates.** Fix: once a host HANDSHAKES, `startLivenessMonitor` re-probes the
+  forwarded socket every `livenessProbeInterval` (30s) with the SAME transport-agnostic
+  `ghostty_probe_host` handshake used for readiness; after `livenessFailureThreshold` (2 —
+  >1 so one blip can't churn) CONSECUTIVE failures it FORCE-KILLS the tracked transport
+  (process-GROUP kill in command mode, `terminate()` for a default ssh master), whose
+  termination handler fires the EXISTING `handleMasterExit` → backoff respawn → fresh probe →
+  fresh watch. So this adds a DETECTOR, not a second recovery path. Generation-token
+  cancellable (`livenessGeneration`), gated on `wanted > 0`, re-checked after the sleep, and
+  cancelled in `teardown`.
+  **(2) ORPHAN-FORWARD REAP.** `masterProcesses` is in-memory, so a GUI that crashed / was
+  SIGKILLed leaves its `ssh -N -L <sock>:…` (plus, in command mode, the login shell + any
+  per-invocation gateway) running untracked; they accumulate across relaunches and can keep
+  serving a stale forward. The socket FILE was already handled (the spawn unlinks + rebinds
+  — that frees the NAME, not the processes). Fix: `reapOrphanedForwards(socketPath:)` runs
+  `pgrep -f <socketPath>` before a command-mode spawn and SIGKILLs the group + pid of each
+  match. The per-host forwarded socket path is deterministic, app-private (under our 0700
+  dir) and appears verbatim in the forward's argv, so it is a precise key; the pure
+  `parsePgrepPids(_:excluding:)` **always excludes our own pid + parent** (killing our group
+  would take the GUI down) and never pid ≤ 1.
+  **(3) `adopt_split` — the FIRST new MCP tool in a while: count 26 → 27** (update the
+  `toolsListHasAllTools` assertion). Everything else rides existing tools, but a SCRIPT had
+  no way to enqueue a queue control command at all: the GUI POSTS `.ghosttyQueueCommand` and
+  the sidecar only ever DRAINS via `take_queue_commands`. `adopt_split{run,key,surfaceUUID,
+  url?}` enqueues the SAME `adopt` command the dashboard button posts, onto the SAME FIFO,
+  via `server.enqueueQueueCommand` — which uses `queue.async` (**NOT `sync` — a nested sync
+  from `dispatch()` would DEADLOCK on that serial queue, the trap `take_queue_commands`
+  documents**) and fires `bus.recordQueueCommand()` so the sidecar drains it in ~1
+  round-trip. AppKit-free; args are validated (trimmed non-empty run/key + a REAL `UUID`)
+  before the FIFO is touched; the SIDECAR stays authoritative for latch/dedup
+  (`adoptDecision` rejects a key already active). **This is what makes the intended split
+  work: keep the queue template dispatching LOCALLY (`host` absent/`"local"`), launch chosen
+  agents ON a box, and adopt them in.** Adopt is fully HOST-AGNOSTIC — `runAdopt` has no host
+  gate, and reconcile DERIVES the host from the live row's composite `sessionID`
+  (`parseSessionKey`), so an adopted REMOTE split records `Assignment.hostName = <box>` and
+  feeds per-host occupancy correctly. **⚠️ The launcher MUST go through MCP
+  `spawn_split_command` (with `host`), NOT the `new_split_on_host` keybind/palette** — the
+  correlation NONCE is minted + registered ONLY on the MCP spawn path (`MCPLayout` →
+  `RemoteAgentIdentity.mintNonce()` → `export GHOSTTY_SURFACE_NONCE=…` via `initial_input`),
+  and without it the box's hook can't self-identify, so the tile shows the agent but never
+  its working/waiting state and the queue can't auto-close it. (A machine-local
+  `launch-on-box` helper in `~/.local/bin` — untracked, it carries a real host name — does
+  spawn-then-optionally-adopt in one call.)
+  Wiring: core — `src/termio/Client.zig` (see the deliberate-close/`closing` note in the
+  Phase-2 bullet above). macOS — `RemoteTunnelController.swift`
+  (`livenessProbeInterval`/`livenessFailureThreshold`/`shouldTripLiveness`/
+  `livenessGeneration`/`startLivenessMonitor`/`stopLivenessMonitor`/`isLivenessCurrent`/
+  `livenessLoop`/`killTransportProcess` + `parsePgrepPids`/`reapOrphanedForwards`, the
+  handshake hook in `probeLoop`, the reap in `spawnCommandTunnel`, the cancel in `teardown`),
+  `MCPTools.swift` (`adopt_split` schema + dispatch). Tests: Swift
+  `RemoteTunnelControllerTests` (`RemoteTunnelHardeningTests`: liveness threshold matrix +
+  interval sanity + `parsePgrepPids` self/parent/junk exclusion + empty), `MCPServerTests`
+  (`toolsListHasAllTools` count **27**, `dispatchAdoptSplitRejectsBadArguments`,
+  `dispatchAdoptSplitAcceptsValidArgumentsAndTrims`). **GUI relaunch + a lib/xcframework
+  rebuild (the Zig `closing` change); NO host restart.**
+
 ## Fork-identity / non-functional changes
 - **Bundle id** `com.mitchellh.ghostty-ramon` for Release, `.local` for the in-tree ReleaseLocal dev build, `.debug` for Debug — all coexist with the official `com.mitchellh.ghostty`, each with its own state/defaults domain. (`macos/Ghostty.xcodeproj/project.pbxproj`, `DockTilePlugin.swift` reads the host bundle id at runtime so each domain reads its own defaults.)
 - **Display name** "Ghostty (ramon)" for Release, "Ghostty (ramon-local)" for ReleaseLocal — so the installed app and the in-tree dev build are visually distinguishable in the dock and ⌘-Tab.

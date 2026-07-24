@@ -311,6 +311,38 @@ The `ssh` target (`cloud-1`) is a tailnet name. Two auth options, both fine:
 Either way the forwarded socket **never leaves the cloud box's loopback namespace** — only the
 SSH stream crosses the network (encrypted).
 
+#### Tunnel liveness watch + orphan-forward reap — hardening ✅
+
+Two holes found by running a real cloud session end-to-end (both bite exactly the
+"leave a session running on the box" use case):
+
+- **A black-holed tunnel never recovered.** Respawn is driven by the transport process
+  EXITING (`handleMasterExit`), and `checkMasterHealth` (`ssh -O check`) turned out to have
+  **no production caller at all** — plus it is inapplicable to command mode. So when a tunnel
+  went dead-but-alive (laptop slept, WiFi roamed, gateway died) `ssh` sat there forever and
+  nothing respawned it. **And ssh keepalives cannot rescue command mode: a wrapper such as
+  `gcloud workstations ssh` injects its own `-o ServerAliveInterval=0` into the ssh argv
+  BEFORE our appended `-o ServerAliveInterval=15`, and OpenSSH honors the FIRST value for an
+  option** — so the keepalive we pass is silently disabled and the connection never
+  self-terminates. Fix: after a host handshakes, a **liveness watch** re-probes the forwarded
+  socket every 30s using the same transport-agnostic `ghostty_probe_host` handshake as
+  readiness; two CONSECUTIVE failures force-kill the tracked transport (process-GROUP kill in
+  command mode) and the EXISTING backoff respawn takes it from there. A detector, not a second
+  recovery path — generation-cancellable, gated on the surface refcount, cancelled by teardown.
+- **Orphaned forwards accumulated across GUI restarts.** `masterProcesses` is in-memory, so a
+  GUI that crashed or was SIGKILLed leaves its `ssh -N -L …` (and in command mode the login
+  shell + any per-invocation gateway) running untracked. The socket FILE was already handled
+  (the spawn unlinks and rebinds — that frees the *name*, not the processes). Fix: before a
+  command-mode spawn, `pgrep -f <forwarded socket path>` and SIGKILL the group + pid of each
+  match. The path is deterministic, app-private and appears verbatim in the forward's argv, so
+  it is a precise key; the pure pid parser always excludes our own pid + parent (killing our
+  own group would take the GUI down) and never touches pid ≤ 1.
+
+A third fix belongs to the session layer rather than the transport: a **deliberate close no
+longer triggers a redial** — `closeSession` sets an atomic `closing` before sending the `Close`
+frame, and `classifyDrop` returns "leave the state alone" whenever it is set, so closing a
+remote split no longer flashes "Reconnecting…" then "session ended" on a dying pane.
+
 #### Per-host transport-command override (single-forward mode) — Phase 6 ✅
 
 Some boxes are **not** reachable by a plain `ssh <target>`. A common case is a box reached only

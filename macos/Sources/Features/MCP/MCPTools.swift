@@ -64,6 +64,23 @@ enum MCPTools {
             ],
         ],
         [
+            // (ramon fork / cloud-hosts + Agent Queue) SCRIPTED adopt — the no-click twin
+            // of the dashboard tile's "Adopt…" button.
+            "name": "adopt_split",
+            "description": "Agent Queue: ADOPT an existing agent split into a RUNNING queue, so the supervisor tracks it like a dispatched item (status polling, keep/auto-close, health counts). This is the scripted equivalent of the dashboard tile's 'Adopt…' button and enqueues the SAME `adopt` control command onto the SAME FIFO, so it takes effect in ~1 sidecar round-trip. USE CASE: launch an agent yourself — e.g. `spawn_split_command` with `host` set, to place it on a cloud box — then hand it to a queue that otherwise dispatches locally. The sidecar is AUTHORITATIVE: it LATCHES the key at adopt time (blocking a second dispatch of a still-listed item), REJECTS a key already active in that run, moves the split into the run's grid, and fires the provider `claim`; a rejected/unknown run or duplicate key is logged sidecar-side and this call still returns ok (fire-and-forget enqueue, like every other queue control). The adopted split's HOST is derived from its own session identity, so adopting a REMOTE split records that box correctly.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "run": ["type": "string", "description": "The running queue's name (= run/origin name), as reported by report_queue_status."],
+                    "key": ["type": "string", "description": "The work-item key to track this split as (e.g. an issue key). Must not already be active in the run."],
+                    "surfaceUUID": ["type": "string", "description": "The surface UUID of the split to adopt (the `id` from list_surfaces / spawn_split_command)."],
+                    "url": ["type": "string", "description": "Optional work-item URL for the dashboard's clickable badge."],
+                ],
+                "required": ["run", "key", "surfaceUUID"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
             "name": "send_text",
             "description": "Type text into a surface as real key events (NOT a paste). submit:true appends a Return to submit. Does not focus the surface.",
             "inputSchema": [
@@ -688,6 +705,27 @@ enum MCPTools {
             }
             let ok = server.applyQueueGraph(payload.graph)
             return ok ? .ok(["ok": true]) : .toolError("queue graph not applied")
+
+        case "adopt_split":
+            // (cloud-hosts + Agent Queue) Enqueue the SAME `adopt` command the dashboard
+            // button posts. `enqueueQueueCommand` hops onto this very serial queue with
+            // `queue.async` (NOT sync — so calling it from dispatch() cannot deadlock) and
+            // fires the bus wake so the sidecar drains it in ~1 round-trip. The sidecar's
+            // reducer owns the latch/dedup decision; we only validate the arguments.
+            guard let run = (arguments["run"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !run.isEmpty
+            else { return .invalidParams("missing or empty run") }
+            guard let key = (arguments["key"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty
+            else { return .invalidParams("missing or empty key") }
+            guard let uuidString = arguments["surfaceUUID"] as? String,
+                  let uuid = UUID(uuidString: uuidString)
+            else { return .invalidParams("missing or malformed surfaceUUID") }
+            let adoptURL = (arguments["url"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            server.enqueueQueueCommand(QueueCommand(
+                action: .adopt, run: run, key: key,
+                surfaceUUID: uuid.uuidString, url: adoptURL))
+            return .ok(["ok": true, "run": run, "key": key])
 
         case "take_queue_commands":
             // dispatch() ALREADY runs on the server serial `queue` (handleRPC is a

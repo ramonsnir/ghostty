@@ -1288,6 +1288,23 @@ or host change** (pure Swift + TS).
 
 ### Adopting a free split into a queue (the `adopt` + `infer_key` commands)
 
+> **Scripted adopt (no click): the `adopt_split` MCP tool.** Everything below describes the
+> dashboard **Adopt…** button, but the same `adopt` command can be enqueued from a script via
+> the `adopt_split{run, key, surfaceUUID, url?}` MCP tool (MCP-SERVER.md). It exists because a
+> script otherwise has NO way to enqueue a queue control command — the GUI *posts*
+> `.ghosttyQueueCommand`, the sidecar only *drains* via `take_queue_commands`. Same FIFO, same
+> reducer, same ~1-round-trip wake; the sidecar stays authoritative for latch/dedup.
+> **The main use case is the local-queue / cloud-agent split:** leave the template dispatching
+> LOCALLY (`host` absent/`"local"`), launch the agents you want on a box with
+> `spawn_split_command` + `host`, then `adopt_split` them in — the queue then tracks them
+> (status polling, keep, auto-close) exactly like dispatched items. Adopt is host-agnostic:
+> `runAdopt` has no host gate and reconcile DERIVES the host from the live row's composite
+> `sessionID`, so an adopted remote split records `Assignment.hostName = <box>` and counts
+> toward that box's occupancy. ⚠️ Launch through `spawn_split_command` (NOT the
+> `new_split_on_host` keybind): the cross-host correlation nonce is minted only on the MCP
+> spawn path, and without it the box's hook can't report working/waiting state, so the queue
+> can never see the agent go idle and will not auto-close it.
+
 - **WHAT** — a dashboard tile **Adopt…** button (on a non-queue CLI-agent tile) pulls a
   human-created split into a running Agent Queue so the queue tracks it like a dispatched item:
   it MOVES the split into the run's grid tab, LATCHES the work-item key, follows the template's

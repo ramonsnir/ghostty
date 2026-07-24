@@ -137,7 +137,7 @@ committed `.mcp.json` needs. (The shim changes rarely — rebuild only if `main.
 
 ## The tools
 
-The server registers **26** tools total: the 12 agent-control tools documented here,
+The server registers **27** tools total: the 12 agent-control tools documented here,
 `set_attention` (the Bell Attention promotion tool — see BELL-ATTENTION.md), `get_haiku_usage`
 (Agent Manager budget query — see AGENT-MANAGER.md), the queue-supervisor internals (driven by
 the Agent Queue sidecar, not meant for hand use — see AGENT-QUEUE.md), and the 4 read-only
@@ -418,7 +418,7 @@ hook reads), so the committed JSON needs no token. Dev identities still reachabl
 `macos/mcp-shim/Sources/ghostty-mcp/main.swift` (`tokenFromLocalConfig`); see "Connecting
 an agent" above.
 
-### The registered tools (26)
+### The registered tools (27)
 
 The 12 agent-control tools: `list_surfaces`, `read_surface`, `get_layout`, `send_text`,
 `send_key`, `scroll`, `wait_for_event`, `watch_for_pattern`, `focus_surface`, `new_tab`,
@@ -436,10 +436,29 @@ split" Haiku key-inference writes back for the GUI to prefill, plus the Hero-Age
 the Hero-Agents `promote`/`demote` commands, and `list_surfaces` rows echo an optional `hero`
 flag (the reconcile-visibility read-back) — none of these adds a NEW tool, so the count below
 is unchanged. See HERO-AGENTS.md for the hero wire contract)
-and the 4 knowledge tools below. So the inventory is **12 agent-control + `set_attention` +
-`get_haiku_usage` + 8 queue/supervisor + 4 knowledge = 26**, and
-`MCPServerTests.toolsListHasAllTools` asserts the total is **26** — keep it in sync when a tool
-is added or removed.
+the 4 knowledge tools below, and `adopt_split`. So the inventory is **12 agent-control +
+`set_attention` + `get_haiku_usage` + 8 queue/supervisor + 4 knowledge + `adopt_split` = 27**,
+and `MCPServerTests.toolsListHasAllTools` asserts the total is **27** — keep it in sync when a
+tool is added or removed.
+
+**`adopt_split{run, key, surfaceUUID, url?}`** (cloud-hardening) — ADOPT an existing agent
+split into a RUNNING Agent Queue: the scripted twin of the dashboard tile's "Adopt…" button.
+It exists because a script had NO way to enqueue a queue control command — the GUI *posts*
+`.ghosttyQueueCommand` and the sidecar only ever *drains* via `take_queue_commands` — so this
+is the one queue-control entry point on the MCP surface. It enqueues the SAME `adopt` command
+onto the SAME FIFO via `MCPServer.enqueueQueueCommand` (`queue.async`, so calling it from
+`dispatch()` — already on that serial queue — cannot deadlock; contrast the nested-`sync`
+warning on `take_queue_commands`) and fires the bus wake, so the sidecar applies it in ~1
+round-trip. Arguments are validated (trimmed non-empty `run`/`key`, a well-formed `UUID`)
+before the FIFO is touched; the SIDECAR remains authoritative for the latch/dedup decision
+(`adoptDecision` rejects a key already active in that run). Host-agnostic: reconcile derives
+the adopted split's host from its composite `sessionID`, so adopting a REMOTE split records
+`Assignment.hostName = <box>`. **Intended use — the local-queue / cloud-agent split:** keep
+the queue template dispatching locally, launch chosen agents on a box with
+`spawn_split_command` + `host`, then `adopt_split` them in. ⚠️ Launch via
+`spawn_split_command` (NOT the `new_split_on_host` keybind) — the cross-host correlation
+NONCE is minted only on the MCP spawn path, and without it the box's hook can't report
+working/waiting state and the queue can't auto-close the split.
 
 `list_surfaces` rows carry `id, title, pwd, window/tab/split position, focused, bell,
 exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /
