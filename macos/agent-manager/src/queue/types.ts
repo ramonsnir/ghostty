@@ -8,6 +8,8 @@
 // array, JSON over stdout); item fields reach the agent as ENV VARS, never spliced
 // into a shell line. NOTHING here is Linear/Git/issue-key aware.
 
+import type { HostSpec } from "./hostpool.js";
+
 // ---------------------------------------------------------------------------
 // Queue template (§5) — the team-specific policy layer, authored as JSON.
 // ---------------------------------------------------------------------------
@@ -277,6 +279,39 @@ export interface ScheduleSpec {
 export interface QueueTemplate {
   /** Shown as the dashboard ORIGIN (§11). Stable identity of the run. */
   name: string;
+  /** (ramon fork / cloud-hosts, Phase 4 O1) The REMOTE host this queue's AGENT splits run
+   *  on — a name in the `pty-remote-host` registry (resolved macOS-side to a forwarded socket).
+   *  Default `"local"` (the laptop's `pty-host` scalar / prior behavior). The PROVIDER commands
+   *  (`list`/`status`/`claim`/`graph`) ALWAYS run laptop-side (adopt option (b)); only the agent
+   *  split is placed on `host`. When `host !== "local"` the agent's cwd + template dir are the
+   *  HOST-RELATIVE `agentWorkdir` / `remoteTemplateDir` (NOT laptop-expanded). See CLOUD-HOSTS.
+   *  OPTIONAL in the type (validateTemplate ALWAYS sets it to "local" when the JSON omits it);
+   *  every runtime read defaults `?? "local"`, so a test/template literal without `host` is local.
+   *
+   *  (ramon fork / cloud-hosts, Phase 5) When the template declares a `hosts[]` POOL, that pool
+   *  is authoritative for PLACEMENT (see `hosts`); this scalar `host` remains the single-entry
+   *  fallback (and the pre-pool wire) so a template with only `host` is a single-entry pool. */
+  host?: string;
+  /** (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) The weighted host POOL the
+   *  supervisor spreads this queue's AGENT splits across by CAPACITY (see CLOUD-QUEUE-BALANCING.md
+   *  + queue/hostpool.ts). When present + non-empty it is authoritative for placement (each new
+   *  agent goes to `argmin(activeOnHost / (maxConcurrent × weight))` among hosts with a free slot);
+   *  a full/down pool makes the item WAIT with a `hostCapacity` block reason. ABSENT ⇒ the scalar
+   *  `host` is used as a single UNBOUNDED-capacity pool (byte-identical to the pre-pool behavior).
+   *  Runtime code reads the NORMALIZED pool (`normalizeHostPool(template)`), never this field or
+   *  the scalar directly, so a half-migration can't silently route everything to `local`. */
+  hosts?: HostSpec[];
+  /** (ramon fork / cloud-hosts, Phase 4 O1) The agent split's cwd WHEN `host !== "local"` — an
+   *  ABSOLUTE path ON THE BOX (host-relative). NOT `~`-expanded against the LAPTOP home (the box's
+   *  home differs); passed through verbatim. Absent ⇒ the agent split falls back to `workdir`
+   *  (only sensible for a local run). Ignored when `host === "local"`. */
+  agentWorkdir?: string;
+  /** (ramon fork / cloud-hosts, Phase 4 O1) The template's script directory ON THE BOX (absolute,
+   *  host-relative) — routed into the AGENT `agent.command`'s `{templateDir}` token +
+   *  `GHOSTTY_QUEUE_TEMPLATE_DIR` when `host !== "local"`, so a shared-repo agent launcher can find
+   *  its sibling scripts on the box. The four PROVIDER/param `{templateDir}` sites keep the LAPTOP
+   *  dir (they run laptop-side). Absent / local ⇒ the laptop template dir is used everywhere. */
+  remoteTemplateDir?: string;
   /** The split cwd; `~` is expanded macOS-side (the sidecar passes it through). */
   workdir: string;
   agent: AgentSpec;
@@ -323,12 +358,18 @@ export interface QueueTemplate {
  *   - "maxItems"          — the run's lifetime dispatch budget is exhausted.
  *   - "queueConcurrency"  — the run's `concurrency` slots are all occupied.
  *   - "globalConcurrency" — the fleet-wide `agent-queue-max-total` is exhausted.
- *   - "heroSlots"         — a HERO item and the fleet-wide `agent-queue-hero-max` is full. */
+ *   - "heroSlots"         — a HERO item and the fleet-wide `agent-queue-hero-max` is full.
+ *   - "hostCapacity"      — (cloud-hosts Phase 5) the item cleared its OTHER gates but NO host in
+ *                           the queue's pool has a free slot (every box is at its `maxConcurrent`,
+ *                           or down + on cooldown). Computed only AFTER the concurrency/maxItems/
+ *                           hero gates clear, so the operator is never told to bump `maxItems`
+ *                           when the real block is a full/down box. */
 export type BlockReason =
   | "maxItems"
   | "queueConcurrency"
   | "globalConcurrency"
-  | "heroSlots";
+  | "heroSlots"
+  | "hostCapacity";
 
 // ---------------------------------------------------------------------------
 // Work item (§5) — the genericity-boundary unit a provider emits.
@@ -389,8 +430,18 @@ export interface Assignment {
   /** The work-item dedup key. */
   key: string;
   /** The stable host session id — the persistence/re-adoption key (§9). 0/absent
-   *  until the spawn returns it. */
+   *  until the spawn returns it. NOTE: only unique WITHIN a host — the cross-host
+   *  persistence/re-adoption key is the `(hostName, sessionID)` PAIR (see `sessionKey` +
+   *  `Assignment.hostName`), so two boxes can each mint session id 5 without colliding. */
   sessionID: number;
+  /** (ramon fork / cloud-hosts, Phase 4 Q1) The host this assignment's session lives on —
+   *  paired with `sessionID` to form the cross-host identity key (`sessionKey`). Recorded from the
+   *  DISPATCH CONTEXT (`template.host`), NOT the spawn reply (which carries only a numeric id).
+   *  OPTIONAL / OMITTED ⇒ `"local"` (a laptop/local session, or a pre-migration store record with
+   *  no host) — every read defaults to `"local"` and a local record OMITS it, so all existing
+   *  single-host state serializes + round-trips BYTE-IDENTICALLY. Set (to a non-"local" name) only
+   *  for a remote-host dispatch. */
+  hostName?: string;
   /** The current GUI surface UUID (freshly minted each launch; null until known). */
   surfaceUUID?: string;
   /** The grid slot index this assignment occupies (§12). */
@@ -410,4 +461,52 @@ export interface Assignment {
    *  pools), is kept-by-default (never auto-closed), and lives in its own dedicated tab.
    *  Flipped by the `promote`/`demote` commands. */
   hero: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 4 Q1/Q2) Cross-host identity key.
+// ---------------------------------------------------------------------------
+
+/**
+ * The CROSS-HOST session identity key: `"${hostName}:${sessionID}"`. PURE. This is the
+ * EXACT composite the macOS `MCPLayout.surfacesJSONData` emits for a `list_surfaces` row's
+ * `sessionID` (the matched Q2 emit↔parse pair), so the sidecar keys its reconcile /
+ * schedule maps on it. A numeric `sessionID` is unique only WITHIN a host — pairing it with
+ * the host lets two boxes each mint id 5 without a false reconcile match.
+ */
+export function sessionKey(hostName: string, sessionID: number): string {
+  return `${hostName}:${sessionID}`;
+}
+
+/**
+ * Parse a WIRE `sessionID` value (the `list_surfaces` composite string, or a legacy bare
+ * number, or absent) into the `(hostName, sessionID)` pair. PURE + TOLERANT — the matched
+ * PARSE side of the Q2 emit. Rules (must agree with the macOS emit byte-for-byte):
+ *   - a `number` (pre-migration emit) → `{hostName:"local", sessionID:n}`;
+ *   - a string with a colon → split on the LAST `:` into `(hostName, u64)`; an empty
+ *     left side or an unparseable right side falls back to `"local"` / `0`;
+ *   - a string with NO colon → a bare-number legacy value → host `"local"`, id = parsed int;
+ *   - anything else (undefined / null / NaN) → `{hostName:"local", sessionID:0}`.
+ * A `sessionID` of 0 is "unknown / not yet attached" — never a match key (the caller skips it).
+ */
+export function parseSessionKey(raw: unknown): { hostName: string; sessionID: number } {
+  if (typeof raw === "number") {
+    return { hostName: "local", sessionID: Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0 };
+  }
+  if (typeof raw !== "string" || raw.length === 0) {
+    return { hostName: "local", sessionID: 0 };
+  }
+  const idx = raw.lastIndexOf(":");
+  if (idx < 0) {
+    // Bare-number legacy value with no host prefix.
+    const n = Number.parseInt(raw, 10);
+    return { hostName: "local", sessionID: Number.isFinite(n) && n > 0 ? n : 0 };
+  }
+  const host = raw.slice(0, idx);
+  const idStr = raw.slice(idx + 1);
+  const n = Number.parseInt(idStr, 10);
+  return {
+    hostName: host.length > 0 ? host : "local",
+    sessionID: Number.isFinite(n) && n > 0 ? n : 0,
+  };
 }

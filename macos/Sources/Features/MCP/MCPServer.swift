@@ -42,6 +42,34 @@ final class MCPServer {
     private let listenSpec: String
     let token: String
 
+    /// (ramon fork / cloud-hosts, D6) PER-BOX capability tokens the server ACCEPTS for
+    /// `/agent-state` ingest ONLY (never `/mcp`). Empty by default = fail-closed: no box
+    /// token is accepted until one is provisioned. Set via `configureCapabilityTokens`;
+    /// mutated/read only on `queue`. These are DISTINCT from the master `token` (which is
+    /// never shipped to a box). Provisioning the per-box token into a 0600 file on the
+    /// box (M2/ops) supplies the matching value.
+    private var capabilityTokens: Set<String> = []
+
+    /// (ramon fork / cloud-hosts, D6) Extra exact Host-header values to accept beyond the
+    /// configured host + loopback (e.g. a tailnet MagicDNS FQDN) so an MCP request over
+    /// the tailnet isn't 403'd by the rebinding guard. Empty by default. The PREFERRED
+    /// setup is a `tailscale serve` Host rewrite to the loopback value; this set is the
+    /// alternative (never a wildcard). Set via `configureAllowedHosts`; read only on
+    /// `queue`.
+    private var extraAllowedHosts: Set<String> = []
+
+    /// (ramon fork / cloud-hosts, D6) Install the per-box capability tokens. Hops onto
+    /// `queue` so the route decision reads a consistent set. Idempotent.
+    func configureCapabilityTokens(_ tokens: Set<String>) {
+        queue.async { [weak self] in self?.capabilityTokens = tokens }
+    }
+
+    /// (ramon fork / cloud-hosts, D6) Install the extra allowed Host values (tailnet
+    /// FQDNs). Hops onto `queue`. Idempotent.
+    func configureAllowedHosts(_ hosts: Set<String>) {
+        queue.async { [weak self] in self?.extraAllowedHosts = hosts }
+    }
+
     /// The parsed host:port. The host is used ONLY for the Host-header
     /// allowlist (DNS-rebinding defense), never as an IP allowlist.
     private let parsed: (host: String, port: UInt16)?
@@ -419,6 +447,21 @@ final class MCPServer {
     }
 
     /// Decide the route. PURE: no AppKit, no socket, no mutation.
+    ///
+    /// (cloud-hosts D6) `capabilityTokens` are PER-BOX, capability-scoped credentials
+    /// provisioned once per remote box. A request authenticated with a capability token
+    /// (and NOT the master `token`) is authorized for `/agent-state` ONLY — NEVER `/mcp`
+    /// (spawn/input). This is the security crux: the master token is the fork's one
+    /// shell-execution credential and MUST NEVER be shipped to a box, so a box POSTs its
+    /// state with a token that CANNOT drive the fleet. A capability token presented to
+    /// `/mcp` returns `.unauthorized` (and bumps the peer backoff — a box hammering /mcp
+    /// gets throttled).
+    ///
+    /// `allowedHosts` is an OPTIONAL extra allow-list of exact Host values (e.g. a
+    /// tailnet MagicDNS FQDN) beyond the configured host + loopback, so an MCP request
+    /// arriving over the tailnet isn't 403'd by the rebinding guard. The PREFERRED setup
+    /// is a `tailscale serve` Host rewrite to the loopback value (keeps the guard tight);
+    /// this set is the alternative (never a wildcard).
     static func decideRoute(
         method: String,
         path: String,
@@ -426,27 +469,41 @@ final class MCPServer {
         configuredHost: String,
         configuredPort: UInt16,
         token: String,
-        peerFailureCount: Int
+        peerFailureCount: Int,
+        capabilityTokens: Set<String> = [],
+        allowedHosts: Set<String> = []
     ) -> RouteDecision {
         // DNS-rebinding defense: reject a present, non-empty Host that is neither
-        // the configured host:port nor a loopback host on the configured port. A
-        // missing/empty Host is allowed.
+        // the configured host:port nor a loopback host on the configured port (nor an
+        // explicitly allowed extra host — e.g. a tailnet FQDN). A missing/empty Host is
+        // allowed.
         if let host = headers["host"], !host.isEmpty,
-           !hostHeaderAllowed(host, configuredHost: configuredHost, configuredPort: configuredPort) {
+           !hostHeaderAllowed(host, configuredHost: configuredHost,
+                              configuredPort: configuredPort, allowedHosts: allowedHosts) {
             return .forbiddenHost
         }
 
-        // Token auth is OPTIONAL. When mcp-token is EMPTY the server is OPEN.
-        // When set it gates every request via the X-Ghostty-Token header ONLY (no
-        // bootstrap `?token=` path — every MCP request can send a header), with
-        // the per-peer brute-force backoff.
+        // Token auth. When the master `token` is EMPTY the server is OPEN (capability
+        // tokens are moot — there is no credential boundary to scope against).
+        // Otherwise a request must present EITHER the master token (full access) or a
+        // per-box capability token (agent-state only). The per-peer brute-force backoff
+        // applies whenever the master token is set.
+        var capabilityScoped = false
         if !token.isEmpty {
             if peerFailureCount >= failedAuthThreshold { return .throttled }
             let headerToken = headers["x-ghostty-token"] ?? ""
-            guard tokensMatch(headerToken, token) else { return .unauthorized }
+            if tokensMatch(headerToken, token) {
+                capabilityScoped = false
+            } else if capabilityTokens.contains(where: { tokensMatch(headerToken, $0) }) {
+                capabilityScoped = true
+            } else {
+                return .unauthorized
+            }
         }
 
         if path == "/mcp" {
+            // (D6) A capability token can NEVER drive /mcp — it authorizes ingest only.
+            if capabilityScoped { return .unauthorized }
             return method == "POST" ? .mcp : .methodNotAllowed
         }
         if path == "/agent-state" {
@@ -471,7 +528,9 @@ final class MCPServer {
             configuredHost: parsed?.host ?? "",
             configuredPort: parsed?.port ?? 0,
             token: token,
-            peerFailureCount: throttleCount)
+            peerFailureCount: throttleCount,
+            capabilityTokens: capabilityTokens,
+            allowedHosts: extraAllowedHosts)
 
         switch decision {
         case .forbiddenHost:
@@ -516,23 +575,44 @@ final class MCPServer {
         guard let payload = MCPAgentState.parse(body) else {
             send(.status(400, "Bad Request"), on: conn); return
         }
-        // Resolve tty -> UUID on MAIN (reads SurfaceView.foregroundPID, main-only),
-        // returning ONLY value types across the hop (the WebMonitor/MCP rule). The
-        // (uuid, pid) snapshot shape matches the Agent Dashboard's detectorSnapshot.
-        let surfaces: [(uuid: UUID, pid: pid_t)] = DispatchQueue.main.sync {
-            var out: [(uuid: UUID, pid: pid_t)] = []
-            for c in TerminalController.all {
-                for view in c.surfaceTree {
-                    if let pid = view.surfaceModel?.foregroundPID, pid > 0 {
-                        out.append((view.id, pid_t(pid)))
+
+        // (cloud-hosts D6) NONCE branch: a REMOTE box's hook carries a correlation nonce
+        // (no tty). Resolve nonce -> local surface UUID via the app-wide
+        // `RemoteAgentIdentity` map — a PURE, thread-safe lookup, so no main hop is
+        // needed. This is an IDENTITY ASSERTION from a box, so it is logged.
+        let resolvedUUID: UUID?
+        if let nonce = payload.nonce {
+            let uuid = RemoteAgentIdentity.shared.resolveSurfaceID(nonce: nonce)
+            if uuid == nil {
+                logger.debug("mcp: /agent-state nonce did not resolve (unknown / expired)")
+            } else {
+                logger.info("mcp: /agent-state nonce resolved to a surface (cross-host identity assertion)")
+            }
+            resolvedUUID = uuid
+        } else if let tty = payload.tty {
+            // Local tty-walk fallback: resolve tty -> UUID on MAIN (reads
+            // SurfaceView.foregroundPID, main-only), returning ONLY value types across
+            // the hop (the WebMonitor/MCP rule). The (uuid, pid) snapshot shape matches
+            // the Agent Dashboard's detectorSnapshot.
+            let surfaces: [(uuid: UUID, pid: pid_t)] = DispatchQueue.main.sync {
+                var out: [(uuid: UUID, pid: pid_t)] = []
+                for c in TerminalController.all {
+                    for view in c.surfaceTree {
+                        if let pid = view.surfaceModel?.foregroundPID, pid > 0 {
+                            out.append((view.id, pid_t(pid)))
+                        }
                     }
                 }
+                return out
             }
-            return out
+            resolvedUUID = MCPAgentState.resolveSurface(forTTY: tty, surfaces: surfaces)
+        } else {
+            resolvedUUID = nil  // parse guarantees this is unreachable
         }
-        guard let uuid = MCPAgentState.resolveSurface(forTTY: payload.tty, surfaces: surfaces) else {
+
+        guard let uuid = resolvedUUID else {
             // 200, not 404: the hook is fire-and-forget and a momentary no-match
-            // (surface just closed, pid not yet pushed) is not an error.
+            // (surface just closed, pid/nonce not yet known) is not an error.
             send(.empty(200, "OK"), on: conn); return
         }
         DispatchQueue.main.async {
@@ -570,8 +650,15 @@ final class MCPServer {
     // MARK: - DNS-rebinding Host-header guard (pure, testable)
 
     /// Accept a Host header only when it names the configured host (or a loopback
-    /// host) on the configured port. PURE + testable.
-    static func hostHeaderAllowed(_ host: String, configuredHost: String, configuredPort: UInt16) -> Bool {
+    /// host, or one of `allowedHosts` — e.g. a tailnet FQDN) on the configured port.
+    /// PURE + testable. `allowedHosts` is matched case-insensitively against the host
+    /// portion (port still gated) — never a wildcard.
+    static func hostHeaderAllowed(
+        _ host: String,
+        configuredHost: String,
+        configuredPort: UInt16,
+        allowedHosts: Set<String> = []
+    ) -> Bool {
         var h = host
         var portStr: String? = nil
         if host.hasPrefix("[") {
@@ -588,7 +675,8 @@ final class MCPServer {
         guard port == configuredPort else { return false }
         let lower = h.lowercased()
         let loopback = (lower == "localhost" || lower == "127.0.0.1" || lower == "::1")
-        return lower == configuredHost.lowercased() || loopback
+        if lower == configuredHost.lowercased() || loopback { return true }
+        return allowedHosts.contains { $0.lowercased() == lower }
     }
 
     // MARK: - HTTP request parsing (pure, testable — no NWConnection)

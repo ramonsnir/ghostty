@@ -357,6 +357,13 @@ class AppDelegate: NSObject,
         let mcpListen = ghostty.config.mcpListen
         if !mcpListen.isEmpty {
             let server = MCPServer(listen: mcpListen, token: ghostty.config.mcpToken)
+            // (ramon fork / cloud-hosts, D6) Install the per-box capability tokens the
+            // server accepts for `/agent-state` ingest ONLY (fail-closed empty set until
+            // configured) + any extra tailnet Host-header FQDNs. Set BEFORE start() so the
+            // first request sees the right policy. Without this the cross-host agent-state
+            // ingest path is unreachable (a box's authenticated POST 401s).
+            server.configureCapabilityTokens(Set(ghostty.config.ptyRemoteCapabilityTokens))
+            server.configureAllowedHosts(Set(ghostty.config.ptyRemoteMcpAllowedHosts))
             server.start()
             self.mcpServer = server
         }

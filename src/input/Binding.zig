@@ -964,6 +964,22 @@ pub const Action = union(enum) {
     /// browser, for a quick bug report. Payload-less.
     report_bug,
 
+    /// (ramon fork / cloud-hosts) Open a new split running on a REMOTE
+    /// `ghostty-host` box declared by `pty-remote-host`. The value is the
+    /// host's registry NAME (e.g. `new_split_on_host:cloud-1`); the macOS
+    /// tunnel supervisor resolves it to a forwarded socket, brings the tunnel
+    /// up, and spawns a `.client` split dialing that socket. The whole value
+    /// after the colon is the host name (mirrors `new_tab`'s value shape).
+    /// Fork-only — keep the keybind in `~/.config/ghostty-ramon/config`.
+    new_split_on_host: []const u8,
+
+    /// (ramon fork / cloud-hosts) Open a new tab running on a REMOTE
+    /// `ghostty-host` box declared by `pty-remote-host`. The value is the
+    /// host's registry NAME (e.g. `new_tab_on_host:cloud-1`); resolution +
+    /// spawn are as in `new_split_on_host`. Fork-only — keep the keybind in
+    /// `~/.config/ghostty-ramon/config`.
+    new_tab_on_host: []const u8,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1651,6 +1667,8 @@ pub const Action = union(enum) {
             .start_agent_queue,
             .goto_last_surface,
             .report_bug,
+            .new_split_on_host,
+            .new_tab_on_host,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,
@@ -3717,6 +3735,33 @@ test "parse: new_tab_command round-trips its command verbatim" {
         defer buf.deinit();
         try a.format(&buf.writer);
         try testing.expectEqualStrings("new_tab_command:~/git/foo/list.sh", buf.written());
+    }
+}
+
+test "Binding new_split_on_host" {
+    const testing = std.testing;
+
+    // The value after the colon is the remote host's registry NAME.
+    {
+        const binding = try parseSingle("a=new_split_on_host:cloud-1");
+        try testing.expect(binding.action == .new_split_on_host);
+        try testing.expectEqualStrings("cloud-1", binding.action.new_split_on_host);
+    }
+
+    // Round-trips through format back to the same string.
+    {
+        const a: Action = .{ .new_split_on_host = "cloud-1" };
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+        try a.format(&buf.writer);
+        try testing.expectEqualStrings("new_split_on_host:cloud-1", buf.written());
+    }
+
+    // new_tab_on_host mirrors the same shape.
+    {
+        const binding = try parseSingle("a=new_tab_on_host:cloud-1");
+        try testing.expect(binding.action == .new_tab_on_host);
+        try testing.expectEqualStrings("cloud-1", binding.action.new_tab_on_host);
     }
 }
 

@@ -264,6 +264,56 @@ bell-diagnostics = true
 # so substitute your own home for the placeholder below.
 pty-host = /Users/you/.ghostty-ramon-host.sock
 
+# --- Cloud-hosted terminals (fork-only, Phase 1) -----------------------------
+# Run SOME splits/tabs on a REMOTE ghostty-host box, reached over an SSH
+# unix-socket forward, mixed with local splits in the same window. Repeatable —
+# one line per named host. Grammar (parsed macOS-side by RemoteHostRegistry):
+#   pty-remote-host = <name> = <ssh-target> : <remote-socket> [ : <local-socket>]
+# The reserved name `local` always means the pty-host scalar above. Open a
+# remote split via the "New Split on Host…" command palette entry (host picker),
+# or bind new_split_on_host:<name> / new_tab_on_host:<name>. See
+# CLOUD-HOSTS-DESIGN.md. Commented — set up a box first (untracked in `local`
+# if the ssh target is machine-specific).
+# pty-remote-host = cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock
+# Extra ssh flags applied to every tunnel (jump host, identity file, port, …):
+# pty-remote-ssh-options = -J jump.example.ts.net -i ~/.ssh/id_ed25519
+# Per-attempt connection ceiling (SECONDS) for a remote split's mid-session
+# redial + the tunnel supervisor's ssh-master respawn. 0 (the default) = the
+# compiled-in default (10s). Only affects REMOTE hosts (local never redials).
+# pty-remote-connect-timeout = 30
+# Per-host TRANSPORT-COMMAND override (cloud-hosts Phase 6): for a box reachable
+# ONLY through a custom wrapper — e.g. a corporate `gcloud workstations ssh`-style
+# launcher exposed as a shell FUNCTION that spins its OWN tunnel per invocation — where the default `ssh`
+# ControlMaster + `ssh -O check` model does not fit. Repeatable; one line per
+# `<host> = <command template>`, where <host> matches a pty-remote-host name above.
+# The tunnel then runs ONE long-lived forward through that command in your LOGIN +
+# INTERACTIVE shell (so a shell function resolves), with the -N -L forward + keepalive
+# appended automatically — NO ControlMaster. When an override exists, the ssh-target
+# field of the pty-remote-host line becomes just a LABEL; only its remote-socket path
+# is used. The command usually carries a real target/identifier, so put the REAL value
+# in the untracked `local`, not here. See CLOUD-HOSTS-DESIGN.md → Transport.
+# pty-remote-host = cloud-1 = cloud-1 : /run/user/1000/ghostty-host.sock
+# pty-remote-host-command = cloud-1 = my-ssh-wrapper cloud-1 --
+# Per-host BASE project dirs for the host-aware project palette (cloud-hosts
+# Phase 4) — the remote analog of `project-directory`. Repeatable; one line per
+# `<host> = <base>`, where <host> matches a pty-remote-host name above. "Open
+# Project…" then lists that BOX's immediate subdirectories of <base> (listed over
+# the tunnel, cached) and opens a tab that RUNS on the host. The base is a path ON
+# THE BOX — NOT expanded against your laptop home. Repeat for more hosts/bases.
+# pty-remote-project-directory = cloud-1 = ~/git
+# Cross-host AGENT state (cloud-hosts Phase 4): so an agent running on a box shows
+# up in the dashboard/queue, its agent-state hook POSTs to the laptop MCP with a
+# PER-BOX capability token (NOT the master mcp-token). Add each box's token here so
+# the MCP server ACCEPTS its /agent-state POSTs (empty = fail-closed) — a credential,
+# so put the real value in the untracked `local`, not here. Repeat per box. Also
+# provision the SAME value into a 0600 file on the box, and set GHOSTTY_MCP_URL in
+# the BOX's own environment (its ghostty-host systemd unit) to the laptop's tailnet
+# /agent-state URL. See CLOUD-HOSTS-DESIGN.md → Deployment.
+# pty-remote-capability-token = <per-box-random-secret>
+# Extra exact Host-header FQDNs the MCP server accepts (tailnet ingest), if you do
+# NOT front the MCP port with `tailscale serve`. Never a wildcard. Repeat as needed.
+# pty-remote-mcp-allowed-host = laptop.example.ts.net
+
 # --- Web monitor (fork-only) -------------------------------------------------
 # GUI-embedded HTTP server: watch/drive splits from a phone over Tailscale.
 # Full notes in WEB-MONITOR.md (repo root). Read at LAUNCH — relaunch the app

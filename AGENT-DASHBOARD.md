@@ -1052,18 +1052,33 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   ~2s detector poll removes dead agents; a missed `Stop` is an accepted cosmetic
   stale-`working`.
 
-- **Persistence via AgentStateStore (keyed by session id, not surface UUID).** Persisted
-  across GUI restart (hooks only POST on transitions, so a relaunched GUI would otherwise
-  show blank chips until the agent next acts): the model write-throughs each state to an
-  `AgentStateStore` (UserDefaults) keyed by the **stable host session id** — NOT the
-  surface UUID, which is freshly minted each launch — and `rebuild(live:)` rehydrates it
-  onto the new UUID by session id (silent restore — no push / no waiting-edge re-fire; the
-  next live hook takes over). Records age-prune (14d / 256-cap, timestamp touched for live
-  sessions). Caveat: a HOST restart resets the session-id counter, so a stale record could
-  briefly hydrate a reused id with wrong state until the next hook self-corrects (host
-  restarts are rare + lose all sessions anyway). `prune` / `AgentStateStore` /
-  `UserDefaultsAgentStateStore` are unit-tested. Claude-Code-only (Codex tiles stay
-  preview-only).
+- **Persistence via AgentStateStore (keyed by the COMPOSITE session key, not surface UUID).**
+  Persisted across GUI restart (hooks only POST on transitions, so a relaunched GUI would
+  otherwise show blank chips until the agent next acts): the model write-throughs each state
+  to an `AgentStateStore` (UserDefaults) keyed by the **composite `"<host>:<u64>"` session
+  key** (`AgentSessionKey`) — NOT the surface UUID, which is freshly minted each launch — and
+  `rebuild(live:)` rehydrates it onto the new UUID by that key (silent restore — no push / no
+  waiting-edge re-fire; the next live hook takes over). Records age-prune (14d / 256-cap,
+  timestamp touched for live sessions). **(cloud-hosts Phase 4 · D3/Q4)** the key is
+  host-namespaced because the host `allocSessionId` dedups only WITHIN one host, so two
+  sessions sharing a `u64` on different hosts would collide in the aggregated keyspace; the
+  manual-tile-order store + the mirror-preview SwiftUI `.id` are pair-keyed the same way (and
+  a remote tile's mirror dials the RESOLVED forwarded socket for its host, never the local
+  one). A PRE-migration bare-number key reads back as the `local:` namespace (back-compat,
+  `AgentSessionKey.normalizeLegacy`). Caveat: a HOST restart resets that host's session-id
+  counter, so a stale record could briefly hydrate a reused id with wrong state until the next
+  hook self-corrects (host restarts are rare + lose all sessions anyway). `prune` /
+  `AgentStateStore` / `UserDefaultsAgentStateStore` / the pair-keying round-trip (incl. legacy
+  → local + the two-host-same-u64 no-collision case) are unit-tested. Claude-Code-only (Codex
+  tiles stay preview-only).
+
+- **(cloud-hosts Phase 4 · M1/M3/D6) Cross-host per-tile state uses a NONCE, not the tty walk.**
+  A remote box's hook can't name a LOCAL tty, so the GUI mints a per-spawn correlation nonce
+  (`RemoteAgentIdentity`), delivers it into the remote shell via `initial_input`, and the box's
+  hook POSTs `{nonce, state}` (with a per-box capability token — never the master mcp-token) to
+  `/agent-state`, which resolves the nonce → the local surface. See MCP-SERVER.md → "Security
+  model" for the capability-token scoping. `LiveSurface`/`HookSnapshotEntry`/`AgentEntry` carry
+  `hostName` so the whole tile pipeline is host-aware.
 
 - **Shared symbols + wiring.** Pinned shared symbols (`AgentState`/`AgentStatePayload`/the
   two `Notification.Name`s/`AgentStateUserInfoKey`) live in

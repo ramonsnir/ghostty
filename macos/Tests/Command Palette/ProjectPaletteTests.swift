@@ -127,4 +127,101 @@ struct ProjectPaletteTests {
             .appendingPathComponent("ghostty-no-such-base-\(UUID().uuidString)")
         #expect(ProjectPaletteView.discoverProjectPaths(bases: [missing.path]).isEmpty)
     }
+
+    // MARK: - parseRemoteProjectBases (the pure `<host> = <base>` line parser)
+
+    @Test func parseRemoteBasesSplitsOnFirstEqualsAndTrims() {
+        let pairs = ProjectPaletteView.parseRemoteProjectBases([
+            "cloud-1 = ~/git",
+            "  cloud-2   =   /srv/work  ",
+        ])
+        #expect(pairs.count == 2)
+        #expect(pairs[0].host == "cloud-1")
+        #expect(pairs[0].base == "~/git")
+        #expect(pairs[1].host == "cloud-2")
+        #expect(pairs[1].base == "/srv/work")
+    }
+
+    @Test func parseRemoteBasesAllowsMultipleBasesPerHostInOrder() {
+        let pairs = ProjectPaletteView.parseRemoteProjectBases([
+            "cloud-1 = ~/git",
+            "cloud-1 = ~/work",
+        ])
+        #expect(pairs.count == 2)
+        #expect(pairs.allSatisfy { $0.host == "cloud-1" })
+        #expect(pairs.map { $0.base } == ["~/git", "~/work"])
+    }
+
+    @Test func parseRemoteBasesCollapsesExactDuplicates() {
+        let pairs = ProjectPaletteView.parseRemoteProjectBases([
+            "cloud-1 = ~/git",
+            "cloud-1 = ~/git",
+        ])
+        #expect(pairs.count == 1)
+    }
+
+    @Test func parseRemoteBasesDropsMalformedLines() {
+        // No '=', empty host, and empty base are all dropped; the one valid line survives.
+        let pairs = ProjectPaletteView.parseRemoteProjectBases([
+            "no-equals-here",
+            " = /orphan-base",
+            "orphan-host = ",
+            "cloud-1 = ~/git",
+        ])
+        #expect(pairs.count == 1)
+        #expect(pairs[0].host == "cloud-1")
+        #expect(pairs[0].base == "~/git")
+    }
+
+    @Test func parseRemoteBasesEmptyForNoLines() {
+        #expect(ProjectPaletteView.parseRemoteProjectBases([]).isEmpty)
+    }
+
+    // MARK: - Remote project cache: stale-while-revalidate schedule
+    //
+    // The pure freshness decision that drives the palette's synchronous cache
+    // read: a cold miss shows a "listing…" row, a fresh hit is served as-is, and a
+    // stale hit is STILL served (marked refreshing) while a background revalidate
+    // runs — the same shape as the tunnel respawn backoff / mirror-reconnect
+    // pure-schedule tests.
+
+    @Test func cacheFreshnessMissWhenNoEntry() {
+        #expect(RemoteTunnelController.cacheFreshness(entry: nil, now: Date()) == .miss)
+    }
+
+    @Test func cacheFreshnessFreshWithinTTL() {
+        let now = Date()
+        let entry = RemoteTunnelController.CachedProjects(
+            paths: ["/a"], fetchedAt: now.addingTimeInterval(-0.5))
+        #expect(RemoteTunnelController.cacheFreshness(entry: entry, now: now, ttl: 1.0) == .fresh)
+    }
+
+    @Test func cacheFreshnessBoundaryIsFresh() {
+        // Exactly at the TTL is fresh (`<=`), so the boundary is pinned (never a
+        // flapping re-fetch at the edge).
+        let now = Date()
+        let entry = RemoteTunnelController.CachedProjects(
+            paths: ["/a"], fetchedAt: now.addingTimeInterval(-1.0))
+        #expect(RemoteTunnelController.cacheFreshness(entry: entry, now: now, ttl: 1.0) == .fresh)
+    }
+
+    @Test func cacheFreshnessStaleBeyondTTL() {
+        let now = Date()
+        let entry = RemoteTunnelController.CachedProjects(
+            paths: ["/a"], fetchedAt: now.addingTimeInterval(-1.5))
+        #expect(RemoteTunnelController.cacheFreshness(entry: entry, now: now, ttl: 1.0) == .stale)
+    }
+
+    // MARK: - parseNulPaths (find -print0 output)
+
+    @Test func parseNulPathsSplitsAndDropsTrailingEmpty() {
+        // `find -print0` terminates every path (incl. the last) with a NUL, so a
+        // trailing empty element must not become a bogus "" path.
+        let data = Data("/home/u/git/alpha\u{0}/home/u/git/beta\u{0}".utf8)
+        #expect(RemoteTunnelController.parseNulPaths(data) == ["/home/u/git/alpha", "/home/u/git/beta"])
+    }
+
+    @Test func parseNulPathsEmptyForEmptyData() {
+        #expect(RemoteTunnelController.parseNulPaths(Data()).isEmpty)
+    }
 }

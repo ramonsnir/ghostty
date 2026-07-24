@@ -54,6 +54,9 @@ class BaseTerminalController: NSWindowController,
     /// (ramon fork / Agent Queue Supervisor) Show/hide the queue-template picker.
     @Published var queueSelectorIsShowing: Bool = false
 
+    /// (ramon fork / cloud-hosts) Show/hide the remote-host picker palette.
+    @Published var remoteHostSelectorIsShowing: Bool = false
+
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 
@@ -349,6 +352,11 @@ class BaseTerminalController: NSWindowController,
             self,
             selector: #selector(ghosttyQueueSelectorDidToggle(_:)),
             name: .ghosttyQueueSelectorDidToggle,
+            object: nil)
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyRemoteHostSelectorDidToggle(_:)),
+            name: .ghosttyRemoteHostSelectorDidToggle,
             object: nil)
         center.addObserver(
             self,
@@ -901,6 +909,12 @@ class BaseTerminalController: NSWindowController,
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard surfaceTree.contains(surfaceView) else { return }
         toggleQueueSelector(nil)
+    }
+
+    @objc private func ghosttyRemoteHostSelectorDidToggle(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard surfaceTree.contains(surfaceView) else { return }
+        toggleRemoteHostSelector(nil)
     }
 
     @objc private func ghosttyMaximizeDidToggle(_ notification: Notification) {
@@ -2098,6 +2112,15 @@ class BaseTerminalController: NSWindowController,
         projectSelectorIsShowing.toggle()
         if projectSelectorIsShowing {
             // Mirror toggleCommandPalette: resign the surface's first responder
+            // so the palette receives keyboard input rather than the surface.
+            _ = focusedSurface?.resignFirstResponder()
+        }
+    }
+
+    @IBAction func toggleRemoteHostSelector(_ sender: Any?) {
+        remoteHostSelectorIsShowing.toggle()
+        if remoteHostSelectorIsShowing {
+            // Mirror toggleProjectSelector: resign the surface's first responder
             // so the palette receives keyboard input rather than the surface.
             _ = focusedSurface?.resignFirstResponder()
         }

@@ -116,11 +116,18 @@ fn singleChildForDescent(pid: c_int) ?c_int {
 /// so the early-null paths have nothing to free, and (b) a manual free of
 /// `command` on the final `name`-dupe failure path. Do NOT add an `errdefer` here.
 pub fn resolve(alloc: Allocator, pid: u64) ?ProcInfo {
-    // Non-macOS stub: the host is macOS-only in practice, and the GUI never calls
-    // this (it consumes the pushed strings). Keeps the core cross-compiling. Note
-    // we do NOT discard `alloc`/`pid` here — on a non-Darwin build everything
-    // below is comptime-dead but still references them, so they count as used (the
-    // idiomatic `if (comptime <off-target>) return null;` form, cf. kernel_info.zig).
+    // Linux arm: the fork's `ghostty-host` also runs on Linux cloud boxes, where
+    // the foreground pid already resolves (via `tcgetpgrp`) but the name/command
+    // must come from `/proc`. This branch returns FIRST on a Linux target, so the
+    // Darwin sysctl/libproc body below is comptime-dead there (never analyzed) —
+    // exactly as the `if (comptime !isDarwin)` guard makes it dead on every other
+    // target. See `resolveLinux`.
+    if (comptime builtin.os.tag == .linux) return resolveLinux(alloc, pid);
+
+    // Non-macOS / non-Linux stub: keeps the core cross-compiling. Note we do NOT
+    // discard `alloc`/`pid` here — on such a build everything below is comptime-
+    // dead but still references them, so they count as used (the idiomatic
+    // `if (comptime <off-target>) return null;` form, cf. kernel_info.zig).
     if (comptime !builtin.os.tag.isDarwin()) return null;
 
     const pid_root: c_int = std.math.cast(c_int, pid) orelse return null;
@@ -229,6 +236,252 @@ fn parseProcArgs2(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+// =============================================================================
+// Linux `/proc` arm
+//
+// The fork's `ghostty-host` also runs on Linux cloud boxes. `foreground_pid`
+// already resolves on Linux (`pty.zig` `tcgetpgrp`), so ONLY the name + command
+// need a `/proc` reader here — this fills the already-negotiated (minor-3)
+// process_info frame; NO protocol change. All the `/proc` I/O functions are only
+// referenced from `resolveLinux` (and the `.linux`-gated test), so on a non-Linux
+// build they are unreferenced and never analyzed. The pure `parseProcCmdline`
+// parser and the pure decision helpers (`parsePpidFromStat`, `pickDescendChild`)
+// are target-agnostic and unit-tested.
+// =============================================================================
+
+/// A direct child of some pid, plus whether its (comm) name is a launcher.
+/// Used by the pure `pickDescendChild` selection.
+const DescendChild = struct { pid: i32, launcher: bool };
+
+/// Resolve `pid` -> `{name, command}` on Linux by reading `/proc`. Contract
+/// mirrors `resolve` (Darwin): both slices owned by `alloc`, null on ANY failure,
+/// never partially-allocs (all fallible reads happen before/around the two dupes,
+/// and the name dupe frees `command` on its own OOM). Descends through launcher
+/// wrappers (`bash …/claude-pool`, `env node …`) to the real program first.
+fn resolveLinux(alloc: Allocator, pid: u64) ?ProcInfo {
+    const pid_root: i32 = std.math.cast(i32, pid) orelse return null;
+    var src: LinuxProcSource = .{};
+    const pid_c = descendToProgramImpl(LinuxProcSource, &src, pid_root);
+
+    // command via /proc/<pid>/cmdline (NUL-separated argv). Errors only on OOM;
+    // any read failure yields an owned empty string (coarse display fallback).
+    const command = readCmdlineLinux(alloc, pid_c) catch return null;
+
+    // name via /proc/<pid>/comm (falls back to an empty owned string).
+    var name_buf: [256]u8 = undefined;
+    const name: []const u8 = if (readCommLinux(pid_c, &name_buf)) |s|
+        alloc.dupe(u8, s) catch {
+            alloc.free(command);
+            return null;
+        }
+    else
+        alloc.dupe(u8, "") catch {
+            alloc.free(command);
+            return null;
+        };
+
+    return .{ .name = name, .command = command };
+}
+
+/// Parse a `/proc/<pid>/cmdline` buffer into a single owned command-line string
+/// (argv joined by single spaces). `/proc/<pid>/cmdline` is the process's argv
+/// with each argument NUL-terminated and NO leading argc / exec-path header — the
+/// simpler sibling of Darwin's `KERN_PROCARGS2`. PURE + bounds-safe so it is
+/// unit-testable on ANY target against a synthetic buffer. Empty runs (the
+/// trailing NUL, or a zombie's empty cmdline) contribute nothing. Errors only on
+/// OOM; returns an owned (possibly empty) slice otherwise.
+fn parseProcCmdline(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var it = std.mem.splitScalar(u8, raw, 0);
+    while (it.next()) |arg| {
+        if (arg.len == 0) continue;
+        if (out.items.len != 0) try out.append(alloc, ' ');
+        try out.appendSlice(alloc, arg);
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+/// Read `/proc/<pid>/cmdline` and parse it. Owned (possibly empty) slice; errors
+/// only on OOM (a missing/unreadable file yields an owned empty string).
+fn readCmdlineLinux(alloc: Allocator, pid: i32) Allocator.Error![]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var data_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch
+        return parseProcCmdline(alloc, "");
+    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch
+        return parseProcCmdline(alloc, "");
+    defer file.close();
+    const n = file.readAll(&data_buf) catch return parseProcCmdline(alloc, "");
+    return parseProcCmdline(alloc, data_buf[0..n]);
+}
+
+/// Read `/proc/<pid>/comm` into `buf`, returning the trimmed (short) process
+/// name or null on failure. The slice aliases `buf` (valid until the next read).
+fn readCommLinux(pid: i32, buf: []u8) ?[]const u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch return null;
+    defer file.close();
+    const n = file.readAll(buf) catch return null;
+    if (n == 0) return null;
+    return std.mem.trimRight(u8, buf[0..n], "\n");
+}
+
+/// Generic descend loop shared in shape with Darwin's `descendToProgram`, but
+/// factored over a `Src` so the Linux port is unit-testable against a fixture
+/// process table. Walks DOWN through launcher processes to the first non-launcher
+/// descendant (the program the user runs). `Src` must provide
+/// `name(pid) ?[]const u8` (valid until the next call) and `singleChild(pid) ?i32`.
+/// Bounded depth; stops at an ambiguous branch, an unnameable pid, or a real
+/// program (returns `pid` unchanged for a direct, non-wrapped program).
+fn descendToProgramImpl(comptime Src: type, src: *Src, pid: i32) i32 {
+    var cur = pid;
+    var depth: usize = 0;
+    while (depth < 16) : (depth += 1) {
+        const name = src.name(cur) orelse return cur; // can't name -> resolve this
+        if (!isLauncher(name)) return cur; // first real program
+        const next = src.singleChild(cur) orelse return cur;
+        if (next <= 0 or next == cur) return cur; // paranoia: no self/invalid loop
+        cur = next;
+    }
+    return cur;
+}
+
+/// The concrete Linux `descendToProgramImpl` source: name via `/proc/<pid>/comm`,
+/// child via `singleChildForDescentLinux`.
+const LinuxProcSource = struct {
+    name_buf: [256]u8 = undefined,
+
+    fn name(self: *LinuxProcSource, pid: i32) ?[]const u8 {
+        return readCommLinux(pid, &self.name_buf);
+    }
+    fn singleChild(self: *LinuxProcSource, pid: i32) ?i32 {
+        _ = self;
+        return singleChildForDescentLinux(pid);
+    }
+};
+
+/// Linux equivalent of `singleChildForDescent`: collect `pid`'s direct children
+/// (from `/proc/<pid>/task/<pid>/children`, or a `/proc/*/stat` PPID scan
+/// fallback) and apply the pure `pickDescendChild` rule.
+fn singleChildForDescentLinux(pid: i32) ?i32 {
+    var children: [64]DescendChild = undefined;
+    const n = collectChildrenLinux(pid, &children);
+    if (n == 0) return null;
+    return pickDescendChild(children[0..n]);
+}
+
+/// Pure: choose the child pid to descend into. Mirrors the Darwin rule — exactly
+/// one child -> it; multiple children -> the SOLE non-launcher child if unique
+/// (a wrapper that also spawned a transient shell), else null (ambiguous branch);
+/// zero -> null. Target-agnostic + pure so it is unit-testable.
+fn pickDescendChild(children: []const DescendChild) ?i32 {
+    if (children.len == 0) return null;
+    if (children.len == 1) return children[0].pid;
+
+    var pick: ?i32 = null;
+    for (children) |c| {
+        if (c.pid <= 0) continue;
+        if (!c.launcher) {
+            if (pick != null) return null; // >1 non-launcher child: ambiguous
+            pick = c.pid;
+        }
+    }
+    return pick;
+}
+
+/// Fill `out` with `pid`'s direct children (+ their launcher flags), returning
+/// the count. Prefers `/proc/<pid>/task/<pid>/children`; on empty/failure falls
+/// back to scanning `/proc/*/stat` for entries whose PPID == `pid`.
+fn collectChildrenLinux(pid: i32, out: []DescendChild) usize {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var data_buf: [4096]u8 = undefined;
+
+    // Preferred: the kernel's own children list (space-separated child pids).
+    if (std.fmt.bufPrint(&path_buf, "/proc/{d}/task/{d}/children", .{ pid, pid })) |path| {
+        if (std.fs.openFileAbsolute(path, .{ .mode = .read_only })) |file| {
+            const n = blk: {
+                defer file.close();
+                break :blk file.readAll(&data_buf) catch 0;
+            };
+            if (n > 0) {
+                var count: usize = 0;
+                var it = std.mem.tokenizeAny(u8, data_buf[0..n], " \n\t");
+                while (it.next()) |tok| {
+                    if (count >= out.len) break;
+                    const cpid = std.fmt.parseInt(i32, tok, 10) catch continue;
+                    out[count] = .{ .pid = cpid, .launcher = childIsLauncherLinux(cpid) };
+                    count += 1;
+                }
+                if (count > 0) return count;
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // Fallback: scan /proc/*/stat for PPID == pid.
+    return scanChildrenByPpidLinux(pid, out);
+}
+
+/// Scan `/proc/*/stat` for processes whose parent pid is `ppid`, filling `out`.
+/// The `/proc/<pid>/task/<pid>/children` file is not always available (kernel
+/// config), so this is the portable fallback.
+fn scanChildrenByPpidLinux(ppid: i32, out: []DescendChild) usize {
+    var dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return 0;
+    defer dir.close();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var data_buf: [4096]u8 = undefined;
+    var count: usize = 0;
+
+    var it = dir.iterate();
+    while (it.next() catch return count) |entry| {
+        if (count >= out.len) break;
+        // Only numeric pid dirs.
+        const cpid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        if (cpid == ppid) continue;
+
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{s}/stat", .{entry.name}) catch continue;
+        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch continue;
+        const n = blk: {
+            defer file.close();
+            break :blk file.readAll(&data_buf) catch 0;
+        };
+        if (n == 0) continue;
+
+        const parsed_ppid = parsePpidFromStat(data_buf[0..n]) orelse continue;
+        if (parsed_ppid != ppid) continue;
+        out[count] = .{ .pid = cpid, .launcher = childIsLauncherLinux(cpid) };
+        count += 1;
+    }
+    return count;
+}
+
+/// Whether child `pid`'s `/proc/<pid>/comm` name is a launcher. Failure ⇒ treated
+/// as NON-launcher (conservative: we won't descend blindly through an unnameable
+/// child, but `pickDescendChild` may still select it if it is the sole one).
+fn childIsLauncherLinux(pid: i32) bool {
+    var buf: [256]u8 = undefined;
+    const name = readCommLinux(pid, &buf) orelse return false;
+    return isLauncher(name);
+}
+
+/// Pure: parse the parent pid (PPID) out of a `/proc/<pid>/stat` line. The comm
+/// field (2nd) is wrapped in parens and MAY itself contain spaces AND parens, so
+/// the reliable anchor is the LAST ')': after it come `state ppid …`
+/// (space-separated). Returns null on any malformed input. Target-agnostic + pure
+/// so it is unit-testable.
+fn parsePpidFromStat(raw: []const u8) ?i32 {
+    const close = std.mem.lastIndexOfScalar(u8, raw, ')') orelse return null;
+    if (close + 1 >= raw.len) return null;
+    var it = std.mem.tokenizeScalar(u8, raw[close + 1 ..], ' ');
+    _ = it.next() orelse return null; // state
+    const ppid_tok = it.next() orelse return null; // ppid
+    return std.fmt.parseInt(i32, ppid_tok, 10) catch null;
+}
+
 test "proc_info parseProcArgs2 parses argc + argv" {
     const alloc = std.testing.allocator;
 
@@ -319,4 +572,108 @@ test "proc_info isLauncher recognizes shells/interpreters, not real programs" {
     try std.testing.expect(!isLauncher("claude-pool"));
     try std.testing.expect(!isLauncher("vim"));
     try std.testing.expect(!isLauncher(""));
+}
+
+test "proc_info parseProcCmdline joins NUL-separated argv" {
+    // Target-agnostic: the /proc/<pid>/cmdline layout is argv with each argument
+    // NUL-terminated (no argc/exec-path header). Runs on ANY target.
+    const alloc = std.testing.allocator;
+    {
+        // Typical: two args + trailing NUL.
+        const cmd = try parseProcCmdline(alloc, "claude\x00--resume\x00");
+        defer alloc.free(cmd);
+        try std.testing.expectEqualStrings("claude --resume", cmd);
+    }
+    {
+        // Empty buffer -> empty owned string.
+        const cmd = try parseProcCmdline(alloc, "");
+        defer alloc.free(cmd);
+        try std.testing.expectEqual(@as(usize, 0), cmd.len);
+    }
+    {
+        // Only NULs -> empty (all runs empty).
+        const cmd = try parseProcCmdline(alloc, "\x00\x00\x00");
+        defer alloc.free(cmd);
+        try std.testing.expectEqual(@as(usize, 0), cmd.len);
+    }
+    {
+        // Unterminated final arg still contributes; no OOB.
+        const cmd = try parseProcCmdline(alloc, "bash\x00-lc");
+        defer alloc.free(cmd);
+        try std.testing.expectEqualStrings("bash -lc", cmd);
+    }
+    {
+        // Embedded empty arg between two reals is dropped (coarse display).
+        const cmd = try parseProcCmdline(alloc, "a\x00\x00b\x00");
+        defer alloc.free(cmd);
+        try std.testing.expectEqualStrings("a b", cmd);
+    }
+}
+
+test "proc_info descendToProgram /proc PPID fixture" {
+    // Comptime-gated to Linux: the /proc descend + its helpers are only compiled
+    // on a Linux target, so the whole body compiles-OUT on macOS but is real on
+    // Linux (the human runs a Linux cross-compile to fully type-check the arm).
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // --- parsePpidFromStat: comm may contain spaces AND parens; anchor last ')'.
+    try std.testing.expectEqual(
+        @as(?i32, 1000),
+        parsePpidFromStat("1234 (claude pool) S 1000 1234 1000 34816"),
+    );
+    try std.testing.expectEqual(@as(?i32, 0), parsePpidFromStat("1 (systemd) S 0 1 1"));
+    // A comm with an embedded ')' — the LAST ')' is the anchor.
+    try std.testing.expectEqual(
+        @as(?i32, 42),
+        parsePpidFromStat("77 (weird)name) R 42 77"),
+    );
+    // Malformed -> null.
+    try std.testing.expectEqual(@as(?i32, null), parsePpidFromStat("garbage no paren"));
+    try std.testing.expectEqual(@as(?i32, null), parsePpidFromStat(""));
+
+    // --- pickDescendChild: single -> it; multiple -> sole non-launcher; else null.
+    try std.testing.expectEqual(
+        @as(?i32, 42),
+        pickDescendChild(&.{.{ .pid = 42, .launcher = true }}),
+    );
+    try std.testing.expectEqual(@as(?i32, 7), pickDescendChild(&.{
+        .{ .pid = 5, .launcher = true },
+        .{ .pid = 7, .launcher = false },
+    }));
+    try std.testing.expectEqual(@as(?i32, null), pickDescendChild(&.{
+        .{ .pid = 7, .launcher = false },
+        .{ .pid = 9, .launcher = false },
+    }));
+    try std.testing.expectEqual(@as(?i32, null), pickDescendChild(&.{}));
+
+    // --- Fixture descend: bash(100) -> claude-pool==bash(200) -> claude(300).
+    // The wrapper chain is all launchers; descent stops at the first non-launcher.
+    const Fixture = struct {
+        name_buf: [256]u8 = undefined,
+        fn name(self: *@This(), pid: i32) ?[]const u8 {
+            const s: []const u8 = switch (pid) {
+                100 => "bash",
+                200 => "bash", // the claude-pool wrapper runs as bash
+                300 => "claude",
+                else => return null,
+            };
+            @memcpy(self.name_buf[0..s.len], s);
+            return self.name_buf[0..s.len];
+        }
+        fn singleChild(self: *@This(), pid: i32) ?i32 {
+            _ = self;
+            return switch (pid) {
+                100 => 200,
+                200 => 300,
+                else => null,
+            };
+        }
+    };
+    var fx: Fixture = .{};
+    // From the wrapper leader, descent lands on the real agent.
+    try std.testing.expectEqual(@as(i32, 300), descendToProgramImpl(Fixture, &fx, 100));
+    // Already a real program: returned unchanged (never overshoots into its kids).
+    try std.testing.expectEqual(@as(i32, 300), descendToProgramImpl(Fixture, &fx, 300));
+    // Unnameable pid: resolve what we have.
+    try std.testing.expectEqual(@as(i32, 999), descendToProgramImpl(Fixture, &fx, 999));
 }

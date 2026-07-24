@@ -189,10 +189,43 @@ extension Ghostty {
                 if !surfaceView.healthy {
                     Rectangle().fill(ghostty.config.backgroundColor)
                     SurfaceRendererUnhealthyView()
-                } else if surfaceView.error != nil {
+                } else if let error = surfaceView.error {
                     Rectangle().fill(ghostty.config.backgroundColor)
-                    SurfaceErrorView()
+                    SurfaceErrorView(error: error)
                 }
+
+                #if canImport(AppKit)
+                // (ramon fork / cloud-hosts) A restored/launched surface bound to a
+                // remote host defers its `.client` dial to the tunnel supervisor's
+                // readiness signal (D5/E2), so the surface is intentionally nil
+                // until the tunnel handshakes. Show an explanatory placeholder
+                // rather than an unexplained blank pane (design rule §564-566).
+                // This inline placeholder is the interim owner until the K1
+                // named-state overlay lands (Phase 2). `pendingRemoteHost` exists
+                // only on the macOS SurfaceView.
+                if let host = surfaceView.pendingRemoteHost {
+                    Rectangle().fill(ghostty.config.backgroundColor)
+                    AwaitingRemoteHostView(hostName: host)
+                }
+
+                // (ramon fork / cloud-hosts, K1/L1) The reconnect / version / unreachable
+                // overlay for a REMOTE `.client` surface. Draws a named, actionable banner
+                // OVER the frozen, dimmed last frame so a dropped / version-refused /
+                // unreachable remote split is NEVER a silent blank pane (design rule
+                // §"never a silent blank pane"). Mounted only for a resolved remote host
+                // (a local surface always reports `.ok`, so this would be inert overhead);
+                // it polls the lock-free `clientStateInfo` accessor. `pendingRemoteHost`
+                // (pre-dial) and this overlay (post-dial) never both show: while pending,
+                // `surface == nil` ⇒ `clientStateInfo` is `.ok` ⇒ no banner.
+                if let host = surfaceView.hostName,
+                   !host.isEmpty,
+                   host.lowercased() != "local" {
+                    ReconnectStateOverlay(
+                        surfaceView: surfaceView,
+                        hostName: host,
+                        backgroundColor: ghostty.config.backgroundColor)
+                }
+                #endif
 
                 // If we're part of a split view and don't have focus, we put a semi-transparent
                 // rectangle above our view to make it look unfocused. We include the last
@@ -241,6 +274,24 @@ extension Ghostty {
     }
 
     struct SurfaceErrorView: View {
+        /// The error that caused the surface to fail to initialize, if known.
+        /// When it is a `Ghostty.Error` with a specific message (e.g. the
+        /// cloud-hosts `.remoteHostUnresolvable`), we surface that message
+        /// verbatim instead of the generic "usually a bug" text.
+        var error: Ghostty.Error? = nil
+
+        private var message: String {
+            switch error {
+            case .some(.remoteHostUnresolvable(let name)):
+                return "This split is bound to remote host \"\(name)\", which is not in your pty-remote-host configuration (renamed, removed, or the config didn't load). Fix the host name in ~/.config/ghostty-ramon/config, or open a new local split."
+            default:
+                return """
+                    The terminal failed to initialize. Please check the logs for
+                    more information. This is usually a bug.
+                    """.replacingOccurrences(of: "\n", with: " ")
+            }
+        }
+
         var body: some View {
             HStack {
                 Image("AppIconImage")
@@ -250,17 +301,142 @@ extension Ghostty {
 
                 VStack(alignment: .leading) {
                     Text("Oh, no. 😭").font(.title)
-                    Text("""
-                        The terminal failed to initialize. Please check the logs for
-                        more information. This is usually a bug.
-                        """.replacingOccurrences(of: "\n", with: " ")
-                    )
-                    .frame(maxWidth: 350)
+                    Text(verbatim: message)
+                        .frame(maxWidth: 350)
                 }
             }
             .padding()
         }
     }
+
+    /// (ramon fork / cloud-hosts) Interim placeholder shown while a remote-host
+    /// `.client` surface waits for its SSH tunnel to hand-shake (E2). Driven by
+    /// `SurfaceView.pendingRemoteHost`; superseded by the K1 named-state overlay
+    /// in Phase 2. Kept intentionally minimal.
+    struct AwaitingRemoteHostView: View {
+        let hostName: String
+
+        var body: some View {
+            HStack {
+                ProgressView()
+                    .controlSize(.small)
+                VStack(alignment: .leading) {
+                    Text("Connecting to \(hostName)…").font(.headline)
+                    Text("Waiting for the SSH tunnel to \(hostName) to come up.")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 350)
+                }
+            }
+            .padding()
+        }
+    }
+
+    #if canImport(AppKit)
+    /// (ramon fork / cloud-hosts, K1/L1) Overlay that renders the `.client` connection
+    /// state for a REMOTE surface OVER the frozen, dimmed last frame. Polls the
+    /// lock-free `SurfaceView.clientStateInfo` accessor on a modest cadence (the state
+    /// is host-fed and pushed only into a core atomic, so there is no notification to
+    /// observe — a timer poll is the analog of the other host-fed per-surface reads).
+    /// The state→(title, body, severity) mapping is the pure, unit-tested
+    /// `Ghostty.SurfaceView.reconnectBanner`; this view only handles presentation.
+    struct ReconnectStateOverlay: View {
+        @ObservedObject var surfaceView: SurfaceView
+        let hostName: String
+        let backgroundColor: Color
+
+        @State private var info: Ghostty.ClientStateInfo = .init()
+
+        /// Poll cadence (seconds). Matches the coarse, human-perceptible granularity of
+        /// the other host-fed per-surface reads (e.g. the dashboard mirror's
+        /// `processExited` poll); a dropped tunnel does not need sub-second latency.
+        private static let pollInterval: UInt64 = 750_000_000
+
+        private var banner: Ghostty.ReconnectBanner? {
+            Ghostty.SurfaceView.reconnectBanner(info: info, host: hostName)
+        }
+
+        var body: some View {
+            ZStack {
+                if let banner {
+                    // Dim the frozen last frame. A transient reconnect is gentle so the
+                    // (still-current) content stays readable; a loud error dims harder.
+                    Rectangle()
+                        .fill(backgroundColor)
+                        .opacity(banner.severity == .transient ? 0.4 : 0.65)
+                        .allowsHitTesting(false)
+
+                    ReconnectBannerCard(banner: banner)
+                        .transition(.opacity)
+                }
+            }
+            .task {
+                // Poll the lock-free host-fed state (no notification pushes it into
+                // Swift), the same shape as the dashboard mirror's `processExited` poll.
+                info = surfaceView.clientStateInfo
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: Self.pollInterval)
+                    let next = surfaceView.clientStateInfo
+                    if next != info { info = next }
+                }
+            }
+        }
+    }
+
+    /// The banner card body for `ReconnectStateOverlay`. A transient reconnect shows a
+    /// small spinner + subtle text; an `info`/`loud` state shows an icon, a bold title,
+    /// and the actionable body, tinted by severity.
+    struct ReconnectBannerCard: View {
+        let banner: Ghostty.ReconnectBanner
+
+        private var accent: Color {
+            switch banner.severity {
+            case .transient: return .gray
+            case .info: return .orange
+            case .loud: return .red
+            }
+        }
+
+        private var iconName: String {
+            switch banner.severity {
+            case .transient: return "arrow.triangle.2.circlepath"
+            case .info: return "moon.zzz"
+            case .loud: return "exclamationmark.triangle.fill"
+            }
+        }
+
+        var body: some View {
+            HStack(alignment: .top, spacing: 10) {
+                if banner.severity == .transient {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: iconName)
+                        .font(.title2)
+                        .foregroundStyle(accent)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(banner.title)
+                        .font(.headline)
+                    Text(banner.body)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: 360, alignment: .leading)
+                }
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(.background)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .strokeBorder(accent.opacity(banner.severity == .transient ? 0.25 : 0.5),
+                                          lineWidth: 1))
+                    .shadow(radius: 6)
+            )
+            .padding()
+        }
+    }
+    #endif
 
     // This is the resize overlay that shows on top of a surface to show the current
     // size during a resize operation.
@@ -667,6 +843,33 @@ extension Ghostty {
         /// persisted across restarts via SurfaceView's Codable `sessionID` key.
         var sessionID: String?
 
+        /// (ramon fork / cloud-hosts) Explicit LOCAL forwarded socket path this
+        /// `.client` surface should dial, resolved GUI-side by the tunnel
+        /// supervisor (`RemoteTunnelController`) from `hostName`. nil ⇒ the core
+        /// falls back to the global `pty-host` scalar (a local surface).
+        /// Forwarded into `ghostty_surface_config_s.pty_host_socket` (D5). NOT
+        /// persisted directly — it is re-resolved from `hostName` at restore
+        /// (the forwarded socket path can change across GUI restarts).
+        var ptyHostSocket: String?
+
+        /// (ramon fork / cloud-hosts) Identity label of the host this surface is
+        /// bound to (the `pty-remote-host` registry key). nil / `"local"` ⇒ the
+        /// local `pty-host`. Persisted alongside `sessionID` (SurfaceView's
+        /// Codable `hostName` key) so the `(host, session_id)` pair survives a
+        /// GUI restart; on restore it is resolved back to a forwarded socket via
+        /// the registry (D3/D4). Forwarded into `ghostty_surface_config_s.host_name`.
+        var hostName: String?
+
+        /// (ramon fork / cloud-hosts, REG-T2/REG-T3) Per-attempt connection ceiling,
+        /// in SECONDS, for this surface's `.client` mid-session redial. Set from
+        /// `pty-remote-connect-timeout` (`Ghostty.Config.ptyRemoteConnectTimeout`)
+        /// ONLY when dialing a REMOTE host; `0` (the default) ⇒ the core's compiled-in
+        /// default ceiling. NOT a protocol/wire field. Forwarded into
+        /// `ghostty_surface_config_s.pty_host_connect_timeout_s`, which the core
+        /// `Surface.init` threads into `Client.Config.connect_timeout_s`. NOT persisted
+        /// (re-applied from config on the deferred remote dial, like `ptyHostSocket`).
+        var ptyHostConnectTimeoutS: UInt32 = 0
+
         /// (ramon fork / Agent Dashboard, Layer 3) When true and the `.client`
         /// termio backend is in use together with a non-zero `sessionID`, the
         /// surface becomes a READ-ONLY render mirror of the host session
@@ -752,6 +955,12 @@ extension Ghostty {
             // session. Default false => byte-identical attach/spawn behavior.
             config.mirror = mirror
 
+            // (ramon fork / cloud-hosts, REG-T2) Per-attempt `.client` redial
+            // connection ceiling in SECONDS (0 ⇒ compiled default). A plain scalar,
+            // only set for a remote host; the core threads it into
+            // Client.Config.connect_timeout_s. NOT a protocol/wire field.
+            config.pty_host_connect_timeout_s = ptyHostConnectTimeoutS
+
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in
                 config.working_directory = cWorkingDir
@@ -761,6 +970,15 @@ extension Ghostty {
 
                     return try initialInput.withCString { cInput in
                         config.initial_input = cInput
+
+                        // (ramon fork / cloud-hosts) Per-surface forwarded socket +
+                        // identity label (D5). null socket ⇒ the core falls back to
+                        // the global `pty-host` scalar; null host_name ⇒ "local".
+                        return try ptyHostSocket.withCString { cSock in
+                            config.pty_host_socket = cSock
+
+                            return try hostName.withCString { cHost in
+                                config.host_name = cHost
 
                         // Convert dictionary to arrays for easier processing
                         let keys = Array(environmentVariables.keys)
@@ -786,6 +1004,8 @@ extension Ghostty {
                                 }
                             }
                         }
+                            } // hostName.withCString
+                        } // ptyHostSocket.withCString
                     }
                 }
             }

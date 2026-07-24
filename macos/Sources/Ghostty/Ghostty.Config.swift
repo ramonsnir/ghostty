@@ -1011,6 +1011,97 @@ extension Ghostty {
             return buffer.compactMap { $0.map { String(cString: $0) } }
         }
 
+        // (ramon fork / cloud-hosts) Raw `pty-remote-host` lines, one per configured
+        // remote host, each the VERBATIM value after the config key's first `=` (e.g.
+        // `cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock`). This getter
+        // does NOT parse the line grammar — that is the SOLE responsibility of
+        // `RemoteHostRegistry.parse(line:)`. A byte-for-byte copy of the
+        // `agentQueueTemplatesDirs` / `projectDirectories` `RepeatableString` readers.
+        var ptyRemoteHostLines: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-host"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts) Raw `pty-remote-host-command` lines — one per host with
+        // a per-host TRANSPORT-COMMAND override, each the VERBATIM value after the config
+        // key's first `=` (e.g. `cloud-1 = my-ssh-wrapper cloud-1 --`). This getter does NOT parse
+        // the `<name> = <command template>` grammar — that is
+        // `RemoteHostRegistry.parseCommand(line:)`, which pairs each command to its
+        // `pty-remote-host` entry (the ssh-target then becomes just a label; the remote
+        // socket path still comes from the `pty-remote-host` line). A byte-for-byte copy of
+        // the `ptyRemoteHostLines` RepeatableString reader.
+        var ptyRemoteHostCommandLines: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-host-command"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts) Raw `pty-remote-project-directory` lines — one per
+        // configured base, each the VERBATIM value after the config key's first `=` (e.g.
+        // `cloud-1 = ~/git`). This getter does NOT parse the `<name> = <base>` grammar —
+        // that is `ProjectPaletteView.parseRemoteProjectBases`. A byte-for-byte copy of the
+        // `ptyRemoteHostLines` / `projectDirectories` `RepeatableString` readers.
+        var remoteProjectDirectories: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-project-directory"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts, D6) Per-box CAPABILITY tokens the in-GUI MCP server
+        // ACCEPTS for `/agent-state` ingest ONLY (never `/mcp`). Empty ⇒ fail-closed (no
+        // box token accepted). Wired into `MCPServer.configureCapabilityTokens` at launch.
+        // A byte-for-byte copy of the `ptyRemoteHostLines` RepeatableString reader.
+        var ptyRemoteCapabilityTokens: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-capability-token"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts, D6) Extra exact `Host`-header values the in-GUI MCP
+        // server ACCEPTS beyond the bind host + loopback (tailnet MagicDNS FQDNs), so an
+        // MCP / `/agent-state` request over the tailnet isn't 403'd by the rebinding guard.
+        // Wired into `MCPServer.configureAllowedHosts` at launch. A byte-for-byte copy of
+        // the `ptyRemoteHostLines` RepeatableString reader.
+        var ptyRemoteMcpAllowedHosts: [String] {
+            guard let config = self.config else { return [] }
+            var v: ghostty_config_string_list_s = .init()
+            let key = "pty-remote-mcp-allowed-host"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return [] }
+            guard v.len > 0 else { return [] }
+            let buffer = UnsafeBufferPointer(start: v.items, count: Int(v.len))
+            return buffer.compactMap { $0.map { String(cString: $0) } }
+        }
+
+        // (ramon fork / cloud-hosts) Extra `ssh` options applied to every remote-host
+        // tunnel (verbatim, appended to the supervisor's ssh command line). nil/empty
+        // when unset. A scalar `?[]const u8`, so read like `ptyHost` above.
+        var ptyRemoteSshOptions: String? {
+            guard let config = self.config else { return nil }
+            var v: UnsafePointer<Int8>?
+            let key = "pty-remote-ssh-options"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return nil }
+            guard let ptr = v else { return nil }
+            let s = String(cString: ptr)
+            return s.isEmpty ? nil : s
+        }
+
         // (ramon fork / Agent Queue Supervisor) Optional global concurrency cap across
         // ALL queue runs (the fleet-wide ceiling). 0 = UNLIMITED (the default).
         //
@@ -1036,6 +1127,20 @@ extension Ghostty {
             guard let config = self.config else { return defaultValue }
             var v: UInt32 = defaultValue
             let key = "agent-queue-hero-max"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        // (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS, for a
+        // REMOTE (`pty-remote-host`) split's mid-session redial AND the tunnel
+        // supervisor's ssh-master respawn (REG-T3). `0` (the default) ⇒ use the
+        // compiled-in default. Same non-optional-UInt32 rule as `agentQueueHeroMax`
+        // above — a `UInt32?` reads back nil and silently returns the default.
+        var ptyRemoteConnectTimeout: UInt32 {
+            let defaultValue: UInt32 = 0
+            guard let config = self.config else { return defaultValue }
+            var v: UInt32 = defaultValue
+            let key = "pty-remote-connect-timeout"
             _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
             return v
         }

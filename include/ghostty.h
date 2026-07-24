@@ -494,9 +494,11 @@ typedef struct {
   // Host pty session to (re)attach to. 0 means none: spawn a FRESH host
   // session (today's behavior). A non-zero value requests that the `.client`
   // backend attach to the existing host session with this id instead of
-  // spawning a new one. Host session ids start at 1, so 0 is a safe sentinel.
-  // Only consulted when the `.client` backend is selected (i.e. `pty-host` is
-  // set); ignored for the in-process `.exec` backend.
+  // spawning a new one. Host session ids are RANDOM non-zero u64 (minted by the
+  // host's allocSessionId), so 0 is a safe sentinel meaning "no session". Only
+  // consulted when the `.client` backend is selected (i.e. `pty-host` is set or
+  // a per-surface `pty_host_socket` is supplied); ignored for the in-process
+  // `.exec` backend.
   uint64_t session_id;
   bool wait_after_command;
   ghostty_surface_context_e context;
@@ -507,6 +509,27 @@ typedef struct {
   // = a normal attach/spawn surface (today's behavior). Appended last so the ABI
   // stays additive; old zero-initialized callers get the safe default.
   bool mirror;
+  // (ramon fork / cloud-hosts) Per-surface AF_UNIX socket path of the
+  // `ghostty-host` this surface should dial. When non-NULL it OVERRIDES the
+  // global `pty-host` config scalar for this surface only (so a cloud split can
+  // dial a different, GUI-resolved forwarded socket while local splits use the
+  // global host). NULL (the default) ⇒ fall back to the global `pty-host`
+  // scalar (today's behavior). Appended last so the ABI stays additive;
+  // zero-initialized callers get NULL.
+  const char* pty_host_socket;
+  // (ramon fork / cloud-hosts) Identity label of the host this surface runs on,
+  // paired with `session_id` for reattach/persistence across a GUI restart
+  // (the `(host, session_id)` key). Caller-supplied; NEVER mutated by the host.
+  // NULL (the default) ⇒ the reserved name "local". Appended last so the ABI
+  // stays additive; zero-initialized callers get NULL.
+  const char* host_name;
+  // (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS, for
+  // this surface's `.client` mid-session redial (only consulted for a resolved
+  // REMOTE host whose redial is opt-in). NOT a protocol field — never sent on
+  // the wire; it only bounds each reconnect attempt of the backoff. 0 (the
+  // default) ⇒ the compiled-in default ceiling. Appended last so the ABI stays
+  // additive; zero-initialized callers get 0.
+  uint32_t pty_host_connect_timeout_s;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -526,6 +549,54 @@ typedef struct {
   uint16_t rows;
   bool valid;
 } ghostty_surface_mirror_grid_s;
+
+// (ramon fork / cloud-hosts) Result of a one-shot Hello->HelloAck handshake
+// probe of a ghostty-host socket (see ghostty_probe_host). `reachable` is true
+// iff the socket connect() succeeded; `handshaked` is true iff a HelloAck was
+// decoded before EOF/timeout (a bare reachable connect is NOT ready — that is
+// the ssh -L accept-then-EOF false-positive). `major`/`minor` carry the host's
+// advertised protocol version and are meaningful ONLY when `handshaked`.
+typedef struct {
+  bool reachable;
+  bool handshaked;
+  uint16_t major;
+  uint16_t minor;
+} ghostty_host_probe_s;
+
+// (ramon fork / cloud-hosts) Surface-visible `.client` connection state — the
+// state channel the macOS reconnect overlay renders so a dropped/failed remote
+// split is never a silent blank pane. `OK` is the normal connected state (and
+// the value for a `.exec` surface). The rest are the drop / version-refuse
+// states (see termio.Client.State):
+//   RECONNECTING     — dropped; the redial machine is retrying.
+//   SESSION_ENDED    — the host handed back a DIFFERENT session id on reattach
+//                      (the host restarted; the prior session is gone).
+//   CANNOT_HANDSHAKE — connected but EOF before any HelloAck (ambiguous:
+//                      starting up / down / incompatible-major). Retryable.
+//   TOO_OLD          — decoded a HelloAck whose MAJOR != the GUI's major
+//                      (a confident, actionable incompatibility — redeploy the host).
+//   UNREACHABLE      — the connect() (tunnel dial) failed. Retryable.
+typedef enum {
+  GHOSTTY_CLIENT_STATE_OK = 0,
+  GHOSTTY_CLIENT_STATE_RECONNECTING = 1,
+  GHOSTTY_CLIENT_STATE_SESSION_ENDED = 2,
+  GHOSTTY_CLIENT_STATE_CANNOT_HANDSHAKE = 3,
+  GHOSTTY_CLIENT_STATE_TOO_OLD = 4,
+  GHOSTTY_CLIENT_STATE_UNREACHABLE = 5,
+} ghostty_client_state_e;
+
+// (ramon fork / cloud-hosts) The `.client` connection state plus the version
+// data the TOO_OLD directional message needs. `host_major`/`host_minor` are the
+// host's advertised protocol version from the last HelloAck (meaningful once a
+// handshake happened; 0 otherwise); `gui_major`/`gui_minor` are this GUI's
+// compiled protocol version. See ghostty_surface_client_state.
+typedef struct {
+  ghostty_client_state_e state;
+  uint16_t host_major;
+  uint16_t host_minor;
+  uint16_t gui_major;
+  uint16_t gui_minor;
+} ghostty_client_state_s;
 
 // Config types
 
@@ -729,7 +800,18 @@ typedef struct {
   // Optional command to feed to the new tab's shell as its first input
   // (caller includes any trailing newline). NULL opens an empty prompt.
   const char* initial_input;
+  // (ramon fork / cloud-hosts) Optional remote pty-remote-host registry name.
+  // When non-NULL (the new_tab_on_host action) the macOS handler resolves it to
+  // a forwarded socket and threads it onto the new tab's SurfaceConfiguration.
+  // NULL => a local tab (the pre-existing behavior).
+  const char* host_name;
 } ghostty_action_new_tab_s;
+
+// apprt.action.NewSplitOnHost.C — (ramon fork / cloud-hosts)
+typedef struct {
+  ghostty_action_split_direction_e direction;
+  const char* host_name;
+} ghostty_action_new_split_on_host_s;
 
 // apprt.action.SetTitle.C
 typedef struct {
@@ -1039,6 +1121,7 @@ typedef enum {
   GHOSTTY_ACTION_GOTO_LAST_SURFACE,
   GHOSTTY_ACTION_HIDE_DASHBOARD_SPLIT,
   GHOSTTY_ACTION_SPOTLIGHT_DASHBOARD_SPLIT,
+  GHOSTTY_ACTION_NEW_SPLIT_ON_HOST,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1087,6 +1170,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_new_split_on_host_s new_split_on_host;
 } ghostty_action_u;
 
 typedef struct {
@@ -1190,6 +1274,13 @@ GHOSTTY_API ghostty_config_key_info_s ghostty_config_key_at(uint32_t);
 // ForkSetup gates the host LaunchAgent reload on this instead of the binary hash.
 GHOSTTY_API uint64_t ghostty_host_reload_identity(void);
 
+// (ramon fork / cloud-hosts) Probe a ghostty-host socket with one
+// Hello->HelloAck round-trip; see ghostty_host_probe_s. GUI-lib-only (never
+// compiled into ghostty-host). `timeout_ms` bounds the whole probe; a NULL
+// socket path returns {reachable=false}. Backs the SSH tunnel supervisor's
+// readiness gate (readiness requires handshaked==true).
+GHOSTTY_API ghostty_host_probe_s ghostty_probe_host(const char* socket_path, uint32_t timeout_ms);
+
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
 GHOSTTY_API void ghostty_app_free(ghostty_app_t);
@@ -1215,6 +1306,11 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_session_id(ghostty_surface_t);
+// (ramon fork / cloud-hosts) Read the surface's `.client` connection state + the
+// TOO_OLD version data (see ghostty_client_state_s). GUI-lib-only; a `.exec`
+// surface always reports OK. Lock-free (reads atomics), so it is safe to call
+// from the apprt/main thread (the K1 reconnect overlay polls it).
+GHOSTTY_API ghostty_client_state_s ghostty_surface_client_state(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 // (ramon fork) Commit a deliberate close of this surface's pty-host session:
 // send a live host Close frame that DESTROYS it (vs the default detach-for-

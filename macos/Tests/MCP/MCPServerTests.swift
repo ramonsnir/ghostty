@@ -374,6 +374,18 @@ struct MCPServerTests {
         }
     }
 
+    // fork / cloud-hosts (O6): spawn_split_command gained an OPTIONAL `host` property —
+    // NO new tool (count stays 26, asserted above). `host` is NOT required.
+    @Test func spawnSplitCommandHasOptionalHost() {
+        let tools = MCPTools.toolsListResult["tools"] as! [[String: Any]]
+        let spawn = tools.first { $0["name"] as? String == "spawn_split_command" }!
+        let schema = spawn["inputSchema"] as! [String: Any]
+        let props = schema["properties"] as! [String: Any]
+        #expect(props["host"] != nil)
+        let required = (schema["required"] as? [String]) ?? []
+        #expect(!required.contains("host"))   // optional — defaults to local
+    }
+
     @Test func toolsListSchemaRequiredFields() {
         let tools = MCPTools.toolsListResult["tools"] as! [[String: Any]]
         func schema(_ name: String) -> [String: Any] {
@@ -463,10 +475,34 @@ struct MCPServerTests {
         // foreground process is the `bash` pool wrapper, NOT "claude" — agentKind
         // is the reliable signal the summarizer uses).
         #expect(d["agentKind"] as? String == "claude")
-        // fork / Agent Queue (§8.4): sessionID is a PLAIN integer, always present.
-        #expect((d["sessionID"] as? NSNumber)?.uint64Value == 4242)
+        // fork / cloud-hosts (Q2): sessionID is now the STRING COMPOSITE
+        // "<hostName>:<sessionID>" (host "local" by default), the matched emit↔parse
+        // pair with the sidecar. NO LONGER an NSNumber.
+        #expect(d["sessionID"] as? String == "local:4242")
+        #expect(d["sessionID"] as? NSNumber == nil)   // the number wire type is gone
         // fork / Agent Manager: hidden is OMITTED when false (not hidden).
         #expect(d["hidden"] == nil)
+        // fork / cloud-hosts (D3): hostName is emitted STANDALONE too; a row that
+        // did not set it defaults to "local".
+        #expect(d["hostName"] as? String == "local")
+    }
+
+    // fork / cloud-hosts (Q2, D3): hostName is emitted standalone AND folded into the
+    // sessionID composite "<hostName>:<sessionID>" for a remote surface — the matched
+    // emit↔parse pair with the sidecar (split on the LAST ':' into (host, u64)).
+    @Test func surfacesJSONDataEmitsHostName() {
+        let remote = MCPLayout.SurfaceRow(
+            id: "R1", title: "claude", pwd: "/tmp",
+            window: 0, tab: 0, tabTitle: "T",
+            splitIndex: 0, splitCount: 1,
+            focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: true,
+            processName: nil, command: nil, idleSeconds: nil,
+            agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+            agentKind: "claude", hidden: false, sessionID: 99, hostName: "cloud-1")
+        let d = MCPLayout.surfacesJSONData([remote])[0]
+        #expect(d["hostName"] as? String == "cloud-1")
+        // The composite carries the SAME host so the sidecar splits it back to (cloud-1, 99).
+        #expect(d["sessionID"] as? String == "cloud-1:99")
     }
 
     // fork / Agent Manager: a hidden tile emits `hidden:true` so the summarizer skips it.
@@ -524,9 +560,9 @@ struct MCPServerTests {
         // The always-present fields are unaffected.
         #expect(d["id"] as? String == "ABC")
         #expect(d["atPrompt"] as? Bool == true)
-        // fork / Agent Queue (§8.4): sessionID is a plain integer, ALWAYS present —
-        // 0 here (no host session). The supervisor self-disables on a 0.
-        #expect((d["sessionID"] as? NSNumber)?.uint64Value == 0)
+        // fork / cloud-hosts (Q2): sessionID composite, ALWAYS present — "local:0" here
+        // (no host session). The supervisor parses the u64 back and self-disables on 0.
+        #expect(d["sessionID"] as? String == "local:0")
     }
 
     // fork / Agent Queue (adopt): the queue tags MUST be emitted when present, so the
@@ -1671,6 +1707,30 @@ struct MCPServerTests {
         #expect(d.docPath == "BELL-ATTENTION.md")
         #expect(d.configKeys.contains("bell-features"))
         #expect(d.configKeys.contains("agent-manager-bell-filter"))
+    }
+
+    // fork / cloud-hosts (MCP-K1): the cloud-hosts FeatureDoc groups the Phase-1 keys
+    // and is enabled once at least one remote host is registered.
+    @Test func featureStatusCloudHostsGate() {
+        // No registry ⇒ disabled, lists the missing key.
+        let off = MCPKnowledge.status("cloud-hosts", pre: pre())
+        #expect(off.enabled == false)
+        #expect(off.requires.contains("pty-remote-host set"))
+        // A registered host ⇒ enabled, no unmet requirements.
+        let on = MCPKnowledge.status(
+            "cloud-hosts",
+            pre: MCPKnowledge.Preconditions(
+                agentDashboard: false, agentManager: false, agentQueue: false,
+                mcpListen: "", mcpToken: "", webMonitorListen: "",
+                projectDirectories: [], nodeResolvable: false, bellFilter: false,
+                remoteHosts: ["cloud-1 = user@example.ts.net : ~/.ghostty-ramon-host.sock"]))
+        #expect(on.enabled == true)
+        #expect(on.requires.isEmpty)
+        // The FeatureDoc exists, points at the design doc, and lists both Phase-1 keys.
+        let doc = MCPKnowledge.featureDoc("cloud-hosts", pre: pre())!
+        #expect(doc.docPath == "CLOUD-HOSTS-DESIGN.md")
+        #expect(doc.configKeys.contains("pty-remote-host"))
+        #expect(doc.configKeys.contains("pty-remote-ssh-options"))
     }
 
     // GUARD (mirrors readersIncludeAllForkOnlyKeys for docs_for_feature): every fork-only

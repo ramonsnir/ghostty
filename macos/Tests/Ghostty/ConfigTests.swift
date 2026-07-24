@@ -325,4 +325,17 @@ struct ConfigTests {
         #expect(F(rawValue: (1 << 9) | (1 << 8)).contains(.push))
         #expect(!F(rawValue: 1 << 9).contains(.dashboard))
     }
+
+    // (ramon fork / cloud-hosts, REG-T1/REG-T3) The connect-timeout getter must READ the
+    // scalar — the same non-optional-UInt32 rule as agentQueueHeroMax (a UInt32? reads
+    // back nil and silently stays the default). Default is 0 (= compiled default).
+    @Test func ptyRemoteConnectTimeoutDefaultsToZero() throws {
+        let config = try TemporaryConfig("")
+        #expect(config.ptyRemoteConnectTimeout == 0)
+    }
+
+    @Test func ptyRemoteConnectTimeoutReadsScalar() throws {
+        let config = try TemporaryConfig("pty-remote-connect-timeout = 15")
+        #expect(config.ptyRemoteConnectTimeout == 15)
+    }
 }

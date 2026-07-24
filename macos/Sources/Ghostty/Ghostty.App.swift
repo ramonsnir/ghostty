@@ -623,6 +623,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_NEW_SPLIT:
                 newSplit(app, target: target, direction: action.action.new_split)
 
+            case GHOSTTY_ACTION_NEW_SPLIT_ON_HOST:
+                newSplitOnHost(app, target: target, params: action.action.new_split_on_host)
+
             case GHOSTTY_ACTION_CLOSE_TAB:
                 closeTab(app, target: target, mode: action.action.close_tab_mode)
 
@@ -1000,6 +1003,23 @@ extension Ghostty {
             // `new_tab_command:<cmd>`). The core already appended a newline.
             let initialInput: String? = params.initial_input.map { String(cString: $0) }
 
+            // (ramon fork / cloud-hosts) Optional remote host registry name
+            // (the `new_tab_on_host` action reuses this `.new_tab` action). A
+            // non-empty name opens the tab on that cloud box; an EMPTY string is
+            // the argument-less command-palette entry (open the host picker);
+            // NULL is a normal local tab (the pre-existing behavior).
+            if let hostName = params.host_name.map({ String(cString: $0) }) {
+                if hostName.isEmpty {
+                    postRemoteHostSelector(target: target)
+                } else {
+                    newTabOnRemoteHost(
+                        target: target,
+                        hostName: hostName,
+                        initialInput: initialInput)
+                }
+                return
+            }
+
             switch target.tag {
             case GHOSTTY_TARGET_APP:
                 var userInfo: [AnyHashable: Any] = [:]
@@ -1075,6 +1095,98 @@ extension Ghostty {
 
             default:
                 assertionFailure()
+            }
+        }
+
+        // (ramon fork / cloud-hosts) Open a new split on a REMOTE `ghostty-host`
+        // box (the `new_split_on_host` action). An EMPTY `host_name` is the
+        // argument-less command-palette entry → open the host picker. A
+        // non-empty name spawns a BARE `.client` split carrying only
+        // `hostName` (session_id null ⇒ fresh spawn on that host); the
+        // SurfaceView resolves the name → forwarded socket and DEFERS the dial
+        // to tunnel readiness (E2/D4/D5). An unresolvable name surfaces the
+        // SurfaceView "host not in registry" error state — never a local dial.
+        private static func newSplitOnHost(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            params: ghostty_action_new_split_on_host_s
+        ) {
+            let hostName = params.host_name.map { String(cString: $0) } ?? ""
+            guard !hostName.isEmpty else {
+                postRemoteHostSelector(target: target)
+                return
+            }
+
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("new split on host does nothing with an app target")
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+
+                var config = SurfaceConfiguration()
+                config.hostName = hostName
+                NotificationCenter.default.post(
+                    name: Notification.ghosttyNewSplit,
+                    object: surfaceView,
+                    userInfo: [
+                        "direction": params.direction,
+                        Notification.NewSurfaceConfigKey: config,
+                    ]
+                )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        // (ramon fork / cloud-hosts) Open a new TAB on a remote host (the
+        // `new_tab_on_host` action, which reuses `.new_tab`). BARE config —
+        // only `hostName` (+ any `initial_input`); no cwd inheritance (a local
+        // path is meaningless on a remote box). SurfaceView owns the
+        // resolve/defer/placeholder (E2/D4).
+        private static func newTabOnRemoteHost(
+            target: ghostty_target_s,
+            hostName: String,
+            initialInput: String?
+        ) {
+            var config = SurfaceConfiguration()
+            config.hostName = hostName
+            config.initialInput = initialInput
+
+            let object: Any?
+            switch target.tag {
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface,
+                      let surfaceView = self.surfaceView(from: surface) else { return }
+                object = surfaceView
+            default:
+                object = nil
+            }
+
+            NotificationCenter.default.post(
+                name: Notification.ghosttyNewTab,
+                object: object,
+                userInfo: [Notification.NewSurfaceConfigKey: config]
+            )
+        }
+
+        // (ramon fork / cloud-hosts) Post the toggle for the remote-host picker
+        // palette (the argument-less `new_split_on_host` / `new_tab_on_host`
+        // command-palette entries). Surface-attached, mirroring
+        // `toggleProjectSelector`: a no-op on an APP target (the palette overlays
+        // a surface).
+        private static func postRemoteHostSelector(target: ghostty_target_s) {
+            switch target.tag {
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface,
+                      let surfaceView = self.surfaceView(from: surface) else { return }
+                NotificationCenter.default.post(
+                    name: .ghosttyRemoteHostSelectorDidToggle,
+                    object: surfaceView)
+            default:
+                Ghostty.logger.warning("remote host selector does nothing with an app target")
             }
         }
 

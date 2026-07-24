@@ -39,6 +39,9 @@ protocol TerminalViewModel: ObservableObject {
     /// (ramon fork / Agent Queue Supervisor) The queue-template picker state.
     var queueSelectorIsShowing: Bool { get set }
 
+    /// (ramon fork / cloud-hosts) The remote-host picker palette state.
+    var remoteHostSelectorIsShowing: Bool { get set }
+
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
 
@@ -151,7 +154,9 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         surfaceView: surfaceView,
                         isPresented: $viewModel.projectSelectorIsShowing,
                         ghosttyConfig: ghostty.config,
-                        projectDirectories: ghostty.config.projectDirectories
+                        projectDirectories: ghostty.config.projectDirectories,
+                        remoteProjectLines: ghostty.config.remoteProjectDirectories,
+                        remoteHostLines: ghostty.config.ptyRemoteHostLines
                     )
 
                     QueuePaletteView(
@@ -159,6 +164,13 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         isPresented: $viewModel.queueSelectorIsShowing,
                         ghosttyConfig: ghostty.config,
                         templatesDirs: ghostty.config.agentQueueTemplatesDirs
+                    )
+
+                    RemoteHostPaletteView(
+                        surfaceView: surfaceView,
+                        isPresented: $viewModel.remoteHostSelectorIsShowing,
+                        ghosttyConfig: ghostty.config,
+                        remoteHostLines: ghostty.config.ptyRemoteHostLines
                     )
                 }
 

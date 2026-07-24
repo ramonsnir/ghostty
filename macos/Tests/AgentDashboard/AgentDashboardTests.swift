@@ -1196,7 +1196,8 @@ struct AgentDashboardSortTests {
         // recency: order follows the manual rank, NOT UUID.
         let a = UUID(), b = UUID(), c = UUID()
         let entries = [entry(a, session: 10), entry(b, session: 20), entry(c, session: 30)]
-        let rank: [UInt64: Int] = [30: 0, 10: 1, 20: 2]
+        // manualRank is now keyed by the COMPOSITE "<host>:<u64>" key (D3/Q4).
+        let rank: [String: Int] = ["local:30": 0, "local:10": 1, "local:20": 2]
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.sessionID)
         #expect(sorted == [30, 10, 20])
     }
@@ -1206,7 +1207,7 @@ struct AgentDashboardSortTests {
         // placed ones — the "new agents at top" choice.
         let a = UUID(), b = UUID(), fresh = UUID()
         let entries = [entry(a, session: 1), entry(b, session: 2), entry(fresh, session: 99)]
-        let rank: [UInt64: Int] = [1: 0, 2: 1]   // 99 is unplaced
+        let rank: [String: Int] = ["local:1": 0, "local:2": 1]   // 99 is unplaced
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.sessionID)
         #expect(sorted == [99, 1, 2])
     }
@@ -1219,7 +1220,7 @@ struct AgentDashboardSortTests {
             entry(b, session: 2),
             entry(wait, session: 3, waiting: true),
         ]
-        let rank: [UInt64: Int] = [1: 0, 2: 1, 3: 2]
+        let rank: [String: Int] = ["local:1": 0, "local:2": 1, "local:3": 2]
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank)
         #expect(sorted.first?.id == wait)
     }
@@ -1230,7 +1231,7 @@ struct AgentDashboardSortTests {
         // and never sorts by the bogus rank.
         let zero = UUID(), placed = UUID()
         let entries = [entry(placed, session: 5), entry(zero, session: 0)]
-        let rank: [UInt64: Int] = [0: 9, 5: 0]
+        let rank: [String: Int] = ["local:0": 9, "local:5": 0]
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.sessionID)
         #expect(sorted == [0, 5])
     }
@@ -1255,7 +1256,7 @@ struct AgentDashboardSortTests {
         // A pinned tile placed LAST in the manual order still floats to the top.
         let a = UUID(), b = UUID(), pinned = UUID()
         let entries = [entry(a, session: 1), entry(b, session: 2), entry(pinned, session: 3)]
-        let rank: [UInt64: Int] = [1: 0, 2: 1, 3: 2]
+        let rank: [String: Int] = ["local:1": 0, "local:2": 1, "local:3": 2]
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank, spotlightedID: pinned)
         #expect(sorted.first?.id == pinned)
     }
@@ -1286,9 +1287,10 @@ struct AgentDashboardManualOrderModelTests {
         let a = UUID(), b = UUID(), c = UUID()
         model.rebuild(live: live([(a, 1), (b, 2), (c, 3)]))
         model.applyAgents(agents([a, b, c]))
-        model.setManualOrder([3, 1, 2])
-        #expect(model.manualOrder == [3, 1, 2])
-        #expect(store.load() == [3, 1, 2])           // persisted
+        // Composite "<host>:<u64>" keys (D3/Q4); local host default.
+        model.setManualOrder(["local:3", "local:1", "local:2"])
+        #expect(model.manualOrder == ["local:3", "local:1", "local:2"])
+        #expect(store.load() == ["local:3", "local:1", "local:2"])   // persisted
         #expect(model.entries.map(\.sessionID) == [3, 1, 2])
         #expect(model.hasManualOrder)
     }
@@ -1296,15 +1298,15 @@ struct AgentDashboardManualOrderModelTests {
     @Test func sessionlessTilesDroppedFromOrder() {
         let store = InMemoryOrderStore()
         let model = AgentDashboardModel(store: InMemoryHideStore(), orderStore: store)
-        model.setManualOrder([0, 5, 0, 7])
-        #expect(model.manualOrder == [5, 7])
-        #expect(store.load() == [5, 7])
+        model.setManualOrder(["local:0", "local:5", "local:0", "local:7"])
+        #expect(model.manualOrder == ["local:5", "local:7"])
+        #expect(store.load() == ["local:5", "local:7"])
     }
 
     @Test func resetOrderClearsAndPersists() {
-        let store = InMemoryOrderStore([9, 8, 7])
+        let store = InMemoryOrderStore(["local:9", "local:8", "local:7"])
         let model = AgentDashboardModel(store: InMemoryHideStore(), orderStore: store)
-        #expect(model.manualOrder == [9, 8, 7])      // loaded from the store at init
+        #expect(model.manualOrder == ["local:9", "local:8", "local:7"])  // loaded at init
         #expect(model.hasManualOrder)
         model.resetOrder()
         #expect(model.manualOrder.isEmpty)
@@ -1318,7 +1320,7 @@ struct AgentDashboardManualOrderModelTests {
         let a = UUID(), b = UUID()
         model.rebuild(live: live([(a, 1), (b, 2)]))
         model.applyAgents(agents([a, b]))
-        model.setManualOrder([1, 2])
+        model.setManualOrder(["local:1", "local:2"])
         #expect(model.entries.map(\.sessionID) == [1, 2])
         // A new agent (session 3) appears: it's unplaced, so it floats to the top.
         let c = UUID()
@@ -1830,7 +1832,7 @@ struct AgentDashboardWaitingSortTests {
                        lastTool: nil, lastPrompt: nil, hookBacked: true, annotation: nil,
                        backgroundShells: 0),
         ]
-        let rank: [UInt64: Int] = [10: 0, 20: 1]
+        let rank: [String: Int] = ["local:10": 0, "local:20": 1]
         let sorted = AgentDashboardModel.sorted(entries, manualRank: rank).map(\.id)
         #expect(sorted == [working, idle])
     }
@@ -1903,33 +1905,51 @@ struct AgentStatePersistenceTests {
         let now = Date()
         let nowS = now.timeIntervalSince1970
         let out = AgentDashboardModel.prune(
-            [1: rec("working", updated: nowS), 2: rec("idle", updated: nowS - 100_000)],
+            ["local:1": rec("working", updated: nowS),
+             "local:2": rec("idle", updated: nowS - 100_000)],
             now: now, maxAge: 3600, maxCount: 256)
-        #expect(out[1] != nil)
-        #expect(out[2] == nil)   // older than maxAge dropped
+        #expect(out["local:1"] != nil)
+        #expect(out["local:2"] == nil)   // older than maxAge dropped
     }
 
     @Test func prunesByCountKeepingNewest() {
         let nowS = Date().timeIntervalSince1970
-        var map: [UInt64: PersistedAgentState] = [:]
-        for i in 0..<10 { map[UInt64(i)] = rec("idle", updated: nowS - Double(i)) }
+        var map: [String: PersistedAgentState] = [:]
+        for i in 0..<10 { map["local:\(i)"] = rec("idle", updated: nowS - Double(i)) }
         let out = AgentDashboardModel.prune(map, now: Date(), maxAge: 1_000_000, maxCount: 3)
         #expect(out.count == 3)
-        #expect(out[0] != nil && out[1] != nil && out[2] != nil) // newest (closest to now)
-        #expect(out[9] == nil)
+        #expect(out["local:0"] != nil && out["local:1"] != nil && out["local:2"] != nil) // newest
+        #expect(out["local:9"] == nil)
     }
 
-    // MARK: store round trip (UInt64 keys survive JSON string-keying)
+    // MARK: store round trip (composite "<host>:<u64>" keys survive JSON)
 
-    @Test func userDefaultsStoreRoundTripsUInt64Keys() {
+    @Test func userDefaultsStoreRoundTripsCompositeKeys() {
         let suite = "ghostty-test-agentstate-roundtrip"
         let d = UserDefaults(suiteName: suite)!
         d.removePersistentDomain(forName: suite)
         defer { d.removePersistentDomain(forName: suite) }
         let store = UserDefaultsAgentStateStore(defaults: d)
         let r = PersistedAgentState(state: "waiting", tool: "Bash", prompt: "hi", message: "approve?", updated: 123)
-        store.save([42: r])
-        #expect(store.load()[42] == r)
+        store.save(["cloud-1:42": r])
+        #expect(store.load()["cloud-1:42"] == r)
+    }
+
+    // (Q4) A PRE-migration bare-number key (written before host namespacing) is read
+    // back as the `local:` namespace — back-compat, mirroring the Codable decode default.
+    @Test func userDefaultsStoreMigratesLegacyBareKeyToLocal() {
+        let suite = "ghostty-test-agentstate-legacy"
+        let d = UserDefaults(suiteName: suite)!
+        d.removePersistentDomain(forName: suite)
+        defer { d.removePersistentDomain(forName: suite) }
+        // Simulate a pre-migration on-disk blob keyed by a bare number.
+        let r = PersistedAgentState(state: "waiting", tool: nil, prompt: nil, message: nil, updated: 1)
+        let legacy = try! JSONEncoder().encode(["12345": r])
+        d.set(legacy, forKey: UserDefaultsAgentStateStore.key)
+        let store = UserDefaultsAgentStateStore(defaults: d)
+        let loaded = store.load()
+        #expect(loaded["local:12345"] == r)   // normalized to the local namespace
+        #expect(loaded["12345"] == nil)        // the bare form is gone
     }
 
     // MARK: hydrate on rebuild
@@ -1938,7 +1958,7 @@ struct AgentStatePersistenceTests {
         let sid: UInt64 = 7
         let model = AgentDashboardModel(
             store: InMemoryHideStore(),
-            agentStateStore: InMemoryAgentStateStore([sid: rec("waiting")]))
+            agentStateStore: InMemoryAgentStateStore(["local:\(sid)": rec("waiting")]))
         let id = UUID()                              // a FRESH uuid (post-restart)
         model.applyAgents(agents([id]))
         model.rebuild(live: live([(id, sid)]))
@@ -1951,18 +1971,37 @@ struct AgentStatePersistenceTests {
     @Test func hydrateSkipsZeroSession() {
         let model = AgentDashboardModel(
             store: InMemoryHideStore(),
-            agentStateStore: InMemoryAgentStateStore([5: rec("idle")]))
+            agentStateStore: InMemoryAgentStateStore(["local:5": rec("idle")]))
         let id = UUID()
         model.applyAgents(agents([id]))
         model.rebuild(live: live([(id, 0)]))         // sessionID 0 → never hydrated
         #expect(model.agentStates[id] == nil)
     }
 
+    // (Q4) Two sessions sharing a u64 on DIFFERENT hosts do NOT re-associate onto the
+    // wrong host: only the matching (host, id) record hydrates each surface.
+    @Test func hydrateIsHostNamespaced() {
+        let idLocal = UUID(), idRemote = UUID()
+        let model = AgentDashboardModel(
+            store: InMemoryHideStore(),
+            agentStateStore: InMemoryAgentStateStore([
+                "local:42": rec("working"),
+                "cloud-1:42": rec("idle"),
+            ]))
+        model.applyAgents(agents([idLocal, idRemote]))
+        model.rebuild(live: [
+            .init(id: idLocal, view: nil, title: "t", pwd: "/x", sessionID: 42, hostName: "local"),
+            .init(id: idRemote, view: nil, title: "t", pwd: "/x", sessionID: 42, hostName: "cloud-1"),
+        ])
+        #expect(model.agentStates[idLocal] == .working)   // local:42 record
+        #expect(model.agentStates[idRemote] == .idle)     // cloud-1:42 record — no collision
+    }
+
     @Test func noCrossSessionContamination() {
         let a = UUID(), b = UUID()
         let model = AgentDashboardModel(
             store: InMemoryHideStore(),
-            agentStateStore: InMemoryAgentStateStore([1: rec("working"), 2: rec("idle")]))
+            agentStateStore: InMemoryAgentStateStore(["local:1": rec("working"), "local:2": rec("idle")]))
         model.applyAgents(agents([a, b]))
         model.rebuild(live: live([(a, 1), (b, 2)]))
         #expect(model.agentStates[a] == .working)
@@ -1979,8 +2018,8 @@ struct AgentStatePersistenceTests {
         model.applyAgents(agents([id]))
         model.rebuild(live: live([(id, sid)]))       // populate `live` so the sid resolves
         model.applyAgentState(id, payload(.working, tool: "Bash"))
-        #expect(store.load()[sid]?.state == "working")
-        #expect(store.load()[sid]?.tool == "Bash")
+        #expect(store.load()["local:\(sid)"]?.state == "working")
+        #expect(store.load()["local:\(sid)"]?.tool == "Bash")
     }
 
     @Test func writeThroughSkipsWhenSessionUnknown() {
@@ -1995,22 +2034,22 @@ struct AgentStatePersistenceTests {
 
     @Test func liveHookOverridesHydratedState() {
         let sid: UInt64 = 3
-        let store = InMemoryAgentStateStore([sid: rec("working")])
+        let store = InMemoryAgentStateStore(["local:\(sid)": rec("working")])
         let model = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
         let id = UUID()
         model.applyAgents(agents([id]))
         model.rebuild(live: live([(id, sid)]))
-        #expect(model.agentStates[id] == .working)        // hydrated
+        #expect(model.agentStates[id] == .working)              // hydrated
         let entered = model.applyAgentState(id, payload(.waiting))
-        #expect(entered == true)                          // working→waiting edge fires
-        #expect(model.agentStates[id] == .waiting)        // live wins over restored
-        #expect(store.load()[sid]?.state == "waiting")    // and is persisted
+        #expect(entered == true)                                // working→waiting edge fires
+        #expect(model.agentStates[id] == .waiting)              // live wins over restored
+        #expect(store.load()["local:\(sid)"]?.state == "waiting")  // and is persisted
     }
 
     // MARK: prune-on-load re-saves
 
     @Test func pruneOnLoadDropsAncientAndResaves() {
-        let store = InMemoryAgentStateStore([1: rec("idle", updated: 0)])  // 1970 → ancient
+        let store = InMemoryAgentStateStore(["local:1": rec("idle", updated: 0)])  // 1970 → ancient
         _ = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
         #expect(store.load().isEmpty)    // pruned + re-saved at init
     }

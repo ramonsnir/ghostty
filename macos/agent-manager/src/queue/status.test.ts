@@ -287,6 +287,90 @@ test("hero: next/running/held refs are marked hero (heroKeys ∪ item.hero)", ()
 });
 
 // ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST) hostCapacity attribution + hosts[] echo.
+// ---------------------------------------------------------------------------
+
+test("hostCapacity: pushed for a REGULAR item that cleared its other gates but no host has room", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    // Every regular gate has room…
+    regularConcurrencyRemaining: 5,
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    heroMax: 2,
+    heroActive: 0,
+    // …but the pool is full/down.
+    anyHostHasFreeSlot: false,
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["hostCapacity"]);
+});
+
+test("hostCapacity: NOT pushed when a host HAS room", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    regularConcurrencyRemaining: 5,
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    anyHostHasFreeSlot: true,
+  }));
+  assert.equal(r.next[0].blockReasons, undefined);
+});
+
+test("hostCapacity: NOT pushed when the other regular gates ALSO block (never masks maxItems etc.)", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    // A regular gate is blocking AND no host has room — the concurrency reason wins; hostCapacity
+    // is only for the "would dispatch if a box were free" case (all other gates clear).
+    regularConcurrencyRemaining: 0,
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    anyHostHasFreeSlot: false,
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["queueConcurrency"]);
+});
+
+test("hostCapacity: a HERO that cleared heroSlots but has no host room gets hostCapacity", () => {
+  const r = queueStatusReport(input({
+    listItems: [hero("H-1")],
+    heroMax: 2,
+    heroActive: 0, // heroRemaining > 0 → hero slot free
+    anyHostHasFreeSlot: false,
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["hostCapacity"]);
+});
+
+test("hostCapacity: a HERO blocked on heroSlots does NOT also get hostCapacity (its own gate wins)", () => {
+  const r = queueStatusReport(input({
+    listItems: [hero("H-1")],
+    heroMax: 2,
+    heroActive: 2, // heroRemaining = 0 → heroSlots blocks
+    anyHostHasFreeSlot: false,
+  }));
+  assert.deepEqual(r.next[0].blockReasons, ["heroSlots"]);
+});
+
+test("hostCapacity: OMITTED anyHostHasFreeSlot (legacy/scalar) never attributes hostCapacity", () => {
+  const r = queueStatusReport(input({
+    listItems: items("A"),
+    regularConcurrencyRemaining: 5,
+    regularGlobalRemaining: 5,
+    regularMaxItemsRemaining: 5,
+    // anyHostHasFreeSlot omitted (undefined) → no attribution.
+  }));
+  assert.equal(r.next[0].blockReasons, undefined);
+});
+
+test("hosts[]: echoed to the report (present + present:false), default [] when omitted", () => {
+  const hosts = [
+    { name: "local", active: 1, maxConcurrent: 2 },
+    { name: "cloud-a", active: 4, maxConcurrent: null },
+  ];
+  assert.deepEqual(queueStatusReport(input({ hosts })).hosts, hosts);
+  assert.deepEqual(queueStatusReport(input()).hosts, []); // omitted → []
+  assert.deepEqual(queueStatusReport(input({ present: false, hosts })).hosts, hosts);
+});
+
+// ---------------------------------------------------------------------------
 // backlogCount — the header-badge number (non-terminal, not waiting/running).
 // ---------------------------------------------------------------------------
 

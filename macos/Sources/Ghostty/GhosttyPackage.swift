@@ -382,6 +382,11 @@ extension Notification.Name {
     /// (ramon fork / Agent Queue Supervisor) Toggle the queue-template picker palette
     static let ghosttyQueueSelectorDidToggle = Notification.Name("com.mitchellh.ghostty.queueSelectorDidToggle")
 
+    /// (ramon fork / cloud-hosts) Toggle the remote-host picker palette (opens a
+    /// split on the picked `pty-remote-host` box — the argument-less
+    /// `new_split_on_host` / `new_tab_on_host` command-palette entries).
+    static let ghosttyRemoteHostSelectorDidToggle = Notification.Name("com.mitchellh.ghostty.remoteHostSelectorDidToggle")
+
     /// Toggle maximize of current window
     static let ghosttyMaximizeDidToggle = Notification.Name("com.mitchellh.ghostty.maximizeDidToggle")
 

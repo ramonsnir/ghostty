@@ -2126,3 +2126,54 @@ fn readTarget(r: anytype) !osccolor.Target {
         else => error.InvalidFrame,
     };
 }
+
+test "protocol: FrameType tag order is append-only within a major (L2)" {
+    // (ramon fork / cloud-hosts / L2) The wire is tag-INTEGER-keyed: every frame's
+    // first payload byte is `@intFromEnum(FrameType)`, and `FrameReader.next`
+    // rejects an unknown tag as a FATAL `error.InvalidFrameType` (a clean close).
+    // So within a protocol MAJOR the tag ordering is APPEND-ONLY — a NEW frame is
+    // appended at the END and the MINOR is bumped; an EXISTING tag's integer value
+    // MUST NEVER change (that would silently re-interpret an old peer's frames as a
+    // different type). This test PINS every tag shipped so far. If it fails because
+    // a value MOVED, that is a WIRE-BREAKING change: do NOT "fix" the expectation —
+    // restore the append-only order. If it fails on the COUNT, you appended a frame:
+    // add its pin at the END and bump PROTOCOL_VERSION_MINOR.
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(FrameType.hello));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(FrameType.hello_ack));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(FrameType.attach));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(FrameType.attached));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(FrameType.detach));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(FrameType.close));
+    try testing.expectEqual(@as(u8, 6), @intFromEnum(FrameType.input));
+    try testing.expectEqual(@as(u8, 7), @intFromEnum(FrameType.resize));
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(FrameType.focus));
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(FrameType.grid_frame));
+    try testing.expectEqual(@as(u8, 10), @intFromEnum(FrameType.mode_frame));
+    try testing.expectEqual(@as(u8, 11), @intFromEnum(FrameType.child_exited));
+    try testing.expectEqual(@as(u8, 12), @intFromEnum(FrameType.ping));
+    try testing.expectEqual(@as(u8, 13), @intFromEnum(FrameType.pong));
+    try testing.expectEqual(@as(u8, 14), @intFromEnum(FrameType.set_search));
+    try testing.expectEqual(@as(u8, 15), @intFromEnum(FrameType.search_nav));
+    try testing.expectEqual(@as(u8, 16), @intFromEnum(FrameType.clear_search));
+    try testing.expectEqual(@as(u8, 17), @intFromEnum(FrameType.search_total));
+    try testing.expectEqual(@as(u8, 18), @intFromEnum(FrameType.search_selected));
+    try testing.expectEqual(@as(u8, 19), @intFromEnum(FrameType.hover));
+    try testing.expectEqual(@as(u8, 20), @intFromEnum(FrameType.link_frame));
+    try testing.expectEqual(@as(u8, 21), @intFromEnum(FrameType.surface_event));
+    try testing.expectEqual(@as(u8, 22), @intFromEnum(FrameType.scroll_viewport));
+    try testing.expectEqual(@as(u8, 23), @intFromEnum(FrameType.jump_to_prompt));
+    try testing.expectEqual(@as(u8, 24), @intFromEnum(FrameType.selection_drag));
+    try testing.expectEqual(@as(u8, 25), @intFromEnum(FrameType.selection_clear));
+    try testing.expectEqual(@as(u8, 26), @intFromEnum(FrameType.selection_text));
+    try testing.expectEqual(@as(u8, 27), @intFromEnum(FrameType.selection_point));
+    try testing.expectEqual(@as(u8, 28), @intFromEnum(FrameType.clear_screen));
+    try testing.expectEqual(@as(u8, 29), @intFromEnum(FrameType.reset));
+    try testing.expectEqual(@as(u8, 30), @intFromEnum(FrameType.at_prompt));
+    try testing.expectEqual(@as(u8, 31), @intFromEnum(FrameType.subscribe_raw));
+    try testing.expectEqual(@as(u8, 32), @intFromEnum(FrameType.raw_output));
+    try testing.expectEqual(@as(u8, 33), @intFromEnum(FrameType.subscribe_render));
+    try testing.expectEqual(@as(u8, 34), @intFromEnum(FrameType.process_info));
+    try testing.expectEqual(@as(u8, 35), @intFromEnum(FrameType.foreground_pid));
+    // COUNT guard: a newly appended tag forces a conscious update above.
+    try testing.expectEqual(@as(usize, 36), std.enums.values(FrameType).len);
+}

@@ -11,11 +11,21 @@ enum AgentState: String, Equatable, Sendable {
 /// (ramon fork / Agent hooks) The parsed, validated hook event, carried as the
 /// userInfo payload. PURE value type — safe across the serial-queue → main hop.
 struct AgentStatePayload: Equatable, Sendable {
-    let tty: String          // controlling tty as the hook saw it (raw, pre-normalize)
+    /// The controlling tty as the hook saw it (raw, pre-normalize). OPTIONAL since the
+    /// cloud-hosts nonce path (D6) carries NO tty — a remote box's hook can't name a
+    /// local tty. At least one of `tty` / `nonce` is always present (the parser rejects
+    /// a body with neither).
+    let tty: String?
     let state: AgentState
     let prompt: String?      // UserPromptSubmit prompt text (truncated by the parser)
     let tool: String?        // PreToolUse tool name
     let message: String?     // Notification message (the "needs input" reason)
+    /// (ramon fork / cloud-hosts, D6) The GUI-minted per-spawn correlation nonce a
+    /// REMOTE agent's hook echoes back (from GHOSTTY_SURFACE_NONCE), resolved by the
+    /// `/agent-state` route to the local surface via `RemoteAgentIdentity`. nil for the
+    /// local tty-walk path. `var` with a default so existing call sites that build a
+    /// tty-only payload are unaffected.
+    var nonce: String? = nil
 }
 
 /// (ramon fork / Agent Manager) An LLM annotation for one surface, written through

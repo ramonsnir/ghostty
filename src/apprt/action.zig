@@ -408,6 +408,13 @@ pub const Action = union(Key) {
     /// duration (opens the panel if closed). Payload-less, surface-scoped.
     spotlight_dashboard_split,
 
+    /// (ramon fork / cloud-hosts) Open a new split running on a REMOTE
+    /// `ghostty-host` box. The value carries the resolved split direction + the
+    /// `pty-remote-host` registry name; the macOS handler resolves the name to a
+    /// forwarded socket + threads it onto the new split's SurfaceConfiguration.
+    /// Appended LAST so the Key enum / ghostty.h tag order stays additive.
+    new_split_on_host: NewSplitOnHost,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -491,6 +498,7 @@ pub const Action = union(Key) {
         goto_last_surface,
         hide_dashboard_split,
         spotlight_dashboard_split,
+        new_split_on_host,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -810,16 +818,25 @@ pub const NewTab = struct {
     /// tab just opens at an empty prompt (the pre-existing behavior).
     initial_input: ?[:0]const u8 = null,
 
+    /// (ramon fork / cloud-hosts) Optional REMOTE host registry name (from
+    /// `pty-remote-host`). When set (the `new_tab_on_host` action), the macOS
+    /// handler resolves it to a forwarded socket and threads `ptyHostSocket`
+    /// + `hostName` onto the new SurfaceConfiguration so the tab dials that
+    /// host. null (the default) ⇒ a local tab (the pre-existing behavior).
+    host_name: ?[:0]const u8 = null,
+
     // Sync with: ghostty_action_new_tab_s
     pub const C = extern struct {
         working_directory: ?[*:0]const u8,
         initial_input: ?[*:0]const u8,
+        host_name: ?[*:0]const u8,
     };
 
     pub fn cval(self: NewTab) C {
         return .{
             .working_directory = if (self.working_directory) |wd| wd.ptr else null,
             .initial_input = if (self.initial_input) |in| in.ptr else null,
+            .host_name = if (self.host_name) |hn| hn.ptr else null,
         };
     }
 
@@ -829,10 +846,47 @@ pub const NewTab = struct {
         _: std.fmt.FormatOptions,
         writer: *std.Io.Writer,
     ) !void {
-        try writer.print("{s}{{ {?s}, {?s} }}", .{
+        try writer.print("{s}{{ {?s}, {?s}, {?s} }}", .{
             @typeName(@This()),
             value.working_directory,
             value.initial_input,
+            value.host_name,
+        });
+    }
+};
+
+/// (ramon fork / cloud-hosts) Value for the `new_split_on_host` action: open a
+/// new split running on a REMOTE `ghostty-host` box. `direction` is resolved
+/// from the surface aspect (like `new_split:auto`) core-side; `host_name` is
+/// the `pty-remote-host` registry name the macOS handler resolves to a
+/// forwarded socket + threads onto the new split's SurfaceConfiguration.
+pub const NewSplitOnHost = struct {
+    direction: SplitDirection,
+    host_name: [:0]const u8,
+
+    // Sync with: ghostty_action_new_split_on_host_s
+    pub const C = extern struct {
+        direction: SplitDirection,
+        host_name: [*:0]const u8,
+    };
+
+    pub fn cval(self: NewSplitOnHost) C {
+        return .{
+            .direction = self.direction,
+            .host_name = self.host_name.ptr,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {}, {s} }}", .{
+            @typeName(@This()),
+            value.direction,
+            value.host_name,
         });
     }
 };

@@ -665,6 +665,170 @@ test("substituteTemplateDir: a template WITHOUT the token is deep-equal after su
 });
 
 // ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 4 O1/O2) The remote-host trio + two-dir routing.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: host defaults to 'local' when absent", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.host, "local");
+  assert.equal(r.template.agentWorkdir, undefined);
+  assert.equal(r.template.remoteTemplateDir, undefined);
+});
+
+test("validateTemplate: host / agentWorkdir / remoteTemplateDir are WHITELISTED (not dropped)", () => {
+  const obj = goodTemplateObj();
+  obj.host = "cloud-1";
+  obj.agentWorkdir = "/home/user/git/ourservice";
+  obj.remoteTemplateDir = "/home/user/git/ourservice/.queues";
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  if (!r.ok) return;
+  assert.equal(r.template.host, "cloud-1");
+  assert.equal(r.template.agentWorkdir, "/home/user/git/ourservice");
+  assert.equal(r.template.remoteTemplateDir, "/home/user/git/ourservice/.queues");
+});
+
+test("validateTemplate: a whitespace/empty host normalizes to 'local'", () => {
+  const obj = goodTemplateObj();
+  obj.host = "   ";
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.host, "local");
+});
+
+test("validateTemplate: a non-string host / empty agentWorkdir => error (not silently dropped)", () => {
+  const badHost = goodTemplateObj();
+  badHost.host = 5;
+  assert.equal(validateTemplate(badHost).ok, false);
+  const badWd = goodTemplateObj();
+  badWd.agentWorkdir = "";
+  assert.equal(validateTemplate(badWd).ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) validateHostPool.
+// ---------------------------------------------------------------------------
+
+test("validateTemplate: hosts absent => no pool (the scalar host is used as a single-entry pool)", () => {
+  const r = validateTemplate(goodTemplateObj());
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal(r.template.hosts, undefined);
+});
+
+test("validateTemplate: a hosts[] POOL is WHITELISTED (not dropped) with weight defaulted to 1", () => {
+  const obj = goodTemplateObj();
+  obj.hosts = [
+    { name: "local", maxConcurrent: 2 },
+    { name: "cloud-a", maxConcurrent: 4, weight: 2, maxItems: 10 },
+  ];
+  const r = validateTemplate(obj);
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  if (!r.ok) return;
+  assert.deepEqual(r.template.hosts, [
+    { name: "local", weight: 1, maxConcurrent: 2 },
+    { name: "cloud-a", weight: 2, maxConcurrent: 4, maxItems: 10 },
+  ]);
+  // The scalar `host` still defaults to "local" alongside the pool (kept for back-compat).
+  assert.equal(r.template.host, "local");
+});
+
+test("validateTemplate: hosts entry needs name + positive maxConcurrent", () => {
+  const noName = goodTemplateObj();
+  noName.hosts = [{ maxConcurrent: 2 }];
+  assert.equal(validateTemplate(noName).ok, false);
+  const noCap = goodTemplateObj();
+  noCap.hosts = [{ name: "cloud-a" }];
+  assert.equal(validateTemplate(noCap).ok, false);
+  const zeroCap = goodTemplateObj();
+  zeroCap.hosts = [{ name: "cloud-a", maxConcurrent: 0 }];
+  assert.equal(validateTemplate(zeroCap).ok, false);
+  const negCap = goodTemplateObj();
+  negCap.hosts = [{ name: "cloud-a", maxConcurrent: -1 }];
+  assert.equal(validateTemplate(negCap).ok, false);
+});
+
+test("validateTemplate: hosts weight must be > 0 when present (0 divides by zero)", () => {
+  const zeroW = goodTemplateObj();
+  zeroW.hosts = [{ name: "cloud-a", maxConcurrent: 2, weight: 0 }];
+  assert.equal(validateTemplate(zeroW).ok, false);
+  const negW = goodTemplateObj();
+  negW.hosts = [{ name: "cloud-a", maxConcurrent: 2, weight: -1 }];
+  assert.equal(validateTemplate(negW).ok, false);
+});
+
+test("validateTemplate: hosts maxItems must be a positive int when present", () => {
+  const badMax = goodTemplateObj();
+  badMax.hosts = [{ name: "cloud-a", maxConcurrent: 2, maxItems: 0 }];
+  assert.equal(validateTemplate(badMax).ok, false);
+});
+
+test("validateTemplate: a DUPLICATE host name in the pool is rejected", () => {
+  const dup = goodTemplateObj();
+  dup.hosts = [
+    { name: "cloud-a", maxConcurrent: 2 },
+    { name: "cloud-a", maxConcurrent: 4 },
+  ];
+  const r = validateTemplate(dup);
+  assert.equal(r.ok, false);
+  if (r.ok) return;
+  assert.ok(r.errors.some((e) => e.includes("duplicated")), r.errors.join("; "));
+});
+
+test("validateTemplate: hosts must be a non-empty array (not-array / empty => error)", () => {
+  const notArr = goodTemplateObj();
+  notArr.hosts = { name: "cloud-a", maxConcurrent: 2 };
+  assert.equal(validateTemplate(notArr).ok, false);
+  const empty = goodTemplateObj();
+  empty.hosts = [];
+  assert.equal(validateTemplate(empty).ok, false);
+});
+
+/** A token template that ALSO targets a remote host, for the two-dir routing test. */
+function remoteTokenTemplate(): QueueTemplate {
+  const obj: Record<string, unknown> = {
+    name: "shared-remote",
+    host: "cloud-1",
+    workdir: "~/git/proj",
+    agentWorkdir: "/home/user/git/proj",
+    remoteTemplateDir: "/home/user/git/proj/.queues",
+    agent: { command: '{templateDir}/agent.sh "$GHOSTTY_ITEM_KEY"' },
+    provider: {
+      list: { command: ["python3", "{templateDir}/list.py"], keyField: "id" },
+      status: { command: ["{templateDir}/status.sh", "{key}"], doneStates: ["done"] },
+      graph: { command: ["{templateDir}/graph.py"] },
+    },
+    params: [{ name: "project", env: "PROJECT", valuesCommand: ["{templateDir}/projects.sh"] }],
+  };
+  const r = validateTemplate(obj);
+  if (!r.ok) throw new Error(`bad template: ${r.errors.join("; ")}`);
+  return r.template;
+}
+
+test("substituteTemplateDir: routes the REMOTE dir into agent.command ONLY, laptop dir into providers/params", () => {
+  const laptop = "/Users/me/git/proj/.queues";
+  const remote = "/home/user/git/proj/.queues";
+  const out = substituteTemplateDir(remoteTokenTemplate(), laptop, remote);
+  // agent.command (runs ON THE BOX) → the remote dir.
+  assert.equal(out.agent.command, `${remote}/agent.sh "$GHOSTTY_ITEM_KEY"`);
+  // The four provider/param sites (run LAPTOP-side) → the laptop dir.
+  assert.deepEqual(out.provider.list.command, ["python3", `${laptop}/list.py`]);
+  assert.deepEqual(out.provider.status.command, [`${laptop}/status.sh`, "{key}"]);
+  assert.deepEqual(out.provider.graph?.command, [`${laptop}/graph.py`]);
+  assert.deepEqual(out.params[0].valuesCommand, [`${laptop}/projects.sh`]);
+});
+
+test("substituteTemplateDir: omitting agentDir uses providerDir on BOTH sides (local, byte-identical)", () => {
+  const out1 = substituteTemplateDir(tokenTemplate(), "/dir");
+  const out2 = substituteTemplateDir(tokenTemplate(), "/dir", "/dir");
+  assert.deepEqual(out1, out2);
+  assert.equal(out1.agent.command, '/dir/agent.sh "$GHOSTTY_ITEM_KEY"');
+});
+
+// ---------------------------------------------------------------------------
 // schedules — validateTemplate (shape + cron) + loader promptFile resolution.
 // ---------------------------------------------------------------------------
 

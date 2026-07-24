@@ -169,6 +169,18 @@ extension Ghostty {
             return ghostty_surface_process_exited(surface)
         }
 
+        // (ramon fork / cloud-hosts, K1) The surface's `.client` connection state +
+        // the version data the too_old directional overlay needs, read LOCK-FREE from
+        // the core (atomics). A `.exec` surface — and a not-yet-materialized remote
+        // surface (`self.surface == nil`, still showing the "Connecting…" placeholder)
+        // — reports `.ok`, so the reconnect overlay stays hidden until a real dial has
+        // a state to report. Polled by `ReconnectStateOverlay` (K1); safe on the main
+        // thread.
+        var clientStateInfo: Ghostty.ClientStateInfo {
+            guard let surface = self.surface else { return .init() }
+            return Ghostty.ClientStateInfo(cValue: ghostty_surface_client_state(surface))
+        }
+
         // fork: the focused FOREGROUND process name (e.g. "claude"), or nil if
         // unknown. Under the pty-host `.client` backend this is the name the HOST
         // resolved and pushed — nil until a host new enough to send it (protocol
@@ -248,6 +260,42 @@ extension Ghostty {
         /// the same live session. nil when the host is not in use (e.g. `.exec`
         /// backend) or for surfaces restored from pre-2b (v5/v7) archives.
         private(set) var sessionID: String?
+
+        /// (ramon fork / cloud-hosts) The identity label (`pty-remote-host`
+        /// registry key) of the host this surface is bound to. nil / `"local"`
+        /// ⇒ the local `pty-host` scalar. Captured from the base config at init
+        /// and persisted via the `hostName` Codable key so the `(host, sessionID)`
+        /// pair survives a GUI restart (D3). On restore it is resolved back to a
+        /// forwarded socket via the registry (D4) — see `resolveHost`.
+        private(set) var hostName: String?
+
+        /// (ramon fork / cloud-hosts) When non-nil, this surface is a RESTORED or
+        /// launched remote-host `.client` whose first dial is DEFERRED to the
+        /// tunnel supervisor's readiness signal (E2): `self.surface` is
+        /// intentionally nil until `materializeClientSurface` fires. Drives the
+        /// interim "awaiting tunnel" placeholder (§564-566). @Published so the
+        /// SwiftUI wrapper re-renders when the placeholder should appear/vanish.
+        @Published private(set) var pendingRemoteHost: String?
+
+        /// (ramon fork / cloud-hosts) The readiness subscription for a
+        /// `pendingRemoteHost` surface. Held until `materializeClientSurface`
+        /// (or deinit) so the deferred dial fires exactly once.
+        private var remoteReadinessCancellable: AnyCancellable?
+
+        /// (ramon fork / cloud-hosts) Captured inputs for the DEFERRED
+        /// `ghostty_surface_new` of a remote-host surface (E2). Held until the
+        /// tunnel handshakes, then consumed once in `materializeClientSurface`.
+        private var pendingRemoteApp: ghostty_app_t?
+        private var pendingRemoteConfig: SurfaceConfiguration?
+
+        /// (ramon fork / cloud-hosts, J1/D7) The host whose tunnel this surface
+        /// has RETAINED via `RemoteTunnelController.retainTunnel`. Set exactly
+        /// once when the deferred remote dial is armed (`subscribeRemoteReadiness`)
+        /// and released exactly once on `deinit` (`releaseTunnel`), so the
+        /// single-owner supervisor's surface refcount stays balanced across the
+        /// surface's whole lifetime — regardless of whether the surface was ever
+        /// materialized. `nil` for a local / `.exec` surface (which never retains).
+        private var retainedRemoteHost: String?
 
         // Notification identifiers associated with this surface
         var notificationIdentifiers: Set<String> = []
@@ -461,6 +509,36 @@ extension Ghostty {
             // config carried one in.
             self.sessionID = surface_cfg.sessionID
 
+            // (ramon fork / cloud-hosts) Remember the host identity so it
+            // round-trips through restorable state paired with `sessionID` (D3).
+            self.hostName = surface_cfg.hostName
+
+            // (ramon fork / cloud-hosts) Three-way host resolution (D4). A surface
+            // bound to a REMOTE host must NOT eagerly single-shot dial: the SSH
+            // tunnel may be down at restore time, and the `.client` backend does
+            // not retry (the App-Nap / single-shot-connect hazard). Instead defer
+            // the dial to the tunnel supervisor's readiness signal (E2). A local
+            // surface (nil / "local") takes the unchanged eager path below.
+            switch Self.resolveHost(surface_cfg.hostName, registry: Self.remoteHostRegistry()) {
+            case .local:
+                break // fall through to the eager dial below (byte-identical)
+
+            case .remote(let entry):
+                // Defer: leave self.surface == nil, stash the deferred-dial inputs,
+                // and await readiness. `materializeClientSurface` runs the single
+                // `ghostty_surface_new` once the tunnel handshakes.
+                self.pendingRemoteApp = app
+                self.pendingRemoteConfig = surface_cfg
+                self.pendingRemoteHost = entry.name
+                self.subscribeRemoteReadiness(host: entry)
+                return
+
+            case .unresolvable(let name):
+                // Never a local-socket fallback and never a spawn (D4).
+                self.error = Ghostty.Error.remoteHostUnresolvable(name)
+                return
+            }
+
             let surface = surface_cfg.withCValue(view: self) { surface_cfg_c in
                 ghostty_surface_new(app, &surface_cfg_c)
             }
@@ -477,11 +555,200 @@ extension Ghostty {
             registerForDraggedTypes(Array(Self.dropTypes))
         }
 
+        // MARK: - (ramon fork / cloud-hosts) Remote-host deferred dial (E2)
+
+        /// The three-way host resolution (D4) — the PURE, testable core. `nil` or
+        /// the reserved `"local"` (case-insensitive) ⇒ `.local` (eager local
+        /// dial). A present name found in `registry` ⇒ `.remote` (deferred dial to
+        /// that host's forwarded socket). A present name NOT in `registry` ⇒
+        /// `.unresolvable` (the error state — NEVER a local dial or a spawn).
+        enum HostResolution: Equatable {
+            case local
+            case remote(RemoteHostEntry)
+            case unresolvable(String)
+        }
+
+        static func resolveHost(
+            _ hostName: String?,
+            registry: [String: RemoteHostEntry]
+        ) -> HostResolution {
+            guard let name = hostName, !name.isEmpty else { return .local }
+            if name.lowercased() == "local" { return .local }
+            if let entry = registry[name] { return .remote(entry) }
+            return .unresolvable(name)
+        }
+
+        /// Whether a `hostName` should be PERSISTED in the surface archive. Only a
+        /// real (non-local) host is persisted, so existing local / `.exec`
+        /// archives stay byte-identical (E1). PURE + testable; the encode gate
+        /// below is the sole caller.
+        static func shouldPersistHostName(_ hostName: String?) -> Bool {
+            guard let name = hostName, !name.isEmpty else { return false }
+            return name.lowercased() != "local"
+        }
+
+        // MARK: - (ramon fork / cloud-hosts) Reconnect overlay state mapping (K1 / L1)
+
+        /// Map a `.client` connection state (+ its version data) to a named, actionable
+        /// banner rendered OVER the frozen, dimmed last frame (K1) — so a dropped /
+        /// version-refused / unreachable remote split is NEVER an unexplained blank pane
+        /// (design rule §"never a silent blank pane"). PURE + static so it is unit-testable
+        /// without a live surface. Returns `nil` for `.ok` (no overlay). `host` is the
+        /// surface's `hostName` (the `pty-remote-host` registry label) for the directional
+        /// copy.
+        ///
+        /// L1 (directional too_old): `too_old` reports the host's advertised protocol
+        /// version vs this GUI's and says to redeploy the host. The Zig side sets `too_old`
+        /// ONLY on a confident MAJOR mismatch (a MINOR-only gap degrades and is NEVER
+        /// too_old — negotiated down), so the copy speaks to the major incompatibility.
+        /// `cannot_handshake` is the AMBIGUOUS EOF-before-ack case (starting up / down /
+        /// incompatible) — its copy claims NO specific version, distinguishing it from the
+        /// confident `too_old`.
+        static func reconnectBanner(
+            info: Ghostty.ClientStateInfo,
+            host: String
+        ) -> Ghostty.ReconnectBanner? {
+            switch info.state {
+            case .ok:
+                return nil
+
+            case .reconnecting:
+                return Ghostty.ReconnectBanner(
+                    title: "Reconnecting to \(host)…",
+                    body: "The connection to \(host) dropped. Retrying — your session is still alive on the host.",
+                    severity: .transient)
+
+            case .sessionEnded:
+                return Ghostty.ReconnectBanner(
+                    title: "Session ended",
+                    body: "\(host) restarted, so this session is gone. Open a new split on \(host) to continue.",
+                    severity: .info)
+
+            case .tooOld:
+                // Directional + actionable (L1): host protocol vs this GUI's; redeploy.
+                return Ghostty.ReconnectBanner(
+                    title: "ghostty-host on \(host) is too old",
+                    body: "Host protocol \(info.hostMajor).\(info.hostMinor), but this GUI needs major \(info.guiMajor) (it speaks \(info.guiMajor).\(info.guiMinor)). Redeploy ghostty-host on \(host) (see CLOUD-HOSTS-DESIGN.md → Deployment).",
+                    severity: .loud)
+
+            case .cannotHandshake:
+                // Ambiguous EOF before any HelloAck — do NOT claim a version (that is the
+                // confident too_old case). Retryable.
+                return Ghostty.ReconnectBanner(
+                    title: "Cannot reach ghostty-host on \(host)",
+                    body: "Connected to \(host) but it closed the connection before the handshake completed. The host may be starting up, down, or an incompatible version. Retrying.",
+                    severity: .loud)
+
+            case .unreachable:
+                return Ghostty.ReconnectBanner(
+                    title: "\(host) is unreachable",
+                    body: "The SSH tunnel to \(host) is down (connection failed). Retrying — it will recover when the tunnel comes back.",
+                    severity: .loud)
+            }
+        }
+
+        /// Build the current `pty-remote-host` registry from the live app config.
+        /// Impure (reads the global config); the pure decision is `resolveHost`.
+        private static func remoteHostRegistry() -> [String: RemoteHostEntry] {
+            guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else { return [:] }
+            let config = appDelegate.ghostty.config
+            // (Phase 6) This is the ONE resolver that feeds the tunnel supervisor
+            // (`retainTunnel`), so it MUST pass the `pty-remote-host-command` lines — that is
+            // how a per-host transport-command override reaches the controller (the
+            // name-only palette / layout callers keep the single-argument builder).
+            return RemoteHostRegistry.parse(
+                lines: config.ptyRemoteHostLines,
+                commandLines: config.ptyRemoteHostCommandLines)
+        }
+
+        /// Bring the tunnel for `host` up on demand and subscribe to its readiness.
+        /// The publisher replays to a late subscriber, so if the tunnel already
+        /// handshaked (another surface for the same host) we materialize at once.
+        @MainActor
+        private func subscribeRemoteReadiness(host: RemoteHostEntry) {
+            let appConfig = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config
+            let sshOptions = appConfig?.ptyRemoteSshOptions
+            // (REG-T2/REG-T3) Thread the per-attempt connect ceiling into the DEFERRED
+            // dial's config so the core `.client` redial (and the initial probe) honor
+            // `pty-remote-connect-timeout`. This is the single chokepoint for BOTH the
+            // launch path and the restore path (every remote surface defers through
+            // here), so a restored surface — whose archived config never persisted the
+            // timeout (like `ptyHostSocket`) — gets it re-applied from the live config.
+            // `0` ⇒ the compiled-in default ceiling.
+            let connectTimeout = appConfig?.ptyRemoteConnectTimeout ?? 0
+            self.pendingRemoteConfig?.ptyHostConnectTimeoutS = connectTimeout
+            // (J1/D7) RETAIN the tunnel (single-owner supervisor). Retain — not the
+            // one-shot `ensureTunnel` — is what bumps the surface refcount that arms
+            // the never-give-up ssh-master respawn (`wanted[host] > 0`) and the
+            // last-surface teardown. Balanced by `releaseTunnel` on deinit. Retaining
+            // more than once for one surface would unbalance the refcount, so guard on
+            // the field: `subscribeRemoteReadiness` is called once per remote surface,
+            // but this keeps the invariant explicit.
+            if retainedRemoteHost == nil {
+                retainedRemoteHost = host.name
+                RemoteTunnelController.shared.retainTunnel(
+                    host: host,
+                    sshOptions: sshOptions,
+                    connectTimeout: connectTimeout)
+            }
+            remoteReadinessCancellable = RemoteTunnelController.shared
+                .readinessPublisher(for: host.name)
+                .sink { [weak self] readiness in
+                    self?.materializeClientSurface(socketPath: readiness.socketPath)
+                }
+        }
+
+        /// Perform the DEFERRED `ghostty_surface_new` for a remote-host surface
+        /// once its tunnel has handshaked (E2). Idempotent: guarded on the surface
+        /// still being un-materialized and still pending, so a replayed / repeated
+        /// readiness emit is a no-op. Mirrors the eager designated-init body.
+        @MainActor
+        private func materializeClientSurface(socketPath: String) {
+            guard self.surface == nil,
+                  self.pendingRemoteHost != nil,
+                  let app = self.pendingRemoteApp,
+                  var cfg = self.pendingRemoteConfig else { return }
+
+            cfg.ptyHostSocket = socketPath
+            let surface = cfg.withCValue(view: self) { surface_cfg_c in
+                ghostty_surface_new(app, &surface_cfg_c)
+            }
+            guard let surface = surface else {
+                self.error = Ghostty.Error.apiFailed
+                self.clearPendingRemoteState()
+                return
+            }
+            self.surfaceModel = Ghostty.Surface(cSurface: surface)
+            self.clearPendingRemoteState()
+
+            // Complete the deferred view setup the eager path did inline.
+            updateTrackingAreas()
+            registerForDraggedTypes(Array(Self.dropTypes))
+        }
+
+        private func clearPendingRemoteState() {
+            self.pendingRemoteHost = nil
+            self.remoteReadinessCancellable = nil
+            self.pendingRemoteApp = nil
+            self.pendingRemoteConfig = nil
+        }
+
         required init?(coder: NSCoder) {
             fatalError("init(coder:) is not supported for this view")
         }
 
         deinit {
+            // (ramon fork / cloud-hosts, J1/D7) Release this surface's tunnel retain
+            // so the single-owner supervisor's refcount drops; when it reaches 0 the
+            // last-surface teardown fires (cancel probing + tear down the ssh master).
+            // Balances the `retainTunnel` in `subscribeRemoteReadiness`; a no-op for a
+            // local / `.exec` surface (which never retained). Cleared to keep it a
+            // single release even if deinit somehow re-enters.
+            if let host = retainedRemoteHost {
+                retainedRemoteHost = nil
+                RemoteTunnelController.shared.releaseTunnel(hostName: host)
+            }
+
             // Remove all of our notificationcenter subscriptions
             let center = NotificationCenter.default
             center.removeObserver(self)
@@ -2154,6 +2421,10 @@ extension Ghostty {
             case title
             case isUserSetTitle
             case sessionID
+            // (ramon fork / cloud-hosts) The host identity paired with sessionID
+            // (D3). Emitted ONLY for a non-local surface, so existing local /
+            // `.exec` archives stay byte-identical.
+            case hostName
             // (ramon fork) Persist the bell / attention indicators so they
             // survive a GUI restart-for-a-new-build instead of silently
             // vanishing. They ride the same window-state archive that already
@@ -2184,6 +2455,11 @@ extension Ghostty {
             // reads nil there and we fall back to a fresh spawn — today's
             // layout-only restore.
             config.sessionID = try container.decodeIfPresent(String.self, forKey: .sessionID)
+
+            // (ramon fork / cloud-hosts) Carry the host identity so the restored
+            // surface re-resolves its forwarded socket via the registry (D4).
+            // Absent in local / `.exec` / pre-cloud archives ⇒ nil ⇒ local.
+            config.hostName = try container.decodeIfPresent(String.self, forKey: .hostName)
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -2228,6 +2504,14 @@ extension Ghostty {
                 return id != 0 ? String(id) : nil
             }
             try container.encodeIfPresent(liveSessionID ?? sessionID, forKey: .sessionID)
+
+            // (ramon fork / cloud-hosts) Persist the host identity ONLY for a
+            // non-local surface so the `(host, sessionID)` pair can be re-resolved
+            // on restore (D3/D4). A nil / "local" hostName is omitted, keeping
+            // existing local / `.exec` archives byte-for-byte unchanged.
+            if Self.shouldPersistHostName(hostName), let hostName {
+                try container.encode(hostName, forKey: .hostName)
+            }
 
             // (ramon fork) Persist the bell / attention indicators so they
             // survive a GUI restart (see CodingKeys + init(from:)). Only
@@ -2816,5 +3100,74 @@ class CachedValue<T> {
         defer { lock.unlock() }
         value = nil
         expiryTask = nil
+    }
+}
+
+// MARK: - (ramon fork / cloud-hosts) Client connection state value types (K1 / L1)
+
+extension Ghostty {
+    /// The `.client` backend connection state, bound EXACTLY to the C
+    /// `ghostty_client_state_e` (see include/ghostty.h / termio.Client.State). `.ok`
+    /// is the normal connected state (and the value for a `.exec` surface); the rest
+    /// are the drop / version-refuse states the K1 reconnect overlay renders.
+    enum ClientState: Equatable {
+        case ok
+        case reconnecting
+        case sessionEnded
+        case cannotHandshake
+        case tooOld
+        case unreachable
+
+        init(cValue: ghostty_client_state_e) {
+            switch cValue {
+            case GHOSTTY_CLIENT_STATE_RECONNECTING: self = .reconnecting
+            case GHOSTTY_CLIENT_STATE_SESSION_ENDED: self = .sessionEnded
+            case GHOSTTY_CLIENT_STATE_CANNOT_HANDSHAKE: self = .cannotHandshake
+            case GHOSTTY_CLIENT_STATE_TOO_OLD: self = .tooOld
+            case GHOSTTY_CLIENT_STATE_UNREACHABLE: self = .unreachable
+            default: self = .ok  // GHOSTTY_CLIENT_STATE_OK and any unknown value
+            }
+        }
+    }
+
+    /// The `.client` connection state plus the protocol versions the `too_old`
+    /// directional message needs (host's advertised version from the last HelloAck,
+    /// meaningful once handshaked; this GUI's compiled version). Mirrors the C
+    /// `ghostty_client_state_s`. Equatable so the overlay's poll can skip redundant
+    /// re-renders.
+    struct ClientStateInfo: Equatable {
+        var state: ClientState = .ok
+        var hostMajor: UInt16 = 0
+        var hostMinor: UInt16 = 0
+        var guiMajor: UInt16 = 0
+        var guiMinor: UInt16 = 0
+
+        init() {}
+
+        init(cValue: ghostty_client_state_s) {
+            self.state = ClientState(cValue: cValue.state)
+            self.hostMajor = cValue.host_major
+            self.hostMinor = cValue.host_minor
+            self.guiMajor = cValue.gui_major
+            self.guiMinor = cValue.gui_minor
+        }
+    }
+
+    /// How loudly the reconnect overlay presents a state: `transient` (a subtle
+    /// reconnecting hint over a lightly-dimmed frame), `info` (session ended), or
+    /// `loud` (an error banner — unreachable / too_old / cannot_handshake).
+    enum ReconnectSeverity: Equatable {
+        case transient
+        case info
+        case loud
+    }
+
+    /// A resolved, human-facing reconnect-overlay banner: a title, an actionable body,
+    /// and a severity that drives the visual treatment. Produced by the pure
+    /// `SurfaceView.reconnectBanner`.
+    struct ReconnectBanner: Equatable {
+        var title: String
+        var body: String
+        var severity: ReconnectSeverity
     }
 }

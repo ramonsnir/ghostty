@@ -252,6 +252,15 @@ is an on-disk file; the sidecar restarts with the GUI but totals stay cumulative
   call (the system prompt is cached) and is cheap on subsequent **cache-read** calls — so a
   burst of cold classifies costs more than the call count alone suggests. The per-account
   breakdown pairs naturally with *Account routing* above to see which account a feature drains.
+- **(cloud-hosts Phase 4 · OQ6) Scope — LAPTOP-side Haiku only.** `get_haiku_usage` tracks ONLY
+  the calls THIS laptop's sidecar makes (summarizer / bell-classify / issue-key-infer). A CLI
+  **work agent** you dispatch onto a cloud box bills **that box's own Claude account** and is
+  INVISIBLE here — there is no cross-host usage aggregation, by design. This is **not a regression**:
+  `get_haiku_usage` never tracked work-agent spend even locally (it is the Agent *Manager*'s Haiku
+  budget, not the fleet's agent spend); a remote agent is simply accounted on the box it runs on.
+  Per-box billing is the accepted v1 answer (cross-host aggregation is a possible future). The MCP
+  **tool count is unchanged at 26** — the cloud-hosts work added the optional `host` arg to
+  `spawn_split_command`, not a new tool.
 
 ```sh
 # quick peek without the MCP tool — per-feature cost in the last 3h (jq):

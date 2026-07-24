@@ -237,6 +237,35 @@ what's being asked → `send_key`/`send_text` to respond → repeat; plus `perfo
   token is set), and per-connection bounds (idle watchdog + absolute deadline +
   connection cap). The long-poll `wait_for_event`/`watch_for_pattern` connections are
   exempt from the idle watchdog but bounded by the clamped `timeoutMs`.
+- **(cloud-hosts Phase 4 · D6) Cross-host agent self-ID uses a NONCE + a per-box
+  CAPABILITY token — the master `mcp-token` is NEVER shipped to a box.** A cloud agent's
+  session id is unknown at spawn (minted host-side on `Attach`, after the launch command
+  is already sent), and the master token is a shell-execution credential that a compromised
+  box could use to drive `spawn_split_command` on the whole fleet. So instead:
+  - the GUI mints a **non-secret per-spawn correlation nonce** (`RemoteAgentIdentity`) and
+    injects it (ONLY it) into the spawned shell via `initial_input`
+    (`export GHOSTTY_SURFACE_NONCE=…` — this CROSSES to the remote box, unlike
+    `environmentVariables`), and keeps a `nonce → (surfaceID, hostName, sessionID)` map;
+  - the box's agent-state hook POSTs `{nonce, state}` (NO tty — a box can't name a local
+    tty) to **`GHOSTTY_MCP_URL`** authenticated with a **per-box capability token**, and
+    `/agent-state` resolves the nonce back to the local surface. `MCPAgentState.parse`
+    accepts a body with a `nonce` and no `tty` (the local tty-walk path is the fallback).
+    **`GHOSTTY_MCP_URL` is NOT GUI-injected** — it is a per-box, laptop-facing value, so
+    provision it in the BOX's own environment (its `ghostty-host` systemd unit
+    `Environment=GHOSTTY_MCP_URL=…`, or a shell profile), where the spawned shells inherit
+    it (with no URL the hook's remote branch is a silent no-op);
+  - `decideRoute` gates the capability token to **`/agent-state` ONLY** — a capability
+    token presented to `/mcp` is `.unauthorized` (never spawn/input). Capability tokens are
+    fail-closed (empty accept-set ⇒ no box token accepted). Populate the laptop-side ACCEPT
+    set with the fork config key **`pty-remote-capability-token`** (repeatable, one token
+    per box; a credential, so keep it in `~/.config/ghostty-ramon/local`) — `AppDelegate`
+    passes it to `MCPServer.configureCapabilityTokens` at launch. Provision the SAME token
+    value into a 0600 file the box's hook reads (ops).
+  - **MCP over the tailnet:** a tailnet MagicDNS Host is 403'd by the rebinding guard by
+    default. PREFERRED fix: a `tailscale serve` Host rewrite to the loopback value (keeps
+    the guard tight). Alternative: add the exact laptop FQDN via the fork config key
+    **`pty-remote-mcp-allowed-host`** (repeatable, `AppDelegate` passes it to
+    `MCPServer.configureAllowedHosts`; `hostHeaderAllowed` accepts it) — never a wildcard.
 
 ---
 
@@ -416,6 +445,17 @@ is added or removed.
 exited, atPrompt` plus three OPTIONAL (omitted-when-unknown) fields: `processName` /
 `command` (foreground process + full cmdline) and `idleSeconds` (seconds since the screen
 last changed).
+
+**(cloud-hosts Phase 4 · O6/Q2)** `spawn_split_command` gained an OPTIONAL **`host`** arg:
+omit or `"local"` ⇒ the local pty-host (default); a `pty-remote-host` registry NAME ⇒ spawn
+a REMOTE `.client` split on that box (the GUI resolves name→forwarded socket + owns the SSH
+tunnel; an unknown name FAILS the spawn). This adds NO new tool — the **count stays 26**.
+And `list_surfaces` now emits `sessionID` as the STRING COMPOSITE **`"<hostName>:<sessionID>"`**
+(host `"local"` by default) — the matched emit↔parse pair with the sidecar (which splits on
+the LAST `:` into `(host, u64)`; a bare-number legacy value parses as host `"local"`). This
+replaces the pre-Phase-4 `NSNumber` and is lossless above 2^53. (`hostName` is also emitted
+standalone.) `spawn_split_command`'s RESULT still returns `sessionId` (lowercase) as a NUMBER,
+with `hostName` read back off `list_surfaces`.
 
 ### Host-gated `processName` / `command` / `idleSeconds`
 

@@ -264,15 +264,16 @@ struct AgentDashboardView: View {
         _ section: AgentDashboardModel.OriginSection,
         source: IndexSet, destination: Int
     ) {
-        // Global displayed order across all sections (WYSIWYG).
-        let global = model.sections.flatMap { $0.entries }.map(\.sessionID)
+        // Global displayed order across all sections (WYSIWYG). COMPOSITE session keys
+        // ("<host>:<u64>") so a cross-host reorder persists per-host (D3/Q4).
+        let global = model.sections.flatMap { $0.entries }.map(\.sessionKey)
         // The section's own slice (in displayed order).
-        var sectionIDs = section.entries.map(\.sessionID)
+        var sectionIDs = section.entries.map(\.sessionKey)
         sectionIDs.move(fromOffsets: source, toOffset: destination)
         // Splice the reordered slice back into the global order at the section's
         // first position, preserving the relative order of the other sections.
-        let sectionSet = Set(section.entries.map(\.sessionID))
-        var result: [UInt64] = []
+        let sectionSet = Set(section.entries.map(\.sessionKey))
+        var result: [String] = []
         var spliced = false
         for sid in global {
             if sectionSet.contains(sid) {

@@ -1071,7 +1071,21 @@ final class WebMonitorServer {
                 guard let view = self.surface(forUUID: uuid),
                       let surface = view.surface else { return nil }
                 let sid = ghostty_surface_session_id(surface)
-                let path = (NSApp.delegate as? AppDelegate)?.ghostty.config.ptyHost
+                // (cloud-hosts D3/Q4) MULTI-HOST IS OUT OF SCOPE FOR THE WEB MONITOR v1.
+                // The raw-stream client dials `config.ptyHost` — the LOCAL socket — so a
+                // REMOTE surface's session id would be dialed against the WRONG socket
+                // (either absent locally, or a same-u64 collision with a local session).
+                // Rather than silently dial the wrong host, we treat a remote surface as
+                // "stream unavailable" (nil socket ⇒ 501), so the page falls back to the
+                // /screen viewport POLL — which reads the GUI's local mirror and works for
+                // a remote surface too. See WEB-MONITOR.md. To support remote streaming,
+                // derive the socket from the surface's host (RemoteTunnelController).
+                let hostName = view.hostName
+                let isRemote = (hostName != nil && hostName!.lowercased() != "local")
+                if isRemote {
+                    self.logger.info("web monitor: raw stream not supported for a remote-host surface (v1) — page falls back to the /screen poll")
+                }
+                let path = isRemote ? nil : (NSApp.delegate as? AppDelegate)?.ghostty.config.ptyHost
                 let size = ghostty_surface_size(surface)  // host grid, so xterm can match
                 return StreamResolution(sessionID: sid, socketPath: path, cols: size.columns, rows: size.rows)
             }()

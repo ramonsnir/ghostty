@@ -14,6 +14,7 @@ import { statSync, readFileSync } from "node:fs";
 import { dirname, resolve as resolvePath } from "node:path";
 
 import { gridCap, MAX_QUEUE_TABS } from "./grid.js";
+import type { HostSpec } from "./hostpool.js";
 import { CronParseError, parseCron } from "./schedule.js";
 import type {
   AgentSpec,
@@ -42,32 +43,43 @@ export const QUEUES_DIR = [".config", "ghostty-ramon", "agent-manager", "queues"
 export const TEMPLATE_DIR_TOKEN = "{templateDir}";
 
 /**
- * (shared templates) Substitute the literal `{templateDir}` token with `dir` (NO trailing
- * slash) in the five contract sites — `provider.list.command`, `provider.status.command`,
- * `provider.graph.command` (when present), `agent.command`, and every param `valuesCommand`
- * (when present). PURE — returns a NEW template with those sub-objects deep-cloned; a token in
- * any OTHER field is left untouched, `{key}` (renderArgv) is unaffected, and `provider.claim`
- * is deliberately NOT substituted (see SHARED-QUEUES-SPEC §0 note). A template with no token is
- * deep-equal to the input after substitution (no-op safety). Substring replace of ALL
- * occurrences in a string.
+ * (shared templates) Substitute the literal `{templateDir}` token in the five contract sites —
+ * `provider.list.command`, `provider.status.command`, `provider.graph.command` (when present),
+ * `agent.command`, and every param `valuesCommand` (when present). PURE — returns a NEW template
+ * with those sub-objects deep-cloned; a token in any OTHER field is left untouched, `{key}`
+ * (renderArgv) is unaffected, and `provider.claim` is deliberately NOT substituted (see
+ * SHARED-QUEUES-SPEC §0 note). Substring replace of ALL occurrences in a string.
+ *
+ * (ramon fork / cloud-hosts, Phase 4 O2) Takes TWO dirs so a cloud queue routes the RIGHT path
+ * to each side: the four PROVIDER/param sites (which run LAPTOP-side) get `providerDir` (the
+ * laptop template dir), while `agent.command` (which runs ON THE BOX) gets `agentDir` (the
+ * HOST-RELATIVE `remoteTemplateDir` when `host !== "local"`). `agentDir` DEFAULTS to `providerDir`,
+ * so a LOCAL run substitutes the same dir everywhere — byte-identical to the prior single-dir
+ * behavior. A template with no token is deep-equal to the input after substitution (no-op safety).
  */
-export function substituteTemplateDir(t: QueueTemplate, dir: string): QueueTemplate {
-  const sub = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(dir);
+export function substituteTemplateDir(
+  t: QueueTemplate,
+  providerDir: string,
+  agentDir: string = providerDir,
+): QueueTemplate {
+  const subProvider = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(providerDir);
+  const subAgent = (s: string): string => s.split(TEMPLATE_DIR_TOKEN).join(agentDir);
   const provider: ProviderSpec = {
     ...t.provider,
-    list: { ...t.provider.list, command: t.provider.list.command.map(sub) },
-    status: { ...t.provider.status, command: t.provider.status.command.map(sub) },
+    list: { ...t.provider.list, command: t.provider.list.command.map(subProvider) },
+    status: { ...t.provider.status, command: t.provider.status.command.map(subProvider) },
   };
   if (t.provider.graph !== undefined) {
-    provider.graph = { ...t.provider.graph, command: t.provider.graph.command.map(sub) };
+    provider.graph = { ...t.provider.graph, command: t.provider.graph.command.map(subProvider) };
   }
   // provider.claim is intentionally NOT substituted (contract note).
   const params = t.params.map((p) =>
-    p.valuesCommand !== undefined ? { ...p, valuesCommand: p.valuesCommand.map(sub) } : p,
+    p.valuesCommand !== undefined ? { ...p, valuesCommand: p.valuesCommand.map(subProvider) } : p,
   );
   return {
     ...t,
-    agent: { ...t.agent, command: sub(t.agent.command) },
+    // agent.command runs on the BOX → route the host-relative agentDir into it.
+    agent: { ...t.agent, command: subAgent(t.agent.command) },
     provider,
     params,
   };
@@ -144,6 +156,21 @@ export function validateTemplate(obj: unknown): ValidateResult {
   );
   // NOTE: `quitWhenEmpty` was removed (see types.ts) — a `quitWhenEmpty` key in template
   // JSON is now silently ignored, never parsed.
+  // (ramon fork / cloud-hosts, Phase 4 O2) The remote-host trio. MUST be whitelisted HERE or
+  // the loader silently drops them (the `validateProviderList`/`coerceQueueCommands` lesson) →
+  // the agent split would never leave the laptop. `host` defaults to "local"; an empty/whitespace
+  // string normalizes to "local". `agentWorkdir`/`remoteTemplateDir` are optional non-empty
+  // strings, NOT `~`-expanded (they are host-relative absolute paths on the box). Only sensible
+  // when `host !== "local"`; ignored otherwise (kept for round-trip honesty).
+  const host = optNonEmptyStringOrDefault(rec.host, "local", "host", errors);
+  const agentWorkdir = optNonEmptyString(rec.agentWorkdir, "agentWorkdir", errors);
+  const remoteTemplateDir = optNonEmptyString(rec.remoteTemplateDir, "remoteTemplateDir", errors);
+  // (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) The OPTIONAL weighted host
+  // POOL. MUST be whitelisted HERE or the loader silently drops it (the `validateProviderList`/
+  // `coerceQueueCommands` chokepoint lesson) → placement would fall back to the scalar `host` and
+  // the pool would never spread. Absent ⇒ undefined (the scalar `host` is used as a single-entry
+  // pool). Scalar `host` is STILL honored either way (kept above for back-compat).
+  const hosts = validateHostPool(rec.hosts, errors);
   const params = validateParams(rec.params, errors);
   // (schedules) The recurring scan agents. Validated for shape + a parseable cron; the
   // `promptFile` field is RESOLVED to `prompt` later, in the file loader (which knows the
@@ -165,6 +192,10 @@ export function validateTemplate(obj: unknown): ValidateResult {
 
   const template: QueueTemplate = {
     name,
+    host,
+    ...(hosts !== undefined ? { hosts } : {}),
+    ...(agentWorkdir !== undefined ? { agentWorkdir } : {}),
+    ...(remoteTemplateDir !== undefined ? { remoteTemplateDir } : {}),
     workdir,
     agent,
     concurrency,
@@ -244,6 +275,64 @@ function validateSchedules(v: unknown, errors: string[]): ScheduleSpec[] {
     if (command !== undefined) spec.command = command;
     if (hasPrompt) spec.prompt = (r.prompt as string).trim();
     if (hasPromptFile) spec.promptFile = (r.promptFile as string).trim();
+    out.push(spec);
+  });
+  return out;
+}
+
+/**
+ * (ramon fork / cloud-hosts, Phase 5 — MULTI-HOST load balancing) Validate the OPTIONAL weighted
+ * host `hosts[]` POOL. PURE. Modeled on `validateSchedules` (+ the `validateProviderList` heroField
+ * chokepoint lesson — an un-whitelisted field is silently dropped). Rules:
+ *   - absent ⇒ `undefined` (no pool — the scalar `host` is used as a single-entry pool).
+ *   - not an array, or an EMPTY array ⇒ an error (a declared-but-empty pool is a typo, not "local").
+ *   - each entry: `name` REQUIRED non-empty string; `maxConcurrent` REQUIRED positive int (the
+ *     PRIMARY knob); `weight` OPTIONAL positive number (default 1; `<= 0` rejected — it would
+ *     divide by zero); `maxItems` OPTIONAL positive int (v1 forward-compat, honored by the
+ *     selector's candidacy but not yet enforced in the runner).
+ *   - DEDUP `name` with a Set (a repeated box would double-seat) — mirrors validateSchedules.
+ * Returns the built specs (weight defaulted to 1) or `undefined` (absent / any error, so the
+ * template bails on `errors.length`). Reserved name `local` is allowed (the laptop pty-host).
+ */
+function validateHostPool(v: unknown, errors: string[]): HostSpec[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    errors.push("hosts must be an array of {name,maxConcurrent,weight?,maxItems?}");
+    return undefined;
+  }
+  if (v.length === 0) {
+    errors.push("hosts must be a non-empty array when present (omit it for a single-host queue)");
+    return undefined;
+  }
+  const out: HostSpec[] = [];
+  const seen = new Set<string>();
+  v.forEach((raw, i) => {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      errors.push(`hosts[${i}] must be an object {name,maxConcurrent,…}`);
+      return;
+    }
+    const r = raw as Record<string, unknown>;
+    const name = reqNonEmptyString(r.name, `hosts[${i}].name`, errors);
+    const maxConcurrent = posInt(r.maxConcurrent, `hosts[${i}].maxConcurrent`, errors);
+    let weight: number | undefined;
+    if (r.weight !== undefined) {
+      if (typeof r.weight === "number" && Number.isFinite(r.weight) && r.weight > 0) {
+        weight = r.weight;
+      } else {
+        errors.push(`hosts[${i}].weight must be a positive number`);
+      }
+    }
+    let maxItems: number | undefined;
+    if (r.maxItems !== undefined) {
+      maxItems = posInt(r.maxItems, `hosts[${i}].maxItems`, errors);
+    }
+    if (name !== undefined) {
+      if (seen.has(name)) errors.push(`hosts[${i}].name "${name}" is duplicated`);
+      seen.add(name);
+    }
+    if (name === undefined || maxConcurrent === undefined) return;
+    const spec: HostSpec = { name, weight: weight ?? 1, maxConcurrent };
+    if (maxItems !== undefined) spec.maxItems = maxItems;
     out.push(spec);
   });
   return out;
@@ -378,6 +467,34 @@ function reqNonEmptyString(
     return undefined;
   }
   return v;
+}
+
+/** (cloud-hosts) An OPTIONAL string: absent ⇒ `undefined` (no error); present-but-not-a-
+ *  non-empty-string ⇒ an error + `undefined`. Trimmed. PURE. */
+function optNonEmptyString(v: unknown, field: string, errors: string[]): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string" || v.trim().length === 0) {
+    errors.push(`${field} must be a non-empty string when present`);
+    return undefined;
+  }
+  return v.trim();
+}
+
+/** (cloud-hosts) An OPTIONAL string with a DEFAULT: absent / empty ⇒ `def` (no error); a
+ *  non-string ⇒ an error + `def`. Trimmed. PURE. Used for `host` (default "local"). */
+function optNonEmptyStringOrDefault(
+  v: unknown,
+  def: string,
+  field: string,
+  errors: string[],
+): string {
+  if (v === undefined) return def;
+  if (typeof v !== "string") {
+    errors.push(`${field} must be a string`);
+    return def;
+  }
+  const t = v.trim();
+  return t.length > 0 ? t : def;
 }
 
 function validateAgent(v: unknown, errors: string[]): AgentSpec | undefined {
