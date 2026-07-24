@@ -3243,12 +3243,27 @@ test "client reattachId prefers the live id, else configured, else fresh" {
 // (ambiguous, retryable); after a handshake => reconnecting for a reconnect
 // client, else leave the state (local single-shot keeps the frozen last frame).
 test "client classifyDrop distinguishes before/after handshake + local vs reconnect" {
-    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(true, false));
-    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(false, false));
-    try testing.expectEqual(@as(?Client.State, .reconnecting), Client.classifyDrop(true, true));
+    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(true, false, false));
+    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(false, false, false));
+    try testing.expectEqual(@as(?Client.State, .reconnecting), Client.classifyDrop(true, true, false));
     // local / single-shot, after a handshake: leave the state (no redial, no
     // busy-loop, frozen last frame persists).
-    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(false, true));
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(false, true, false));
+}
+
+// (cloud-hosts) A DELIBERATELY closed session (`closeSession` sent a Close frame,
+// so `closing` is set) drops ON PURPOSE: `classifyDrop` must leave the state alone
+// in EVERY combination — never `.reconnecting` (which would show "Reconnecting…"
+// then "session ended" on a pane the user just closed) and never
+// `.cannot_handshake`. `closing` therefore dominates both other inputs.
+test "client classifyDrop: a deliberate close never reconnects or errors" {
+    // The real-world case: remote reconnect client, handshaked, then closed.
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(true, true, true));
+    // Closed before the handshake ever landed (close raced a slow connect).
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(true, false, true));
+    // Local/single-shot arms are unaffected (already null, still null).
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(false, true, true));
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(false, false, true));
 }
 
 // (H1/H2) A HelloAck with a MATCHING major records the version + marks the

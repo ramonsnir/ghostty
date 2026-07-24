@@ -1303,7 +1303,17 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   failed `writeCallback` also trips `.reconnecting` (write-error trip) — but ONLY when the failed
   completion's own fd (`streamFd(s)`) matches the live `read_thread_fd`, so a STALE error completion
   from a torn-down connection (the pools/queue are left intact across teardown to drain) can't
-  spuriously tear down an already-reconnected healthy session (drain-order-independent). **(e)** the lock-free
+  spuriously tear down an already-reconnected healthy session (drain-order-independent).
+  **⚠️ A DELIBERATE close must NOT redial (fork-only, cloud-hardening):** `closeSession` sends a
+  `Close` frame that makes the host destroy the session, so the socket drop that follows is
+  EXPECTED — but `onAttachDrop` classified it like any other drop and a REMOTE (reconnect) surface
+  therefore tried to reattach a session the user had just closed, flashing "Reconnecting…" then
+  "session ended" on a dying pane. Fix: `closeSession` sets an atomic `Client.closing` BEFORE the
+  frame goes out (so the drop can't race ahead of the flag), `classifyDrop(reconnect, handshaked,
+  closing)` returns `null` whenever `closing` — dominating BOTH other arms, so neither
+  `.reconnecting` nor `.cannot_handshake` is set — and both redial triggers (`onAttachDrop` and the
+  `writeCallback` error trip) skip the `xev.Async` notify when closing. LOCAL/`.exec`/`.mirror`
+  never call `closeSession`, so `closing` stays false and their paths are byte-identical. **(e)** the lock-free
   `ghostty_surface_client_state` accessor + `SurfaceView.clientStateInfo` feed the
   `ReconnectStateOverlay` (K1/L1) — a named, actionable banner over the frozen, dimmed last frame,
   so a dropped / version-refused / unreachable remote split is never a silent blank pane; the pure

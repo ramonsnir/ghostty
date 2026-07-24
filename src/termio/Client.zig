@@ -165,7 +165,12 @@ pub fn reattachId(live: u64, configured: ?u64) ?u64 {
 /// incompatible-major); after a handshake a reconnect client goes
 /// `.reconnecting` while a `local`/single-shot client leaves its state (the
 /// frozen last frame persists — today's behavior, minus the busy-loop).
-pub fn classifyDrop(reconnect: bool, handshaked: bool) ?State {
+pub fn classifyDrop(reconnect: bool, handshaked: bool, closing: bool) ?State {
+    // (cloud-hosts) A DELIBERATELY closed session (Close frame sent) drops on
+    // purpose: leave the state alone — no `.reconnecting` banner, no
+    // `.cannot_handshake` error — the pane is going away. Checked FIRST so it wins
+    // over both arms below.
+    if (closing) return null;
     if (!handshaked) return .cannot_handshake;
     return if (reconnect) .reconnecting else null;
 }
@@ -333,6 +338,18 @@ client_state: std.atomic.Value(State) = .init(.ok),
 /// renderMutex. Written (release) by `handleFrame`'s `.hello_ack` arm and reset
 /// to false by the redial machine before it re-dials. Never set under `.mirror`.
 ack_seen: std.atomic.Value(bool) = .init(false),
+
+/// (ramon fork / cloud-hosts) Set once `closeSession` has sent a `Close` frame,
+/// i.e. the session was DELIBERATELY destroyed (close split/tab/window at the
+/// undo-commit boundary). The host then stops the child + frees the session, so
+/// the socket drop that follows is EXPECTED — a reconnect client must NOT read it
+/// as a transport failure and redial a session that no longer exists (which would
+/// show "Reconnecting…" then "session ended" on a pane the user just closed).
+/// Read by `onAttachDrop` + the `writeCallback` error trip; both run after the
+/// store, and a stale `false` merely costs one harmless redial attempt, so
+/// `.monotonic`-style laxity is fine — we use acquire/release for clarity.
+/// Always false for `local`/`.exec`/`.mirror` (they never call `closeSession`).
+closing: std.atomic.Value(bool) = .init(false),
 
 /// (ramon fork / cloud-hosts) The host's advertised protocol version from the
 /// last decoded `HelloAck` (H1), for the D1 `too_old` directional message
@@ -1066,6 +1083,9 @@ pub fn closeSession(
     if (self.config.role != .attach) return;
     const sid = self.session_id.load(.acquire);
     if (sid == 0) return;
+    // (cloud-hosts) Mark the session deliberately-closed BEFORE the frame goes out,
+    // so the drop it provokes can never race ahead of the flag and trip a redial.
+    self.closing.store(true, .release);
     try self.sendFrame(td, .close, protocol.Close{ .session_id = sid });
 }
 
@@ -2161,7 +2181,9 @@ fn writeCallback(
         // a torn-down connection ⇒ ignore it (its pool slots were already reclaimed
         // above). This makes correctness independent of xev's drain ordering.
         if (client.reconnect_client) |c| {
-            if (streamFd(s) == client.read_thread_fd) {
+            // (cloud-hosts) …and never on a DELIBERATELY closed session: the write
+            // error is just the torn-down connection we asked the host to destroy.
+            if (streamFd(s) == client.read_thread_fd and !c.closing.load(.acquire)) {
                 c.setClientState(.reconnecting);
                 if (client.reconnect_async) |*a| a.notify() catch {};
             }
@@ -2509,12 +2531,17 @@ const ReadThread = struct {
     /// `local`/single-shot client never redials.
     fn onAttachDrop(client: *Client) void {
         const handshaked = client.ack_seen.load(.acquire);
-        // Pure classification (unit-tested): before-ack => cannot_handshake;
-        // after-ack => reconnecting for a reconnect client, else leave the state.
-        if (classifyDrop(client.config.reconnect, handshaked)) |s| client.setClientState(s);
+        // (cloud-hosts) A DELIBERATE close makes this drop EXPECTED — the session is
+        // already gone host-side by our own request, so neither re-state nor redial.
+        const closing = client.closing.load(.acquire);
+        // Pure classification (unit-tested): closing => leave the state; before-ack =>
+        // cannot_handshake; after-ack => reconnecting for a reconnect client, else
+        // leave the state.
+        if (classifyDrop(client.config.reconnect, handshaked, closing)) |s| client.setClientState(s);
         // Wake the IO-thread redial machine ONLY for a reconnect client (a
-        // `local`/single-shot client leaves `reconnect_async` null — never redials).
-        if (client.config.reconnect) {
+        // `local`/single-shot client leaves `reconnect_async` null — never redials),
+        // and never for a deliberately-closed session.
+        if (client.config.reconnect and !closing) {
             if (client.reconnect_async) |a| a.notify() catch {};
         }
     }
