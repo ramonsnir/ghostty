@@ -538,6 +538,7 @@ final class WebMonitorServer {
         case clearBell(uuid: UUID)               // POST /api/surface/{uuid}/bell (acknowledge bell)
         case clearAttention(uuid: UUID)          // POST /api/surface/{uuid}/attention (acknowledge promotion)
         case setHidden(uuid: UUID)               // POST /api/surface/{uuid}/hidden {hidden:bool} (dashboard hide set)
+        case setMaximized(uuid: UUID)            // POST /api/surface/{uuid}/maximize {maximized:bool} (split zoom)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
         case serviceWorker                       // GET /sw.js (bootstrap; Web Push SW)
         case pushConfig                          // GET /api/push/config (VAPID pubkey + enabled)
@@ -674,6 +675,9 @@ final class WebMonitorServer {
             case "hidden":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .setHidden(uuid: uuid)
+            case "maximize":
+                guard method == "POST" else { return .methodNotAllowed }
+                return .setMaximized(uuid: uuid)
             default:
                 return .notFound
             }
@@ -922,6 +926,52 @@ final class WebMonitorServer {
                 }
                 guard ok else { return .status(503, "Service Unavailable") }
                 return .json(Data(#"{"ok":true,"hidden":\#(want)}"#.utf8))
+            }
+
+        case .setMaximized(let uuid):
+            clearAuthFailures(peer)
+            // (ramon fork / Web monitor) MAXIMIZE this split ON THE MAC. What the phone
+            // renders is the host session's GRID, and that grid is sized by the pane's
+            // size on the laptop — so the only way to see more from here is to make the
+            // pane itself bigger. That is exactly what `toggle_split_zoom` does, and we
+            // set the tab's zoom DIRECTLY (`SplitTree(root:zoomed:)`, the same reset
+            // `revealIfZoomedAway` performs) rather than routing through
+            // `MCPLayout.performAction`, which also FOCUSES the surface — a remote
+            // "let me see more" gesture must not yank the Mac's keyboard focus.
+            //
+            // The pane's PTY resizes, so the program reflows (SIGWINCH) here and again
+            // on restore; that is the same cost as pressing the zoom keybind on the Mac.
+            // The page reconnects its stream afterwards because xterm.js is sized ONCE
+            // from the X-Ghostty-Cols/-Rows headers at stream open (see `openStream`).
+            guard let want = Self.maximizedFlag(body: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            respondFromMain(on: conn) {
+                guard let (controller, view) = self.controllerAndView(forUUID: uuid),
+                      let root = controller.surfaceTree.root else { return .status(404, "Not Found") }
+                let tree = controller.surfaceTree
+                let isZoomedHere = tree.zoomedLeaves().contains { $0.id == view.id }
+                switch Self.maximizeOutcome(
+                    want: want,
+                    leafCount: Array(tree).count,
+                    isZoomedHere: isZoomedHere
+                ) {
+                case .unsupported:
+                    // A single-pane tab has nothing to maximize INTO. The page disables
+                    // the control off the row's `splitCount`, so this is the arm a stale
+                    // client hits — an honest 409 rather than a silent no-op.
+                    return .status(409, "Conflict")
+                case .zoom:
+                    guard let node = root.node(view: view) else { return .status(404, "Not Found") }
+                    controller.surfaceTree = .init(root: root, zoomed: node)
+                    return .json(Data(#"{"ok":true,"maximized":true}"#.utf8))
+                case .unzoom:
+                    controller.surfaceTree = .init(root: root, zoomed: nil)
+                    return .json(Data(#"{"ok":true,"maximized":false}"#.utf8))
+                case .noop(let maximized):
+                    return .json(Data("{\"ok\":true,\"maximized\":\(maximized)}".utf8))
+                }
             }
 
         case .asset(let name, let ext, let contentType):
@@ -1335,12 +1385,13 @@ final class WebMonitorServer {
         return false
     }
 
-    /// PURE: decode a hide request body `{"hidden": <bool>}` into the desired hide
-    /// state. Accepts a JSON bool, or `0`/`1` / `"true"`/`"false"` for lenient
-    /// clients; nil on missing/unparseable input.
-    static func hiddenFlag(body: Data) -> Bool? {
+    /// PURE: decode a single named boolean out of a JSON request body. Accepts a
+    /// JSON bool, or `0`/`1` / `"true"`/`"false"`/`"yes"`/`"no"` for lenient clients;
+    /// nil on a missing key or unparseable input. Shared by the `{"hidden": …}` and
+    /// `{"maximized": …}` set-a-flag routes so they can't drift apart.
+    static func boolFlag(body: Data, key: String) -> Bool? {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let raw = obj["hidden"] else { return nil }
+              let raw = obj[key] else { return nil }
         if let b = raw as? Bool { return b }
         if let n = raw as? NSNumber { return n.boolValue }
         if let s = raw as? String {
@@ -1351,6 +1402,36 @@ final class WebMonitorServer {
             }
         }
         return nil
+    }
+
+    /// PURE: decode a hide request body `{"hidden": <bool>}` into the desired hide state.
+    static func hiddenFlag(body: Data) -> Bool? { boolFlag(body: body, key: "hidden") }
+
+    /// PURE: decode a maximize request body `{"maximized": <bool>}` into the desired
+    /// split-zoom state. Explicit-set (not a toggle) so a client working from a stale
+    /// list can't invert the state it thinks it is changing.
+    static func maximizedFlag(body: Data) -> Bool? { boolFlag(body: body, key: "maximized") }
+
+    /// What a `/maximize` request should actually do, given what the client asked for
+    /// and the tab's real state. PURE so the whole decision matrix is testable without
+    /// AppKit; the handler only performs the resulting tree mutation.
+    enum MaximizeOutcome: Equatable {
+        case zoom                     // set this leaf as the tab's zoomed node
+        case unzoom                   // clear the tab's zoom
+        case noop(maximized: Bool)    // already in the requested state; report it back
+        case unsupported              // single-pane tab: nothing to maximize into (409)
+    }
+
+    /// PURE. Maximizing a single-pane tab is `.unsupported` — there is no other pane to
+    /// take space from, so it would silently do nothing. RESTORING is only honored when
+    /// THIS surface is the zoomed one: a client whose list is stale must not un-zoom a
+    /// DIFFERENT split that someone zoomed on the Mac in the meantime.
+    static func maximizeOutcome(want: Bool, leafCount: Int, isZoomedHere: Bool) -> MaximizeOutcome {
+        if want {
+            if leafCount <= 1 { return .unsupported }
+            return isZoomedHere ? .noop(maximized: true) : .zoom
+        }
+        return isZoomedHere ? .unzoom : .noop(maximized: false)
     }
 
     /// NATIVE macOS virtual keycode (NSEvent.keyCode space — see KeySpec.keycode)
@@ -1533,6 +1614,12 @@ final class WebMonitorServer {
         /// the "Focus on heroes" filter. Defaulted so existing `SurfaceRow(...)` call sites
         /// (tests) that predate heroes still compile.
         var hero: Bool = false
+        /// (ramon fork / Web monitor) True iff this surface is the one its tab is
+        /// split-ZOOMED to — i.e. already maximized on the Mac. Drives the viewer's
+        /// Maximize/Restore label; `splitCount` (above) is what DISABLES the control
+        /// on a single-pane tab, where there is nothing to maximize into. Defaulted
+        /// like `hero` so existing `SurfaceRow(...)` call sites still compile.
+        var maximized: Bool = false
     }
 
     /// MUST be called on main. Iterates AppKit surfaces (thin) and defers the
@@ -1577,6 +1664,9 @@ final class WebMonitorServer {
             }
             let tabTitle = c.window?.title ?? ""
             let leaves = Array(c.surfaceTree)
+            // (ramon fork) Which leaves are inside this tab's zoomed subtree, computed
+            // ONCE per tab rather than per leaf. Empty when the tab isn't zoomed.
+            let zoomedIDs = Set(c.surfaceTree.zoomedLeaves().map(\.id))
             for (splitIdx, view) in leaves.enumerated() {
                 rows.append(SurfaceRow(
                     id: view.id.uuidString, title: view.title, pwd: view.pwd ?? "",
@@ -1585,7 +1675,8 @@ final class WebMonitorServer {
                     attentionNeeded: view.attentionNeeded,
                     isAgent: filter?.agents.contains(view.id) ?? false,
                     hidden: filter?.hidden.contains(view.id) ?? false,
-                    hero: filter?.hero.contains(view.id) ?? false))
+                    hero: filter?.hero.contains(view.id) ?? false,
+                    maximized: zoomedIDs.contains(view.id)))
             }
         }
         return Self.surfacesJSONData(
@@ -1618,6 +1709,7 @@ final class WebMonitorServer {
                 "bell": $0.bell, "attentionNeeded": $0.attentionNeeded,
                 "attnIndicator": ($0.bell && monitorBell) || ($0.attentionNeeded && monitorAttn),
                 "isAgent": $0.isAgent, "hidden": $0.hidden, "hero": $0.hero,
+                "maximized": $0.maximized,
             ]
         }
         let obj: [String: Any] = ["agentDashboard": agentDashboard, "surfaces": arr]
@@ -2113,6 +2205,9 @@ final class WebMonitorServer {
              white-space: nowrap; color: var(--fg); font-weight: bold; }
       #clearbell, #clearattn { flex: 0 0 auto; background: #4a3a1a; border-color: #6a5320; color: #f0c060; }
       #clearbell:active, #clearattn:active { background: #6a5320; }
+      /* Maximize/Restore the split ON THE MAC. Disabled (via the generic
+         button:disabled rule) when the split is alone in its tab. */
+      #maximize { flex: 0 0 auto; }
       #banner { display: none; padding: 7px 12px; background: #5a2a2a; color: #ffd9d9; text-align: center; }
       #banner.ok { background: #2a4a2a; color: #d9ffd9; }
       #notice { display: none; padding: 9px 12px; background: #4a3a1a; color: #f0c060; }
@@ -2191,6 +2286,7 @@ final class WebMonitorServer {
                wide (the sidebar is always present there). -->
           <button id="menubtn" title="Back to the session list">&larr; Sessions</button>
           <span id="cur"></span>
+          <button id="maximize" style="display:none">&#x26f6; Maximize</button>
           <button id="clearbell" style="display:none"
                   title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
           <button id="clearattn" style="display:none"
@@ -2275,6 +2371,7 @@ final class WebMonitorServer {
       var curEl = document.getElementById("cur");
       var clearBellBtn = document.getElementById("clearbell");
       var clearAttnBtn = document.getElementById("clearattn");
+      var maxBtn = document.getElementById("maximize");
       var modeEl = document.getElementById("mode");
       var modeToggleEl = document.getElementById("modebar");
       var inp = document.getElementById("inp");
@@ -2286,6 +2383,11 @@ final class WebMonitorServer {
       var frameMode = false, framePending = false;
       // The surface for which we've already seeded the scroll cursor (see sendScroll).
       var scrollSeededFor = null;
+      // Maximize state for the surface being viewed, mirrored from its /api/surfaces
+      // row (the single source of truth, refreshed by loadList + refreshBellButton).
+      // curSplitCount <= 1 means the split is alone in its tab, so there is nothing to
+      // maximize into and the control is DISABLED rather than a no-op.
+      var curMaximized = false, curSplitCount = 1;
 
       function showTokenRecovery(msg) {
         notice.style.display = "block";
@@ -2396,6 +2498,14 @@ final class WebMonitorServer {
           listLoaded = true;
           var allRows = (data && data.surfaces) || [];
           var dashboard = !!(data && data.agentDashboard);
+          // The list refreshes on a timer while viewing, so it doubles as the poll that
+          // keeps the Maximize/Restore control honest when the Mac's layout changes
+          // under us (someone zoomed/unzoomed there, or a queue re-tiled the tab).
+          if (current) {
+            for (var ci = 0; ci < allRows.length; ci++) {
+              if (allRows[ci].id === current) { setMaximizeState(allRows[ci]); break; }
+            }
+          }
           applyFilterAvailability(dashboard);
           var heroFocus = dashboard && fHeroes.checked;
           var agentsOnly = !heroFocus && dashboard && fAgents.checked;
@@ -2633,11 +2743,32 @@ final class WebMonitorServer {
         jumpBtn.style.display = "none";
         setClearBellVisible(false);
         setClearAttnVisible(false);
+        setMaximizeState(null);
         highlightActive();
       }
 
       function setClearBellVisible(on) { clearBellBtn.style.display = on ? "inline-block" : "none"; }
       function setClearAttnVisible(on) { clearAttnBtn.style.display = on ? "inline-block" : "none"; }
+
+      // Reflect a surface row's layout state onto the Maximize/Restore control. The
+      // row is authoritative: `maximized` says whether the Mac tab is already zoomed to
+      // this split (so the button offers Restore), and `splitCount` says whether there
+      // is anything to maximize into at all — a split alone in its tab gets a DISABLED
+      // button with an explanatory title, not a button that silently does nothing.
+      function setMaximizeState(row) {
+        if (!row) { maxBtn.style.display = "none"; return; }
+        curMaximized = !!row.maximized;
+        curSplitCount = row.splitCount || 1;
+        var alone = curSplitCount <= 1;
+        maxBtn.style.display = "inline-block";
+        maxBtn.disabled = alone;
+        maxBtn.textContent = curMaximized ? "\\u26f6 Restore" : "\\u26f6 Maximize";
+        maxBtn.title = alone
+          ? "This split is the only one in its tab \\u2014 nothing to maximize"
+          : (curMaximized
+             ? "Restore this split to its normal size on the Mac"
+             : "Maximize this split on the Mac so it gets a bigger viewport here");
+      }
 
       // Refresh the Clear-bell/Clear-attention buttons against the live state for
       // the viewed split (a bell may ring / a promotion may land mid-view).
@@ -2651,7 +2782,11 @@ final class WebMonitorServer {
             var rows = data.surfaces || [];
             var hit = null;
             for (var i = 0; i < rows.length; i++) { if (rows[i].id === want) { hit = rows[i]; break; } }
-            if (hit) { setClearBellVisible(!!hit.bell); setClearAttnVisible(!!hit.attentionNeeded); }
+            if (hit) {
+              setClearBellVisible(!!hit.bell);
+              setClearAttnVisible(!!hit.attentionNeeded);
+              setMaximizeState(hit);
+            }
           })
           .catch(function () {});
       }
@@ -2674,6 +2809,11 @@ final class WebMonitorServer {
         scrollSeededFor = null;
         setClearBellVisible(!!bell);
         setClearAttnVisible(false);
+        // Disable (don't hide — that flickers) Maximize until refreshBellButton's
+        // /api/surfaces round-trip reports this split's real zoom state + split count.
+        // showSurface is also called with no row by exitFrameMode and by the maximize
+        // reconnect, so the row is never available here.
+        maxBtn.disabled = true;
         refreshBellButton();
         placeholderEl.style.display = "none";
         curEl.textContent = title || "";
@@ -2722,6 +2862,59 @@ final class WebMonitorServer {
             else { setBanner("Clear attention failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
           })
           .catch(function () { setBanner("Clear attention failed \\u2014 not delivered.", false, true); });
+      };
+
+      // Maximize/Restore this split ON THE MAC. The viewport we render is the host
+      // session's grid, which is sized by the pane on the laptop — so growing the pane
+      // is the only way to see more from here.
+      //
+      // After the resize lands we RECONNECT the stream, because xterm.js is sized ONCE
+      // from the X-Ghostty-Cols/-Rows headers at stream open (see openStream): leaving
+      // the old size in place against a re-gridded host would wrap and clip the output.
+      // The delay lets the Mac's relayout + the host resize round-trip settle so the
+      // reconnect reads the NEW grid; this is the same snap-and-reopen the \\u25cf Live
+      // button does when leaving frame mode.
+      var maximizeReconnectDelay = 450;
+      maxBtn.onclick = function () {
+        if (!current) { noActiveSession(); return; }
+        if (maxBtn.disabled) return;
+        // A focused BUTTON makes the global keydown driver bail (isTypingField), which
+        // would silently kill desktop keyboard driving after one click. Give focus back.
+        maxBtn.blur();
+        var want = !curMaximized;
+        var wantID = current;
+        maxBtn.disabled = true;
+        fetch(url("/api/surface/" + current + "/maximize"), {
+          method: "POST",
+          headers: headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ maximized: want })
+        })
+          .then(function (r) {
+            if (r && r.status === 404) { sessionClosedTeardown(); return; }
+            if (r && r.status === 409) {
+              // The tab turned out to have a single pane after all (our list was stale).
+              setMaximizeState({ maximized: false, splitCount: 1 });
+              setBanner("Nothing to maximize \\u2014 this split is alone in its tab.", false, true);
+              return;
+            }
+            if (!r || !r.ok) {
+              maxBtn.disabled = false;
+              setBanner("Maximize failed (HTTP " + (r ? r.status : "?") + ").", false, true);
+              return;
+            }
+            curMaximized = want;
+            setMaximizeState({ maximized: want, splitCount: curSplitCount });
+            setBanner(want ? "Maximized on the Mac \\u2014 resizing\\u2026" : "Restored on the Mac \\u2014 resizing\\u2026", true);
+            setTimeout(function () {
+              if (current !== wantID) return;
+              showSurface(wantID, curEl.textContent, false);
+              clearBannerIfNotError();
+            }, maximizeReconnectDelay);
+          })
+          .catch(function () {
+            maxBtn.disabled = false;
+            setBanner("Maximize failed \\u2014 not delivered.", false, true);
+          });
       };
 
       function prefGet(k, dflt) { try { var v = localStorage.getItem(k); return v === null ? dflt : v; } catch (e) { return dflt; } }

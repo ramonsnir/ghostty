@@ -1141,6 +1141,35 @@ struct WebMonitorServerTests {
         #expect(page.contains("if (isTypingField(e.target)) return;"))
     }
 
+    @Test func htmlPageHasMaximizeControl() {
+        // The viewer's Maximize/Restore button + its POST. It must be a TOGGLE driven by
+        // the row's `maximized` flag, not a blind "always maximize".
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("id=\"maximize\""))
+        #expect(page.contains("maxBtn.onclick = function () {"))
+        #expect(page.contains("/maximize"))
+        #expect(page.contains("JSON.stringify({ maximized: want })"))
+        #expect(page.contains("function setMaximizeState(row)"))
+    }
+
+    @Test func htmlPageMaximizeIsDisabledOnASinglePaneTab() {
+        // The ask was an explicitly DISABLED control on a single-split tab, not a
+        // button that silently does nothing. The page derives that from `splitCount`.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("var alone = curSplitCount <= 1;"))
+        #expect(page.contains("maxBtn.disabled = alone;"))
+    }
+
+    @Test func htmlPageMaximizeReconnectsTheStream() {
+        // Load-bearing: xterm.js is sized ONCE from the X-Ghostty-Cols/-Rows headers at
+        // stream open, so after the host grid changes the page MUST reopen the stream or
+        // the re-emulated output wraps and clips at the stale width.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("var maximizeReconnectDelay = 450;"))
+        #expect(page.contains("}, maximizeReconnectDelay);"))
+        #expect(page.contains("showSurface(wantID, curEl.textContent, false);"))
+    }
+
     @Test func decideRouteSurfacesGet() {
         #expect(decide("GET", "/api/surfaces") == .surfacesList)
     }
@@ -1273,6 +1302,79 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.hiddenFlag(body: Data(#"{"hidden":"false"}"#.utf8)) == false)
         #expect(WebMonitorServer.hiddenFlag(body: Data(#"{}"#.utf8)) == nil)              // missing
         #expect(WebMonitorServer.hiddenFlag(body: Data("not json".utf8)) == nil)
+    }
+
+    // (ramon fork / Web monitor) Maximize-a-split-on-the-Mac route + body parse +
+    // the decision matrix that keeps a stale client from doing the wrong thing.
+    @Test func decideRouteSetMaximizedPost() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/maximize") == .setMaximized(uuid: id))
+    }
+
+    @Test func decideRouteSetMaximizedGetMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/maximize") == .methodNotAllowed)
+    }
+
+    @Test func maximizedFlagDecode() {
+        #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"maximized":true}"#.utf8)) == true)
+        #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"maximized":false}"#.utf8)) == false)
+        #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"maximized":1}"#.utf8)) == true)
+        #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"maximized":"no"}"#.utf8)) == false)
+        #expect(WebMonitorServer.maximizedFlag(body: Data(#"{}"#.utf8)) == nil)              // missing
+        #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"hidden":true}"#.utf8)) == nil)  // wrong key
+        #expect(WebMonitorServer.maximizedFlag(body: Data("not json".utf8)) == nil)
+    }
+
+    // A split alone in its tab has nothing to maximize INTO — that is `.unsupported`
+    // (a 409), never a silent no-op. The page disables the control off `splitCount`,
+    // so this is the server-side backstop for a stale client.
+    @Test func maximizeOutcomeSinglePaneTabIsUnsupported() {
+        #expect(WebMonitorServer.maximizeOutcome(want: true, leafCount: 1, isZoomedHere: false) == .unsupported)
+        #expect(WebMonitorServer.maximizeOutcome(want: true, leafCount: 0, isZoomedHere: false) == .unsupported)
+    }
+
+    @Test func maximizeOutcomeZoomsAndUnzooms() {
+        #expect(WebMonitorServer.maximizeOutcome(want: true, leafCount: 3, isZoomedHere: false) == .zoom)
+        #expect(WebMonitorServer.maximizeOutcome(want: false, leafCount: 3, isZoomedHere: true) == .unzoom)
+    }
+
+    // Already in the requested state: report it, mutate nothing.
+    @Test func maximizeOutcomeIsIdempotent() {
+        #expect(WebMonitorServer.maximizeOutcome(want: true, leafCount: 3, isZoomedHere: true)
+                == .noop(maximized: true))
+        #expect(WebMonitorServer.maximizeOutcome(want: false, leafCount: 3, isZoomedHere: false)
+                == .noop(maximized: false))
+    }
+
+    // The load-bearing safety arm: a RESTORE aimed at a split that is NOT the zoomed
+    // one must not clear a zoom someone set on the Mac for a DIFFERENT split.
+    @Test func maximizeOutcomeRestoreOfANonZoomedSplitLeavesTheTabAlone() {
+        #expect(WebMonitorServer.maximizeOutcome(want: false, leafCount: 4, isZoomedHere: false)
+                == .noop(maximized: false))
+    }
+
+    // Restoring a single-pane tab is a harmless no-op, NOT `.unsupported` — the
+    // "nothing to maximize into" objection only applies to maximizing.
+    @Test func maximizeOutcomeRestoreOnSinglePaneIsANoop() {
+        #expect(WebMonitorServer.maximizeOutcome(want: false, leafCount: 1, isZoomedHere: false)
+                == .noop(maximized: false))
+    }
+
+    // The page needs the row's zoom state to label the button Maximize vs Restore.
+    @Test func surfacesJSONEmitsMaximized() throws {
+        let d = WebMonitorServer.surfacesJSONData([
+            .init(id: "z-1", title: "Zoomed", pwd: "", window: 0, tab: 0, tabTitle: "T",
+                  splitIndex: 0, splitCount: 2, bell: false, attentionNeeded: false,
+                  isAgent: false, hidden: false, maximized: true),
+            .init(id: "n-1", title: "Normal", pwd: "", window: 0, tab: 0, tabTitle: "T",
+                  splitIndex: 1, splitCount: 2, bell: false, attentionNeeded: false,
+                  isAgent: false, hidden: false),
+        ], agentDashboard: false)
+        let arr = try surfacesArray(d)
+        #expect(arr?[0]["maximized"] as? Bool == true)
+        #expect(arr?[1]["maximized"] as? Bool == false)  // default when omitted
+        #expect(arr?[0]["splitCount"] as? Int == 2)      // what disables the control
     }
 
     @Test func decideRouteUnknownActionIsNotFound() {

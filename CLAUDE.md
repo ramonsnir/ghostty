@@ -382,9 +382,57 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   (outside `#main`) so they stay visible in the narrow list-view drawer, `#viewhdr` is `flex-wrap`
   + the `#maclayoutnote` desktop affordance is hidden on narrow so the header never scrolls the
   page body sideways, and `showSurface` deliberately does NOT focus the Send field (an
-  always-focused input would make the global keydown driver bail). **See `WEB-MONITOR.md`
+  always-focused input would make the global keydown driver bail).
+  **⛶ MAXIMIZE a split ON THE MAC from the viewer (fork-only, GUI/page-only; no Zig/host/protocol
+  change):** the viewport a client renders IS the host session's GRID, and the grid is sized by the
+  pane on the laptop — so a split squeezed into a corner shows a tiny remote view and NOTHING
+  page-side can fix it (one grid per session). The only lever is to grow the pane, i.e.
+  `toggle_split_zoom`. New route `POST /api/surface/{uuid}/maximize` `{"maximized":bool}` — an
+  EXPLICIT SET, not a toggle, so a stale client can't invert the state it thinks it's changing
+  (pure `maximizedFlag`; it and `hiddenFlag` now share `boolFlag(body:key:)`). The handler sets the
+  zoom DIRECTLY (`controller.surfaceTree = .init(root:zoomed:)`, the same reset `revealIfZoomedAway`
+  performs) — **deliberately NOT `MCPLayout.performAction("toggle_split_zoom")`, which FOCUSES the
+  surface first**: a remote "let me see more" must not yank the Mac's keyboard focus (or, via the
+  sustained-focus debounce, dismiss a bell). Decision is the pure `maximizeOutcome(want:leafCount:
+  isZoomedHere:)` → `.zoom`/`.unzoom`/`.noop(maximized:)`/`.unsupported`: maximizing a SINGLE-PANE
+  tab is `.unsupported` (409) because there's no pane to take space from — the page DISABLES the
+  button off the row's `splitCount` and the 409 is the stale-client backstop (RESTORING a
+  single-pane tab is a plain `.noop`); and a RESTORE is honored **only when this surface is the
+  zoomed one** (`tree.zoomedLeaves()`), so a stale client can't clear a zoom someone set on the Mac
+  for a DIFFERENT split. `SurfaceRow.maximized` (defaulted like `hero`, computed once per tab from
+  `zoomedLeaves()`) is emitted on every `/api/surfaces` row and, with the pre-existing `splitCount`,
+  is the SINGLE source of truth for the button's label + disabled state (`setMaximizeState(row)`,
+  fed by `refreshBellButton` AND the `loadList` timer, so it self-corrects when someone zooms on the
+  Mac). **⚠️ THE LOAD-BEARING PAGE DETAIL: the stream MUST be reconnected after the resize** —
+  `openStream` sizes xterm.js EXACTLY ONCE from the `X-Ghostty-Cols`/`-Rows` headers and there is NO
+  mid-stream resize signal, so the old size against a re-gridded host wraps + clips the re-emulated
+  output; the page waits `maximizeReconnectDelay` (450ms, for the SwiftUI relayout + host resize to
+  settle) then `showSurface(...)` — the same dispose+reopen `exitFrameMode` uses. The button also
+  `blur()`s on click (a focused `BUTTON` makes the global keydown driver bail via `isTypingField`
+  and would silently kill desktop keyboard driving). ACCEPTED, all deliberate: the PTY resizes both
+  ways so the program REFLOWS on maximize AND restore (same as pressing the zoom keybind); a
+  maximize left on PERSISTS across a GUI restart (`SplitTree` Codable encodes the `zoomed` path +
+  the fork forces restoration on) — unzoom on the Mac or hit Restore; per-tab exclusivity is FREE
+  (`zoomed` is one field, so maximizing another split in the tab just moves the zoom); sibling
+  splits are HIDDEN not resized (they leave the hierarchy and keep their grid, so other agents are
+  undisturbed — the cost is their bells degrade to the `zoomedHiddenBell` badge and their dashboard
+  tiles take the zoom-hidden `hostGeomBox`/`mergeHostGeom` path that already exists); and
+  `SplitTree.inserting`/`combined`/`resizing` all reset `zoomed` to nil, so a queue spawning into
+  that tab silently clears the maximize (fail-safe). Wiring (all `WebMonitorServer.swift`):
+  `RouteDecision.setMaximized` + the `"maximize"` arm + handler, `boolFlag`/`maximizedFlag`,
+  `MaximizeOutcome`/`maximizeOutcome`, `SurfaceRow.maximized` + emit, page `#maximize` +
+  `setMaximizeState` + `maxBtn.onclick` + `maximizeReconnectDelay` + the `loadList`/
+  `refreshBellButton`/`showSurface`/`showPlaceholder` hooks. Tests: `WebMonitorServerTests`
+  (`decideRouteSetMaximizedPost`/`…GetMethodNotAllowed`, `maximizedFlagDecode`,
+  `maximizeOutcomeSinglePaneTabIsUnsupported`/`…ZoomsAndUnzooms`/`…IsIdempotent`/
+  `…RestoreOfANonZoomedSplitLeavesTheTabAlone`/`…RestoreOnSinglePaneIsANoop`,
+  `surfacesJSONEmitsMaximized`, `htmlPageHasMaximizeControl`,
+  `htmlPageMaximizeIsDisabledOnASinglePaneTab`, `htmlPageMaximizeReconnectsTheStream`).
+  GUI relaunch only; NO Zig/lib/host change.
+  **See `WEB-MONITOR.md`
   (→ "Using it from a laptop" for the user-facing sidebar/keyboard/clipboard UX, → Scope / The
-  responsive client, and → Implementation notes) for the responsive layout + capability model,
+  responsive client, and → Implementation notes incl. "Maximize a split from the phone/laptop")
+  for the responsive layout + capability model,
   the color/scrollback architecture, the Claude scroll-region finding, HTTP API, threading,
   push/VAPID, wiring + tests; + `DESKTOP-MONITOR-DESIGN.md` (SUPERSEDED — historical).**
 

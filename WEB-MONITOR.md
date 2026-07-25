@@ -147,7 +147,25 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
    - All input is sent as **real key/wheel events** (`ghostty_surface_key` / `_mouse_scroll`),
      not pasted — so Enter actually submits and control keys actually fire.
-5. Closed surface (404) or a dropped link shows a visible **"Session closed." / "connection
+5. **⛶ Maximize** (in the viewer header) — when the split you're watching is a small pane on
+   the Mac, what you see here is small too: the viewport you're rendering **is** the host
+   session's grid, and that grid is sized by the pane on the laptop. Maximize **zooms that
+   split on the Mac** (the same thing `toggle_split_zoom` does), so it takes over its tab and
+   the grid — and your view — gets bigger. The button becomes **⛶ Restore** to put it back.
+   Things worth knowing:
+   - It **does not focus** the split on the Mac, so it won't steal your keyboard focus there or
+     dismiss a bell.
+   - The pane's PTY resizes both ways, so the program **reflows** (a TUI repaints; a shell
+     re-wraps). That's the same cost as pressing the zoom keybind on the Mac.
+   - The stream **reconnects automatically** a moment after the resize (a brief "resizing…"),
+     because the terminal here is sized once when the stream opens.
+   - It's **disabled** when the split is the only pane in its tab — there'd be nothing to
+     maximize into.
+   - A maximize left on **persists** (it survives a Mac GUI restart, like any zoom). That's
+     deliberate: unzoom it on the Mac with `ctrl+a>z`, or hit Restore here. Maximizing a
+     different split in the same tab simply moves the zoom — a tab is only ever zoomed to one
+     split.
+6. Closed surface (404) or a dropped link shows a visible **"Session closed." / "connection
    lost"** banner — it won't silently leave a stale screen.
 
 ---
@@ -299,13 +317,14 @@ real scrollback can't come from the GUI. Instead:
 | `GET /` | the embedded responsive page — serves both phone and laptop (`?token=` accepted here when a token is set) |
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
-| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,isAgent,hidden,hero}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is) |
+| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,splitCount,isAgent,hidden,hero,maximized}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is; `maximized`+`splitCount` drive the ⛶ Maximize control) |
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
 | `GET /api/surface/{uuid}/frame` | host's authoritative render as a self-contained ANSI frame (color); for frame-mode scrolling. 501 without pty-host |
 | `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → seed cursor at surface center, then a real mouse wheel to the app |
 | `POST /api/surface/{uuid}/hidden` | `{"hidden":bool}` → hide/reveal in the Agent Dashboard hide set (503 if the dashboard isn't running) |
+| `POST /api/surface/{uuid}/maximize` | `{"maximized":bool}` → split-zoom / unzoom this split's tab on the Mac, so its grid (and the viewport here) grows. `409` when the split is alone in its tab |
 | `GET /sw.js` | the Web Push service worker (bootstrap; `?token=` accepted) |
 | `GET /api/push/config` | JSON `{vapidPublicKey, enabled, subscriptions}` |
 | `POST /api/push/subscribe` | register a browser `PushSubscription` |
@@ -658,6 +677,71 @@ instantly. ZERO host/Zig change; GUI relaunch. Wiring: `WebMonitorServer.swift`
 button + `setHidden(id,hidden)`. Tests: `WebMonitorServerTests`
 (`decideRouteSetHiddenPost`/`…GetMethodNotAllowed`, `hiddenFlagDecode`).
 
+### Maximize a split from the phone/laptop (fork-only, GUI/page-only) — ⛶ Maximize/Restore
+
+**The whole point:** what a viewer renders is the host session's GRID, and the grid is sized by
+the pane on the Mac. A split squeezed into a corner of a busy tab therefore shows a tiny viewport
+remotely, and NOTHING page-side can fix that — there is exactly one grid per session. So the only
+lever is to make the pane bigger, which is precisely `toggle_split_zoom`.
+
+Route `POST /api/surface/{uuid}/maximize`, body `{"maximized":bool}` — an EXPLICIT SET, not a
+toggle, so a client working from a stale list can't invert the state it thinks it's changing.
+Body parsing is the lenient pure `maximizedFlag(body:)`; it and `hiddenFlag` now both delegate to
+a shared `boolFlag(body:key:)` so the two set-a-flag routes can't drift.
+
+The handler resolves `controllerAndView(forUUID:)` and sets the tab's zoom **DIRECTLY** —
+`controller.surfaceTree = .init(root: root, zoomed: node)`, the same `SplitTree(root:zoomed:)`
+reset `revealIfZoomedAway` performs. **Deliberately NOT `MCPLayout.performAction("toggle_split_zoom")`**,
+which FOCUSES the surface first: a remote "let me see more" gesture must not yank the Mac's
+keyboard focus (and, via the sustained-focus debounce, potentially dismiss a bell).
+
+The decision is the pure, fully-tested `maximizeOutcome(want:leafCount:isZoomedHere:)` →
+`.zoom` / `.unzoom` / `.noop(maximized:)` / `.unsupported`:
+- **`.unsupported` (409) — maximizing a SINGLE-PANE tab.** There is no other pane to take space
+  from, so it would silently do nothing. The page DISABLES the control off the row's
+  `splitCount`; the 409 is the backstop for a stale client. (RESTORING a single-pane tab is a
+  plain `.noop`, not unsupported — the objection only applies to maximizing.)
+- **Restore is honored only when THIS surface is the zoomed one** (`isZoomedHere`, via
+  `tree.zoomedLeaves()`). Otherwise it's a `.noop`: a stale client must not clear a zoom someone
+  set on the Mac for a DIFFERENT split.
+
+`SurfaceRow` gains `maximized` (defaulted like `hero`), computed once per tab from
+`Set(c.surfaceTree.zoomedLeaves().map(\.id))` and emitted on every `/api/surfaces` row; paired
+with the pre-existing `splitCount`, that row IS the single source of truth for the button's
+label + disabled state (`setMaximizeState(row)`, fed by both `refreshBellButton` and the
+`loadList` timer, so the control self-corrects when someone zooms/unzooms on the Mac).
+
+**⚠️ The load-bearing page-side detail: the stream MUST be reconnected after the resize.**
+`openStream` sizes xterm.js EXACTLY ONCE from the `X-Ghostty-Cols`/`X-Ghostty-Rows` response
+headers, and there is no mid-stream resize signal — so leaving the old size against a re-gridded
+host wraps and clips the re-emulated output. After a successful POST the page waits
+`maximizeReconnectDelay` (450ms, for the SwiftUI relayout + host resize round-trip to settle) and
+calls `showSurface(...)`, the same dispose+reopen `exitFrameMode` uses. The button also `blur()`s
+itself on click, because a focused `BUTTON` makes the global keydown driver bail (`isTypingField`)
+and would silently kill desktop keyboard driving.
+
+**Accepted behaviors (all deliberate).** The PTY resizes both ways so the program reflows
+(SIGWINCH) on maximize AND on restore — identical to pressing the zoom keybind on the Mac. A
+maximize left on PERSISTS across a GUI restart (`SplitTree`'s `Codable` encodes the `zoomed`
+path, and the fork forces window-state restoration on). Per-tab exclusivity is free — `zoomed` is
+a single field, so maximizing another split in the same tab just moves the zoom. Sibling splits
+are HIDDEN, not resized (they leave the view hierarchy and keep their grid), so the other agents
+in that tab are undisturbed; the cost is that their bells degrade to the `zoomedHiddenBell` badge
+and their dashboard tiles take the zoom-hidden geometry path `hostGeomBox`/`mergeHostGeom` already
+covers. `SplitTree.inserting`/`combined`/`resizing` all reset `zoomed` to nil, so a queue spawning
+into that tab or any resize silently clears the maximize — a fail-safe, not a bug.
+
+ZERO host/Zig/protocol change; GUI relaunch only. Wiring (all `WebMonitorServer.swift`):
+`RouteDecision.setMaximized` + the `"maximize"` route arm + the handler; `boolFlag`/`hiddenFlag`/
+`maximizedFlag`; `MaximizeOutcome`/`maximizeOutcome`; `SurfaceRow.maximized` + `surfacesJSON`
+population + `surfacesJSONData` emit; page `#maximize` button + CSS + `setMaximizeState` +
+`maxBtn.onclick` + `maximizeReconnectDelay` + the `loadList`/`refreshBellButton`/`showSurface`/
+`showPlaceholder` hooks. Tests: `WebMonitorServerTests` (`decideRouteSetMaximizedPost`/
+`…GetMethodNotAllowed`, `maximizedFlagDecode`, `maximizeOutcomeSinglePaneTabIsUnsupported`/
+`…ZoomsAndUnzooms`/`…IsIdempotent`/`…RestoreOfANonZoomedSplitLeavesTheTabAlone`/
+`…RestoreOnSinglePaneIsANoop`, `surfacesJSONEmitsMaximized`, `htmlPageHasMaximizeControl`,
+`htmlPageMaximizeIsDisabledOnASinglePaneTab`, `htmlPageMaximizeReconnectsTheStream`).
+
 ### Input = REAL key/wheel events, NOT paste (critical)
 
 `ghostty_surface_text` routes through `completeClipboardPaste` (clipboard path) — pasted `\n`
@@ -845,7 +929,8 @@ GUI/page parts are GUI-only (a relaunch reattaches).
   `ptyHost` getter)
 - `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen`/`webMonitorToken`/`ptyHost`)
 - `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` (server + xterm page + routes +
-  Notify toggle + `/sw.js` + `/api/push/*`)
+  Notify toggle + `/sw.js` + `/api/push/*`; the ⛶ Maximize route `.setMaximized` +
+  `maximizeOutcome` + `SurfaceRow.maximized` + the page's Maximize/Restore control)
 - `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`;
   Hero Agents: `PushKind.hero`/`payloadValue`, `onHero`, pure `pushTitle`/`pushPayload` seams,
   the `AgentStateUserInfoKey.hero`→`onHero` route in the attention observer)
