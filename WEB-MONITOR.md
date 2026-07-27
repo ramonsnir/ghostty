@@ -147,7 +147,7 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      once); Enter/Ctrl-C/etc. are single-fire on purpose.
    - All input is sent as **real key/wheel events** (`ghostty_surface_key` / `_mouse_scroll`),
      not pasted — so Enter actually submits and control keys actually fire.
-5. **⛶ Maximize** (in the viewer header) — when the split you're watching is a small pane on
+5. **⛶ Maximize** (in the viewer header, right next to **← Sessions**) — when the split you're watching is a small pane on
    the Mac, what you see here is small too: the viewport you're rendering **is** the host
    session's grid, and that grid is sized by the pane on the laptop. Maximize **zooms that
    split on the Mac** (the same thing `toggle_split_zoom` does), so it takes over its tab and
@@ -731,6 +731,15 @@ and their dashboard tiles take the zoom-hidden geometry path `hostGeomBox`/`merg
 covers. `SplitTree.inserting`/`combined`/`resizing` all reset `zoomed` to nil, so a queue spawning
 into that tab or any resize silently clears the maximize — a fail-safe, not a bug.
 
+**⚠️ Header ORDER is layout, not cosmetics: `#maximize` must come BEFORE `#cur`.** `#cur` (the
+title) is `flex: 1 1 auto` and grows to fill the header, so anything placed after it is the first
+thing pushed onto a second row once `#viewhdr` wraps on a narrow viewport — which is exactly what
+the button did when it first shipped after the title (a wasted header row). Placing it between
+`#menubtn` and `#cur` packs it beside the ← Sessions control and lets the title ellipsize around
+it (`#cur` is `min-width: 0` + `text-overflow: ellipsis`, so it shrinks rather than wrapping the
+row). On wide layouts `#menubtn` is `display: none`, so Maximize simply leads the header. Locked
+by `htmlPageMaximizeSitsBesideTheBackControl`.
+
 ZERO host/Zig/protocol change; GUI relaunch only. Wiring (all `WebMonitorServer.swift`):
 `RouteDecision.setMaximized` + the `"maximize"` route arm + the handler; `boolFlag`/`hiddenFlag`/
 `maximizedFlag`; `MaximizeOutcome`/`maximizeOutcome`; `SurfaceRow.maximized` + `surfacesJSON`
@@ -740,7 +749,8 @@ population + `surfacesJSONData` emit; page `#maximize` button + CSS + `setMaximi
 `…GetMethodNotAllowed`, `maximizedFlagDecode`, `maximizeOutcomeSinglePaneTabIsUnsupported`/
 `…ZoomsAndUnzooms`/`…IsIdempotent`/`…RestoreOfANonZoomedSplitLeavesTheTabAlone`/
 `…RestoreOnSinglePaneIsANoop`, `surfacesJSONEmitsMaximized`, `htmlPageHasMaximizeControl`,
-`htmlPageMaximizeIsDisabledOnASinglePaneTab`, `htmlPageMaximizeReconnectsTheStream`).
+`htmlPageMaximizeIsDisabledOnASinglePaneTab`, `htmlPageMaximizeReconnectsTheStream`,
+`htmlPageMaximizeSitsBesideTheBackControl`).
 
 ### Input = REAL key/wheel events, NOT paste (critical)
 
