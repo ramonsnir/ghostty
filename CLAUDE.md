@@ -422,12 +422,20 @@ refs + handler to `Ghostty.App.swift` and the `recordFocusedSurface` hook to
   `RouteDecision.setMaximized` + the `"maximize"` arm + handler, `boolFlag`/`maximizedFlag`,
   `MaximizeOutcome`/`maximizeOutcome`, `SurfaceRow.maximized` + emit, page `#maximize` +
   `setMaximizeState` + `maxBtn.onclick` + `maximizeReconnectDelay` + the `loadList`/
-  `refreshBellButton`/`showSurface`/`showPlaceholder` hooks. Tests: `WebMonitorServerTests`
+  `refreshBellButton`/`showSurface`/`showPlaceholder` hooks. **⚠️ HEADER ORDER IS LAYOUT, NOT
+  COSMETICS — `#maximize` must sit BETWEEN `#menubtn` and `#cur`:** `#cur` (the title) is
+  `flex: 1 1 auto` and grows to fill `#viewhdr`, so anything AFTER it is the first thing pushed
+  onto a SECOND header row once the header wraps on a narrow viewport — which is exactly what the
+  button did when it first shipped after the title (a wasted row). Before `#cur` it packs beside
+  the ← Sessions control and the title ellipsizes around it (`min-width: 0` + `text-overflow`), and
+  on wide (where `#menubtn` is `display: none`) Maximize simply leads the header. Tests:
+  `WebMonitorServerTests`
   (`decideRouteSetMaximizedPost`/`…GetMethodNotAllowed`, `maximizedFlagDecode`,
   `maximizeOutcomeSinglePaneTabIsUnsupported`/`…ZoomsAndUnzooms`/`…IsIdempotent`/
   `…RestoreOfANonZoomedSplitLeavesTheTabAlone`/`…RestoreOnSinglePaneIsANoop`,
   `surfacesJSONEmitsMaximized`, `htmlPageHasMaximizeControl`,
-  `htmlPageMaximizeIsDisabledOnASinglePaneTab`, `htmlPageMaximizeReconnectsTheStream`).
+  `htmlPageMaximizeIsDisabledOnASinglePaneTab`, `htmlPageMaximizeReconnectsTheStream`,
+  `htmlPageMaximizeSitsBesideTheBackControl` — the order guard).
   GUI relaunch only; NO Zig/lib/host change.
   **See `WEB-MONITOR.md`
   (→ "Using it from a laptop" for the user-facing sidebar/keyboard/clipboard UX, → Scope / The

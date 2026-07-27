@@ -2285,8 +2285,11 @@ final class WebMonitorServer {
           <!-- Narrow-layout back/menu: reopens the sidebar drawer. CSS-hidden on
                wide (the sidebar is always present there). -->
           <button id="menubtn" title="Back to the session list">&larr; Sessions</button>
-          <span id="cur"></span>
+          <!-- Maximize sits BEFORE #cur (which is flex:1 and grows to fill): after the
+               title it got pushed onto a second header row on narrow layouts. Here it
+               packs next to the back control and the title ellipsizes around it. -->
           <button id="maximize" style="display:none">&#x26f6; Maximize</button>
+          <span id="cur"></span>
           <button id="clearbell" style="display:none"
                   title="Acknowledge/clear the bell for this split (it can ring again later)">&#128276; Clear</button>
           <button id="clearattn" style="display:none"

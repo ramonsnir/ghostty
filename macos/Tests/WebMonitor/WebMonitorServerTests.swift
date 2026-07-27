@@ -1152,6 +1152,22 @@ struct WebMonitorServerTests {
         #expect(page.contains("function setMaximizeState(row)"))
     }
 
+    @Test func htmlPageMaximizeSitsBesideTheBackControl() {
+        // Header order is load-bearing for layout, not cosmetic: #cur is flex:1 and grows
+        // to fill, so anything AFTER it gets pushed onto a second row once #viewhdr wraps
+        // on a narrow viewport. Maximize must precede #cur so it packs next to #menubtn
+        // and the title ellipsizes around it instead.
+        let page = WebMonitorServer.htmlPage
+        guard let menu = page.range(of: "id=\"menubtn\""),
+              let maximize = page.range(of: "id=\"maximize\""),
+              let cur = page.range(of: "<span id=\"cur\">") else {
+            Issue.record("view header is missing one of #menubtn / #maximize / #cur")
+            return
+        }
+        #expect(menu.lowerBound < maximize.lowerBound)
+        #expect(maximize.lowerBound < cur.lowerBound)
+    }
+
     @Test func htmlPageMaximizeIsDisabledOnASinglePaneTab() {
         // The ask was an explicitly DISABLED control on a single-split tab, not a
         // button that silently does nothing. The page derives that from `splitCount`.
