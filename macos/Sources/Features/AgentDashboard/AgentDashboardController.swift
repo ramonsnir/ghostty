@@ -351,6 +351,22 @@ final class AgentDashboardModel: ObservableObject {
     /// thereafter (mutes the `idleSeconds` heuristic for these ids).
     private(set) var hookBacked: Set<UUID> = []
 
+    /// (ramon fork / hook-state lease) Consecutive detector ticks that WALKED a
+    /// surface holding hook state and found no agent process in its subtree. Reset
+    /// by a detector hit or a fresh hook post; at `hookOnlyMissLimit` the surface
+    /// joins `staleHookState`. Only LOCAL surfaces are counted (see `applyAgents`).
+    private var hookMisses: [UUID: Int] = [:]
+
+    /// (ramon fork / hook-state lease) Surfaces whose hook state is no longer
+    /// EVIDENCE of a live agent — the Claude Code process that posted it is gone.
+    /// `@Published` because it gates `isAgentSurface`, i.e. whether a tile exists.
+    ///
+    /// The recorded state itself is deliberately NOT deleted: it stays readable via
+    /// `hookSnapshot`/`list_surfaces` (the Agent Queue's close gate reads the last
+    /// `agentState` of a finished agent), it is just no longer proof that THIS
+    /// surface is running an agent.
+    @Published private(set) var staleHookState: Set<UUID> = []
+
     // MARK: - Manual order (ramon fork / Agent Dashboard)
 
     /// The user's manual tile order: an ORDERED list of stable COMPOSITE session keys
@@ -453,6 +469,13 @@ final class AgentDashboardModel: ObservableObject {
     /// during `rebuild`, so a long-idle-but-ALIVE agent isn't age-pruned without
     /// churning UserDefaults on every rebuild.
     static let persistTouchInterval: TimeInterval = 3600
+
+    /// (ramon fork / hook-state lease) How many CONSECUTIVE detector ticks may walk a
+    /// hook-only LOCAL surface and find no agent process before its hook state stops
+    /// counting as evidence of an agent. At the detector's 2s cadence this is ~30s —
+    /// long enough to ride out the hook-lands-before-the-first-walk race (one tick)
+    /// plus any transient, short enough that a stale tile is never permanent.
+    static let hookOnlyMissLimit = 15
 
     init(
         store: HideStore,
@@ -694,11 +717,60 @@ final class AgentDashboardModel: ObservableObject {
 
     /// Apply fresh detector results (off-main → main). Updates the liveness
     /// timestamps used as the secondary sort key.
-    func applyAgents(_ next: [UUID: AgentKind]) {
+    ///
+    /// `walked` is the set of surface ids the detector actually WALKED this tick (the
+    /// ids in its snapshot — a surface with no foreground pid is absent). It drives the
+    /// hook-state LEASE below: only a walked surface can be judged, so "the detector
+    /// never looked" is never mistaken for "no agent is there". Defaulted to nil so a
+    /// caller with no walk evidence (tests, any non-detector path) leaves the lease
+    /// bookkeeping untouched.
+    func applyAgents(_ next: [UUID: AgentKind], walked: Set<UUID>? = nil) {
         let now = Date()
         for id in next.keys { lastSeen[id] = now }
         agents = next
+        if let walked { updateHookLease(detected: next, walked: walked) }
         rebuildEntriesFromCurrentState()
+    }
+
+    /// (ramon fork / hook-state lease) Age the hook-only agent evidence against this
+    /// detector tick.
+    ///
+    /// WHY: a hook post proves a Claude Code process ran in this surface — it does NOT
+    /// prove one is running NOW, and the state was previously kept for the surface's
+    /// whole life. So any shell that ever shelled out to `claude` (e.g. an account
+    /// script running a headless `claude -p` credential probe) became a permanent
+    /// dashboard tile. The state is a LEASE: renewed by evidence, expired without it.
+    ///
+    /// Renewed by EITHER a detector hit (`agents[id] != nil`) or a fresh hook post
+    /// (`applyAgentState`). Expired after `hookOnlyMissLimit` consecutive clean walks.
+    ///
+    /// Scoped to LOCAL surfaces on purpose: the detector walks the LOCAL process table
+    /// from the row's foreground pid, which for a REMOTE surface is a pid on the box —
+    /// meaningless here. A cross-host agent is exactly the case hook state exists to
+    /// cover, so a remote surface is never leased and keeps today's behavior.
+    private func updateHookLease(detected: [UUID: AgentKind], walked: Set<UUID>) {
+        var nowStale = staleHookState
+        for id in walked where agentStates[id] != nil {
+            if detected[id] != nil {
+                // The process is right there — full renewal.
+                hookMisses[id] = nil
+                nowStale.remove(id)
+                continue
+            }
+            // Already expired: nothing left to age (and don't churn the counter).
+            guard !nowStale.contains(id), isLocalSurface(id) else { continue }
+            let misses = (hookMisses[id] ?? 0) + 1
+            hookMisses[id] = misses
+            if misses >= Self.hookOnlyMissLimit { nowStale.insert(id) }
+        }
+        if nowStale != staleHookState { staleHookState = nowStale }
+    }
+
+    /// True iff `id` is a live surface on the LOCAL host. An id not (yet) in `live` is
+    /// treated as non-local — the conservative answer, since the lease only ever
+    /// EXPIRES evidence.
+    private func isLocalSurface(_ id: UUID) -> Bool {
+        live.first(where: { $0.id == id })?.hostName == "local"
     }
 
     /// (ramon fork / Agent hooks) Apply one hook event (called on main from the
@@ -721,6 +793,12 @@ final class AgentDashboardModel: ObservableObject {
         _ id: UUID, _ payload: AgentStatePayload, backgroundShells bgOverride: Int? = nil
     ) -> Bool {
         hookBacked.insert(id)
+
+        // (hook-state lease) A fresh post is fresh evidence: a Claude Code process was
+        // alive in this surface just now. Renew before the coalesce early-return below,
+        // so a repeat of an unchanged state still counts as a heartbeat.
+        hookMisses[id] = nil
+        if staleHookState.contains(id) { staleHookState.remove(id) }
 
         let prev = agentStates[id]
 
@@ -885,6 +963,11 @@ final class AgentDashboardModel: ObservableObject {
         lastPrompt = lastPrompt.filter { liveIDs.contains($0.key) }
         lastMessage = lastMessage.filter { liveIDs.contains($0.key) }
         hookBacked = hookBacked.intersection(liveIDs)
+        // (hook-state lease) Same pruning rule as the rest of the per-id state.
+        hookMisses = hookMisses.filter { liveIDs.contains($0.key) }
+        if !staleHookState.isSubset(of: liveIDs) {
+            staleHookState = staleHookState.intersection(liveIDs)
+        }
         // (ramon fork / Agent Manager) Drop annotations for vanished surfaces too
         // (in-memory only, so nothing is persisted — just don't leak).
         annotations = annotations.filter { liveIDs.contains($0.key) }
@@ -999,17 +1082,28 @@ final class AgentDashboardModel: ObservableObject {
     /// queue-tracked, and POSTing state). Only Claude Code runs that hook, so a report
     /// IS proof of an agent; treating it as such is both more robust and more honest than
     /// pattern-matching a process tree through an arbitrary wrapper.
+    ///
+    /// (ramon fork / hook-state lease) Signal 2 is EVIDENCE, not a permanent fact: a hook
+    /// post proves a Claude Code process ran here, not that one is running now. So it is
+    /// discounted once `updateHookLease` has watched the detector walk this LOCAL surface
+    /// `hookOnlyMissLimit` times running and find no agent — otherwise any shell that ever
+    /// shelled out to `claude` (a headless `claude -p` probe) stayed a tile for the
+    /// surface's whole life. Signal 1 is unaffected, and a remote surface is never leased.
     func isAgentSurface(_ id: UUID) -> Bool {
-        agents[id] != nil || agentStates[id] != nil
+        if agents[id] != nil { return true }
+        return agentStates[id] != nil && !staleHookState.contains(id)
     }
 
     /// The agent kind to display for `id`: the DETECTED kind when the process walk found
     /// one, else a hook-implied `claude` (only Claude Code POSTs agent state). Keeps the
     /// tile's badge + the hover controls that gate on a non-nil kind working for a
-    /// cross-host agent the detector could not classify.
+    /// cross-host agent the detector could not classify. Nil once the hook evidence has
+    /// gone stale (same lease as `isAgentSurface`), so `hookSnapshot` → `list_surfaces`
+    /// stops calling a plain shell an agent too.
     func displayAgentKind(_ id: UUID) -> AgentKind? {
         if let a = agents[id] { return a }
-        return agentStates[id] != nil ? AgentKind("claude") : nil
+        guard agentStates[id] != nil, !staleHookState.contains(id) else { return nil }
+        return AgentKind("claude")
     }
 
     /// (ramon fork / Hero Agents) The set of currently-live surface ids annotated as HEROES
@@ -1856,8 +1950,8 @@ final class AgentDashboardController: NSWindowController {
         panel.setFrameAutosaveName(Self.autosaveName)
         panel.delegate = self
 
-        detector.onResults = { [weak self] results in
-            self?.model.applyAgents(results)
+        detector.onResults = { [weak self] results, walked in
+            self?.model.applyAgents(results, walked: walked)
         }
 
         subscribeChurn()

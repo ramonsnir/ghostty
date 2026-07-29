@@ -1429,6 +1429,136 @@ struct AgentDashboardHookStateTests {
         #expect(model.entries.first(where: { $0.id == a })?.agentState == .working)
     }
 
+    // MARK: - Hook-state LEASE (ramon fork)
+    //
+    // A hook post proves a Claude Code process RAN in a surface, not that one is
+    // running now. It used to be kept for the surface's whole life, so any shell that
+    // ever shelled out to `claude` — e.g. an account script running a headless
+    // `claude -p ping` credential probe — became a PERMANENT dashboard tile. The state
+    // is now a lease renewed by evidence (a detector hit or a fresh hook post) and
+    // expired after `hookOnlyMissLimit` consecutive clean detector walks.
+
+    /// Drive `n` detector ticks that walked `ids` and matched nothing.
+    private func cleanWalks(_ model: AgentDashboardModel, _ ids: [UUID], _ n: Int) {
+        for _ in 0..<n { model.applyAgents([:], walked: Set(ids)) }
+    }
+
+    @Test func hookOnlyStateExpiresAfterTheDetectorKeepsFindingNoAgent() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.idle, prompt: "ping"))
+        #expect(model.isAgentSurface(a))
+
+        // One short of the limit it is still an agent — the lease has not run out.
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit - 1)
+        #expect(model.isAgentSurface(a))
+
+        cleanWalks(model, [a], 1)
+        #expect(!model.isAgentSurface(a))
+        #expect(model.entries.isEmpty)
+        // The kind goes with it, so `list_surfaces` stops calling a shell an agent.
+        #expect(model.displayAgentKind(a) == nil)
+        #expect(model.hookSnapshot()[a]?.agentKind == nil)
+        // The recorded STATE survives — only the agent CLASSIFICATION expired.
+        #expect(model.agentStates[a] == .idle)
+        #expect(model.hookSnapshot()[a]?.agentState == "idle")
+    }
+
+    @Test func aDetectedAgentIsNeverLeasedAway() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.waiting))
+        // The detector sees it on every tick, so the misses never accumulate.
+        for _ in 0..<(AgentDashboardModel.hookOnlyMissLimit * 3) {
+            model.applyAgents(agents([a]), walked: [a])
+        }
+        #expect(model.isAgentSurface(a))
+        #expect(model.staleHookState.isEmpty)
+    }
+
+    @Test func aFreshHookPostRenewsTheLease() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.working))
+
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit - 1)
+        model.applyAgentState(a, payload(.working, tool: "Bash"))   // heartbeat
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit - 1)
+        #expect(model.isAgentSurface(a))                            // counter restarted
+    }
+
+    /// A new agent in the same surface must un-stale it — the tile has to come back.
+    @Test func anExpiredSurfaceRecoversWhenAnAgentAppearsAgain() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.idle))
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit)
+        #expect(!model.isAgentSurface(a))
+
+        model.applyAgentState(a, payload(.working, prompt: "next task"))
+        #expect(model.isAgentSurface(a))
+        #expect(model.displayAgentKind(a)?.command == "claude")
+
+        // ...and equally when only the DETECTOR sees the new process.
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit)
+        #expect(!model.isAgentSurface(a))
+        model.applyAgents(agents([a]), walked: [a])
+        #expect(model.isAgentSurface(a))
+    }
+
+    /// The lease is LOCAL-only. A remote surface's foreground pid lives on the box, so
+    /// the local walk says nothing about it — and cross-host is exactly the case
+    /// hook-only evidence exists to cover.
+    @Test func aRemoteSurfaceIsNeverLeasedAway() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: [.init(id: a, view: nil, title: "t", pwd: "/x",
+                                   sessionID: 7, hostName: "box")])
+        model.applyAgentState(a, payload(.working))
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit * 2)
+        #expect(model.isAgentSurface(a))
+    }
+
+    /// A surface the detector never WALKED (no foreground pid — a host too old to push
+    /// one) must not be judged: absent from `walked` is "no opinion", not "no agent".
+    @Test func aSurfaceTheDetectorNeverWalkedIsNotLeasedAway() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID(), other = UUID()
+        model.rebuild(live: live([a, other]))
+        model.applyAgentState(a, payload(.working))
+        // Ticks happen, but `a` is never in the walked set.
+        for _ in 0..<(AgentDashboardModel.hookOnlyMissLimit * 2) {
+            model.applyAgents([:], walked: [other])
+        }
+        #expect(model.isAgentSurface(a))
+    }
+
+    /// Back-compat: a caller with no walk evidence (the default) never ages the lease.
+    @Test func applyAgentsWithoutWalkEvidenceLeavesTheLeaseAlone() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.working))
+        for _ in 0..<(AgentDashboardModel.hookOnlyMissLimit * 2) { model.applyAgents([:]) }
+        #expect(model.isAgentSurface(a))
+    }
+
+    @Test func leaseStateIsPrunedWhenTheSurfaceGoesAway() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.idle))
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit)
+        #expect(model.staleHookState.contains(a))
+
+        model.rebuild(live: [])
+        #expect(model.staleHookState.isEmpty)
+    }
+
     @Test func workingToWaitingReturnsTrueAndUnhides() {
         let store = InMemoryHideStore()
         let model = AgentDashboardModel(store: store)

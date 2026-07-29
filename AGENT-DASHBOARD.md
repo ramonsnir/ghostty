@@ -32,6 +32,16 @@ below); without it the panel degrades to metadata-only tiles.
 > classifies a pool-launched cloud agent. A hook report is proof of an agent, so the tile
 > appears with a hook-implied `claude` badge; a detected kind still wins when present. A plain
 > shell (neither signal) is still never shown.
+>
+> **Hook evidence EXPIRES (it is a lease, not a permanent fact).** A hook report proves a
+> Claude Code process *ran* in that split, not that one is running *now* — so a shell that
+> merely shells out to `claude` once (e.g. an account script running a headless
+> `claude -p …` credential probe) would otherwise stay a tile forever. Instead, once the
+> detector has walked that split ~30s running (15 polls) and found no agent process, the
+> hook evidence stops counting and the tile disappears. A new agent in the same split (a
+> detector hit *or* a fresh hook post) brings it straight back. Only **local** splits are
+> aged this way — a cross-host split's foreground pid lives on the box, where the local
+> walk can say nothing, so a box agent is never expired.
 
 ## Quick start — the config
 
@@ -385,10 +395,16 @@ gains a live state chip.
 
 - **Claude Code only.** The hook events are Claude Code's; Codex and other agents
   keep the preview-only tile (still detected, still previewed, just no state chip).
-- **No TTL / no liveness ping.** State changes only on a hook event. If a session is
-  killed mid-turn without firing `Stop`, the tile can sit on a stale `working` until
-  the ~2s detector poll notices the process is gone and removes the tile entirely — a
-  cosmetic miss, not a leak.
+- **No TTL / no liveness ping on the STATE itself.** The state value changes only on a
+  hook event. If a session is killed mid-turn without firing `Stop`, the tile can sit on
+  a stale `working` until the ~2s detector poll notices the process is gone and removes
+  the tile entirely — a cosmetic miss, not a leak. (The *agent classification* implied by
+  a hook report does expire — see the lease below — but the last reported state value is
+  kept, so `list_surfaces` can still report how a finished agent ended.)
+- **A one-shot `claude` in a shell briefly makes that shell a tile.** Anything that runs
+  `claude` in a split fires the hooks, so the split shows up as an agent for as long as
+  that process lives plus the ~30s lease. That is correct while it runs and self-clears
+  after; it is not permanent.
 - **One tab per tty.** Correlation is by controlling tty, which is unique per terminal
   split, so this is exact in practice.
 
@@ -1060,6 +1076,46 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   debounce is keyed per-kind so a bell never swallows the waiting push). **No TTL** — the
   ~2s detector poll removes dead agents; a missed `Stop` is an accepted cosmetic
   stale-`working`.
+
+- **Hook evidence is a LEASE, aged by detector ticks (`updateHookLease`).** `isAgentSurface`
+  treats a hook report as proof of an agent — but a report proves a Claude Code process RAN
+  here, not that one is running NOW, and the state was previously kept for the surface's whole
+  life. So **any** shell that ever shelled out to `claude` became a permanent tile. The live
+  case that surfaced it: an account-pool `login` script verifies credentials with a headless
+  `CLAUDE_CONFIG_DIR=… claude -p ping`; that real Claude Code run fires the hooks, the ppid
+  walk lands them on the script's split, and the split showed a `claude` tile (state `idle`,
+  prompt `ping`) for as long as it stayed open — and across GUI restarts, since the record is
+  persisted by session key. Fix: `applyAgents(_:walked:)` calls `updateHookLease`, which per
+  detector tick RENEWS a hook-only surface's evidence on a detector hit and otherwise counts a
+  miss; at `hookOnlyMissLimit` (**15** ticks ≈ 30s at the 2s cadence) the id joins the
+  `@Published staleHookState` set, and `isAgentSurface`/`displayAgentKind` stop honoring signal
+  2 for it. `applyAgentState` renews the lease BEFORE its coalesce early-return, so an
+  unchanged republish still counts as a heartbeat. Load-bearing details:
+  - **The lease EXPIRES the classification, it does NOT delete the state.** `agentStates`/
+    `lastTool`/`lastPrompt` stay readable via `hookSnapshot`, so an Agent Queue item whose
+    agent just exited can still be seen as `idle` by the close gate; only `agentKind` goes
+    nil, which is also what stops the sidecar treating a plain shell as an agent.
+  - **`walked` is required, and is NOT `results.keys`.** The detector now reports the set of
+    ids it actually walked this tick (`Set(snapshot.map(\.uuid))` in `AgentDetector.tick`,
+    threaded through the two-argument `onResults`). A surface with no foreground pid never
+    enters the detector snapshot, so without this "the detector never looked" would read as
+    "no agent is there". `applyAgents`'s `walked` defaults to nil = no walk evidence = the
+    lease is left completely alone (every non-detector caller and existing test is unchanged).
+  - **LOCAL surfaces only** (`isLocalSurface`). The detector walks the LOCAL process table
+    from the row's foreground pid; for a REMOTE surface that pid is a pid on the box and means
+    nothing here. Cross-host is precisely what signal 2 exists for, so a remote surface is
+    never leased and keeps the pre-lease behavior. An id not yet in `live` is treated as
+    non-local — the conservative answer, since the lease only ever REMOVES evidence.
+  - **Why not a SessionEnd hook instead?** `SessionEnd` is already wired (to `idle`), so
+    distinguishing it would need a new arg in all 40 installed `settings.json` files, it
+    can't self-heal a killed agent that never fires it, and a NESTED `claude -p` inside a
+    real agent's Bash call would end and wrongly clear the outer agent's state. Ageing off
+    the detector needs no hook/settings change and is self-healing.
+  - Detection is **paused while the panel is hidden** (`show()`/`orderOutWithoutPersisting()`
+    drive `detector.resume`/`pause`), so no ticks arrive and nothing expires with the panel
+    closed — correct by construction, and the reason the lease counts TICKS, not wall-clock.
+  - `hookMisses` + `staleHookState` prune to `liveIDs` in `rebuild(live:)` like every other
+    per-id map; an already-stale id stops incrementing its counter.
 
 - **Persistence via AgentStateStore (keyed by the COMPOSITE session key, not surface UUID).**
   Persisted across GUI restart (hooks only POST on transitions, so a relaunched GUI would

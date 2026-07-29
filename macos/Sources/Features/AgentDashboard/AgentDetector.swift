@@ -178,8 +178,12 @@ final class AgentDetector {
     private let queue = DispatchQueue(label: "agent-dashboard.detector", qos: .utility)
     private let interval: TimeInterval
 
-    /// Published on main with the latest results.
-    var onResults: (([UUID: AgentKind]) -> Void)?
+    /// Published on main with the latest results, plus the set of surface ids actually
+    /// WALKED this tick. The walked set is NOT `results.keys` (that is only the matches)
+    /// and NOT every live surface (one with no foreground pid never enters the snapshot):
+    /// it is exactly the ids this tick has an opinion about, which is what lets the model
+    /// distinguish "walked, no agent" from "never looked" when ageing hook-state evidence.
+    var onResults: (([UUID: AgentKind], Set<UUID>) -> Void)?
 
     private var timer: DispatchSourceTimer?
     private var snapshotProvider: (() -> [(uuid: UUID, pid: pid_t)])?
@@ -236,7 +240,8 @@ final class AgentDetector {
         )
         cache = nextCache
 
-        DispatchQueue.main.async { [weak self] in self?.onResults?(results) }
+        let walked = Set(snapshot.map(\.uuid))
+        DispatchQueue.main.async { [weak self] in self?.onResults?(results, walked) }
     }
 
     /// PURE per-tick resolution, factored out of `tick()` so the cache behavior

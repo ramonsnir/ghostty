@@ -1692,10 +1692,48 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   revisited. **Repairing an already-mis-marked item** means editing the run's persisted record
   (`…/queues/.state/<run>.state.json`, `state: "EXITED"` → `"RUNNING"`) and relaunching so the
   sidecar rehydrates it — there is no un-exit command.
+  **(6) HOOK EVIDENCE WAS PERMANENT — a plain shell stayed an agent tile forever (found
+  live; the direct consequence of (4)).** `isAgentSurface`'s signal 2 (`agentStates[id] !=
+  nil`) treated a hook report as a PERMANENT fact, but a report only proves a Claude Code
+  process RAN in that split — and `agentStates` was pruned ONLY when the SURFACE died
+  (`rebuild`'s `liveIDs` filter), with no "the claude exited ⇒ drop it" path. So ANY shell
+  that ever shelled out to `claude` became a tile for its whole life. Live case: the
+  account-pool `login` script verifies credentials with a headless `CLAUDE_CONFIG_DIR=…
+  claude -p ping`; that real Claude Code run fires the hooks (they're wired in every pool
+  config dir), the ppid walk lands them on the script's split, and the split showed a
+  `claude` tile — state `idle`, prompt `ping` — indefinitely, and ACROSS GUI restarts
+  (`writeThrough` persists it by session key for 14 days). Fix: hook evidence is a **LEASE**
+  aged by detector ticks. `applyAgents(_:walked:)` → `updateHookLease` RENEWS a hook-only
+  surface on a detector hit and otherwise counts a miss; at `hookOnlyMissLimit` (**15** ticks
+  ≈ 30s at the 2s cadence) the id joins the `@Published staleHookState`, and
+  `isAgentSurface`/`displayAgentKind` stop honoring signal 2 for it (a fresh hook post or a
+  detector hit un-stales it instantly). **⚠️ It expires the CLASSIFICATION, not the DATA** —
+  `agentStates`/`lastTool`/`lastPrompt` stay readable via `hookSnapshot`, so the Agent
+  Queue's close gate can still see how a finished agent ended; only `agentKind` goes nil
+  (which is also what stops the SIDECAR treating a plain shell as an agent). **⚠️ `walked`
+  is load-bearing and is NOT `results.keys`:** `AgentDetector.tick` now reports the ids it
+  actually WALKED (`Set(snapshot.map(\.uuid))`) via a two-argument `onResults`, because a
+  surface with no `foregroundPID` never enters the detector snapshot — without it "never
+  looked" would read as "no agent there". `applyAgents`'s `walked` DEFAULTS TO nil = no
+  evidence = lease untouched, so every non-detector caller + all ~70 existing test call
+  sites are byte-identical. **⚠️ LOCAL-only** (`isLocalSurface`): the detector walks the
+  LOCAL process table from the row's foreground pid, which for a REMOTE surface is a pid on
+  the BOX — cross-host is exactly what signal 2 exists for, so a remote surface is never
+  leased (an id not yet in `live` counts as non-local, the conservative side since the lease
+  only REMOVES evidence). Detection is PAUSED while the panel is hidden, so nothing expires
+  with the panel closed — correct by construction, and why the lease counts TICKS not
+  wall-clock. A `SessionEnd`-hook clear was REJECTED: `SessionEnd` already maps to `idle`, so
+  distinguishing it needs a new arg in all 40 installed `settings.json` files, it can't
+  self-heal a killed agent, and a NESTED `claude -p` inside a real agent's Bash call would
+  wrongly clear the outer agent's state.
   Wiring: core — `src/termio/Client.zig` (see the deliberate-close/`closing` note in the
   Phase-2 bullet above). macOS — `SurfaceView_AppKit.swift` (`processExited` no-surface branch
   + pure `processExitedWithoutSurface`), `AgentDashboardController.swift` (`isAgentSurface`/
-  `displayAgentKind` + the four gates), `RemoteTunnelController.swift`
+  `displayAgentKind` + the four gates; the LEASE — `hookMisses`/`staleHookState`/
+  `hookOnlyMissLimit`/`updateHookLease`/`isLocalSurface` + `applyAgents(_:walked:)` +
+  the `applyAgentState` renewal + the `rebuild` prune + the `onResults` two-arg closure),
+  `AgentDetector.swift` (two-argument `onResults` + the `walked` set in `tick`),
+  `RemoteTunnelController.swift`
   (`livenessProbeInterval`/`livenessFailureThreshold`/`shouldTripLiveness`/
   `livenessGeneration`/`startLivenessMonitor`/`stopLivenessMonitor`/`isLivenessCurrent`/
   `livenessLoop`/`killTransportProcess` + `parsePgrepPids`/`reapOrphanedForwards`, the
@@ -1706,7 +1744,12 @@ reserves a real grid slot…`). **Cadence — completion-anchored
   (`toolsListHasAllTools` count **27**, `dispatchAdoptSplitRejectsBadArguments`,
   `dispatchAdoptSplitAcceptsValidArgumentsAndTrims`), `AgentDashboardHookStateTests`
   (`hookStateAloneMakesAnEntryWhenTheDetectorMissed`, `detectedKindWinsOverTheHookImpliedOne`,
-  `plainShellIsStillNeverAnEntry`, `hookSnapshotReportsAKindForAHookOnlyAgent`),
+  `plainShellIsStillNeverAnEntry`, `hookSnapshotReportsAKindForAHookOnlyAgent`, plus the
+  LEASE cases `hookOnlyStateExpiresAfterTheDetectorKeepsFindingNoAgent` (state SURVIVES,
+  kind does not), `aDetectedAgentIsNeverLeasedAway`, `aFreshHookPostRenewsTheLease`,
+  `anExpiredSurfaceRecoversWhenAnAgentAppearsAgain`, `aRemoteSurfaceIsNeverLeasedAway`,
+  `aSurfaceTheDetectorNeverWalkedIsNotLeasedAway`,
+  `applyAgentsWithoutWalkEvidenceLeavesTheLeaseAlone`, `leaseStateIsPrunedWhenTheSurfaceGoesAway`),
   `SurfaceViewAppKitTests` (`pendingRemoteSurfaceIsNotExited`,
   `noSurfaceAndNoPendingDialIsExited`). **GUI relaunch + a lib/xcframework
   rebuild (the Zig `closing` change); NO host restart.**
