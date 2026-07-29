@@ -216,12 +216,13 @@ keybind = ctrl+a>r=reload_config
 # key AND the app is frontmost) — so a background window, another macOS Space,
 # or a non-focused split still uses the full out-of-focus set above.
 #
-# In focus: sound only (system beep), no dock attention, no title 🔔.
-# `border` is intentionally omitted, not written as `no-border`: this key is
-# parsed from the BellFeatures defaults (border=false), independently of
-# `bell-features`, so border is already off here and a focused ring never
-# arms the visual bell at all.
-bell-features-focused = system,no-attention,no-title
+# In focus: NOTHING — no beep, no audio file, no dock attention, no title 🔔.
+# (Was `system` = the system beep; silenced 2026-07-29.) `border` is
+# intentionally omitted, not written as `no-border`: this key is parsed from
+# the BellFeatures defaults (border=false), independently of `bell-features`,
+# so border is already off here and a focused ring never arms the visual bell
+# at all. `attention`/`title` DO default on, so they must be negated.
+bell-features-focused = no-system,no-audio,no-attention,no-title
 
 # --- Bell Attention v2: two-tier "bell vs needs-you" ---------------------
 # Fork-only keys (see BELL-ATTENTION.md). Every bell fires `bell-features`
@@ -230,16 +231,23 @@ bell-features-focused = system,no-attention,no-title
 # it ADDS `attention-features` (the loud set). Promotion is per-bell + fail-open
 # and decoupled from the continuous summarizer, so it stays cheap.
 agent-manager-bell-filter = true
-# Tier 1 — fires on EVERY bell: sound only. FORK-ONLY OVERRIDE of the shared
-# `bell-features` (system,attention,title,border) so an official Ghostty keeps
-# its full visual bell while the fork stays quiet-until-promoted. Parsed from the
-# BellFeatures defaults (attention+title ON), so attention+title are negated
-# explicitly; the rest default off. Non-repeatable ⇒ last-wins over the shared file.
-bell-features = system,audio,no-attention,no-title
-# Tier 2 — ADDED when a bell is promoted to "needs you" (equals the compiled
-# default; listed for clarity): tab 🔔, surface border, dock bounce+badge,
-# dashboard unhide/float, web push, web-monitor indicator.
-attention-features = title,border,bounce,badge,dashboard,push,monitor
+# Tier 1 — fires on EVERY bell: NOTHING. Fully silent + invisible, so an
+# unpromoted bell has no effect at all and only a PROMOTED bell (tier 2 below)
+# ever surfaces. (Was `system,audio`; sound removed 2026-07-29 — `audio` was
+# already a no-op since `bell-audio-path` is unset.) FORK-ONLY OVERRIDE of the
+# shared `bell-features` (system,attention,title,border) so an official Ghostty
+# keeps its full visual bell while the fork stays quiet-until-promoted. Parsed
+# from the BellFeatures defaults (attention+title ON), so those two MUST be
+# negated; system/audio are negated explicitly to document the intent.
+# Non-repeatable ⇒ last-wins over the shared file.
+bell-features = no-system,no-audio,no-attention,no-title
+# Tier 2 — ADDED when a bell is promoted to "needs you": tab 🔔, surface
+# border, dashboard unhide/float, web push, web-monitor indicator. NO DOCK
+# EFFECTS (2026-07-29): `bounce` (dock bounce) + `badge` (dock tile count) are
+# off, and so is `attention` — the back-compat alias the consumers treat as
+# (bounce AND badge), which DEFAULTS ON and therefore must be negated
+# explicitly or it would re-enable both.
+attention-features = title,border,dashboard,push,monitor,no-attention,no-bounce,no-badge
 # The rate-limit WATCHDOG — the one promotion that fires WITHOUT a real bell:
 # Haiku tags a surface `rate_limited` when it sees an agent halted on Claude's
 # usage-limit prompt, and the sidecar raises tier 2 for it. Default is `true`;
@@ -250,9 +258,9 @@ agent-manager-alert-watchdog = false
 # Diagnostics: trace the bell -> attention lifecycle to
 # ~/Library/Logs/ghostty-ramon-bell-diagnostics.jsonl (GUI + sidecar). Off by
 # default; on while investigating "why did the bell fire / why didn't it" and
-# ring->attention delay. Append-only — turn it back off when done. See
-# BELL-ATTENTION.md (-> Diagnostics).
-bell-diagnostics = true
+# ring->attention delay. Append-only (no rotation) — turn it back off when done.
+# See BELL-ATTENTION.md (-> Diagnostics).
+bell-diagnostics = false
 
 # --- PTY host: emulation-on-host (always-on) -----------------------------
 # Fork-only key (an official Ghostty would error on it). Non-null selects the
