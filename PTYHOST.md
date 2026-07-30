@@ -662,3 +662,110 @@ set (it gates both the os_log path under subsystem=<bundle id> and the stderr pa
 - The original implementation plan (`.claude/plans/ptyhost-implementation-plan.md`,
   the `§` cross-refs in old commit messages) is **not in this worktree**; this doc and
   the source comments are authoritative.
+
+---
+
+## PTY-host runs under a launchd LaunchAgent (deploy + new-machine setup)
+
+The `ghostty-host` process (the fork's emulation-on-host backend — see
+top-level `PTYHOST.md`) is **not** launched by the GUI app or a login script. It
+runs as a **user LaunchAgent** `com.mitchellh.ghostty-ramon.host`
+(`~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist`, `KeepAlive=true` +
+`RunAtLoad=true`). The GUI merely connects to its socket
+(`pty-host = ~/.ghostty-ramon-host.sock` in the fork config). One long-lived host
+serves every GUI restart; a **host** restart still loses all live sessions
+(RAM-only). Locations: binary `~/.local/bin/ghostty-host`, socket
+`~/.ghostty-ramon-host.sock`, combined stdout+stderr log
+`~/Library/Logs/ghostty-ramon-host.log`.
+
+**Canonical plist — replicate verbatim on every laptop for environment consistency.**
+launchd requires ABSOLUTE paths (no `~`/env expansion in `ProgramArguments` or the
+socket path), so **replace `/Users/ramon` with that machine's home** (and keep
+`pty-host` in the config pointing at the same absolute socket path):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.mitchellh.ghostty-ramon.host</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ramon/.local/bin/ghostty-host</string>
+        <string>--listen=/Users/ramon/.ghostty-ramon-host.sock</string>
+    </array>
+    <!-- ReleaseFast host honors GHOSTTY_RESOURCES_DIR first; point it at the installed
+         bundle so the child shell gets TERM=xterm-ghostty + a valid TERMINFO. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GHOSTTY_RESOURCES_DIR</key>
+        <string>/Applications/Ghostty (ramon).app/Contents/Resources/ghostty</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>/Users/ramon/Library/Logs/ghostty-ramon-host.log</string>
+    <key>StandardErrorPath</key><string>/Users/ramon/Library/Logs/ghostty-ramon-host.log</string>
+</dict>
+</plist>
+```
+
+**New-machine setup (one-time):** (1) build the host
+(`zig build -Demit-macos-app=false -Doptimize=ReleaseFast`) and copy
+`zig-out/bin/ghostty-host` → `~/.local/bin/ghostty-host`; (2) write the plist above
+(fix the home path) to `~/Library/LaunchAgents/…`; (3)
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist`
+(RunAtLoad starts it); (4) ensure `pty-host = <that socket>` is in the fork config.
+
+### ⚠️ After redeploying the host binary, RELOAD the agent — NEVER just `kill` it
+launchd pins a code-signing launch requirement (**LWCR**) derived from the host binary's
+Designated Requirement. **For Ramon's hand-built dev host this is the cdhash**: the fork
+builds `ghostty-host` **ad-hoc / linker-signed** (no cert chain → the DR falls back to a
+cdhash requirement), so **every rebuild has a new cdhash** and the old LWCR rejects it.
+(The COLLEAGUE bundled host is different — Developer-ID-signed, so its DR/LWCR is pinned
+to the identity `identifier + Team ID`, NOT the cdhash; that's exactly why the ForkSetup
+reload gate keys off the protocol/epoch reload IDENTITY, not the binary hash — a new
+same-identity host loads under the old LWCR fine. This whole section is about the AD-HOC
+dev host below.) If you swap `~/.local/bin/ghostty-host` under a
+running job and then merely `kill` it, `KeepAlive` respawns the NEW binary under the
+OLD pinned requirement → launchd rejects it → it **exits 78 (`EX_CONFIG`) before it
+can even write a log line** → hot crash loop (`launchctl print …` shows
+`last exit code = 78`, `needs LWCR update`, and `runs` climbing) → nothing binds the
+socket → **the GUI shows empty screens**. The binary is fine — it runs perfectly
+standalone, even with the exact plist env; only launchd rejects it. (This cost a long
+debug session on 2026-06-17; the symptom "I killed the host and a new window didn't
+relaunch it / empty screens" is THIS.)
+
+> The COLLEAGUE path (`ForkSetup`, which manages the *bundled* Developer-ID host) does
+> NOT face this cdhash trap: that host's LWCR is identity-pinned, so a new same-identity
+> build satisfies it. ForkSetup therefore only bootout-reloads when the host RELOAD
+> IDENTITY (protocol version + `host_reload_epoch`) changes — NOT on every host recompile
+> — and skips the reload on a GUI-only update even if the host's cdhash changed, so live
+> sessions survive. (Older builds keyed off a SHA-256 of the host binary and reloaded on
+> any recompile; superseded — see the First-launch setup section in
+> `FORK-DISTRIBUTION.md`.) Ramon's hand-managed ad-hoc host here is a separate manual deploy —
+> ForkSetup leaves it alone via the ownership-marker gate, and it still needs the
+> bootout+bootstrap reload above on every rebuild.
+
+**Correct deploy-then-restart of the host** (run from a NON-ramon terminal —
+Terminal.app or the official Ghostty — since it ends every session, including this
+Claude Code one if it lives under the host):
+```sh
+# 1) deploy without disturbing the running host: atomic rename keeps the live
+#    process's inode (a plain `cp` over it risks ETXTBSY / corrupting it).
+cp /path/to/repo/zig-out/bin/ghostty-host ~/.local/bin/ghostty-host.new
+chmod +x ~/.local/bin/ghostty-host.new
+mv -f ~/.local/bin/ghostty-host.new ~/.local/bin/ghostty-host
+# 2) RELOAD (bootout+bootstrap) so launchd re-derives the LWCR from the new binary.
+#    Do NOT `kill` — KeepAlive would crash-loop the new binary under the stale LWCR.
+launchctl bootout   gui/$(id -u)/com.mitchellh.ghostty-ramon.host
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mitchellh.ghostty-ramon.host.plist
+# 3) verify healthy: pid set, runs=1, "(never exited)", and "server listening" in the log.
+launchctl print gui/$(id -u)/com.mitchellh.ghostty-ramon.host | grep -iE 'pid =|last exit|runs ='
+```
+After the host comes back, **open fresh tabs/windows** — surfaces attached to the
+pre-restart sessions are dead (sessions are RAM-only). Note: `pkill`/`pgrep -f
+ghostty-host` do NOT match the host's cmdline on macOS; to find the pid use
+`ps ax -o pid,command | grep '[g]hostty-host --listen'`. A stale socket file is NOT a
+problem — the host unlinks-and-rebinds.
+

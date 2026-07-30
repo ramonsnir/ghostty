@@ -1126,3 +1126,166 @@ must be a full Hello→HelloAck round-trip (not a bare connect, which false-posi
 three-way host resolution (unresolvable ≠ local fallback); do NOT ship the master `mcp-token` to
 boxes (per-box capability-scoped token via a 0600 file) and correlate agents via a GUI-minted
 nonce (session_id is unknown at spawn time).
+
+---
+
+## Hardening — live-found fixes (tunnel liveness watch, orphan reap, adopt_split, cross-host tile)
+
+- **Cloud-hosted terminals — hardening: tunnel LIVENESS watch + orphan-forward REAP +
+  the `adopt_split` MCP tool** (fork-only, macOS; GUI-lib + Zig-client only — NO host /
+  protocol / wire change). Three fixes found by running a real cloud session, plus the
+  scripted-adopt entry point that makes "launch on a box, tracked by a local queue" work
+  without a click.
+  **(1) LIVENESS WATCH — the tunnel-never-recovers hole.** `handleMasterExit` only respawns
+  when the transport process EXITS, and `checkMasterHealth` (`ssh -O check`) had **NO
+  production caller at all** (only a test) and is inapplicable to command mode. So a
+  BLACK-HOLED tunnel (laptop slept, WiFi roamed, gateway died) left `ssh` alive forever →
+  nothing respawned it → the remote split could not reattach. **⚠️ And ssh keepalives can't
+  save it in command mode: a wrapper (e.g. a Cloud-Workstations launcher) injects its OWN
+  `-o ServerAliveInterval=0` into the ssh argv BEFORE our appended `=15`, and OpenSSH takes
+  the FIRST value for an option — so our keepalive is silently DISABLED and the dead tunnel
+  never self-terminates.** Fix: once a host HANDSHAKES, `startLivenessMonitor` re-probes the
+  forwarded socket every `livenessProbeInterval` (30s) with the SAME transport-agnostic
+  `ghostty_probe_host` handshake used for readiness; after `livenessFailureThreshold` (2 —
+  >1 so one blip can't churn) CONSECUTIVE failures it FORCE-KILLS the tracked transport
+  (process-GROUP kill in command mode, `terminate()` for a default ssh master), whose
+  termination handler fires the EXISTING `handleMasterExit` → backoff respawn → fresh probe →
+  fresh watch. So this adds a DETECTOR, not a second recovery path. Generation-token
+  cancellable (`livenessGeneration`), gated on `wanted > 0`, re-checked after the sleep, and
+  cancelled in `teardown`.
+  **(2) ORPHAN-FORWARD REAP.** `masterProcesses` is in-memory, so a GUI that crashed / was
+  SIGKILLed leaves its `ssh -N -L <sock>:…` (plus, in command mode, the login shell + any
+  per-invocation gateway) running untracked; they accumulate across relaunches and can keep
+  serving a stale forward. The socket FILE was already handled (the spawn unlinks + rebinds
+  — that frees the NAME, not the processes). Fix: `reapOrphanedForwards(socketPath:)` runs
+  `pgrep -f <socketPath>` before a command-mode spawn and SIGKILLs the group + pid of each
+  match. The per-host forwarded socket path is deterministic, app-private (under our 0700
+  dir) and appears verbatim in the forward's argv, so it is a precise key; the pure
+  `parsePgrepPids(_:excluding:)` **always excludes our own pid + parent** (killing our group
+  would take the GUI down) and never pid ≤ 1.
+  **(3) `adopt_split` — the FIRST new MCP tool in a while: count 26 → 27** (update the
+  `toolsListHasAllTools` assertion). Everything else rides existing tools, but a SCRIPT had
+  no way to enqueue a queue control command at all: the GUI POSTS `.ghosttyQueueCommand` and
+  the sidecar only ever DRAINS via `take_queue_commands`. `adopt_split{run,key,surfaceUUID,
+  url?}` enqueues the SAME `adopt` command the dashboard button posts, onto the SAME FIFO,
+  via `server.enqueueQueueCommand` — which uses `queue.async` (**NOT `sync` — a nested sync
+  from `dispatch()` would DEADLOCK on that serial queue, the trap `take_queue_commands`
+  documents**) and fires `bus.recordQueueCommand()` so the sidecar drains it in ~1
+  round-trip. AppKit-free; args are validated (trimmed non-empty run/key + a REAL `UUID`)
+  before the FIFO is touched; the SIDECAR stays authoritative for latch/dedup
+  (`adoptDecision` rejects a key already active). **This is what makes the intended split
+  work: keep the queue template dispatching LOCALLY (`host` absent/`"local"`), launch chosen
+  agents ON a box, and adopt them in.** Adopt is fully HOST-AGNOSTIC — `runAdopt` has no host
+  gate, and reconcile DERIVES the host from the live row's composite `sessionID`
+  (`parseSessionKey`), so an adopted REMOTE split records `Assignment.hostName = <box>` and
+  feeds per-host occupancy correctly. **⚠️ The launcher MUST go through MCP
+  `spawn_split_command` (with `host`), NOT the `new_split_on_host` keybind/palette** — the
+  correlation NONCE is minted + registered ONLY on the MCP spawn path (`MCPLayout` →
+  `RemoteAgentIdentity.mintNonce()` → `export GHOSTTY_SURFACE_NONCE=…` via `initial_input`),
+  and without it the box's hook can't self-identify, so the tile shows the agent but never
+  its working/waiting state and the queue can't auto-close it. (A machine-local
+  `launch-on-box` helper in `~/.local/bin` — untracked, it carries a real host name — does
+  spawn-then-optionally-adopt in one call.)
+  **(4) THE CROSS-HOST TILE WAS INVISIBLE (found live).** A box agent was adopted,
+  queue-tracked and reporting `agentState:"working"` — yet **no dashboard tile**. Cause: the
+  dashboard's `entries` builder HARD-FILTERED on `agents[id] != nil` (the local process
+  DETECTOR's map), and detection can never succeed for the pool-wrapper tree: the host-side
+  `/proc` descent (`descendToProgram` → `pickDescendChild`) deliberately declares **>1
+  non-launcher child AMBIGUOUS and gives up**, and a `claude-pool` wrapper has exactly that —
+  `claude` PLUS a transient `sleep`. Observed tree: `bash(noetive-agent.sh) → bash(claude-pool)
+  → {claude, sleep}`. So `agentKind` stayed nil and the surface was filtered out of the panel.
+  (Note `exec`-ing the pool would NOT fix it — the pool itself spawns that pair.) Fix (GUI-only,
+  no box-host restart, so a running cloud agent is not disturbed): `isAgentSurface(id)` =
+  `agents[id] != nil || agentStates[id] != nil` — Claude's own hook reporting state IS proof of
+  an agent, and it is the ONLY reliable cross-host signal. `displayAgentKind(id)` falls back to a
+  hook-implied `AgentKind("claude")` so the tile badge + the hover controls that gate on a
+  non-nil kind keep working, while a DETECTED kind still WINS (a Codex agent is never relabeled).
+  A plain shell (no detection, no hook) is STILL never a tile, so the "agent-only" guarantee +
+  spec §2.6 state-2 hold. **`hookSnapshot` emits the DISPLAY kind too** — its `agentKind` feeds
+  MCP `list_surfaces`, and the Agent Manager SIDECAR keys its agent detection off that field, so
+  leaving it nil would give the cross-host tile NO Haiku status annotation even once it renders.
+  Applied at all four gates (`liveAgentIDs`, `rebuildEntriesFromCurrentState`,
+  `hiddenAgents`, the hidden loop). The deeper `pickDescendChild` fix (prefer a known-agent child
+  over an ambiguous helper) is DEFERRED: it links into `ghostty-host`, so it needs a Linux host
+  rebuild + restart on the box, which would KILL the running cloud agents.
+  **(5) A GUI RESTART MARKED A LIVE CLOUD AGENT AS CRASHED (found live; the worst of the
+  five).** `SurfaceView.processExited` returned `true` whenever `self.surface == nil` — a
+  pre-cloud-hosts assumption that "no core surface ⇔ the child died". That stopped being true
+  in Phase 1: a restored/launched REMOTE surface DEFERS its `.client` dial until the tunnel
+  handshakes (`pendingRemoteHost` → `materializeClientSurface`), so it legitimately has NO
+  core surface for seconds while showing "Connecting to <host>…". In that window the GUI LIED
+  — `MCPLayout` emitted `exited: true` on the `list_surfaces` row → the sidecar's `nextState`
+  saw RUNNING+`exited` (`supervisor.ts`: `if (ctx.exited && (SPAWNED|RUNNING|QUEUED)) return
+  "EXITED"`) → the item was marked **EXITED: bell rung, slot freed, status-polling +
+  auto-close stopped** — while the agent was happily working on the box. It fired on EVERY GUI
+  restart that restored a cloud agent, and the `EXITED` record is STICKY by design (it holds
+  the key so a crashed item is never silently re-dispatched, and blocks re-adopt), so the item
+  stays untracked until its split is closed. Fix: the no-surface branch returns the PURE
+  `processExitedWithoutSurface(pendingRemoteHost:)` = `pendingRemoteHost == nil`, so a PENDING
+  remote surface reads NOT exited while local/`.exec` (nil pending) is byte-identical. The
+  hazard was already handled correctly 12 lines below in `clientStateInfo` (a
+  not-yet-materialized remote surface reports `.ok`) — `processExited` simply hadn't been
+  revisited. **Repairing an already-mis-marked item** means editing the run's persisted record
+  (`…/queues/.state/<run>.state.json`, `state: "EXITED"` → `"RUNNING"`) and relaunching so the
+  sidecar rehydrates it — there is no un-exit command.
+  **(6) HOOK EVIDENCE WAS PERMANENT — a plain shell stayed an agent tile forever (found
+  live; the direct consequence of (4)).** `isAgentSurface`'s signal 2 (`agentStates[id] !=
+  nil`) treated a hook report as a PERMANENT fact, but a report only proves a Claude Code
+  process RAN in that split — and `agentStates` was pruned ONLY when the SURFACE died
+  (`rebuild`'s `liveIDs` filter), with no "the claude exited ⇒ drop it" path. So ANY shell
+  that ever shelled out to `claude` became a tile for its whole life. Live case: the
+  account-pool `login` script verifies credentials with a headless `CLAUDE_CONFIG_DIR=…
+  claude -p ping`; that real Claude Code run fires the hooks (they're wired in every pool
+  config dir), the ppid walk lands them on the script's split, and the split showed a
+  `claude` tile — state `idle`, prompt `ping` — indefinitely, and ACROSS GUI restarts
+  (`writeThrough` persists it by session key for 14 days). Fix: hook evidence is a **LEASE**
+  aged by detector ticks. `applyAgents(_:walked:)` → `updateHookLease` RENEWS a hook-only
+  surface on a detector hit and otherwise counts a miss; at `hookOnlyMissLimit` (**15** ticks
+  ≈ 30s at the 2s cadence) the id joins the `@Published staleHookState`, and
+  `isAgentSurface`/`displayAgentKind` stop honoring signal 2 for it (a fresh hook post or a
+  detector hit un-stales it instantly). **⚠️ It expires the CLASSIFICATION, not the DATA** —
+  `agentStates`/`lastTool`/`lastPrompt` stay readable via `hookSnapshot`, so the Agent
+  Queue's close gate can still see how a finished agent ended; only `agentKind` goes nil
+  (which is also what stops the SIDECAR treating a plain shell as an agent). **⚠️ `walked`
+  is load-bearing and is NOT `results.keys`:** `AgentDetector.tick` now reports the ids it
+  actually WALKED (`Set(snapshot.map(\.uuid))`) via a two-argument `onResults`, because a
+  surface with no `foregroundPID` never enters the detector snapshot — without it "never
+  looked" would read as "no agent there". `applyAgents`'s `walked` DEFAULTS TO nil = no
+  evidence = lease untouched, so every non-detector caller + all ~70 existing test call
+  sites are byte-identical. **⚠️ LOCAL-only** (`isLocalSurface`): the detector walks the
+  LOCAL process table from the row's foreground pid, which for a REMOTE surface is a pid on
+  the BOX — cross-host is exactly what signal 2 exists for, so a remote surface is never
+  leased (an id not yet in `live` counts as non-local, the conservative side since the lease
+  only REMOVES evidence). Detection is PAUSED while the panel is hidden, so nothing expires
+  with the panel closed — correct by construction, and why the lease counts TICKS not
+  wall-clock. A `SessionEnd`-hook clear was REJECTED: `SessionEnd` already maps to `idle`, so
+  distinguishing it needs a new arg in all 40 installed `settings.json` files, it can't
+  self-heal a killed agent, and a NESTED `claude -p` inside a real agent's Bash call would
+  wrongly clear the outer agent's state.
+  Wiring: core — `src/termio/Client.zig` (see the deliberate-close/`closing` note in the
+  Phase-2 bullet above). macOS — `SurfaceView_AppKit.swift` (`processExited` no-surface branch
+  + pure `processExitedWithoutSurface`), `AgentDashboardController.swift` (`isAgentSurface`/
+  `displayAgentKind` + the four gates; the LEASE — `hookMisses`/`staleHookState`/
+  `hookOnlyMissLimit`/`updateHookLease`/`isLocalSurface` + `applyAgents(_:walked:)` +
+  the `applyAgentState` renewal + the `rebuild` prune + the `onResults` two-arg closure),
+  `AgentDetector.swift` (two-argument `onResults` + the `walked` set in `tick`),
+  `RemoteTunnelController.swift`
+  (`livenessProbeInterval`/`livenessFailureThreshold`/`shouldTripLiveness`/
+  `livenessGeneration`/`startLivenessMonitor`/`stopLivenessMonitor`/`isLivenessCurrent`/
+  `livenessLoop`/`killTransportProcess` + `parsePgrepPids`/`reapOrphanedForwards`, the
+  handshake hook in `probeLoop`, the reap in `spawnCommandTunnel`, the cancel in `teardown`),
+  `MCPTools.swift` (`adopt_split` schema + dispatch). Tests: Swift
+  `RemoteTunnelControllerTests` (`RemoteTunnelHardeningTests`: liveness threshold matrix +
+  interval sanity + `parsePgrepPids` self/parent/junk exclusion + empty), `MCPServerTests`
+  (`toolsListHasAllTools` count **27**, `dispatchAdoptSplitRejectsBadArguments`,
+  `dispatchAdoptSplitAcceptsValidArgumentsAndTrims`), `AgentDashboardHookStateTests`
+  (`hookStateAloneMakesAnEntryWhenTheDetectorMissed`, `detectedKindWinsOverTheHookImpliedOne`,
+  `plainShellIsStillNeverAnEntry`, `hookSnapshotReportsAKindForAHookOnlyAgent`, plus the
+  LEASE cases `hookOnlyStateExpiresAfterTheDetectorKeepsFindingNoAgent` (state SURVIVES,
+  kind does not), `aDetectedAgentIsNeverLeasedAway`, `aFreshHookPostRenewsTheLease`,
+  `anExpiredSurfaceRecoversWhenAnAgentAppearsAgain`, `aRemoteSurfaceIsNeverLeasedAway`,
+  `aSurfaceTheDetectorNeverWalkedIsNotLeasedAway`,
+  `applyAgentsWithoutWalkEvidenceLeavesTheLeaseAlone`, `leaseStateIsPrunedWhenTheSurfaceGoesAway`),
+  `SurfaceViewAppKitTests` (`pendingRemoteSurfaceIsNotExited`,
+  `noSurfaceAndNoPendingDialIsExited`). **GUI relaunch + a lib/xcframework
+  rebuild (the Zig `closing` change); NO host restart.**

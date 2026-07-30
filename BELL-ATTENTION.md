@@ -612,3 +612,33 @@ mechanism with an `alert` tag) and `AGENT-MANAGER.md`.
 - Zig `attention-features` + `BellFeatures bit positions`.
 
 **GUI relaunch + rebuilt sidecar `dist`; no host change.**
+
+---
+
+## Bell visibility across splits / zoom (fork-only; always on)
+
+- **Bell visibility across splits/zoom** (fork-only tweak to upstream macOS Swift; no
+  config key — always on) — two fixes so a bell in a non-focused or zoomed-away split is
+  never silently lost (previously only the dock badge lit up). **(A) Tab-title
+  aggregation:** the 🔔 title prefix now reflects the **window-level aggregate** bell
+  (ANY surface in the tab rang), not just the focused surface — `setupTitleListener`
+  combines `titleSurface.$title` with `self.$bell` (the same aggregate the dock badge
+  uses, from `setupBellNotificationPublisher`) instead of `titleSurface.$bell`, and
+  `applyTitleToWindow`'s `titleOverride` branch reads `self.bell`. **(B) Hidden-split
+  bell badge under zoom:** while a split is zoomed, a hidden split that rings can't draw
+  its own bell border (hidden splits aren't in the SwiftUI hierarchy — `TerminalSplitTreeView`
+  renders only the zoomed subtree), so a small amber `bell.badge` pill is shown
+  top-trailing on the zoomed view, driven by a new `BaseTerminalController.zoomedHiddenBell`
+  (`@Published`, derived in `setupZoomedHiddenBellPublisher` by combining `$surfaceTree`
+  with `surfaceValuesPublisher(\.bell)` → `SplitTree.hasBellOutsideZoom(bells:)`; reads
+  the tree from the combineLatest tuple, NOT `self.surfaceTree`, because `@Published`
+  emits in `willSet` so the stored prop still holds the old tree mid-cycle). The badge is
+  gated on the same static `bell-features` `.border` as the border, so badge-under-zoom
+  and amber-border-on-unzoom are a symmetric handoff; its corner-pill geometry stays
+  visually distinct from the full-perimeter amber bell border and the orange marked-pane
+  inset. Wiring: `macos/Sources/Features/Splits/SplitTree.swift` (`zoomedLeaves()` +
+  `hasBellOutsideZoom(bells:)` pure transforms), `BaseTerminalController.swift` (title
+  aggregate + `zoomedHiddenBell` publisher), `macos/Sources/Features/Terminal/TerminalView.swift`
+  (`zoomedHiddenBell` protocol requirement + `HiddenSplitBellBadge`). Tests:
+  `macos/Tests/Splits/SplitTreeTests.swift` (`hasBellOutsideZoom*`, `zoomedLeaves*`).
+
