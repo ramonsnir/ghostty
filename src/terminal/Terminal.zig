@@ -30,6 +30,8 @@ const Stream = @import("stream_terminal.zig").Stream;
 const size = @import("size.zig");
 const pagepkg = @import("page.zig");
 const style = @import("style.zig");
+// FORK(host-handoff): shared (de)serialization helpers.
+const serial = @import("serial.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Page = pagepkg.Page;
@@ -267,6 +269,115 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.title.deinit(alloc);
     self.glyph_glossary.deinit(alloc);
     self.* = undefined;
+}
+
+// FORK(host-handoff): full-fidelity same-build (de)serialization -------------
+//
+// Marshal a live terminal's entire emulation state to a byte stream and rebuild
+// an equal Terminal from it, for transferring a running session to a successor
+// process built from the IDENTICAL binary (see src/host/session_transfer.zig,
+// which adds the magic + layout-fingerprint guard around these). Every Terminal
+// field is covered; the recursive walk bottoms out in the page-memory memcpy in
+// PageList/page.zig. `.exec` behavior is unchanged: these are additive methods.
+
+/// Maximum length of a length-prefixed Terminal-level blob (pwd/title) we'll
+/// allocate when reading. Same-build handoff is trusted, but this bounds a
+/// speculative allocation on a truncated stream.
+const max_serialized_field = 1 << 24; // 16 MiB
+
+/// Serialize this terminal's full state to `writer`.
+pub fn serialize(self: *const Terminal, writer: anytype) !void {
+    try writer.writeInt(u16, self.cols, .little);
+    try writer.writeInt(u16, self.rows, .little);
+    try writer.writeInt(u32, self.width_px, .little);
+    try writer.writeInt(u32, self.height_px, .little);
+    try serial.writePod(writer, self.status_display);
+    try serial.writePod(writer, self.scrolling_region);
+    try serial.writePod(writer, self.modes);
+    try serial.writePod(writer, self.mouse_shape);
+    try serial.writePod(writer, self.flags);
+
+    // previous_char (?u21)
+    if (self.previous_char) |c| {
+        try writer.writeByte(1);
+        try writer.writeInt(u32, c, .little);
+    } else {
+        try writer.writeByte(0);
+    }
+
+    try serial.writePod(writer, self.colors);
+    try self.tabstops.serialize(writer);
+    try serial.writeBytes(writer, self.pwd.items);
+    try serial.writeBytes(writer, self.title.items);
+    try self.glyph_glossary.serialize(writer);
+    try self.screens.serialize(writer);
+}
+
+/// Rebuild a terminal written by `serialize`. The returned terminal owns all
+/// its memory and must be `deinit`ed with the same allocator.
+pub fn deserialize(alloc: Allocator, reader: anytype) !Terminal {
+    const cols = try reader.readInt(u16, .little);
+    const rows = try reader.readInt(u16, .little);
+    const width_px = try reader.readInt(u32, .little);
+    const height_px = try reader.readInt(u32, .little);
+    const status_display = try serial.readPod(ansi.StatusDisplay, reader);
+    const scrolling_region = try serial.readPod(ScrollingRegion, reader);
+    const modes = try serial.readPod(modespkg.ModeState, reader);
+    const mouse_shape = try serial.readPod(mouse.Shape, reader);
+    const flags = try serial.readPod(@FieldType(Terminal, "flags"), reader);
+
+    const previous_char: ?u21 = if ((try reader.readByte()) != 0)
+        @intCast(try reader.readInt(u32, .little))
+    else
+        null;
+
+    const colors = try serial.readPod(Colors, reader);
+
+    var tabstops = try Tabstops.deserialize(alloc, reader);
+    errdefer tabstops.deinit(alloc);
+
+    var pwd = try readArrayList(alloc, reader);
+    errdefer pwd.deinit(alloc);
+    var title = try readArrayList(alloc, reader);
+    errdefer title.deinit(alloc);
+
+    var glyph_glossary = try glyph.Glossary.deserialize(alloc, reader);
+    errdefer glyph_glossary.deinit(alloc);
+
+    var screens = try ScreenSet.deserialize(alloc, reader);
+    errdefer screens.deinit(alloc);
+
+    return .{
+        .cols = cols,
+        .rows = rows,
+        .width_px = width_px,
+        .height_px = height_px,
+        .status_display = status_display,
+        .scrolling_region = scrolling_region,
+        .modes = modes,
+        .mouse_shape = mouse_shape,
+        .flags = flags,
+        .previous_char = previous_char,
+        .colors = colors,
+        .tabstops = tabstops,
+        .pwd = pwd,
+        .title = title,
+        .glyph_glossary = glyph_glossary,
+        .screens = screens,
+    };
+}
+
+/// FORK(host-handoff): read a length-prefixed byte blob into a fresh ArrayList.
+fn readArrayList(alloc: Allocator, reader: anytype) !std.ArrayList(u8) {
+    const len = try reader.readInt(u64, .little);
+    if (len > max_serialized_field) return error.SerialBlobTooLarge;
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(alloc);
+    if (len > 0) {
+        try list.resize(alloc, @intCast(len));
+        try reader.readNoEof(list.items);
+    }
+    return list;
 }
 
 /// Return a terminal.Stream that can process VT streams and update this

@@ -75,6 +75,33 @@ pub fn deinit(self: *Tabstops, alloc: Allocator) void {
     self.* = undefined;
 }
 
+/// FORK(host-handoff): serialize tabstops (cols + the preallocated bitset +
+/// the dynamic bitset) for a same-build session handoff.
+pub fn serialize(self: *const Tabstops, writer: anytype) !void {
+    try writer.writeInt(u64, self.cols, .little);
+    try writer.writeAll(&self.prealloc_stops);
+    try writer.writeInt(u64, @intCast(self.dynamic_stops.len), .little);
+    if (self.dynamic_stops.len > 0) try writer.writeAll(self.dynamic_stops);
+}
+
+/// FORK(host-handoff): rebuild tabstops written by `serialize`. The returned
+/// tabstops owns its dynamic allocation and must be `deinit`ed.
+pub fn deserialize(alloc: Allocator, reader: anytype) !Tabstops {
+    const cols: usize = @intCast(try reader.readInt(u64, .little));
+    var prealloc: [prealloc_count]Unit = undefined;
+    try reader.readNoEof(&prealloc);
+
+    var result: Tabstops = .{ .cols = cols, .prealloc_stops = prealloc };
+    const dyn_len: usize = @intCast(try reader.readInt(u64, .little));
+    if (dyn_len > 0) {
+        const d = try alloc.alloc(Unit, dyn_len);
+        errdefer alloc.free(d);
+        try reader.readNoEof(d);
+        result.dynamic_stops = d;
+    }
+    return result;
+}
+
 /// Set the tabstop at a certain column. The columns are 0-indexed.
 pub fn set(self: *Tabstops, col: usize) void {
     const i = entry(col);

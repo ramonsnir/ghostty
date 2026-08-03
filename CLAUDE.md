@@ -34,8 +34,9 @@ The docs:
 | `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md` | remote `ghostty-host` over SSH: design + build plan + Phase-4/6 + hardening |
 | `CLOUD-QUEUE-BALANCING.md` | per-queue multi-host load balancing |
 | `PTYHOST.md` | pty-host architecture, session lifecycle, write-pool fix, launchd LaunchAgent deploy |
+| `HOST-HANDOFF.md` | session-preserving `ghostty-host` upgrades: supervisor+worker, the handoff sequence, fd/child ownership contract, triggers (SIGHUP + exec-path self-check), the switchover deploy |
 | `FORK-FIXES.md` | standalone robustness / upstream-bug fixes (`CachedValue` crash) |
-| `FORK-DISTRIBUTION.md` | fork identity (bundle id / icon / update feed), colleague DMG release, `ForkSetup` first-launch |
+| `FORK-DISTRIBUTION.md` | fork identity (bundle id / icon / update feed), colleague DMG release, `ForkSetup` first-launch (supervisor LaunchAgent + two-identity host reload) |
 | `FORK-DEV.md` | the macOS build / test / install iteration lifecycle |
 | `SHARING.md` / `ONBOARDING.md` | user-facing colleague guide + onboarding cheat sheet |
 | `DESKTOP-MONITOR-DESIGN.md` | SUPERSEDED — historical |
@@ -211,6 +212,62 @@ restart loses them). Config `pty-host` (local socket). Covers: the `SegmentedPoo
 grow-corruption input-freeze fix (a core change → host restart), unconditional window-state
 restoration (`window-save-state` is ignored, pinned `"always"`), deliberate-close-destroys-session,
 the launchd LaunchAgent deploy (bootout+bootstrap, never `kill`), and the cloud-hosts redial subsystem.
+Also the **host-handoff** path (behind `// FORK(host-handoff):`, additive + gated — `.exec` is
+byte-for-byte unchanged when unused): (1) `src/host/session_transfer.zig` — a same-build,
+full-fidelity marshal of a live `terminal.Terminal` (all scrollback, cursor, selection, modes,
+charsets, kitty graphics, glyph glossary) behind a MAGIC + layout-fingerprint guard; (2) the
+**pty-master DETACH + ADOPT** mechanism (`Exec.zig`/`Termio.zig`/`Session.zig`): a predecessor
+`Session.detachForHandoff` gives up the pty master fd WITHOUT killing the child or closing the
+master (extract first via `masterFdForHandoff`/`childPidForHandoff`), and `Session.adopt` builds a
+fully-running successor Session around that master fd + child pid + rehydrated Terminal (via
+`Exec.adopt` + `termio.Options.adopt_terminal`), continuing the SAME shell. Adopted-close SIGHUPs +
+reaps the child and closes the master exactly once (no double-close/leak) — via `Exec.threadExit` for
+a started session, or `Exec.deinit` for one destroyed WITHOUT ever starting (owner-thread-spawn
+failed); `Session.adopt` sets `Exec.adopt` only on full construction success, so a mid-build failure
+leaves the caller owning the fd (no double-close). An adopt-INIT FAILURE (task #7) closes ONLY the
+successor's master copy, NEVER SIGHUPs the (predecessor's) child. The
+accessors also surface an adopted session's own fd/pid, so a successor can hand off AGAIN (chained
+swaps). (2b) **Worker-side supervisor↔worker CONTROL handling** (`Server.zig`, macOS-only, gated on
+`Server.control_fd`): `register_master`/`unregister_master` announce; `freeze_all` serializes + hands
+every session up + retains a `frozen` map; `adopt` takes a handed-off session over (registered under
+its original id); `shutdown` drops the frozen state; `unfreeze` re-adopts it (incumbent survives a
+failed successor) — over `handoff_protocol.zig` + `fdpass.zig` (`SCM_RIGHTS`). The worker now
+AUTO-announces every fresh session's master from `sessionOwnerThread` (`announceSpawnedMaster`,
+idempotent via `announced_masters`; adopted sessions skip it via `SessionEntry.announce_master`). (2c)
+**The SUPERVISOR process** (`Supervisor.zig`, macOS-only): the SAME `ghostty-host` binary in a new argv
+mode — `main_host.zig` dispatches `--supervise` / `--handoff-worker` / `--listen=` / stdout-diff via the
+pure `Supervisor.parseMode`. It binds the listen socket forever, `spawnWorker`s a worker by fork/exec
+with the listener at fd 3 + a control socketpair at fd 4 (dup2 + CLOEXEC-clear inheritance), holds every
+pty master (`MasterRegistry` via a `readerLoop`), crash-restarts a dead worker (first cut: loses its
+sessions), and BROKERS a handoff (`brokerHandoff`, the unit-tested core): `freeze_all` v1 → `adopt`→v2 →
+a HEALTH-ACK GATE (all acked + `ready` → `shutdown` v1; any nack/timeout → `unfreeze` v1 + kill v2,
+never a no-server window). Two TRIGGERS now fire a handoff (`triggerSelfHandoff`, reader-thread-inline,
+canonical path re-resolved at trigger time, coalesced): a **SIGHUP** (async-signal-safe handler → atomic
+flag + `reader_wake` self-pipe; the "new build installed" nudge ForkSetup sends) and a periodic
+**exec-path staleness self-check** folded into the reader `poll` (macOS `libproc` `proc_pidpath` + the
+pure `workerPathStale`: stale on `ENOENT`/unlinked-exec — the EPERM condition — or a canonical-path
+mismatch → hand off to a fresh worker; the supervisor's own stale path only WARNs, no self-exec).
+In-process tests in `src/host/test.zig`: the worker-side detach+adopt + freeze→adopt / unfreeze / task-#7
+SEQUENCE tests (mock supervisor vs real `Server` workers) PLUS the `brokerHandoff` SUCCESS/ABORT tests
+(two mock workers + a fake registry over `socketpair`s) + a `parseMode` arg-parse test + the trigger tests
+(pure `workerPathStale` + `proc_pidpath` self-resolve). SIGHUP delivery + timer-driven firing + a real
+supervisor process on launchd restart are live-smoke only; a host restart still loses sessions today.
+Host change. (2d) **ForkSetup wiring** (Swift/GUI-only → `FORK-DISTRIBUTION.md` + `HOST-HANDOFF.md`):
+the colleague host LaunchAgent plist now runs the SUPERVISOR (`ghostty-host --supervise --listen=…`), and
+the reload gate is SPLIT into a **supervisor** vs **worker** identity (carved in Swift from the existing
+`ghostty_host_reload_identity()`, NO new C export) so a common WORKER change is a non-destructive
+`.handoffWorker` (SIGHUP the running supervisor → session-preserving handoff, no bootout) and only a rare
+SUPERVISOR change keeps the destructive `.reload`; first-cut mapping supervisor=protocol MAJOR,
+worker=MINOR+`host_reload_epoch`. Plus (3) **P2 GUI local handoff-redial**
+(`Client.Config.handoff_redial`, GUI-only, no host change): a LOCAL `.attach` surface reuses the
+cloud-hosts redial machine — armed via the derived `Config.wantsRedial()` (`reconnect or
+handoff_redial`) — to reconnect across the ~1-3s handoff socket gap, but with a FINITE cap
+(`shouldKeepRedialing`, `RECONNECT_HANDOFF_MAX_ATTEMPTS=3`) so a genuinely-dead local host is NOT
+stormed; `session_ended`-on-miss stays gated on `reconnect` ALONE (local falls through to
+adopt-fresh-id, no dead-pane overlay). `handoff_redial=true, reconnect=false` for a local attach;
+remote stays `reconnect=true`; mirrors get neither; both-false is the byte-for-byte single-shot path.
+Set in `src/Surface.zig` (inverse of the `reconnect` gate, no C ABI). Pure-helper + arming tests in
+`src/termio/client_difftest.zig`.
 
 ### Cloud-hosted terminals → `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md`
 Some splits/tabs run their shell on a remote `ghostty-host` over an SSH unix-socket forward, mixed

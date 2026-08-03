@@ -3240,15 +3240,61 @@ test "client reattachId prefers the live id, else configured, else fresh" {
 }
 
 // (G2/H2/D1) Drop classification: before any HelloAck => cannot_handshake
-// (ambiguous, retryable); after a handshake => reconnecting for a reconnect
-// client, else leave the state (local single-shot keeps the frozen last frame).
-test "client classifyDrop distinguishes before/after handshake + local vs reconnect" {
+// (ambiguous, retryable); after a handshake => reconnecting for a REDIALING
+// client, else leave the state (single-shot keeps the frozen last frame).
+// FORK(host-handoff): the first arg is now the DERIVED `wants_redial`
+// (`reconnect or handoff_redial`), not `reconnect` alone — see the dedicated
+// handoff case below.
+test "client classifyDrop distinguishes before/after handshake + single-shot vs redial" {
     try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(true, false, false));
     try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(false, false, false));
     try testing.expectEqual(@as(?Client.State, .reconnecting), Client.classifyDrop(true, true, false));
-    // local / single-shot, after a handshake: leave the state (no redial, no
+    // single-shot (neither flag), after a handshake: leave the state (no redial, no
     // busy-loop, frozen last frame persists).
     try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(false, true, false));
+}
+
+// FORK(host-handoff): a LOCAL handoff-redial client reaches `classifyDrop` with
+// `wants_redial=true` (via `Config.wantsRedial()`), so a post-handshake drop goes
+// `.reconnecting` — it HOLDS keystrokes across the handoff gap instead of dropping
+// them, exactly like a remote reconnect client. The arg is the derived predicate,
+// so this is byte-identical to the `classifyDrop(true, true, false)` case above;
+// this test pins the INTENT that handoff maps onto the same `true`.
+test "client classifyDrop: handoff-redial (wants_redial=true) holds via reconnecting" {
+    // handoff surface, handshaked, genuine drop => reconnecting (hold the gap).
+    try testing.expectEqual(@as(?Client.State, .reconnecting), Client.classifyDrop(true, true, false));
+    // handoff surface, drop BEFORE the first HelloAck => still cannot_handshake.
+    try testing.expectEqual(@as(?Client.State, .cannot_handshake), Client.classifyDrop(true, false, false));
+    // handoff surface, DELIBERATE close => leave the state (closing dominates).
+    try testing.expectEqual(@as(?Client.State, null), Client.classifyDrop(true, true, true));
+}
+
+// FORK(host-handoff): the redial retry-cap policy. A REMOTE reconnect client
+// redials FOREVER (true at every attempt, regardless of handoff_redial). A
+// handoff-redial-ONLY client redials only a bounded burst
+// (RECONNECT_HANDOFF_MAX_ATTEMPTS): true while attempts < cap, false at/after the
+// cap (then it gives up on its frozen last frame rather than storming a dead local
+// host). Neither flag => never redial (the machine isn't even armed).
+test "client shouldKeepRedialing: remote forever, handoff bounded, neither never" {
+    // REMOTE reconnect: always true, at low AND absurdly-high attempt counts, and
+    // regardless of the handoff flag (reconnect dominates).
+    try testing.expect(Client.shouldKeepRedialing(true, false, 0));
+    try testing.expect(Client.shouldKeepRedialing(true, false, 3));
+    try testing.expect(Client.shouldKeepRedialing(true, false, 1_000_000));
+    try testing.expect(Client.shouldKeepRedialing(true, true, 3));
+
+    // handoff-redial ONLY (reconnect=false): a bounded burst. With the cap at 3,
+    // attempts 0,1,2 keep going; attempt 3 (and beyond) gives up.
+    try testing.expect(Client.shouldKeepRedialing(false, true, 0));
+    try testing.expect(Client.shouldKeepRedialing(false, true, 1));
+    try testing.expect(Client.shouldKeepRedialing(false, true, 2));
+    try testing.expect(!Client.shouldKeepRedialing(false, true, 3));
+    try testing.expect(!Client.shouldKeepRedialing(false, true, 4));
+    try testing.expect(!Client.shouldKeepRedialing(false, true, 1_000));
+
+    // NEITHER flag: never redial (only reachable in tests — the machine is unarmed).
+    try testing.expect(!Client.shouldKeepRedialing(false, false, 0));
+    try testing.expect(!Client.shouldKeepRedialing(false, false, 5));
 }
 
 // (cloud-hosts) A DELIBERATELY closed session (`closeSession` sent a Close frame,
@@ -3348,6 +3394,25 @@ test "client attached reattach-miss -> session_ended, no fresh-id adoption" {
         try testing.expectEqual(Client.State.ok, client.clientState());
     }
 
+    // FORK(host-handoff): a LOCAL handoff-redial client (handoff_redial=true,
+    // reconnect=false) that gets a reattach MISS behaves EXACTLY like the plain
+    // local client above — the `session_ended` gate is on `config.reconnect`
+    // ALONE, deliberately NOT `wantsRedial()`. A genuinely-unknown id (an
+    // aborted/failed handoff, not the intended path) falls through to ADOPT the
+    // host's fresh id (9) and go `.ok`, never the remote dead-pane state local
+    // cannot render. (A SUCCESSFUL handoff re-registers the original id, so this
+    // miss arm is not even reached — `reattachId` HITS.)
+    {
+        var client = try Client.init(alloc, .{ .session_id = 5, .handoff_redial = true });
+        defer client.deinit();
+        const att: protocol.Attached = .{ .session_id = 9, .cols = 80, .rows = 24 };
+        const payload = try att.encode(alloc);
+        defer alloc.free(payload);
+        try client.handleFrame(alloc, .attached, payload);
+        try testing.expectEqual(@as(u64, 9), client.session_id.load(.acquire));
+        try testing.expectEqual(Client.State.ok, client.clientState());
+    }
+
     // Requested 5, host returns 5 (a real reattach hit) => store + state .ok.
     // (Hit path is identical for local and remote; use a remote client here.)
     {
@@ -3374,16 +3439,30 @@ test "client attached reattach-miss -> session_ended, no fresh-id adoption" {
     }
 }
 
-// (I1/D2.4) The redial machinery is ARMED only for a reconnect client. A
-// `reconnect=false` (local/single-shot) client leaves it null so its read thread
-// can NEVER trigger a redial; a `reconnect=true` client arms it. Both tear down
-// cleanly (no leak, no double-free) — exercises the connectAndAttach arm + the
-// sentinel-guarded ThreadData.deinit without needing a running loop.
-test "client reconnect machinery armed iff Config.reconnect (clean teardown)" {
+// (I1/D2.4) The redial machinery is ARMED on the DERIVED `Config.wantsRedial()`
+// predicate. A plain single-shot client (neither `reconnect` nor
+// FORK(host-handoff) `handoff_redial`) leaves it null so its read thread can NEVER
+// trigger a redial; a `reconnect=true` (remote) OR a `handoff_redial=true` (local)
+// client arms it. All cases tear down cleanly (no leak, no double-free) —
+// exercises the connectAndAttach arm + the sentinel-guarded ThreadData.deinit
+// without needing a running loop.
+test "client redial machinery armed iff Config.wantsRedial (clean teardown)" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = testing.allocator;
 
-    inline for (.{ false, true }) |reconnect| {
+    // (reconnect, handoff_redial, expect_armed): neither => inert; either alone =>
+    // armed. Both-true is unreachable in production (the Surface gates are exact
+    // inverses) so it is not exercised here.
+    const cases = .{
+        .{ false, false, false },
+        .{ true, false, true },
+        .{ false, true, true },
+    };
+    inline for (cases) |case| {
+        const reconnect = case[0];
+        const handoff_redial = case[1];
+        const expect_armed = case[2];
+
         var listener = try TestListener.init(alloc);
         defer listener.deinit(alloc);
         try listener.start();
@@ -3394,8 +3473,12 @@ test "client reconnect machinery armed iff Config.reconnect (clean teardown)" {
         var client = try Client.init(alloc, .{
             .socket_path = listener.path,
             .reconnect = reconnect,
+            .handoff_redial = handoff_redial,
         });
         defer client.deinit();
+
+        // The derived predicate is what arms the machine.
+        try testing.expectEqual(expect_armed, client.config.wantsRedial());
 
         var td: termio.Termio.ThreadData = undefined;
         td.alloc = alloc;
@@ -3403,8 +3486,8 @@ test "client reconnect machinery armed iff Config.reconnect (clean teardown)" {
         td.backend = .{ .client = undefined };
         try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
 
-        // The read thread's drop-wakeup pointer is set ONLY for a reconnect client.
-        if (reconnect) {
+        // The read thread's drop-wakeup pointer is set ONLY for a redialing client.
+        if (expect_armed) {
             try testing.expect(client.reconnect_async != null);
             try testing.expect(td.backend.client.reconnect_async != null);
         } else {

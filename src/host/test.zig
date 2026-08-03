@@ -6,6 +6,7 @@
 //! All test names contain the literal "host" so `-Dtest-filter=host` matches.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 
 const terminalpkg = @import("../terminal/main.zig");
@@ -24,6 +25,17 @@ const protocol = @import("protocol.zig");
 const Server = @import("Server.zig");
 const Client = @import("../termio/Client.zig");
 const CoreSurface = @import("../Surface.zig");
+const session_transfer = @import("session_transfer.zig");
+const Supervisor = @import("Supervisor.zig");
+
+/// FORK(host-handoff): the supervisor↔worker control codec + fd-passing, gated to
+/// macOS (the Darwin cmsg ABI @compileErrors elsewhere). Referenced ONLY inside
+/// `if (comptime builtin.os.tag == .macos)` blocks in the handoff-sequence tests
+/// below, so it is never analyzed on the Linux host.
+const hp = if (builtin.os.tag == .macos) struct {
+    const proto = @import("handoff_protocol.zig");
+    const fdpass = @import("fdpass.zig");
+} else struct {};
 
 test "host session spawn+diff" {
     const alloc = testing.allocator;
@@ -2662,6 +2674,54 @@ fn pollNext(
         return r; // tag or null(EOF)
     }
     return null;
+}
+
+// FORK(host-handoff): the WORKER path. A Server built via `initFromListenFd`
+// around a supervisor-bound listener accepts on it, and with `owns_path=false`
+// its deinit does NOT unlink the shared path (the supervisor keeps it bound
+// across worker swaps). `init()`'s own accept/attach behavior is already covered
+// by the integration tests below — they now flow through `initFromListenFd`.
+test "host handoff: initFromListenFd adopts a pre-bound listener; owns_path=false keeps the path" {
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/worker.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    // Supervisor role: bind the path once.
+    const listen_fd = try Server.bindListenSocket(sock_path);
+
+    // Worker role: adopt the pre-bound listener (owns_path=false).
+    const server = try Server.initFromListenFd(alloc, sock_path, listen_fd, false);
+    try server.start();
+
+    // The adopted listener accepts connections: a Hello handshake completes.
+    {
+        const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer posix.close(client);
+        try connectUnix(client, sock_path);
+        setRecvTimeout(client);
+
+        var rdr: ClientReader = .{};
+        defer rdr.deinit(alloc);
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(alloc);
+
+        try clientSend(alloc, client, .hello, protocol.Hello{
+            .identity_bundle_id = "test.client",
+        });
+        const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
+        try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+    }
+
+    // Explicit deinit (not deferred) so we can inspect the path afterwards.
+    server.deinit();
+
+    // owns_path=false => deinit must NOT have unlinked the shared path.
+    _ = try tmp.dir.statFile("worker.sock");
 }
 
 test "host socket integration: attach, input, gridframe marker, reattach" {
@@ -8002,4 +8062,941 @@ test "host idle-fix: reaper reclaims a child-exited detached session, never a li
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
     try testing.expect(reaped);
+}
+
+// ===========================================================================
+// FORK(host-handoff): DETACH + ADOPT integration test.
+// ===========================================================================
+
+/// FORK(host-handoff): count the process's currently-open file descriptors by
+/// listing the kernel's fd directory (macOS `/dev/fd`, Linux `/proc/self/fd`).
+/// Listing the directory itself uses exactly one fd in BOTH snapshots, so a
+/// before/after comparison around a full detach->adopt->close cycle is a clean
+/// net-zero leak check. Returns 0 if the directory can't be opened (the test
+/// then relies on the direct closed-fd + child-reaped assertions instead).
+fn hostHandoffFdCount() usize {
+    const path = switch (builtin.os.tag) {
+        .macos => "/dev/fd",
+        else => "/proc/self/fd",
+    };
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (it.next() catch return n) |_| n += 1;
+    return n;
+}
+
+/// FORK(host-handoff): true iff `fd` is closed. Uses the RAW libc `fcntl` (not
+/// `std.posix.fcntl`, which maps EBADF to `unreachable`): a closed fd makes
+/// `F_GETFD` fail and return -1.
+fn hostHandoffFdClosed(fd: posix.fd_t) bool {
+    return std.c.fcntl(fd, @as(c_int, posix.F.GETFD)) == -1;
+}
+
+/// FORK(host-handoff): pump `session`'s render loop until its active screen
+/// (incl. scrollback) contains `needle`, or `max_iters` elapse. Reads the screen
+/// dump under `render_mutex` (the same lock the IO/render threads take). Returns
+/// whether the needle appeared. Bounded so a wiring regression fails, not hangs.
+fn hostHandoffDriveUntilContains(
+    session: *Session,
+    needle: []const u8,
+    max_iters: usize,
+) !bool {
+    const alloc = testing.allocator;
+    var i: usize = 0;
+    while (i < max_iters) : (i += 1) {
+        try session.tickRenderLoop();
+        {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            const dump = session.io.terminal.screens.active.dumpStringAlloc(
+                alloc,
+                .{ .screen = .{ .x = 0, .y = 0 } },
+            ) catch {
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+                continue;
+            };
+            defer alloc.free(dump);
+            if (std.mem.indexOf(u8, dump, needle) != null) return true;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "host handoff: detach a session and adopt it into another; real shell survives host" {
+    // In-process handoff (no second process, no SCM_RIGHTS — a local `dup` models
+    // the fd pass): Session A spawns a real shell; we drive a stable marker onto
+    // its screen, extract (dup) its pty master + child pid + a serialized copy of
+    // its Terminal, DETACH A (stop its IO WITHOUT killing the child or closing the
+    // master), tear A down, then ADOPT the master+pid+rehydrated-terminal into
+    // Session B — proving the SAME shell is still alive and its full screen
+    // (including scrollback) survived, and that on B's close the child is reaped
+    // and no fd is leaked.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    // Warm up any lazy global fd initialization (resources dir, passwd, xev loop
+    // internals) with a full create/start/stop/destroy cycle BEFORE snapshotting
+    // the fd baseline, so the net-zero leak check isn't tripped by first-use
+    // one-time allocations that outlive a single session.
+    {
+        const warm = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+        try warm.start();
+        warm.stop();
+        warm.destroy();
+    }
+    const fd_before = hostHandoffFdCount();
+
+    // ---- Session A: spawn a real shell and drive a stable marker onto screen.
+    const a = try Session.create(alloc, .{ .cols = 80, .rows = 24 });
+    // No `defer a.destroy()`: we destroy A explicitly mid-test, after detaching.
+    try a.start();
+    try a.sendInput("printf 'HANDOFF_MARKER_123\\n'\n");
+    try testing.expect(try hostHandoffDriveUntilContains(a, "HANDOFF_MARKER_123", 300));
+
+    // ---- Extract BEFORE detach: detach neutralizes the subprocess, after which
+    // the accessors return null.
+    const master = a.masterFdForHandoff() orelse return error.NoMasterFd;
+    const pid = a.childPidForHandoff() orelse return error.NoChildPid;
+
+    // The successor owns a DUP of the master (models the SCM_RIGHTS-received fd;
+    // the shared kernel read pointer means it resumes exactly where A stopped).
+    const dup_master = try posix.dup(master);
+
+    // DETACH A: stops A's read thread + child-exit watcher, WITHOUT SIGHUP-ing the
+    // child or closing the master, and joins the IO thread (so A's Terminal is now
+    // single-threaded and safe to serialize without a lock).
+    a.detachForHandoff();
+
+    // Serialize A's Terminal and capture its screen dump (for the equality check).
+    var xfer: std.ArrayList(u8) = .empty;
+    defer xfer.deinit(alloc);
+    try session_transfer.serialize(&a.io.terminal, xfer.writer(alloc));
+
+    const dump_a = try a.io.terminal.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .screen = .{ .x = 0, .y = 0 } },
+    );
+    defer alloc.free(dump_a);
+    try testing.expect(std.mem.indexOf(u8, dump_a, "HANDOFF_MARKER_123") != null);
+
+    // Tear A down. Because A detached, destroy() closes NEITHER the master (still
+    // open, now ours) NOR SIGHUPs the child (still alive).
+    a.destroy();
+
+    // Model the predecessor process exiting (the OS reaps its leftover master fd).
+    // In the real cross-process handoff the successor already holds its own dup
+    // via SCM_RIGHTS; here it holds `dup_master`, so the file description lives on.
+    posix.close(master);
+
+    // The child MUST still be alive after the detach + A teardown.
+    posix.kill(pid, 0) catch |err| switch (err) {
+        error.ProcessNotFound => return error.ChildDiedOnDetach,
+        else => {}, // e.g. PermissionDenied still means the process exists
+    };
+
+    // ---- Rehydrate the Terminal and ADOPT into Session B (consumes term_b).
+    var fbs = std.io.fixedBufferStream(xfer.items);
+    const term_b = try session_transfer.deserialize(alloc, fbs.reader());
+    const b = try Session.adopt(
+        alloc,
+        .{ .cols = 80, .rows = 24 },
+        dup_master,
+        pid,
+        term_b,
+    );
+    try b.start();
+
+    // B's screen (incl. scrollback) must equal A's captured screen immediately:
+    // the rehydrated terminal is full-fidelity and nothing new has arrived yet.
+    try b.tickRenderLoop();
+    {
+        const dump_b = try b.io.terminal.screens.active.dumpStringAlloc(
+            alloc,
+            .{ .screen = .{ .x = 0, .y = 0 } },
+        );
+        defer alloc.free(dump_b);
+        try testing.expectEqualStrings(dump_a, dump_b);
+    }
+
+    // ---- Prove the SAME shell is alive and reattached to B: a new command typed
+    // into B's pty is executed by the surviving shell and lands on B's screen.
+    try b.sendInput("printf 'SECOND_MARKER_456\\n'\n");
+    try testing.expect(try hostHandoffDriveUntilContains(b, "SECOND_MARKER_456", 300));
+
+    // ---- Close B: the adopted-session teardown SIGHUPs the child and closes the
+    // master (the dup) exactly once.
+    b.stop();
+
+    // The child must be reaped within a bounded wait (kill -> ESRCH). killPid
+    // reaps synchronously inside b.stop(), so the first probe normally succeeds;
+    // the loop just guards against scheduling slack.
+    var reaped = false;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        if (posix.kill(pid, 0)) |_| {
+            // still alive
+        } else |err| switch (err) {
+            error.ProcessNotFound => {
+                reaped = true;
+                break;
+            },
+            else => {},
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(reaped);
+
+    // The adopted master (the dup) must be closed exactly once by B's teardown.
+    try testing.expect(hostHandoffFdClosed(dup_master));
+
+    b.destroy();
+
+    // Net fd-leak check: after the whole detach->adopt->close cycle every fd
+    // opened for A and B — plus both master fds — must be closed again, so the
+    // open-fd count must not have GROWN vs the warmed baseline. `<=` (rather than
+    // strict `==`) makes the blocking assertion immune to unrelated transient fd
+    // churn while still catching any real leak (a leak strictly increases the
+    // count). The dup_master-closed assertion above independently proves the
+    // handed-off master itself is not leaked. Skipped only if the fd directory
+    // wasn't listable on this platform.
+    const fd_after = hostHandoffFdCount();
+    if (fd_before != 0 and fd_after != 0) {
+        try testing.expect(fd_after <= fd_before);
+    }
+}
+
+test "host handoff: destroy an adopted session that was NEVER started releases the master + reaps the child (Exec.deinit adopt cleanup)" {
+    // Regression for the error-path lifecycle gap: `Session.adopt` builds a session
+    // that OWNS the handed-off master fd + child, but if the owner thread that would
+    // run `Exec.threadExit` never spawns (an OOM / thread-spawn failure in
+    // `Server.registerAdoptedSession`), the session is `destroy()`ed WITHOUT ever
+    // starting — so `threadExit`'s adopt teardown never fires. `Exec.deinit`'s
+    // adopt-cleanup (case (d)) must then close the master + SIGHUP/reap the child, or
+    // the pty master fd LEAKS and the child is ORPHANED. This test drives exactly
+    // that path (adopt then destroy, no start) and asserts no leak / no orphan.
+    if (comptime builtin.os.tag == .macos) {
+        const alloc = testing.allocator;
+
+        // Warm lazy global fd init so the net-zero baseline is stable.
+        {
+            const warm = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+            try warm.start();
+            warm.stop();
+            warm.destroy();
+        }
+        const fd_before = hostHandoffFdCount();
+
+        // Spawn a throwaway real shell to obtain a LIVE master + child pid + a
+        // serialized Terminal to feed the adopt (same extraction the detach+adopt
+        // test uses).
+        const a = try Session.create(alloc, .{ .cols = 80, .rows = 24 });
+        try a.start();
+        try a.sendInput("printf 'ADOPT_UNSTARTED_123\\n'\n");
+        try testing.expect(try hostHandoffDriveUntilContains(a, "ADOPT_UNSTARTED_123", 300));
+
+        const master = a.masterFdForHandoff() orelse return error.NoMasterFd;
+        const pid = a.childPidForHandoff() orelse return error.NoChildPid;
+        const dup_master = try posix.dup(master); // the successor's copy
+
+        a.detachForHandoff();
+        var xfer: std.ArrayList(u8) = .empty;
+        defer xfer.deinit(alloc);
+        try session_transfer.serialize(&a.io.terminal, xfer.writer(alloc));
+        a.destroy();
+        posix.close(master); // predecessor's original master gone
+
+        try testing.expect(hostHandoffAlive(pid)); // child survived the detach
+
+        // Rehydrate + ADOPT into B (consumes term_b) — then DESTROY B without ever
+        // calling start(). Exec.deinit's case (d) must release both resources.
+        var fbs = std.io.fixedBufferStream(xfer.items);
+        const term_b = try session_transfer.deserialize(alloc, fbs.reader());
+        const b = try Session.adopt(alloc, .{ .cols = 80, .rows = 24 }, dup_master, pid, term_b);
+        b.destroy(); // NEVER started
+
+        // The adopted master (the dup) is closed exactly once.
+        try testing.expect(hostHandoffFdClosed(dup_master));
+        // The child is reaped (SIGHUP + reap), not orphaned.
+        try testing.expect(hostHandoffWaitReaped(pid, 300));
+        // No fd leaked across the whole cycle.
+        const fd_after = hostHandoffFdCount();
+        if (fd_before != 0 and fd_after != 0) try testing.expect(fd_after <= fd_before);
+    }
+}
+
+// ===========================================================================
+// FORK(host-handoff): full freeze -> adopt / unfreeze SEQUENCE integration
+// tests. A MOCK SUPERVISOR (this test thread) drives real `Server` workers over
+// control `socketpair`s: it reads the workers' `register_master` announcements,
+// sends `freeze_all` / `adopt` / `shutdown` / `unfreeze`, and holds a `dup` of
+// the pty master (modeling the supervisor's SCM_RIGHTS copy) to hand between
+// workers. Each worker runs its real control loop on its own thread
+// (`startControlLoop`), so the supervisor's send/recv never deadlocks against a
+// worker's blocking blob write. macOS-only (the codec rides `fdpass`).
+// ===========================================================================
+
+/// FORK(host-handoff): a connected AF_UNIX SOCK_STREAM pair (`[0]` = supervisor
+/// end, `[1]` = worker end). Mirrors the codec tests' `testSocketpair`.
+fn hostHandoffSocketpair() ![2]posix.fd_t {
+    var sv: [2]posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(
+        @intCast(posix.AF.UNIX),
+        @intCast(posix.SOCK.STREAM),
+        0,
+        &sv,
+    ));
+    return sv;
+}
+
+/// FORK(host-handoff): build a bare worker `Server` around a throwaway (never
+/// accepted-on) listener. The handoff sequence never uses the GUI socket, so we
+/// skip `Server.start()` (no accept/reaper threads); session owner threads are
+/// spawned per-session by `spawnSession`/adopt and torn down by `deinit`.
+/// `owns_path=false` so `deinit` closes the dummy fd without unlinking a path.
+fn hostHandoffMakeWorker(alloc: std.mem.Allocator) !*Server {
+    const dummy = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    errdefer posix.close(dummy);
+    return try Server.initFromListenFd(alloc, "handoff-seq-test-worker", dummy, false);
+}
+
+/// FORK(host-handoff): poll a session's active screen (incl. scrollback) for
+/// `needle` WITHOUT ticking the render loop — the session runs on its own owner
+/// thread, whose IO thread advances the terminal independently of any render
+/// tick. Reads the dump under `render_mutex` (the lock the IO/render threads
+/// take). Bounded so a wiring regression fails fast, not hangs.
+fn hostHandoffPollScreenContains(session: *Session, needle: []const u8, max_iters: usize) !bool {
+    const alloc = testing.allocator;
+    var i: usize = 0;
+    while (i < max_iters) : (i += 1) {
+        {
+            session.render_mutex.lock();
+            defer session.render_mutex.unlock();
+            const dump = session.io.terminal.screens.active.dumpStringAlloc(
+                alloc,
+                .{ .screen = .{ .x = 0, .y = 0 } },
+            ) catch {
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+                continue;
+            };
+            defer alloc.free(dump);
+            if (std.mem.indexOf(u8, dump, needle) != null) return true;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+/// FORK(host-handoff): poll until `server` has a registered session under `sid`
+/// (an `unfreeze` re-adopts asynchronously on the control loop thread), or fail.
+fn hostHandoffWaitForSession(server: *Server, sid: u64, max_iters: usize) !*Server.SessionEntry {
+    var i: usize = 0;
+    while (i < max_iters) : (i += 1) {
+        if (server.lookupForTest(sid)) |e| return e;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.SessionNeverReappeared;
+}
+
+/// FORK(host-handoff): true iff `pid` still exists (kill(pid,0) != ESRCH). EPERM
+/// still means the process exists.
+fn hostHandoffAlive(pid: posix.pid_t) bool {
+    if (posix.kill(pid, 0)) |_| {
+        return true;
+    } else |err| return err != error.ProcessNotFound;
+}
+
+/// FORK(host-handoff): poll until `pid` is reaped (kill -> ESRCH), or fail.
+fn hostHandoffWaitReaped(pid: posix.pid_t, max_iters: usize) bool {
+    var i: usize = 0;
+    while (i < max_iters) : (i += 1) {
+        if (!hostHandoffAlive(pid)) return true;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+/// FORK(host-handoff): poll until `server` has no frozen sessions left — i.e. the
+/// control loop has fully processed an async `shutdown`/`unfreeze` frame — so a
+/// following fd-leak check does not race the control loop thread.
+fn hostHandoffWaitFrozenEmpty(server: *Server, max_iters: usize) bool {
+    var i: usize = 0;
+    while (i < max_iters) : (i += 1) {
+        if (server.frozenCountForTest() == 0) return true;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "host handoff sequence: success v1->v2, same shell survives across freeze+adopt, no fd leak" {
+    if (comptime builtin.os.tag == .macos) {
+        const alloc = testing.allocator;
+
+        // Warm lazy global fd init (resources dir, passwd, xev) so the net-zero
+        // leak baseline isn't tripped by first-use allocations (mirrors the
+        // detach+adopt unit test's warm-up).
+        {
+            const warm = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+            try warm.start();
+            warm.stop();
+            warm.destroy();
+        }
+        const fd_before = hostHandoffFdCount();
+
+        // Control channels: [0] = supervisor end (this test), [1] = worker end.
+        // The supervisor ends are closed EXPLICITLY just before the fd-leak check
+        // (not via defer, which would run after the measurement + inflate it).
+        const sv1 = try hostHandoffSocketpair();
+        const sv2 = try hostHandoffSocketpair();
+
+        // ---- Worker v1: spawn a real shell, drive a stable marker onto its screen.
+        const v1 = try hostHandoffMakeWorker(alloc);
+        try v1.startControlLoop(sv1[1]);
+        const e1 = try v1.spawnSessionForTest();
+        const sid = e1.session_id;
+        try e1.session.sendInput("printf 'HANDOFF_MARKER_123\\n'\n");
+        try testing.expect(try hostHandoffPollScreenContains(e1.session, "HANDOFF_MARKER_123", 300));
+
+        const master1 = e1.session.masterFdForHandoff() orelse return error.NoMasterFd;
+        const pid = e1.session.childPidForHandoff() orelse return error.NoChildPid;
+
+        // v1 announces the session UP (register_master + a dup of its master).
+        v1.notifySessionSpawned(sid, pid, master1);
+
+        // ---- Supervisor: receive register_master; hold its master dup + the pid.
+        var rfds: [1]posix.fd_t = undefined;
+        const reg = try hp.proto.recvFrame(sv1[0], &rfds);
+        try testing.expectEqual(hp.proto.Tag.register_master, reg.frame.tag);
+        try testing.expectEqual(sid, reg.frame.session_id);
+        try testing.expectEqual(@as(usize, 1), reg.fd_count);
+        try testing.expectEqual(@as(u64, @intCast(pid)), reg.frame.aux);
+        const super_master = rfds[0];
+
+        // ---- Supervisor: freeze v1; read the serialized session + freeze_done.
+        try hp.proto.sendFrame(sv1[0], .{ .tag = .freeze_all }, &.{});
+        var sfds: [1]posix.fd_t = undefined;
+        const ss = try hp.proto.recvFrame(sv1[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.session_state, ss.frame.tag);
+        try testing.expectEqual(sid, ss.frame.session_id);
+        try testing.expectEqual(@as(usize, 0), ss.fd_count);
+        const blob = try hp.proto.readBlob(sv1[0], alloc, ss.frame.aux);
+        defer alloc.free(blob);
+        const done = try hp.proto.recvFrame(sv1[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.freeze_done, done.frame.tag);
+        try testing.expectEqual(@as(u64, 1), done.frame.aux);
+
+        // v1 no longer serves the session; the child is still alive (frozen).
+        try testing.expect(v1.lookupForTest(sid) == null);
+        try testing.expect(hostHandoffAlive(pid));
+
+        // ---- Worker v2: adopt the handed-off session (master dup + blob).
+        const v2 = try hostHandoffMakeWorker(alloc);
+        try v2.startControlLoop(sv2[1]);
+        try hp.proto.sendFrame(sv2[0], .{
+            .tag = .adopt,
+            .session_id = sid,
+            .aux = blob.len,
+            .aux2 = @intCast(pid),
+        }, &.{super_master});
+        try hp.proto.writeBlob(sv2[0], blob);
+        // The supervisor drops its own master dup once the successor holds its copy.
+        posix.close(super_master);
+
+        const ack = try hp.proto.recvFrame(sv2[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.adopt_ack, ack.frame.tag);
+        try testing.expectEqual(sid, ack.frame.session_id);
+        try testing.expectEqual(@as(u64, 1), ack.frame.aux);
+        const rdy = try hp.proto.recvFrame(sv2[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.ready, rdy.frame.tag);
+        try testing.expectEqual(@as(u64, 1), rdy.frame.aux);
+
+        // v2 serves the session under the SAME id; its screen carries the marker.
+        const e2 = try hostHandoffWaitForSession(v2, sid, 300);
+        try testing.expect(try hostHandoffPollScreenContains(e2.session, "HANDOFF_MARKER_123", 300));
+        // The SAME shell is alive: a NEW command typed into v2 runs + lands.
+        try e2.session.sendInput("printf 'SECOND_MARKER_456\\n'\n");
+        try testing.expect(try hostHandoffPollScreenContains(e2.session, "SECOND_MARKER_456", 300));
+        try testing.expectEqual(pid, e2.session.childPidForHandoff().?);
+
+        // ---- Supervisor: shutdown v1. Its control loop closes the frozen master
+        // fd + drops the blob (no SIGHUP — the successor owns the child now).
+        try hp.proto.sendFrame(sv1[0], .{ .tag = .shutdown }, &.{});
+        // Wait for the control loop to actually process it (frozen drained), so the
+        // fd-leak check below is deterministic rather than racing the loop.
+        try testing.expect(hostHandoffWaitFrozenEmpty(v1, 300));
+
+        // Close v2: the adopted-session teardown SIGHUPs + reaps the child and closes
+        // the (adopted) master exactly once.
+        v2.deinit();
+        try testing.expect(hostHandoffWaitReaped(pid, 300));
+
+        // v1 deinit joins its (now-exited) control loop + frees its remaining fds.
+        v1.deinit();
+
+        // Close the supervisor socketpair ends BEFORE measuring (they are ours, not
+        // the workers') so they don't inflate the count.
+        posix.close(sv1[0]);
+        posix.close(sv2[0]);
+
+        // Net fd-leak check across the whole freeze->adopt->close cycle.
+        const fd_after = hostHandoffFdCount();
+        if (fd_before != 0 and fd_after != 0) try testing.expect(fd_after <= fd_before);
+    }
+}
+
+test "host handoff sequence: aborted handoff -> unfreeze, incumbent survives (child never killed)" {
+    if (comptime builtin.os.tag == .macos) {
+        const alloc = testing.allocator;
+
+        {
+            const warm = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+            try warm.start();
+            warm.stop();
+            warm.destroy();
+        }
+        const fd_before = hostHandoffFdCount();
+
+        // Supervisor end closed explicitly before the fd-leak check (not via defer).
+        const sv1 = try hostHandoffSocketpair();
+
+        // ---- Worker v1: spawn a real shell + marker; announce it up.
+        const v1 = try hostHandoffMakeWorker(alloc);
+        try v1.startControlLoop(sv1[1]);
+        const e1 = try v1.spawnSessionForTest();
+        const sid = e1.session_id;
+        try e1.session.sendInput("printf 'HANDOFF_MARKER_123\\n'\n");
+        try testing.expect(try hostHandoffPollScreenContains(e1.session, "HANDOFF_MARKER_123", 300));
+        const master1 = e1.session.masterFdForHandoff() orelse return error.NoMasterFd;
+        const pid = e1.session.childPidForHandoff() orelse return error.NoChildPid;
+        v1.notifySessionSpawned(sid, pid, master1);
+
+        var rfds: [1]posix.fd_t = undefined;
+        const reg = try hp.proto.recvFrame(sv1[0], &rfds);
+        try testing.expectEqual(hp.proto.Tag.register_master, reg.frame.tag);
+        const super_master = rfds[0];
+
+        // ---- Supervisor: freeze v1.
+        try hp.proto.sendFrame(sv1[0], .{ .tag = .freeze_all }, &.{});
+        var sfds: [1]posix.fd_t = undefined;
+        const ss = try hp.proto.recvFrame(sv1[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.session_state, ss.frame.tag);
+        const blob = try hp.proto.readBlob(sv1[0], alloc, ss.frame.aux);
+        defer alloc.free(blob);
+        const done = try hp.proto.recvFrame(sv1[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.freeze_done, done.frame.tag);
+
+        // The session is frozen (gone from the registry) but its child is ALIVE.
+        try testing.expect(v1.lookupForTest(sid) == null);
+        try testing.expect(hostHandoffAlive(pid));
+
+        // ---- Handoff ABORTS: no successor comes up. Supervisor drops its dup and
+        // tells v1 to unfreeze (re-adopt from the state it kept).
+        posix.close(super_master);
+        try hp.proto.sendFrame(sv1[0], .{ .tag = .unfreeze }, &.{});
+
+        // v1 resumes serving the SAME session under the SAME id.
+        const e1b = try hostHandoffWaitForSession(v1, sid, 300);
+        try testing.expect(try hostHandoffPollScreenContains(e1b.session, "HANDOFF_MARKER_123", 300));
+        // Same shell alive: a new command runs on the resumed session.
+        try e1b.session.sendInput("printf 'RESUMED_MARKER_789\\n'\n");
+        try testing.expect(try hostHandoffPollScreenContains(e1b.session, "RESUMED_MARKER_789", 300));
+        try testing.expectEqual(pid, e1b.session.childPidForHandoff().?);
+        // The child was NEVER killed across the abort.
+        try testing.expect(hostHandoffAlive(pid));
+
+        // Teardown reaps the (resumed) child + closes the master exactly once.
+        v1.deinit();
+        try testing.expect(hostHandoffWaitReaped(pid, 300));
+
+        posix.close(sv1[0]);
+        const fd_after = hostHandoffFdCount();
+        if (fd_before != 0 and fd_after != 0) try testing.expect(fd_after <= fd_before);
+    }
+}
+
+test "host handoff sequence: v2 adopt FAILS -> v1's child stays alive (task #7), unfreeze recovers" {
+    if (comptime builtin.os.tag == .macos) {
+        const alloc = testing.allocator;
+
+        {
+            const warm = try Session.create(alloc, .{ .cols = 20, .rows = 5 });
+            try warm.start();
+            warm.stop();
+            warm.destroy();
+        }
+        const fd_before = hostHandoffFdCount();
+
+        // Supervisor ends closed explicitly before the fd-leak check (not via defer).
+        const sv1 = try hostHandoffSocketpair();
+        const sv2 = try hostHandoffSocketpair();
+
+        // ---- Worker v1: spawn + marker + announce + freeze (as before).
+        const v1 = try hostHandoffMakeWorker(alloc);
+        try v1.startControlLoop(sv1[1]);
+        const e1 = try v1.spawnSessionForTest();
+        const sid = e1.session_id;
+        try e1.session.sendInput("printf 'HANDOFF_MARKER_123\\n'\n");
+        try testing.expect(try hostHandoffPollScreenContains(e1.session, "HANDOFF_MARKER_123", 300));
+        const master1 = e1.session.masterFdForHandoff() orelse return error.NoMasterFd;
+        const pid = e1.session.childPidForHandoff() orelse return error.NoChildPid;
+        v1.notifySessionSpawned(sid, pid, master1);
+
+        var rfds: [1]posix.fd_t = undefined;
+        const reg = try hp.proto.recvFrame(sv1[0], &rfds);
+        try testing.expectEqual(hp.proto.Tag.register_master, reg.frame.tag);
+        const super_master = rfds[0];
+
+        try hp.proto.sendFrame(sv1[0], .{ .tag = .freeze_all }, &.{});
+        var sfds: [1]posix.fd_t = undefined;
+        const ss = try hp.proto.recvFrame(sv1[0], &sfds);
+        const blob = try hp.proto.readBlob(sv1[0], alloc, ss.frame.aux);
+        defer alloc.free(blob);
+        _ = try hp.proto.recvFrame(sv1[0], &sfds); // freeze_done
+
+        // ---- Worker v2: DRIVE THE ADOPT TO FAIL with a corrupt blob (a flipped
+        // magic byte => deserialize fails BEFORE the child is ever touched). This
+        // exercises the "adopt failure must not SIGHUP the predecessor's child"
+        // rule (task #7): v2 closes only its own master-fd copy + nacks; v1's
+        // child stays alive.
+        const bad_blob = try alloc.dupe(u8, blob);
+        defer alloc.free(bad_blob);
+        bad_blob[0] +%= 1; // corrupt the handoff MAGIC
+
+        const v2 = try hostHandoffMakeWorker(alloc);
+        try v2.startControlLoop(sv2[1]);
+        try hp.proto.sendFrame(sv2[0], .{
+            .tag = .adopt,
+            .session_id = sid,
+            .aux = bad_blob.len,
+            .aux2 = @intCast(pid),
+        }, &.{super_master});
+        try hp.proto.writeBlob(sv2[0], bad_blob);
+        posix.close(super_master);
+
+        // v2 nacks (ok=0) and does NOT come up with the session.
+        const ack = try hp.proto.recvFrame(sv2[0], &sfds);
+        try testing.expectEqual(hp.proto.Tag.adopt_ack, ack.frame.tag);
+        try testing.expectEqual(sid, ack.frame.session_id);
+        try testing.expectEqual(@as(u64, 0), ack.frame.aux);
+        try testing.expect(v2.lookupForTest(sid) == null);
+
+        // THE task #7 ASSERTION: v2's failed adopt did NOT kill v1's child.
+        try testing.expect(hostHandoffAlive(pid));
+
+        // ---- Recovery: v1 unfreezes and resumes the SAME live shell.
+        try hp.proto.sendFrame(sv1[0], .{ .tag = .unfreeze }, &.{});
+        const e1b = try hostHandoffWaitForSession(v1, sid, 300);
+        try testing.expect(try hostHandoffPollScreenContains(e1b.session, "HANDOFF_MARKER_123", 300));
+        try e1b.session.sendInput("printf 'RECOVERED_999\\n'\n");
+        try testing.expect(try hostHandoffPollScreenContains(e1b.session, "RECOVERED_999", 300));
+        try testing.expectEqual(pid, e1b.session.childPidForHandoff().?);
+        try testing.expect(hostHandoffAlive(pid));
+
+        // Teardown.
+        v2.deinit(); // no session; closes control_fd + dummy listener
+        v1.deinit(); // tears down the resumed session -> SIGHUPs + reaps the child
+        try testing.expect(hostHandoffWaitReaped(pid, 300));
+
+        posix.close(sv1[0]);
+        posix.close(sv2[0]);
+        const fd_after = hostHandoffFdCount();
+        if (fd_before != 0 and fd_after != 0) try testing.expect(fd_after <= fd_before);
+    }
+}
+
+// ===========================================================================
+// FORK(host-handoff): BROKER unit tests. `Supervisor.brokerHandoff` is the pure
+// protocol dance (no posix_spawn) — the test drives it with TWO `socketpair`s
+// while playing BOTH mock workers on their own threads, so it validates the real
+// `handoff_protocol` wire dance + the health-ack gate + abort/unfreeze. macOS-only
+// (the codec rides the Darwin cmsg ABI). The mock-worker helpers below reference
+// `hp.proto`, so they are referenced ONLY from these macOS-gated tests (never
+// analyzed on the Linux host).
+// ===========================================================================
+
+const HostHandoffMockV1Ctx = struct {
+    ctrl: posix.fd_t,
+    id_a: u64,
+    id_b: u64,
+    blob_a: []const u8,
+    blob_b: []const u8,
+    saw_shutdown: *bool,
+    saw_unfreeze: *bool,
+};
+
+const HostHandoffMockV2Ctx = struct {
+    alloc: std.mem.Allocator,
+    ctrl: posix.fd_t,
+    /// Number of `adopt` frames the successor received (asserted by the test).
+    adopts_seen: *usize,
+    /// When true, nack the FIRST adopt (`ok=0`) to exercise the abort path; else
+    /// ack every adopt ok + report `ready{2}`.
+    nack_first: bool,
+};
+
+/// FORK(host-handoff): mock predecessor. Answers `freeze_all` with two
+/// `session_state`+blob frames + `freeze_done{2}`, then records whether the broker
+/// concluded with `shutdown` (success) or `unfreeze` (abort).
+fn hostHandoffMockV1(ctx: *HostHandoffMockV1Ctx) void {
+    if (comptime builtin.os.tag != .macos) return;
+    var fds: [1]posix.fd_t = undefined;
+    const fa = hp.proto.recvFrame(ctx.ctrl, &fds) catch return;
+    if (fa.frame.tag != .freeze_all) return;
+
+    hp.proto.sendFrame(ctx.ctrl, .{ .tag = .session_state, .session_id = ctx.id_a, .aux = ctx.blob_a.len }, &.{}) catch return;
+    hp.proto.writeBlob(ctx.ctrl, ctx.blob_a) catch return;
+    hp.proto.sendFrame(ctx.ctrl, .{ .tag = .session_state, .session_id = ctx.id_b, .aux = ctx.blob_b.len }, &.{}) catch return;
+    hp.proto.writeBlob(ctx.ctrl, ctx.blob_b) catch return;
+    hp.proto.sendFrame(ctx.ctrl, .{ .tag = .freeze_done, .aux = 2 }, &.{}) catch return;
+
+    const fin = hp.proto.recvFrame(ctx.ctrl, &fds) catch return;
+    switch (fin.frame.tag) {
+        .shutdown => ctx.saw_shutdown.* = true,
+        .unfreeze => ctx.saw_unfreeze.* = true,
+        else => {},
+    }
+}
+
+/// FORK(host-handoff): mock successor. Reads the two `adopt`s (each carrying a
+/// master fd + blob), then either acks both + `ready{2}` (success) or nacks the
+/// first (abort). Closes every received master fd + frees every blob so the test
+/// leaks nothing.
+fn hostHandoffMockV2(ctx: *HostHandoffMockV2Ctx) void {
+    if (comptime builtin.os.tag != .macos) return;
+    var fds: [1]posix.fd_t = undefined;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const ad = hp.proto.recvFrame(ctx.ctrl, &fds) catch return;
+        for (fds[0..ad.fd_count]) |fd| posix.close(fd);
+        if (ad.frame.tag != .adopt) return;
+        const blob = hp.proto.readBlob(ctx.ctrl, ctx.alloc, ad.frame.aux) catch return;
+        ctx.alloc.free(blob);
+        ctx.adopts_seen.* += 1;
+        const ok: u64 = if (ctx.nack_first and i == 0) 0 else 1;
+        hp.proto.sendFrame(ctx.ctrl, .{ .tag = .adopt_ack, .session_id = ad.frame.session_id, .aux = ok }, &.{}) catch return;
+        // On a nack the broker aborts immediately; still drain the 2nd adopt (the
+        // broker sends BOTH before reading any ack) so its SCM_RIGHTS fd is closed.
+    }
+    if (!ctx.nack_first) {
+        hp.proto.sendFrame(ctx.ctrl, .{ .tag = .ready, .aux = 2 }, &.{}) catch return;
+    }
+}
+
+/// FORK(host-handoff): build a `MasterRegistry` with two entries whose master fds
+/// are dups of a throwaway pipe read end (the mock successor only READS the adopt
+/// frame; the fd's identity is irrelevant). Returns the pipe fds so the caller can
+/// close them; `registry.deinit()` closes the two dups.
+fn hostHandoffFakeRegistry(alloc: std.mem.Allocator, id_a: u64, id_b: u64) !struct {
+    registry: Supervisor.MasterRegistry,
+    pipe: [2]posix.fd_t,
+} {
+    const pipe = try posix.pipe();
+    errdefer {
+        posix.close(pipe[0]);
+        posix.close(pipe[1]);
+    }
+    var registry = Supervisor.MasterRegistry.init(alloc);
+    errdefer registry.deinit();
+    try registry.put(id_a, .{ .master_fd = try posix.dup(pipe[0]), .child_pid = 1111 });
+    try registry.put(id_b, .{ .master_fd = try posix.dup(pipe[0]), .child_pid = 2222 });
+    return .{ .registry = registry, .pipe = pipe };
+}
+
+test "host handoff broker: SUCCESS v1->v2 acks all + ready -> shutdown v1, no unfreeze" {
+    if (comptime builtin.os.tag == .macos) {
+        const alloc = testing.allocator;
+        const id_a: u64 = 0xAAAA;
+        const id_b: u64 = 0xBBBB;
+
+        const sv1 = try hostHandoffSocketpair(); // [0]=broker v1_ctrl, [1]=mock-v1
+        defer posix.close(sv1[0]);
+        defer posix.close(sv1[1]);
+        const sv2 = try hostHandoffSocketpair(); // [0]=broker v2_ctrl, [1]=mock-v2
+        defer posix.close(sv2[0]);
+        defer posix.close(sv2[1]);
+
+        var fake = try hostHandoffFakeRegistry(alloc, id_a, id_b);
+        defer {
+            fake.registry.deinit();
+            posix.close(fake.pipe[0]);
+            posix.close(fake.pipe[1]);
+        }
+
+        var saw_shutdown = false;
+        var saw_unfreeze = false;
+        var adopts_seen: usize = 0;
+        var v1_ctx: HostHandoffMockV1Ctx = .{
+            .ctrl = sv1[1],
+            .id_a = id_a,
+            .id_b = id_b,
+            .blob_a = "SESSION-A-STATE",
+            .blob_b = "SESSION-B-STATE-XYZ",
+            .saw_shutdown = &saw_shutdown,
+            .saw_unfreeze = &saw_unfreeze,
+        };
+        var v2_ctx: HostHandoffMockV2Ctx = .{
+            .alloc = alloc,
+            .ctrl = sv2[1],
+            .adopts_seen = &adopts_seen,
+            .nack_first = false,
+        };
+
+        const t1 = try std.Thread.spawn(.{}, hostHandoffMockV1, .{&v1_ctx});
+        const t2 = try std.Thread.spawn(.{}, hostHandoffMockV2, .{&v2_ctx});
+
+        // The broker drives the real wire dance against the two mock workers.
+        try Supervisor.brokerHandoff(alloc, sv1[0], sv2[0], &fake.registry, 2000);
+
+        t1.join();
+        t2.join();
+
+        try testing.expect(saw_shutdown); // v1 got shutdown (success)
+        try testing.expect(!saw_unfreeze); // and NOT unfreeze
+        try testing.expectEqual(@as(usize, 2), adopts_seen);
+    }
+}
+
+test "host handoff broker: ABORT on a nacked adopt -> unfreeze v1, no shutdown" {
+    if (comptime builtin.os.tag == .macos) {
+        const alloc = testing.allocator;
+        const id_a: u64 = 0xCCCC;
+        const id_b: u64 = 0xDDDD;
+
+        const sv1 = try hostHandoffSocketpair();
+        defer posix.close(sv1[0]);
+        defer posix.close(sv1[1]);
+        const sv2 = try hostHandoffSocketpair();
+        defer posix.close(sv2[0]);
+        defer posix.close(sv2[1]);
+
+        var fake = try hostHandoffFakeRegistry(alloc, id_a, id_b);
+        defer {
+            fake.registry.deinit();
+            posix.close(fake.pipe[0]);
+            posix.close(fake.pipe[1]);
+        }
+
+        var saw_shutdown = false;
+        var saw_unfreeze = false;
+        var adopts_seen: usize = 0;
+        var v1_ctx: HostHandoffMockV1Ctx = .{
+            .ctrl = sv1[1],
+            .id_a = id_a,
+            .id_b = id_b,
+            .blob_a = "A",
+            .blob_b = "BB",
+            .saw_shutdown = &saw_shutdown,
+            .saw_unfreeze = &saw_unfreeze,
+        };
+        var v2_ctx: HostHandoffMockV2Ctx = .{
+            .alloc = alloc,
+            .ctrl = sv2[1],
+            .adopts_seen = &adopts_seen,
+            .nack_first = true, // nack the first adopt
+        };
+
+        const t1 = try std.Thread.spawn(.{}, hostHandoffMockV1, .{&v1_ctx});
+        const t2 = try std.Thread.spawn(.{}, hostHandoffMockV2, .{&v2_ctx});
+
+        const res = Supervisor.brokerHandoff(alloc, sv1[0], sv2[0], &fake.registry, 2000);
+
+        t1.join();
+        t2.join();
+
+        try testing.expectError(error.HandoffAborted, res);
+        try testing.expect(saw_unfreeze); // v1 got unfreeze (incumbent survives)
+        try testing.expect(!saw_shutdown); // and NOT shutdown
+    }
+}
+
+test "host handoff supervisor arg parsing (parseMode dispatch)" {
+    // --handoff-worker: fds parsed; --listen path is informational.
+    {
+        const args = [_][]const u8{ "--handoff-worker", "--listen-fd=3", "--control-fd=4", "--listen=/tmp/x" };
+        const mode = try Supervisor.parseMode(&args);
+        try testing.expect(mode == .handoff_worker);
+        try testing.expectEqual(@as(posix.fd_t, 3), mode.handoff_worker.listen_fd);
+        try testing.expectEqual(@as(posix.fd_t, 4), mode.handoff_worker.control_fd);
+        try testing.expectEqualStrings("/tmp/x", mode.handoff_worker.listen_path.?);
+    }
+    // --supervise wins over the standalone `--listen=` in the SAME argv.
+    {
+        const args = [_][]const u8{ "--supervise", "--listen=/tmp/s", "--worker=/opt/gh" };
+        const mode = try Supervisor.parseMode(&args);
+        try testing.expect(mode == .supervise);
+        try testing.expectEqualStrings("/tmp/s", mode.supervise.listen_path);
+        try testing.expectEqualStrings("/opt/gh", mode.supervise.worker_path.?);
+    }
+    // Pre-existing standalone listen path (behavior preserved).
+    {
+        const args = [_][]const u8{"--listen=/tmp/legacy"};
+        const mode = try Supervisor.parseMode(&args);
+        try testing.expect(mode == .listen);
+        try testing.expectEqualStrings("/tmp/legacy", mode.listen);
+    }
+    // A bare positional socket path (pre-existing behavior).
+    {
+        const args = [_][]const u8{"/tmp/bare.sock"};
+        const mode = try Supervisor.parseMode(&args);
+        try testing.expect(mode == .listen);
+        try testing.expectEqualStrings("/tmp/bare.sock", mode.listen);
+    }
+    // No recognized args -> the Phase-1 stdout-diff harness.
+    {
+        const args = [_][]const u8{};
+        const mode = try Supervisor.parseMode(&args);
+        try testing.expect(mode == .stdout_diff);
+    }
+    // --handoff-worker missing --control-fd -> a parse error, not a silent default.
+    {
+        const args = [_][]const u8{ "--handoff-worker", "--listen-fd=3" };
+        try testing.expectError(error.MissingRequiredArg, Supervisor.parseMode(&args));
+    }
+    // A non-numeric fd arg is rejected.
+    {
+        const args = [_][]const u8{ "--handoff-worker", "--listen-fd=abc", "--control-fd=4" };
+        try testing.expectError(error.InvalidFdArg, Supervisor.parseMode(&args));
+    }
+}
+
+// FORK(host-handoff): handoff-TRIGGER tests. The exec-path staleness self-check is
+// the EPERM fix's trigger; its DECISION is a pure function (unit-tested here) and
+// its `proc_pidpath` resolver is exercised against this test process. The SIGHUP
+// delivery + the timer-driven firing are smoke-only (no test installs a real signal
+// handler + forks a real worker), per the design.
+// ===========================================================================
+
+test "host supervisor: proc_pidpath resolves this process's own exec path (libproc extern + workerExecPath helper)" {
+    if (comptime builtin.os.tag == .macos) {
+        var buf: [Supervisor.PROC_PIDPATHINFO_MAXSIZE]u8 = undefined;
+        const resolved = Supervisor.workerExecPath(std.c.getpid(), &buf) orelse
+            return error.TestUnexpectedResult; // our own pid must resolve
+        try testing.expect(resolved.len > 0);
+        try testing.expect(resolved[0] == '/'); // an absolute path
+        // The path names our own running binary, so it must exist.
+        try std.fs.accessAbsolute(resolved, .{});
+        // And it is the same executable `selfExePath` reports (realpath may differ
+        // only by symlink normalization, so compare basenames — this proves the
+        // extern + helper resolved THIS process's exec path, not some other).
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const self_exe = try std.fs.selfExePath(&exe_buf);
+        try testing.expectEqualStrings(std.fs.path.basename(self_exe), std.fs.path.basename(resolved));
+    }
+}
+
+test "host supervisor: workerPathStale pure decision (resolves+equal / ENOENT / differs)" {
+    // (a) exec path resolves AND equals canonical -> NOT stale.
+    try testing.expect(!Supervisor.workerPathStale("/opt/ghostty-host", "/opt/ghostty-host"));
+    // (b) exec path can't be resolved (proc_pidpath failed / ENOENT: the exec file
+    //     was unlinked — the EPERM-bug condition) -> STALE.
+    try testing.expect(Supervisor.workerPathStale(null, "/opt/ghostty-host"));
+    // (c) exec path resolves but differs from canonical (bundle moved/replaced) ->
+    //     STALE.
+    try testing.expect(Supervisor.workerPathStale("/opt/ghostty-host.old", "/opt/ghostty-host"));
+    // A trailing-byte difference is still a difference (guards against a prefix-match
+    // bug in the decision).
+    try testing.expect(Supervisor.workerPathStale("/opt/ghostty-host2", "/opt/ghostty-host"));
 }

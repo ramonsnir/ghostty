@@ -13,6 +13,8 @@ const LoadingImage = @import("graphics_image.zig").LoadingImage;
 const Image = @import("graphics_image.zig").Image;
 const Rect = @import("graphics_image.zig").Rect;
 const Command = command.Command;
+// FORK(host-handoff): shared (de)serialization helpers.
+const serial = @import("../serial.zig");
 
 const log = std.log.scoped(.kitty_gfx);
 
@@ -73,6 +75,146 @@ pub const ImageStorage = struct {
 
         self.clearPlacements(s);
         self.placements.deinit(alloc);
+    }
+
+    // FORK(host-handoff): full-fidelity same-build (de)serialization ---------
+    //
+    // Images (id -> pixel data + metadata) and placements (keyed, each pinned
+    // to a screen location or virtual) are transferred. Placement pins are
+    // re-tracked against the rebuilt pagelist exactly like the cursor/selection
+    // pins. The transient in-flight `loading` image is intentionally dropped
+    // (see deserialize).
+
+    /// Serialize this image storage to `writer`. `pages` is the (already
+    /// serialized) pagelist of the owning screen, used to encode placement pin
+    /// locations as `(page_index, x, y)`.
+    pub fn serialize(
+        self: *const ImageStorage,
+        pages: *const PageList,
+        writer: anytype,
+    ) !void {
+        try serial.writePod(writer, self.dirty);
+        try serial.writePod(writer, self.next_image_id);
+        try serial.writePod(writer, self.next_internal_placement_id);
+        try serial.writePod(writer, self.image_limits);
+        try writer.writeInt(u64, self.total_bytes, .little);
+        try writer.writeInt(u64, self.total_limit, .little);
+
+        try writer.writeInt(u64, self.images.count(), .little);
+        var it = self.images.iterator();
+        while (it.next()) |kv| {
+            try serial.writePod(writer, kv.key_ptr.*);
+            try kv.value_ptr.serialize(writer);
+        }
+
+        try writer.writeInt(u64, self.placements.count(), .little);
+        var pit = self.placements.iterator();
+        while (pit.next()) |kv| {
+            try serial.writePod(writer, kv.key_ptr.*);
+            try serializePlacement(pages, writer, kv.value_ptr);
+        }
+
+        // NOTE: `loading` (a partially-transmitted image spanning multiple
+        // escape sequences) is deliberately not serialized. A handoff mid
+        // transmission is a rare transient; dropping it means the next
+        // continuation chunk is ignored rather than corrupting state.
+    }
+
+    /// Rebuild image storage written by `serialize`. `pages` is the rebuilt
+    /// pagelist of the owning screen; placement pins are tracked against it.
+    pub fn deserialize(
+        alloc: Allocator,
+        pages: *PageList,
+        reader: anytype,
+    ) !ImageStorage {
+        var self: ImageStorage = .{};
+        errdefer {
+            var it = self.images.iterator();
+            while (it.next()) |kv| kv.value_ptr.deinit(alloc);
+            self.images.deinit(alloc);
+            var pit = self.placements.iterator();
+            while (pit.next()) |kv| switch (kv.value_ptr.location) {
+                .pin => |p| pages.untrackPin(p),
+                .virtual => {},
+            };
+            self.placements.deinit(alloc);
+        }
+
+        self.dirty = try serial.readPod(bool, reader);
+        self.next_image_id = try serial.readPod(u32, reader);
+        self.next_internal_placement_id = try serial.readPod(u32, reader);
+        self.image_limits = try serial.readPod(LoadingImage.Limits, reader);
+        self.total_bytes = @intCast(try reader.readInt(u64, .little));
+        self.total_limit = @intCast(try reader.readInt(u64, .little));
+
+        const img_count = try reader.readInt(u64, .little);
+        try self.images.ensureTotalCapacity(alloc, @intCast(img_count));
+        var i: u64 = 0;
+        while (i < img_count) : (i += 1) {
+            const id = try serial.readPod(u32, reader);
+            const img = try Image.deserialize(alloc, reader);
+            self.images.putAssumeCapacity(id, img);
+        }
+
+        const pl_count = try reader.readInt(u64, .little);
+        try self.placements.ensureTotalCapacity(alloc, @intCast(pl_count));
+        var j: u64 = 0;
+        while (j < pl_count) : (j += 1) {
+            const key = try serial.readPod(PlacementKey, reader);
+            const placement = try deserializePlacement(pages, reader);
+            self.placements.putAssumeCapacity(key, placement);
+        }
+
+        return self;
+    }
+
+    /// FORK(host-handoff): serialize a single placement (location + geometry).
+    fn serializePlacement(
+        pages: *const PageList,
+        writer: anytype,
+        p: *const Placement,
+    ) !void {
+        switch (p.location) {
+            .pin => |pin| {
+                try writer.writeByte(0);
+                try pages.serializePinLoc(writer, pin);
+            },
+            .virtual => try writer.writeByte(1),
+        }
+        try serial.writePod(writer, p.x_offset);
+        try serial.writePod(writer, p.y_offset);
+        try serial.writePod(writer, p.source_x);
+        try serial.writePod(writer, p.source_y);
+        try serial.writePod(writer, p.source_width);
+        try serial.writePod(writer, p.source_height);
+        try serial.writePod(writer, p.columns);
+        try serial.writePod(writer, p.rows);
+        try serial.writePod(writer, p.z);
+    }
+
+    /// FORK(host-handoff): rebuild a placement written by `serializePlacement`,
+    /// re-tracking its pin (if any) against `pages`.
+    fn deserializePlacement(
+        pages: *PageList,
+        reader: anytype,
+    ) !Placement {
+        const location: Placement.Location = switch (try reader.readByte()) {
+            0 => .{ .pin = try pages.trackPinAt(try PageList.readPinLoc(reader)) },
+            1 => .virtual,
+            else => return error.InvalidPlacementLocation,
+        };
+        return .{
+            .location = location,
+            .x_offset = try serial.readPod(u32, reader),
+            .y_offset = try serial.readPod(u32, reader),
+            .source_x = try serial.readPod(u32, reader),
+            .source_y = try serial.readPod(u32, reader),
+            .source_width = try serial.readPod(u32, reader),
+            .source_height = try serial.readPod(u32, reader),
+            .columns = try serial.readPod(u32, reader),
+            .rows = try serial.readPod(u32, reader),
+            .z = try serial.readPod(i32, reader),
+        };
     }
 
     /// Kitty image protocol is enabled if we have a non-zero limit.

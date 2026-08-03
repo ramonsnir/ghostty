@@ -13,6 +13,8 @@ const lib = @import("lib.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Screen = @import("Screen.zig");
+// FORK(host-handoff): shared (de)serialization helpers.
+const serial = @import("serial.zig");
 
 /// The possible keys for screens in the screen set.
 pub const Key = lib.Enum(lib.target, &.{
@@ -104,6 +106,60 @@ pub fn remove(
 pub fn switchTo(self: *ScreenSet, key: Key) void {
     self.active_key = key;
     self.active = self.all.get(key).?;
+}
+
+/// FORK(host-handoff): serialize the screen set (active key, per-key
+/// generations, the always-present primary screen, and the optional alternate
+/// screen) for a same-build session handoff.
+pub fn serialize(self: *const ScreenSet, writer: anytype) !void {
+    try serial.writePod(writer, self.active_key);
+    try writer.writeInt(u64, self.generation(.primary), .little);
+    try writer.writeInt(u64, self.generation(.alternate), .little);
+
+    // Primary is always initialized.
+    try self.get(.primary).?.serialize(writer);
+
+    // Alternate is lazily initialized.
+    if (self.get(.alternate)) |alt| {
+        try writer.writeByte(1);
+        try alt.serialize(writer);
+    } else {
+        try writer.writeByte(0);
+    }
+}
+
+/// FORK(host-handoff): rebuild a screen set written by `serialize`. The returned
+/// set owns its screens and must be `deinit`ed.
+pub fn deserialize(alloc: Allocator, reader: anytype) !ScreenSet {
+    const active_key = try serial.readPod(Key, reader);
+    const gen_primary: usize = @intCast(try reader.readInt(u64, .little));
+    const gen_alternate: usize = @intCast(try reader.readInt(u64, .little));
+
+    const primary = try alloc.create(Screen);
+    errdefer alloc.destroy(primary);
+    primary.* = try Screen.deserialize(alloc, reader);
+    errdefer primary.deinit();
+
+    var all: std.EnumMap(Key, *Screen) = .init(.{ .primary = primary });
+
+    if ((try reader.readByte()) != 0) {
+        const alt = try alloc.create(Screen);
+        errdefer alloc.destroy(alt);
+        alt.* = try Screen.deserialize(alloc, reader);
+        errdefer alt.deinit();
+        all.put(.alternate, alt);
+    }
+
+    var generations: std.EnumMap(Key, usize) = .initFull(0);
+    generations.put(.primary, gen_primary);
+    generations.put(.alternate, gen_alternate);
+
+    return .{
+        .active_key = active_key,
+        .active = all.get(active_key).?,
+        .all = all,
+        .generations = generations,
+    };
 }
 
 test ScreenSet {

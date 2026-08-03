@@ -41,8 +41,35 @@ const Session = @import("Session.zig");
 const RenderState = @import("RenderState.zig");
 const protocol = @import("protocol.zig");
 const proc_info = @import("../os/main.zig").proc_info;
+const builtin = @import("builtin");
+const session_transfer = @import("session_transfer.zig");
+
+/// FORK(host-handoff): the supervisor↔worker control codec + fd-passing, gated to
+/// macOS. `handoff_protocol`/`fdpass` hand-roll the Darwin `SCM_RIGHTS` cmsg ABI
+/// and @compileError elsewhere, so they must NOT be semantically analyzed on the
+/// Linux cloud-box host. This container is an empty struct off macOS; every
+/// reference to `handoff.proto`/`handoff.fdpass` lives inside an
+/// `if (comptime builtin.os.tag == .macos)` block (whose body is never analyzed
+/// off macOS), so the imports here are only reached on macOS.
+const handoff = if (builtin.os.tag == .macos) struct {
+    pub const proto = @import("handoff_protocol.zig");
+    pub const fdpass = @import("fdpass.zig");
+} else struct {};
 
 const log = std.log.scoped(.host_server);
+
+/// FORK(host-handoff): per-session state a worker RETAINS after `freeze_all` so it
+/// can `unfreeze` (re-adopt) on an aborted handoff. `master_fd` is the worker's OWN
+/// pty master (kept open across the detach+destroy — the supervisor already holds
+/// its own dup via `register_master`); `blob` is the serialized `terminal.Terminal`
+/// (owned by `Server.alloc`). On `unfreeze` both are consumed by `Session.adopt`
+/// (fd) / `deserialize` (blob); on `shutdown` the fd is closed and the blob freed
+/// (the successor owns the live child + its own master copy now).
+pub const FrozenSession = struct {
+    master_fd: posix.fd_t,
+    child_pid: posix.pid_t,
+    blob: []u8,
+};
 
 /// 1 MiB socket buffers so a full grid frame never short-writes (plan §2).
 const SOCKET_BUF: c_int = 1 * 1024 * 1024;
@@ -51,8 +78,15 @@ alloc: Allocator,
 
 /// The bound, listening AF_UNIX socket.
 listen_fd: posix.socket_t,
-/// The bound socket path, owned (unlinked on deinit).
+/// The bound socket path, owned (freed on deinit).
 path: []const u8,
+/// FORK(host-handoff): whether THIS Server owns the socket path — i.e. whether
+/// deinit should `unlink` it. True for a standalone/`init` host that bound the
+/// path itself; FALSE for a worker built via `initFromListenFd`, where the
+/// supervisor bound the path and keeps it bound across worker swaps (the worker
+/// must not unlink it out from under the supervisor). The fd is always closed on
+/// deinit regardless; only the path unlink is gated.
+owns_path: bool = true,
 
 /// Registry of live sessions, keyed by host-assigned session_id. Ids are RANDOM
 /// 64-bit values (see allocSessionId), not a sequential counter — so a session_id
@@ -62,6 +96,42 @@ path: []const u8,
 /// "unattached" sentinel.
 sessions: std.AutoHashMap(u64, *SessionEntry),
 registry_mutex: std.Thread.Mutex = .{},
+
+/// FORK(host-handoff): the supervisor↔worker CONTROL socket (an inherited
+/// `socketpair` end), or null for a standalone worker with no supervisor. When
+/// null the entire handoff path is inert and behavior is byte-for-byte the
+/// pre-handoff Server (`notifySessionSpawned`/`notifySessionClosed` are no-ops,
+/// no control loop runs, `frozen` stays empty). Owned by the Server: closed on
+/// `deinit`. macOS-only in practice (the codec is Darwin-cmsg-only).
+control_fd: ?posix.socket_t = null,
+/// FORK(host-handoff): serializes ALL worker→supervisor writes on `control_fd`
+/// (a frame + any trailing blob is one indivisible message), so a
+/// `notifySessionSpawned` on a spawn thread never interleaves its bytes with the
+/// control loop's `session_state`/`adopt_ack`. Recv (supervisor→worker) is the
+/// opposite direction on the full-duplex socketpair and needs no lock.
+control_write_mutex: std.Thread.Mutex = .{},
+/// FORK(host-handoff): the worker's control loop thread (recvFrame →
+/// handleControlFrame), spawned by `startControlLoop`. null until then.
+control_thread: ?std.Thread = null,
+/// FORK(host-handoff): cleared to break the control loop — by a `shutdown` frame
+/// or by `deinit`. The loop re-checks it after each frame and on recv error.
+control_running: std.atomic.Value(bool) = .init(true),
+/// FORK(host-handoff): sessions FROZEN by `freeze_all` and awaiting either
+/// `shutdown` (drop) or `unfreeze` (re-adopt), keyed by their original
+/// session_id. Empty except between a freeze and its resolution. Guarded by
+/// `registry_mutex` (touched only on the control loop thread + `deinit`, both of
+/// which take it).
+frozen: std.AutoHashMap(u64, FrozenSession) = undefined,
+
+/// FORK(host-handoff): session_ids already announced to the supervisor via
+/// `register_master`, so a session is announced EXACTLY ONCE. The owner thread
+/// auto-announces every fresh spawn (`announceSpawnedMaster`); this dedup makes a
+/// redundant announce (e.g. an in-process test that ALSO calls
+/// `notifySessionSpawned`, or a retry) a harmless no-op instead of a second
+/// `register_master` that would overwrite + leak the supervisor's held dup.
+/// Guarded by `control_write_mutex` (checked+inserted in the same critical section
+/// as the send). Present on all targets; only populated on macOS.
+announced_masters: std.AutoHashMap(u64, void) = undefined,
 
 /// All open connections + the reaping queue. BOTH lists are guarded by the one
 /// `conns_mutex` so a read thread's migration (remove from `conns` + append to
@@ -209,6 +279,14 @@ pub const SessionEntry = struct {
     teardown_requested: bool = false,
     /// Released by the closer to wake the parked owner thread.
     teardown: std.Thread.ResetEvent = .{},
+    /// FORK(host-handoff): whether the owner thread should announce this session's
+    /// pty master to the supervisor (`register_master`) once it comes up. TRUE for
+    /// a fresh `spawnSession` (the supervisor must hold a dup of every new session
+    /// for the handoff); FALSE for a session built by `registerAdoptedSession`
+    /// (adopt/unfreeze) — a successor must NOT re-announce a session the supervisor
+    /// already tracks, and doing so would interleave a `register_master` into the
+    /// `adopt_ack`/`ready` handoff response stream the broker reads.
+    announce_master: bool = true,
 
     fn addSubscriber(self: *SessionEntry, conn: *Conn) !void {
         self.mutex.lock();
@@ -646,15 +724,12 @@ fn makeAddr(path: []const u8) !posix.sockaddr.un {
     return addr;
 }
 
-/// Create + bind + listen the server socket at `path`. Caller owns the
-/// returned *Server (call deinit).
-pub fn init(alloc: Allocator, path: []const u8) !*Server {
-    const self = try alloc.create(Server);
-    errdefer alloc.destroy(self);
-
-    const path_dup = try alloc.dupe(u8, path);
-    errdefer alloc.free(path_dup);
-
+/// FORK(host-handoff): create + `unlink`-stale + bind + listen a fresh AF_UNIX
+/// socket at `path`, returning the listening fd. Split out of `init` so the
+/// supervisor — which owns the socket path across worker swaps — can bind it
+/// ONCE and hand the same listener fd to each successive worker (via
+/// `initFromListenFd`), eliminating the unlink/rebind race on every handoff.
+pub fn bindListenSocket(path: []const u8) !posix.socket_t {
     const fd = try posix.socket(
         posix.AF.UNIX,
         posix.SOCK.STREAM,
@@ -669,11 +744,48 @@ pub fn init(alloc: Allocator, path: []const u8) !*Server {
     try posix.bind(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
     try posix.listen(fd, 16);
 
+    return fd;
+}
+
+/// Create + bind + listen the server socket at `path`. Caller owns the
+/// returned *Server (call deinit). This is the standalone/self-bound path —
+/// it owns the socket path and unlinks it on deinit.
+pub fn init(alloc: Allocator, path: []const u8) !*Server {
+    const fd = try bindListenSocket(path);
+    errdefer posix.close(fd);
+    return try initFromListenFd(alloc, path, fd, true);
+}
+
+/// FORK(host-handoff): build a Server around an ALREADY-bound listening socket
+/// — the WORKER path. The supervisor bound `path` and passes `listen_fd` down
+/// (SCM_RIGHTS / fork-inherit); the worker adopts it and accepts on it without
+/// re-binding. `owns_path` MUST be false for a supervisor-managed worker so its
+/// deinit does not unlink the path the supervisor keeps bound across swaps (the
+/// fd is still closed on deinit either way). On any init error the caller
+/// retains ownership of `listen_fd`.
+pub fn initFromListenFd(
+    alloc: Allocator,
+    path: []const u8,
+    listen_fd: posix.socket_t,
+    owns_path: bool,
+) !*Server {
+    const self = try alloc.create(Server);
+    errdefer alloc.destroy(self);
+
+    const path_dup = try alloc.dupe(u8, path);
+    errdefer alloc.free(path_dup);
+
     self.* = .{
         .alloc = alloc,
-        .listen_fd = fd,
+        .listen_fd = listen_fd,
         .path = path_dup,
+        .owns_path = owns_path,
         .sessions = std.AutoHashMap(u64, *SessionEntry).init(alloc),
+        // FORK(host-handoff): the frozen-session map (empty unless a handoff is
+        // mid-flight). Present on all targets; only ever populated on macOS.
+        .frozen = std.AutoHashMap(u64, FrozenSession).init(alloc),
+        // FORK(host-handoff): the announced-session dedup set (see the field doc).
+        .announced_masters = std.AutoHashMap(u64, void).init(alloc),
         .host_pid = std.c.getpid(),
         .host_start_epoch = std.time.timestamp(),
         // Idle-leak fix: monotonic epoch for the reaper grace window (NOT wall-clock).
@@ -1613,6 +1725,16 @@ pub fn lookupForTest(self: *Server, session_id: u64) ?*SessionEntry {
     return self.lookup(session_id);
 }
 
+/// FORK(host-handoff): TEST-ONLY — number of currently-frozen sessions. Lets a
+/// handoff test poll until an async `shutdown`/`unfreeze` frame has been fully
+/// processed by the control loop (frozen drained), so the subsequent fd-leak
+/// check is deterministic rather than racing the control loop thread.
+pub fn frozenCountForTest(self: *Server) usize {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    return self.frozen.count();
+}
+
 /// Test-only: number of live (not-yet-reaped) connections. Used by the
 /// reconnect-reaping test to assert disconnected conns drain to baseline.
 pub fn connCountForTest(self: *Server) usize {
@@ -1859,6 +1981,31 @@ pub fn allocSessionId(self: *Server) u64 {
     }
 }
 
+/// Wire every Server render/child/event callback onto a SessionEntry's Session
+/// (ctx = the entry). Factored out of `spawnSession` so the FORK(host-handoff)
+/// adopt/unfreeze paths (`registerAdoptedSession`) wire an adopted Session
+/// identically — the hooks are session-lifetime and don't distinguish a fresh
+/// spawn from an adopted one.
+fn wireSessionHooks(e: *SessionEntry) void {
+    const session = e.session;
+    session.on_render_ctx = e;
+    session.on_render = onRender;
+    session.on_child_exited_ctx = e;
+    session.on_child_exited = onChildExited;
+    session.on_search_event_ctx = e;
+    session.on_search_event = onSearchEvent;
+    session.on_surface_event_ctx = e;
+    session.on_surface_event = onSurfaceEvent;
+    session.on_selection_text_ctx = e;
+    session.on_selection_text = onSelectionText;
+    session.on_at_prompt_ctx = e;
+    session.on_at_prompt = onAtPrompt;
+    session.on_raw_output_ctx = e;
+    session.on_raw_output = onRawOutput;
+    session.on_process_info_ctx = e;
+    session.on_process_info = onProcessInfo;
+}
+
 /// Spawn a fresh Session, register it, and start its dedicated owning thread.
 /// CALLER MUST HOLD registry_mutex (findings SR-1 / ZM1): the only caller,
 /// handleAttach, holds it across the whole spawn+dereference so a concurrent
@@ -1891,22 +2038,7 @@ fn spawnSession(
 
     // Wire the render-tick push + child-exit hooks BEFORE start so the very
     // first tick can broadcast.
-    session.on_render_ctx = e;
-    session.on_render = onRender;
-    session.on_child_exited_ctx = e;
-    session.on_child_exited = onChildExited;
-    session.on_search_event_ctx = e;
-    session.on_search_event = onSearchEvent;
-    session.on_surface_event_ctx = e;
-    session.on_surface_event = onSurfaceEvent;
-    session.on_selection_text_ctx = e;
-    session.on_selection_text = onSelectionText;
-    session.on_at_prompt_ctx = e;
-    session.on_at_prompt = onAtPrompt;
-    session.on_raw_output_ctx = e;
-    session.on_raw_output = onRawOutput;
-    session.on_process_info_ctx = e;
-    session.on_process_info = onProcessInfo;
+    wireSessionHooks(e);
 
     // registry_mutex is held by the caller (handleAttach), so put/remove here
     // must NOT re-lock it (would deadlock).
@@ -1932,6 +2064,17 @@ fn sessionOwnerThread(e: *SessionEntry) void {
     // exactly one of {Close, deinit} frees the entry. See SessionEntry's doc.
 
     if (e.session.start()) {
+        // FORK(host-handoff): announce this fresh session's pty master UP to the
+        // supervisor (`register_master` + a dup) so it holds crash insurance + the
+        // handoff source. INERT unless a supervisor control channel is armed
+        // (`control_fd` set) — the standalone Server + every existing test skip it
+        // entirely, so `.exec`/serving behavior is byte-for-byte unchanged. Only
+        // for a fresh spawn (`announce_master`); an adopted session is already
+        // tracked. The pty opens asynchronously on the IO thread, so this polls
+        // briefly for it before announcing.
+        if (e.announce_master and e.server.control_fd != null) {
+            e.server.announceSpawnedMaster(e);
+        }
         // Started OK; run the render loop until the child exits OR a teardown
         // notifies render_stop.
         e.session.runRenderLoop() catch |err| {
@@ -2638,6 +2781,12 @@ fn handleClose(self: *Server, conn: *Conn, session_id: u64) !void {
     // fetchRemove hands the entry to exactly one caller, so Close-vs-Close and
     // Close-vs-deinit can never both tear down the same entry.
     const e = entry orelse return;
+    // FORK(host-handoff): an EXPLICIT GUI close means this session's pty is truly
+    // gone — tell the supervisor to drop its `register_master` dup. (No-op unless a
+    // control_fd is set. Deliberately NOT in `teardownEntry`, which the freeze path
+    // also uses: a freeze DESTROYS the live Session but the supervisor KEEPS the
+    // master for the handoff, so freeze must not emit `unregister_master`.)
+    self.notifySessionClosed(e.session_id);
     self.teardownEntry(e);
 }
 
@@ -2704,6 +2853,494 @@ fn teardownEntry(self: *Server, e: *SessionEntry) void {
     self.alloc.destroy(e);
 }
 
+// ===========================================================================
+// FORK(host-handoff): worker-side supervisor↔worker control handling.
+//
+// A worker (`ghostty-host`) serves GUI sessions; a session-less supervisor
+// brokers a handoff between an OLD worker (predecessor) and a NEW one
+// (successor), holding a dup of every pty master. This section is the WORKER
+// half: it announces sessions up the control socket (`register_master` /
+// `unregister_master`), and handles the supervisor's control frames —
+// `freeze_all` (serialize + hand every session up), `adopt` (take a handed-off
+// session over), `shutdown` (predecessor may exit), `unfreeze` (abort: re-adopt
+// the frozen sessions and resume). Everything here is INERT when `control_fd`
+// is null (the standalone worker + every existing test), so `.exec`/serving
+// behavior is byte-for-byte unchanged. macOS-only (the codec rides `fdpass`'s
+// Darwin cmsg ABI); each body is inside `if (comptime builtin.os.tag == .macos)`
+// so it is never analyzed on the Linux host.
+// ===========================================================================
+
+/// FORK(host-handoff): arm the worker's supervisor control channel: store
+/// `control_fd` and spawn the control loop thread (`controlLoop`). Call once,
+/// after `initFromListenFd`, on a supervisor-managed worker. The Server takes
+/// ownership of `control_fd` (closed on `deinit`).
+pub fn startControlLoop(self: *Server, control_fd: posix.socket_t) !void {
+    if (comptime builtin.os.tag == .macos) {
+        self.control_fd = control_fd;
+        self.control_thread = try std.Thread.spawn(.{}, controlLoop, .{self});
+    } else {
+        // No handoff off macOS; close the fd we were handed so it doesn't leak.
+        posix.close(control_fd);
+    }
+}
+
+/// FORK(host-handoff): block until the control loop thread has EXITED on its own —
+/// a `shutdown` frame (control_running → false) or the supervisor dropping the
+/// channel (recvFrame → Closed breaks the loop). Used by worker MODE
+/// (`main_host.zig`) to serve until told to hand off, WITHOUT `deinit`'s
+/// force-stop. Nulls `control_thread` so the subsequent `deinit` does not re-join
+/// (its `if (self.control_thread)` block is skipped; it still closes control_fd).
+/// A no-op if no control loop was started. Idempotent.
+pub fn joinControlLoop(self: *Server) void {
+    if (self.control_thread) |t| {
+        t.join();
+        self.control_thread = null;
+    }
+}
+
+/// FORK(host-handoff): the control loop — block on `recvFrame`, dispatch each
+/// supervisor frame to `handleControlFrame`, until a `shutdown` frame (or
+/// `deinit`) clears `control_running`, or the socket closes. Runs on its own
+/// thread. `handleControlFrame` is `pub` and driven directly by the in-process
+/// integration test; this loop is the thin production wrapper around it.
+fn controlLoop(self: *Server) void {
+    if (comptime builtin.os.tag == .macos) {
+        while (self.control_running.load(.acquire)) {
+            var fds: [1]posix.fd_t = undefined;
+            const r = handoff.proto.recvFrame(self.control_fd.?, &fds) catch |err| {
+                if (err != error.Closed) log.warn("control recvFrame err={}", .{err});
+                break;
+            };
+            self.handleControlFrame(r.frame, &fds, r.fd_count) catch |err|
+                log.err("handleControlFrame tag={} err={}", .{ r.frame.tag, err });
+        }
+    }
+}
+
+/// FORK(host-handoff): announce a freshly-spawned session's pty master UP the
+/// control channel (`register_master{session_id, aux=child_pid}` + a DUP of the
+/// master via `SCM_RIGHTS`), so the supervisor holds its own copy (SIGHUP
+/// insurance + the source fd for a future `adopt`). No-op when `control_fd` is
+/// null. The caller resolves `master_fd`/`child_pid` once the session's pty is
+/// actually open (they are `null` until the IO thread's `threadEnter` runs), so
+/// this is invoked once the session is confirmed up — not synchronously from
+/// `spawnSession`, whose returned session has not opened its pty yet.
+pub fn notifySessionSpawned(
+    self: *Server,
+    session_id: u64,
+    child_pid: posix.pid_t,
+    master_fd: posix.fd_t,
+) void {
+    if (comptime builtin.os.tag == .macos) {
+        const cfd = self.control_fd orelse return;
+        self.control_write_mutex.lock();
+        defer self.control_write_mutex.unlock();
+        // Dedup: announce each session EXACTLY ONCE. Checked + marked in the same
+        // critical section as the send, so the owner-thread auto-announce and any
+        // redundant caller (e.g. an in-process test) can never both emit a
+        // `register_master`. Marked only AFTER a successful send, so a transient
+        // dup/send failure is retried rather than silently swallowed.
+        if (self.announced_masters.contains(session_id)) return;
+        // Send a DUP so our own live master (still polled by the session's IO
+        // thread) is untouched; SCM_RIGHTS copies it into the supervisor, then we
+        // drop our transient dup.
+        const dup_fd = posix.dup(master_fd) catch |err| {
+            log.warn("register_master dup failed session={d} err={}", .{ session_id, err });
+            return;
+        };
+        defer posix.close(dup_fd);
+        handoff.proto.sendFrame(cfd, .{
+            .tag = .register_master,
+            .session_id = session_id,
+            .aux = @intCast(child_pid),
+        }, &.{dup_fd}) catch |err| {
+            log.warn("register_master send failed session={d} err={}", .{ session_id, err });
+            return;
+        };
+        self.announced_masters.put(session_id, {}) catch {};
+    }
+}
+
+/// FORK(host-handoff): wait for a fresh session's pty to come up (it opens on the
+/// IO thread's `threadEnter`, which races `start()` returning), then announce its
+/// master to the supervisor. Runs on the session's owner thread BEFORE the render
+/// loop, gated to macOS + a set `control_fd` by the caller. Bounded so a session
+/// whose pty never opens (a start anomaly) does not spin — it just skips the
+/// announce. The `masterFdForHandoff`/`childPidForHandoff` reads follow the same
+/// unsynchronized "stored state only" accessor convention the freeze path uses.
+fn announceSpawnedMaster(self: *Server, e: *SessionEntry) void {
+    if (comptime builtin.os.tag == .macos) {
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            if (e.session.masterFdForHandoff()) |master| {
+                if (e.session.childPidForHandoff()) |pid| {
+                    self.notifySessionSpawned(e.session_id, pid, master);
+                    return;
+                }
+            }
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        log.warn("session {d} pty never came up; skipped register_master announce", .{e.session_id});
+    }
+}
+
+/// FORK(host-handoff): tell the supervisor a session's pty is GONE (an explicit
+/// close) so it drops its `register_master` dup: `unregister_master{session_id}`.
+/// No-op when `control_fd` is null. Best-effort (a dead supervisor socket just
+/// logs). NOT called by the freeze path — a freeze hands the master off, it does
+/// not close it.
+pub fn notifySessionClosed(self: *Server, session_id: u64) void {
+    if (comptime builtin.os.tag == .macos) {
+        const cfd = self.control_fd orelse return;
+        self.control_write_mutex.lock();
+        defer self.control_write_mutex.unlock();
+        // Drop the dedup mark so a (astronomically unlikely) future session that
+        // recycles this id can announce again.
+        _ = self.announced_masters.remove(session_id);
+        handoff.proto.sendFrame(cfd, .{
+            .tag = .unregister_master,
+            .session_id = session_id,
+        }, &.{}) catch |err|
+            log.warn("unregister_master send failed session={d} err={}", .{ session_id, err });
+    }
+}
+
+/// FORK(host-handoff): dispatch one supervisor→worker control frame. `fds_out`
+/// holds any `SCM_RIGHTS` fd (`fd_count` of them; only `adopt` carries one). Left
+/// `pub` so the in-process integration test drives freeze/adopt/shutdown/unfreeze
+/// directly. macOS-only; a no-op off macOS.
+pub fn handleControlFrame(
+    self: *Server,
+    frame: handoff.proto.Frame,
+    fds_out: []posix.fd_t,
+    fd_count: usize,
+) !void {
+    if (comptime builtin.os.tag == .macos) {
+        switch (frame.tag) {
+            .freeze_all => try self.handleFreezeAll(),
+            .adopt => try self.handleAdopt(frame, fds_out, fd_count),
+            .shutdown => self.handleShutdown(),
+            .unfreeze => try self.handleUnfreeze(),
+            // The remaining tags are worker→supervisor (we SEND them); receiving
+            // one is a protocol error from a misbehaving supervisor. Close any
+            // stray fd so it doesn't leak, then ignore.
+            else => {
+                for (fds_out[0..fd_count]) |fd| posix.close(fd);
+                log.warn("control: unexpected worker→supervisor tag {} received", .{frame.tag});
+            },
+        }
+    }
+}
+
+/// FORK(host-handoff): `freeze_all` — serialize + hand EVERY live session up to
+/// the supervisor, then keep enough to `unfreeze` on an abort. Per session:
+/// extract the master fd + child pid, DETACH (joins the IO thread so the Terminal
+/// is single-threaded and safe to serialize — same order as the adopt unit test),
+/// serialize the Terminal, send `session_state{id, aux=blob_len}` + the blob UP
+/// (NO fd — the supervisor already holds a master dup from `register_master`),
+/// RETAIN `{own master fd, child pid, blob}` in `frozen`, and DESTROY the now-
+/// serialized Session (which, post-detach, leaves the master open + the child
+/// alive). Finally `freeze_done{aux=count}`. The retained master fd is the
+/// session's OWN master, kept open across detach+destroy for a possible resume.
+fn handleFreezeAll(self: *Server) !void {
+    if (comptime builtin.os.tag == .macos) {
+        const cfd = self.control_fd orelse return;
+
+        // Snapshot + remove every live entry under registry_mutex (mirrors the
+        // reaper's collect-then-process-outside-the-lock discipline: teardownEntry
+        // joins the owner thread and must not run under registry_mutex).
+        var to_freeze: std.ArrayList(*SessionEntry) = .empty;
+        defer to_freeze.deinit(self.alloc);
+        {
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            var it = self.sessions.iterator();
+            while (it.next()) |kv| try to_freeze.append(self.alloc, kv.value_ptr.*);
+            for (to_freeze.items) |e| _ = self.sessions.remove(e.session_id);
+        }
+
+        var count: u64 = 0;
+        for (to_freeze.items) |e| {
+            const master = e.session.masterFdForHandoff();
+            const pid = e.session.childPidForHandoff();
+            if (master == null or pid == null) {
+                // No pty to hand off (a never-started or start-failed session):
+                // it cannot survive a handoff, so just tear it down.
+                self.teardownEntry(e);
+                continue;
+            }
+
+            // Detach FIRST (joins the IO thread; the render loop stops), then
+            // serialize under render_mutex to be coherent against any final
+            // owner-thread renderTick read that races the render-loop stop.
+            e.session.detachForHandoff();
+
+            var blob: std.ArrayList(u8) = .empty;
+            defer blob.deinit(self.alloc);
+            {
+                e.session.render_mutex.lock();
+                defer e.session.render_mutex.unlock();
+                try session_transfer.serialize(&e.session.io.terminal, blob.writer(self.alloc));
+            }
+
+            // Send session_state + blob UP (frame + blob is one indivisible
+            // message under the write mutex).
+            {
+                self.control_write_mutex.lock();
+                defer self.control_write_mutex.unlock();
+                try handoff.proto.sendFrame(cfd, .{
+                    .tag = .session_state,
+                    .session_id = e.session_id,
+                    .aux = @intCast(blob.items.len),
+                }, &.{});
+                try handoff.proto.writeBlob(cfd, blob.items);
+            }
+
+            // RETAIN for a possible unfreeze. `master` (our own fd) stays open
+            // across the teardownEntry below (destroy post-detach neither SIGHUPs
+            // the child nor closes the master). Move the blob out of the local.
+            const kept_blob = try blob.toOwnedSlice(self.alloc);
+            errdefer self.alloc.free(kept_blob);
+            {
+                self.registry_mutex.lock();
+                defer self.registry_mutex.unlock();
+                try self.frozen.put(e.session_id, .{
+                    .master_fd = master.?,
+                    .child_pid = pid.?,
+                    .blob = kept_blob,
+                });
+            }
+
+            // Destroy the now-serialized live Session. The owner thread runs
+            // Session.destroy on its own thread (Phase-1 invariant); post-detach
+            // that leaves our master fd open + the child alive.
+            self.teardownEntry(e);
+            count += 1;
+        }
+
+        {
+            self.control_write_mutex.lock();
+            defer self.control_write_mutex.unlock();
+            try handoff.proto.sendFrame(cfd, .{ .tag = .freeze_done, .aux = count }, &.{});
+        }
+    }
+}
+
+/// FORK(host-handoff): `adopt` — take over a session handed off by a predecessor.
+/// `frame.aux` = blob length (follows on the socket), `frame.aux2` = child pid,
+/// and `fds_out[0]` = the pty master (SCM_RIGHTS). Deserialize the blob, build a
+/// running successor Session around the master fd + child pid + rehydrated
+/// Terminal (`Session.adopt`), register it under its ORIGINAL session_id, start
+/// its owner thread, and `adopt_ack{ok}`. On a SUCCESS, follow with
+/// `ready{live_session_count}`. On a deserialize/adopt FAILURE the master-fd copy
+/// is closed and the child is left ALONE (it is still the predecessor's — it will
+/// `unfreeze`); we send `adopt_ack{ok=0}` and no `ready`.
+fn handleAdopt(
+    self: *Server,
+    frame: handoff.proto.Frame,
+    fds_out: []posix.fd_t,
+    fd_count: usize,
+) !void {
+    if (comptime builtin.os.tag == .macos) {
+        const cfd = self.control_fd orelse return;
+
+        // A missing master fd is a malformed adopt: read+drop the blob to keep the
+        // stream in sync, then nack.
+        if (fd_count < 1) {
+            const blob = handoff.proto.readBlob(cfd, self.alloc, frame.aux) catch null;
+            if (blob) |b| self.alloc.free(b);
+            try self.sendAdoptAck(frame.session_id, false);
+            return;
+        }
+        const master_fd = fds_out[0];
+
+        const blob = try handoff.proto.readBlob(cfd, self.alloc, frame.aux);
+        defer self.alloc.free(blob);
+
+        // Deserialize. On failure the child is NOT ours to kill (predecessor's) —
+        // close only our master-fd copy and nack.
+        var fbs = std.io.fixedBufferStream(blob);
+        const terminal = session_transfer.deserialize(self.alloc, fbs.reader()) catch |err| {
+            log.warn("adopt deserialize failed session={d} err={}", .{ frame.session_id, err });
+            posix.close(master_fd);
+            try self.sendAdoptAck(frame.session_id, false);
+            return;
+        };
+
+        // Build the successor Session (consumes `terminal`; on failure it frees the
+        // terminal internally but NOT our master fd — close it, don't SIGHUP).
+        const session = Session.adopt(
+            self.alloc,
+            .{},
+            master_fd,
+            @intCast(frame.aux2),
+            terminal,
+        ) catch |err| {
+            log.warn("Session.adopt failed session={d} err={}", .{ frame.session_id, err });
+            posix.close(master_fd);
+            try self.sendAdoptAck(frame.session_id, false);
+            return;
+        };
+
+        // Register under the ORIGINAL session_id + start the owner thread. On any
+        // failure `registerAdoptedSession` has already destroyed the session (which
+        // SIGHUPs + closes — the successor DID own it once construction succeeded).
+        self.registerAdoptedSession(frame.session_id, session) catch |err| {
+            log.warn("register adopted session={d} err={}", .{ frame.session_id, err });
+            try self.sendAdoptAck(frame.session_id, false);
+            return;
+        };
+
+        try self.sendAdoptAck(frame.session_id, true);
+        // Report readiness with the live count (see the doc: a per-successful-adopt
+        // `ready` lets the supervisor, which knows the freeze count, wait for the
+        // final one without an explicit "all adopts sent" frame).
+        const live: u64 = blk: {
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            break :blk self.sessions.count();
+        };
+        self.control_write_mutex.lock();
+        defer self.control_write_mutex.unlock();
+        try handoff.proto.sendFrame(cfd, .{ .tag = .ready, .aux = live }, &.{});
+    }
+}
+
+/// FORK(host-handoff): send `adopt_ack{session_id, aux = 1|0}`.
+fn sendAdoptAck(self: *Server, session_id: u64, ok: bool) !void {
+    if (comptime builtin.os.tag == .macos) {
+        const cfd = self.control_fd orelse return;
+        self.control_write_mutex.lock();
+        defer self.control_write_mutex.unlock();
+        try handoff.proto.sendFrame(cfd, .{
+            .tag = .adopt_ack,
+            .session_id = session_id,
+            .aux = if (ok) 1 else 0,
+        }, &.{});
+    }
+}
+
+/// FORK(host-handoff): `shutdown` — the successor is serving, so the predecessor
+/// may exit(0). DESTROY the frozen state: close each retained (own) master fd and
+/// free each blob. Do NOT SIGHUP the children — the successor owns them now.
+/// Break the control loop (`control_running=false`), letting the process exit.
+fn handleShutdown(self: *Server) void {
+    if (comptime builtin.os.tag == .macos) {
+        self.registry_mutex.lock();
+        var it = self.frozen.iterator();
+        while (it.next()) |kv| {
+            posix.close(kv.value_ptr.master_fd);
+            self.alloc.free(kv.value_ptr.blob);
+        }
+        self.frozen.clearRetainingCapacity();
+        self.registry_mutex.unlock();
+
+        self.control_running.store(false, .release);
+    }
+}
+
+/// FORK(host-handoff): `unfreeze` — the handoff ABORTED (the successor never came
+/// up / never acked). Re-adopt every frozen session from the state we kept:
+/// deserialize its blob and `Session.adopt(own master fd, child pid, terminal)`,
+/// re-register under its original id + start it — resuming service on the SAME
+/// live children. This is the "incumbent survives a failed successor" path.
+fn handleUnfreeze(self: *Server) !void {
+    if (comptime builtin.os.tag == .macos) {
+        // Drain `frozen` into a local list so we can rebuild sessions without
+        // holding registry_mutex across Session.adopt / owner-thread spawn.
+        var items: std.ArrayList(struct { id: u64, fz: FrozenSession }) = .empty;
+        defer items.deinit(self.alloc);
+        {
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            var it = self.frozen.iterator();
+            while (it.next()) |kv| try items.append(self.alloc, .{ .id = kv.key_ptr.*, .fz = kv.value_ptr.* });
+            self.frozen.clearRetainingCapacity();
+        }
+
+        for (items.items) |item| {
+            const fz = item.fz;
+            defer self.alloc.free(fz.blob);
+
+            var fbs = std.io.fixedBufferStream(fz.blob);
+            const terminal = session_transfer.deserialize(self.alloc, fbs.reader()) catch |err| {
+                // We serialized it ourselves, so this is unexpected; salvage by
+                // closing our master fd (no successor to own it) and dropping it.
+                log.err("unfreeze deserialize failed session={d} err={}", .{ item.id, err });
+                posix.close(fz.master_fd);
+                continue;
+            };
+
+            const session = Session.adopt(
+                self.alloc,
+                .{},
+                fz.master_fd,
+                fz.child_pid,
+                terminal,
+            ) catch |err| {
+                log.err("unfreeze Session.adopt failed session={d} err={}", .{ item.id, err });
+                posix.close(fz.master_fd);
+                continue;
+            };
+
+            self.registerAdoptedSession(item.id, session) catch |err|
+                log.err("unfreeze register session={d} err={}", .{ item.id, err });
+        }
+    }
+}
+
+/// FORK(host-handoff): register an already-constructed (adopted) Session under
+/// `id` and start its owner thread — the adopt/unfreeze analogue of the tail of
+/// `spawnSession`, but locking `registry_mutex` itself (the control loop holds no
+/// lock, unlike handleAttach). On ANY failure the just-built Session is destroyed
+/// (its adopted-teardown SIGHUPs + closes, since construction transferred
+/// ownership) and the error is propagated.
+fn registerAdoptedSession(self: *Server, id: u64, session: *Session) !void {
+    if (comptime builtin.os.tag == .macos) {
+        // Own the session until its owner thread takes over. On ANY failure below,
+        // this errdefer destroys it — its adopted-teardown SIGHUPs + closes, since
+        // `Session.adopt` transferred ownership of the master fd + child to it.
+        // (`Session.destroy` from THIS thread is legal: runRenderLoop never ran, so
+        // its Phase-1 render-loop-thread assert is skipped.) Disarmed by the normal
+        // return once `sessionOwnerThread` is spawned and owns the destroy.
+        errdefer session.destroy();
+
+        const e = try self.alloc.create(SessionEntry);
+        errdefer self.alloc.destroy(e);
+        // FORK(host-handoff): an adopted session is already tracked by the
+        // supervisor (it sent the `adopt`), so the owner thread must NOT
+        // re-`register_master` it — that would corrupt the supervisor's registry
+        // and interleave into the handoff response stream.
+        e.* = .{ .server = self, .session_id = id, .session = session, .announce_master = false };
+        wireSessionHooks(e);
+
+        {
+            self.registry_mutex.lock();
+            defer self.registry_mutex.unlock();
+            try self.sessions.put(id, e);
+        }
+        errdefer {
+            self.registry_mutex.lock();
+            _ = self.sessions.remove(id);
+            self.registry_mutex.unlock();
+        }
+
+        e.thread = try std.Thread.spawn(.{}, sessionOwnerThread, .{e});
+    } else {
+        session.destroy();
+    }
+}
+
+/// FORK(host-handoff): TEST-ONLY — spawn a fresh login-shell session on this
+/// worker and return its entry (mirrors what an Attach would do, minus the socket
+/// conn), so a handoff test can drive a real shell without the full GUI protocol.
+/// Locks registry_mutex like handleAttach does around `spawnSession`.
+pub fn spawnSessionForTest(self: *Server) !*SessionEntry {
+    self.registry_mutex.lock();
+    defer self.registry_mutex.unlock();
+    return try self.spawnSession(null, null);
+}
+
 /// Tear down the server: stop accepting, quiesce read threads, tear down
 /// sessions, then free conns.
 ///
@@ -2731,6 +3368,18 @@ fn teardownEntry(self: *Server, e: *SessionEntry) void {
 ///      owner threads, keeping the F2 invariant intact by construction.
 pub fn deinit(self: *Server) void {
     self.running.store(false, .release);
+
+    // FORK(host-handoff): stop + join the control loop FIRST — it can spawn/adopt/
+    // destroy sessions + owner threads, so it must be quiescent before the session
+    // drain below. Clear the running flag, then shutdown control_fd to break a
+    // blocked recvFrame (Closed → loop exits), then join. (A `shutdown` frame may
+    // have already stopped it; this is idempotent.)
+    if (self.control_thread) |t| {
+        self.control_running.store(false, .release);
+        if (self.control_fd) |cfd| posix.shutdown(cfd, .both) catch {};
+        t.join();
+        self.control_thread = null;
+    }
 
     // Closing the listen fd unblocks the accept thread.
     posix.close(self.listen_fd);
@@ -2795,6 +3444,24 @@ pub fn deinit(self: *Server) void {
     }
     self.sessions.deinit();
 
+    // FORK(host-handoff): drop any still-frozen sessions (a worker torn down while
+    // a handoff was mid-flight / never resolved). Close each retained master fd and
+    // free each blob — do NOT SIGHUP the children (a frozen child is either the
+    // successor's now, or was already reaped). Empty on the standalone/non-macOS
+    // path, so this is a no-op there.
+    {
+        var it = self.frozen.iterator();
+        while (it.next()) |kv| {
+            posix.close(kv.value_ptr.master_fd);
+            self.alloc.free(kv.value_ptr.blob);
+        }
+        self.frozen.deinit();
+    }
+    // FORK(host-handoff): drop the announced-session dedup set.
+    self.announced_masters.deinit();
+    // FORK(host-handoff): the Server owns control_fd; close it (the loop is joined).
+    if (self.control_fd) |cfd| posix.close(cfd);
+
     // Tell the reaper to drain `dead_conns` and exit, then join it. By now
     // `conns` is already empty (we spun on it above) and every exited read
     // thread has migrated its Conn into `dead_conns`, so the reaper drains those
@@ -2810,7 +3477,11 @@ pub fn deinit(self: *Server) void {
     self.dead_conns.deinit(self.alloc);
     self.conns.deinit(self.alloc);
 
-    posix.unlink(self.path) catch {};
+    // FORK(host-handoff): only unlink the path if THIS Server bound it. A
+    // supervisor-managed worker (owns_path=false) shares a path the supervisor
+    // keeps bound across worker swaps; unlinking it here would break the next
+    // worker's accepts. The fd itself was already closed above regardless.
+    if (self.owns_path) posix.unlink(self.path) catch {};
     self.alloc.free(self.path);
 
     const alloc = self.alloc;

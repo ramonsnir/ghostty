@@ -96,20 +96,32 @@ enum ForkSetup {
     /// (successfully) installed/reloaded for. Drives version-aware reload.
     static let kInstalledHostVersion = "forkSetup.hostLaunchAgentVersion"
 
-    /// UserDefaults key: the host RELOAD IDENTITY the LaunchAgent was last
-    /// (re)loaded for — `ghostty_host_reload_identity()` decoded to "major.minor.epoch"
-    /// (protocol version + the GUI-side `host_reload_epoch`). The RELOAD decision keys
-    /// off THIS, not the bundle version and NOT the binary hash. The notarized host's
-    /// launchd LWCR is pinned to the Developer-ID identity (identifier + Team ID), NOT
-    /// the cdhash (verified empirically), so a new same-identity host build satisfies
-    /// the existing requirement and loads on the next natural restart with no bootout.
-    /// We therefore only bootout-reload (which kills the host's RAM-only sessions) when
-    /// the protocol/epoch actually changed — i.e. the running host can't serve the new
-    /// GUI, or a host-internal fix must run. A GUI-only update keeps the identity
-    /// stable ⇒ no reload ⇒ sessions preserved. (Replaced the former binary-hash key
-    /// `forkSetup.hostLaunchAgentBinaryHash`, which reloaded on any recompile even when
-    /// behavior was unchanged.)
-    static let kInstalledHostReloadIdentity = "forkSetup.hostLaunchAgentReloadIdentity"
+    /// (ramon fork / host-handoff) UserDefaults keys: the host's reload identity is
+    /// now SPLIT into a SUPERVISOR identity and a WORKER identity, so the common
+    /// worker-protocol change no longer triggers the destructive bootout. Both are
+    /// decoded from the SAME packed `ghostty_host_reload_identity()` value (see
+    /// `decodeReloadIdentities`); the launchd job now runs the SUPERVISOR
+    /// (`ghostty-host --supervise`), which fork/execs the WORKER that actually serves
+    /// GUI sessions.
+    ///
+    /// FIRST-CUT SPLIT (documented in HOST-HANDOFF.md): supervisor identity = the
+    /// protocol MAJOR (rare bumps) → a change means the supervisor binary / its
+    /// launchd contract changed → the RARE destructive `bootout`+`bootstrap`
+    /// (`.reload`, kills the host's RAM-only sessions). Worker identity = the protocol
+    /// MINOR + the GUI-side `host_reload_epoch` (common bumps) → a change with the
+    /// supervisor unchanged is a NON-destructive `.handoffWorker`: SIGHUP the running
+    /// supervisor so it re-execs its worker from the current bundle and BROKERS a
+    /// session-preserving handoff (no bootout, no LWCR reload — the new worker's
+    /// cdhash is a supervisor child, not a launchd job). A GUI-only update keeps BOTH
+    /// identities stable ⇒ `.upToDate` ⇒ sessions preserved.
+    ///
+    /// (Replaces the single `forkSetup.hostLaunchAgentReloadIdentity` key. An
+    /// upgrading colleague has neither new key recorded → the no-recorded-identity
+    /// branch of `plan()` records both WITHOUT a bootout, so the split rolls out
+    /// non-destructively; the actual plain-host→supervisor switchover is the one
+    /// deliberate destructive deploy, P4 in HOST-HANDOFF.md.)
+    static let kInstalledHostSupervisorIdentity = "forkSetup.hostLaunchAgentSupervisorIdentity"
+    static let kInstalledHostWorkerIdentity = "forkSetup.hostLaunchAgentWorkerIdentity"
 
     /// UserDefaults key: the CFBundleVersion the `ghostty-mcp` shim was last
     /// installed to `~/.local/bin` for. Drives version-aware reinstall.
@@ -253,7 +265,22 @@ enum ForkSetup {
             [
                 "Label": label,
                 ForkSetup.managedKey: managingBundleID,
-                "ProgramArguments": [hostBinaryPath, "--listen=\(socketPath)"],
+                // (ramon fork / host-handoff) The launchd job runs the SUPERVISOR, not
+                // a plain host: `ghostty-host --supervise --listen=<socket>`. The
+                // supervisor binds the socket once (forever), holds every pty master,
+                // and fork/execs the WORKER (`ghostty-host --handoff-worker …`, the same
+                // binary self-exec'd) that serves GUI sessions — so a worker upgrade is a
+                // session-preserving handoff (SIGHUP → `.handoffWorker`), not a bootout.
+                // `KeepAlive` now supervises the SUPERVISOR.
+                //
+                // IDEALLY the supervisor runs from a STABLE path (outside the churning
+                // bundle) so its OWN exec path never goes stale; bundling it (same binary
+                // as before, at Contents/MacOS/ghostty-host) is the FIRST cut. Residual:
+                // the supervisor's own exec path can still go stale if the bundle moves
+                // (Sparkle staging cleanup / Trash) — the supervisor's self-check WARNS on
+                // that; a stable-path install (e.g. copy the supervisor to ~/.local/bin
+                // and point ProgramArguments there) is a follow-up.
+                "ProgramArguments": [hostBinaryPath, "--supervise", "--listen=\(socketPath)"],
                 "EnvironmentVariables": ["GHOSTTY_RESOURCES_DIR": resourcesDir],
                 "RunAtLoad": true,
                 "KeepAlive": true,
@@ -291,8 +318,18 @@ enum ForkSetup {
         case skipExternallyManaged
         /// No plist yet → write it + bootstrap.
         case install(LaunchAgentSpec)
-        /// We own the plist and the bundle version changed → rewrite + reload
-        /// (bootout+bootstrap) so launchd re-derives the LWCR for the new binary.
+        /// (ramon fork / host-handoff) We own the plist, the SUPERVISOR identity is
+        /// unchanged, but the WORKER identity changed and a supervisor is RUNNING →
+        /// tell the running supervisor (SIGHUP) to re-exec its worker from the current
+        /// bundle and BROKER a session-preserving handoff. NON-destructive: NO bootout,
+        /// the AF_UNIX listener + the pty masters stay in the supervisor, live sessions
+        /// survive, and the new worker's cdhash needs no LWCR reload (it is a supervisor
+        /// CHILD, not a launchd job). This is now the COMMON host-upgrade path.
+        case handoffWorker(LaunchAgentSpec)
+        /// We own the plist and the SUPERVISOR identity changed → rewrite + reload
+        /// (bootout+bootstrap) so launchd re-derives the LWCR for the new supervisor
+        /// binary / its changed launchd contract. DESTRUCTIVE (kills the host's RAM-only
+        /// sessions) — now RARE (only a supervisor-identity change, not a worker one).
         case reload(LaunchAgentSpec)
         /// We own the plist and the version matches → nothing to do.
         case upToDate
@@ -311,19 +348,34 @@ enum ForkSetup {
     }
 
     /// Pure decision for the host LaunchAgent. See type doc for the safety rules.
+    ///
+    /// (ramon fork / host-handoff) The reload gate is now TWO-IDENTITY: a
+    /// SUPERVISOR identity + a WORKER identity, both decoded from the same packed
+    /// `ghostty_host_reload_identity()` (see `decodeReloadIdentities`). This splits
+    /// the single destructive reload so the COMMON worker-protocol change becomes a
+    /// non-destructive `.handoffWorker` (SIGHUP the running supervisor) and only a
+    /// RARE supervisor-identity change keeps the destructive `.reload`
+    /// (bootout+bootstrap).
     /// - Parameters:
     ///   - existingPlistManagedBy: the `GhosttyAppManaged` value found in the
     ///     existing plist, or nil if the file is absent OR present-but-unreadable
     ///     OR present-without-our-marker (all of which mean "not ours").
-    /// - Parameter agentRunning: whether the LaunchAgent is currently loaded AND
-    ///   running (a live pid). Only consulted to AVOID a destructive reload when
-    ///   the version bookkeeping was lost but the host is healthy.
+    ///   - installedSupervisorIdentity / installedWorkerIdentity: the recorded
+    ///     identities (nil on a fresh machine, an upgrade from the single-key build,
+    ///     or lost defaults).
+    ///   - currentSupervisorIdentity / currentWorkerIdentity: this bundle's identities.
+    /// - Parameter agentRunning: whether the LaunchAgent (the supervisor job) is
+    ///   currently loaded AND running (a live pid). Consulted to avoid a destructive
+    ///   reload when the bookkeeping was lost but the host is healthy, AND to decide
+    ///   whether a worker change can be SIGHUP-handed-off (needs a live supervisor).
     static func plan(
         bundledHostExists: Bool,
         existingPlistFileExists: Bool,
         existingPlistManagedBy: String?,
-        installedReloadIdentity: String?,
-        currentReloadIdentity: String,
+        installedSupervisorIdentity: String?,
+        currentSupervisorIdentity: String,
+        installedWorkerIdentity: String?,
+        currentWorkerIdentity: String,
         agentRunning: Bool,
         spec: LaunchAgentSpec
     ) -> Plan {
@@ -333,33 +385,42 @@ enum ForkSetup {
             guard existingPlistManagedBy == spec.managingBundleID else {
                 return .skipExternallyManaged
             }
-            // PRIMARY gate: the host RELOAD IDENTITY (protocol version + epoch), NOT
-            // the binary hash and NOT the bundle version. The notarized host's launchd
-            // LWCR is pinned to the Developer-ID identity (identifier + Team ID), not
-            // the cdhash (verified) — so a new same-identity host satisfies the existing
-            // requirement and loads on the next natural restart with no bootout. We
-            // therefore reload (bootout+bootstrap, which KILLS the host's RAM-only
-            // sessions) ONLY when the protocol/epoch changed — i.e. the running old host
-            // can't serve the new GUI, or a host-internal fix must actually run. A
-            // GUI-only release keeps the identity stable ⇒ sessions preserved. Bump the
-            // protocol version or `host_reload_epoch` (embedded.zig) to force a reload.
-            if let recorded = installedReloadIdentity {
-                if recorded == currentReloadIdentity {
-                    // Identity unchanged. Healthy → nothing to do; a recorded-but-
-                    // not-running host (booted out / plist half-removed) is revived
-                    // NON-DESTRUCTIVELY (no bootout — the LWCR is still satisfied).
-                    return agentRunning ? .upToDate : .revive(spec)
-                }
-                return .reload(spec)  // protocol/epoch changed → deliver the new host
+            // No recorded SUPERVISOR identity: fresh under the two-identity gate
+            // (upgrading from the single-key build — every existing colleague hits
+            // this exactly once — or lost defaults). Because the LWCR is
+            // identity-pinned, this transition is NON-DESTRUCTIVE: record both
+            // identities WITHOUT reloading. A running host is adopted; a not-running
+            // one is revived (bootstrap, no bootout).
+            guard let recordedSupervisor = installedSupervisorIdentity else {
+                return agentRunning ? .adoptRunning(spec) : .revive(spec)
             }
-            // No recorded identity: first launch under identity-gating (upgrading from
-            // a hash-keyed build — every existing colleague hits this exactly once), or
-            // lost defaults. Because the LWCR is identity-pinned, this transition is
-            // NON-DESTRUCTIVE — record the identity WITHOUT reloading. A running host is
-            // adopted; a not-running one is revived (bootstrap, no bootout). This is a
-            // strict improvement over the old hash gate's one-last-version-reload, which
-            // needlessly killed sessions on the upgrade.
-            return agentRunning ? .adoptRunning(spec) : .revive(spec)
+            // SUPERVISOR-identity gate (the RARE, destructive one). The notarized
+            // host's launchd LWCR is pinned to the Developer-ID identity (identifier +
+            // Team ID), not the cdhash (verified) — so a new same-identity supervisor
+            // satisfies the existing requirement and loads on the next natural restart
+            // with no bootout. We reload (bootout+bootstrap, which KILLS the host's
+            // RAM-only sessions) ONLY when the SUPERVISOR identity changed (the
+            // supervisor binary / its launchd contract changed — first cut: the
+            // protocol MAJOR). This dominates a concurrent worker change: a new
+            // supervisor re-establishes the whole job anyway.
+            if recordedSupervisor != currentSupervisorIdentity {
+                return .reload(spec)
+            }
+            // Supervisor unchanged. WORKER-identity gate (the COMMON, non-destructive
+            // one — first cut: protocol MINOR + `host_reload_epoch`). A worker change
+            // with a RUNNING supervisor is a session-preserving handoff: SIGHUP it so
+            // it re-execs the worker from the current bundle. If the supervisor is NOT
+            // running there is nothing to SIGHUP → revive brings it up (it then spawns
+            // a fresh worker at the current build anyway — no bootout, no lost sessions
+            // since there are none). A nil recorded worker identity with the supervisor
+            // matching is treated as up-to-date (belt-and-braces; we always record both).
+            if let recordedWorker = installedWorkerIdentity,
+               recordedWorker != currentWorkerIdentity {
+                return agentRunning ? .handoffWorker(spec) : .revive(spec)
+            }
+            // Both identities unchanged. Healthy → nothing to do; a recorded-but-
+            // not-running host is revived NON-DESTRUCTIVELY (no bootout).
+            return agentRunning ? .upToDate : .revive(spec)
         }
         return .install(spec)
     }
@@ -982,17 +1043,19 @@ enum ForkSetup {
         let ours = fileExists && managedBy == spec.managingBundleID
         let agentRunning = ours ? hostRunning(target: target) : false
 
-        // The lib-reported reload identity (protocol version + epoch) drives the reload
-        // decision — see kInstalledHostReloadIdentity. Read once here; the same string
-        // is recorded on every acting branch.
-        let currentReloadIdentity = hostReloadIdentityString()
+        // The lib-reported reload identities (supervisor + worker) drive the reload
+        // decision — see kInstalledHost{Supervisor,Worker}Identity. Decoded once here
+        // from the same packed value; both are recorded on every acting branch.
+        let (currentSupervisorIdentity, currentWorkerIdentity) = hostReloadIdentities()
 
         let decision = plan(
             bundledHostExists: bundledHostExists,
             existingPlistFileExists: fileExists,
             existingPlistManagedBy: managedBy,
-            installedReloadIdentity: defaults.string(forKey: kInstalledHostReloadIdentity),
-            currentReloadIdentity: currentReloadIdentity,
+            installedSupervisorIdentity: defaults.string(forKey: kInstalledHostSupervisorIdentity),
+            currentSupervisorIdentity: currentSupervisorIdentity,
+            installedWorkerIdentity: defaults.string(forKey: kInstalledHostWorkerIdentity),
+            currentWorkerIdentity: currentWorkerIdentity,
             agentRunning: agentRunning,
             spec: spec)
 
@@ -1002,49 +1065,131 @@ enum ForkSetup {
         case .skipExternallyManaged:
             logger.info("host LaunchAgent at \(plistPath, privacy: .public) is externally managed; not touching it")
         case .upToDate:
-            logger.debug("host LaunchAgent already loaded for reload identity \(currentReloadIdentity, privacy: .public)")
+            logger.debug("host LaunchAgent already loaded (supervisor \(currentSupervisorIdentity, privacy: .public), worker \(currentWorkerIdentity, privacy: .public))")
         case .adoptRunning(let spec):
-            // Healthy host already running but no recorded reload identity (upgrading
-            // from a hash-keyed build, or lost defaults): record the identity + refresh
+            // Healthy host already running but no recorded identities (upgrading from
+            // the single-key / hash-keyed build, or lost defaults): record both + refresh
             // the plist on disk — NO bootout, so the running host's sessions survive.
-            // Recording it here means future GUI-only updates compare equal and never
-            // reload. (Safe on the hash→identity upgrade because the LWCR is
-            // identity-pinned — the running old host keeps serving.)
+            // Recording them here means future GUI-only updates compare equal and never
+            // reload. (Safe because the LWCR is identity-pinned — the running old host
+            // keeps serving. NOTE: this refreshes the plist to the --supervise form; the
+            // running plain host keeps serving until the deliberate P4 switchover.)
             try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
-            defaults.set(bundleVersion, forKey: kInstalledHostVersion)
-            defaults.set(currentReloadIdentity, forKey: kInstalledHostReloadIdentity)
-            logger.info("adopted already-running host LaunchAgent \(spec.label, privacy: .public); recorded reload identity \(currentReloadIdentity, privacy: .public) without restart")
+            recordHostIdentities(defaults: defaults, bundleVersion: bundleVersion,
+                                 supervisor: currentSupervisorIdentity, worker: currentWorkerIdentity)
+            logger.info("adopted already-running host LaunchAgent \(spec.label, privacy: .public); recorded identities (supervisor \(currentSupervisorIdentity, privacy: .public), worker \(currentWorkerIdentity, privacy: .public)) without restart")
+        case .handoffWorker(let spec):
+            // COMMON host upgrade: the WORKER identity changed but the SUPERVISOR
+            // identity did NOT, and a supervisor is running. Tell the running supervisor
+            // to re-exec its worker from the current bundle via SIGHUP — it brokers a
+            // freeze→adopt handoff and the live sessions SURVIVE. NO bootout; the new
+            // worker's cdhash needs no LWCR reload (it is a supervisor child). Refresh
+            // the plist on disk (harmless; keeps it current) so a future launchd restart
+            // brings up the same spec.
+            //
+            // ⚠️ DEPLOY-ORDERING CAVEAT: this SIGHUP assumes the running job is a GENUINE
+            // supervisor (its handler treats SIGHUP as "hand off to a new worker"). A plain
+            // pre-supervisor host's DEFAULT SIGHUP action is TERMINATION — so worker
+            // handoffs must not be relied on until the deliberate P4 plain-host→supervisor
+            // switchover has actually brought a supervisor up. The migration path
+            // (`.adoptRunning`, below) records the supervisor identity WITHOUT verifying the
+            // running process is already a supervisor, so land the two-identity ForkSetup
+            // change together with the P4 switchover (see HOST-HANDOFF.md), not ahead of it.
+            try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+            if signalSupervisorWorkerHandoff(target: target) {
+                recordHostIdentities(defaults: defaults, bundleVersion: bundleVersion,
+                                     supervisor: currentSupervisorIdentity, worker: currentWorkerIdentity)
+                logger.info("signaled running host supervisor \(spec.label, privacy: .public) to hand off to a new worker (worker identity \(currentWorkerIdentity, privacy: .public)); sessions preserved")
+            } else {
+                // Couldn't resolve the supervisor pid to signal. Leave the recorded worker
+                // identity STALE so the next launch retries; do NOT bootout (that would
+                // kill sessions). A natural relaunch or the supervisor's own exec-path
+                // staleness self-check will pick up the new worker.
+                logger.warning("could not resolve host supervisor pid to signal a worker handoff; will retry next launch")
+            }
         case .install(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                reloadIdentity: currentReloadIdentity, defaults: defaults, fileManager: fileManager,
-                                bootout: false, verb: "installed")
+                                supervisorIdentity: currentSupervisorIdentity, workerIdentity: currentWorkerIdentity,
+                                defaults: defaults, fileManager: fileManager, bootout: false, verb: "installed")
         case .reload(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                reloadIdentity: currentReloadIdentity, defaults: defaults, fileManager: fileManager,
-                                bootout: true, verb: "reloaded")
+                                supervisorIdentity: currentSupervisorIdentity, workerIdentity: currentWorkerIdentity,
+                                defaults: defaults, fileManager: fileManager, bootout: true, verb: "reloaded")
         case .revive(let spec):
             installAndBootstrap(spec: spec, plistPath: plistPath, bundleVersion: bundleVersion,
-                                reloadIdentity: currentReloadIdentity, defaults: defaults, fileManager: fileManager,
-                                bootout: false, verb: "revived")
+                                supervisorIdentity: currentSupervisorIdentity, workerIdentity: currentWorkerIdentity,
+                                defaults: defaults, fileManager: fileManager, bootout: false, verb: "revived")
         }
     }
 
-    /// The bundled host's reload identity as "major.minor.epoch", decoded from the
-    /// lib's packed `ghostty_host_reload_identity()` (protocol version + the GUI-side
-    /// `host_reload_epoch`). The value the reload gate compares — see
-    /// kInstalledHostReloadIdentity. Not the host BINARY's identity: it's the lib's,
-    /// which is exactly what we want (the lib and the bundled host are built together).
-    static func hostReloadIdentityString() -> String {
-        decodeReloadIdentity(ghostty_host_reload_identity())
+    /// Record the installed host version + both reload identities in one place, so
+    /// every acting branch keeps the three keys consistent.
+    private static func recordHostIdentities(
+        defaults: UserDefaults, bundleVersion: String, supervisor: String, worker: String
+    ) {
+        defaults.set(bundleVersion, forKey: kInstalledHostVersion)
+        defaults.set(supervisor, forKey: kInstalledHostSupervisorIdentity)
+        defaults.set(worker, forKey: kInstalledHostWorkerIdentity)
     }
 
-    /// Pure decode of the packed reload identity → "major.minor.epoch". Split out so
-    /// the bit-unpacking is unit-testable without the lib call.
+    /// (ramon fork / host-handoff) Resolve the RUNNING supervisor's pid from
+    /// `launchctl print <target>` and send it SIGHUP — the "a new worker is available"
+    /// trigger (see HOST-HANDOFF.md). The supervisor re-execs its worker from the
+    /// current bundle and brokers a session-preserving handoff; its SIGHUP handler is
+    /// async-signal-safe (posts to its reader thread). Returns true iff a live pid was
+    /// found AND `kill(2)` succeeded. Best-effort: a missing pid or a kill failure
+    /// returns false and the caller retries next launch — it NEVER boots out (that
+    /// would kill sessions).
+    private static func signalSupervisorWorkerHandoff(target: String) -> Bool {
+        guard let pid = supervisorPID(target: target) else { return false }
+        return kill(pid, SIGHUP) == 0
+    }
+
+    /// Parse the `pid = N` line from `launchctl print <target>` for a running job.
+    /// Returns nil if the job isn't printable or has no live pid. Reuses the same
+    /// `pid = \d+` shape `hostRunning` matches on.
+    private static func supervisorPID(target: String) -> pid_t? {
+        let result = runLaunchctlCapturing(["print", target])
+        guard result.status == 0,
+              let range = result.stdout.range(of: #"pid = \d+"#, options: .regularExpression)
+        else { return nil }
+        let digits = result.stdout[range].drop(while: { !$0.isNumber })
+        return pid_t(digits)
+    }
+
+    /// (ramon fork / host-handoff) The bundled host's (supervisor, worker) reload
+    /// identities, decoded from the lib's packed `ghostty_host_reload_identity()`
+    /// (protocol version + the GUI-side `host_reload_epoch`). These are what the reload
+    /// gate compares — see kInstalledHost{Supervisor,Worker}Identity. Not the host
+    /// BINARY's identity: it's the lib's, which is exactly what we want (the lib and the
+    /// bundled host are built together).
+    static func hostReloadIdentities() -> (supervisor: String, worker: String) {
+        decodeReloadIdentities(ghostty_host_reload_identity())
+    }
+
+    /// Pure decode of the packed reload identity → the combined "major.minor.epoch"
+    /// string (kept for the human-readable one-liner + as the base for the split).
+    /// Split out so the bit-unpacking is unit-testable without the lib call.
     static func decodeReloadIdentity(_ packed: UInt64) -> String {
         let major = (packed >> 32) & 0xFFFF
         let minor = (packed >> 16) & 0xFFFF
         let epoch = packed & 0xFFFF
         return "\(major).\(minor).\(epoch)"
+    }
+
+    /// (ramon fork / host-handoff) Pure carve of the SAME packed value into a
+    /// SUPERVISOR identity and a WORKER identity — no new C export needed (see
+    /// HOST-HANDOFF.md). FIRST-CUT SPLIT: supervisor = protocol MAJOR (a change is
+    /// RARE and means a destructive `.reload`); worker = protocol MINOR + the GUI-side
+    /// `host_reload_epoch` (a change is COMMON and means a non-destructive
+    /// `.handoffWorker` — SIGHUP the running supervisor). Bumping the protocol MINOR or
+    /// `host_reload_epoch` (embedded.zig) upgrades the worker without a bootout; only a
+    /// protocol MAJOR bump forces the supervisor reload.
+    static func decodeReloadIdentities(_ packed: UInt64) -> (supervisor: String, worker: String) {
+        let major = (packed >> 32) & 0xFFFF
+        let minor = (packed >> 16) & 0xFFFF
+        let epoch = packed & 0xFFFF
+        return (supervisor: "\(major)", worker: "\(minor).\(epoch)")
     }
 
     /// Write the plist and (re)bring-up the agent.
@@ -1055,7 +1200,8 @@ enum ForkSetup {
     ///   then guarantees a loaded-but-stopped job starts (it never restarts a
     ///   running one, lacking `-k`).
     private static func installAndBootstrap(
-        spec: LaunchAgentSpec, plistPath: String, bundleVersion: String, reloadIdentity: String,
+        spec: LaunchAgentSpec, plistPath: String, bundleVersion: String,
+        supervisorIdentity: String, workerIdentity: String,
         defaults: UserDefaults, fileManager: FileManager, bootout: Bool, verb: String
     ) {
         let dir = (plistPath as NSString).deletingLastPathComponent
@@ -1096,11 +1242,11 @@ enum ForkSetup {
         // LWCR was just re-derived, but this keeps the recorded-success bar honest.)
         let loaded = hostRunning(target: target)
         if loaded {
-            defaults.set(bundleVersion, forKey: kInstalledHostVersion)
-            // Record the reload identity so subsequent GUI-only updates (protocol/epoch
+            // Record both identities so subsequent GUI-only updates (protocol/epoch
             // unchanged) compare equal and skip the reload, preserving live sessions.
-            defaults.set(reloadIdentity, forKey: kInstalledHostReloadIdentity)
-            logger.info("\(verb, privacy: .public) host LaunchAgent \(spec.label, privacy: .public) for reload identity \(reloadIdentity, privacy: .public)")
+            recordHostIdentities(defaults: defaults, bundleVersion: bundleVersion,
+                                 supervisor: supervisorIdentity, worker: workerIdentity)
+            logger.info("\(verb, privacy: .public) host LaunchAgent \(spec.label, privacy: .public) (supervisor \(supervisorIdentity, privacy: .public), worker \(workerIdentity, privacy: .public))")
         } else {
             // The old job was booted out and the new one would not load: the host
             // is OFFLINE (terminals will be empty) until the next relaunch. Leave

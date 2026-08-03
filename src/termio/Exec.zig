@@ -43,6 +43,31 @@ const FlatpakHostCommand = if (!build_config.flatpak) struct {
 /// The subprocess state for our exec backend.
 subprocess: Subprocess,
 
+/// FORK(host-handoff): the ADOPT payload. When non-null, `threadEnter` reuses an
+/// already-open pty master fd + an already-running child pid (handed off from a
+/// predecessor `ghostty-host`) INSTEAD of spawning a fresh subprocess: it skips
+/// `subprocess.start`, builds the exit watcher from `child_pid`, and reads from
+/// `master_fd`. The `subprocess` is then never started (pty==null, process==null),
+/// so its teardown neither SIGHUPs the child nor closes the master; the adopt
+/// teardown in `threadExit` owns both (SIGHUP `child_pid`, close `master_fd`). Null
+/// on the normal `.exec` path, where every code path is byte-for-byte unchanged.
+adopt: ?Adopt = null,
+
+/// FORK(host-handoff): detach-for-handoff request. When set before the IO thread
+/// is stopped, `threadExit` gives up the pty WITHOUT SIGHUP-ing the child or
+/// closing the master (it neutralizes the subprocess so the later `Exec.deinit`
+/// does neither) — the successor `ghostty-host` will keep reading the same master
+/// (shared kernel read pointer across dup/SCM_RIGHTS) and reap the child. False on
+/// the normal path (unchanged teardown). Mutually exclusive with `adopt` in
+/// practice, but `detach_requested` takes precedence if both were ever set.
+detach_requested: bool = false,
+
+/// FORK(host-handoff): the ADOPT payload type (see the `adopt` field).
+pub const Adopt = struct {
+    master_fd: posix.fd_t,
+    child_pid: posix.pid_t,
+};
+
 /// Initialize the exec state. This will NOT start it, this only sets
 /// up the internal state necessary to start it later.
 pub fn init(
@@ -56,6 +81,30 @@ pub fn init(
 }
 
 pub fn deinit(self: *Exec) void {
+    // FORK(host-handoff): release a handed-off session's adopt resources EXACTLY
+    // ONCE, regardless of whether the IO thread ever ran `threadExit`. `self.adopt`
+    // is non-null here ONLY for an adopted session that never reached a teardown
+    // which consumed it. Case matrix:
+    //   (a) normal `.exec` — `adopt == null` (never set) → skip; byte-for-byte
+    //       unchanged for the non-handoff path.
+    //   (b) adopted, STARTED then closed — `threadExit`'s adopt branch already
+    //       closed the master + SIGHUP'd the child + nulled `self.adopt` → skipped
+    //       here (no double-close, no double-SIGHUP).
+    //   (c) adopted, STARTED then DETACHED (handed off again) — `threadExit`'s
+    //       detach branch nulled `self.adopt` (the master moved to the successor)
+    //       → skipped here (must NOT close a handed-off master).
+    //   (d) adopted, NEVER STARTED — e.g. `Session.adopt` succeeded but the owner
+    //       thread failed to spawn, so `Session.destroy` runs `Exec.deinit` without
+    //       any `threadExit`. `self.adopt` is still set → close the master + SIGHUP/
+    //       reap the child HERE, so the pty master fd is not LEAKED and the child
+    //       not ORPHANED. (`Session.adopt` sets `adopt` only on full SUCCESS — a
+    //       mid-construction FAILURE leaves it null, so the caller that passed the
+    //       fd still owns closing it; there is no double-close on that path.)
+    if (self.adopt) |a| {
+        posix.close(a.master_fd);
+        Subprocess.killPid(@intCast(a.child_pid)) catch {};
+        self.adopt = null;
+    }
     self.subprocess.deinit();
 }
 
@@ -88,22 +137,66 @@ pub fn threadEnter(
     io: *termio.Termio,
     td: *termio.Termio.ThreadData,
 ) !void {
-    // Start our subprocess
-    const pty_fds = self.subprocess.start(alloc) catch |err| {
-        // If we specifically got this error then we are in the forked
-        // process and our child failed to execute. If we DIDN'T
-        // get this specific error then we're in the parent and
-        // we need to bubble it up.
-        if (err != error.ExecFailedInChild) return err;
+    // FORK(host-handoff): ADOPT short-circuits `subprocess.start`. When
+    // `self.adopt` is set we reuse the handed-off master fd (both read+write, as
+    // for a POSIX pty) and build the exit watcher from the handed-off child pid.
+    // EVERYTHING below the two acquisitions (kill pipe, write stream, termios
+    // timer, read thread, td.backend, process.wait, termios timer arm) is shared
+    // and unchanged. When `self.adopt` is null every statement here is
+    // byte-for-byte the original `.exec` path.
 
-        // We're in the child. Nothing more we can do but abnormal exit.
-        // The Command will output some additional information.
-        posix.exit(1);
+    // Start our subprocess (skipped entirely when adopting). The explicit
+    // `PtyFds` result type lets the adopt literal and the wrapped `start()` result
+    // peer-resolve; the `else` branch is behaviorally identical to the original
+    // `const pty_fds = self.subprocess.start(...) catch ...`.
+    const PtyFds = struct { read: Pty.Fd, write: Pty.Fd };
+    const pty_fds: PtyFds = if (self.adopt) |adopt| .{
+        .read = adopt.master_fd,
+        .write = adopt.master_fd,
+    } else fds: {
+        const started = self.subprocess.start(alloc) catch |err| {
+            // If we specifically got this error then we are in the forked
+            // process and our child failed to execute. If we DIDN'T
+            // get this specific error then we're in the parent and
+            // we need to bubble it up.
+            if (err != error.ExecFailedInChild) return err;
+
+            // We're in the child. Nothing more we can do but abnormal exit.
+            // The Command will output some additional information.
+            posix.exit(1);
+        };
+        break :fds .{ .read = started.read, .write = started.write };
     };
-    errdefer self.subprocess.stop();
+    errdefer if (self.adopt == null) self.subprocess.stop();
 
-    // Watcher to detect subprocess exit
-    var process: ?xev.Process = if (self.subprocess.process) |v| switch (v) {
+    // FORK(host-handoff): while adopting, the (inert) subprocess will NOT clean up
+    // the handed-off master fd on the normal teardown path, so a mid-init failure
+    // here must release it itself or it leaks. Runs ONLY on a threadEnter error (on
+    // success threadEnter returns void and this never fires; the read thread is
+    // spawned as the last fallible step, so if we reach an error the reader is not
+    // yet polling the master and closing it is safe).
+    //
+    // task #7: an adopt-INIT failure must CLOSE ONLY this successor's master-fd
+    // copy — it must NEVER SIGHUP the child. During a handoff the child still
+    // belongs to the PREDECESSOR (which kept it alive and, on abort, `unfreeze`s —
+    // re-adopts — its frozen sessions). This successor holds only a COPY of the pty
+    // master (received via SCM_RIGHTS); the pid it watches is the predecessor's live
+    // child. Killing that child here would destroy the predecessor's still-live
+    // session out from under the abort/unfreeze recovery — the exact "incumbent
+    // survives a failed successor" invariant. So we release our master-fd copy and
+    // leave the child untouched. (The adopted-session NORMAL teardown in
+    // `threadExit` still SIGHUPs + reaps on a REAL close — that path is unchanged;
+    // only this mid-init FAILURE path must not.)
+    errdefer if (self.adopt) |adopt| {
+        posix.close(adopt.master_fd);
+    };
+
+    // Watcher to detect subprocess exit. When adopting, watch the handed-off
+    // pid directly (xev.Process on macOS/Linux watches ANY pid, so we don't need
+    // to have forked it).
+    var process: ?xev.Process = if (self.adopt) |adopt|
+        try xev.Process.init(adopt.child_pid)
+    else if (self.subprocess.process) |v| switch (v) {
         .fork_exec => |cmd| try xev.Process.init(
             cmd.pid orelse return error.ProcessNoPid,
         ),
@@ -196,6 +289,50 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     assert(td.backend == .exec);
     const exec = &td.backend.exec;
 
+    // FORK(host-handoff): detach-for-handoff. Give up the pty WITHOUT SIGHUP-ing
+    // the child or closing the master. Neutralize the subprocess so the later
+    // `Exec.deinit` -> `subprocess.deinit` does neither: `pty = null` makes
+    // `pty.deinit` (the master close) a no-op, and `process = null` makes
+    // `subprocess.stop` a no-op (no SIGHUP). Then stop the read thread the same
+    // way the normal path does. The caller extracted (dup'd) the master fd + pid
+    // BEFORE requesting the detach (masterFdForHandoff / childPidForHandoff read
+    // `subprocess`, which we null out here), and the successor resumes reading the
+    // same master (the kernel read pointer is shared across dup/SCM_RIGHTS).
+    if (self.detach_requested) {
+        self.subprocess.pty = null;
+        self.subprocess.process = null;
+        // Neutralize an ADOPTED session's handle too, symmetrically: after a
+        // detach, `masterFdForHandoff`/`childPidForHandoff` must return null (the
+        // fd + child now belong to the NEXT successor), and the adopt-teardown
+        // branch below must never SIGHUP/close a handed-off master. The detach
+        // path (like the fresh one) neither closes the master nor SIGHUPs — the
+        // caller extracted both before requesting the detach.
+        self.adopt = null;
+        stopReadThread(exec);
+        return;
+    }
+
+    // FORK(host-handoff): adopted-session teardown. The subprocess was never
+    // started (pty==null, process==null), so neither `subprocess.stop` nor
+    // `subprocess.deinit` will SIGHUP the child or close the master. Do both here:
+    // SIGHUP the adopted child (unless the exit watcher already saw it exit), stop
+    // the read thread, then close the master fd EXACTLY ONCE (nobody else owns it
+    // — `subprocess.deinit`'s null-pty branch skips its close, so there is no
+    // double-close). Ordering mirrors the normal path: kill first (so a noisy
+    // child stops writing), then stop the reader, then release the fd after the
+    // reader has joined (never close a fd the read thread is still polling).
+    if (self.adopt) |adopt| {
+        if (!exec.exited) Subprocess.killPid(@intCast(adopt.child_pid)) catch |err|
+            log.warn("error sending SIGHUP to adopted child err={}", .{err});
+        stopReadThread(exec);
+        posix.close(adopt.master_fd);
+        // FORK(host-handoff): the adopt resources are now released — null the
+        // handle so the later `Exec.deinit` (case (b)) does NOT double-close the
+        // master / double-SIGHUP the child.
+        self.adopt = null;
+        return;
+    }
+
     if (exec.exited) self.subprocess.externalExit();
     self.subprocess.stop();
 
@@ -216,6 +353,32 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
 
     if (comptime builtin.os.tag == .windows) {
         // Interrupt the blocking read so the thread can see the quit message
+        if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
+            switch (windows.kernel32.GetLastError()) {
+                .NOT_FOUND => {},
+                else => |err| log.warn("error interrupting read thread err={}", .{err}),
+            }
+        }
+    }
+
+    exec.read_thread.join();
+}
+
+/// FORK(host-handoff): stop the pty read thread — write the quit byte to its
+/// pipe, cancel a blocking Windows read, and join. This is exactly the inline
+/// sequence the normal `threadExit` uses; it is factored out ONLY so the new
+/// adopt + detach teardown branches can reuse it. The normal `.exec` teardown
+/// keeps its copy inline (byte-for-byte unchanged).
+fn stopReadThread(exec: *ThreadData) void {
+    _ = posix.write(exec.read_thread_pipe, "x") catch |err| switch (err) {
+        error.BrokenPipe => {},
+        else => log.warn(
+            "error writing to read thread quit pipe err={}",
+            .{err},
+        ),
+    };
+
+    if (comptime builtin.os.tag == .windows) {
         if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
             switch (windows.kernel32.GetLastError()) {
                 .NOT_FOUND => {},
@@ -266,6 +429,27 @@ pub fn resize(
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
 ) !void {
+    // FORK(host-handoff): an adopted Exec never started `subprocess` (pty==null),
+    // so `subprocess.resize` would only record the size and skip the pty ioctl,
+    // leaving the handed-off shell's window size stale after a GUI resize. Set the
+    // size directly on the handed-off master fd instead (TIOCSWINSZ needs only the
+    // master). POSIX host only — the `comptime` switch keeps the `Pty{ .master }`
+    // literal out of Windows analysis (WindowsPty has no `master`).
+    if (self.adopt) |adopt| {
+        switch (comptime builtin.os.tag) {
+            .windows => {},
+            else => {
+                var pty: Pty = .{ .master = adopt.master_fd, .slave = undefined };
+                pty.setSize(.{
+                    .ws_row = std.math.cast(u16, grid_size.rows) orelse std.math.maxInt(u16),
+                    .ws_col = std.math.cast(u16, grid_size.columns) orelse std.math.maxInt(u16),
+                    .ws_xpixel = std.math.cast(u16, screen_size.width) orelse std.math.maxInt(u16),
+                    .ws_ypixel = std.math.cast(u16, screen_size.height) orelse std.math.maxInt(u16),
+                }) catch |err| log.warn("error resizing adopted pty master err={}", .{err});
+            },
+        }
+        return;
+    }
     return try self.subprocess.resize(grid_size, screen_size);
 }
 
@@ -1656,6 +1840,34 @@ pub fn childPidForDiag(self: *const Exec) ?posix.pid_t {
         .fork_exec => |cmd| cmd.pid,
         .flatpak => null,
     };
+}
+
+/// FORK(host-handoff): the live pty master fd of a spawned `.exec` (the fd the
+/// read thread polls and the write stream writes), or null if the subprocess was
+/// not started with a pty (adopting, flatpak, Windows, or pre-start). Reads
+/// STORED state only (no syscalls, no mutation), so the normal `.exec` path is
+/// unaffected. The handoff caller `dup`s this (or passes it via SCM_RIGHTS) to a
+/// successor session BEFORE requesting a detach. POSIX only — a `Pty` on Windows
+/// has no single `master`, so this returns null there.
+pub fn masterFdForHandoff(self: *const Exec) ?posix.fd_t {
+    if (comptime builtin.os.tag == .windows) return null;
+    // An ADOPTED Exec never started `subprocess` (pty==null); its live master is
+    // the handed-off `self.adopt.master_fd`. Surfacing it here makes a SUCCESSOR
+    // itself handoff-capable (a chained worker swap: successor→predecessor). A
+    // `detachForHandoff` nulls `self.adopt` (threadExit), so a detached adopted
+    // session correctly returns null, exactly like a detached fresh one.
+    if (self.adopt) |adopt| return adopt.master_fd;
+    return if (self.subprocess.pty) |pty| pty.master else null;
+}
+
+/// FORK(host-handoff): the direct child pid to hand off (the fork/exec leader the
+/// exit watcher is attached to), or null if there is none. Reads STORED state
+/// only. For an ADOPTED Exec (no fork/exec of our own) this is the handed-off
+/// `self.adopt.child_pid`, so a successor can hand its child off again; otherwise
+/// it is `childPidForDiag`'s fork/exec pid. Null after a detach (adopt nulled).
+pub fn childPidForHandoff(self: *const Exec) ?posix.pid_t {
+    if (self.adopt) |adopt| return adopt.child_pid;
+    return self.childPidForDiag();
 }
 
 test "execCommand darwin: shell command" {

@@ -22,6 +22,8 @@ const point = @import("point.zig");
 const size = @import("size.zig");
 const style = @import("style.zig");
 const hyperlink = @import("hyperlink.zig");
+// FORK(host-handoff): shared (de)serialization helpers.
+const serial = @import("serial.zig");
 const Offset = size.Offset;
 const Page = pagepkg.Page;
 const Row = pagepkg.Row;
@@ -565,6 +567,177 @@ pub fn clone(
     result.assertIntegrity();
     return result;
 }
+
+// FORK(host-handoff): full-fidelity same-build (de)serialization ------------
+//
+// Reproduces clone()'s pin-remap model but over a byte stream and for the WHOLE
+// screen (cursor style/hyperlink, saved cursor, selection, charset, kitty
+// keyboard/graphics, semantic prompt) — not just the read-only subset clone()
+// keeps. The pagelist is serialized first; every pin (cursor, selection,
+// kitty placements) is then encoded by location and re-tracked on rebuild.
+
+/// The maximum length of a heap-allocated URI/id we'll read from a serialized
+/// cursor hyperlink. Same-build handoff is trusted, but this bounds a
+/// speculative allocation on a truncated stream.
+const max_serialized_uri = 1 << 20;
+
+/// Serialize this screen to `writer`.
+pub fn serialize(self: *const Screen, writer: anytype) !void {
+    try self.pages.serialize(writer);
+    try serial.writePod(writer, self.no_scrollback);
+    try self.serializeCursor(writer);
+    try serial.writeOptPod(writer, self.saved_cursor);
+    try self.serializeSelection(writer);
+    try serial.writePod(writer, self.charset);
+    try serial.writePod(writer, self.protected_mode);
+    try serial.writePod(writer, self.kitty_keyboard);
+    try serial.writePod(writer, self.semantic_prompt);
+    try serial.writePod(writer, self.dirty);
+    if (comptime build_options.kitty_graphics) {
+        try self.kitty_images.serialize(&self.pages, writer);
+    }
+}
+
+/// Rebuild a screen written by `serialize`. The returned screen owns all its
+/// memory and must be `deinit`ed.
+pub fn deserialize(alloc: Allocator, reader: anytype) !Screen {
+    var self: Screen = undefined;
+    self.alloc = alloc;
+    self.pages = try PageList.deserialize(alloc, reader);
+    errdefer self.pages.deinit();
+
+    self.no_scrollback = try serial.readPod(bool, reader);
+
+    self.cursor = try self.deserializeCursor(alloc, reader);
+    errdefer self.cursor.deinit(alloc);
+
+    self.saved_cursor = try serial.readOptPod(SavedCursor, reader);
+    self.selection = try self.deserializeSelection(reader);
+    self.charset = try serial.readPod(CharsetState, reader);
+    self.protected_mode = try serial.readPod(ansi.ProtectedMode, reader);
+    self.kitty_keyboard = try serial.readPod(kitty.KeyFlagStack, reader);
+    self.semantic_prompt = try serial.readPod(SemanticPrompt, reader);
+    self.dirty = try serial.readPod(Dirty, reader);
+
+    if (comptime build_options.kitty_graphics) {
+        self.kitty_images = try kitty.graphics.ImageStorage.deserialize(
+            alloc,
+            &self.pages,
+            reader,
+        );
+    } else {
+        self.kitty_images = .{};
+    }
+
+    self.assertIntegrity();
+    return self;
+}
+
+fn serializeCursor(self: *const Screen, writer: anytype) !void {
+    const c = &self.cursor;
+    try serial.writePod(writer, c.x);
+    try serial.writePod(writer, c.y);
+    try serial.writePod(writer, c.pending_wrap);
+    try serial.writePod(writer, c.cursor_style);
+    try serial.writePod(writer, c.protected);
+    try serial.writePod(writer, c.style);
+    try serial.writePod(writer, c.style_id);
+    try serial.writePod(writer, c.hyperlink_id);
+    try serial.writePod(writer, c.hyperlink_implicit_id);
+    try serial.writePod(writer, c.semantic_content);
+    try serial.writePod(writer, c.semantic_content_clear_eol);
+
+    // Active cursor hyperlink (heap-allocated OSC8 in-progress link).
+    if (c.hyperlink) |link| {
+        try writer.writeByte(1);
+        switch (link.id) {
+            .implicit => |v| {
+                try writer.writeByte(0);
+                try serial.writePod(writer, v);
+            },
+            .explicit => |v| {
+                try writer.writeByte(1);
+                try serial.writeBytes(writer, v);
+            },
+        }
+        try serial.writeBytes(writer, link.uri);
+    } else {
+        try writer.writeByte(0);
+    }
+
+    // The cursor's page location; re-tracked on rebuild.
+    try self.pages.serializePinLoc(writer, self.cursor.page_pin);
+}
+
+fn deserializeCursor(self: *Screen, alloc: Allocator, reader: anytype) !Cursor {
+    var c: Cursor = undefined;
+    c.x = try serial.readPod(size.CellCountInt, reader);
+    c.y = try serial.readPod(size.CellCountInt, reader);
+    c.pending_wrap = try serial.readPod(bool, reader);
+    c.cursor_style = try serial.readPod(CursorStyle, reader);
+    c.protected = try serial.readPod(bool, reader);
+    c.style = try serial.readPod(style.Style, reader);
+    c.style_id = try serial.readPod(style.Id, reader);
+    c.hyperlink_id = try serial.readPod(hyperlink.Id, reader);
+    c.hyperlink_implicit_id = try serial.readPod(size.OffsetInt, reader);
+    c.semantic_content = try serial.readPod(pagepkg.Cell.SemanticContent, reader);
+    c.semantic_content_clear_eol = try serial.readPod(bool, reader);
+
+    c.hyperlink = null;
+    if ((try reader.readByte()) != 0) {
+        const id: hyperlink.Hyperlink.Id = switch (try reader.readByte()) {
+            0 => .{ .implicit = try serial.readPod(size.OffsetInt, reader) },
+            1 => .{ .explicit = try serial.readBytes(alloc, reader, max_serialized_uri) },
+            else => return error.InvalidHyperlinkId,
+        };
+        errdefer switch (id) {
+            .explicit => |v| alloc.free(v),
+            .implicit => {},
+        };
+        const uri = try serial.readBytes(alloc, reader, max_serialized_uri);
+        errdefer alloc.free(uri);
+        const link = try alloc.create(hyperlink.Hyperlink);
+        link.* = .{ .id = id, .uri = uri };
+        c.hyperlink = link;
+    }
+    errdefer if (c.hyperlink) |link| {
+        link.deinit(alloc);
+        alloc.destroy(link);
+    };
+
+    // Re-track the cursor's page pin and derive its row/cell pointers.
+    const pin = try self.pages.trackPinAt(try PageList.readPinLoc(reader));
+    const rac = pin.rowAndCell();
+    c.page_pin = pin;
+    c.page_row = rac.row;
+    c.page_cell = rac.cell;
+    return c;
+}
+
+fn serializeSelection(self: *const Screen, writer: anytype) !void {
+    if (self.selection) |sel| {
+        assert(sel.tracked());
+        try writer.writeByte(1);
+        try serial.writePod(writer, sel.rectangle);
+        try self.pages.serializePinLoc(writer, sel.bounds.tracked.start);
+        try self.pages.serializePinLoc(writer, sel.bounds.tracked.end);
+    } else {
+        try writer.writeByte(0);
+    }
+}
+
+fn deserializeSelection(self: *Screen, reader: anytype) !?Selection {
+    if ((try reader.readByte()) == 0) return null;
+    const rectangle = try serial.readPod(bool, reader);
+    const start = try self.pages.trackPinAt(try PageList.readPinLoc(reader));
+    errdefer self.pages.untrackPin(start);
+    const end = try self.pages.trackPinAt(try PageList.readPinLoc(reader));
+    return .{
+        .bounds = .{ .tracked = .{ .start = start, .end = end } },
+        .rectangle = rectangle,
+    };
+}
+
 pub fn increaseCapacity(
     self: *Screen,
     node: *PageList.List.Node,

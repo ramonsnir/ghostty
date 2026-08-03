@@ -544,7 +544,44 @@ pub const Image = struct {
         copy.data = "";
         return copy;
     }
+
+    /// FORK(host-handoff): maximum image payload we'll allocate when reading a
+    /// serialized image. Same-build handoff is trusted, but this bounds a
+    /// speculative allocation on a truncated/garbled stream.
+    const max_serialized_data = 1 << 31; // 2 GiB
+
+    /// FORK(host-handoff): serialize this image (metadata + raw pixel data).
+    pub fn serialize(self: *const Image, writer: anytype) !void {
+        try serial.writePod(writer, self.id);
+        try serial.writePod(writer, self.number);
+        try serial.writePod(writer, self.width);
+        try serial.writePod(writer, self.height);
+        try serial.writePod(writer, self.format);
+        try serial.writePod(writer, self.compression);
+        try serial.writePod(writer, self.transmit_time);
+        try serial.writePod(writer, self.implicit_id);
+        try serial.writeBytes(writer, self.data);
+    }
+
+    /// FORK(host-handoff): rebuild an image written by `serialize`. The returned
+    /// image owns its `data` and must be `deinit`ed.
+    pub fn deserialize(alloc: Allocator, reader: anytype) !Image {
+        var img: Image = .{};
+        img.id = try serial.readPod(u32, reader);
+        img.number = try serial.readPod(u32, reader);
+        img.width = try serial.readPod(u32, reader);
+        img.height = try serial.readPod(u32, reader);
+        img.format = try serial.readPod(command.Transmission.Format, reader);
+        img.compression = try serial.readPod(command.Transmission.Compression, reader);
+        img.transmit_time = try serial.readPod(std.time.Instant, reader);
+        img.implicit_id = try serial.readPod(bool, reader);
+        img.data = try serial.readBytes(alloc, reader, max_serialized_data);
+        return img;
+    }
 };
+
+// FORK(host-handoff): shared (de)serialization helpers.
+const serial = @import("../serial.zig");
 
 /// The rect taken up by some image placement, in grid cells. This will
 /// be rounded up to the nearest grid cell since we can't place images

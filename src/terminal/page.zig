@@ -652,6 +652,33 @@ pub const Page = struct {
         return result;
     }
 
+    /// FORK(host-handoff): Serialize this page to `writer` for a same-build
+    /// host handoff.
+    ///
+    /// A page's entire interior is offset-based, so the page is fully described
+    /// by (1) its struct fields — every field except `memory` is a relocatable
+    /// offset or a scalar (rows/cells offsets, styles/string_alloc/grapheme_*/
+    /// hyperlink_* allocator metadata, size, capacity, dirty) — and (2) its raw
+    /// `memory` backing block, which holds all cell/style/grapheme/hyperlink/
+    /// string data. We therefore write the struct verbatim followed by the raw
+    /// bytes. This is exactly what `cloneBuf` does (`result = self.*;
+    /// result.memory = buf; memcpy`) but across a byte stream; the ONLY absolute
+    /// pointer, `memory`, is re-pointed on rebuild.
+    ///
+    /// The read side lives in `PageList.deserialize` because rebuilding a page
+    /// requires the pagelist's memory pool to allocate correctly-sized (pooled
+    /// vs. heap) page-aligned backing.
+    pub fn serialize(self: *const Page, writer: anytype) !void {
+        // Explicit backing length up front so the reader can validate that the
+        // backing it allocates from `capacity` matches what we wrote.
+        try writer.writeInt(u64, @intCast(self.memory.len), .little);
+        // The struct: carries every relocatable offset + size + capacity +
+        // dirty. `memory` (ptr+len) is written too but is overwritten on read.
+        try writer.writeAll(std.mem.asBytes(self));
+        // The backing block rides along unchanged.
+        try writer.writeAll(self.memory);
+    }
+
     pub const StyleSetError = error{
         StyleSetOutOfMemory,
         StyleSetNeedsRehash,

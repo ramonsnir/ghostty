@@ -12,6 +12,8 @@ const Glyf = @import("../../../font/opentype/glyf.zig").Glyf;
 
 const request = @import("request.zig");
 const RegisterReq = request.Request.Register;
+// FORK(host-handoff): shared (de)serialization helpers.
+const serial = @import("../../serial.zig");
 
 const DesignMetrics = FontGlyph.DesignMetrics;
 const Constraint = FontGlyph.RenderOptions.Constraint;
@@ -47,6 +49,83 @@ pub fn deinit(self: *Glossary, alloc: Allocator) void {
     for (self.entries.values()) |*entry| entry.deinit(alloc);
     self.entries.deinit(alloc);
     self.* = undefined;
+}
+
+// FORK(host-handoff): full-fidelity same-build (de)serialization of the
+// per-terminal Glyph Protocol registrations. Each entry carries a decoded
+// glyph outline (heap slices of contours + points) plus POD metadata.
+
+/// Sanity bounds for speculative allocations when reading a serialized outline.
+const max_serialized_contours = 1 << 20;
+const max_serialized_points = 1 << 22;
+
+/// Serialize the glossary (insertion order preserved for FIFO eviction) to
+/// `writer`.
+pub fn serialize(self: *const Glossary, writer: anytype) !void {
+    try writer.writeInt(u64, self.entries.count(), .little);
+    var it = self.entries.iterator();
+    while (it.next()) |kv| {
+        try serial.writePod(writer, kv.key_ptr.*);
+        try serializeEntry(writer, kv.value_ptr);
+    }
+}
+
+/// Rebuild a glossary written by `serialize`. The returned glossary owns all
+/// glyph memory and must be `deinit`ed.
+pub fn deserialize(alloc: Allocator, reader: anytype) !Glossary {
+    var self: Glossary = .{ .entries = .empty };
+    errdefer self.deinit(alloc);
+
+    const count = try reader.readInt(u64, .little);
+    try self.entries.ensureTotalCapacity(alloc, @intCast(count));
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const cp = try serial.readPod(u21, reader);
+        const entry = try deserializeEntry(alloc, reader);
+        self.entries.putAssumeCapacity(cp, entry);
+    }
+    return self;
+}
+
+fn serializeEntry(writer: anytype, e: *const Entry) !void {
+    try writer.writeByte(@intFromEnum(std.meta.activeTag(e.glyph)));
+    switch (e.glyph) {
+        .glyf => |outline| {
+            try serial.writePodSlice(writer, Glyf.Outline.Point, outline.points);
+            try serial.writePodSlice(writer, u16, outline.contours);
+        },
+    }
+    try serial.writePod(writer, e.design);
+    try serial.writePod(writer, e.width);
+    try serial.writePod(writer, e.constraint);
+}
+
+fn deserializeEntry(alloc: Allocator, reader: anytype) !Entry {
+    var entry: Entry = undefined;
+    switch (try reader.readByte()) {
+        0 => {
+            const points = try serial.readPodSlice(
+                alloc,
+                reader,
+                Glyf.Outline.Point,
+                max_serialized_points,
+            );
+            errdefer alloc.free(points);
+            const contours = try serial.readPodSlice(
+                alloc,
+                reader,
+                u16,
+                max_serialized_contours,
+            );
+            entry.glyph = .{ .glyf = .{ .contours = contours, .points = points } };
+        },
+        else => return error.InvalidGlyphTag,
+    }
+    errdefer entry.deinit(alloc);
+    entry.design = try serial.readPod(DesignMetrics, reader);
+    entry.width = try serial.readPod(request.Width, reader);
+    entry.constraint = try serial.readPod(Constraint, reader);
+    return entry;
 }
 
 /// Register the given glyph entry.

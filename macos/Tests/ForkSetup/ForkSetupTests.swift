@@ -16,160 +16,149 @@ struct ForkSetupTests {
             home: "/Users/colleague")
     }
 
-    // MARK: - plan(): the safety-critical state machine
+    // MARK: - plan(): the safety-critical state machine (two-identity gate)
+
+    // Convenience wrapper over the (now two-identity) planner. Defaults model the
+    // common "our plist, bundled host present" case; each test overrides what it
+    // exercises. `spec()` is deterministic, so a fresh one compares equal (Equatable)
+    // to the one plan() carries in .install/.reload/etc.
+    private func plan(
+        supInstalled: String?, sup: String,
+        workerInstalled: String?, worker: String,
+        running: Bool,
+        bundledHost: Bool = true,
+        plistExists: Bool = true,
+        managedBy: String? = "com.mitchellh.ghostty-ramon"
+    ) -> ForkSetup.Plan {
+        ForkSetup.plan(
+            bundledHostExists: bundledHost,
+            existingPlistFileExists: plistExists,
+            existingPlistManagedBy: managedBy,
+            installedSupervisorIdentity: supInstalled,
+            currentSupervisorIdentity: sup,
+            installedWorkerIdentity: workerInstalled,
+            currentWorkerIdentity: worker,
+            agentRunning: running,
+            spec: spec())
+    }
 
     @Test func planSkipsWhenNoBundledHost() {
         // Dev/local builds (incl. Ramon's locally-built Release) have no bundled
         // host -> we must never run launchctl. This is the primary safety gate.
-        let p = ForkSetup.plan(
-            bundledHostExists: false,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: "1.3.0",
-            currentReloadIdentity: "1.4.0",
-            agentRunning: false,
-            spec: spec())
-        #expect(p == .skipNoBundledHost)
+        #expect(plan(supInstalled: "1", sup: "2", workerInstalled: "3.0", worker: "4.0",
+                     running: false, bundledHost: false) == .skipNoBundledHost)
     }
 
     @Test func planInstallsOnCleanMachine() {
         // No plist present + a bundled host -> fresh install.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: false,
-            existingPlistManagedBy: nil,
-            installedReloadIdentity: nil,
-            currentReloadIdentity: "1.4.0",
-            agentRunning: false,
-            spec: s)
-        #expect(p == .install(s))
+        #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: false, plistExists: false, managedBy: nil) == .install(spec()))
     }
 
     @Test func planSkipsExternallyManagedPlist() {
         // A plist exists with NO ownership marker (Ramon's hand-rolled agent, or
         // any third party) -> leave it strictly alone, even with a bundled host.
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: nil,
-            installedReloadIdentity: nil,
-            currentReloadIdentity: "1.4.0",
-            agentRunning: true,   // even if something is running, not ours -> skip
-            spec: spec())
-        #expect(p == .skipExternallyManaged)
+        // Even if something is running, not ours -> skip.
+        #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: true, managedBy: nil) == .skipExternallyManaged)
     }
 
     @Test func planSkipsPlistManagedByDifferentBundle() {
         // A marker that isn't OURS (e.g. a different fork identity) is still
         // treated as "not ours" -> skip.
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon.debug",
-            installedReloadIdentity: "1.4.0",
-            currentReloadIdentity: "1.4.0",
-            agentRunning: false,
-            spec: spec(bundleID: "com.mitchellh.ghostty-ramon"))
-        #expect(p == .skipExternallyManaged)
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: "4.0", worker: "4.0",
+                     running: false, managedBy: "com.mitchellh.ghostty-ramon.debug")
+                == .skipExternallyManaged)
     }
 
-    // MARK: - plan(): reload-identity gate (protocol version + epoch, NOT the binary hash)
+    // MARK: - plan(): two-identity reload gate (supervisor vs worker)
 
-    @Test func planUpToDateWhenOursAndIdentityMatches() {
-        // THE FIX: a GUI-only update keeps the reload identity stable (same protocol
-        // version + epoch) even though the host BINARY recompiled to a new cdhash. The
-        // notarized host's LWCR is identity-pinned, so no bootout is needed and the
-        // host's RAM-only sessions are preserved -> .upToDate.
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: "1.4.0",
-            currentReloadIdentity: "1.4.0",
-            agentRunning: true,
-            spec: spec())
-        #expect(p == .upToDate)
+    @Test func planUpToDateWhenBothIdentitiesMatch() {
+        // A GUI-only update keeps BOTH identities stable (same protocol major/minor +
+        // epoch) even though the host BINARY recompiled to a new cdhash -> .upToDate,
+        // no bootout, sessions preserved.
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: "4.0", worker: "4.0",
+                     running: true) == .upToDate)
     }
 
-    @Test func planRevivesDeadHostWhenIdentityMatches() {
-        // Recorded-current identity but NOT running (booted out / crash-looped / plist
-        // half-removed): NON-destructively revive on relaunch (no bootout, since the
-        // LWCR is still satisfied) instead of being stranded on .upToDate.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: "1.4.0",
-            currentReloadIdentity: "1.4.0",
-            agentRunning: false,
-            spec: s)
-        #expect(p == .revive(s))
+    @Test func planRevivesDeadHostWhenBothIdentitiesMatch() {
+        // Both recorded-current but NOT running (booted out / crash-looped / plist
+        // half-removed): NON-destructively revive on relaunch (no bootout) instead of
+        // being stranded on .upToDate.
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: "4.0", worker: "4.0",
+                     running: false) == .revive(spec()))
     }
 
-    @Test func planReloadsWhenProtocolMinorChangedEvenIfRunning() {
-        // A real wire-protocol change (minor bump) means the running old host can't
-        // serve the new GUI -> reload (bootout+bootstrap), even though it's up.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: "1.4.0",
-            currentReloadIdentity: "1.5.0",
-            agentRunning: true,
-            spec: s)
-        #expect(p == .reload(s))
+    @Test func planHandsOffWorkerWhenWorkerMinorChangedAndRunning() {
+        // THE SPLIT: a protocol-MINOR bump changes ONLY the worker identity (supervisor
+        // unchanged). With a RUNNING supervisor this is a NON-destructive worker handoff
+        // (SIGHUP), NOT a bootout -> .handoffWorker; sessions survive.
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: "4.0", worker: "5.0",
+                     running: true) == .handoffWorker(spec()))
     }
 
-    @Test func planReloadsWhenEpochBumped() {
-        // The manual override: same protocol version, but `host_reload_epoch` bumped
-        // (a host-internal fix colleagues must actually run) -> reload.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: "1.4.0",
-            currentReloadIdentity: "1.4.1",
-            agentRunning: true,
-            spec: s)
-        #expect(p == .reload(s))
+    @Test func planHandsOffWorkerWhenEpochBumpedAndRunning() {
+        // Same protocol version, but `host_reload_epoch` bumped -> the epoch lives in
+        // the WORKER identity, so a running supervisor is SIGHUP-handed-off (common
+        // host-internal fix delivered without killing sessions) -> .handoffWorker.
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: "4.0", worker: "4.1",
+                     running: true) == .handoffWorker(spec()))
     }
 
-    @Test func planAdoptsRunningHostWhenNoRecordedIdentity() {
-        // The hash->identity UPGRADE transition (and lost-defaults): we own the plist,
-        // never recorded an identity, but a healthy host is ALREADY running. Because the
-        // LWCR is identity-pinned we must NOT bootout (that would kill its RAM-only
-        // sessions) — adopt it (record the identity, no restart). This is the key
-        // improvement over the old hash gate, which force-reloaded on this transition.
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: nil,
-            currentReloadIdentity: "1.4.0",
-            agentRunning: true,
-            spec: s)
-        #expect(p == .adoptRunning(s))
+    @Test func planRevivesWhenWorkerChangedButNotRunning() {
+        // Worker identity changed but no supervisor is running -> nothing to SIGHUP;
+        // revive brings the supervisor up (it then spawns a fresh worker at the current
+        // build). No bootout, and there are no live sessions to lose.
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: "4.0", worker: "5.0",
+                     running: false) == .revive(spec()))
     }
 
-    @Test func planRevivesWhenNoRecordedIdentityAndNotRunning() {
-        // No recorded identity AND the host isn't running -> non-destructive revive
-        // (bootstrap, no bootout); there are no live sessions to lose, and no reload is
-        // warranted (the LWCR is identity-pinned).
-        let s = spec()
-        let p = ForkSetup.plan(
-            bundledHostExists: true,
-            existingPlistFileExists: true,
-            existingPlistManagedBy: "com.mitchellh.ghostty-ramon",
-            installedReloadIdentity: nil,
-            currentReloadIdentity: "1.4.0",
-            agentRunning: false,
-            spec: s)
-        #expect(p == .revive(s))
+    @Test func planReloadsWhenSupervisorIdentityChangedAndRunning() {
+        // A SUPERVISOR-identity change (first cut: a protocol MAJOR bump) means the
+        // supervisor binary / its launchd contract changed -> the RARE destructive
+        // bootout+bootstrap so launchd re-derives the LWCR, even though it's up.
+        #expect(plan(supInstalled: "1", sup: "2", workerInstalled: "4.0", worker: "0.0",
+                     running: true) == .reload(spec()))
+    }
+
+    @Test func planReloadsWhenSupervisorChangedEvenIfNotRunning() {
+        // Supervisor identity changed and the host is down: still .reload (bootout is a
+        // harmless no-op on a dead job; bootstrap brings up the new supervisor binary).
+        #expect(plan(supInstalled: "1", sup: "2", workerInstalled: "4.0", worker: "0.0",
+                     running: false) == .reload(spec()))
+    }
+
+    @Test func planReloadDominatesWhenBothIdentitiesChangedAndRunning() {
+        // Supervisor AND worker both changed at once -> the supervisor reload dominates
+        // (a fresh supervisor re-establishes the whole job); no partial worker handoff.
+        #expect(plan(supInstalled: "1", sup: "2", workerInstalled: "4.0", worker: "5.1",
+                     running: true) == .reload(spec()))
+    }
+
+    @Test func planAdoptsRunningHostWhenNoRecordedSupervisorIdentity() {
+        // The single-key -> two-identity UPGRADE transition (and lost-defaults): we own
+        // the plist, never recorded a supervisor identity, but a healthy host is ALREADY
+        // running. Because the LWCR is identity-pinned we must NOT bootout (that would
+        // kill its RAM-only sessions) -> adopt it (record both identities, no restart).
+        #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: true) == .adoptRunning(spec()))
+    }
+
+    @Test func planRevivesWhenNoRecordedSupervisorIdentityAndNotRunning() {
+        // No recorded supervisor identity AND the host isn't running -> non-destructive
+        // revive (bootstrap, no bootout); there are no live sessions to lose.
+        #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: false) == .revive(spec()))
+    }
+
+    @Test func planTreatsNilWorkerWithMatchingSupervisorAsUpToDate() {
+        // Defensive/impossible state (we always record both together): supervisor
+        // recorded + matching, worker identity NOT recorded -> up-to-date when running
+        // (never a spurious handoff), revive when down.
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: true) == .upToDate)
+        #expect(plan(supInstalled: "1", sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: false) == .revive(spec()))
     }
 
     @Test func decodeReloadIdentityUnpacksMajorMinorEpoch() {
@@ -178,6 +167,27 @@ struct ForkSetupTests {
         #expect(ForkSetup.decodeReloadIdentity((1 << 32) | (4 << 16) | 1) == "1.4.1")
         #expect(ForkSetup.decodeReloadIdentity((2 << 32) | (0 << 16) | 0) == "2.0.0")
         #expect(ForkSetup.decodeReloadIdentity(0) == "0.0.0")
+    }
+
+    @Test func decodeReloadIdentitiesCarvesSupervisorMajorAndWorkerMinorEpoch() {
+        // FIRST-CUT SPLIT: supervisor = protocol MAJOR (rare -> destructive reload);
+        // worker = protocol MINOR + host_reload_epoch (common -> SIGHUP handoff). Both
+        // decoded from the SAME packed value as decodeReloadIdentity (no new C export).
+        let a = ForkSetup.decodeReloadIdentities((1 << 32) | (4 << 16) | 0)
+        #expect(a.supervisor == "1")
+        #expect(a.worker == "4.0")
+        // A MINOR bump moves the WORKER identity, supervisor unchanged.
+        let b = ForkSetup.decodeReloadIdentities((1 << 32) | (5 << 16) | 0)
+        #expect(b.supervisor == "1")   // same supervisor -> handoff, not reload
+        #expect(b.worker == "5.0")
+        // An EPOCH bump moves the WORKER identity, supervisor unchanged.
+        let c = ForkSetup.decodeReloadIdentities((1 << 32) | (4 << 16) | 1)
+        #expect(c.supervisor == "1")
+        #expect(c.worker == "4.1")
+        // A MAJOR bump moves the SUPERVISOR identity -> destructive reload.
+        let d = ForkSetup.decodeReloadIdentities((2 << 32) | (0 << 16) | 0)
+        #expect(d.supervisor == "2")
+        #expect(d.worker == "0.0")
     }
 
     // MARK: - LaunchAgentSpec shape
@@ -207,9 +217,11 @@ struct ForkSetupTests {
         #expect(dict["RunAtLoad"] as? Bool == true)
         #expect(dict["KeepAlive"] as? Bool == true)
         #expect(dict["ProcessType"] as? String == "Interactive")
+        // (ramon fork / host-handoff) The launchd job now runs the SUPERVISOR.
         let args = dict["ProgramArguments"] as? [String]
         #expect(args == [
             "/Applications/Ghostty (ramon).app/Contents/MacOS/ghostty-host",
+            "--supervise",
             "--listen=/Users/colleague/.ghostty-ramon-host.sock",
         ])
         let env = dict["EnvironmentVariables"] as? [String: String]

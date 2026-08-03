@@ -923,6 +923,223 @@ pub fn clone(
     return result;
 }
 
+// FORK(host-handoff): full-fidelity same-build (de)serialization -------------
+//
+// These reproduce the structural walk of `clone()` above (iterate pages in
+// order, allocate fresh nodes with `createPageExt`, remap pins by location)
+// but redirect the source/destination to a byte stream. Unlike `clone()`, the
+// whole pagelist is transferred (all scrollback) and the viewport/scroll
+// position is preserved.
+//
+// Tracked pins are NOT serialized as a generic set. Instead each *owner* of a
+// pin (the viewport here; the cursor/selection/kitty-placements in Screen)
+// serializes its pin's logical location `(page_index, x, y)` and re-tracks a
+// fresh pin after the page list is rebuilt. `pinLocation`/`nodeAtIndex`/
+// `trackPinAt` are the helpers the owners use.
+
+/// Serialize this pagelist (all pages + viewport) to `writer`.
+pub fn serialize(self: *const PageList, writer: anytype) !void {
+    // Scalars we must carry. page_serial(_min)/page_size/total_rows are
+    // recomputed on rebuild (exactly like clone()), so they are not written.
+    try writer.writeInt(u16, self.cols, .little);
+    try writer.writeInt(u16, self.rows, .little);
+    try writer.writeInt(u64, self.explicit_max_size, .little);
+    try writer.writeInt(u64, self.min_max_size, .little);
+
+    // Pages, in list order.
+    var count: u64 = 0;
+    {
+        var it = self.pages.first;
+        while (it) |n| : (it = n.next) count += 1;
+    }
+    try writer.writeInt(u64, count, .little);
+    {
+        var it = self.pages.first;
+        while (it) |n| : (it = n.next) try n.data.serialize(writer);
+    }
+
+    // Viewport: tag + pin location + cached row offset. Preserves scroll pos.
+    try writer.writeByte(@intFromEnum(std.meta.activeTag(self.viewport)));
+    try self.serializePinLoc(writer, self.viewport_pin);
+    if (self.viewport_pin_row_offset) |off| {
+        try writer.writeByte(1);
+        try writer.writeInt(u64, off, .little);
+    } else {
+        try writer.writeByte(0);
+    }
+}
+
+/// Rebuild a pagelist written by `serialize`. The returned pagelist owns its
+/// own memory pool (like `clone`) and must be `deinit`ed by the caller.
+pub fn deserialize(alloc: Allocator, reader: anytype) !PageList {
+    const cols = try reader.readInt(u16, .little);
+    const rows = try reader.readInt(u16, .little);
+    const explicit_max_size = try reader.readInt(u64, .little);
+    const min_max_size = try reader.readInt(u64, .little);
+    const page_count = try reader.readInt(u64, .little);
+
+    var pool: MemoryPool = try .init(
+        alloc,
+        pageAllocator(),
+        @intCast(page_count),
+    );
+    errdefer pool.deinit();
+
+    // The viewport pin is always pre-allocated and tracked (invariant).
+    const viewport_pin = try pool.pins.create();
+    var tracked_pins: PinSet = .{};
+    errdefer tracked_pins.deinit(pool.alloc);
+    try tracked_pins.putNoClobber(pool.alloc, viewport_pin, {});
+
+    var page_list: List = .{};
+    errdefer {
+        const page_alloc = pool.pages.arena.child_allocator;
+        var it = page_list.first;
+        while (it) |node| : (it = node.next) {
+            if (node.data.memory.len > std_size) page_alloc.free(node.data.memory);
+        }
+    }
+
+    var page_serial: u64 = 0;
+    var page_size: usize = 0;
+    var total_rows: usize = 0;
+    var i: u64 = 0;
+    while (i < page_count) : (i += 1) {
+        // Read the explicit backing length + the page struct (which carries the
+        // capacity we need to size/allocate the backing).
+        const mem_len = try reader.readInt(u64, .little);
+        var tmp: Page = undefined;
+        try reader.readNoEof(std.mem.asBytes(&tmp));
+
+        // Allocate a node + correctly-sized (pooled vs heap) page-aligned
+        // backing for this capacity, exactly like clone().
+        const node = try createPageExt(
+            &pool,
+            tmp.capacity,
+            &page_serial,
+            &page_size,
+        );
+        // Append immediately so the errdefer above reclaims its backing if a
+        // subsequent read fails.
+        page_list.append(node);
+
+        const backing = node.data.memory;
+        if (backing.len != mem_len) return error.PageBackingSizeMismatch;
+
+        // Re-point `memory` at the freshly allocated backing and adopt the
+        // rest of the (offset-based) struct verbatim, then fill the backing.
+        tmp.memory = backing;
+        node.data = tmp;
+        try reader.readNoEof(node.data.memory);
+        node.data.assertIntegrity();
+
+        total_rows += node.data.size.rows;
+    }
+
+    // Viewport.
+    const viewport_tag = try reader.readByte();
+    const vp_loc = try readPinLoc(reader);
+    const has_off = (try reader.readByte()) != 0;
+    const vp_off: ?usize = if (has_off)
+        @intCast(try reader.readInt(u64, .little))
+    else
+        null;
+    viewport_pin.* = .{
+        .node = nodeAtIndex(page_list, vp_loc.index),
+        .x = vp_loc.x,
+        .y = vp_loc.y,
+        .garbage = vp_loc.garbage,
+    };
+    const viewport: Viewport = switch (viewport_tag) {
+        0 => .active,
+        1 => .top,
+        2 => .pin,
+        else => return error.InvalidViewportTag,
+    };
+
+    var result: PageList = .{
+        .pool = pool,
+        .pages = page_list,
+        .page_serial = page_serial,
+        .page_serial_min = 0,
+        .page_size = page_size,
+        .explicit_max_size = explicit_max_size,
+        .min_max_size = min_max_size,
+        .cols = cols,
+        .rows = rows,
+        .total_rows = total_rows,
+        .tracked_pins = tracked_pins,
+        .viewport = viewport,
+        .viewport_pin = viewport_pin,
+        .viewport_pin_row_offset = vp_off,
+    };
+    result.assertIntegrity();
+    return result;
+}
+
+/// FORK(host-handoff): a serialized pin location within a pagelist.
+pub const PinLoc = struct {
+    index: usize,
+    x: size.CellCountInt,
+    y: size.CellCountInt,
+    garbage: bool,
+};
+
+/// FORK(host-handoff): serialize a pin as `(page_index, x, y, garbage)`.
+pub fn serializePinLoc(
+    self: *const PageList,
+    writer: anytype,
+    p: *const Pin,
+) !void {
+    try writer.writeInt(u64, @intCast(self.pageIndex(p.node)), .little);
+    try writer.writeInt(u16, p.x, .little);
+    try writer.writeInt(u16, p.y, .little);
+    try writer.writeByte(@intFromBool(p.garbage));
+}
+
+/// FORK(host-handoff): read a pin location written by `serializePinLoc`.
+pub fn readPinLoc(reader: anytype) !PinLoc {
+    const index: usize = @intCast(try reader.readInt(u64, .little));
+    const x = try reader.readInt(u16, .little);
+    const y = try reader.readInt(u16, .little);
+    const garbage = (try reader.readByte()) != 0;
+    return .{ .index = index, .x = x, .y = y, .garbage = garbage };
+}
+
+/// FORK(host-handoff): resolve a serialized pin location into a freshly tracked
+/// pin. Used by owners (cursor/selection/kitty placements) after the page list
+/// is rebuilt.
+pub fn trackPinAt(self: *PageList, loc: PinLoc) Allocator.Error!*Pin {
+    return try self.trackPin(.{
+        .node = nodeAtIndex(self.pages, loc.index),
+        .x = loc.x,
+        .y = loc.y,
+        .garbage = loc.garbage,
+    });
+}
+
+/// FORK(host-handoff): index of `node` within the page list (list order).
+fn pageIndex(self: *const PageList, node: *const List.Node) usize {
+    var idx: usize = 0;
+    var it = self.pages.first;
+    while (it) |n| : (it = n.next) {
+        if (@intFromPtr(n) == @intFromPtr(node)) return idx;
+        idx += 1;
+    }
+    unreachable; // a valid pin always references a node in its own list
+}
+
+/// FORK(host-handoff): the node at `index` within `list` (list order).
+fn nodeAtIndex(list: List, index: usize) *List.Node {
+    var it = list.first;
+    var i: usize = 0;
+    while (it) |n| : (it = n.next) {
+        if (i == index) return n;
+        i += 1;
+    }
+    unreachable; // a serialized index always references an existing node
+}
+
 /// Resize options
 pub const Resize = struct {
     /// The new cols/cells of the screen.

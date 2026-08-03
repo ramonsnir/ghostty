@@ -743,6 +743,17 @@ pub fn init(
                 // via the macOS AgentPreviewTile backoff). So `local`/nil host and
                 // mirrors stay byte-for-byte single-shot (reconnect=false).
                 .reconnect = per_surface_sock != null and client_role == .attach,
+                // FORK(host-handoff): the INVERSE population — a LOCAL `.attach`
+                // surface (no per-surface socket override ⇒ the global `pty-host`
+                // scalar ⇒ the local host) opts into a BOUNDED redial so it can
+                // survive a same-machine host handoff (~1-3s socket gap) instead of
+                // freezing on its last frame. This is derived purely in Zig from the
+                // SAME inputs as `reconnect` (no new apprt/C-ABI field), and is the
+                // EXACT INVERSE of the remote gate, so for an `.attach` surface
+                // exactly one of {reconnect, handoff_redial} is true and a `.mirror`
+                // gets NEITHER — never both. A genuinely-dead local host is NOT
+                // stormed: the redial is capped (see `shouldKeepRedialing`).
+                .handoff_redial = per_surface_sock == null and client_role == .attach,
                 // (cloud-hosts / REG-T2) Per-attempt redial connection ceiling
                 // (seconds); 0 ⇒ the compiled-in default. Read defensively so
                 // apprts without the field compile to 0.

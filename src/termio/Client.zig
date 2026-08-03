@@ -127,6 +127,17 @@ const DEFAULT_CONNECT_TIMEOUT_S: u32 = 10;
 const RECONNECT_QUICK_ATTEMPTS: u32 = 6;
 const RECONNECT_STEADY_MS: u64 = 60_000;
 
+/// FORK(host-handoff): retry cap for a handoff-redial-ONLY client
+/// (`handoff_redial && !reconnect`). A LOCAL surface redials only this many
+/// dial attempts — a bounded quick burst (delays 1s,2s,4s via `reconnectDelayMs`,
+/// spanning ~7s of wall time, comfortably covering a same-machine host-handoff gap
+/// of ~1-3s) — and then STOPS, rather than falling into the steady-60s-forever
+/// cadence a remote `reconnect` client uses. Stopping is deliberate: a genuinely-
+/// dead local KeepAlive host (nothing accepting on the socket) must NOT be stormed
+/// forever. A remote `reconnect` client ignores this cap (redials forever). See
+/// `shouldKeepRedialing`.
+const RECONNECT_HANDOFF_MAX_ATTEMPTS: u32 = 3;
+
 /// Pure backoff schedule so the burst→steady shape is unit-testable in
 /// isolation (see `client_difftest.zig`), exactly like the Swift
 /// `mirrorReconnectDelay`. Quick burst 1s,2s,4s,8s,16s,30s for the first
@@ -147,6 +158,28 @@ pub fn connectTimeoutMs(connect_timeout_s: u32) u64 {
     return s * 1000;
 }
 
+/// FORK(host-handoff): retry-cap decision for the redial state machine. Pure so
+/// the "forever vs bounded burst vs never" policy is unit-testable in isolation
+/// (mirrors `reconnectDelayMs`/`reattachId`). Returns whether the machine should
+/// SCHEDULE another dial given `attempt` = the number of dials ALREADY made
+/// (`ThreadData.reconnect_attempt`); a `true` means "schedule attempt #(attempt+1)".
+///
+///   - REMOTE reconnect (`reconnect`): ALWAYS true — redials forever (quick burst →
+///     steady 60s cadence), UNCHANGED from the cloud-hosts behavior.
+///   - handoff-redial ONLY (`handoff_redial && !reconnect`): true only while
+///     `attempt < RECONNECT_HANDOFF_MAX_ATTEMPTS`, i.e. a bounded burst to cover a
+///     same-machine host-handoff gap, then STOP — never the steady-forever cadence
+///     (which would storm a genuinely-dead local KeepAlive host).
+///   - NEITHER flag: false — the redial machine is not even armed, so this is only
+///     ever reached in tests; encode the total policy anyway.
+///
+/// `reconnect` dominates: a client that is somehow both keeps the forever behavior.
+pub fn shouldKeepRedialing(reconnect: bool, handoff_redial: bool, attempt: u32) bool {
+    if (reconnect) return true;
+    if (!handoff_redial) return false;
+    return attempt < RECONNECT_HANDOFF_MAX_ATTEMPTS;
+}
+
 /// (ramon fork / cloud-hosts / D4) The Attach session id a REDIAL sends. Pure so
 /// the reattach-vs-fresh gate is unit-testable in isolation. `live` is the
 /// host-ASSIGNED id (`session_id.load`, 0 = never attached); `configured` is the
@@ -162,17 +195,22 @@ pub fn reattachId(live: u64, configured: ?u64) ?u64 {
 /// surface-visible state to set (null ⇒ leave the current state). Pure so the D1
 /// before/after-handshake distinction is unit-testable. A drop BEFORE any
 /// HelloAck is the ambiguous `.cannot_handshake` (starting up / down /
-/// incompatible-major); after a handshake a reconnect client goes
-/// `.reconnecting` while a `local`/single-shot client leaves its state (the
-/// frozen last frame persists — today's behavior, minus the busy-loop).
-pub fn classifyDrop(reconnect: bool, handshaked: bool, closing: bool) ?State {
+/// incompatible-major); after a handshake a REDIALING client goes `.reconnecting`
+/// (holds outbound frames during the gap) while a single-shot client leaves its
+/// state (the frozen last frame persists — today's behavior, minus the busy-loop).
+///
+/// FORK(host-handoff): `wants_redial` is the DERIVED arming predicate
+/// (`Config.wantsRedial()` = `reconnect or handoff_redial`), NOT `reconnect`
+/// alone — so a LOCAL handoff-redial client ALSO goes `.reconnecting` on a drop
+/// and holds keystrokes across the handoff gap instead of dropping them.
+pub fn classifyDrop(wants_redial: bool, handshaked: bool, closing: bool) ?State {
     // (cloud-hosts) A DELIBERATELY closed session (Close frame sent) drops on
     // purpose: leave the state alone — no `.reconnecting` banner, no
     // `.cannot_handshake` error — the pane is going away. Checked FIRST so it wins
     // over both arms below.
     if (closing) return null;
     if (!handshaked) return .cannot_handshake;
-    return if (reconnect) .reconnecting else null;
+    return if (wants_redial) .reconnecting else null;
 }
 
 /// General-purpose allocator. Owns the mirror pools + reader buffer.
@@ -554,16 +592,47 @@ pub const Config = struct {
     /// default) is the byte-identical single-shot connect path; set `true` ONLY
     /// for a resolved REMOTE host (a `local`/nil host must stay `false` so the
     /// redial loop never storms the local KeepAlive host). A SCALAR copied by
-    /// value. Declared now for a stable Config ABI; the redial state machine
-    /// that consumes it lands in a later phase (no behavior today).
+    /// value. A remote client redials FOREVER (quick burst → steady 60s cadence)
+    /// and surfaces `session_ended`/overlay states.
     reconnect: bool = false,
 
+    /// FORK(host-handoff): opt-in BOUNDED LOCAL redial to survive a same-machine
+    /// host handoff — a local `ghostty-host` handing its live sessions to a
+    /// successor process, which drops the GUI socket for ~1-3s while the GUI
+    /// reconnects and reattaches by `session_id`. DISTINCT from `reconnect`:
+    ///   - a remote client sets `reconnect=true, handoff_redial=false` (redial
+    ///     forever, `session_ended` + overlay) — UNCHANGED;
+    ///   - a LOCAL `.attach` surface sets `handoff_redial=true, reconnect=false`
+    ///     (redial only a bounded burst of `RECONNECT_HANDOFF_MAX_ATTEMPTS`, then
+    ///     STOP and leave the surface on its frozen last frame — never the
+    ///     steady-forever cadence, which would storm a genuinely-dead local host,
+    ///     and never a `session_ended` overlay, which local has no way to render);
+    ///   - a `.mirror` sets NEITHER.
+    /// `false && reconnect==false` is byte-for-byte today's single-shot local
+    /// path. A SCALAR copied by value. Both flags arm the SAME redial machine
+    /// (see `wantsRedial`); they differ only in the retry cap (`shouldKeepRedialing`)
+    /// and in the `session_ended`-on-miss gate (which stays on `reconnect` alone).
+    handoff_redial: bool = false,
+
     /// (ramon fork / cloud-hosts) Per-attempt connection ceiling, in SECONDS,
-    /// for the opt-in redial (only meaningful when `reconnect` is true). Bounds
-    /// how long each reconnect attempt's dial+handshake may take before the
-    /// backoff schedules the next; NOT a protocol field, never sent on the wire.
+    /// for the opt-in redial (only meaningful when the redial machine is armed —
+    /// `reconnect` or FORK(host-handoff) `handoff_redial`). Bounds how long each
+    /// reconnect attempt's dial+handshake may take before the backoff schedules
+    /// the next; NOT a protocol field, never sent on the wire.
     /// `0` ⇒ `DEFAULT_CONNECT_TIMEOUT_S`. A SCALAR copied by value.
     connect_timeout_s: u32 = 0,
+
+    /// FORK(host-handoff): the DERIVED arming predicate for the IO-thread redial
+    /// machine. `true` ⇒ arm it (create the async/timers, wake it on a drop, and
+    /// hold outbound frames via `.reconnecting` during the gap). A remote
+    /// `reconnect` client and a local `handoff_redial` client BOTH arm it and are
+    /// otherwise identical up to the retry cap (`shouldKeepRedialing`); a plain
+    /// single-shot local / `.mirror` client (neither flag) leaves the machine
+    /// null + inert, so that path stays byte-for-byte unchanged. Introduced so the
+    /// `reconnect or handoff_redial` OR is not duplicated across the arming sites.
+    pub fn wantsRedial(self: Config) bool {
+        return self.reconnect or self.handoff_redial;
+    }
 };
 
 /// Forward-map a surface-config host session id (a `u64` carried from the
@@ -894,14 +963,19 @@ pub fn connectAndAttach(
     }
 
     // (cloud-hosts / I1) Arm the OPT-IN redial machinery on the loop, BEFORE the
-    // Hello send so any later failure unwinds it. Only a resolved REMOTE host
-    // opts in (`Config.reconnect`); a `local`/nil host leaves these null + inert,
-    // so the single-shot path is byte-for-byte unchanged. The async is the read
-    // thread's / writeCallback's wakeup into the IO-thread redial state machine;
-    // the timers drive the backoff + the handshake watchdog. All redial steps run
-    // on THIS IO thread (the loop thread), so the write_stream/pool/fd ownership
-    // never crosses threads (D2): the only cross-thread signals are the
-    // thread-safe `async.notify()` + the `client_state`/`session_id` atomics.
+    // Hello send so any later failure unwinds it. A resolved REMOTE host
+    // (`Config.reconnect`) OR — FORK(host-handoff) — a LOCAL `.attach` surface
+    // (`Config.handoff_redial`) opts in; the derived predicate `wantsRedial()`
+    // folds both. A plain single-shot local / `.mirror` client (neither flag)
+    // leaves these null + inert, so the single-shot path is byte-for-byte
+    // unchanged. The two armed cases share ALL of this machinery and diverge only
+    // at the retry cap (`shouldKeepRedialing`, checked in `scheduleReconnect`).
+    // The async is the read thread's / writeCallback's wakeup into the IO-thread
+    // redial state machine; the timers drive the backoff + the handshake watchdog.
+    // All redial steps run on THIS IO thread (the loop thread), so the
+    // write_stream/pool/fd ownership never crosses threads (D2): the only
+    // cross-thread signals are the thread-safe `async.notify()` + the
+    // `client_state`/`session_id` atomics.
     //
     // These errdefers are at FUNCTION scope (declared here, before the arming
     // block) so they fire for a failure ANYWHERE after this point — the arming
@@ -911,7 +985,7 @@ pub fn connectAndAttach(
     errdefer if (client_td.reconnect_async) |*a| a.deinit();
     errdefer if (client_td.reconnect_timer) |*t| t.deinit();
     errdefer if (client_td.reconnect_watchdog) |*t| t.deinit();
-    if (self.config.reconnect) {
+    if (self.config.wantsRedial()) {
         client_td.reconnect_client = self;
         client_td.reconnect_alloc = alloc;
         client_td.reconnect_io = io;
@@ -1547,6 +1621,17 @@ pub fn handleFrame(
             // never reaches this arm (it subscribes with a known id, no Attach) and
             // never sets `reconnect`, so `reconnect` cleanly discriminates a remote
             // reattach from a local attach here.
+            //
+            // FORK(host-handoff): this gate stays on `config.reconnect` ALONE — it
+            // deliberately does NOT use `wantsRedial()`. A local `handoff_redial`
+            // client that redials into a genuinely-unknown id (the successor did NOT
+            // re-register our session — a failed/aborted handoff, not the intended
+            // path) must fall through to the SAME adopt-the-fresh-id behavior a
+            // plain local attach uses, NOT the remote `session_ended` dead-pane
+            // state (which it cannot render). On a SUCCESSFUL handoff the successor
+            // re-registers each session under its ORIGINAL id, so `redialReattach`'s
+            // `reattachId` HITS (att.session_id == requested) and this miss arm is
+            // never entered.
             if (self.config.reconnect) {
                 if (self.config.session_id) |requested| {
                     if (requested != 0 and att.session_id != requested) {
@@ -2082,9 +2167,12 @@ fn sendFrame(
     // send here would queue onto a dead/rebuilding stream. HOLD/DROP it: the redial
     // re-sends Hello+Attach via `sendFrameRaw` (which bypasses this gate), and
     // buffered input during a drop is intentionally discarded (a reconnect is not a
-    // paste buffer). A `local`/non-reconnect client never enters `.reconnecting`
-    // (only the redial machine sets it, and it is gated on `Config.reconnect`), so
-    // this is a byte-for-byte no-op on the single-shot path.
+    // paste buffer). Only the redial machine ever sets `.reconnecting`, and it is
+    // armed only on `Config.wantsRedial()`. FORK(host-handoff): a LOCAL
+    // handoff-redial client now DOES enter `.reconnecting` for the handoff gap (so
+    // keystrokes are held, not queued onto the dead stream); a plain single-shot /
+    // `.mirror` client (neither flag) never does, so this stays a byte-for-byte
+    // no-op on the single-shot path.
     if (self.client_state.load(.acquire) == .reconnecting) return;
     std.debug.assert(td.backend == .client);
     try sendFrameRaw(&td.backend.client, td.loop, td.alloc, tag, frame);
@@ -2159,9 +2247,12 @@ fn writeCallback(
         // gives — the socket stays open (no read-side EOF) for ~ServerAlive×Count,
         // but writes fail. So trip the redial from here too (not just the read
         // thread's EOF path): set the hold gate + wake the IO-thread redial
-        // machine. Both are no-ops for a `local`/single-shot client
+        // machine. Both are no-ops for a plain single-shot / `.mirror` client
         // (`reconnect_client`/`reconnect_async` null ⇒ nothing armed), preserving
-        // the byte-for-byte single-shot path. The redial coalesces (reconnect_async
+        // the byte-for-byte single-shot path; FORK(host-handoff): a local
+        // `handoff_redial` client IS armed here, so a black-holed-write handoff gap
+        // trips its bounded redial exactly like the read-thread EOF path. The
+        // redial coalesces (reconnect_async
         // duplicate triggers are ignored while a redial is in flight), so the read
         // thread's EOF path firing too is harmless. We run on the IO/loop thread
         // here, so touching `reconnect_client` is same-thread safe.
@@ -2302,8 +2393,11 @@ pub fn probeHost(alloc: Allocator, path: []const u8, timeout_ms: u32) ProbeResul
 // where it is serialized with `queueWrite`/`writeCallback` (all IO-thread), so
 // the write side never races. The backoff is an `xev.Timer` on the loop (NOT a
 // bare sleep — D2.3): a clean quit stops the loop, cancelling the timer. Gated
-// entirely on `Config.reconnect`, so a `local`/single-shot client never arms any
-// of this and is byte-for-byte unchanged.
+// entirely on `Config.wantsRedial()` (FORK(host-handoff): `reconnect` for a remote
+// forever-redial client OR `handoff_redial` for a bounded LOCAL one), so a plain
+// single-shot / `.mirror` client never arms any of this and is byte-for-byte
+// unchanged. The two armed cases share this whole machine; they diverge ONLY at
+// the retry cap enforced in `scheduleReconnect` (`shouldKeepRedialing`).
 
 fn reconnectAsyncCallback(
     td_: ?*ThreadData,
@@ -2376,7 +2470,27 @@ fn teardownConnection(self: *Client, td: *ThreadData) void {
 }
 
 fn scheduleReconnect(self: *Client, td: *ThreadData, loop: *xev.Loop) void {
-    _ = self;
+    // FORK(host-handoff): the retry CAP. A remote `reconnect` client keeps
+    // redialing forever; a handoff-redial-ONLY client (`handoff_redial &&
+    // !reconnect`) is bounded to `RECONNECT_HANDOFF_MAX_ATTEMPTS` dials (enough to
+    // cover a same-machine handoff gap) and then GIVES UP — it must NOT fall into
+    // the steady-60s-forever cadence, which would storm a genuinely-dead local
+    // KeepAlive host. `td.reconnect_attempt` is the count of dials already made.
+    if (!shouldKeepRedialing(self.config.reconnect, self.config.handoff_redial, td.reconnect_attempt)) {
+        // Cap exhausted: stop scheduling. Leave the surface exactly where it is —
+        // the frozen last frame persists (the mirror owns no live state), there is
+        // NO overlay locally, and there is NEVER an `.exec` fallback. We do NOT
+        // clear `redial_in_flight`: leaving it set makes `reconnectAsyncCallback`'s
+        // coalesce guard permanently swallow any further drop notify, so a handoff
+        // client that exhausted its burst never dials a dead local host again. The
+        // last-set state is `.@"unreachable"` (from the failing `attemptReconnect`),
+        // which — being != `.reconnecting` — does not permanently hold input.
+        log.warn(
+            "host-handoff redial gave up after {d} attempt(s); local surface stays on its last frame (no overlay, no .exec fallback)",
+            .{td.reconnect_attempt},
+        );
+        return;
+    }
     if (td.reconnect_timer) |*timer| {
         timer.run(
             loop,
@@ -2525,23 +2639,29 @@ fn redialReattach(self: *Client, td: *ThreadData, loop: *xev.Loop) !void {
 const ReadThread = struct {
     /// (cloud-hosts / G1+G2+H2) The `.attach` read loop hit a genuine drop (EOF /
     /// read-error / fatal decode / POLLHUP). Classify it into a surface-visible
-    /// state and, for a reconnect-enabled client, wake the IO-thread redial
-    /// machine; then the caller RETURNS (exits the loop cleanly — the fix for the
-    /// old busy-loop that re-polled a peer-closed socket forever). A
-    /// `local`/single-shot client never redials.
+    /// state and, for a REDIALING client, wake the IO-thread redial machine; then
+    /// the caller RETURNS (exits the loop cleanly — the fix for the old busy-loop
+    /// that re-polled a peer-closed socket forever). A plain single-shot client
+    /// never redials.
+    ///
+    /// FORK(host-handoff): both arming decisions use the derived `wantsRedial()`
+    /// (`reconnect or handoff_redial`), so a LOCAL handoff-redial surface ALSO goes
+    /// `.reconnecting` (holding keystrokes across the gap) and wakes the redial
+    /// machine — while a plain single-shot local / `.mirror` client (neither flag)
+    /// leaves `reconnect_async` null and is byte-for-byte unchanged.
     fn onAttachDrop(client: *Client) void {
         const handshaked = client.ack_seen.load(.acquire);
         // (cloud-hosts) A DELIBERATE close makes this drop EXPECTED — the session is
         // already gone host-side by our own request, so neither re-state nor redial.
         const closing = client.closing.load(.acquire);
         // Pure classification (unit-tested): closing => leave the state; before-ack =>
-        // cannot_handshake; after-ack => reconnecting for a reconnect client, else
+        // cannot_handshake; after-ack => reconnecting for a redialing client, else
         // leave the state.
-        if (classifyDrop(client.config.reconnect, handshaked, closing)) |s| client.setClientState(s);
-        // Wake the IO-thread redial machine ONLY for a reconnect client (a
-        // `local`/single-shot client leaves `reconnect_async` null — never redials),
-        // and never for a deliberately-closed session.
-        if (client.config.reconnect and !closing) {
+        if (classifyDrop(client.config.wantsRedial(), handshaked, closing)) |s| client.setClientState(s);
+        // Wake the IO-thread redial machine ONLY for a redialing client (a plain
+        // single-shot client leaves `reconnect_async` null — never redials), and
+        // never for a deliberately-closed session.
+        if (client.config.wantsRedial() and !closing) {
             if (client.reconnect_async) |a| a.notify() catch {};
         }
     }
@@ -2717,7 +2837,8 @@ pub const ThreadData = struct {
     read_thread_live: bool = false,
 
     // --- (cloud-hosts / I1) opt-in redial machinery ---
-    // Null / inert for a `local`/single-shot client (`Config.reconnect == false`),
+    // Null / inert for a plain single-shot / `.mirror` client (armed on
+    // `Config.wantsRedial()` — FORK(host-handoff): `reconnect` OR `handoff_redial`),
     // so that path is byte-for-byte unchanged. All fields are touched ONLY on the
     // IO/loop thread (no atomics needed among them); the cross-thread signal is
     // `reconnect_async.notify()` from the read thread / writeCallback plus the

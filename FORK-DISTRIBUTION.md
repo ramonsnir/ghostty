@@ -95,7 +95,9 @@ facts for an agent touching this code:
   `mcp-listen`/`web-monitor-listen` disabled — see the seed bullet below); (2) **auto-provision
   the untracked machine-local `~/.config/ghostty-ramon/local`** with `mcp-listen` + a CSPRNG
   `mcp-token` (see the local-secrets bullet below); (3) install/version-reload a launchd
-  LaunchAgent for a `ghostty-host` BUNDLED at `Contents/MacOS/ghostty-host`; (4) install the
+  LaunchAgent that runs the host-handoff **SUPERVISOR** (`ghostty-host --supervise
+  --listen=<socket>`, same binary BUNDLED at `Contents/MacOS/ghostty-host`; it fork/execs the
+  worker that serves GUI sessions — see the two-identity reload paragraph below + HOST-HANDOFF.md); (4) install the
   bundled `ghostty-mcp` shim onto PATH (see the MCP-shim bullet below); (5) install a
   **`ghostty-ramon` CLI launcher** onto PATH (see the next bullet); (6) fire a **one-time
   first-run welcome notification** (idempotent via the persisted `forkSetup.welcomeShown`
@@ -134,46 +136,52 @@ facts for an agent touching this code:
   `com.mitchellh.ghostty-ramon.host`): it only acts when a host is actually bundled
   (local/dev builds skip — they don't bundle it), and it writes an ownership marker
   (`GhosttyAppManaged` = bundle id) into any plist it creates, refusing to touch a
-  pre-existing plist that lacks the marker. **The host reload is gated on the host
-  RELOAD IDENTITY — protocol version + a manual epoch — NOT the binary hash and NOT the
-  bundle version** — `plan(...)` compares a recorded "major.minor.epoch" string
-  (`kInstalledHostReloadIdentity`, from `ghostty_host_reload_identity()` = protocol
-  `PROTOCOL_VERSION_MAJOR`/`MINOR` + the GUI-side `host_reload_epoch` const in
-  `embedded.zig`, decoded by the pure `decodeReloadIdentity`) against the current one; it
-  does the bootout+bootstrap (which re-derives launchd's LWCR and KILLS the host's RAM-only
-  sessions) ONLY when that identity changed — i.e. a real wire-protocol change OR a manual
-  epoch bump (a host-internal fix colleagues must actually run). **Why identity, not the
-  cdhash: the notarized host's launchd LWCR is pinned to the Developer-ID identity
-  (identifier + Team ID `72PSTG4224`), NOT the cdhash** — verified empirically (`codesign
-  -dr -` shows no cdhash clause; a re-signed same-identity binary respawns under the old
-  LWCR with no exit-78). So a new same-identity host build satisfies the existing LWCR and
-  loads fine on the next natural restart with NO reload — the reload the old hash gate did
-  on every recompile was unnecessary. A GUI-only update (host recompiled to a new cdhash but
-  same protocol/epoch) is therefore **`.upToDate`, no reload, sessions preserved.** (This
-  supersedes the former SHA-256 binary-hash gate `kInstalledHostHash`/`hostBinaryHash`, which
-  reloaded on ANY host recompile — e.g. a Config.zig change that links into the host — even
-  when behavior was identical.) **⭐ THE TRANSITION IS NON-DESTRUCTIVE — the release that FIRST
-  ships this gate does NOT restart a colleague's host** (a common wrong assumption — "surely
-  ONE last restart to switch mechanisms"; NO). An upgrading colleague has a recorded hash but
-  NO recorded identity, so `plan(...)` takes the no-recorded-identity branch ONCE: `.adoptRunning`
-  if the host is up, `.revive` if down — **both `bootout: false`**, so it records the identity
-  and refreshes the plist WITHOUT killing the running host's RAM-only sessions. This is the whole
-  difference from the OLD hash gate, whose own hash→(pre-hash) transition DID do a one-last
-  version-reload. The adopted host keeps running the OLD binary; the NEW bundled host only starts
-  on the colleague's next NATURAL restart (reboot / manual), which is fine because the running
-  old host still satisfies the identity-pinned LWCR and speaks a compatible protocol.
-  **⚠️ THE ONE RULE THAT MAKES THE NON-DESTRUCTIVE TRANSITION SAFE: do NOT bump the protocol
-  MAJOR in the same release that a colleague first adopts under (i.e. any release while some
-  colleagues still have no recorded identity).** Because `.adoptRunning` leaves the OLD host
-  running without a reload, a simultaneous MAJOR bump would leave a major-N GUI talking to a
-  major-(N−1) host → the host REJECTS the handshake → empty surfaces until a manual host restart.
-  A protocol MINOR bump is safe (negotiated down; features gate on `negotiated_minor`), and a
-  MAJOR bump is safe once every colleague has a recorded identity (then `plan` takes the normal
-  `.reload` path). If you must bump the major, prefer bumping `host_reload_epoch` in a PRIOR
-  release first so colleagues record an identity, THEN bump the major in a later release. **The
-  cdhash-pinning exit-78 crash-loop gotcha still applies to Ramon's HAND-BUILT ad-hoc dev host
-  (no cert chain → DR falls back to cdhash) — but that host is hand-managed, untouched by
-  ForkSetup.** Pure planner `plan(...)`,
+  pre-existing plist that lacks the marker. **The host reload is gated on a TWO-IDENTITY
+  split — a SUPERVISOR identity + a WORKER identity — NOT the binary hash and NOT the bundle
+  version** (host-handoff; see HOST-HANDOFF.md). Both are carved IN SWIFT from the SAME packed
+  `ghostty_host_reload_identity()` (= protocol `PROTOCOL_VERSION_MAJOR`/`MINOR` + the GUI-side
+  `host_reload_epoch` const in `embedded.zig`) by the pure `decodeReloadIdentities` — **no new
+  C export**. FIRST-CUT MAPPING (documented in the code + HOST-HANDOFF.md): **supervisor
+  identity = protocol MAJOR** (rare); **worker identity = protocol MINOR + `host_reload_epoch`**
+  (common). `plan(...)` compares each recorded identity (`kInstalledHostSupervisorIdentity` /
+  `kInstalledHostWorkerIdentity`) against the current:
+  - **Worker identity changed, supervisor unchanged, supervisor RUNNING → `.handoffWorker`**
+    (the COMMON path): the executor resolves the running supervisor's pid from `launchctl
+    print` and `kill(pid, SIGHUP)`s it, so the supervisor re-execs its worker from the current
+    bundle and BROKERS a freeze→adopt handoff — **NO bootout, sessions SURVIVE, no LWCR reload**
+    (the new worker's cdhash is a supervisor child, not a launchd job). A worker change with no
+    running supervisor is `.revive` (nothing to SIGHUP; bring the supervisor up).
+  - **Supervisor identity changed → `.reload`** (the RARE, destructive `bootout`+`bootstrap`
+    that re-derives launchd's LWCR and KILLS the host's RAM-only sessions). A concurrent worker
+    change is dominated — a fresh supervisor re-establishes the whole job.
+  - **Both unchanged → `.upToDate`** (healthy) / `.revive` (down) — so a GUI-only update (host
+    recompiled to a new cdhash but same protocol/epoch) preserves sessions.
+
+  **Why identity, not the cdhash: the notarized host's launchd LWCR is pinned to the
+  Developer-ID identity (identifier + Team ID `72PSTG4224`), NOT the cdhash** — verified
+  empirically (`codesign -dr -` shows no cdhash clause; a re-signed same-identity binary
+  respawns under the old LWCR with no exit-78). So a new same-identity supervisor build
+  satisfies the existing LWCR and loads on the next natural restart with NO reload. **⭐ THE
+  SINGLE-KEY → TWO-IDENTITY TRANSITION IS NON-DESTRUCTIVE:** an upgrading colleague has NEITHER
+  new key recorded, so `plan(...)` takes the no-recorded-supervisor-identity branch ONCE:
+  `.adoptRunning` if the host is up, `.revive` if down — **both `bootout: false`**, recording
+  both identities WITHOUT killing the running host's sessions. (This supersedes the former
+  single `kInstalledHostReloadIdentity` gate, itself the successor to the SHA-256 hash gate
+  `kInstalledHostHash`.) The **one unavoidable session-losing deploy is the P4 switchover** from
+  the plain-host job to the supervisor job (the plist's ProgramArguments change from `--listen`
+  to `--supervise --listen`) — run it deliberately; after that, worker upgrades are
+  non-destructive handoffs. **⚠️ THE ONE RULE THAT KEEPS THE NON-DESTRUCTIVE TRANSITION SAFE:
+  do NOT bump the protocol MAJOR in a release a colleague first adopts under** (while some
+  colleagues have no recorded identity): `.adoptRunning` leaves the OLD host running without a
+  reload, so a simultaneous MAJOR bump would leave a major-N GUI talking to a major-(N−1) host →
+  handshake REJECTED → empty surfaces until a manual host restart. A protocol MINOR bump is safe
+  (negotiated down; now a worker handoff), and a MAJOR bump is safe once every colleague has a
+  recorded identity (then `plan` takes the normal `.reload` path). **The cdhash-pinning exit-78
+  crash-loop gotcha still applies to Ramon's HAND-BUILT ad-hoc dev host (no cert chain → DR
+  falls back to cdhash) — but that host is hand-managed, untouched by ForkSetup.** ONE RESIDUAL
+  (a follow-up): the SUPERVISOR ideally runs from a STABLE path outside the churning bundle so
+  its OWN exec path never goes stale; the first cut bundles it (same path as before), and the
+  supervisor's own exec-path self-check WARNS if the bundle moves. Pure planner `plan(...)`,
   `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`,
   `planLocalSecretsInstall`, `localHasMCPToken`, `planMCPRegister` are unit-tested. Wiring:
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG;
@@ -181,13 +189,17 @@ facts for an agent touching this code:
   `AppDelegate.swift` (the synchronous `performHostSetup()` call + the off-main
   `performDeferred()`), `project.pbxproj` (iOS exclusion). Tests:
   `macos/Tests/ForkSetup/ForkSetupTests.swift` (incl. `cli*` plan gates, `welcome*`,
-  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, the host reload-identity
-  gate `planUpToDateWhenOursAndIdentityMatches`/`planReloadsWhenProtocolMinorChanged*`/
-  `planReloadsWhenEpochBumped`/`planAdoptsRunningHostWhenNoRecordedIdentity` (the non-destructive
-  hash→identity transition)/`decodeReloadIdentityUnpacksMajorMinorEpoch`, and the seed-content
-  `configSeed*` assertions for the new onboarding content). The Zig side adds
-  `ghostty_host_reload_identity()` in `src/apprt/embedded.zig` (+ `include/ghostty.h`) — a
-  lib/xcframework rebuild, NO host restart (the export isn't compiled into `ghostty-host`).
+  `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, the TWO-IDENTITY reload
+  gate `planUpToDateWhenBothIdentitiesMatch` / `planHandsOffWorkerWhenWorkerMinorChangedAndRunning`
+  / `planHandsOffWorkerWhenEpochBumpedAndRunning` / `planReloadsWhenSupervisorIdentityChanged*` /
+  `planReloadDominatesWhenBothIdentitiesChangedAndRunning` /
+  `planAdoptsRunningHostWhenNoRecordedSupervisorIdentity` (the non-destructive single-key→two-identity
+  transition) / `decodeReloadIdentitiesCarvesSupervisorMajorAndWorkerMinorEpoch`, and the seed-content
+  `configSeed*` assertions incl. the `--supervise` ProgramArguments). **This change is Swift/GUI-only:
+  it reuses the EXISTING `ghostty_host_reload_identity()` export (carving supervisor-vs-worker in
+  Swift), so it needs NO new C export and NO lib/xcframework rebuild for the identity split** — the
+  Zig side is untouched by ForkSetup here (the supervisor/worker/broker Zig lives in `src/host/`,
+  a HOST change deployed by the deliberate P4 switchover; see HOST-HANDOFF.md).
 
 - **Auto-provisioned MCP secrets (`~/.config/ghostty-ramon/local`, ForkSetup job 2).** On
   first launch the fork writes the untracked machine-local `local` with `mcp-listen =

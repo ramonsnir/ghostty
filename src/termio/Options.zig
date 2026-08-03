@@ -5,6 +5,7 @@ const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
 const Config = @import("../config.zig").Config;
 const termio = @import("../termio.zig");
+const terminalpkg = @import("../terminal/main.zig");
 
 /// All size metrics for the terminal.
 size: renderer.Size,
@@ -39,3 +40,11 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// FORK(host-handoff): a rehydrated Terminal to ADOPT instead of building a fresh
+/// one. Set only by the headless host's `Session.adopt` when a predecessor
+/// `ghostty-host` handed off a live session (its serialized terminal +
+/// still-running child + pty master). When non-null, `Termio.init` uses this
+/// terminal verbatim and takes ownership of it. Null on every normal path (fresh
+/// `.exec`/`.client` spawn), where terminal construction is unchanged.
+adopt_terminal: ?terminalpkg.Terminal = null,

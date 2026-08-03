@@ -248,8 +248,18 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         break :modes modes;
     };
 
-    // Create our terminal
-    var term = try terminalpkg.Terminal.init(alloc, opts: {
+    // Create our terminal.
+    //
+    // FORK(host-handoff): when the caller hands us a rehydrated Terminal
+    // (`opts.adopt_terminal`, deserialized from a predecessor host's session) we
+    // ADOPT it verbatim instead of building a fresh one. It already carries the
+    // full restored emulation state (scrollback, cursor style, selection, modes,
+    // charsets, kitty graphics, pixel sizes), so we also SKIP the fresh-terminal
+    // defaults below (cursor style / pixel size) which would clobber the restored
+    // values. Ownership transfers to this Termio (freed by `self.terminal.deinit`
+    // in `deinit`, or by the `errdefer` here if init later fails). When null this
+    // is byte-for-byte the original fresh-terminal path.
+    var term = if (opts.adopt_terminal) |adopted| adopted else try terminalpkg.Terminal.init(alloc, opts: {
         const grid_size = opts.size.grid();
         break :opts .{
             .cols = grid_size.columns,
@@ -272,12 +282,17 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     });
     errdefer term.deinit(alloc);
 
-    // Set our default cursor style
-    term.screens.active.cursor.cursor_style = opts.config.cursor_style;
+    // FORK(host-handoff): skip the fresh-terminal defaults when adopting a
+    // rehydrated terminal (it already holds the restored cursor style + pixel
+    // sizes; overwriting them would corrupt the handed-off screen).
+    if (opts.adopt_terminal == null) {
+        // Set our default cursor style
+        term.screens.active.cursor.cursor_style = opts.config.cursor_style;
 
-    // Setup our terminal size in pixels for certain requests.
-    term.width_px = term.cols * opts.size.cell.width;
-    term.height_px = term.rows * opts.size.cell.height;
+        // Setup our terminal size in pixels for certain requests.
+        term.width_px = term.cols * opts.size.cell.width;
+        term.height_px = term.rows * opts.size.cell.height;
+    }
 
     // Setup our backend.
     var backend = opts.backend;
@@ -858,4 +873,23 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+/// FORK(host-handoff): the live pty master fd to hand off, or null if the backend
+/// has none (`.client`, or an `.exec` without a started pty). Forwards to the
+/// `.exec` backend; reads stored state only.
+pub fn masterFdForHandoff(self: *Termio) ?posix.fd_t {
+    return switch (self.backend) {
+        .exec => |*e| e.masterFdForHandoff(),
+        .client => null,
+    };
+}
+
+/// FORK(host-handoff): the child pid to hand off, or null if the backend has none.
+/// Forwards to the `.exec` backend; reads stored state only.
+pub fn childPidForHandoff(self: *Termio) ?posix.pid_t {
+    return switch (self.backend) {
+        .exec => |*e| e.childPidForHandoff(),
+        .client => null,
+    };
 }

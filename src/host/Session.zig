@@ -512,12 +512,62 @@ started: bool = false,
 /// runRenderLoop was never used (e.g. tests that only call tickRenderLoop).
 render_loop_thread: ?std.Thread.Id = null,
 
+/// FORK(host-handoff): the payload carried by `Session.adopt` through
+/// `createInternal`. It holds the three things a successor host needs to continue
+/// a predecessor's live session: the handed-off pty master fd, the still-running
+/// child pid, and the rehydrated Terminal (from `session_transfer.deserialize`).
+/// Ownership of `terminal` transfers into the created Session (consumed by Termio,
+/// or freed if init fails before Termio takes it).
+const AdoptCtx = struct {
+    master_fd: std.posix.fd_t,
+    child_pid: std.posix.pid_t,
+    terminal: terminalpkg.Terminal,
+};
+
 /// Create a fully-constructed Session at a stable heap address. This builds
 /// Termio (which spawns the child only at threadEnter, not here) but does NOT
 /// spawn the IO thread; call start() for that.
 pub fn create(alloc: Allocator, opts: Options) !*Session {
+    return createInternal(alloc, opts, null);
+}
+
+/// FORK(host-handoff): build a Session that ADOPTS a live session handed off by a
+/// predecessor `ghostty-host` — an already-open pty `master_fd`, the still-running
+/// `child_pid`, and a rehydrated `terminal` (from `session_transfer.deserialize`)
+/// — instead of spawning a fresh shell. The result is a fully-running Session
+/// (render loop, push gate, raw-output tee, everything) identical to a freshly
+/// created one EXCEPT that it continues the existing shell + screen: `Termio.init`
+/// uses the rehydrated terminal and `Exec.threadEnter` reuses `master_fd` +
+/// `child_pid` instead of `subprocess.start`. Takes ownership of `terminal`, of
+/// `master_fd` (closed on session close), and of the child (SIGHUP'd on session
+/// close). Call `start()` next, exactly as for `create`.
+pub fn adopt(
+    alloc: Allocator,
+    opts: Options,
+    master_fd: std.posix.fd_t,
+    child_pid: std.posix.pid_t,
+    terminal: terminalpkg.Terminal,
+) !*Session {
+    return createInternal(alloc, opts, .{
+        .master_fd = master_fd,
+        .child_pid = child_pid,
+        .terminal = terminal,
+    });
+}
+
+/// FORK(host-handoff): the shared body of `create` (adopt_ctx == null) and
+/// `adopt` (adopt_ctx set). With adopt_ctx null this is byte-for-byte the original
+/// `create`; the adopt branches are all guarded by `adopt_ctx`.
+fn createInternal(alloc: Allocator, opts: Options, adopt_ctx: ?AdoptCtx) !*Session {
     const self = try alloc.create(Session);
     errdefer alloc.destroy(self);
+
+    // FORK(host-handoff): own the caller-provided rehydrated terminal until Termio
+    // takes it. Freed here on ANY failure before `Termio.init`; disarmed (set to
+    // null) the instant we hand it to `Termio.init`, which from then on owns
+    // freeing it on its own failure (its internal `errdefer term.deinit`).
+    var adopt_terminal: ?terminalpkg.Terminal = if (adopt_ctx) |a| a.terminal else null;
+    errdefer if (adopt_terminal) |*t| t.deinit(alloc);
 
     // Default config: deterministic, never errors on fork-only keys.
     var config = try Config.default(alloc);
@@ -546,10 +596,14 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
     // returns this `.path`, and Exec.init dupes it again into Exec-owned memory,
     // so the config-arena copy only needs to outlive this create call. `null`
     // opts leaves the finalize default untouched (today's $HOME behavior).
-    if (opts.working_directory) |wd| {
+    // FORK(host-handoff): the working-directory / initial-input spawn-opts apply
+    // only to a FRESH spawn. An adopted session continues an existing shell, so
+    // feeding either would be wrong (initial_input would re-run a command on the
+    // live shell via ThreadEnterState). Skip both when adopting.
+    if (adopt_ctx == null) if (opts.working_directory) |wd| {
         const arena_alloc = config._arena.?.allocator();
         config.@"working-directory" = .{ .path = try arena_alloc.dupe(u8, wd) };
-    }
+    };
 
     // initial_input (cwd-inherit's sibling spawn-opt): if the GUI's Attach
     // carried initial input, store it into THIS session's config.input as a
@@ -563,13 +617,13 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
     // config.deinit. Must run BEFORE the Termio block (ThreadEnterState reads
     // config.input at Termio.init time). `null` => config.input stays empty
     // (no ThreadEnterState), today's behavior.
-    if (opts.initial_input) |ii| {
+    if (adopt_ctx == null) if (opts.initial_input) |ii| {
         const arena_alloc = config._arena.?.allocator();
         try config.input.list.append(
             arena_alloc,
             .{ .raw = try arena_alloc.dupeZ(u8, ii) },
         );
-    }
+    };
 
     const size: renderer.Size = .{
         .screen = .{
@@ -664,6 +718,17 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
         });
         errdefer io_exec.deinit();
 
+        // FORK(host-handoff): the handed-off master fd + child pid are threaded into
+        // Exec (so its threadEnter reuses them instead of spawning a subprocess)
+        // AFTER Termio.init succeeds — see the `self.io.backend.exec.adopt` set
+        // below the block. Setting it only on the createInternal SUCCESS path is
+        // load-bearing for the no-leak / no-double-close contract: on ANY failure
+        // here `Exec.adopt` stays null, so neither this `io_exec.deinit()` errdefer
+        // nor the tail `self.io.deinit()` releases the master — the caller that
+        // passed the fd (e.g. `Server.handleAdopt`) still owns closing it exactly
+        // once. On success, ownership transfers to the Session (released once by
+        // `Exec.threadExit` if started, or `Exec.deinit` if destroyed unstarted).
+
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
@@ -673,7 +738,16 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
         var derived = try termio.Termio.DerivedConfig.init(alloc, &self.config);
         errdefer derived.deinit();
 
-        // Build Termio: constructs the terminal into self.io.
+        // FORK(host-handoff): hand the rehydrated terminal to Termio.init and
+        // DISARM our ownership errdefer in the same breath — from here on
+        // Termio.init owns freeing it (its internal `errdefer term.deinit`) if it
+        // fails, and `self.io.deinit()` owns it on success. Null when not adopting
+        // => the fresh-terminal path is unchanged.
+        const adopt_terminal_moved = adopt_terminal;
+        adopt_terminal = null;
+
+        // Build Termio: constructs the terminal into self.io (or adopts the moved
+        // rehydrated one).
         try termio.Termio.init(&self.io, alloc, .{
             .size = size,
             .full_config = &self.config,
@@ -687,6 +761,7 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
                 .surface = surface,
                 .app = .{ .rt_app = &self.rt_app, .mailbox = app_queue },
             },
+            .adopt_terminal = adopt_terminal_moved,
         });
     }
     // Outside the block, Termio has taken ownership of env / io_exec /
@@ -700,6 +775,20 @@ pub fn create(alloc: Allocator, opts: Options) !*Session {
 
     // Hard invariant: inspector stays null.
     std.debug.assert(self.renderer_state.inspector == null);
+
+    // FORK(host-handoff): NOW that construction has fully succeeded (nothing
+    // fallible remains before `return`), transfer ownership of the handed-off
+    // master fd + child pid into the Termio-owned Exec. `threadEnter` reuses them
+    // (skipping `subprocess.start`), and teardown releases them exactly once:
+    // `Exec.threadExit`'s adopt branch on a started+closed session, or
+    // `Exec.deinit` on a session destroyed WITHOUT ever starting (the owner-thread-
+    // spawn-failed case). Because this is the LAST statement, `Exec.adopt` is set
+    // iff createInternal returns success — a failure above leaves it null and the
+    // caller retains ownership of the fd (no leak, no double-close).
+    if (adopt_ctx) |a| self.io.backend.exec.adopt = .{
+        .master_fd = a.master_fd,
+        .child_pid = a.child_pid,
+    };
 
     return self;
 }
@@ -1817,6 +1906,43 @@ pub fn childPidForDiag(self: *Session) ?std.posix.pid_t {
         .exec => |*e| e.childPidForDiag(),
         .client => null,
     };
+}
+
+/// FORK(host-handoff): the live pty master fd to hand off to a successor, or null
+/// if there is none (`.client`, or an `.exec` without a started pty). Reads stored
+/// state only. MUST be called (and the fd dup'd / SCM_RIGHTS-sent) BEFORE
+/// `detachForHandoff`, which neutralizes the subprocess and makes this return null.
+pub fn masterFdForHandoff(self: *Session) ?std.posix.fd_t {
+    return self.io.masterFdForHandoff();
+}
+
+/// FORK(host-handoff): the child pid to hand off to a successor, or null. Reads
+/// stored state only. Like `masterFdForHandoff`, call BEFORE `detachForHandoff`.
+pub fn childPidForHandoff(self: *Session) ?std.posix.pid_t {
+    return self.io.childPidForHandoff();
+}
+
+/// FORK(host-handoff): DETACH this session's IO for handoff. Stops the read thread
+/// and the child-exit watcher WITHOUT SIGHUP-ing the child or closing the pty
+/// master, so a successor `Session.adopt` can continue them (the master's kernel
+/// read pointer is shared across dup/SCM_RIGHTS, so the successor resumes exactly
+/// where this session stopped). The caller MUST have already extracted the fd +
+/// pid (masterFdForHandoff / childPidForHandoff) and serialized the terminal,
+/// because this neutralizes `subprocess` and the accessors then return null. After
+/// this returns the IO thread is joined and the render loop stopped; call
+/// `destroy()` to free the rest — it will NOT touch the handed-off master or child.
+pub fn detachForHandoff(self: *Session) void {
+    // Mark the Exec so the threadExit that runs when the IO thread stops (just
+    // below, inside stop()) takes the detach path. Set BEFORE stop(): the IO
+    // thread only reads this flag in threadExit, which runs after it observes the
+    // stop notify, so the notify is the happens-before barrier (same non-atomic
+    // cross-thread flag convention the backend already uses, e.g.
+    // Exec.ThreadData.termios_timer_running).
+    switch (self.io.backend) {
+        .exec => |*e| e.detach_requested = true,
+        .client => {},
+    }
+    self.stop();
 }
 
 /// Stop the session: signal the IO thread + render loop, join the IO thread.
