@@ -415,9 +415,24 @@ enum MCPLayout {
     /// appended a trailing newline and set as the tab's initial input (an
     /// interactive shell runs it; it does not replace the shell). Returns false
     /// ONLY if nothing was created.
+    ///
+    /// Thin Bool wrapper over `newTabReturningID` for callers that only need
+    /// success/failure (e.g. the MCP `new_tab` tool). Callers that want to drive
+    /// the new tab (the web monitor navigates the phone into it) use
+    /// `newTabReturningID` for the new leaf's UUID.
     static func newTab(cwd: String?, command: String?, sourceUUID: UUID?) -> Bool {
+        newTabReturningID(cwd: cwd, command: command, sourceUUID: sourceUUID) != nil
+    }
+
+    /// Like `newTab` (same behavior, guards, and `cwd`/`command` handling — see the
+    /// doc above) but returns the CREATED leaf surface's stable UUID, or nil if
+    /// nothing was created. The new tab's split tree is populated SYNCHRONOUSLY by
+    /// `TerminalController.newTab`, so the leaf id is read back immediately (its
+    /// `surfaceTree.first`), never returning the `SurfaceView` across a hop. MUST be
+    /// called on main.
+    static func newTabReturningID(cwd: String?, command: String?, sourceUUID: UUID?) -> UUID? {
         let initialInput: String? = command.map { $0.hasSuffix("\n") ? $0 : $0 + "\n" }
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return false }
+        guard let appDelegate = NSApp.delegate as? AppDelegate else { return nil }
 
         if let sourceUUID,
            let view = surface(forUUID: sourceUUID),
@@ -432,7 +447,7 @@ enum MCPLayout {
             if let initialInput { config.initialInput = initialInput }
             let created = TerminalController.newTab(
                 appDelegate.ghostty, from: window, withBaseConfig: config)
-            return created != nil
+            return created?.surfaceTree.first?.id
         }
 
         // No (resolvable/seated) source. The `ghosttyNewTab` notification's only observer
@@ -453,7 +468,7 @@ enum MCPLayout {
         let parent = TerminalController.all.first?.window
         let created = TerminalController.newTab(
             appDelegate.ghostty, from: parent, withBaseConfig: config)
-        return created != nil
+        return created?.surfaceTree.first?.id
     }
 
     // MARK: - Agent Queue: spawn_split_command / force_close

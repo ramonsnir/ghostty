@@ -1152,6 +1152,33 @@ struct WebMonitorServerTests {
         #expect(page.contains("function setMaximizeState(row)"))
     }
 
+    @Test func htmlPageHasNewTabControl() {
+        // The list screen's "＋ New tab" button + its POST to /api/new-tab, which on
+        // success must navigate INTO the created surface (showSurface) — a plain shell
+        // wouldn't survive the default "Agents only" filter, so without the jump the
+        // button would look like a no-op.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("id=\"newtab\""))
+        #expect(page.contains("newTabBtn.onclick = newTab"))
+        #expect(page.contains("function newTab()"))
+        #expect(page.contains("\"/api/new-tab\""))
+        #expect(page.contains("method: \"POST\""))
+        // On success it jumps into the new tab so it's not hidden by the filters.
+        #expect(page.contains("showSurface(data.id, \"New tab\", false)"))
+    }
+
+    @Test func htmlPageNewTabButtonSitsAboveTheList() {
+        // The action bar must precede the list so it's reachable in BOTH the wide
+        // sidebar and the narrow drawer (same DOM), not buried below the rows.
+        let page = WebMonitorServer.htmlPage
+        guard let actions = page.range(of: "id=\"listactions\""),
+              let list = page.range(of: "<div id=\"list\">") else {
+            Issue.record("sidebar is missing #listactions and/or #list")
+            return
+        }
+        #expect(actions.lowerBound < list.lowerBound)
+    }
+
     @Test func htmlPageMaximizeSitsBesideTheBackControl() {
         // Header order is load-bearing for layout, not cosmetic: #cur is flex:1 and grows
         // to fill, so anything AFTER it gets pushed onto a second row once #viewhdr wraps
@@ -1330,6 +1357,25 @@ struct WebMonitorServerTests {
     @Test func decideRouteSetMaximizedGetMethodNotAllowed() {
         let id = UUID()
         #expect(decide("GET", "/api/surface/\(id.uuidString)/maximize") == .methodNotAllowed)
+    }
+
+    // (ramon fork / Web monitor) Open-a-new-tab route. Not surface-scoped (no
+    // {uuid}); POST only; header-token gated like every other /api/* route.
+    @Test func decideRouteNewTabPost() {
+        #expect(decide("POST", "/api/new-tab") == .newTab)
+    }
+
+    @Test func decideRouteNewTabGetMethodNotAllowed() {
+        #expect(decide("GET", "/api/new-tab") == .methodNotAllowed)
+    }
+
+    @Test func decideRouteNewTabIsNotABootstrapPathSoQueryTokenIsRejected() {
+        // /api/new-tab is a real /api route, so (unlike GET / or the assets) it must
+        // NOT accept the token via ?token= — only the X-Ghostty-Token header. A
+        // query-only token is unauthorized.
+        #expect(decide("POST", "/api/new-tab",
+                       query: ["token": Self.tok],
+                       headers: ["host": "\(Self.host):\(Self.port)"]) == .unauthorized)
     }
 
     @Test func maximizedFlagDecode() {

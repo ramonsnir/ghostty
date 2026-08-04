@@ -528,6 +528,7 @@ final class WebMonitorServer {
         case unauthorized                        // 401 (token mismatch); bumps failure count
         case page                                // 200 GET / (embedded HTML)
         case surfacesList                        // GET /api/surfaces
+        case newTab                              // POST /api/new-tab (open a fresh Ghostty tab)
         case methodNotAllowed                    // 405
         case notFound                            // 404
         case screen(uuid: UUID, scrollback: Bool) // GET /api/surface/{uuid}/screen
@@ -626,6 +627,11 @@ final class WebMonitorServer {
         }
         if path == "/api/surfaces" {
             return method == "GET" ? .surfacesList : .methodNotAllowed
+        }
+        // Open a fresh Ghostty tab on the Mac from the list screen. Not
+        // surface-scoped (no {uuid}); header-token gated like every /api/* route.
+        if path == "/api/new-tab" {
+            return method == "POST" ? .newTab : .methodNotAllowed
         }
 
         // /api/push/{action} — Web Push registration + the arm/mute toggle.
@@ -751,6 +757,25 @@ final class WebMonitorServer {
                         self.send(.json(json), on: conn)
                     }
                 }
+            }
+
+        case .newTab:
+            clearAuthFailures(peer)
+            // (ramon fork / Web monitor) Open a FRESH Ghostty tab on the Mac from the
+            // list screen — the same thing ⌘T / the MCP `new_tab` tool does. We reuse
+            // MCPLayout.newTabReturningID with NO source (⇒ frontmost terminal window,
+            // or a brand-new window if none is open) and hand the new leaf's UUID back
+            // so the page can navigate STRAIGHT into it. That auto-navigate is
+            // load-bearing UX: a brand-new plain shell isn't a detected agent, so with
+            // the default "Agents only" list filter ON it would never appear in the
+            // list and the button would look like a silent no-op. Runs on main (touches
+            // TerminalController); assumeIsolated like the setHidden handler.
+            respondFromMain(on: conn) {
+                let id = MainActor.assumeIsolated {
+                    MCPLayout.newTabReturningID(cwd: nil, command: nil, sourceUUID: nil)
+                }
+                guard let id else { return .status(500, "Internal Server Error") }
+                return .json(Data(#"{"ok":true,"id":"\#(id.uuidString)"}"#.utf8))
             }
 
         case .methodNotAllowed:
@@ -2165,6 +2190,10 @@ final class WebMonitorServer {
       #tokenrecovery { display: none; padding: 10px 12px; border-bottom: 1px solid var(--border); }
       #tokenrecovery input[type=text] { width: 100%; background: var(--inputbg); color: var(--fg);
         border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 6px; }
+      /* "＋ New tab" action bar — full-width button above the session list. */
+      #listactions { padding: 8px 12px 0; }
+      #listactions #newtab { width: 100%; padding: 9px 10px; font-weight: 600; }
+      #listactions #newtab:hover { border-color: var(--accent); color: var(--accent); }
       #list { flex: 1 1 auto; overflow-y: auto; padding: 8px; }
       .grouphdr { padding: 10px 4px 5px; margin-top: 8px; border-bottom: 1px solid var(--border); }
       .grouphdr:first-child { margin-top: 0; }
@@ -2278,6 +2307,12 @@ final class WebMonitorServer {
                  spellcheck="false" inputmode="text" enterkeyhint="go" aria-label="Token">
           <button id="tokenconnect">Connect</button>
         </div>
+        <!-- Open a fresh Ghostty tab on the Mac (POST /api/new-tab), then navigate
+             straight into it. Lives above the list so it's reachable in both the wide
+             sidebar and the narrow drawer. -->
+        <div id="listactions">
+          <button id="newtab" title="Open a new terminal tab on the Mac and jump into it">&#43; New tab</button>
+        </div>
         <div id="list"></div>
       </aside>
       <main id="main">
@@ -2361,6 +2396,7 @@ final class WebMonitorServer {
       var app = document.getElementById("app");
       var menuBtn = document.getElementById("menubtn");
       var listEl = document.getElementById("list");
+      var newTabBtn = document.getElementById("newtab");
       var filterBar = document.getElementById("filterbar");
       var fHeroes = document.getElementById("f-heroes");
       var fAgents = document.getElementById("f-agents");
@@ -3167,6 +3203,39 @@ final class WebMonitorServer {
           else { setBanner("Hide failed (HTTP " + (r ? r.status : "?") + ").", false, true); }
         }).catch(function () { setBanner("Hide failed \\u2014 not delivered.", false, true); });
       }
+
+      // Open a fresh Ghostty tab on the Mac (POST /api/new-tab) and jump straight
+      // into it. The auto-navigate matters: a brand-new plain shell isn't a detected
+      // agent, so with the default "Agents only" filter ON it would never appear in
+      // the list and tapping the button would look like a silent no-op. The button is
+      // disabled while the request is in flight to swallow double-taps.
+      function newTab() {
+        newTabBtn.disabled = true;
+        fetch(url("/api/new-tab"), { method: "POST", headers: headers() })
+          .then(function (r) {
+            if (r && r.status === 401) throw new Error("401");
+            return r && r.ok ? r.json() : null;
+          })
+          .then(function (data) {
+            newTabBtn.disabled = false;
+            if (data && data.id) {
+              setBanner(null);
+              showSurface(data.id, "New tab", false);
+              loadList();
+            } else {
+              setBanner("Couldn't open a new tab.", false, true);
+            }
+          })
+          .catch(function (e) {
+            newTabBtn.disabled = false;
+            if (String(e.message) === "401") {
+              showTokenRecovery("Unauthorized. The token is wrong or was rotated. Reopen with ?token=..., or paste a token below.");
+            } else {
+              setBanner("Couldn't open a new tab \\u2014 not delivered.", false, true);
+            }
+          });
+      }
+      newTabBtn.onclick = newTab;
 
       // FRAME MODE (scrolling a full-screen app) — carried over unchanged from the
       // phone page: drive the host wheel (/scroll) then PAINT the host's

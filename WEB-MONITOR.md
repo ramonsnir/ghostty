@@ -125,6 +125,12 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      keybind — so hiding a split **from the phone is a hide in the dashboard too** (unified), and
      the **Hide hidden** filter then drops it. Auto-unhide-on-bell still applies (an agent that
      rings reappears). This is how you hide an agent split from the phone.
+   - **＋ New tab** sits above the list (both the phone drawer and the laptop sidebar). It opens a
+     fresh terminal tab on the Mac — same as ⌘T there — and **jumps you straight into it**, so you
+     can start a new shell (or launch a CLI agent) from the phone. It opens in the frontmost Mac
+     terminal window (a brand-new window if none is open). The auto-jump is deliberate: a plain new
+     shell isn't a detected agent, so the default **Agents only** filter would otherwise hide it
+     from the list and the button would look like it did nothing.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
    (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up),
    in the **same JetBrains Mono Nerd Font Ghostty uses** (vendored as woff2 and served by the
@@ -318,6 +324,7 @@ real scrollback can't come from the GUI. Instead:
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
 | `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,splitCount,isAgent,hidden,hero,maximized}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is; `maximized`+`splitCount` drive the ⛶ Maximize control) |
+| `POST /api/new-tab` | open a fresh Ghostty tab on the Mac (frontmost window, or a new window if none) → `{ok:true,id:<uuid>}` so the page navigates into it. `500` if nothing was created |
 | `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
@@ -629,11 +636,13 @@ needs `pty-host`); `GET /api/surface/{uuid}/frame` (host authoritative ANSI fram
 fallback, reuses `cachedVisibleContents`/`cachedScreenContents`); `POST
 /api/surface/{uuid}/input`; `POST /api/surface/{uuid}/scroll` (`{"dy":±ticks}`); `POST
 /api/surface/{uuid}/hidden` (`{"hidden":bool}` → toggle the Agent Dashboard hide set, see the
-hide note below).
+hide note below); `POST /api/new-tab` (open a fresh tab on the Mac → `{ok:true,id:<uuid>}`, see
+the new-tab note below).
 
 Status codes: Unknown id/path → 404, wrong method → 405, bad/negative/oversized
 Content-Length → 400, chunked → 411, oversized → 413, bad Host → 403, throttled (token mode)
-→ 429; `/hidden` → 503 when the dashboard isn't running.
+→ 429; `/hidden` → 503 when the dashboard isn't running; `/api/new-tab` → 500 when nothing
+was created.
 
 ### Agent filters (fork-only, GUI-only) — list-only "Agents only" / "Hide hidden"
 
@@ -676,6 +685,35 @@ instantly. ZERO host/Zig change; GUI relaunch. Wiring: `WebMonitorServer.swift`
 `AgentDashboardController.swift` (`setHidden(surfaceID:hidden:)`), page `loadList` row Hide/Show
 button + `setHidden(id,hidden)`. Tests: `WebMonitorServerTests`
 (`decideRouteSetHiddenPost`/`…GetMethodNotAllowed`, `hiddenFlagDecode`).
+
+### Open a new tab from the list (fork-only, GUI/page-only) — ＋ New tab
+
+A **＋ New tab** button in the list screen (above `#list`, so it shows in BOTH the wide sidebar
+and the narrow drawer — one DOM) opens a fresh Ghostty tab on the Mac and navigates the page
+straight into it. Route `POST /api/new-tab` — **NOT surface-scoped** (no `{uuid}`), header-token
+gated like every `/api/*` route (it is not a bootstrap path, so a query `?token=` is rejected —
+`decideRouteNewTabIsNotABootstrapPathSoQueryTokenIsRejected` guards this).
+
+The handler hops to main (`respondFromMain` + `MainActor.assumeIsolated`, like `setHidden`) and
+calls **`MCPLayout.newTabReturningID(cwd:nil, command:nil, sourceUUID:nil)`** — a new UUID-returning
+core that `MCPLayout.newTab` (the Bool the MCP `new_tab` tool uses) now delegates to, so the MCP
+path is untouched. No source ⇒ the tab opens in the **frontmost terminal window** (a brand-new
+window if none is open), exactly like ⌘T / the MCP tool's no-source path; the new tab's split tree
+is populated SYNCHRONOUSLY so the created leaf's id is read back immediately (`surfaceTree.first?.id`).
+It returns `{ok:true,id:<uuid>}`, or **500** if nothing was created.
+
+**The auto-navigate is load-bearing, not a nicety.** A brand-new plain shell isn't a detected CLI
+agent, so with the default **Agents only** filter ON it would never appear in the list — the button
+would look like a silent no-op. On `{id}` the page calls `showSurface(id, "New tab", false)` and
+jumps into the new surface's live view (the id is the same `.uuidString` form the list rows use, so
+`highlightActive` matches). The button is **disabled while the POST is in flight** to swallow
+double-taps, re-enabled on completion, and a failure shows a sticky banner (a 401 pops the
+token-recovery box, matching `loadList`). ZERO host/Zig/protocol change; GUI relaunch only. Wiring:
+`WebMonitorServer.swift` (`RouteDecision.newTab` + the `/api/new-tab` route arm + the handler), page
+`#listactions`/`#newtab` button + CSS + `newTab()` + `newTabBtn.onclick`; `MCPLayout.swift`
+(`newTabReturningID` core + the thin `newTab` Bool wrapper). Tests: `WebMonitorServerTests`
+(`decideRouteNewTabPost`/`…GetMethodNotAllowed`/`…IsNotABootstrapPathSoQueryTokenIsRejected`,
+`htmlPageHasNewTabControl`, `htmlPageNewTabButtonSitsAboveTheList`).
 
 ### Maximize a split from the phone/laptop (fork-only, GUI/page-only) — ⛶ Maximize/Restore
 
@@ -940,7 +978,11 @@ GUI/page parts are GUI-only (a relaunch reattaches).
 - `macos/Sources/Ghostty/Ghostty.Config.swift` (`webMonitorListen`/`webMonitorToken`/`ptyHost`)
 - `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` (server + xterm page + routes +
   Notify toggle + `/sw.js` + `/api/push/*`; the ⛶ Maximize route `.setMaximized` +
-  `maximizeOutcome` + `SurfaceRow.maximized` + the page's Maximize/Restore control)
+  `maximizeOutcome` + `SurfaceRow.maximized` + the page's Maximize/Restore control; the ＋ New tab
+  route `.newTab` + `/api/new-tab` handler + the page's `#newtab` button + `newTab()`)
+- `macos/Sources/Features/MCP/MCPLayout.swift` (`newTabReturningID` — the UUID-returning new-tab
+  core the ＋ New tab route uses; `newTab` is now a thin Bool wrapper over it, so the MCP `new_tab`
+  tool is unchanged)
 - `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`;
   Hero Agents: `PushKind.hero`/`payloadValue`, `onHero`, pure `pushTitle`/`pushPayload` seams,
   the `AgentStateUserInfoKey.hero`→`onHero` route in the attention observer)
