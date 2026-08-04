@@ -330,6 +330,10 @@ enum ForkSetup {
         /// (bootout+bootstrap) so launchd re-derives the LWCR for the new supervisor
         /// binary / its changed launchd contract. DESTRUCTIVE (kills the host's RAM-only
         /// sessions) — now RARE (only a supervisor-identity change, not a worker one).
+        /// ALSO the ONE-TIME plain pre-supervisor host → supervisor switchover (an old
+        /// build's plain `--listen` plist, no recorded supervisor identity, host
+        /// running): the single unavoidable session-losing deploy for a colleague,
+        /// after which worker upgrades are non-destructive `.handoffWorker`s.
         case reload(LaunchAgentSpec)
         /// We own the plist and the version matches → nothing to do.
         case upToDate
@@ -368,10 +372,17 @@ enum ForkSetup {
     ///   currently loaded AND running (a live pid). Consulted to avoid a destructive
     ///   reload when the bookkeeping was lost but the host is healthy, AND to decide
     ///   whether a worker change can be SIGHUP-handed-off (needs a live supervisor).
+    /// - Parameter existingPlistRunsSupervisor: whether the EXISTING on-disk plist's
+    ///   ProgramArguments already contain `--supervise` (from `plistRunsSupervisor`).
+    ///   Distinguishes a genuine supervisor whose identity record was lost (→ adopt)
+    ///   from the ONE-TIME plain pre-supervisor host → supervisor UPGRADE (→ reload):
+    ///   the OLD build wrote a plain `--listen` plist + only the single-key identity,
+    ///   so both new identity keys are absent AND the plist has no `--supervise`.
     static func plan(
         bundledHostExists: Bool,
         existingPlistFileExists: Bool,
         existingPlistManagedBy: String?,
+        existingPlistRunsSupervisor: Bool,
         installedSupervisorIdentity: String?,
         currentSupervisorIdentity: String,
         installedWorkerIdentity: String?,
@@ -385,14 +396,25 @@ enum ForkSetup {
             guard existingPlistManagedBy == spec.managingBundleID else {
                 return .skipExternallyManaged
             }
-            // No recorded SUPERVISOR identity: fresh under the two-identity gate
-            // (upgrading from the single-key build — every existing colleague hits
-            // this exactly once — or lost defaults). Because the LWCR is
-            // identity-pinned, this transition is NON-DESTRUCTIVE: record both
-            // identities WITHOUT reloading. A running host is adopted; a not-running
-            // one is revived (bootstrap, no bootout).
+            // No recorded SUPERVISOR identity: EITHER a genuine supervisor whose record
+            // was lost, OR the pre-supervisor plain-host → supervisor UPGRADE (the old
+            // build only wrote the single-key `kInstalledHostReloadIdentity`; both new
+            // keys are absent). These need OPPOSITE handling, so disambiguate on the
+            // EXISTING plist's args (`--supervise`) — NOT on `agentRunning` alone.
             guard let recordedSupervisor = installedSupervisorIdentity else {
-                return agentRunning ? .adoptRunning(spec) : .revive(spec)
+                if existingPlistRunsSupervisor {
+                    // A genuine supervisor plist already on disk → its identity record
+                    // was merely lost (defaults wiped). NON-DESTRUCTIVE: adopt the running
+                    // supervisor / revive a down one; record both identities, no bootout.
+                    return agentRunning ? .adoptRunning(spec) : .revive(spec)
+                }
+                // A PLAIN pre-supervisor host under a plain `--listen` plist → the
+                // ONE-TIME switchover. Running → the single unavoidable destructive
+                // `.reload` (bootout the plain host, bootstrap the supervisor) — adopting
+                // it would leave a plain host under a supervisor plist and a later
+                // `.handoffWorker` would SIGHUP-KILL it. Not running → nothing to lose, so
+                // bring the supervisor up NON-DESTRUCTIVELY (`.revive`, bootout:false).
+                return agentRunning ? .reload(spec) : .revive(spec)
             }
             // SUPERVISOR-identity gate (the RARE, destructive one). The notarized
             // host's launchd LWCR is pinned to the Developer-ID identity (identifier +
@@ -1033,7 +1055,11 @@ enum ForkSetup {
 
         let plistPath = "\(home)/Library/LaunchAgents/\(spec.label).plist"
         let target = "gui/\(getuid())/\(spec.label)"
-        let (fileExists, managedBy) = readPlistMarker(plistPath: plistPath, fileManager: fileManager)
+        // ONE parse of the existing plist: feeds both the ownership gate (marker) and
+        // the supervisor-vs-plain discrimination (ProgramArguments) — see plan()'s
+        // no-recorded-supervisor-identity branch (the plain-host → supervisor upgrade).
+        let (fileExists, managedBy, programArguments) = readPlist(plistPath: plistPath, fileManager: fileManager)
+        let existingPlistRunsSupervisor = plistRunsSupervisor(programArguments)
 
         // Probe "is the host already running?" when the plist is ours — every
         // ours-path consumes it: it decides revive-vs-upToDate (version matches)
@@ -1052,6 +1078,7 @@ enum ForkSetup {
             bundledHostExists: bundledHostExists,
             existingPlistFileExists: fileExists,
             existingPlistManagedBy: managedBy,
+            existingPlistRunsSupervisor: existingPlistRunsSupervisor,
             installedSupervisorIdentity: defaults.string(forKey: kInstalledHostSupervisorIdentity),
             currentSupervisorIdentity: currentSupervisorIdentity,
             installedWorkerIdentity: defaults.string(forKey: kInstalledHostWorkerIdentity),
@@ -1067,13 +1094,14 @@ enum ForkSetup {
         case .upToDate:
             logger.debug("host LaunchAgent already loaded (supervisor \(currentSupervisorIdentity, privacy: .public), worker \(currentWorkerIdentity, privacy: .public))")
         case .adoptRunning(let spec):
-            // Healthy host already running but no recorded identities (upgrading from
-            // the single-key / hash-keyed build, or lost defaults): record both + refresh
-            // the plist on disk — NO bootout, so the running host's sessions survive.
+            // Healthy GENUINE supervisor already running (its plist runs `--supervise`)
+            // but no recorded identities — defaults were wiped / lost. plan() only routes
+            // here when the existing plist is a supervisor (a plain pre-supervisor host
+            // takes `.reload` instead), so adopting is safe: record both + refresh the
+            // plist on disk — NO bootout, so the running supervisor's sessions survive.
             // Recording them here means future GUI-only updates compare equal and never
-            // reload. (Safe because the LWCR is identity-pinned — the running old host
-            // keeps serving. NOTE: this refreshes the plist to the --supervise form; the
-            // running plain host keeps serving until the deliberate P4 switchover.)
+            // reload. (Safe because the LWCR is identity-pinned — the running supervisor
+            // keeps serving.)
             try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
             recordHostIdentities(defaults: defaults, bundleVersion: bundleVersion,
                                  supervisor: currentSupervisorIdentity, worker: currentWorkerIdentity)
@@ -1087,14 +1115,13 @@ enum ForkSetup {
             // the plist on disk (harmless; keeps it current) so a future launchd restart
             // brings up the same spec.
             //
-            // ⚠️ DEPLOY-ORDERING CAVEAT: this SIGHUP assumes the running job is a GENUINE
-            // supervisor (its handler treats SIGHUP as "hand off to a new worker"). A plain
-            // pre-supervisor host's DEFAULT SIGHUP action is TERMINATION — so worker
-            // handoffs must not be relied on until the deliberate P4 plain-host→supervisor
-            // switchover has actually brought a supervisor up. The migration path
-            // (`.adoptRunning`, below) records the supervisor identity WITHOUT verifying the
-            // running process is already a supervisor, so land the two-identity ForkSetup
-            // change together with the P4 switchover (see HOST-HANDOFF.md), not ahead of it.
+            // This SIGHUP is only ever sent to a GENUINE supervisor: `.handoffWorker` is
+            // reached solely when a supervisor identity was already RECORDED (which only
+            // the supervisor-install/reload/adopt paths do), and the plain pre-supervisor
+            // → supervisor migration is routed to `.reload` (the P4 switchover), NOT
+            // `.adoptRunning` — see plan()'s `existingPlistRunsSupervisor` disambiguation.
+            // So a plain host (whose default SIGHUP action is TERMINATION) is never
+            // signaled here.
             try? spec.plistData().write(to: URL(fileURLWithPath: plistPath), options: .atomic)
             if signalSupervisorWorkerHandoff(target: target) {
                 recordHostIdentities(defaults: defaults, bundleVersion: bundleVersion,
@@ -1277,18 +1304,42 @@ enum ForkSetup {
         }
     }
 
-    /// Read the ownership marker from an existing plist.
+    /// (ramon fork / host-handoff) Read the ownership marker AND ProgramArguments from
+    /// an existing plist in ONE parse. `managedBy` is nil when the file is absent,
+    /// unreadable, not a plist dict, or lacks our marker (all "not ours");
+    /// `programArguments` is nil when absent/unreadable or the key is missing/mistyped.
+    /// The single parse feeds both the ownership gate and the supervisor-vs-plain
+    /// discrimination (`plistRunsSupervisor`).
+    static func readPlist(
+        plistPath: String, fileManager: FileManager
+    ) -> (exists: Bool, managedBy: String?, programArguments: [String]?) {
+        guard fileManager.fileExists(atPath: plistPath) else { return (false, nil, nil) }
+        guard let data = fileManager.contents(atPath: plistPath),
+              let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dict = obj as? [String: Any]
+        else { return (true, nil, nil) }
+        return (true, dict[managedKey] as? String, dict["ProgramArguments"] as? [String])
+    }
+
+    /// Read the ownership marker from an existing plist. Thin wrapper over `readPlist`
+    /// (kept for callers/tests that only need the marker).
     /// Returns (fileExists, managedBy). managedBy is nil when the file is absent,
     /// unreadable, not a plist dict, or lacks our marker — all "not ours".
     static func readPlistMarker(
         plistPath: String, fileManager: FileManager
     ) -> (exists: Bool, managedBy: String?) {
-        guard fileManager.fileExists(atPath: plistPath) else { return (false, nil) }
-        guard let data = fileManager.contents(atPath: plistPath),
-              let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let dict = obj as? [String: Any]
-        else { return (true, nil) }
-        return (true, dict[managedKey] as? String)
+        let r = readPlist(plistPath: plistPath, fileManager: fileManager)
+        return (r.exists, r.managedBy)
+    }
+
+    /// (ramon fork / host-handoff) Pure: does an existing host plist run the SUPERVISOR
+    /// (`ghostty-host --supervise …`) rather than a plain pre-supervisor host
+    /// (`--listen=…` only)? True iff its ProgramArguments contain `--supervise`. Used
+    /// ONLY in the no-recorded-supervisor-identity branch of `plan()` to tell a genuine
+    /// supervisor (lost record → adopt) from the one-time plain-host → supervisor
+    /// upgrade (→ reload switchover).
+    static func plistRunsSupervisor(_ programArguments: [String]?) -> Bool {
+        programArguments?.contains("--supervise") ?? false
     }
 
     /// Poll `launchctl print` for a live `pid = N`, allowing RunAtLoad a moment to

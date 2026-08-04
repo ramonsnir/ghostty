@@ -162,27 +162,37 @@ facts for an agent touching this code:
   empirically (`codesign -dr -` shows no cdhash clause; a re-signed same-identity binary
   respawns under the old LWCR with no exit-78). So a new same-identity supervisor build
   satisfies the existing LWCR and loads on the next natural restart with NO reload. **⭐ THE
-  SINGLE-KEY → TWO-IDENTITY TRANSITION IS NON-DESTRUCTIVE:** an upgrading colleague has NEITHER
-  new key recorded, so `plan(...)` takes the no-recorded-supervisor-identity branch ONCE:
-  `.adoptRunning` if the host is up, `.revive` if down — **both `bootout: false`**, recording
-  both identities WITHOUT killing the running host's sessions. (This supersedes the former
-  single `kInstalledHostReloadIdentity` gate, itself the successor to the SHA-256 hash gate
-  `kInstalledHostHash`.) The **one unavoidable session-losing deploy is the P4 switchover** from
-  the plain-host job to the supervisor job (the plist's ProgramArguments change from `--listen`
-  to `--supervise --listen`) — run it deliberately; after that, worker upgrades are
-  non-destructive handoffs. **⚠️ THE ONE RULE THAT KEEPS THE NON-DESTRUCTIVE TRANSITION SAFE:
-  do NOT bump the protocol MAJOR in a release a colleague first adopts under** (while some
-  colleagues have no recorded identity): `.adoptRunning` leaves the OLD host running without a
-  reload, so a simultaneous MAJOR bump would leave a major-N GUI talking to a major-(N−1) host →
-  handshake REJECTED → empty surfaces until a manual host restart. A protocol MINOR bump is safe
-  (negotiated down; now a worker handoff), and a MAJOR bump is safe once every colleague has a
-  recorded identity (then `plan` takes the normal `.reload` path). **The cdhash-pinning exit-78
+  NO-RECORDED-SUPERVISOR-IDENTITY BRANCH DISAMBIGUATES ON THE EXISTING PLIST'S ARGS** (pure
+  `plistRunsSupervisor`, from the SAME single plist parse as the ownership marker — see
+  `readPlist`), because a colleague reaching it is in ONE of two OPPOSITE situations:
+  - **Genuine supervisor, record lost** (existing plist already runs `--supervise`): defaults
+    were wiped but a real supervisor is up → `.adoptRunning` (running) / `.revive` (down),
+    **`bootout: false`**, recording both identities WITHOUT killing sessions.
+  - **Plain pre-supervisor host** (existing plist is `--listen`-only — the OLD build wrote a
+    plain plist + only the single-key `kInstalledHostReloadIdentity`): this is the **ONE-TIME
+    plain-host → supervisor switchover (P4)** → `.reload` when running (bootout the plain host,
+    bootstrap the supervisor — the single unavoidable session-losing deploy), `.revive` when
+    down (nothing to lose). **This is the bug-fix:** adopting a plain host as if it were a
+    supervisor would leave a plain host under a supervisor plist (EPERM risk) and a later
+    `.handoffWorker` would SIGHUP-KILL it (a plain host's default SIGHUP action is termination).
+    After this one `.reload`, worker upgrades are non-destructive `.handoffWorker`s.
+
+  (The two-key gate supersedes the former single `kInstalledHostReloadIdentity`, itself the
+  successor to the SHA-256 hash gate `kInstalledHostHash`.) **⚠️ THE ONE RULE THAT KEEPS THE
+  GENUINE-SUPERVISOR adopt SAFE: do NOT bump the protocol MAJOR in a release a colleague first
+  adopts under** (while a genuine supervisor has no recorded identity): `.adoptRunning` leaves
+  the OLD supervisor running without a reload, so a simultaneous MAJOR bump would leave a
+  major-N GUI talking to a major-(N−1) host → handshake REJECTED → empty surfaces until a manual
+  host restart. A protocol MINOR bump is safe (negotiated down; now a worker handoff), and a
+  MAJOR bump is safe once every colleague has a recorded identity (then `plan` takes the normal
+  `.reload` path). **The cdhash-pinning exit-78
   crash-loop gotcha still applies to Ramon's HAND-BUILT ad-hoc dev host (no cert chain → DR
   falls back to cdhash) — but that host is hand-managed, untouched by ForkSetup.** ONE RESIDUAL
   (a follow-up): the SUPERVISOR ideally runs from a STABLE path outside the churning bundle so
   its OWN exec path never goes stale; the first cut bundles it (same path as before), and the
   supervisor's own exec-path self-check WARNS if the bundle moves. Pure planner `plan(...)`,
-  `makeSpec`, `configSeedContents`, `readPlistMarker`, `planCLIInstall`, `shouldShowWelcome`,
+  `makeSpec`, `configSeedContents`, `readPlist`/`readPlistMarker`, `plistRunsSupervisor`,
+  `planCLIInstall`, `shouldShowWelcome`,
   `planLocalSecretsInstall`, `localHasMCPToken`, `planMCPRegister` are unit-tested. Wiring:
   `macos/Sources/Features/ForkSetup/ForkSetup.swift` (`import Security` for the CSPRNG;
   `registerMCPWithClaudeIfNeeded` + `loginShellStatus`/`claudeOnPath`/`ghosttyMCPRegistered`),
@@ -192,9 +202,12 @@ facts for an agent touching this code:
   `mcpRegister*`, `localSecrets*`/`generateMCPToken`/`localHasMCPToken`, the TWO-IDENTITY reload
   gate `planUpToDateWhenBothIdentitiesMatch` / `planHandsOffWorkerWhenWorkerMinorChangedAndRunning`
   / `planHandsOffWorkerWhenEpochBumpedAndRunning` / `planReloadsWhenSupervisorIdentityChanged*` /
-  `planReloadDominatesWhenBothIdentitiesChangedAndRunning` /
-  `planAdoptsRunningHostWhenNoRecordedSupervisorIdentity` (the non-destructive single-key→two-identity
-  transition) / `decodeReloadIdentitiesCarvesSupervisorMajorAndWorkerMinorEpoch`, and the seed-content
+  `planReloadDominatesWhenBothIdentitiesChangedAndRunning`, the migration disambiguation
+  `planAdoptsRunningSupervisorWhenNoRecordedIdentityAndPlistIsSupervisor` (lost-record recovery) vs
+  `planReloadsWhenNoRecordedIdentityAndExistingPlistIsPlainHostAndRunning` (the one-time plain-host→
+  supervisor switchover) / `planRevivesWhenNoRecordedIdentityAndPlainPlistNotRunning` /
+  `plistRunsSupervisorDetectsSuperviseFlag` / `readPlistExtractsSupervisorProgramArgumentsEndToEnd` /
+  `decodeReloadIdentitiesCarvesSupervisorMajorAndWorkerMinorEpoch`, and the seed-content
   `configSeed*` assertions incl. the `--supervise` ProgramArguments). **This change is Swift/GUI-only:
   it reuses the EXISTING `ghostty_host_reload_identity()` export (carving supervisor-vs-worker in
   Swift), so it needs NO new C export and NO lib/xcframework rebuild for the identity split** — the

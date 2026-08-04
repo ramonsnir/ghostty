@@ -180,22 +180,30 @@ broker is **never re-entered**; a handoff already in flight coalesces new trigge
   protocol MAJOR** (rare bumps → destructive reload); **worker = protocol MINOR +
   `host_reload_epoch`** (common bumps → SIGHUP handoff). Recorded in two UserDefaults
   keys (`kInstalledHost{Supervisor,Worker}Identity`, replacing the single
-  `kInstalledHostReloadIdentity`); an upgrading colleague has neither recorded, so
-  `plan()` takes the non-destructive `.adoptRunning`/`.revive` branch once (records
-  both, no bootout). The `.handoffWorker` EXECUTOR resolves the supervisor pid from
-  `launchctl print <label>` (the same job label + `pid = N` probe used elsewhere) and
-  `kill(pid, SIGHUP)`s it; a missing pid / failed kill is left UNrecorded so the next
-  launch retries (never a bootout).
-- **The one switchover deploy** (P4): migrating from the plain-host job to the
-  supervisor job costs exactly ONE unavoidable session-losing deploy; after that,
-  worker upgrades are non-destructive handoffs.
-- **⚠️ Deploy-ordering caveat**: `.handoffWorker` SIGHUPs the running job assuming it
-  is a genuine supervisor (SIGHUP = "hand off to a new worker"). A plain pre-supervisor
-  host's DEFAULT SIGHUP action is TERMINATION. ForkSetup's migration branch
-  (`.adoptRunning`) records the supervisor identity WITHOUT verifying the running
-  process is already a supervisor, so land the two-identity ForkSetup change TOGETHER
-  with the P4 switchover — never ship worker-handoff reliance ahead of a real
-  supervisor being up.
+  `kInstalledHostReloadIdentity`). The `.handoffWorker` EXECUTOR resolves the
+  supervisor pid from `launchctl print <label>` (the same job label + `pid = N` probe
+  used elsewhere) and `kill(pid, SIGHUP)`s it; a missing pid / failed kill is left
+  UNrecorded so the next launch retries (never a bootout).
+- **The plain-host → supervisor first update is a ONE-TIME `.reload`; subsequent worker
+  updates are `.handoffWorker`.** An upgrading colleague reaches the
+  no-recorded-supervisor-identity branch (the old build wrote only the single-key
+  identity, so both new keys are absent), which **disambiguates on the EXISTING plist's
+  ProgramArguments** via the pure `plistRunsSupervisor` (`--supervise` present?), read
+  from the SAME single plist parse as the ownership marker (`readPlist`):
+  - existing plist ALREADY runs `--supervise` → a genuine supervisor whose identity
+    record was merely lost → **non-destructive** `.adoptRunning` (running) / `.revive`
+    (down), recording both identities without a bootout.
+  - existing plist is a PLAIN `--listen` host (the real pre-supervisor→supervisor
+    UPGRADE) → the **ONE-TIME switchover** `.reload` when running (bootout the plain
+    host, bootstrap the supervisor — the single unavoidable session-losing deploy), or
+    `.revive` when down (nothing to lose). After this, worker upgrades are
+    non-destructive `.handoffWorker`s.
+  - **Why this matters (the bug it fixes):** adopting a plain host as if it were a
+    supervisor would leave a plain host running under a supervisor plist (EPERM risk
+    from the moved bundle) with no supervisor actually up, and a later `.handoffWorker`
+    would SIGHUP that plain host — whose DEFAULT SIGHUP action is TERMINATION — killing
+    every session. The `--supervise`-args check ensures a SIGHUP only ever targets a
+    genuine supervisor.
 
 ## Redeploy classification
 

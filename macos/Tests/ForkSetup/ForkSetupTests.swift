@@ -28,12 +28,17 @@ struct ForkSetupTests {
         running: Bool,
         bundledHost: Bool = true,
         plistExists: Bool = true,
-        managedBy: String? = "com.mitchellh.ghostty-ramon"
+        managedBy: String? = "com.mitchellh.ghostty-ramon",
+        // Defaults to a supervisor plist (the steady state); the plain-host → supervisor
+        // migration cases pass `runsSupervisor: false`. Only consulted in the
+        // no-recorded-supervisor-identity branch.
+        runsSupervisor: Bool = true
     ) -> ForkSetup.Plan {
         ForkSetup.plan(
             bundledHostExists: bundledHost,
             existingPlistFileExists: plistExists,
             existingPlistManagedBy: managedBy,
+            existingPlistRunsSupervisor: runsSupervisor,
             installedSupervisorIdentity: supInstalled,
             currentSupervisorIdentity: sup,
             installedWorkerIdentity: workerInstalled,
@@ -135,20 +140,54 @@ struct ForkSetupTests {
                      running: true) == .reload(spec()))
     }
 
-    @Test func planAdoptsRunningHostWhenNoRecordedSupervisorIdentity() {
-        // The single-key -> two-identity UPGRADE transition (and lost-defaults): we own
-        // the plist, never recorded a supervisor identity, but a healthy host is ALREADY
-        // running. Because the LWCR is identity-pinned we must NOT bootout (that would
+    @Test func planAdoptsRunningSupervisorWhenNoRecordedIdentityAndPlistIsSupervisor() {
+        // Lost-defaults recovery for a GENUINE supervisor: we own the plist, it ALREADY
+        // runs `--supervise`, a healthy supervisor is running, but the identity record
+        // was wiped. Because the LWCR is identity-pinned we must NOT bootout (that would
         // kill its RAM-only sessions) -> adopt it (record both identities, no restart).
         #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
-                     running: true) == .adoptRunning(spec()))
+                     running: true, runsSupervisor: true) == .adoptRunning(spec()))
     }
 
-    @Test func planRevivesWhenNoRecordedSupervisorIdentityAndNotRunning() {
-        // No recorded supervisor identity AND the host isn't running -> non-destructive
-        // revive (bootstrap, no bootout); there are no live sessions to lose.
+    @Test func planReloadsWhenNoRecordedIdentityAndExistingPlistIsPlainHostAndRunning() {
+        // THE MIGRATION FIX: an old (pre-supervisor) build wrote a PLAIN `--listen` plist
+        // + only the single-key identity, so both new identity keys are absent AND the
+        // plist has no `--supervise`. A plain host is running. This is the ONE-TIME
+        // plain-host -> supervisor switchover -> `.reload` (bootout the plain host,
+        // bootstrap the supervisor). Adopting here would leave a plain host under a
+        // supervisor plist and a later `.handoffWorker` would SIGHUP-KILL it.
         #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
-                     running: false) == .revive(spec()))
+                     running: true, runsSupervisor: false) == .reload(spec()))
+    }
+
+    @Test func planRevivesWhenNoRecordedIdentityAndPlainPlistNotRunning() {
+        // Plain pre-supervisor plist, no recorded identity, but nothing is running ->
+        // nothing to lose, so bring the supervisor up NON-DESTRUCTIVELY (`.revive`,
+        // bootout:false) rather than a destructive reload.
+        #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: false, runsSupervisor: false) == .revive(spec()))
+    }
+
+    @Test func planRevivesWhenNoRecordedIdentityAndSupervisorPlistNotRunning() {
+        // No recorded identity, the plist ALREADY runs `--supervise`, but the supervisor
+        // isn't running -> non-destructive revive (bootstrap, no bootout); no live
+        // sessions to lose.
+        #expect(plan(supInstalled: nil, sup: "1", workerInstalled: nil, worker: "4.0",
+                     running: false, runsSupervisor: true) == .revive(spec()))
+    }
+
+    // MARK: - plistRunsSupervisor(): supervisor-vs-plain-host discrimination
+
+    @Test func plistRunsSupervisorDetectsSuperviseFlag() {
+        // The supervisor plist's args carry `--supervise`; a plain pre-supervisor host's
+        // don't. nil/empty/plain all read as "not a supervisor".
+        #expect(ForkSetup.plistRunsSupervisor(
+            ["/A/Contents/MacOS/ghostty-host", "--supervise", "--listen=/x"]) == true)
+        #expect(ForkSetup.plistRunsSupervisor(
+            ["/A/Contents/MacOS/ghostty-host", "--listen=/x"]) == false)
+        #expect(ForkSetup.plistRunsSupervisor(["/A/Contents/MacOS/ghostty-host"]) == false)
+        #expect(ForkSetup.plistRunsSupervisor([]) == false)
+        #expect(ForkSetup.plistRunsSupervisor(nil) == false)
     }
 
     @Test func planTreatsNilWorkerWithMatchingSupervisorAsUpToDate() {
@@ -255,6 +294,20 @@ struct ForkSetupTests {
         let (exists, managedBy) = ForkSetup.readPlistMarker(plistPath: path, fileManager: .default)
         #expect(exists == true)
         #expect(managedBy == "com.mitchellh.ghostty-ramon")
+    }
+
+    @Test func readPlistExtractsSupervisorProgramArgumentsEndToEnd() throws {
+        // Round-trip: our own written plist -> readPlist surfaces the marker AND the
+        // ProgramArguments, and plistRunsSupervisor recognizes its own `--supervise`.
+        // This closes the migration loop (a plist WE wrote is a supervisor plist).
+        let path = NSTemporaryDirectory() + "ghostty-forksetup-args-\(UUID().uuidString).plist"
+        try spec().plistData().write(to: URL(fileURLWithPath: path))
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let (exists, managedBy, args) = ForkSetup.readPlist(plistPath: path, fileManager: .default)
+        #expect(exists == true)
+        #expect(managedBy == "com.mitchellh.ghostty-ramon")
+        #expect(args?.contains("--supervise") == true)
+        #expect(ForkSetup.plistRunsSupervisor(args) == true)
     }
 
     @Test func readPlistMarkerTreatsUnmarkedPlistAsNotOurs() throws {
