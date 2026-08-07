@@ -797,7 +797,7 @@ call is cents on cache READS). Load-bearing details:
   the new `queueKeySuggested` annotation (best-effort: any failure writes the `""` "inferred
   nothing" sentinel). **No Swift change to `get_haiku_usage` is needed** — `MCPUsage.aggregate`
   buckets by an arbitrary feature STRING, so `issue-key-infer` is broken out automatically. See
-  AGENT-QUEUE.md → "Adopting a free split".
+  AGENT-QUEUE-INTERNALS.md → "Adopting a free split into a queue".
 - **Persistence + retention**: `usage.ts` appends one JSONL line per call to
   `~/Library/Logs/ghostty-ramon-haiku-usage.jsonl` (best-effort, never throws — mirrors
   diag.ts). `trimUsageLog(14, Date.now())` runs once at sidecar startup (`main()`), dropping

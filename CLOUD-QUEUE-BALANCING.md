@@ -8,8 +8,7 @@ config/validate), 5.1 (placement wired into dispatch + schedule + the down-host 
 **`maxItems`** is honored by the selector for forward-compat but NOT yet enforced in the runner
 (v1 = concurrency-only; the persisted per-host counter is the deferred v1.1 / Phase 5.3 item, along
 with the `hosts[]` readiness hint from `RemoteTunnelController.handshaked` and the Swift `hostCapacity`
-decode/render). See AGENT-QUEUE.md → "Multi-host load balancing" + "Implementation notes → Multi-host
-load balancing" for the shipped wiring + tests.
+decode/render). See AGENT-QUEUE.md → "Multi-host load balancing" + `AGENT-QUEUE-INTERNALS-OPS.md` → "Multi-host load balancing" for the shipped wiring + tests.
 
 Cloud-hosts Phases 1–4 are
 implemented + committed at this checkout — a per-queue scalar `host` already places an Agent Queue's

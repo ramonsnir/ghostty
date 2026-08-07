@@ -29,7 +29,8 @@ The docs:
 | `MCP-SERVER.md` | MCP server + shim, agent-control + knowledge tools |
 | `AGENT-DASHBOARD.md` | live agent-preview sidebar panel |
 | `AGENT-MANAGER.md` | Haiku status summarizer sidecar, warm-base, usage tracking, rate-limit watchdog, orphan guard |
-| `AGENT-QUEUE.md` | queue supervisor, grid/packing, adopt, schedules, health/backlog, multi-host |
+| `AGENT-QUEUE.md` | queue supervisor user guide: grid/packing, adopt, schedules, health/backlog, multi-host |
+| `AGENT-QUEUE-INTERNALS.md` / `-UI.md` / `-OPS.md` | Agent Queue impl notes — part 1 engine/dispatch/config/adopt/params; part 2 layout/dashboard/live-controls; part 3 throttling/run-identity/restart/multi-host |
 | `HERO-AGENTS.md` | hero agents (attention-as-scarce-resource, two-pool model) |
 | `CLOUD-HOSTS-DESIGN.md` / `CLOUD-HOSTS-IMPL-PLAN.md` | remote `ghostty-host` over SSH: design + build plan + Phase-4/6 + hardening |
 | `CLOUD-QUEUE-BALANCING.md` | per-queue multi-host load balancing |
@@ -195,7 +196,7 @@ rides Claude Code's own auth (no API key). Traps: detection keys off `agentKind`
 on PATH; cost is controlled by throttle + warm-base fork-per-call. Includes the **sidecar orphan
 guard** (`GHOSTTY_PARENT_PID` watchdog) and `get_haiku_usage`. GUI relaunch + rebuilt sidecar `dist`.
 
-### Agent Queue → `AGENT-QUEUE.md`
+### Agent Queue → `AGENT-QUEUE.md` (user guide) + `AGENT-QUEUE-INTERNALS.md` / `-UI.md` / `-OPS.md` (impl notes)
 Turns the dashboard into an active supervisor: from a JSON template it opens a tab of splits,
 launches one CLI agent per work item, caps concurrency, tracks to completion, force-closes done+idle
 splits (unless kept), and re-polls. Fork-only, macOS, OFF by default. Keys: `agent-queue`,
