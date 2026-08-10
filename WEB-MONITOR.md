@@ -132,13 +132,23 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      shell isn't a detected agent, so the default **Agents only** filter would otherwise hide it
      from the list and the button would look like it did nothing.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
-   (fed by the host raw-byte stream; the terminal is sized to the host's grid so TUIs line up),
+   (fed by a host byte stream over **Server-Sent Events**, which streams incrementally on every
+   browser — notably iOS Safari, which *buffers* a plain `fetch()` stream and would otherwise show
+   stale content; the terminal is sized to the host's grid so TUIs line up),
    in the **same JetBrains Mono Nerd Font Ghostty uses** (vendored as woff2 and served by the
    app, so it renders correctly on a phone that doesn't have the font installed).
    It scrolls horizontally if the host grid is wider than the phone; use the **font-size**
    control to fit. If the stream is unavailable it falls back to a plain-text snapshot poll.
 4. **Input:**
    - **Text field + Send** — *types* the text into the terminal; it does **not** submit.
+     **Autocorrect + spellcheck are ON** on this field (so a prose reply to an agent gets
+     corrected — iOS honors these hints); autocapitalize stays OFF so a typed shell command
+     isn't capitalized. (The token box is the opposite — strict-off — a secret is never
+     autocorrected.)
+   - **First-tap on iOS:** the on-screen buttons (quick-keys, Send) register on the **first**
+     tap even while the text field is focused. Previously iOS ate the first tap dismissing the
+     keyboard, so a button needed two or three taps; the page now keeps the field's focus on tap
+     so the button fires immediately (and the keyboard stays up for the next reply).
    - **Enter** quick-key — submits (a real Enter keypress).
    - Quick-keys: **Enter · y · n · Esc · Tab · ⌫ Backspace · Clear (Ctrl-U) · Ctrl-C**, the
      **digits 1–4** (numbered agent menus), and **arrows**.
@@ -308,9 +318,16 @@ real scrollback can't come from the GUI. Instead:
 - A Swift **host-protocol client** (`WebMonitorHostClient`, POSIX `AF_UNIX`) connects to the
   `pty-host` socket, does the `Hello` handshake, `subscribe_raw`s a session, and decodes the
   `raw_output` stream.
-- The server's **`GET /api/surface/{uuid}/stream`** pipes those raw bytes to the browser as a
-  long-lived `application/octet-stream`, with the host grid size in `X-Ghostty-Cols/-Rows`
-  headers; the page feeds it to `xterm.js` (sized to that grid).
+- The server's **`GET /api/surface/{uuid}/stream-sse`** pipes those raw bytes to the browser as
+  **Server-Sent Events** — each host chunk base64-framed as one SSE `data:` event, with the host
+  grid size sent in-band as the first `event: size` (EventSource can't read response headers) and
+  a periodic keepalive comment on an idle stream; the page (`EventSource`) base64-decodes each
+  frame back to bytes and feeds them to `xterm.js` (sized to that grid). **Why SSE, not a raw
+  `fetch()` stream:** iOS WebKit *buffers* a `fetch().body.getReader()` stream — it delivers
+  chunks in large batches, so a low-rate terminal shows **stale** content until a reconnect —
+  whereas `EventSource` delivers incrementally on every browser. The raw `application/octet-stream`
+  **`/stream`** route (grid size in `X-Ghostty-Cols/-Rows` headers) is kept as an alternative but
+  the page no longer uses it.
 - Input/scroll go back the other way as real key/wheel events on the GUI surface, forwarded by
   the `.client` backend to the host.
 
@@ -325,7 +342,8 @@ real scrollback can't come from the GUI. Instead:
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
 | `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,splitCount,isAgent,hidden,hero,maximized}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is; `maximized`+`splitCount` drive the ⛶ Maximize control) |
 | `POST /api/new-tab` | open a fresh Ghostty tab on the Mac (frontmost window, or a new window if none) → `{ok:true,id:<uuid>}` so the page navigates into it. `500` if nothing was created |
-| `GET /api/surface/{uuid}/stream` | live raw-byte stream (xterm.js source; needs `pty-host`) |
+| `GET /api/surface/{uuid}/stream-sse` | **live stream over Server-Sent Events — the page's primary live transport** (xterm.js source; needs `pty-host`). Same host bytes as `/stream`, base64-framed as SSE `data:` events; the grid size is the first `event: size` (EventSource can't read response headers) and the token rides `?token=` (EventSource can't set a header). iOS-safe: iOS WebKit **buffers** a plain `fetch()`-body stream so the terminal shows stale content, while EventSource delivers incrementally on every browser. |
+| `GET /api/surface/{uuid}/stream` | live **raw** byte stream (`application/octet-stream`; header-token only). Kept as an alternative; the page no longer uses it (iOS buffers it — see `/stream-sse`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
 | `POST /api/surface/{uuid}/input` | real key events (raw text, or `{"key":…}`) |
 | `GET /api/surface/{uuid}/frame` | host's authoritative render as a self-contained ANSI frame (color); for frame-mode scrolling. 501 without pty-host |
@@ -389,15 +407,17 @@ real scrollback can't come from the GUI. Instead:
 ## Status
 
 Implemented and reviewed across code / design / UX / test-coverage. Covered by a Swift unit
-suite (`GhosttyTests/WebMonitorServerTests`, 250+ cases) + host integration/protocol tests
-(`zig build test -Dtest-filter=host`) + a Zig config-parse test; the macOS app builds clean.
-Committed on `ramon-fork` (not pushed).
+suite (`GhosttyTests/WebMonitorServerTests`, 250+ cases — including the SSE-transport framing
++ route + query-token tests and the mobile-input page-content guards) + host integration/protocol
+tests (`zig build test -Dtest-filter=host`) + a Zig config-parse test; the macOS app builds clean
+and the full `GhosttyTests` unit suite passes (1306 cases, 0 failures). Committed on `ramon-fork`
+(not pushed).
 
 ## Where the code lives
 
 | Piece | File |
 |---|---|
-| Server + embedded `xterm.js` page (routing, `/stream`, `/scroll`, assets, Notify toggle) | `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` |
+| Server + embedded `xterm.js` page (routing, `/stream-sse` + raw `/stream`, `/scroll`, assets, Notify toggle, mobile input fixes) | `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` |
 | Web Push crypto (VAPID/RFC 8292 + RFC 8291 `aes128gcm`) + subscription store / bell→push | `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` |
 | Host-protocol client (subscribe to `raw_output`) | `macos/Sources/Features/WebMonitor/WebMonitorHostClient.swift` |
 | Vendored xterm.js | `macos/Sources/Features/WebMonitor/vendor/xterm.{js,css}` |
@@ -602,11 +622,66 @@ crash-safe frames carry it: `subscribe_raw` (client→host) + `raw_output` (host
 `src/host/protocol.zig`, routed by `src/host/Server.zig` raw subscribers. A Swift
 host-protocol client — `WebMonitorHostClient` (POSIX `AF_UNIX`) — connects to the `pty-host`
 socket, does the `Hello` handshake, `subscribe_raw`s a session, and decodes the `raw_output`
-stream. `GET /api/surface/{uuid}/stream` pipes those bytes to the browser as a long-lived
-`application/octet-stream` with the host grid in `X-Ghostty-Cols`/`X-Ghostty-Rows` headers
-(from `ghostty_surface_size`); the page `term.resize()`s `xterm.js` to that grid so
-cursor-addressed TUIs render aligned. **Without `pty-host`** (or if the stream can't start →
-501) the page falls back to the plain-text snapshot poll.
+stream. The page streams those bytes over **Server-Sent Events** (`stream-sse`, see below);
+`term.resize()`s `xterm.js` to the host grid so cursor-addressed TUIs render aligned.
+**Without `pty-host`** (or if the stream can't start → 501) the page falls back to the
+plain-text snapshot poll.
+
+### iOS-safe live transport = SSE, NOT a `fetch()` byte stream (fork-only, GUI/page-only)
+
+**Symptom this fixes:** on iOS Safari the terminal preview showed **stale** content — you had to
+maximize/restore or reload to force a reconnect, then it went stale again; desktop Chrome and
+Android Chrome were fine. **Root cause:** iOS WebKit **buffers** a `fetch().body.getReader()`
+response — it delivers stream chunks in large batches, so a low-rate terminal (the common case)
+sits in WebKit's buffer and never reaches the reader until enough bytes accumulate. A reconnect
+replays the host ring buffer as one burst (clears the buffer threshold → looks current), then it
+freezes again as new bytes trickle in. Chrome/Blink (desktop + Android) delivers incrementally,
+so only iOS was affected.
+
+**Fix (page transport swap, no host/Zig change):** the same host bytes now stream as
+**Server-Sent Events**, which `EventSource` delivers incrementally on every browser. Both the
+`.raw` and `.sse` framings reuse the identical resolve + `WebMonitorHostClient` pipe (a
+`StreamFraming` param on `routeStream`/`startStream`); `.sse` differs only in:
+- **Head** `sseStreamResponseHead()` → `Content-Type: text/event-stream` (+ `no-store,
+  no-transform`, `nosniff`, `Connection: close`, no `Content-Length`).
+- **Grid size in-band** `sseSizeEvent(cols,rows)` → `event: size\ndata: {"cols":C,"rows":R}\n\n`
+  written BEFORE any output frame (EventSource can't read the `X-Ghostty-Cols/-Rows` headers the
+  raw stream uses). The page listens for `event: size` and `term.resize`s first.
+- **Per-chunk frame** `sseDataFrame(bytes)` → `data: <base64>\n\n` (base64 is single-line and
+  survives SSE's UTF-8/newline framing; the page `b64ToBytes`→`term.write(Uint8Array)` so xterm
+  does its own UTF-8 decode, byte-exact — multi-byte glyphs split across chunks reassemble).
+- **Keepalive** a repeating `sseKeepalive` comment (`: keepalive\n\n`, every
+  `sseKeepaliveInterval`=25s) so an idle/silent stream isn't dropped by iOS / an intermediary —
+  its own `streamKeepaliveTimers` timer, cancelled in the `.cancelled/.failed` state handler,
+  the host client's `onClose`, and `stop()`.
+- **Auth** EventSource can't set a header, so `stream-sse` accepts `?token=` — the ONE
+  non-bootstrap route in `acceptsQueryToken` (`isBootstrapPath || isStreamSSEPath`); the raw
+  `/stream` stays header-only, and every other `/api/*` route still ignores the query token.
+- **Reconnect model** the page does NOT rely on EventSource's silent auto-reconnect (a
+  reconnect re-subscribes → the host replays its ring → **duplicate** output on the same
+  terminal). On `es.onerror` it `close()`s and falls back to the `/screen` poll (which cleanly
+  detects a 404 → "Session closed."); the existing `visibilitychange` resync / reselecting the
+  split re-opens a fresh live view. This is the same fall-back-then-recover shape the old
+  `fetch` path used, and it is why background tabs behave the same as before (iOS suspends a
+  backgrounded tab for ANY transport — the `visibilitychange` handler is the real resume path).
+
+The raw `.raw`/`application/octet-stream` `/stream` route is kept (still routed + tested) as an
+alternative but the page no longer uses it. GUI/page-only — relaunch, no host restart.
+
+### Mobile input fixes (fork-only, GUI/page-only)
+
+- **Autocorrect on the Send field.** iOS honors `autocorrect`/`spellcheck` (Android largely
+  ignores them), so the Send `#inp` explicitly-off attributes meant "redume" was never corrected
+  to "resume". Now `autocorrect="on" spellcheck="true"` (with `autocapitalize="off"` so a typed
+  shell command isn't capitalized). The token `#tokeninput` stays strict-off — a secret is never
+  autocorrected.
+- **First-tap-eaten on iOS.** While the Send field is focused (soft keyboard up), iOS consumes
+  the FIRST tap on a button dismissing the keyboard, so a `click`-wired button only fired on the
+  2nd/3rd tap. `keepFocusOnTap` `preventDefault`s `pointerdown`/`mousedown` on the static buttons
+  so the tap no longer reads as "dismiss keyboard" — the `click` fires on the first tap and the
+  field keeps focus (keyboard stays up for the next reply). Keyboard Tab-activation is unaffected
+  (only pointer focus-steal is prevented). The auto-repeat buttons already acted on
+  `pointerdown`, which is why arrows/scroll always worked first-tap.
 
 ### Font
 

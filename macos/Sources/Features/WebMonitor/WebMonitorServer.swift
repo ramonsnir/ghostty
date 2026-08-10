@@ -114,6 +114,17 @@ final class WebMonitorServer {
     /// `streamClients`. Mutated only on `queue`.
     private var streamingConns: Set<ObjectIdentifier> = []
 
+    /// Per-connection SSE keepalive timers (see `armStreamKeepalive`). Only SSE
+    /// (`.sse`) streams have one; it writes a periodic comment line so an idle,
+    /// silent stream is not dropped. Keyed by connection identity; cancelled +
+    /// dropped in the `.cancelled/.failed` state handler, the host client's
+    /// `onClose`, and `stop()`. Mutated only on `queue`.
+    private var streamKeepaliveTimers: [ObjectIdentifier: DispatchSourceTimer] = [:]
+
+    /// How often an SSE stream emits a keepalive comment. Short enough to beat a
+    /// typical proxy / NAT idle timeout, long enough to be negligible traffic.
+    private static let sseKeepaliveInterval: TimeInterval = 25
+
     /// Per-peer failed-token counter (keyed by remote IP string). Cheap brute
     /// force speed bump; resets on a successful auth. Mutated only on `queue`.
     /// Each entry carries the count plus the last-failure time so the lockout
@@ -312,6 +323,8 @@ final class WebMonitorServer {
             for (_, client) in self.streamClients { client.stop() }
             self.streamClients.removeAll()
             self.streamingConns.removeAll()
+            for (_, timer) in self.streamKeepaliveTimers { timer.cancel() }
+            self.streamKeepaliveTimers.removeAll()
             for (_, conn) in self.connectionRefs { conn.cancel() }
             self.connectionRefs.removeAll()
         }
@@ -380,6 +393,7 @@ final class WebMonitorServer {
                     client.stop()
                 }
                 self?.streamingConns.remove(key)
+                self?.streamKeepaliveTimers.removeValue(forKey: key)?.cancel()
             default:
                 break
             }
@@ -533,6 +547,7 @@ final class WebMonitorServer {
         case notFound                            // 404
         case screen(uuid: UUID, scrollback: Bool) // GET /api/surface/{uuid}/screen
         case stream(uuid: UUID)                  // GET /api/surface/{uuid}/stream (raw byte stream)
+        case streamSSE(uuid: UUID)               // GET /api/surface/{uuid}/stream-sse (Server-Sent Events; iOS-safe)
         case frame(uuid: UUID)                   // GET /api/surface/{uuid}/frame (host authoritative ANSI frame)
         case input(uuid: UUID)                   // POST /api/surface/{uuid}/input
         case scroll(uuid: UUID)                  // POST /api/surface/{uuid}/scroll (mouse wheel)
@@ -580,6 +595,30 @@ final class WebMonitorServer {
         path == "/" || path == "/sw.js" || assetRoutes[path] != nil
     }
 
+    /// Whether `path` is the SSE live-stream route `/api/surface/{uuid}/stream-sse`.
+    /// The browser opens this with `EventSource`, which — like a `<script>` tag —
+    /// CANNOT set the `X-Ghostty-Token` header, so this route must accept the token
+    /// via `?token=` (see `acceptsQueryToken`). PURE; the shape check mirrors the
+    /// `/api/surface/{uuid}/{action}` parse in `decideRoute`.
+    static func isStreamSSEPath(_ path: String) -> Bool {
+        let comps = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        return comps.count == 4 && comps[0] == "api" && comps[1] == "surface"
+            && comps[3] == "stream-sse" && UUID(uuidString: comps[2]) != nil
+    }
+
+    /// The SET of routes that accept the token via `?token=` (not only the
+    /// `X-Ghostty-Token` header): the bootstrap page + its `<script>/<link>`
+    /// assets (`isBootstrapPath`) AND the SSE live stream (`isStreamSSEPath`),
+    /// which `EventSource` reaches with no way to set a header. SECURITY: every
+    /// OTHER `/api/*` route still requires the header and ignores any query token.
+    /// The SSE route is a live PTY stream (not a public asset), so accepting the
+    /// query token here is the one deliberate extension beyond the public bootstrap
+    /// assets — matched by the constant-time compare + per-peer backoff like any
+    /// route, and the token is already present in the page URL the client holds.
+    static func acceptsQueryToken(_ path: String) -> Bool {
+        isBootstrapPath(path) || isStreamSSEPath(path)
+    }
+
     /// Decide the route. PURE: no AppKit, no socket, no mutation.
     static func decideRoute(
         method: String,
@@ -603,13 +642,15 @@ final class WebMonitorServer {
         // OPEN — access control is the tailnet / Tailscale ACL alone (the bound
         // port + Host-header allowlist still apply). When a token IS configured
         // it gates every route, with the per-peer brute-force backoff. The query
-        // token (`?token=`) is accepted ONLY for the BOOTSTRAP paths (GET / and
-        // the <script>/<link> asset routes, which cannot send a custom header);
-        // every /api/* route requires the X-Ghostty-Token header.
+        // token (`?token=`) is accepted ONLY for the paths a browser reaches with
+        // no way to set a custom header (`acceptsQueryToken`): the BOOTSTRAP paths
+        // (GET / and the <script>/<link> asset routes) AND the SSE live stream
+        // (opened via EventSource); every OTHER /api/* route requires the
+        // X-Ghostty-Token header.
         if !token.isEmpty {
             if peerFailureCount >= failedAuthThreshold { return .throttled }
             let headerToken = headers["x-ghostty-token"] ?? ""
-            let presented = isBootstrapPath(path) ? (query["token"] ?? headerToken) : headerToken
+            let presented = acceptsQueryToken(path) ? (query["token"] ?? headerToken) : headerToken
             guard tokensMatch(presented, token) else { return .unauthorized }
         }
 
@@ -661,6 +702,16 @@ final class WebMonitorServer {
                 // like every other /api/* route (it is NOT a bootstrap path).
                 guard method == "GET" else { return .methodNotAllowed }
                 return .stream(uuid: uuid)
+            case "stream-sse":
+                // Long-lived Server-Sent-Events stream — same host bytes as
+                // /stream, but base64-framed as SSE `data:` events. This is the
+                // page's primary live transport: iOS WebKit BUFFERS a plain
+                // `fetch()`-body stream (it delivers chunks in large batches, so a
+                // low-rate terminal appears stale), whereas EventSource delivers
+                // incrementally on every browser. Reached via EventSource, which
+                // cannot set the header, so it takes `?token=` (acceptsQueryToken).
+                guard method == "GET" else { return .methodNotAllowed }
+                return .streamSSE(uuid: uuid)
             case "frame":
                 // One-shot HOST-authoritative ANSI frame (for scrolling a
                 // full-screen app without xterm.js re-emulation drift).
@@ -820,7 +871,11 @@ final class WebMonitorServer {
 
         case .stream(let uuid):
             clearAuthFailures(peer)
-            routeStream(uuid: uuid, on: conn)
+            routeStream(uuid: uuid, on: conn, framing: .raw)
+
+        case .streamSSE(let uuid):
+            clearAuthFailures(peer)
+            routeStream(uuid: uuid, on: conn, framing: .sse)
 
         case .input(let uuid):
             clearAuthFailures(peer)
@@ -1109,6 +1164,59 @@ final class WebMonitorServer {
         return Data(head.utf8)
     }
 
+    // MARK: - SSE framing (the iOS-safe live transport)
+
+    /// How a live stream's bytes are put on the wire. `.raw` is the original
+    /// unframed `application/octet-stream` body (fed by `fetch().body.getReader()`
+    /// — kept as an alternative). `.sse` base64-frames the SAME host bytes as
+    /// Server-Sent Events, the page's primary transport: iOS WebKit BUFFERS a
+    /// `fetch()`-body stream (chunks arrive in large batches, so a low-rate
+    /// terminal looks stale), while `EventSource` delivers incrementally on every
+    /// browser. Both reuse the identical resolve + host-client pipe.
+    enum StreamFraming { case raw, sse }
+
+    /// The HTTP response head for the SSE (`.sse`) live stream: a 200 with a
+    /// `text/event-stream` body that runs until the connection closes. Unlike the
+    /// raw head, the grid size is NOT a header (EventSource cannot read response
+    /// headers) — it is sent in-band as the first `size` event (`sseSizeEvent`).
+    /// PURE + `internal` so the wire bytes are unit-testable.
+    static func sseStreamResponseHead() -> Data {
+        var head = "HTTP/1.1 200 OK\r\n"
+        head += "Content-Type: text/event-stream; charset=utf-8\r\n"
+        // SSE must not be buffered/transformed by any intermediary; `tailscale
+        // serve` (Go reverse proxy) auto-flushes text/event-stream, and these keep
+        // it honest end-to-end.
+        head += "Cache-Control: no-store, no-transform\r\n"
+        head += "X-Content-Type-Options: nosniff\r\n"
+        head += "Connection: close\r\n"
+        head += "\r\n"
+        return Data(head.utf8)
+    }
+
+    /// The first SSE event: the host grid size, carried in-band because
+    /// EventSource can't read the `X-Ghostty-Cols/-Rows` headers the raw stream
+    /// uses. The page listens for `event: size` and `term.resize(cols, rows)`s
+    /// xterm.js BEFORE any output frames, so cursor-addressed TUIs line up. PURE.
+    static func sseSizeEvent(cols: UInt16, rows: UInt16) -> Data {
+        Data("event: size\ndata: {\"cols\":\(cols),\"rows\":\(rows)}\n\n".utf8)
+    }
+
+    /// Frame one chunk of raw PTY bytes as an SSE `data:` event. The bytes are
+    /// base64-encoded (single line — `base64EncodedString()` inserts no line
+    /// breaks, and base64 contains no `\n`, so it is exactly one `data:` line) so
+    /// arbitrary/binary PTY output survives SSE's UTF-8, newline-delimited framing
+    /// intact. The page base64-decodes back to bytes and `term.write`s them, so
+    /// multi-byte UTF-8 sequences are reassembled byte-for-byte by xterm.js. PURE.
+    static func sseDataFrame(_ bytes: Data) -> Data {
+        Data("data: \(bytes.base64EncodedString())\n\n".utf8)
+    }
+
+    /// An SSE keepalive: a comment line (starts with `:`), ignored by EventSource.
+    /// Sent periodically on an idle stream so a silent connection is not dropped by
+    /// an intermediary / iOS, which would otherwise force a reconnect + full
+    /// ring-replay repaint. PURE constant.
+    static let sseKeepalive = Data(": keepalive\n\n".utf8)
+
     /// Resolve a surface UUID to its host session id + the configured pty-host
     /// socket path, then open a `WebMonitorHostClient` and pipe its raw PTY
     /// bytes onto `conn` as a streaming response. Falls back to 501 (so the
@@ -1129,7 +1237,7 @@ final class WebMonitorServer {
     /// never leaks a host client. The host client's `onBytes`/`onClose` fire on
     /// ITS own background queue; they only call thread-safe `NWConnection`
     /// methods, so no further hop is needed.
-    private func routeStream(uuid: UUID, on conn: NWConnection) {
+    private func routeStream(uuid: UUID, on conn: NWConnection, framing: StreamFraming) {
         let key = ObjectIdentifier(conn)
 
         // De-blocked resolve hop (head-of-line fix): like the simple handlers
@@ -1196,7 +1304,8 @@ final class WebMonitorServer {
                     self.send(.status(501, "Not Implemented"), on: conn)
                 case let .proceed(socketPath, sessionID, cols, rows):
                     self.startStream(on: conn, key: key, socketPath: socketPath,
-                                     sessionID: sessionID, cols: cols, rows: rows)
+                                     sessionID: sessionID, cols: cols, rows: rows,
+                                     framing: framing)
                 }
             }
         }
@@ -1208,30 +1317,48 @@ final class WebMonitorServer {
     /// pure-decision switch above.
     private func startStream(on conn: NWConnection, key: ObjectIdentifier,
                              socketPath: String, sessionID: UInt64,
-                             cols: UInt16, rows: UInt16) {
+                             cols: UInt16, rows: UInt16, framing: StreamFraming) {
         // Enter streaming mode: this connection is long-lived, so exempt it from
         // BOTH watchdogs (they would otherwise cancel it mid-stream), and mark it
         // so teardown stays idempotent. We deliberately do NOT route this through
         // `send()` (that path writes a Content-Length body + cancels on
-        // completion); instead we write the head, then raw chunks, ourselves.
+        // completion); instead we write the head, then framed chunks, ourselves.
         cancelConnectionTimer(key)
         streamingConns.insert(key)
 
         // Write the streaming HTTP head. On failure the connection is already
-        // gone; the state handler will clean up.
-        conn.send(content: Self.streamResponseHead(cols: cols, rows: rows),
-                  completion: .contentProcessed { _ in })
+        // gone; the state handler will clean up. For SSE the grid size can't ride
+        // response headers (EventSource can't read them), so it goes in-band as
+        // the first `size` event, written BEFORE any output frames so xterm.js
+        // resizes before the ring replay lands.
+        switch framing {
+        case .raw:
+            conn.send(content: Self.streamResponseHead(cols: cols, rows: rows),
+                      completion: .contentProcessed { _ in })
+        case .sse:
+            conn.send(content: Self.sseStreamResponseHead(),
+                      completion: .contentProcessed { _ in })
+            conn.send(content: Self.sseSizeEvent(cols: cols, rows: rows),
+                      completion: .contentProcessed { _ in })
+            // Keepalive: SSE has no per-chunk framing on the raw stream to carry a
+            // heartbeat, so an idle split (no output) would leave the connection
+            // silent and liable to be dropped by iOS / an intermediary. A periodic
+            // comment line keeps it warm; cancelled on teardown (state handler,
+            // onClose, stop()).
+            armStreamKeepalive(key, conn: conn)
+        }
 
-        // Open the host client and pipe raw bytes onto the connection. onBytes /
-        // onClose fire on the client's own background queue; NWConnection.send /
-        // .cancel are thread-safe, so we call them directly. We hop to `queue`
-        // for the dict cleanup in onClose to keep `streamClients`/`streamingConns`
-        // single-threaded.
+        // Open the host client and pipe bytes onto the connection, framed per
+        // `framing`. onBytes / onClose fire on the client's own background queue;
+        // NWConnection.send / .cancel are thread-safe, so we call them directly.
+        // We hop to `queue` for the dict cleanup in onClose to keep
+        // `streamClients`/`streamingConns`/keepalive single-threaded.
         let client = WebMonitorHostClient(
             socketPath: socketPath,
             sessionID: sessionID,
             onBytes: { [weak conn] data in
-                conn?.send(content: data, completion: .contentProcessed { err in
+                let payload = (framing == .sse) ? Self.sseDataFrame(data) : data
+                conn?.send(content: payload, completion: .contentProcessed { err in
                     // A write error means the peer (phone) hung up; tear the
                     // connection down so the host client's read loop stops.
                     if err != nil { conn?.cancel() }
@@ -1244,10 +1371,28 @@ final class WebMonitorServer {
                 self?.queue.async {
                     self?.streamClients[key] = nil
                     self?.streamingConns.remove(key)
+                    self?.streamKeepaliveTimers.removeValue(forKey: key)?.cancel()
                 }
             })
         streamClients[key] = client
         client.start()
+    }
+
+    /// Arm a repeating keepalive that writes an SSE comment line on an SSE stream
+    /// so a silent (idle) connection stays warm. Runs on `queue`; the timer fires
+    /// on `queue`, so the `streamKeepaliveTimers` access is race-free.
+    private func armStreamKeepalive(_ key: ObjectIdentifier, conn: NWConnection) {
+        streamKeepaliveTimers[key]?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.sseKeepaliveInterval,
+                       repeating: Self.sseKeepaliveInterval)
+        timer.setEventHandler { [weak conn] in
+            conn?.send(content: Self.sseKeepalive, completion: .contentProcessed { err in
+                if err != nil { conn?.cancel() }
+            })
+        }
+        streamKeepaliveTimers[key] = timer
+        timer.resume()
     }
 
     /// Load a vendored static asset from the app bundle and wrap it in an
@@ -2367,9 +2512,13 @@ final class WebMonitorServer {
           <button id="scrolldown" title="Scroll down (real wheel to the app; paints the host frame)">&#8681; Scroll</button>
         </div>
         <div class="bar">
+          <!-- autocorrect/spellcheck ON so prose replies to an agent get corrected
+               (iOS honors these hints; Android largely ignores them). autocapitalize
+               stays OFF so typed shell commands/flags aren't capitalized. The token
+               field below is the opposite (strict-off) — never autocorrect a secret. -->
           <input id="inp" type="text" placeholder="type a reply, then Send (or just type on the terminal directly)"
-                 autocapitalize="off" autocorrect="off" autocomplete="off"
-                 spellcheck="false" inputmode="text" enterkeyhint="send"
+                 autocapitalize="off" autocorrect="on" autocomplete="off"
+                 spellcheck="true" inputmode="text" enterkeyhint="send"
                  aria-label="Input to send to the terminal">
           <button id="send" title="Type into the terminal (does NOT submit — press Enter to send)">Send</button>
         </div>
@@ -2705,10 +2854,15 @@ final class WebMonitorServer {
         timer = setInterval(poll, 700);
       }
 
-      // Open the live raw-byte stream for `uuid` into an xterm.js terminal — the
-      // same path as the phone page, but with a desktop-scale font size. Sizes the
-      // terminal to the HOST grid from the X-Ghostty-Cols/-Rows headers (never
-      // resizes the PTY). Degrades to the poll fallback on any failure.
+      // Open the live view for `uuid` into an xterm.js terminal. The transport is
+      // Server-Sent Events (EventSource), NOT a buffered fetch() body stream: iOS
+      // WebKit BUFFERS fetch stream chunks (it delivers them in large batches, so a
+      // low-rate terminal shows stale content until you force a reconnect), while
+      // EventSource delivers incrementally on every browser. The bytes are the
+      // SAME host PTY bytes, base64-framed as SSE `data:` events on the server.
+      // The host grid size arrives in-band as the first `size` event (EventSource
+      // can't read response headers), and the token rides ?token= (EventSource
+      // can't set a header). Degrades to the /screen poll on any failure.
       function openStream(uuid) {
         if (!window.Terminal) return null;
         var term = new Terminal({
@@ -2723,45 +2877,60 @@ final class WebMonitorServer {
         screenEl.style.display = "none";
         modeToggleEl.style.display = "none";
 
-        var reader = null;
+        var es = null;
         var disposed = false;
         function teardown() {
           if (disposed) return;
           disposed = true;
-          if (reader) { try { reader.cancel(); } catch (e) {} }
+          if (es) { try { es.close(); } catch (e) {} }
           try { term.dispose(); } catch (e) {}
         }
-
-        fetch(url("/api/surface/" + uuid + "/stream"), { headers: headers({}) })
-          .then(function (r) {
-            if (r.status === 404) { if (stream === handle) { sessionClosedTeardown(); } return; }
-            if (!r.ok || !r.body) {
-              if (stream === handle) fallbackToPoll("Live stream unavailable \\u2014 using snapshot.");
-              return;
-            }
-            reader = r.body.getReader();
-            var hc = parseInt(r.headers.get("X-Ghostty-Cols"), 10);
-            var hr = parseInt(r.headers.get("X-Ghostty-Rows"), 10);
-            if (hc > 0 && hr > 0) { try { term.resize(hc, hr); } catch (e) {} }
-            function pump() {
-              return reader.read().then(function (res) {
-                if (disposed) return;
-                if (res.done) {
-                  if (stream === handle) fallbackToPoll("Live stream ended \\u2014 using snapshot.");
-                  return;
-                }
-                if (!frameMode) term.write(res.value);
-                return pump();
-              });
-            }
-            return pump();
-          })
-          .catch(function () {
-            if (disposed) return;
-            if (stream === handle) fallbackToPoll("Connection lost \\u2014 using snapshot.");
-          });
-
         var handle = { dispose: teardown, term: term };
+
+        // Decode one SSE `data:` frame (base64 of raw PTY bytes) back to a
+        // Uint8Array so xterm.js writes the EXACT bytes and does its own UTF-8
+        // decoding (multi-byte glyphs survive intact). Mirrors vapidKeyBytes().
+        function b64ToBytes(b64) {
+          try {
+            var raw = atob(b64), n = raw.length, arr = new Uint8Array(n);
+            for (var i = 0; i < n; i++) arr[i] = raw.charCodeAt(i) & 0xff;
+            return arr;
+          } catch (e) { return null; }
+        }
+
+        try {
+          es = new EventSource(url("/api/surface/" + uuid + "/stream-sse", { token: token }));
+        } catch (e) {
+          if (stream === handle) fallbackToPoll("Live stream unavailable \\u2014 using snapshot.");
+          return handle;
+        }
+        // Host grid size, before any output frame, so cursor-addressed TUIs align.
+        es.addEventListener("size", function (evt) {
+          if (disposed) return;
+          try {
+            var s = JSON.parse(evt.data);
+            if (s.cols > 0 && s.rows > 0) term.resize(s.cols, s.rows);
+          } catch (e) {}
+        });
+        es.onmessage = function (evt) {
+          if (disposed || frameMode) return;
+          var b = b64ToBytes(evt.data);
+          if (b && b.length) { try { term.write(b); } catch (e) {} }
+        };
+        es.onerror = function () {
+          // A closed/failed stream (404 session-gone, 501 no-pty-host, or a
+          // network drop) surfaces here. We deliberately DON'T rely on
+          // EventSource's silent auto-reconnect: reconnecting re-subscribes and the
+          // host replays its ring buffer, which would DUPLICATE onto this same
+          // terminal. Close it and fall back to the /screen poll, which cleanly
+          // detects a 404 (-> "Session closed.") and otherwise keeps a working
+          // plain-text view; the visibilitychange resync / reselect brings the
+          // live color view back.
+          if (disposed) return;
+          try { es.close(); } catch (e) {}
+          if (stream === handle) fallbackToPoll("Live stream interrupted \\u2014 using snapshot.");
+        };
+
         return handle;
       }
 
@@ -2908,8 +3077,8 @@ final class WebMonitorServer {
       // is the only way to see more from here.
       //
       // After the resize lands we RECONNECT the stream, because xterm.js is sized ONCE
-      // from the X-Ghostty-Cols/-Rows headers at stream open (see openStream): leaving
-      // the old size in place against a re-gridded host would wrap and clip the output.
+      // from the SSE `size` event at stream open (see openStream): leaving the old size
+      // in place against a re-gridded host would wrap and clip the output.
       // The delay lets the Mac's relayout + the host resize round-trip settle so the
       // reconnect reads the NEW grid; this is the same snap-and-reopen the \\u25cf Live
       // button does when leaving frame mode.
@@ -3173,6 +3342,25 @@ final class WebMonitorServer {
         el.addEventListener("pointerleave", stop);
         el.addEventListener("click", function (e) { e.preventDefault(); });
       }
+
+      // iOS first-tap fix. While the Send field is focused (soft keyboard up), the
+      // FIRST tap on a button is otherwise consumed dismissing the keyboard, so the
+      // button's `click` only fires on the second/third tap ("I have to tap a
+      // button 2-3 times"). Preventing the default focus-shift on pointerdown /
+      // mousedown means the tap no longer reads as "dismiss keyboard": the click
+      // fires on the FIRST tap and the field keeps focus (keyboard stays up for the
+      // next reply). Harmless on desktop, and buttons don't need focus here (a
+      // focused button would in fact make the keyboard driver bail). The auto-
+      // repeat buttons already act on pointerdown, so they don't rely on this, but
+      // re-applying it to them is harmless. Only the STATIC buttons are swept;
+      // dynamic list rows are tapped from the list, not right after typing.
+      function keepFocusOnTap(el) {
+        if (!el) return;
+        var pd = function (e) { e.preventDefault(); };
+        el.addEventListener("pointerdown", pd);
+        el.addEventListener("mousedown", pd);
+      }
+      Array.prototype.forEach.call(document.querySelectorAll("button"), keepFocusOnTap);
 
       // On-screen quick-key row: arrows + backspace auto-repeat on hold; the rest
       // (enter/space/y/n/esc/tab/ctrl-u/ctrl-c) are single-fire.

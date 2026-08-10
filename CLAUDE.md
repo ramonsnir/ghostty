@@ -157,14 +157,19 @@ bell visibility across splits/zoom. GUI relaunch + rebuilt sidecar `dist`; no ho
 
 ### Web monitor → `WEB-MONITOR.md`
 GUI-embedded HTTP server; from a phone/laptop over Tailscale lists surfaces, renders one in color
-via xterm.js off the raw PTY stream, sends input, scrolls, maximizes a split, opens a new tab
-(＋ New tab in the list → `POST /api/new-tab`, auto-jumps into it), and does bell→Web-Push.
+via xterm.js off a per-session host byte stream, sends input, scrolls, maximizes a split, opens a
+new tab (＋ New tab in the list → `POST /api/new-tab`, auto-jumps into it), and does bell→Web-Push.
 Fork-only, OFF by default. Keys: `web-monitor-listen` (bind loopback `127.0.0.1:18787`, front with
 `tailscale serve` for HTTPS), `web-monitor-token` 🔒. ONE responsive capability-adaptive page for
 phone + desktop. Traps: input is REAL key events with NATIVE macOS virtual keycodes (the
 `GHOSTTY_KEY_*` enum is wrong); scroll uses FRAME MODE (host authoritative render via
 `ghostty_surface_read_ansi`) + a first-scroll cursor seed — never re-emulate scroll-region in
-xterm.js (garble). The raw-tee is a HOST change; the scroll/hide/maximize/page work is GUI-only.
+xterm.js (garble). **The live view streams over SSE (`/stream-sse`: base64 `data:` frames, grid
+size as the first in-band `event: size`, token via `?token=`), NOT `fetch()`+getReader — iOS
+WebKit BUFFERS a fetch body stream so the preview goes stale (the raw `/stream` is kept but
+unused).** Mobile input: the Send field has autocorrect/spellcheck ON (autocapitalize off; token
+box strict-off); buttons `preventDefault` pointerdown so the iOS keyboard-dismiss doesn't eat the
+first tap. The raw-tee is a HOST change; the SSE/scroll/hide/maximize/page work is GUI-only.
 
 ### MCP server + knowledge tools → `MCP-SERVER.md`
 GUI-embedded MCP server (HTTP JSON-RPC + stdio shim `ghostty-mcp`) giving an orchestrating agent

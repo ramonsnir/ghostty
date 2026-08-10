@@ -967,9 +967,7 @@ struct WebMonitorServerTests {
         #expect(page.contains("/jetbrains-mono-regular.woff2"))
         #expect(page.contains("/jetbrains-mono-bold.woff2"))
         #expect(page.contains("function openStream"))
-        #expect(page.contains("/stream"))
-        #expect(page.contains("X-Ghostty-Cols"))
-        #expect(page.contains("X-Ghostty-Rows"))
+        #expect(page.contains("/stream-sse"))       // live transport (SSE; see htmlPageLiveStreamUsesEventSource)
         #expect(page.contains("function enterFrameMode"))
         #expect(page.contains("function paintFrame"))
         #expect(page.contains("function exitFrameMode"))
@@ -1073,6 +1071,75 @@ struct WebMonitorServerTests {
         #expect(page.contains("function fallbackToPoll"))
         #expect(page.contains("/screen"))
         #expect(page.contains("id=\"screen\""))
+    }
+
+    @Test func htmlPageLiveStreamUsesEventSource() {
+        // iOS fix (#3): the live view streams over EventSource (SSE), NOT a fetch()
+        // body reader. iOS WebKit buffers a fetch body stream (chunks arrive in big
+        // batches), so a low-rate terminal shows STALE content until you force a
+        // reconnect; EventSource delivers incrementally on every browser.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("new EventSource("))
+        #expect(page.contains("es.onmessage"))
+        #expect(page.contains("es.onerror"))
+        #expect(page.contains("function b64ToBytes"))     // base64 SSE frame -> bytes
+        // The grid size arrives in-band as the first `size` event (EventSource
+        // cannot read the X-Ghostty-Cols/-Rows response headers the raw stream uses),
+        // and resizes xterm BEFORE any output lands.
+        #expect(page.contains("addEventListener(\"size\""))
+        #expect(page.contains("term.resize(s.cols, s.rows)"))
+        // EventSource can't set a header, so the token rides ?token= on the URL.
+        #expect(page.contains("\"/api/surface/\" + uuid + \"/stream-sse\", { token: token }"))
+        // The buffered fetch-stream path MUST be gone — its persistence IS the bug.
+        // (Match the actual code, not the explanatory comment which names getReader.)
+        #expect(!page.contains(".getReader("))
+        #expect(!page.contains("reader.read()"))
+    }
+
+    @Test func htmlPageSendInputEnablesAutocorrect() {
+        // #1: the Send field turns autocorrect + spellcheck ON (iOS honors these;
+        // it's why "redume" wasn't corrected) while autocapitalize stays OFF (so a
+        // typed shell command isn't capitalized). The token field is the OPPOSITE —
+        // strict-off — because a secret must never be autocorrected.
+        let page = WebMonitorServer.htmlPage
+        guard let inpStart = page.range(of: "id=\"inp\"")?.lowerBound,
+              let inpEnd = page.range(of: ">", range: inpStart..<page.endIndex)?.upperBound else {
+            Issue.record("#inp element not found in htmlPage"); return
+        }
+        let inp = String(page[inpStart..<inpEnd])
+        #expect(inp.contains("autocorrect=\"on\""))
+        #expect(inp.contains("spellcheck=\"true\""))
+        #expect(inp.contains("autocapitalize=\"off\""))
+        guard let tokStart = page.range(of: "id=\"tokeninput\"")?.lowerBound,
+              let tokEnd = page.range(of: ">", range: tokStart..<page.endIndex)?.upperBound else {
+            Issue.record("#tokeninput element not found in htmlPage"); return
+        }
+        let tok = String(page[tokStart..<tokEnd])
+        #expect(tok.contains("autocorrect=\"off\""))
+        #expect(tok.contains("spellcheck=\"false\""))
+    }
+
+    @Test func htmlPageKeepsButtonFocusOnTap() {
+        // #2: on iOS, the first tap on a button while the Send field is focused is
+        // consumed dismissing the keyboard, so a click-wired button only fires on the
+        // 2nd/3rd tap. keepFocusOnTap preventDefaults pointerdown/mousedown so the tap
+        // doesn't read as "dismiss keyboard" — the click fires on the first tap. It is
+        // applied to the static buttons.
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("function keepFocusOnTap"))
+        #expect(page.contains("querySelectorAll(\"button\"), keepFocusOnTap"))
+        // Pin the mechanism (preventDefault on the pointer/mouse down), not just the
+        // name — a no-op body would satisfy a bare name match.
+        if let start = page.range(of: "function keepFocusOnTap")?.lowerBound,
+           let end = page.range(of: "querySelectorAll(\"button\"), keepFocusOnTap",
+                                 range: start..<page.endIndex)?.lowerBound {
+            let body = String(page[start..<end])
+            #expect(body.contains("addEventListener(\"pointerdown\", pd)"))
+            #expect(body.contains("addEventListener(\"mousedown\", pd)"))
+            #expect(body.contains("e.preventDefault()"))
+        } else {
+            Issue.record("keepFocusOnTap not found in htmlPage")
+        }
     }
 
     @Test func htmlPageDataViewStateMachineTransitions() {
@@ -1204,9 +1271,9 @@ struct WebMonitorServerTests {
     }
 
     @Test func htmlPageMaximizeReconnectsTheStream() {
-        // Load-bearing: xterm.js is sized ONCE from the X-Ghostty-Cols/-Rows headers at
-        // stream open, so after the host grid changes the page MUST reopen the stream or
-        // the re-emulated output wraps and clips at the stale width.
+        // Load-bearing: xterm.js is sized ONCE from the SSE `size` event at stream open,
+        // so after the host grid changes the page MUST reopen the stream or the
+        // re-emulated output wraps and clips at the stale width.
         let page = WebMonitorServer.htmlPage
         #expect(page.contains("var maximizeReconnectDelay = 450;"))
         #expect(page.contains("}, maximizeReconnectDelay);"))
@@ -1313,6 +1380,46 @@ struct WebMonitorServerTests {
     @Test func decideRouteFramePostMethodNotAllowed() {
         let id = UUID()
         #expect(decide("POST", "/api/surface/\(id.uuidString)/frame") == .methodNotAllowed)
+    }
+
+    // (ramon fork / Web monitor) SSE live-stream route — the page's iOS-safe live
+    // transport. GET only; POST is 405. The raw /stream twin is still routed.
+    @Test func decideRouteStreamSSEGet() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/stream-sse") == .streamSSE(uuid: id))
+    }
+
+    @Test func decideRouteStreamSSEPostMethodNotAllowed() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/stream-sse") == .methodNotAllowed)
+    }
+
+    @Test func decideRouteRawStreamGet() {
+        let id = UUID()
+        #expect(decide("GET", "/api/surface/\(id.uuidString)/stream") == .stream(uuid: id))
+    }
+
+    @Test func decideRouteStreamSSEAcceptsQueryToken() {
+        // EventSource cannot send X-Ghostty-Token, so the SSE stream (unlike every
+        // OTHER /api/* route) authenticates via ?token=. A query-ONLY token resolves.
+        let id = UUID()
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/api/surface/\(id.uuidString)/stream-sse",
+            query: ["token": Self.tok], headers: ["host": "\(Self.host):\(Self.port)"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .streamSSE(uuid: id))
+    }
+
+    @Test func decideRouteRawStreamRejectsQueryToken() {
+        // The RAW /stream (header-only, NOT in acceptsQueryToken) must reject a
+        // query-only token — only the SSE twin takes it. Guards against the query
+        // token leaking onto a route that doesn't need it.
+        let id = UUID()
+        let d = WebMonitorServer.decideRoute(
+            method: "GET", path: "/api/surface/\(id.uuidString)/stream",
+            query: ["token": Self.tok], headers: ["host": "\(Self.host):\(Self.port)"],
+            configuredHost: Self.host, configuredPort: Self.port, token: Self.tok, peerFailureCount: 0)
+        #expect(d == .unauthorized)
     }
 
     // (ramon fork / Web monitor) Scroll cursor-seed flag: only the first scroll of a
@@ -1812,6 +1919,36 @@ struct WebMonitorServerTests {
         #expect(WebMonitorServer.isBootstrapPath("/jetbrains-mono-bold.woff2"))
         #expect(!WebMonitorServer.isBootstrapPath("/api/surfaces"))
         #expect(!WebMonitorServer.isBootstrapPath("/anything/else"))
+        // The SSE stream is NOT a bootstrap path (it's not a public asset) — it is
+        // the one non-bootstrap route that still takes the query token, gated
+        // separately by isStreamSSEPath / acceptsQueryToken (below).
+        let id = UUID().uuidString
+        #expect(!WebMonitorServer.isBootstrapPath("/api/surface/\(id)/stream-sse"))
+    }
+
+    @Test func isStreamSSEPathRecognizesOnlyTheSSERoute() {
+        let id = UUID().uuidString
+        #expect(WebMonitorServer.isStreamSSEPath("/api/surface/\(id)/stream-sse"))
+        // NOT the raw stream, other actions, a malformed uuid, or the wrong shape.
+        #expect(!WebMonitorServer.isStreamSSEPath("/api/surface/\(id)/stream"))
+        #expect(!WebMonitorServer.isStreamSSEPath("/api/surface/\(id)/frame"))
+        #expect(!WebMonitorServer.isStreamSSEPath("/api/surface/not-a-uuid/stream-sse"))
+        #expect(!WebMonitorServer.isStreamSSEPath("/api/surfaces"))
+        #expect(!WebMonitorServer.isStreamSSEPath("/"))
+    }
+
+    @Test func acceptsQueryTokenCoversBootstrapAndSSEOnly() {
+        let id = UUID().uuidString
+        // Bootstrap page + assets + service worker.
+        #expect(WebMonitorServer.acceptsQueryToken("/"))
+        #expect(WebMonitorServer.acceptsQueryToken("/xterm.js"))
+        #expect(WebMonitorServer.acceptsQueryToken("/sw.js"))
+        // The SSE stream (EventSource can't set a header).
+        #expect(WebMonitorServer.acceptsQueryToken("/api/surface/\(id)/stream-sse"))
+        // But NOT the raw stream, nor any other /api route.
+        #expect(!WebMonitorServer.acceptsQueryToken("/api/surface/\(id)/stream"))
+        #expect(!WebMonitorServer.acceptsQueryToken("/api/surfaces"))
+        #expect(!WebMonitorServer.acceptsQueryToken("/api/new-tab"))
     }
 
     @Test func decideRouteAssetJS() {
@@ -2141,6 +2278,57 @@ struct WebMonitorServerTests {
         let stored = (data: payload, at: now)
         #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(0.9)) == payload)
         #expect(WebMonitorServer.cachedSurfacesData(stored, now: now.addingTimeInterval(1.0)) == nil)
+    }
+
+    // MARK: - SSE framing (the iOS-safe live transport)
+    //
+    // The SSE (`.sse`) live stream base64-frames the SAME host PTY bytes the raw
+    // stream carries, because iOS WebKit buffers a plain fetch()-body stream. These
+    // pin the exact wire bytes of the head, the in-band `size` event (EventSource
+    // can't read response headers), the per-chunk `data:` frame, and the keepalive.
+
+    @Test func sseStreamResponseHeadShape() {
+        let head = String(decoding: WebMonitorServer.sseStreamResponseHead(), as: UTF8.self)
+        #expect(head.hasPrefix("HTTP/1.1 200 OK\r\n"))
+        #expect(head.contains("Content-Type: text/event-stream; charset=utf-8\r\n"))
+        #expect(head.contains("Cache-Control: no-store, no-transform\r\n"))
+        #expect(head.contains("X-Content-Type-Options: nosniff\r\n"))
+        #expect(head.contains("Connection: close\r\n"))
+        #expect(head.hasSuffix("\r\n\r\n"))
+        // Unbounded body (no Content-Length) and NO grid-size headers — the size is
+        // sent in-band as the first `size` event because EventSource can't read them.
+        #expect(!head.contains("Content-Length"))
+        #expect(!head.lowercased().contains("x-ghostty-cols"))
+    }
+
+    @Test func sseSizeEventShape() {
+        let e = String(decoding: WebMonitorServer.sseSizeEvent(cols: 80, rows: 24), as: UTF8.self)
+        #expect(e == "event: size\ndata: {\"cols\":80,\"rows\":24}\n\n")
+    }
+
+    @Test func sseDataFrameBase64RoundTrips() {
+        // Arbitrary/binary bytes (a CSI escape, a NUL, a high byte, a newline) survive
+        // the base64 SSE framing intact: `data: <base64>\n\n`, exactly one data line
+        // (base64 has no embedded newline), decodable back to the original bytes.
+        let bytes = Data([0x1b, 0x5b, 0x33, 0x31, 0x6d, 0x00, 0xff, 0x0a])
+        let frame = String(decoding: WebMonitorServer.sseDataFrame(bytes), as: UTF8.self)
+        #expect(frame.hasPrefix("data: "))
+        #expect(frame.hasSuffix("\n\n"))
+        let b64 = frame.dropFirst("data: ".count).dropLast(2)
+        #expect(!b64.contains("\n"))
+        #expect(Data(base64Encoded: String(b64)) == bytes)
+    }
+
+    @Test func sseDataFrameEmptyIsWellFormed() {
+        #expect(String(decoding: WebMonitorServer.sseDataFrame(Data()), as: UTF8.self) == "data: \n\n")
+    }
+
+    @Test func sseKeepaliveIsAComment() {
+        // A comment line (leading ':'), ignored by EventSource — keeps an idle,
+        // silent stream from being dropped by an intermediary / iOS.
+        let k = String(decoding: WebMonitorServer.sseKeepalive, as: UTF8.self)
+        #expect(k.hasPrefix(":"))
+        #expect(k.hasSuffix("\n\n"))
     }
 
     // MARK: - /stream post-hop decision (streamSetupDecision)
