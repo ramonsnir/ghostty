@@ -160,6 +160,9 @@ keybind = ctrl+a>x=close_surface
 keybind = ctrl+a>z=toggle_split_zoom
 # space   re-equalize (tmux's "next layout" is the closest useful thing)
 keybind = ctrl+a>space=equalize_splits
+# shift+space  reorganize into the densest grid (ceil(sqrt N) columns): an
+#              uneven layout (e.g. three-over-one) collapses to a clean 2x2.
+keybind = ctrl+a>shift+space=compact_splits
 # { / }   swap focused pane with previous / next (tmux's swap-pane -U / -D)
 keybind = ctrl+a>shift+{=swap_split:previous
 keybind = ctrl+a>shift+}=swap_split:next
