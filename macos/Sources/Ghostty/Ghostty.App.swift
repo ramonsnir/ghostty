@@ -653,6 +653,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_EQUALIZE_SPLITS:
                 equalizeSplits(app, target: target)
 
+            case GHOSTTY_ACTION_COMPACT_SPLITS:
+                compactSplits(app, target: target)
+
             case GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM:
                 return toggleSplitZoom(app, target: target)
 
@@ -1873,6 +1876,31 @@ extension Ghostty {
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 NotificationCenter.default.post(
                     name: Notification.didEqualizeSplits,
+                    object: surfaceView
+                )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        /// (ramon fork) Post a request to reorganize the target surface's tab
+        /// into the densest balanced grid. Modeled on `equalizeSplits`: a
+        /// whole-tree operation, so it targets the surface and lets the
+        /// controller do the rebuild.
+        private static func compactSplits(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("compact splits does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                NotificationCenter.default.post(
+                    name: Notification.didCompactSplits,
                     object: surfaceView
                 )
 

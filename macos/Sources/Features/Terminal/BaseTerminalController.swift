@@ -382,6 +382,11 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyDidCompactSplits(_:)),
+            name: Ghostty.Notification.didCompactSplits,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(ghosttyDidFocusSplit(_:)),
             name: Ghostty.Notification.ghosttyFocusSplit,
             object: nil)
@@ -964,6 +969,23 @@ class BaseTerminalController: NSWindowController,
 
         // Equalize the splits
         surfaceTree = surfaceTree.equalized()
+    }
+
+    @objc private func ghosttyDidCompactSplits(_ notification: Notification) {
+        guard let target = notification.object as? Ghostty.SurfaceView else { return }
+
+        // Check if target surface is in current controller's tree
+        guard surfaceTree.contains(target) else { return }
+
+        // Need at least two panes to reorganize; a single pane is a no-op.
+        guard surfaceTree.count > 1 else { return }
+
+        // Rebuild the tab into the densest grid. Same leaf views (panes only
+        // re-position), so this is a structural change but never a close —
+        // pass no closingViews. Keep the acting pane focused and make it
+        // undoable, like the other structural split actions.
+        let newTree = surfaceTree.compactedToDensestGrid()
+        replaceSurfaceTree(newTree, moveFocusTo: target, undoAction: "Compact Splits")
     }
 
     /// Map the `axis` carried in a split-reorg notification to a SplitTree direction.

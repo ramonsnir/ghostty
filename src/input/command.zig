@@ -537,6 +537,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Equalize the size of all splits.",
         }},
 
+        .compact_splits => comptime &.{.{
+            .action = .compact_splits,
+            .title = "Compact Splits",
+            .description = "Reorganize all splits into the densest grid (fewest rows and columns).",
+        }},
+
         .flip_split => comptime &.{
             .{
                 .action = .{ .flip_split = .horizontal },

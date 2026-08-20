@@ -415,6 +415,12 @@ pub const Action = union(Key) {
     /// Appended LAST so the Key enum / ghostty.h tag order stays additive.
     new_split_on_host: NewSplitOnHost,
 
+    /// (ramon fork) Reorganize the target surface's tab into the densest
+    /// balanced grid (`ceil(sqrt(N))` columns). Payload-less, surface-scoped,
+    /// macOS-only. Appended LAST so the Key enum / ghostty.h tag order stays
+    /// additive.
+    compact_splits,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -499,6 +505,7 @@ pub const Action = union(Key) {
         hide_dashboard_split,
         spotlight_dashboard_split,
         new_split_on_host,
+        compact_splits,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

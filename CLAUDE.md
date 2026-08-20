@@ -135,10 +135,12 @@ load-bearing gotchas, chokepoints ("omission silently drops the command"), wirin
 Fork-only actions on the focused surface (all in the command palette unless noted):
 `flip_split`, `toggle_split_direction`, `move_split_to_new_tab`, `merge_tabs`,
 `new_tab[:dir]`, `new_tab_command`, `mark_split` / `clear_split_mark` /
-`pull_marked_split`, `swap_split`, `goto_last_surface`, `report_bug`,
+`pull_marked_split`, `swap_split`, `compact_splits`, `goto_last_surface`, `report_bug`,
 `toggle_project_selector` (needs the `project-directory` key). Plus always-on tweaks to
 upstream `goto_split` (directional wrap-around cycling) and `equalize_splits` (visual-grid
-equalization), and the `repeatable:` flag prefix (tmux `bind -r`). GUI/Zig+lib depending on
+equalization), and the `repeatable:` flag prefix (tmux `bind -r`). `compact_splits`
+reorganizes the tab into the densest `ceil(sqrt(N))`-column grid (reuses the Agent-Queue
+compact-grid transform); no default keybind — bind it in `~/.config/ghostty-ramon/config`. GUI/Zig+lib depending on
 the action. **Authoring trap:** trigger keys are case-insensitive and the `repeatable:` flag
 is NOT part of trigger identity, so two bindings at one prefix silently clobber (last wins,
 no error) — write `shift+` explicitly for any shifted symbol (`!`,`%`,`?`,…) and give

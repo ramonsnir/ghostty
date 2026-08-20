@@ -456,6 +456,24 @@ extension SplitTree {
         return .init(root: newRoot, zoomed: zoomed)
     }
 
+    /// (ramon fork) Reorganize every leaf into the DENSEST balanced grid for the
+    /// current leaf count: `ceil(sqrt(N))` equal-width columns and the fewest
+    /// equal-height rows that hold them (via `compactGrid`). Leaves are taken in
+    /// the tree's natural reading order (left-to-right, top-to-bottom), so the
+    /// same views are reused (panes only re-position) and the zoom state resets.
+    ///
+    /// Unlike `equalized()` — which keeps the existing structure and only
+    /// re-weights the dividers — this DISCARDS the current nesting and rebuilds a
+    /// clean grid. Examples: 3 → `[2,1]`, 4 → `[2,2]`, 5 → `[3,2]`, 9 → `[3,3,3]`.
+    /// A tree with ≤1 leaf is returned unchanged. PURE. Idempotent: compacting an
+    /// already-compact grid yields the same layout.
+    func compactedToDensestGrid() -> Self {
+        let leaves = Array(self)
+        guard leaves.count > 1 else { return self }
+        let cols = Int(Double(leaves.count).squareRoot().rounded(.up))
+        return compactGrid(leaves: leaves, maxCols: cols, maxRows: 0)
+    }
+
     /// Returns the nearest split node enclosing `view` whose direction matches
     /// `orientation`, walking up from the view's leaf toward the root. This lets
     /// callers target an outer split even when `view` is nested inside another

@@ -1649,4 +1649,92 @@ struct SplitTreeTests {
         let rebuilt = tree.compactGrid(leaves: [a, b], maxCols: 3, maxRows: 3)
         #expect(rebuilt.zoomed == nil)
     }
+
+    // MARK: - compactedToDensestGrid (ramon fork: reorganize into the densest grid)
+
+    @Test func densestGridColumnsAreCeilSqrt() {
+        // The whole point of the action: the column count is ceil(sqrt(N)) and the
+        // rows are the fewest that hold N. This differs from the queue's fixed
+        // 3-col cap — e.g. 3 panes become [2,1] here, not a single row of three.
+        // The source layout is an arbitrary left-to-right chain; compaction
+        // rebuilds it regardless of the starting structure.
+        func shapeFor(_ n: Int) -> [Int] {
+            let views = (0..<n).map { _ in MockView() }
+            var tree = SplitTree(view: views[0])
+            for i in 1..<n {
+                tree = try! tree.inserting(view: views[i], at: views[i - 1], direction: .right)
+            }
+            let out = tree.compactedToDensestGrid()
+            return gridShape(out, within: CGSize(width: 1200, height: 1000)).map(\.count)
+        }
+        #expect(shapeFor(2) == [2])        // ceil(√2)=2 cols, 1 row
+        #expect(shapeFor(3) == [2, 1])     // ceil(√3)=2 cols
+        #expect(shapeFor(4) == [2, 2])     // ceil(√4)=2 cols → 2×2
+        #expect(shapeFor(5) == [3, 2])     // ceil(√5)=3 cols
+        #expect(shapeFor(6) == [3, 3])     // ceil(√6)=3 cols
+        #expect(shapeFor(9) == [3, 3, 3])  // ceil(√9)=3 cols → 3×3
+        #expect(shapeFor(10) == [4, 3, 3]) // ceil(√10)=4 cols
+    }
+
+    @Test func densestGridFlattensLopsidedFourPanes() throws {
+        // The reported annoyance: a tab with an uneven layout (a row of three with
+        // a fourth pane hanging below one of them) collapses to a clean 2×2 with
+        // equal quadrants, panes kept in reading order.
+        let a = MockView(), b = MockView(), c = MockView(), d = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right) // a | b
+        tree = try tree.inserting(view: c, at: b, direction: .right) // a | b | c
+        tree = try tree.inserting(view: d, at: c, direction: .down)  // c stacks into c/d
+        #expect(Array(tree) == [a, b, c, d])
+
+        let out = tree.compactedToDensestGrid()
+        let bounds = CGSize(width: 1200, height: 1000)
+        let shape = gridShape(out, within: bounds)
+        #expect(shape.map(\.count) == [2, 2])
+        #expect(shape[0] == [a, b])
+        #expect(shape[1] == [c, d])
+        // Equal quadrants (same shape as compactGridFourPanesIsTwoByTwo).
+        let rects = leafRects(out, within: bounds)
+        expectRect(rects[ObjectIdentifier(a)], x: 0, y: 0, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(b)], x: 600, y: 0, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(c)], x: 0, y: 500, w: 600, h: 500)
+        expectRect(rects[ObjectIdentifier(d)], x: 600, y: 500, w: 600, h: 500)
+    }
+
+    @Test func densestGridSinglePaneIsUnchanged() {
+        // A single pane has nothing to reorganize.
+        let a = MockView()
+        let out = SplitTree(view: a).compactedToDensestGrid()
+        #expect(!out.isSplit)
+        #expect(Array(out) == [a])
+    }
+
+    @Test func densestGridEmptyIsUnchanged() {
+        let out = SplitTree<MockView>().compactedToDensestGrid()
+        #expect(out.isEmpty)
+    }
+
+    @Test func densestGridIsIdempotent() {
+        // Compacting an already-compact grid yields the identical layout.
+        let views = (0..<5).map { _ in MockView() }
+        var tree = SplitTree(view: views[0])
+        for i in 1..<5 {
+            tree = try! tree.inserting(view: views[i], at: views[i - 1], direction: .right)
+        }
+        let bounds = CGSize(width: 1200, height: 1000)
+        let once = tree.compactedToDensestGrid()
+        let twice = once.compactedToDensestGrid()
+        #expect(Array(once) == Array(twice))
+        #expect(leafRects(once, within: bounds) == leafRects(twice, within: bounds))
+    }
+
+    @Test func densestGridResetsZoom() throws {
+        let a = MockView(), b = MockView()
+        var tree = SplitTree(view: a)
+        tree = try tree.inserting(view: b, at: a, direction: .right)
+        tree = SplitTree(root: tree.root, zoomed: tree.root)
+        #expect(tree.zoomed != nil)
+        let out = tree.compactedToDensestGrid()
+        #expect(out.zoomed == nil)
+    }
 }

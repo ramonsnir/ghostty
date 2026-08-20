@@ -488,6 +488,10 @@ extension Ghostty.Notification {
     /// Notification sent to the split root to equalize split sizes
     static let didEqualizeSplits = Notification.Name("com.mitchellh.ghostty.didEqualizeSplits")
 
+    /// (ramon fork) Notification sent to reorganize a surface's tab into the
+    /// densest balanced grid.
+    static let didCompactSplits = Notification.Name("com.mitchellh.ghostty.didCompactSplits")
+
     /// Notification sent to mirror (flip) the split containing a surface.
     static let didFlipSplit = Notification.Name("com.mitchellh.ghostty.didFlipSplit")
 

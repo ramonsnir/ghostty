@@ -6246,6 +6246,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .compact_splits => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .compact_splits,
+            {},
+        ),
+
         .toggle_split_zoom => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_split_zoom,

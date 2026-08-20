@@ -692,6 +692,18 @@ pub const Action = union(enum) {
     /// Equalize the size of all splits in the current window.
     equalize_splits,
 
+    /// (ramon fork) Reorganize all panes in the current tab into the DENSEST
+    /// balanced grid: `ceil(sqrt(N))` equal-width columns and the fewest
+    /// equal-height rows that hold them (e.g. 4 panes → 2×2, 3 panes → two on
+    /// top and one below). Panes keep their reading order (left-to-right,
+    /// top-to-bottom). Unlike `equalize_splits` (which only re-weights the
+    /// dividers of the existing layout) this DISCARDS the current split nesting
+    /// and rebuilds a clean grid, and resets zoom. Payload-less; a single pane
+    /// is a no-op.
+    ///
+    /// Only implemented on macOS.
+    compact_splits,
+
     /// Mirror a split enclosing the current surface, swapping the positions of
     /// its two sides. The divider stays in the same place.
     ///
@@ -1699,6 +1711,7 @@ pub const Action = union(enum) {
             .toggle_readonly,
             .resize_split,
             .equalize_splits,
+            .compact_splits,
             .flip_split,
             .toggle_split_direction,
             .move_split_to_new_tab,
@@ -3974,6 +3987,21 @@ test "Binding report_bug" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("report_bug", buf.written());
+}
+
+test "Binding compact_splits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=compact_splits");
+    try testing.expect(binding.action == .compact_splits);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("compact_splits", buf.written());
 }
 
 test "format: new_tab round-trips bare and with value" {
