@@ -2691,11 +2691,19 @@ test "host handoff: initFromListenFd adopts a pre-bound listener; owns_path=fals
     const sock_path = try std.fmt.allocPrint(alloc, "{s}/worker.sock", .{dir_path});
     defer alloc.free(sock_path);
 
-    // Supervisor role: bind the path once.
+    // Supervisor role: bind the path once. The test (supervisor) owns the listen fd
+    // (owns_listen_fd=false below → the worker never closes it); close it on exit.
     const listen_fd = try Server.bindListenSocket(sock_path);
+    defer posix.close(listen_fd);
 
-    // Worker role: adopt the pre-bound listener (owns_path=false).
-    const server = try Server.initFromListenFd(alloc, sock_path, listen_fd, false);
+    // Worker role: adopt the pre-bound listener (owns_path=false). owns_listen_fd=false
+    // too: like a real supervisor-managed worker, deinit must NOT close the shared
+    // listener. The deinit defer is registered BEFORE start() so a start() failure or a
+    // mid-test assertion failure still cleans the Server up; the flag stops it
+    // double-deinit-ing after the explicit deinit below.
+    const server = try Server.initFromListenFd(alloc, sock_path, listen_fd, false, false);
+    var server_deinited = false;
+    defer if (!server_deinited) server.deinit();
     try server.start();
 
     // The adopted listener accepts connections: a Hello handshake completes.
@@ -2713,15 +2721,104 @@ test "host handoff: initFromListenFd adopts a pre-bound listener; owns_path=fals
         try clientSend(alloc, client, .hello, protocol.Hello{
             .identity_bundle_id = "test.client",
         });
+        // `tries` is a retry count, each with a 100ms RCVTIMEO (see pollNext /
+        // setRecvTimeout) → 50 = a ~5s worst-case budget. The healthy handshake
+        // returns on the first try; a real wiring regression exhausts the budget and
+        // fails fast (well under the 180s watchdog).
         const tag = (try pollNext(&rdr, alloc, client, &payload, 50)).?;
         try testing.expectEqual(protocol.FrameType.hello_ack, tag);
     }
 
-    // Explicit deinit (not deferred) so we can inspect the path afterwards.
+    // Explicit deinit (flag set so the defer skips it) so we can inspect the path +
+    // listener fd afterwards.
     server.deinit();
+    server_deinited = true;
 
     // owns_path=false => deinit must NOT have unlinked the shared path.
     _ = try tmp.dir.statFile("worker.sock");
+
+    // owns_listen_fd=false => deinit must NOT have closed the listener. `fstat`
+    // succeeding proves the fd is still open (a closed fd would give EBADF); the
+    // `defer` above closes it.
+    _ = try posix.fstat(listen_fd);
+}
+
+// FORK(host-handoff) issue #6: the SHARED-listener poison regression. A supervisor
+// binds the listener once and both the outgoing worker (v1) and the incoming worker
+// (v2) hold it (fork/dup2/SCM_RIGHTS — modeled in-process by a `dup`). Pre-fix,
+// v1's `deinit` closed the shared listener to unblock its blocked accept thread,
+// which on XNU set `SS_DRAINING` on the shared socket object and poisoned v2's
+// `accept()` forever (every connection → ECONNABORTED, GUI hangs after every app
+// update). Post-fix, v1 unblocks its accept thread via the `accept_wake` self-pipe
+// and — with owns_listen_fd=false — never closes the shared fd, so v2 keeps serving.
+// This asserts a NEW client is accepted by v2 AFTER v1 is torn down.
+test "host handoff: v1 teardown does not poison the shared listener; v2 still accepts" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const sock_path = try std.fmt.allocPrint(alloc, "{s}/shared.sock", .{dir_path});
+    defer alloc.free(sock_path);
+
+    // Supervisor role: bind the listener ONCE. The test (supervisor) owns both fds
+    // (owns_listen_fd=false on both workers → they never close them); cleanup defers
+    // are installed IMMEDIATELY so an early assertion failure can't leak them.
+    const listen_fd = try Server.bindListenSocket(sock_path);
+    defer posix.close(listen_fd);
+    // v2's inherited copy shares the same underlying socket object (as a real fork /
+    // SCM_RIGHTS pass would) — the poison, if any, lands on the SHARED object.
+    const listen_fd_v2 = try posix.dup(listen_fd);
+    defer posix.close(listen_fd_v2);
+
+    // Both workers adopt the shared listener (owns_path + owns_listen_fd both false —
+    // the real supervisor-managed worker config). Each deinit defer is registered
+    // BEFORE start() so a start() failure still tears the Server down.
+    const v1 = try Server.initFromListenFd(alloc, sock_path, listen_fd, false, false);
+    // v1 is torn down mid-test (the swap); the flag stops the defer double-deinit-ing
+    // it, while still cleaning it up if an assertion fails BEFORE the swap.
+    var v1_torn_down = false;
+    defer if (!v1_torn_down) v1.deinit();
+    try v1.start();
+    const v2 = try Server.initFromListenFd(alloc, sock_path, listen_fd_v2, false, false);
+    defer v2.deinit();
+    try v2.start();
+
+    const helloOk = struct {
+        fn call(a: std.mem.Allocator, path: []const u8) !void {
+            const client = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+            defer posix.close(client);
+            try connectUnix(client, path);
+            setRecvTimeout(client);
+            var rdr: ClientReader = .{};
+            defer rdr.deinit(a);
+            var payload: std.ArrayList(u8) = .empty;
+            defer payload.deinit(a);
+            try clientSend(a, client, .hello, protocol.Hello{ .identity_bundle_id = "test.client" });
+            // `tries` is a retry count with a 100ms RCVTIMEO each (see pollNext /
+            // setRecvTimeout) → 50 = a ~5s worst-case budget; the healthy handshake
+            // returns on the first try. Well under the 180s watchdog on failure.
+            const tag = (try pollNext(&rdr, a, client, &payload, 50)) orelse return error.NoHelloAck;
+            try testing.expectEqual(protocol.FrameType.hello_ack, tag);
+        }
+    }.call;
+
+    // Pre-swap: a client is served (by whichever worker wins the accept race).
+    try helloOk(alloc, sock_path);
+
+    // THE SWAP: tear v1 down (as the broker's `shutdown` does). Pre-fix this poisoned
+    // the shared listener; post-fix it unblocks v1's accept thread via the self-pipe
+    // and leaves the shared fd untouched.
+    v1.deinit();
+    v1_torn_down = true;
+
+    // The assertion: a NEW connection is still accepted — by v2 (the only worker
+    // left). Pre-fix this EOFs (ECONNABORTED on v2's poisoned accept); post-fix v2
+    // answers immediately.
+    try helloOk(alloc, sock_path);
 }
 
 test "host socket integration: attach, input, gridframe marker, reattach" {
@@ -8360,7 +8457,10 @@ fn hostHandoffSocketpair() ![2]posix.fd_t {
 fn hostHandoffMakeWorker(alloc: std.mem.Allocator) !*Server {
     const dummy = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     errdefer posix.close(dummy);
-    return try Server.initFromListenFd(alloc, "handoff-seq-test-worker", dummy, false);
+    // owns_path=false (no path to unlink) but owns_listen_fd=TRUE: `dummy` is a
+    // PRIVATE throwaway (never accepted on, not shared with anyone), so deinit should
+    // close it — keeping the sequence tests' net-fd-leak check at zero.
+    return try Server.initFromListenFd(alloc, "handoff-seq-test-worker", dummy, false, true);
 }
 
 /// FORK(host-handoff): poll a session's active screen (incl. scrollback) for
@@ -8847,7 +8947,10 @@ test "host handoff broker: SUCCESS v1->v2 acks all + ready -> shutdown v1, no un
         const t1 = try std.Thread.spawn(.{}, hostHandoffMockV1, .{&v1_ctx});
         const t2 = try std.Thread.spawn(.{}, hostHandoffMockV2, .{&v2_ctx});
 
-        // The broker drives the real wire dance against the two mock workers.
+        // The broker drives the real wire dance against the two mock workers. The
+        // pre-commit successor-liveness check MSG_PEEKs v2's control channel (sv2[0]),
+        // which the mock v2 keeps open + drained → EAGAIN → treated as alive, so the
+        // SUCCESS path holds.
         try Supervisor.brokerHandoff(alloc, sv1[0], sv2[0], &fake.registry, 2000);
 
         t1.join();
@@ -8901,6 +9004,8 @@ test "host handoff broker: ABORT on a nacked adopt -> unfreeze v1, no shutdown" 
         const t1 = try std.Thread.spawn(.{}, hostHandoffMockV1, .{&v1_ctx});
         const t2 = try std.Thread.spawn(.{}, hostHandoffMockV2, .{&v2_ctx});
 
+        // The abort here is driven by the nacked adopt, which returns before the
+        // pre-commit successor-liveness check ever runs.
         const res = Supervisor.brokerHandoff(alloc, sv1[0], sv2[0], &fake.registry, 2000);
 
         t1.join();

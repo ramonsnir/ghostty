@@ -409,6 +409,13 @@ handoff_result: HandoffError!void = {},
 /// how often `poll` returns. Owned by the reader thread. `null` before the first.
 last_staleness_check: ?std.time.Instant = null,
 
+/// FORK(host-handoff) issue #6 (secondary): latch so the "supervisor's own exec path
+/// no longer resolves" warning is logged ONCE per transition into the stale state,
+/// not on every staleness tick (~2 lines/10s → ~690 KB observed on a 13-day-old
+/// supervisor). Set when the condition first holds; cleared when the path resolves
+/// again (so a genuine later regression warns anew). Owned by the reader thread.
+warned_own_path_stale: bool = false,
+
 /// Cleared to stop the reader thread + break `run`'s park.
 running: std.atomic.Value(bool) = .init(true),
 
@@ -517,6 +524,13 @@ pub fn run(self: *Supervisor) !void {
     if (comptime builtin.os.tag != .macos) return error.Unsupported;
 
     self.reader_wake = try posix.pipe();
+    // FORK(host-handoff) issue #6 (secondary): FD_CLOEXEC both ends so a spawned
+    // worker does not inherit the supervisor's private self-pipe across execve (a
+    // leaked `reader_wake[1]` kept the pipe open in every worker + shell child). The
+    // dup2 dance in `childExecWorker` only cleared CLOEXEC on the fd-3/fd-4 targets;
+    // everything else the supervisor holds must stay CLOEXEC.
+    setCloexec(self.reader_wake[0]);
+    setCloexec(self.reader_wake[1]);
 
     // FORK(host-handoff): publish the reader wake fd, THEN install the SIGHUP
     // handler — a SIGHUP now nudges the reader thread to broker a handoff to the
@@ -827,10 +841,17 @@ fn checkWorkerStalenessAndMaybeHandoff(self: *Supervisor) bool {
     if (comptime builtin.os.tag != .macos) return false;
 
     // Supervisor self-check: warn-only. A stable supervisor install is a deploy
-    // concern; self-exec is deliberately out of scope here.
+    // concern; self-exec is deliberately out of scope here. Rate-limited to ONCE per
+    // transition into the stale state (issue #6 secondary) so a supervisor whose exec
+    // path is gone doesn't spam ~2 lines/10s forever.
     var sup_buf: [PROC_PIDPATHINFO_MAXSIZE]u8 = undefined;
     if (workerExecPath(std.c.getpid(), &sup_buf) == null) {
-        log.warn("supervisor's own exec path no longer resolves (binary unlinked); a supervisor upgrade is a deploy concern — not self-exec'ing", .{});
+        if (!self.warned_own_path_stale) {
+            log.warn("supervisor's own exec path no longer resolves (binary unlinked); a supervisor upgrade is a deploy concern — not self-exec'ing", .{});
+            self.warned_own_path_stale = true;
+        }
+    } else {
+        self.warned_own_path_stale = false;
     }
 
     // Worker exec-path staleness.
@@ -1083,11 +1104,50 @@ pub fn brokerHandoff(
 
     // Gate: EVERY session acked ok AND the successor reached the freeze count.
     if (ok_acks == count and ready_reached) {
+        // FORK(host-handoff) issue #6: a final SUCCESSOR-LIVENESS check before commit.
+        // For a session-carrying handoff the ack-gate above already proved v2's
+        // control loop is alive (it adopted + acked + sent `ready`). But a ZERO-session
+        // handoff (count==0) sends no adopts and `ready_reached` starts true, so the
+        // gate never touches v2 — a v2 that died at startup (e.g. a failed `exec`) would
+        // otherwise be committed while v1 is shut down, leaving no worker. Check v2's
+        // CONTROL channel with a non-consuming `MSG_PEEK` recv: on v2's death the kernel
+        // closes its end, so the recv returns EOF; if so, ABORT → `unfreeze` v1 (the
+        // incumbent keeps serving), never a no-server window.
+        //
+        // NOTE: this is NOT the issue's originally-proposed connect-probe, which was
+        // dropped as unsound — it ran BEFORE `shutdown` so it could never observe the
+        // post-`shutdown` `SS_DRAINING` poison, and with v1 still sharing the listener
+        // it could not attribute an accept to v2. The poison itself is fixed at the
+        // source in `Server` (owns_listen_fd + the wakeable accept loop).
+        if (!successorAlive(v2_ctrl)) {
+            log.warn("handoff: successor control channel closed before commit (v2 died); aborting", .{});
+            return abortUnfreeze(v1_ctrl);
+        }
         // SUCCESS — the successor is serving. The predecessor may exit(0) now.
         proto.sendFrame(v1_ctrl, .{ .tag = .shutdown }, &.{}) catch return error.ProtocolError;
         return;
     }
     return abortUnfreeze(v1_ctrl);
+}
+
+/// FORK(host-handoff) issue #6: true iff the successor's control channel is still open
+/// — i.e. v2 is still alive. When v2's process dies the kernel closes `worker_end`, so
+/// a non-blocking `recv` on the supervisor's peer `v2_ctrl` returns EOF (0). A
+/// `MSG_PEEK` recv distinguishes EOF from DATA without consuming: a live v2 that raced
+/// a frame onto the channel during the handoff window (e.g. a `register_master` from a
+/// GUI client that connected + spawned on v2) leaves BYTES pending → alive, and the
+/// peeked frame stays queued for the committed control loop to process. This is:
+///   - **zombie-proof** — fd closure happens on process exit, independent of reaping
+///     (unlike `kill(pid,0)`, which reports a zombie as still-alive on XNU);
+///   - **EOF-precise** — only a real EOF (0 bytes) vetoes; pending data ≠ dead, so a
+///     live-but-chatty v2 is never falsely aborted;
+///   - **attributable to v2** — it is v2's OWN channel, not the shared listener.
+/// Any error other than a definite EOF is treated as alive (don't veto a handoff on a
+/// probe hiccup — a false abort is safe-sided, but avoid it).
+fn successorAlive(v2_ctrl: posix.fd_t) bool {
+    var buf: [1]u8 = undefined;
+    const n = posix.recv(v2_ctrl, &buf, posix.MSG.PEEK | posix.MSG.DONTWAIT) catch return true;
+    return n != 0; // 0 = orderly EOF (v2's end closed → v2 died); >0 = data → alive.
 }
 
 /// Send `unfreeze` to v1 (resume the incumbent) and report the handoff aborted.

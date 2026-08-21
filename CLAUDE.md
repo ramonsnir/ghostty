@@ -249,8 +249,17 @@ pure `Supervisor.parseMode`. It binds the listen socket forever, `spawnWorker`s 
 with the listener at fd 3 + a control socketpair at fd 4 (dup2 + CLOEXEC-clear inheritance), holds every
 pty master (`MasterRegistry` via a `readerLoop`), crash-restarts a dead worker (first cut: loses its
 sessions), and BROKERS a handoff (`brokerHandoff`, the unit-tested core): `freeze_all` v1 → `adopt`→v2 →
-a HEALTH-ACK GATE (all acked + `ready` → `shutdown` v1; any nack/timeout → `unfreeze` v1 + kill v2,
-never a no-server window). Two TRIGGERS now fire a handoff (`triggerSelfHandoff`, reader-thread-inline,
+a HEALTH-ACK GATE + a pre-commit successor-liveness check (all acked + `ready` AND v2's control channel
+still open, via a `recv(MSG_PEEK)` EOF check → `shutdown` v1; any nack/timeout/dead-successor → `unfreeze` v1 + kill
+v2, never a no-server window). The listener is a SHARED socket object across {supervisor,v1,v2}; **issue
+#6** — a worker `deinit` must NEVER close it (`owns_listen_fd=false`) and the accept loop is wakeable
+(`poll`+`accept_wake` self-pipe, non-blocking listener, `setBlocking` accepted fds) so v1's teardown can't
+XNU-`SS_DRAINING`-poison the successor's accepts (the actual fix). CLOEXEC hygiene: `accept_wake` +
+`reader_wake` + the worker's inherited listener/control fds are all `FD_CLOEXEC` so shells never inherit
+them (a leaked control fd would defeat crash detection). The issue's proposed connect "service probe" was
+dropped as unsound — it runs BEFORE the poison (v1's post-`shutdown` `deinit`) and can't attribute an
+accept to v2 (→ `HOST-HANDOFF.md`).
+Two TRIGGERS now fire a handoff (`triggerSelfHandoff`, reader-thread-inline,
 canonical path re-resolved at trigger time, coalesced): a **SIGHUP** (async-signal-safe handler → atomic
 flag + `reader_wake` self-pipe; the "new build installed" nudge ForkSetup sends) and a periodic
 **exec-path staleness self-check** folded into the reader `poll` (macOS `libproc` `proc_pidpath` + the

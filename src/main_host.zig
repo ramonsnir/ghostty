@@ -98,9 +98,20 @@ fn runHandoffWorker(alloc: std.mem.Allocator, w: Supervisor.WorkerArgs) !void {
     std.log.info("ghostty-host starting (worker: listen-fd={d} control-fd={d})", .{ w.listen_fd, w.control_fd });
 
     // The listener is already bound; owns_path=false so this worker never unlinks
-    // the path the supervisor keeps bound across worker swaps.
-    const server = try Server.initFromListenFd(alloc, w.listen_path orelse "", w.listen_fd, false);
+    // the path the supervisor keeps bound across worker swaps, and owns_listen_fd=false
+    // so it never CLOSES the shared listener (closing it while the accept thread is
+    // blocked would poison it for the successor — issue #6; the supervisor owns it).
+    const server = try Server.initFromListenFd(alloc, w.listen_path orelse "", w.listen_fd, false, false);
     defer server.deinit();
+    // FORK(host-handoff) issue #6 (CLOEXEC hygiene): CLOEXEC the inherited control fd
+    // BEFORE `start()` opens the accept path. Both fds arrive with CLOEXEC cleared (to
+    // survive this worker's execve); `start()` re-sets it on the listener before it
+    // spawns the accept thread, but the control fd is otherwise not set until
+    // `startControlLoop` runs AFTER `start()` — a session spawned in that window would
+    // fork a shell inheriting the un-CLOEXEC control fd, keeping the supervisor↔worker
+    // channel open past worker death and defeating crash detection. Set it here first;
+    // `startControlLoop` re-sets it idempotently for any other caller.
+    Server.setCloexec(w.control_fd);
     try server.start();
     try server.startControlLoop(w.control_fd);
 

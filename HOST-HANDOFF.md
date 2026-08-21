@@ -77,13 +77,43 @@ unchanged so the GUI protocol stays byte-stable).
    master-dup + blob → v2 deserializes, `Session.adopt(master, pid, terminal)`,
    registers it under the ORIGINAL id, starts it, `adopt_ack{ok}`; then
    `ready{count}`.
-4. **Health-ack gate** (`Supervisor.brokerHandoff`): SUCCESS iff every session
-   `adopt_ack{ok=1}` AND a `ready` reached the freeze count → `shutdown` v1 (it
-   exits, v2 is the live worker). ANY nack / timeout / missing master → **abort**:
+4. **Health-ack gate + successor-liveness check** (`Supervisor.brokerHandoff`):
+   SUCCESS iff every session `adopt_ack{ok=1}` AND a `ready` reached the freeze count
+   AND the successor process is still alive → `shutdown` v1 (it exits, v2 is the live
+   worker). ANY nack / timeout / missing master / dead successor → **abort**:
    `unfreeze` v1 (it re-adopts its frozen sessions + resumes) and the caller kills
    v2. Every abort path routes through `abortUnfreeze`, which tells v1 to resume
    *before* returning the error — so there is **never a window where neither
    serves**.
+   - **The successor-liveness check** (`successorAlive`, issue #6): a cheap
+     non-blocking `MSG_PEEK` recv on v2's CONTROL channel before commit. For a session-carrying
+     handoff the ack-gate already proved v2's control loop is alive; but a
+     **zero-session** handoff sends no adopts and `ready_reached` starts true, so the
+     gate never touches v2 — a v2 that died at startup (e.g. a failed `exec`) would
+     otherwise be committed while v1 is shut down. When v2's process dies the kernel
+     closes its control-socket end, so a `recv(MSG_PEEK|MSG_DONTWAIT)` on the
+     supervisor's peer returns EOF (0 bytes) → veto → abort; a live v2 → `EAGAIN` (or
+     a peeked, non-consumed pending frame) → commit. `MSG_PEEK` (not a bare `poll`)
+     is used so a live v2 that RACED a frame onto the channel during the handoff window
+     (e.g. a `register_master` from a GUI client that spawned on v2) is not mistaken
+     for EOF. This is **zombie-proof** (fd closure is independent of reaping — unlike
+     `kill(pid,0)`, which reports an un-reaped zombie as alive on XNU) and
+     **attributable to v2** (its own channel, not the shared listener). The pure
+     broker unit tests keep the mock v2 channel open, so the SUCCESS path holds.
+     Residual (benign, unfixed): if v2's `execve` is still in flight at check time
+     (worker_end not yet closed) and then fails, a zero-session handoff commits into a
+     brief no-server window — but with no sessions to lose and the supervisor's
+     crash-restart bringing a fresh worker right back, this self-heals; the freeze
+     round-trip with v1 also gives v2 ample startup slack first.
+   - **Why NOT a connect "service probe"** (the issue's originally-proposed point 3,
+     deliberately dropped): a probe that `connect`s to the listen socket before commit
+     **cannot** detect this bug — the `SS_DRAINING` poison happens at v1's `deinit`,
+     triggered by the `shutdown` sent *after* the probe, so at probe time the listener
+     is always healthy. It also cannot **attribute** an accept to v2 (v1 still shares
+     the listener), and an unaccepted conn just queues in the backlog and reads
+     healthy. It added ~500ms/handoff blocking the reader thread for no real
+     detection. The poison is fixed at the source instead (see the listener-fd
+     ownership contract below); the regression test guards it deterministically.
 
 ### The single-active-reader invariant
 
@@ -125,6 +155,64 @@ executes); the child survives an aborted handoff and is recovered by `unfreeze`;
 an adopt failure never kills the predecessor's child; a never-started adopted
 session's destroy releases the master + reaps the child; net open-fd count never
 grows.
+
+## The listener fd ownership contract (issue #6 — the shared-socket poison)
+
+The **GUI listen socket** is a second shared fd with its own ownership rules,
+separate from the per-session pty masters. The supervisor binds it ONCE
+(`Server.bindListenSocket`) and every worker inherits the SAME socket object
+(fork + `dup2` → fd 3, and across a handoff the successor inherits it too). So all
+of {supervisor, v1, v2} hold references to one kernel socket object.
+
+**The bug it fixes:** `Server.deinit` used to `posix.close(self.listen_fd)` to
+unblock its accept thread (which was parked in a blocking `accept()`). On XNU,
+closing an fd *while a thread of that process is blocked in `accept()` on it* sets
+`SS_DRAINING` on the **socket object** — which is shared — so **every subsequent
+`accept()` in ANY holder returns `ECONNABORTED`, forever**. During a handoff v1's
+`shutdown` → `deinit` therefore poisoned the listener v2 had just inherited: v2
+acked healthy, v1 exited, and v2 owned a listener it could never accept on → the
+GUI hung at launch after **every** app update (the exec-path staleness trigger
+fires a handoff on every update). See the issue for the XNU `SS_DRAINING` /
+`bsd/kern/uipc_syscalls.c` detail and a minimal 2-child OS repro.
+
+The rules now (all `// FORK(host-handoff):`-marked in `src/host/Server.zig`):
+
+- **`owns_listen_fd`** — a field DISTINCT from `owns_path`. True only for a Server
+  that solely owns the socket it may close (the standalone `init` host, or a test's
+  private throwaway listener); **false for a supervisor-managed worker**
+  (`initFromListenFd`), whose listener is shared. `deinit` closes `listen_fd` ONLY
+  when `owns_listen_fd` — a worker never closes the shared listener (the OS reaps
+  its copy on process exit, at which point no thread is blocked in accept anyway).
+- **Wakeable accept loop** — the accept thread now blocks in `poll([listen_fd,
+  accept_wake[0]])`, never in `accept()`. `deinit` unblocks it by writing one byte
+  to the `accept_wake` self-pipe (mirrors `Supervisor.reader_wake`), then joins —
+  **without touching the socket**. So even for an owned listener, nothing is ever
+  blocked in `accept()` at close time.
+- **Non-blocking listener + blocking accepted conns** — `start()` sets `O_NONBLOCK`
+  on `listen_fd` so `accept()` never blocks after a `poll` wake (needed because
+  during a handoff BOTH workers poll the shared listener and the loser of an accept
+  race must get `WouldBlock` and re-poll, not block → else it would be stuck in
+  `accept()` at *its* teardown, the same poison). **Gotcha:** on macOS/BSD `accept()`
+  INHERITS the listener's `O_NONBLOCK` onto the accepted socket, which would make
+  `Conn.readLoop`'s blocking `read` drop the conn before Hello — so each accepted fd
+  is explicitly set back to blocking (`setBlocking`).
+- **CLOEXEC hygiene** — both `accept_wake` ends (and, secondary finding, both
+  `Supervisor.reader_wake` ends) are `FD_CLOEXEC`, so no supervisor/worker
+  bookkeeping fd leaks into a shell child across `fork`+`execve`. The worker ALSO
+  re-sets `FD_CLOEXEC` on its inherited **listener** (`start`) and **control** fd
+  (`startControlLoop`) — both arrive with CLOEXEC *cleared* (to survive the worker's
+  own `execve`), and `Command` only wires stdin/out/err + relies on CLOEXEC for the
+  rest, so without this every shell would inherit them. A shell holding the control
+  fd would keep the supervisor↔worker channel open after the worker died, defeating
+  the supervisor's EOF crash detection (and the successor-liveness check above).
+
+Verified by `src/host/test.zig` "host handoff: v1 teardown does not poison the
+shared listener; v2 still accepts": two Servers share a `dup`'d listener, a client
+is served pre-swap, v1 is `deinit`'d (the swap), and a NEW client is then accepted
+by v2 — which FAILS pre-fix (poisoned socket) and passes post-fix. Also confirmed
+end-to-end with the issue's shell repro: pre-fix post-handoff connect → `EOF` +
+`accept failed err=error.ConnectionAborted`; post-fix → connection held +
+`handoff committed … now serving`.
 
 ## GUI reconnection
 
@@ -227,11 +315,17 @@ lib/xcframework rebuild + GUI relaunch; ForkSetup is Swift/GUI.
   + the rehydrated-terminal injection.
 - `src/host/Server.zig` — `initFromListenFd`/`bindListenSocket`/`owns_path`; the
   worker control handlers (`handleFreezeAll`/`handleAdopt`/`handleShutdown`/
-  `handleUnfreeze`, `notifySessionSpawned`, the `frozen` map, `startControlLoop`).
+  `handleUnfreeze`, `notifySessionSpawned`, the `frozen` map, `startControlLoop`);
+  **issue #6** — `owns_listen_fd` + the wakeable `acceptLoop` (`accept_wake`
+  self-pipe, non-blocking listener via `setNonblock`, `setBlocking` on accepted fds,
+  `setCloexec` on the listener + control fd) so a worker `deinit` never poisons the
+  shared listener and shells never inherit the listener/control fds.
 - `src/host/Supervisor.zig` — the `--supervise` process: `parseMode`, `spawnWorker`
   + `childExecWorker` (fork/exec fd-inheritance: F_DUPFD→dup2 fd 3=listener/4=control,
   clear CLOEXEC), `MasterRegistry`/`readerLoop`, `handleWorkerCrash`, `handoff` +
-  the unit-tested `brokerHandoff`, and the **triggers**: `sighupHandler` /
+  the unit-tested `brokerHandoff` (+ its **issue #6** `successorAlive` pre-commit
+  control-channel EOF liveness check), the `reader_wake` CLOEXEC fix + the rate-limited
+  stale-supervisor warning (`warned_own_path_stale`), and the **triggers**: `sighupHandler` /
   `installSighupHandler` + the `g_sighup_*` globals, the `libproc.proc_pidpath`
   binding with `workerExecPath` + the pure `workerPathStale`,
   `checkWorkerStalenessAndMaybeHandoff` (folded into `readerLoop`'s poll), and
@@ -247,7 +341,10 @@ lib/xcframework rebuild + GUI relaunch; ForkSetup is Swift/GUI.
   (success / abort→unfreeze / never-started-destroy / adopt-failure-doesn't-kill);
   the broker health-ack gate driven with mock workers over socketpairs; the pure
   `workerPathStale` decision (resolves-equal / ENOENT-null / differs) + the
-  `proc_pidpath` resolver against this test process's own exec path; arg parsing.
+  `proc_pidpath` resolver against this test process's own exec path; arg parsing;
+  **issue #6** — the shared-listener poison regression (two Servers share a `dup`'d
+  listener; a client is served, v1 is torn down, a NEW client is still accepted by
+  v2) + the `owns_listen_fd`-keeps-the-listener-open assertion.
 - **Live-smoke only (P4):** the real fork/exec of a worker that inherits the fd-3
   listener + fd-4 control across `execve`; crash-restart; SIGHUP + the timer-driven
   handoff firing; the full 2-process handoff end to end.

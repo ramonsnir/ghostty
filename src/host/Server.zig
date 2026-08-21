@@ -9,7 +9,9 @@
 //! NOT share the Session's xev render loop (keeps the GPU-free invariant and
 //! avoids reworking Phase-1's single-thread render-loop/destroy ordering):
 //!
-//!   - one ACCEPT thread, blocking in `accept()`;
+//!   - one ACCEPT thread, blocking in `poll()` on the listener + a wake self-pipe
+//!     (FORK/issue #6: it is woken for teardown via the pipe, NOT by closing the
+//!     listener, which would poison a supervisor-shared listener — see `acceptLoop`);
 //!   - one READ thread per connection, blocking in `read()` + decoding frames;
 //!   - one OWNING thread per Session, which calls `start()` -> `runRenderLoop()`
 //!     -> `destroy()` (Phase-1 binds the render loop + destroy to one thread,
@@ -84,9 +86,29 @@ path: []const u8,
 /// deinit should `unlink` it. True for a standalone/`init` host that bound the
 /// path itself; FALSE for a worker built via `initFromListenFd`, where the
 /// supervisor bound the path and keeps it bound across worker swaps (the worker
-/// must not unlink it out from under the supervisor). The fd is always closed on
-/// deinit regardless; only the path unlink is gated.
+/// must not unlink it out from under the supervisor). Whether deinit CLOSES the
+/// listen fd is a SEPARATE gate — see `owns_listen_fd` below.
 owns_path: bool = true,
+/// FORK(host-handoff): whether THIS Server owns the LISTENING fd — i.e. whether
+/// deinit may `posix.close(listen_fd)`. True for a standalone/`init` host that
+/// created the socket; FALSE for a supervisor-managed worker (`initFromListenFd`),
+/// whose listener is a SHARED socket object (fork/dup2/SCM_RIGHTS) also held by
+/// the supervisor and the successor worker. Closing that shared fd WHILE this
+/// worker's accept thread is blocked in `accept()` sets `SS_DRAINING` on the
+/// shared socket object on XNU, poisoning `accept()` for the SUCCESSOR (every
+/// future accept returns `ECONNABORTED`) — the "handoff bricks the pty-host" bug.
+/// A worker therefore never closes the listener; the OS reaps its copy on process
+/// exit, and the accept thread is unblocked via the `accept_wake` self-pipe below,
+/// not by closing the socket. See `deinit` + `acceptLoop`.
+owns_listen_fd: bool = true,
+/// FORK(host-handoff): self-pipe that wakes the accept thread out of its `poll`
+/// for a clean teardown WITHOUT closing `listen_fd` (which would poison a shared
+/// listener — see `owns_listen_fd`). `[0]` = read end (polled alongside
+/// `listen_fd`), `[1]` = write end (poked by `deinit`). Both ends are FD_CLOEXEC
+/// so they never leak into a shell child across the worker's `fork`+`execve`.
+/// Created in `start()`; `.{ -1, -1 }` until then (and on the never-started path).
+/// Mirrors `Supervisor.reader_wake`.
+accept_wake: [2]posix.fd_t = .{ -1, -1 },
 
 /// Registry of live sessions, keyed by host-assigned session_id. Ids are RANDOM
 /// 64-bit values (see allocSessionId), not a sequential counter — so a session_id
@@ -347,7 +369,6 @@ pub const SessionEntry = struct {
             } else i += 1;
         }
     }
-
 };
 
 /// A single GUI connection.
@@ -753,21 +774,31 @@ pub fn bindListenSocket(path: []const u8) !posix.socket_t {
 pub fn init(alloc: Allocator, path: []const u8) !*Server {
     const fd = try bindListenSocket(path);
     errdefer posix.close(fd);
-    return try initFromListenFd(alloc, path, fd, true);
+    // Standalone host: it created + owns the socket, so it owns both the path
+    // (unlink on deinit) and the listen fd (close on deinit).
+    return try initFromListenFd(alloc, path, fd, true, true);
 }
 
 /// FORK(host-handoff): build a Server around an ALREADY-bound listening socket
 /// — the WORKER path. The supervisor bound `path` and passes `listen_fd` down
 /// (SCM_RIGHTS / fork-inherit); the worker adopts it and accepts on it without
 /// re-binding. `owns_path` MUST be false for a supervisor-managed worker so its
-/// deinit does not unlink the path the supervisor keeps bound across swaps (the
-/// fd is still closed on deinit either way). On any init error the caller
-/// retains ownership of `listen_fd`.
+/// deinit does not unlink the path the supervisor keeps bound across swaps.
+///
+/// FORK(host-handoff): `owns_listen_fd` gates whether deinit may CLOSE `listen_fd`
+/// — a SEPARATE concern from `owns_path`. It MUST be false for a supervisor-managed
+/// worker: the listener is a shared socket object (fork/dup2/SCM_RIGHTS) and closing
+/// it while this worker's accept thread is blocked in `accept()` poisons it for the
+/// successor (`SS_DRAINING` → `ECONNABORTED`). Pass true only when this Server is the
+/// sole owner of a socket it may close on deinit (a standalone `init` host, or a
+/// test's private throwaway listener). On any init error the caller retains ownership
+/// of `listen_fd`.
 pub fn initFromListenFd(
     alloc: Allocator,
     path: []const u8,
     listen_fd: posix.socket_t,
     owns_path: bool,
+    owns_listen_fd: bool,
 ) !*Server {
     const self = try alloc.create(Server);
     errdefer alloc.destroy(self);
@@ -780,6 +811,7 @@ pub fn initFromListenFd(
         .listen_fd = listen_fd,
         .path = path_dup,
         .owns_path = owns_path,
+        .owns_listen_fd = owns_listen_fd,
         .sessions = std.AutoHashMap(u64, *SessionEntry).init(alloc),
         // FORK(host-handoff): the frozen-session map (empty unless a handoff is
         // mid-flight). Present on all targets; only ever populated on macOS.
@@ -797,10 +829,71 @@ pub fn initFromListenFd(
 
 /// Spawn the accept + conn-reaper + session-reaper threads. Returns immediately.
 pub fn start(self: *Server) !void {
+    // FORK(host-handoff): the accept-thread wake self-pipe. `deinit` writes to it to
+    // unblock `acceptLoop`'s `poll` for a clean join WITHOUT closing `listen_fd` (a
+    // shared worker listener must never be closed while a thread is blocked in
+    // accept — see `owns_listen_fd`). Both ends are FD_CLOEXEC so they don't leak
+    // into shell children across the worker's fork+execve.
+    self.accept_wake = try posix.pipe();
+    errdefer {
+        posix.close(self.accept_wake[0]);
+        posix.close(self.accept_wake[1]);
+        self.accept_wake = .{ -1, -1 };
+    }
+    setCloexec(self.accept_wake[0]);
+    setCloexec(self.accept_wake[1]);
+
+    // FORK(host-handoff): make the listener non-blocking so `accept()` NEVER blocks
+    // the accept thread — it always returns to `poll`, where the wake pipe (and the
+    // `running` flag) can end it. This also matters during a live handoff, when BOTH
+    // the outgoing and incoming workers poll the SHARED listener and only one wins a
+    // given `accept()`; the loser must get `WouldBlock` and re-poll, not block.
+    setNonblock(self.listen_fd);
+
+    // FORK(host-handoff) issue #6 (CLOEXEC hygiene): a supervisor-spawned worker
+    // inherits the listener with CLOEXEC CLEARED (so it survives the worker's own
+    // execve); re-set it here so the worker's SHELL children do NOT inherit the
+    // listener across their fork+exec (`Command` only wires stdin/out/err and relies
+    // on CLOEXEC for the rest). A shell holding the shared listener keeps the socket
+    // object referenced; more importantly, the sibling control fd must not leak either
+    // (see `startControlLoop`) or a shell would keep the supervisor↔worker channel
+    // open after the worker dies, defeating crash detection. Harmless for the
+    // standalone host too (its shells have no business holding the listener).
+    setCloexec(self.listen_fd);
+
     self.reaper_thread = try std.Thread.spawn(.{}, reaperLoop, .{self});
     // Idle-leak fix: the periodic dead-session reaper.
     self.session_reaper_thread = try std.Thread.spawn(.{}, sessionReaperLoop, .{self});
     self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+}
+
+/// FORK(host-handoff): set FD_CLOEXEC on `fd` (best-effort). Keeps supervisor/worker
+/// bookkeeping fds from leaking into shell children across fork+execve. `pub` so the
+/// worker entrypoint can CLOEXEC the inherited control fd BEFORE `start()` opens the
+/// accept path (issue #6 — closing the spawn-in-flight window).
+pub fn setCloexec(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFD, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFD, flags | posix.FD_CLOEXEC) catch {};
+}
+
+/// FORK(host-handoff): set O_NONBLOCK on `fd` (best-effort). Used on the listener so
+/// the accept loop can poll+accept without ever blocking in `accept()`.
+fn setNonblock(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {};
+}
+
+/// FORK(host-handoff): CLEAR O_NONBLOCK on `fd` (best-effort). On macOS/BSD `accept()`
+/// INHERITS the listener's O_NONBLOCK onto the accepted socket, so with a non-blocking
+/// listener every accepted conn would be non-blocking too — and `Conn.readLoop`'s
+/// blocking `posix.read` would return `WouldBlock` and drop the conn before the client's
+/// Hello arrives. Restore blocking semantics on each accepted fd.
+fn setBlocking(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    // Widen the NONBLOCK bit to the flags' width BEFORE `~`, so the complement keeps
+    // every other status bit set (a u32 `~` then widened would zero the high bits).
+    const nonblock: @TypeOf(flags) = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+    _ = posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock) catch {};
 }
 
 /// TEST-ONLY: return the first render subscriber Conn of `session_id`, or null.
@@ -989,16 +1082,60 @@ pub fn reapSessionsOnce(self: *Server, now_ms: i64, grace_ms: i64) void {
 
 fn acceptLoop(self: *Server) void {
     while (self.running.load(.acquire)) {
-        const fd = posix.accept(self.listen_fd, null, null, 0) catch |err| {
-            // When deinit closes listen_fd, accept fails; that's the exit path.
+        // FORK(host-handoff): block in `poll`, NOT in `accept`, so `deinit` can end
+        // this thread by poking `accept_wake` — WITHOUT closing `listen_fd`. Closing
+        // a shared worker listener while a thread is blocked in `accept()` poisons it
+        // for the successor (`SS_DRAINING` → `ECONNABORTED`); the wake pipe avoids
+        // that entirely. The listener is non-blocking (`start`), so `accept()` below
+        // returns immediately on a spurious wake / lost accept race.
+        var pfds = [_]posix.pollfd{
+            .{ .fd = self.listen_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = self.accept_wake[0], .events = posix.POLL.IN, .revents = 0 },
+        };
+        _ = posix.poll(&pfds, -1) catch |err| {
             if (!self.running.load(.acquire)) return;
-            // A transient accept() error (EINTR/EMFILE/ECONNABORTED) must NOT
-            // permanently kill the accept thread on a long-lived host (it would
-            // silently deny ALL future GUI connections). Log and keep looping.
-            // Finding F6.
-            log.warn("accept failed err={}; continuing", .{err});
+            log.warn("accept poll failed err={}; continuing", .{err});
             continue;
         };
+        if (!self.running.load(.acquire)) return;
+
+        // Teardown wake: drain the pipe and re-check `running` at the loop top.
+        if (pfds[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+            var drain: [64]u8 = undefined;
+            _ = posix.read(self.accept_wake[0], &drain) catch {};
+            continue;
+        }
+        // A listener error condition (should never happen for a bound AF_UNIX listen
+        // socket held for the process lifetime) would be reported by `poll` every
+        // iteration — guard against a hot spin by backing off briefly instead of
+        // re-polling immediately. `POLL.IN` may accompany it, so only treat as an
+        // error when there's no readable connection to accept.
+        if (pfds[0].revents & posix.POLL.IN == 0) {
+            if (pfds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
+                log.warn("listener poll error revents={d}; backing off", .{pfds[0].revents});
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            continue;
+        }
+
+        const fd = posix.accept(self.listen_fd, null, null, 0) catch |err| switch (err) {
+            // Non-blocking listener + a lost accept race (during a handoff both the
+            // outgoing and incoming worker poll the shared listener; only one wins) or
+            // a spurious wake: nothing to accept right now, just re-poll.
+            error.WouldBlock => continue,
+            else => {
+                if (!self.running.load(.acquire)) return;
+                // A transient accept() error (EINTR/EMFILE/ECONNABORTED) must NOT
+                // permanently kill the accept thread on a long-lived host (it would
+                // silently deny ALL future GUI connections). Log and keep looping.
+                // Finding F6.
+                log.warn("accept failed err={}; continuing", .{err});
+                continue;
+            },
+        };
+        // FORK(host-handoff): the non-blocking listener leaks O_NONBLOCK onto the
+        // accepted fd on macOS/BSD; clear it so the conn's blocking reads/writes work.
+        setBlocking(fd);
         self.setupConn(fd) catch |err| {
             log.warn("setup conn failed err={}", .{err});
             posix.close(fd);
@@ -2876,6 +3013,14 @@ fn teardownEntry(self: *Server, e: *SessionEntry) void {
 /// ownership of `control_fd` (closed on `deinit`).
 pub fn startControlLoop(self: *Server, control_fd: posix.socket_t) !void {
     if (comptime builtin.os.tag == .macos) {
+        // FORK(host-handoff) issue #6 (CLOEXEC hygiene): the control fd was inherited
+        // with CLOEXEC cleared (to survive the worker's execve); re-set it so a shell
+        // child never inherits the supervisor↔worker channel. A leaked copy in a shell
+        // would keep the channel open after the worker exits, defeating the
+        // supervisor's EOF-based crash detection (and the handoff's pre-commit
+        // successor-liveness check). The worker uses the fd via recv/send directly,
+        // which CLOEXEC does not affect.
+        setCloexec(control_fd);
         self.control_fd = control_fd;
         self.control_thread = try std.Thread.spawn(.{}, controlLoop, .{self});
     } else {
@@ -3381,9 +3526,18 @@ pub fn deinit(self: *Server) void {
         self.control_thread = null;
     }
 
-    // Closing the listen fd unblocks the accept thread.
-    posix.close(self.listen_fd);
+    // FORK(host-handoff): unblock the accept thread via the wake self-pipe, then
+    // join it — do NOT close `listen_fd` to wake it. `running` was cleared above, so
+    // the woken thread exits at the loop top. Closing the listener to unblock a
+    // blocked `accept()` poisons a SHARED worker listener for the successor
+    // (`SS_DRAINING` → `ECONNABORTED`); the pipe avoids touching the socket at all.
+    if (self.accept_wake[1] != -1) _ = posix.write(self.accept_wake[1], &[_]u8{1}) catch {};
     if (self.accept_thread) |t| t.join();
+    // The accept thread is joined (nothing is blocked in accept on `listen_fd`), so
+    // closing it now is safe — but only if WE own it. A supervisor-managed worker
+    // (`owns_listen_fd=false`) shares the listener with the supervisor + successor
+    // and must never close it; the OS reaps its copy when the worker process exits.
+    if (self.owns_listen_fd) posix.close(self.listen_fd);
 
     // Idle-leak fix: stop + join the SESSION reaper before draining the registry, so it
     // is never mid-teardownEntry (which frees an entry) when the drain loop runs. Clear
@@ -3480,9 +3634,15 @@ pub fn deinit(self: *Server) void {
     // FORK(host-handoff): only unlink the path if THIS Server bound it. A
     // supervisor-managed worker (owns_path=false) shares a path the supervisor
     // keeps bound across worker swaps; unlinking it here would break the next
-    // worker's accepts. The fd itself was already closed above regardless.
+    // worker's accepts. (The listen fd close is separately gated on
+    // `owns_listen_fd` above — a shared listener is never closed here.)
     if (self.owns_path) posix.unlink(self.path) catch {};
     self.alloc.free(self.path);
+
+    // FORK(host-handoff): close the accept-wake self-pipe (created in `start`; still
+    // -1 on a never-started Server, e.g. the handoff-sequence test workers).
+    if (self.accept_wake[0] != -1) posix.close(self.accept_wake[0]);
+    if (self.accept_wake[1] != -1) posix.close(self.accept_wake[1]);
 
     const alloc = self.alloc;
     alloc.destroy(self);
