@@ -78,26 +78,10 @@ final class AgentDashboardTabWindow: NSWindow, NonTerminalTabWindow {
         initialFirstResponder = nil
     }
 
-    /// Handle tab-switching keys ourselves. Ghostty's `next_tab`/`previous_tab`
-    /// keybinds (ctrl+tab / ctrl+shift+tab) are dispatched from the FOCUSED
-    /// SURFACE, and this tab has none — so from the dashboard tab those keys would
-    /// otherwise do nothing, trapping you on it. Route them to the native tab-group
-    /// selectors instead. (ctrl+tab = next, ctrl+shift+tab = previous — the macOS
-    /// convention; wraps within the group.)
-    override func keyDown(with event: NSEvent) {
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if event.keyCode == 0x30 { // tab
-            if mods == .control {
-                selectNextTab(nil)
-                return
-            }
-            if mods == [.control, .shift] {
-                selectPreviousTab(nil)
-                return
-            }
-        }
-        super.keyDown(with: event)
-    }
+    // ctrl+tab / ctrl+shift+tab tab-switching FROM this surface-less tab is handled
+    // in `AppDelegate.localEventKeyDown` (the app-level key monitor, which runs
+    // before AppKit dispatch) — a window `keyDown` override never sees Tab because
+    // SwiftUI/the responder chain swallows it for focus traversal first.
 
     /// Never let AppKit pick a mirror `SurfaceView` subview as the initial first
     /// responder when this tab becomes key — same guard as `AgentDashboardPanel`.

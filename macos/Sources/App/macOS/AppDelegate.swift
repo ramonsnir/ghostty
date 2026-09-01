@@ -968,6 +968,27 @@ class AppDelegate: NSObject,
             return nil
         }
 
+        // (ramon fork / Agent Dashboard, tab mode) Let ctrl+tab / ctrl+shift+tab
+        // switch tabs FROM the docked dashboard tab. That tab has no terminal
+        // surface, so Ghostty's next_tab/previous_tab keybinds (dispatched from the
+        // focused surface) never fire from it, and SwiftUI/the responder chain
+        // swallows Tab (0x30) for focus traversal before the window's keyDown sees
+        // it — so without this you're trapped on the dashboard tab. This app-level
+        // monitor runs BEFORE AppKit dispatch, so intercept here and drive the
+        // native tab-group selectors directly. Scoped to the dashboard tab window.
+        if let keyWindow = NSApp.keyWindow, keyWindow is AgentDashboardTabWindow,
+           event.keyCode == 0x30 { // tab
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if mods == .control {
+                keyWindow.selectNextTab(nil)
+                return nil
+            }
+            if mods == [.control, .shift] {
+                keyWindow.selectPreviousTab(nil)
+                return nil
+            }
+        }
+
         // (ramon fork / Agent Dashboard) When a dashboard modal's text field is the
         // key window (e.g. the Adopt sheet's issue-key field), route the standard
         // editing keys straight to the field editor instead of letting Ghostty's

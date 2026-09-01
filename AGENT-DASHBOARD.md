@@ -548,8 +548,10 @@ gains a live state chip.
 - **Docked-tab presentation (tab mode):** `AgentDashboardTabWindow.swift` (the
   leftmost native tab window that re-hosts `AgentDashboardView`, + the
   `NonTerminalTabWindow` marker protocol; `isReleasedWhenClosed=false` since it has no
-  `NSWindowController`; a `keyDown` override routing ctrl-tab / ctrl-shift-tab to
-  `selectNextTab`/`selectPreviousTab` so a surface-less tab isn't a trap); in
+  `NSWindowController`); ctrl-tab / ctrl-shift-tab switching FROM the surface-less tab is
+  handled in `AppDelegate.localEventKeyDown` (the app key monitor, before AppKit dispatch —
+  a window `keyDown` never sees Tab, SwiftUI swallows it for focus traversal) → the window's
+  `selectNextTab`/`selectPreviousTab`; in
   `AgentDashboardController.swift` the
   `Presentation` enum (`panel`/`tab`/`off`), the pure `nonisolated`
   `nextPresentation` (the panel→tab→off cycle) + `resolveLaunchPresentation`
