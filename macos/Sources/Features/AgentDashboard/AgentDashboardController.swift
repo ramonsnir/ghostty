@@ -1981,13 +1981,29 @@ final class AgentDashboardController: NSWindowController {
     /// for the panel's content and, in tab mode, the docked tab's content — only
     /// ONE is mounted at a time (the inactive shell's content is released), so there
     /// is a single set of mirror `SurfaceView`s regardless of presentation.
-    private func makeHostingView() -> NSHostingView<AgentDashboardView> {
-        let host = NSHostingView(rootView: AgentDashboardView(
+    private func makeHostingView(maxContentWidth: CGFloat? = nil) -> NSHostingView<AnyView> {
+        let dashboard = AgentDashboardView(
             model: model,
             ghostty: ghostty,
             ptyHostEnabled: ghostty.config.ptyHost != nil,
             commands: ghostty.config.agentDashboardCommands
-        ))
+        )
+        let root: AnyView
+        if let cap = maxContentWidth {
+            // Docked-tab mode: the tab spans the FULL (wide) terminal-window width,
+            // which would blow up the mirror-preview scale (huge text). Cap the
+            // dashboard column to the panel's chosen width, leading-aligned, so tiles
+            // size exactly like the floating panel; fill the rest with window bg.
+            root = AnyView(
+                ZStack(alignment: .topLeading) {
+                    Color(nsColor: .windowBackgroundColor)
+                    dashboard.frame(maxWidth: cap, maxHeight: .infinity, alignment: .topLeading)
+                }
+            )
+        } else {
+            root = AnyView(dashboard)
+        }
+        let host = NSHostingView(rootView: root)
         host.autoresizingMask = [.width, .height]
         return host
     }
@@ -2137,7 +2153,7 @@ final class AgentDashboardController: NSWindowController {
     /// the tab shell is active so only one mirror set exists at a time).
     private func ensurePanelContent() {
         guard let panel = window else { return }
-        if !(panel.contentView is NSHostingView<AgentDashboardView>) {
+        if !(panel.contentView is NSHostingView<AnyView>) {
             panel.contentView = makeHostingView()
         }
     }
@@ -2146,7 +2162,7 @@ final class AgentDashboardController: NSWindowController {
     /// leaving panel mode, so the tab shell owns the only mirror set.
     private func releasePanelContent() {
         guard let panel = window,
-              panel.contentView is NSHostingView<AgentDashboardView> else { return }
+              panel.contentView is NSHostingView<AnyView> else { return }
         setMirrorOcclusion(false, in: panel)
         panel.contentView = NSView()
     }
@@ -2185,7 +2201,9 @@ final class AgentDashboardController: NSWindowController {
         if tabWindow == nil {
             let win = AgentDashboardTabWindow()
             win.setFrame(host.frame, display: false)
-            win.contentView = makeHostingView()
+            // Cap the dashboard column at the panel's width so the tab (full
+            // terminal-window width) doesn't blow up the preview scale.
+            win.contentView = makeHostingView(maxContentWidth: Self.defaultWidth)
             win.delegate = self
             tabWindow = win
         }

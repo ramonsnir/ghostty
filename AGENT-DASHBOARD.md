@@ -71,7 +71,14 @@ How the docked tab behaves:
   to move it.
 - **It's a leftmost, non-numbered tab.** Numeric tab nav counts terminals only — `goto_tab:1` /
   cmd-1 is your **first terminal**, not the dashboard (the dashboard tab carries no cmd-number).
-  `previous`/`next` tab (and ctrl-tab) still cycle through it, since it *is* a tab.
+  `previous`/`next` tab **and ctrl-tab / ctrl-shift-tab** cycle through it, since it *is* a tab —
+  including **from** the dashboard tab (it has no terminal surface to dispatch the Ghostty keybind,
+  so the tab window handles ctrl-tab / ctrl-shift-tab itself via the native tab-group selectors, so
+  you're never trapped on it).
+- **Preview width is capped to the panel's width.** The tab spans the full (wide) terminal-window
+  width, but the dashboard content is capped at the floating panel's chosen width (leading-aligned,
+  window background filling the rest) so the mirror previews render at the same size as the panel —
+  not blown up to the full tab width.
 - **Closing / lifecycle.** Closing the dashboard tab (its ⨯) turns the dashboard **off** (like the
   panel's close button). If the terminal window hosting it closes, the dashboard **re-docks** into
   another terminal window if one remains, else it goes dormant and re-docks when a terminal window
@@ -540,12 +547,17 @@ gains a live state chip.
   `AgentDetector.swift` (off-main libproc poller + pure `matchAgent`/`resolve`).
 - **Docked-tab presentation (tab mode):** `AgentDashboardTabWindow.swift` (the
   leftmost native tab window that re-hosts `AgentDashboardView`, + the
-  `NonTerminalTabWindow` marker protocol); in `AgentDashboardController.swift` the
+  `NonTerminalTabWindow` marker protocol; `isReleasedWhenClosed=false` since it has no
+  `NSWindowController`; a `keyDown` override routing ctrl-tab / ctrl-shift-tab to
+  `selectNextTab`/`selectPreviousTab` so a surface-less tab isn't a trap); in
+  `AgentDashboardController.swift` the
   `Presentation` enum (`panel`/`tab`/`off`), the pure `nonisolated`
   `nextPresentation` (the panel→tab→off cycle) + `resolveLaunchPresentation`
   (persist/migrate), `cycle()`/`apply(_:)`, the panel-vs-tab shell helpers
   (`showPanel`/`hidePanel`/`ensurePanelContent`/`releasePanelContent`,
-  `dockTabIntoFocusedWindow`/`undockTab`/`focusedTerminalWindow`), the generalized
+  `dockTabIntoFocusedWindow`/`undockTab`/`focusedTerminalWindow`), the tab's content
+  capped at `defaultWidth` via `makeHostingView(maxContentWidth:)` so previews match
+  the panel size, the generalized
   `setMirrorOcclusion(_:in:)` + `activeHostWindow` + `ownsWindow(_:)`, the
   `subscribeWindowLifecycle`/`handleWindowWillClose` re-dock/undock recovery, and
   `restoreAtLaunch`. **Terminal-only tab paths taught to skip the non-terminal tab:**
