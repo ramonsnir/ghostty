@@ -374,7 +374,7 @@ class AppDelegate: NSObject,
         if ghostty.config.agentDashboard {
             let controller = AgentDashboardController(ghostty: ghostty)
             self.agentDashboard = controller
-            controller.restoreVisibility()
+            controller.restoreAtLaunch()
         }
 
         // (ramon fork / Agent Manager) Spawn + supervise the TS Agent SDK sidecar.
@@ -614,9 +614,12 @@ class AppDelegate: NSObject,
         return terminate()
     }
 
-    /// (ramon fork / Agent Dashboard) Toggle the app-global dashboard panel.
-    /// Lazily creates the controller on first invocation when not enabled at
-    /// launch.
+    /// (ramon fork / Agent Dashboard) CYCLE the app-global dashboard presentation:
+    /// floating panel → docked tab → off → panel (remembered across launches). The
+    /// tab presentation docks the dashboard as a leftmost native tab in the focused
+    /// terminal window so the terminal can stay full-screen on a small display; the
+    /// panel is the original floating window (best on an external monitor). Lazily
+    /// creates the controller on first invocation when not enabled at launch.
     @objc private func ghosttyToggleAgentDashboard(_ notification: Notification) {
         // Posted from the apprt action callback, which arrives on the main
         // thread; the controller is @MainActor-isolated.
@@ -624,7 +627,7 @@ class AppDelegate: NSObject,
             if agentDashboard == nil {
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
-            agentDashboard?.toggle()
+            agentDashboard?.cycle()
         }
     }
 
@@ -1031,15 +1034,15 @@ class AppDelegate: NSObject,
     /// `sheetParent`/`parent` up to the panel. Used to stop `localEventKeyDown` from
     /// stealing the standard editing keys from the modal's text field.
     private func agentDashboardOwnsKeyWindow() -> Bool {
-        guard let panel = agentDashboard?.window else { return false }
-        var current = NSApp.keyWindow
-        var hops = 0
-        while let win = current, hops < 8 {
-            if win === panel { return true }
-            current = win.sheetParent ?? win.parent
-            hops += 1
+        // Matches EITHER the floating panel or the docked-tab window (and any sheet
+        // presented from them), so a dashboard modal's ⌘X/⌘C/⌘V/⌘A resolves in both
+        // presentations. The walk up `sheetParent`/`parent` lives in `ownsWindow`.
+        // `localEventKeyDown` (our caller) is a main-thread NSEvent monitor but a
+        // nonisolated context, and `ownsWindow` reads @MainActor controller state,
+        // so hop with `assumeIsolated` (safe: event monitors fire on main).
+        MainActor.assumeIsolated {
+            agentDashboard?.ownsWindow(NSApp.keyWindow) ?? false
         }
-        return false
     }
 
     /// (ramon fork / Agent Dashboard) Route a standard editing key (⌘X/⌘C/⌘V/⌘A) to

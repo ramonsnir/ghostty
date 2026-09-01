@@ -3175,3 +3175,72 @@ struct AgentMirrorReconnectTests {
         #expect(AgentPreviewTile.mirrorReconnectDelay(attempt: -1) == 1)
     }
 }
+
+// MARK: - Dashboard presentation (tab mode) — pure state logic
+
+struct AgentDashboardPresentationTests {
+    typealias P = AgentDashboardController.Presentation
+
+    @Test func cycleRotatesPanelTabOffPanel() {
+        // The single `toggle_agent_dashboard` action cycles the three states.
+        #expect(AgentDashboardController.nextPresentation(.panel) == .tab)
+        #expect(AgentDashboardController.nextPresentation(.tab) == .off)
+        #expect(AgentDashboardController.nextPresentation(.off) == .panel)
+    }
+
+    @Test func cycleReturnsToStartInThreePresses() {
+        var p: P = .off
+        for _ in 0..<3 { p = AgentDashboardController.nextPresentation(p) }
+        #expect(p == .off)
+        // And every state is reachable within the cycle.
+        let reached = Set([
+            AgentDashboardController.nextPresentation(.off),
+            AgentDashboardController.nextPresentation(.panel),
+            AgentDashboardController.nextPresentation(.tab),
+        ])
+        #expect(reached == Set<P>([.panel, .tab, .off]))
+    }
+
+    @Test func launchPrefersPersistedValue() {
+        // A remembered presentation wins over the legacy bool, in every variant.
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: "tab", legacyWasVisible: false) == .tab)
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: "panel", legacyWasVisible: nil) == .panel)
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: "off", legacyWasVisible: true) == .off)
+    }
+
+    @Test func launchMigratesFromLegacyWasVisibleWhenNoPersistedValue() {
+        // No persisted presentation yet (upgrade / first run): fall back to the
+        // legacy bool — nil (first-ever run) shows the panel; false stays off.
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: nil, legacyWasVisible: nil) == .panel)
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: nil, legacyWasVisible: true) == .panel)
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: nil, legacyWasVisible: false) == .off)
+    }
+
+    @Test func launchIgnoresGarbagePersistedValue() {
+        // An unparseable persisted string falls through to the legacy migration.
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: "bogus", legacyWasVisible: false) == .off)
+        #expect(AgentDashboardController.resolveLaunchPresentation(
+            persisted: "", legacyWasVisible: nil) == .panel)
+    }
+
+    @MainActor
+    @Test func dashboardTabWindowIsNonTerminal() {
+        // The load-bearing fact behind the terminal-only tab filtering (numeric
+        // goto_tab / relabelTabs / termination counting): the dashboard tab window
+        // is marked NonTerminalTabWindow and is NOT a TerminalWindow, while an
+        // ordinary window is neither.
+        let tab = AgentDashboardTabWindow()
+        #expect(tab is NonTerminalTabWindow)
+        #expect(!(tab is TerminalWindow))
+        let plain = NSWindow(contentRect: .init(x: 0, y: 0, width: 100, height: 100),
+                             styleMask: [.titled], backing: .buffered, defer: false)
+        #expect(!(plain is NonTerminalTabWindow))
+    }
+}

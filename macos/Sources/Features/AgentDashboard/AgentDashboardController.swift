@@ -1907,11 +1907,30 @@ final class AgentDashboardController: NSWindowController {
 
     private let detector: AgentDetector
 
-    /// Whether the panel is currently visible. Persisted as
-    /// `agentDashboardWasVisible` so launch can restore the open/closed state.
-    private(set) var isShown = false
+    /// (ramon fork / Agent Dashboard, tab mode) How the dashboard is presented.
+    /// `.panel` = the original floating `AgentDashboardPanel`; `.tab` = docked as a
+    /// native leftmost tab in a terminal window's group (`AgentDashboardTabWindow`);
+    /// `.off` = hidden. The `toggle_agent_dashboard` action CYCLES panel → tab →
+    /// off → panel, and the choice is remembered across launches (`presentationKey`).
+    enum Presentation: String { case panel, tab, off }
+
+    /// The current presentation. Starts `.off` (nothing shown) so a lazily-created
+    /// controller's first `cycle()` opens the panel; `restoreAtLaunch` sets the
+    /// remembered value at startup (persisted as `presentationKey`, migrated from
+    /// the legacy `wasVisibleKey` bool on the first launch after upgrade).
+    private(set) var presentation: Presentation = .off
+
+    /// The docked-tab window when `presentation == .tab` and a terminal window is
+    /// available to host it; nil in panel/off mode or while dormant (no terminal
+    /// window to dock into yet — a later `didBecomeMain` docks it).
+    private var tabWindow: AgentDashboardTabWindow?
+
+    /// Whether the dashboard is currently visible in EITHER shell. Derived from
+    /// `presentation` so all the existing `isShown`-gated observers keep working.
+    var isShown: Bool { presentation != .off }
 
     static let wasVisibleKey = "agentDashboardWasVisible"
+    static let presentationKey = "agentDashboardPresentation"
     static let autosaveName = "com.mitchellh.ghostty.agentDashboard"
 
     init(ghostty: Ghostty.App) {
@@ -1929,13 +1948,7 @@ final class AgentDashboardController: NSWindowController {
         let panel = AgentDashboardPanel(pinned: ghostty.config.agentDashboardPin)
         super.init(window: panel)
 
-        let host = NSHostingView(rootView: AgentDashboardView(
-            model: model,
-            ghostty: ghostty,
-            ptyHostEnabled: ghostty.config.ptyHost != nil,
-            commands: ghostty.config.agentDashboardCommands
-        ))
-        host.autoresizingMask = [.width, .height]
+        let host = makeHostingView()
 
         // First-run default frame, THEN autosave name (autosave wins on every
         // later run; the default only takes effect the very first time).
@@ -1955,6 +1968,7 @@ final class AgentDashboardController: NSWindowController {
         }
 
         subscribeChurn()
+        subscribeWindowLifecycle()
         subscribeAgentState()
         subscribeAnnotation()
         subscribeQueueStatus()
@@ -1963,12 +1977,87 @@ final class AgentDashboardController: NSWindowController {
         rebuildControllerObservers()
     }
 
+    /// Build a fresh `NSHostingView` mounting the shared `AgentDashboardView`. Used
+    /// for the panel's content and, in tab mode, the docked tab's content — only
+    /// ONE is mounted at a time (the inactive shell's content is released), so there
+    /// is a single set of mirror `SurfaceView`s regardless of presentation.
+    private func makeHostingView() -> NSHostingView<AgentDashboardView> {
+        let host = NSHostingView(rootView: AgentDashboardView(
+            model: model,
+            ghostty: ghostty,
+            ptyHostEnabled: ghostty.config.ptyHost != nil,
+            commands: ghostty.config.agentDashboardCommands
+        ))
+        host.autoresizingMask = [.width, .height]
+        return host
+    }
+
     required init?(coder: NSCoder) { fatalError("not implemented") }
 
-    // MARK: - Show / hide
+    // MARK: - Show / hide / presentation
 
-    func toggle() {
-        if isShown { hide() } else { show() }
+    /// (ramon fork / Agent Dashboard, tab mode) The single action bound to
+    /// `toggle_agent_dashboard`: CYCLE the presentation panel → tab → off → panel.
+    /// This is how you move the dashboard between the floating panel (best on an
+    /// external monitor) and a docked leftmost tab (best on a small laptop screen
+    /// that wants the terminal full-screen), and how you hide it. The chosen state
+    /// is remembered across launches.
+    func cycle() {
+        apply(Self.nextPresentation(presentation))
+    }
+
+    /// Pure cycle transition for `toggle_agent_dashboard`: panel → tab → off →
+    /// panel. Extracted so the state machine is unit-testable without NSWindow.
+    nonisolated static func nextPresentation(_ current: Presentation) -> Presentation {
+        switch current {
+        case .panel: return .tab
+        case .tab:   return .off
+        case .off:   return .panel
+        }
+    }
+
+    /// Pure launch-presentation resolution: use the persisted `presentationKey`
+    /// value if it parses; otherwise MIGRATE from the legacy `wasVisibleKey` bool
+    /// (nil = first-ever run ⇒ panel shown). Extracted for unit tests.
+    nonisolated static func resolveLaunchPresentation(
+        persisted: String?,
+        legacyWasVisible: Bool?
+    ) -> Presentation {
+        if let persisted, let parsed = Presentation(rawValue: persisted) {
+            return parsed
+        }
+        return (legacyWasVisible ?? true) ? .panel : .off
+    }
+
+    /// Kept for source compatibility with the AppDelegate handler name; the action
+    /// now CYCLES rather than plain show/hide (see `cycle()`).
+    func toggle() { cycle() }
+
+    /// (ramon fork / Agent Dashboard, tab mode) Apply a presentation, driving the
+    /// shell transitions and persisting the choice. Exactly one shell is mounted at
+    /// a time: entering `.tab` releases the panel's content and docks the tab;
+    /// entering `.panel` undocks the tab and remounts the panel; `.off` tears both
+    /// down. Idempotent enough to call repeatedly.
+    func apply(_ p: Presentation) {
+        presentation = p
+        UserDefaults.standard.set(p.rawValue, forKey: Self.presentationKey)
+        // Keep the legacy bool coherent for any older read path + migration.
+        UserDefaults.standard.set(p != .off, forKey: Self.wasVisibleKey)
+
+        switch p {
+        case .panel:
+            undockTab()
+            showPanel()
+        case .tab:
+            hidePanel()
+            releasePanelContent()
+            dockTabIntoFocusedWindow(select: true)
+        case .off:
+            undockTab()
+            hidePanel()
+            releasePanelContent()
+        }
+        updateDetector()
     }
 
     /// Hide the given surface from the dashboard (driven by the
@@ -2000,65 +2089,194 @@ final class AgentDashboardController: NSWindowController {
     /// to decide, then shows first so the surface is already in `live` when it re-sorts.
     func spotlight(surfaceID id: UUID) {
         let willSpotlight = model.spotlightedSurfaceID != id
-        if willSpotlight, !isShown { show() }
+        if willSpotlight {
+            // Spotlight must SHOW the dashboard (the point is to see the agent). If
+            // it's off, restore to the panel. If it's a docked tab, bring that tab
+            // forward so the spotlighted tile is actually on screen.
+            if presentation == .off {
+                apply(.panel)
+            } else if presentation == .tab {
+                // Dormant tab mode (persisted .tab but not yet docked): dock now +
+                // select, so spotlight actually surfaces the agent instead of no-op'ing
+                // on a nil tab window. Otherwise just bring the docked tab forward.
+                if tabWindow == nil { dockTabIntoFocusedWindow(select: true) }
+                else { tabWindow?.makeKeyAndOrderFront(nil) }
+            }
+        }
         model.toggleSpotlight(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
     }
 
-    func show() {
+    // MARK: Panel shell
+
+    /// Mount + order the floating panel front, resuming its mirror renderers. The
+    /// async re-drive handles mirror `SurfaceView`s that SwiftUI mounts a runloop
+    /// after layout (empty on the synchronous pass) — see `setMirrorOcclusion`.
+    private func showPanel() {
+        guard let panel = window else { return }
+        ensurePanelContent()
         rebuild()
         rebuildControllerObservers()
-        window?.orderFrontRegardless()
-        isShown = true
-        UserDefaults.standard.set(true, forKey: Self.wasVisibleKey)
-        // Resume the mirror renderers (they were paused on the last hide).
-        setMirrorOcclusion(true)
-        // The SwiftUI NSHostingView mounts its mirror SurfaceViews ASYNCHRONOUSLY
-        // after layout, so on the very first show() (and whenever a new tile
-        // appears on this open) `surfaceViews(in:)` returns an empty / partial
-        // set and the synchronous call above can't reach the not-yet-mounted
-        // mirrors. Re-drive occlusion after a runloop hop so freshly-mounted
-        // mirrors are resumed too (idempotent for the ones already handled).
+        panel.orderFrontRegardless()
+        setMirrorOcclusion(true, in: panel)
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isShown else { return }
-            self.setMirrorOcclusion(true)
+            guard let self, self.presentation == .panel else { return }
+            self.setMirrorOcclusion(true, in: panel)
         }
-        detector.resume(snapshotProvider: { [weak self] in self?.detectorSnapshot() ?? [] })
     }
 
-    func hide() {
-        orderOutWithoutPersisting()
-        UserDefaults.standard.set(false, forKey: Self.wasVisibleKey)
+    /// Order the panel out + pause its mirrors. Does NOT mutate persistence (the
+    /// caller owns that) — used both by an explicit `.off`/`.tab` transition and at
+    /// teardown so an open-at-quit panel re-opens next launch.
+    private func hidePanel() {
+        guard let panel = window else { return }
+        setMirrorOcclusion(false, in: panel)
+        panel.orderOut(nil)
     }
 
-    /// Order the panel out + pause work WITHOUT mutating the persisted
-    /// `wasVisibleKey`. Used at app teardown so a panel that is OPEN at quit
-    /// restores as open next launch (spec §1.4/§6.1) — only an explicit user
-    /// `hide()` writes `false`.
-    private func orderOutWithoutPersisting() {
-        window?.orderOut(nil)
-        // Inform the mirror surfaces they are off-screen so their renderers
-        // pause (spec §8 cost-control). The panel is not an NSWindowDelegate on
-        // the occlusion path, so we drive it explicitly here.
-        setMirrorOcclusion(false)
-        isShown = false
-        detector.pause()
+    /// Mount the panel's SwiftUI content if it isn't currently (it's released while
+    /// the tab shell is active so only one mirror set exists at a time).
+    private func ensurePanelContent() {
+        guard let panel = window else { return }
+        if !(panel.contentView is NSHostingView<AgentDashboardView>) {
+            panel.contentView = makeHostingView()
+        }
     }
 
-    /// Restore visibility from the remembered default. Called at launch when
-    /// `agent-dashboard` is enabled in config. First run (key absent) defaults
-    /// to SHOWN (spec §6.1: "shown by default the first time").
-    func restoreVisibility() {
+    /// Release the panel's SwiftUI content (drops its mirror `SurfaceView`s) when
+    /// leaving panel mode, so the tab shell owns the only mirror set.
+    private func releasePanelContent() {
+        guard let panel = window,
+              panel.contentView is NSHostingView<AgentDashboardView> else { return }
+        setMirrorOcclusion(false, in: panel)
+        panel.contentView = NSView()
+    }
+
+    // MARK: Tab shell
+
+    /// The terminal window a fresh dock should target: the key terminal window,
+    /// else the main one, else any visible/first terminal window. Nil when no
+    /// terminal window exists yet (dock is deferred; a `didBecomeMain` retries).
+    private func focusedTerminalWindow() -> NSWindow? {
+        if let kw = NSApp.keyWindow, kw.windowController is TerminalController { return kw }
+        if let mw = NSApp.mainWindow, mw.windowController is TerminalController { return mw }
+        // ONLY a VISIBLE terminal window. A closed terminal window LINGERS in
+        // `NSApp.windows` (Ghostty windows are `releasedWhenClosed = NO`), so an
+        // unconditional `.first?.window` fallback would re-dock into a just-closed
+        // zombie — resurrecting a phantom dashboard window (and keeping the app
+        // alive) after the user closed their last terminal, in the default
+        // `quit-after-last-window-closed = false` config. No visible terminal ⇒ nil
+        // ⇒ the dashboard stays dormant and re-docks when one next becomes active.
+        return TerminalController.all.first(where: { $0.window?.isVisible == true })?.window
+    }
+
+    /// Create (if needed) + dock the dashboard tab LEFTMOST in the focused terminal
+    /// window's tab group. `select` brings the tab forward (a user cycle) vs. just
+    /// slotting it in without stealing the terminal's selection (launch restore).
+    /// A no-op (stays dormant) when no terminal window exists yet.
+    private func dockTabIntoFocusedWindow(select: Bool) {
+        guard presentation == .tab else { return }
+        guard let host = focusedTerminalWindow() else {
+            // Dormant: no terminal to host it. A later terminal `didBecomeMain`
+            // (see `subscribeChurn`) docks it. Drop any stale tab window.
+            undockTab()
+            return
+        }
+
+        if tabWindow == nil {
+            let win = AgentDashboardTabWindow()
+            win.setFrame(host.frame, display: false)
+            win.contentView = makeHostingView()
+            win.delegate = self
+            tabWindow = win
+        }
+        guard let win = tabWindow, host !== win else { return }
+
+        // Insert leftmost: add BELOW the group's current first window (the
+        // `.below` = to-the-left pattern used by fullscreen tab restore). Remove
+        // first if macOS already auto-grouped it, so ordering is deterministic.
+        if let group = host.tabGroup, let first = group.windows.first {
+            if group.windows.contains(win) { group.removeWindow(win) }
+            if first === win {
+                host.addTabbedWindowSafely(win, ordered: .below)
+            } else {
+                first.addTabbedWindowSafely(win, ordered: .below)
+            }
+        } else {
+            host.addTabbedWindowSafely(win, ordered: .below)
+        }
+
+        if select { win.makeKeyAndOrderFront(nil) }
+        rebuild()
+        rebuildControllerObservers()
+        let visible = win.occlusionState.contains(.visible)
+        setMirrorOcclusion(visible, in: win)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentation == .tab, let w = self.tabWindow else { return }
+            self.setMirrorOcclusion(w.occlusionState.contains(.visible), in: w)
+        }
+    }
+
+    /// Remove the dashboard tab from its group + close it, releasing its mirrors.
+    /// Safe to call when not docked.
+    private func undockTab() {
+        guard let win = tabWindow else { return }
+        setMirrorOcclusion(false, in: win)
+        win.contentView = NSView()
+        if let group = win.tabGroup, group.windows.contains(win) {
+            group.removeWindow(win)
+        }
+        win.delegate = nil
+        tabWindow = nil
+        win.close()
+    }
+
+    /// Resume/pause the off-main agent detector with the dashboard's visibility.
+    private func updateDetector() {
+        if presentation == .off {
+            detector.pause()
+        } else {
+            detector.resume(snapshotProvider: { [weak self] in self?.detectorSnapshot() ?? [] })
+        }
+    }
+
+    // MARK: Launch / teardown
+
+    /// Restore the remembered presentation at launch. Reads `presentationKey`;
+    /// on first launch after upgrade (key absent) it MIGRATES from the legacy
+    /// `wasVisibleKey` bool (first-ever run → panel shown). For `.tab`, docking is
+    /// deferred until a terminal window exists (tried immediately, else a
+    /// `didBecomeMain` docks it).
+    func restoreAtLaunch() {
         let defaults = UserDefaults.standard
-        let wantShown = defaults.object(forKey: Self.wasVisibleKey) == nil
-            ? true
+        let legacy: Bool? = defaults.object(forKey: Self.wasVisibleKey) == nil
+            ? nil
             : defaults.bool(forKey: Self.wasVisibleKey)
-        if wantShown { show() }
+        let p = Self.resolveLaunchPresentation(
+            persisted: defaults.string(forKey: Self.presentationKey),
+            legacyWasVisible: legacy)
+
+        if p == .tab {
+            presentation = .tab
+            defaults.set(p.rawValue, forKey: Self.presentationKey)
+            defaults.set(true, forKey: Self.wasVisibleKey)
+            // Release the panel's init-time content (empty at launch — the model
+            // has no live surfaces yet — but keep hygiene explicit) so the tab shell
+            // owns the only content, and DON'T steal the terminal's selection.
+            releasePanelContent()
+            dockTabIntoFocusedWindow(select: false)
+            updateDetector()
+        } else {
+            apply(p)
+        }
     }
 
     func teardown() {
-        // Order out WITHOUT clobbering wasVisibleKey, so an open-at-quit panel
-        // re-opens next launch.
-        orderOutWithoutPersisting()
+        // Order the panel out + undock the tab WITHOUT clobbering the persisted
+        // presentation, so an open-at-quit dashboard re-opens next launch. Don't
+        // call apply() (that would persist `.off`).
+        hidePanel()
+        undockTab()
+        detector.pause()
     }
 
     /// Drive `ghostty_surface_set_occlusion` across the mirror SurfaceViews so
@@ -2078,8 +2296,8 @@ final class AgentDashboardController: NSWindowController {
     /// `ghostty_surface_set_occlusion` is idempotent, so an unconditional call
     /// is safe and correct; we still write `isWindowVisible` to keep SurfaceView's
     /// own drag-restore bookkeeping coherent.
-    private func setMirrorOcclusion(_ visible: Bool) {
-        guard let content = window?.contentView else { return }
+    private func setMirrorOcclusion(_ visible: Bool, in host: NSWindow? = nil) {
+        guard let content = (host ?? activeHostWindow)?.contentView else { return }
         for surfaceView in Self.surfaceViews(in: content) {
             guard let surface = surfaceView.surface else { continue }
             ghostty_surface_set_occlusion(surface, visible)
@@ -2087,7 +2305,35 @@ final class AgentDashboardController: NSWindowController {
         }
     }
 
-    /// Recursively collect the mirror `SurfaceView`s mounted in the panel.
+    /// The window currently presenting the dashboard content (panel or docked tab),
+    /// or nil when off / dormant. Drives occlusion + the ⌘V key-window ownership.
+    private var activeHostWindow: NSWindow? {
+        switch presentation {
+        case .panel: return window
+        case .tab:   return tabWindow
+        case .off:   return nil
+        }
+    }
+
+    /// (ramon fork / Agent Dashboard, tab mode) True iff `candidate` is (or is a
+    /// sheet/child of) the dashboard's panel OR its docked tab window. Lets
+    /// `AppDelegate.localEventKeyDown` route the standard editing keys to a
+    /// dashboard modal's field editor in BOTH presentations.
+    func ownsWindow(_ candidate: NSWindow?) -> Bool {
+        guard let candidate else { return false }
+        let mine: [NSWindow] = [window, tabWindow].compactMap { $0 }
+        guard !mine.isEmpty else { return false }
+        var current: NSWindow? = candidate
+        var hops = 0
+        while let win = current, hops < 8 {
+            if mine.contains(where: { $0 === win }) { return true }
+            current = win.sheetParent ?? win.parent
+            hops += 1
+        }
+        return false
+    }
+
+    /// Recursively collect the mirror `SurfaceView`s mounted in the active shell.
     private static func surfaceViews(in view: NSView) -> [Ghostty.SurfaceView] {
         var out: [Ghostty.SurfaceView] = []
         if let sv = view as? Ghostty.SurfaceView { out.append(sv) }
@@ -2117,8 +2363,72 @@ final class AgentDashboardController: NSWindowController {
                     // grid/entry recompute is gated on visibility.
                     self.rebuildControllerObservers()
                     if self.isShown { self.rebuild() }
+                    // (tab mode) If we want a docked tab but don't have one yet
+                    // (launch before any terminal existed, or the host window
+                    // closed), dock into the now-available terminal window.
+                    self.redockIfDormant()
                 }
                 .store(in: &cancellables)
+        }
+    }
+
+    /// (ramon fork / Agent Dashboard, tab mode) Dock the tab when we WANT tab mode
+    /// but have no tab window (launch before any terminal existed, or the host
+    /// window closed). Deferred one runloop so it never targets a window that is
+    /// mid-close (a `willCloseNotification` fires BEFORE the window leaves
+    /// `NSApp.windows`). Guarded on `tabWindow == nil`, so it does NOT follow focus
+    /// once docked — the tab stays where you put it.
+    private func redockIfDormant() {
+        guard presentation == .tab, tabWindow == nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentation == .tab, self.tabWindow == nil,
+                  self.focusedTerminalWindow() != nil else { return }
+            self.dockTabIntoFocusedWindow(select: false)
+        }
+    }
+
+    /// (ramon fork / Agent Dashboard, tab mode) Keep the docked tab consistent as
+    /// windows close: when its host window closes (the tab itself goes away) re-dock
+    /// into another terminal window if one remains; when the tab is left alone in a
+    /// group (its last terminal sibling closed) undock so it can't strand the group
+    /// or keep the app alive (it is not counted as a terminal window). Uses
+    /// `willCloseNotification`; the group membership is re-checked next runloop, once
+    /// AppKit has settled the close.
+    private func subscribeWindowLifecycle() {
+        NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self, let closing = note.object as? NSWindow else { return }
+                self.handleWindowWillClose(closing)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleWindowWillClose(_ closing: NSWindow) {
+        // Our own tab window is closing (host window closed, or the tab's ⨯). Drop
+        // the reference; if we still want tab mode and a terminal remains, re-dock.
+        if closing === tabWindow {
+            setMirrorOcclusion(false, in: tabWindow)
+            tabWindow = nil
+            // If we still want tab mode and a terminal remains, re-dock (deferred).
+            redockIfDormant()
+            return
+        }
+
+        // A terminal window closed. If our tab is now the only member left in its
+        // group (no terminal siblings), undock it — then re-dock elsewhere if any
+        // terminal window remains, else go dormant so the app can terminate.
+        guard presentation == .tab, tabWindow != nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentation == .tab, let win = self.tabWindow else { return }
+            let terminals = (win.tabGroup?.windows ?? []).filter {
+                $0.windowController is TerminalController
+            }
+            guard terminals.isEmpty else { return }
+            self.undockTab()
+            if self.focusedTerminalWindow() != nil {
+                self.dockTabIntoFocusedWindow(select: false)
+            }
         }
     }
 
@@ -2383,23 +2693,26 @@ final class AgentDashboardController: NSWindowController {
 // MARK: - NSWindowDelegate
 
 extension AgentDashboardController: NSWindowDelegate {
-    /// Route a native close-button click through `hide()` (so `isShown` stays in
-    /// sync and the next `toggle()` re-opens instead of wasting a press) and
-    /// suppress the actual close (the panel is reused, never destroyed).
+    /// A native close-button click on EITHER shell turns the dashboard off (undock /
+    /// order-out) rather than destroying the controller. The state change is
+    /// scheduled async so we don't mutate window state from inside the close
+    /// callback (undock closes the tab window), and we suppress the AppKit close.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        hide()
-        return false
+        if sender === tabWindow || sender === window {
+            DispatchQueue.main.async { [weak self] in self?.apply(.off) }
+            return false
+        }
+        return true
     }
 
-    /// Drive mirror occlusion off the ACTUAL panel occlusion state, not only the
-    /// explicit show/hide path (matching `BaseTerminalController`). This catches
-    /// cases the show/hide gates miss — e.g. the panel becoming occluded by a
-    /// fullscreen window on its Space, or a mirror that mounted asynchronously
-    /// after `show()` already ran — so a hidden/occluded panel's previews always
-    /// pause (spec §8). Only acts while we believe we're shown so an explicit
-    /// `hide()` (which already paused) isn't second-guessed into resuming.
+    /// Drive mirror occlusion off the ACTUAL occlusion state of the active shell,
+    /// not only the explicit show/hide path (matching `BaseTerminalController`).
+    /// This catches cases the transitions miss — a panel occluded by a fullscreen
+    /// window on its Space, a mirror mounted asynchronously, or (tab mode) the
+    /// dashboard tab being deselected in its group — so a hidden/occluded shell's
+    /// previews always pause (spec §8). Only acts on the shell we're presenting.
     func windowDidChangeOcclusionState(_ notification: Notification) {
-        guard isShown, let window else { return }
-        setMirrorOcclusion(window.occlusionState.contains(.visible))
+        guard let win = notification.object as? NSWindow, win === activeHostWindow else { return }
+        setMirrorOcclusion(win.occlusionState.contains(.visible), in: win)
     }
 }

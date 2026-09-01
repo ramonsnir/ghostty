@@ -731,7 +731,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // otherwise the accessory view doesn't matter.
         tabListenForFrame = window?.tabbedWindows?.count ?? 0 > 1
 
-        if let windows = window?.tabbedWindows as? [TerminalWindow] {
+        // (ramon fork / Agent Dashboard tab) `compactMap` (not an `as?` cast of the
+        // whole array): a docked Agent Dashboard tab is NOT a `TerminalWindow`, and
+        // a single non-`TerminalWindow` member would make a whole-array `as?` return
+        // nil and skip cmd-1…9 labeling for the ENTIRE group. Dropping the dashboard
+        // tab here also numbers only the real terminals (1…N), so the dashboard tab
+        // carries no cmd-number — matching numeric `goto_tab:N` (which skips it too).
+        if let windows = window?.tabbedWindows?.compactMap({ $0 as? TerminalWindow }) {
             for (tab, window) in zip(1..., windows) {
                 // We need to clear any windows beyond this because they have had
                 // a keyEquivalent set previously.
@@ -1833,8 +1839,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // The configured value is 1-indexed.
             guard tabIndex >= 1 else { return }
 
-            // If our index is outside our boundary then we use the max
-            finalIndex = min(Int(tabIndex - 1), tabbedWindows.count - 1)
+            // (ramon fork / Agent Dashboard tab) Numeric goto counts TERMINAL tabs
+            // only, so a docked dashboard tab (leftmost, non-terminal) doesn't shift
+            // `goto_tab:N` — `goto_tab:1` is the first real terminal, matching the
+            // cmd-1…9 labeling in `relabelTabs`. PREVIOUS/NEXT/LAST (the tabIndex<=0
+            // branch above) still cycle through every tab, including the dashboard.
+            let terminals = tabbedWindows.filter { !($0 is NonTerminalTabWindow) }
+            guard !terminals.isEmpty else { return }
+            let idx = min(Int(tabIndex - 1), terminals.count - 1)
+            terminals[idx].makeKeyAndOrderFront(nil)
+            return
         }
 
         guard finalIndex >= 0 else { return }

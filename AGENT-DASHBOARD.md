@@ -12,6 +12,11 @@ windows can be raised in front of it. It carries a real, visible **window title
 ("Agent Dashboard")** and a standard-window accessibility subrole, so an external
 window manager (Rectangle Pro etc.) can target it by title.
 
+**It can also dock as a native leftmost TAB** inside a terminal window instead of
+floating — better on a small laptop screen that wants the terminal full-screen.
+`toggle_agent_dashboard` cycles floating-panel → docked-tab → off. See **Panel vs.
+docked tab** below.
+
 Each row shows the agent's last rows in full ANSI color, highlights the ones that
 **rang the bell** (needs-your-input) with the amber bell border, and **jumps you to
 that split** (raising its window, selecting its tab, un-zooming if it's hidden under
@@ -42,6 +47,42 @@ below); without it the panel degrades to metadata-only tiles.
 > detector hit *or* a fresh hook post) brings it straight back. Only **local** splits are
 > aged this way — a cross-host split's foreground pid lives on the box, where the local
 > walk can say nothing, so a box agent is never expired.
+
+## Panel vs. docked tab (for a small laptop screen)
+
+The dashboard has **two presentations**, and `toggle_agent_dashboard` **cycles** between them
+(and off): **floating panel → docked tab → off → panel**. The choice is **remembered across
+launches** (persisted per fork identity; there is **no config key** — it's a runtime toggle).
+
+- **Floating panel** (the original): a separate window off to the side. Best on a **wide/external
+  monitor** where you have room for a status wall next to your terminals. (This is the presentation
+  the `agent-dashboard-pin` / `spotlight` / all-Spaces behavior described elsewhere applies to.)
+- **Docked tab**: the SAME native dashboard (same live tiles, health bars, controls — **not** a TUI)
+  hosted as a **native macOS tab, pinned leftmost** in your **focused terminal window's** tab group.
+  Best on a **small laptop screen** where you want the terminal **full-screen**: in native
+  full-screen the system tab bar stays, so the dashboard is one tab-switch away without a window
+  covering the terminal. Cycle to it on the laptop; cycle back to the panel when you dock an external
+  monitor.
+
+How the docked tab behaves:
+- **One tab, in the focused window.** Cycling to tab mode docks a single dashboard tab into whichever
+  terminal window is focused **at that moment** and selects it. It does **not** follow focus
+  afterward (it stays where you docked it). Cycle off → tab again while a different window is focused
+  to move it.
+- **It's a leftmost, non-numbered tab.** Numeric tab nav counts terminals only — `goto_tab:1` /
+  cmd-1 is your **first terminal**, not the dashboard (the dashboard tab carries no cmd-number).
+  `previous`/`next` tab (and ctrl-tab) still cycle through it, since it *is* a tab.
+- **Closing / lifecycle.** Closing the dashboard tab (its ⨯) turns the dashboard **off** (like the
+  panel's close button). If the terminal window hosting it closes, the dashboard **re-docks** into
+  another terminal window if one remains, else it goes dormant and re-docks when a terminal window
+  next becomes active (so it never keeps the app alive after your last terminal closes).
+- **Cost is unchanged.** Only the selected tab renders its live mirror previews; a backgrounded
+  dashboard tab pauses them (same occlusion pause as a hidden panel).
+
+**Limitation:** the docked tab is a plain titled window, so with `macos-titlebar-style = tabs`
+(titlebar-tabs) it may look slightly off next to the styled terminal tabs; native titlebar style is
+the tested path. It also can't be dragged left of itself to *stay* leftmost — a manual tab reorder is
+allowed and not re-pinned.
 
 ## Quick start — the config
 
@@ -101,7 +142,10 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   re-read a changed value).
 - **`toggle_agent_dashboard`** — a payload-less keybind action (fork-only). Bind it to
   whatever you like; `ctrl+a>d` is the tmux-flavored default. It's also in the command
-  palette as **"Toggle Agent Dashboard"**.
+  palette as **"Toggle Agent Dashboard"**. **It CYCLES the presentation: floating panel →
+  docked tab → off → panel** (see **Panel vs. docked tab** below), and the chosen state is
+  **remembered across launches**. (This changed from a plain show/hide — the cycle now also
+  covers hiding via its `off` step.)
 - **`hide_dashboard_split`** — a payload-less, **surface-scoped** keybind action
   (fork-only). It **hides the FOCUSED split** from the dashboard — the keyboard equivalent
   of a tile's eye-slash **Hide** button, so you can declutter the dashboard from inside the
@@ -494,13 +538,31 @@ gains a live state chip.
   `AgentDashboardView.swift` (grid + degraded states + hidden popover),
   `AgentPreviewTile.swift` (tile + `AgentMirrorPreview` mirror-render),
   `AgentDetector.swift` (off-main libproc poller + pure `matchAgent`/`resolve`).
-- **Wiring:** `macos/Sources/App/macOS/AppDelegate.swift` (create-on-launch + toggle
-  notification + teardown); `macos/Sources/Ghostty/Ghostty.Config.swift`
+- **Docked-tab presentation (tab mode):** `AgentDashboardTabWindow.swift` (the
+  leftmost native tab window that re-hosts `AgentDashboardView`, + the
+  `NonTerminalTabWindow` marker protocol); in `AgentDashboardController.swift` the
+  `Presentation` enum (`panel`/`tab`/`off`), the pure `nonisolated`
+  `nextPresentation` (the panel→tab→off cycle) + `resolveLaunchPresentation`
+  (persist/migrate), `cycle()`/`apply(_:)`, the panel-vs-tab shell helpers
+  (`showPanel`/`hidePanel`/`ensurePanelContent`/`releasePanelContent`,
+  `dockTabIntoFocusedWindow`/`undockTab`/`focusedTerminalWindow`), the generalized
+  `setMirrorOcclusion(_:in:)` + `activeHostWindow` + `ownsWindow(_:)`, the
+  `subscribeWindowLifecycle`/`handleWindowWillClose` re-dock/undock recovery, and
+  `restoreAtLaunch`. **Terminal-only tab paths taught to skip the non-terminal tab:**
+  `TerminalController.relabelTabs` (whole-array `as? [TerminalWindow]` → `compactMap`)
+  and the numeric branch of `onGotoTab` (index over `!(… is NonTerminalTabWindow)`).
+  Presentation is remembered as `agentDashboardPresentation` in the per-fork
+  UserDefaults (**no config key** — a runtime toggle). **GUI-only Swift** — no Zig,
+  no new keybind action (the existing `toggle_agent_dashboard` was repurposed to cycle).
+- **Wiring:** `macos/Sources/App/macOS/AppDelegate.swift` (create-on-launch +
+  `restoreAtLaunch`; the toggle notification now calls `cycle()`; `teardown`;
+  `agentDashboardOwnsKeyWindow` → `ownsWindow` for both shells, via
+  `MainActor.assumeIsolated`); `macos/Sources/Ghostty/Ghostty.Config.swift`
   (`agentDashboard`, `agentDashboardCommands`, `resolveAgentDashboardCommands`,
   `agentDashboardPin`); the panel level is set in `AgentDashboardPanel(pinned:)`,
   passed `ghostty.config.agentDashboardPin` by the controller;
   `macos/Ghostty.xcodeproj/project.pbxproj` (iOS-target exclusion of the macOS-only
-  files).
+  files, incl. `AgentDashboardTabWindow.swift`).
 - **Per-tile agent state (Claude Code hooks):** the hook script + settings snippet in
   `example/claude-hooks/{ghostty-agent-state.sh,settings-hooks.json}`; the shared
   symbols (`AgentState`, `AgentStatePayload`, the two `Notification.Name`s) in
@@ -519,7 +581,8 @@ gains a live state chip.
   `src/host/test.zig`
   (minor-4 / `ForegroundPid` round-trip), `src/termio/Client.zig` (`foreground_pid`
   decode), plus the Swift detector/model/sort tests + the `AgentDashboardPanelTests`
-  pin/window-level tests in
+  pin/window-level tests + the **`AgentDashboardPresentationTests`** (the `panel→tab→off`
+  cycle, the persist/migrate launch resolution, and the `NonTerminalTabWindow` marker) in
   `macos/Tests/AgentDashboard/AgentDashboardTests.swift` and the hook/agent-state
   pure-helper tests in `macos/Tests/MCP/MCPAgentStateTests.swift`.
 

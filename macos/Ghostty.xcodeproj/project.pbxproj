@@ -127,6 +127,7 @@
 				Features/About/CyclingIconView.swift,
 				Features/AgentDashboard/AgentDashboardController.swift,
 				Features/AgentDashboard/AgentDashboardPanel.swift,
+				Features/AgentDashboard/AgentDashboardTabWindow.swift,
 				Features/AgentDashboard/AgentDashboardView.swift,
 				Features/AgentDashboard/AgentDetector.swift,
 				Features/AgentDashboard/AgentPreviewTile.swift,
