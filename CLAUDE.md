@@ -188,14 +188,17 @@ Sidebar `NSPanel` with a live natively-rendered preview of every split running a
 to jump, Hide, spotlight, dismiss bell system-wide, adopt into a queue. Fork-only, macOS, OFF by
 default. Keys: `agent-dashboard`, `agent-dashboard-commands`, `agent-dashboard-pin`,
 `agent-dashboard-spotlight-seconds`; actions `toggle_agent_dashboard`, `hide_dashboard_split`,
-`spotlight_dashboard_split`. Live previews need `pty-host`. **Two presentations:** the floating
-panel OR a **docked native leftmost TAB** in the focused terminal window (same SwiftUI, not a TUI —
-for a small laptop screen wanting the terminal full-screen). `toggle_agent_dashboard` now **CYCLES**
-panel → tab → off, remembered across launches (persisted `agentDashboardPresentation` in UserDefaults;
-**no config key**). Tab mode adds `AgentDashboardTabWindow.swift` + the `NonTerminalTabWindow` marker
-and teaches `TerminalController.relabelTabs` / numeric `onGotoTab` to skip the non-terminal tab
-(cmd-1/`goto_tab:1` = first TERMINAL). **GUI-only Swift** (no Zig, no new action — the existing toggle
-was repurposed). Traps: agent detection is HOST-GATED
+`spotlight_dashboard_split`, `focus_agent_dashboard`. Live previews need `pty-host`. **Two
+presentations:** the floating panel OR a **docked native leftmost TAB** in the focused terminal
+window (same SwiftUI, not a TUI — for a small laptop screen wanting the terminal full-screen).
+`toggle_agent_dashboard` now **CYCLES** panel → tab → off, remembered across launches (persisted
+`agentDashboardPresentation` in UserDefaults; **no config key**); **`focus_agent_dashboard`** jumps
+to the dashboard (select the docked tab / bring the panel forward) — the "tab 0" left of cmd-1..9
+(suggested `ctrl+a>backquote`). Tab mode adds `AgentDashboardTabWindow.swift` + the
+`NonTerminalTabWindow` marker and teaches `TerminalController.relabelTabs` / numeric `onGotoTab` to
+skip the non-terminal tab (cmd-1/`goto_tab:1` = first TERMINAL); ctrl-tab from the tab is handled in
+`AppDelegate.localEventKeyDown`. **Mostly GUI-only Swift; `focus_agent_dashboard` is the one Zig+lib
+piece** (new apprt action + C export → rebuild the xcframework). Traps: agent detection is HOST-GATED
 on the minor-4 `foreground_pid` frame; per-tile state comes from Claude Code hooks POSTing to MCP
 `/agent-state`; hook-only evidence is a LEASE that expires so a plain shell that once ran `claude`
 stops being a tile. Mostly GUI; the mirror-grid C export is Zig+lib but NOT compiled into the host.

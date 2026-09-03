@@ -949,6 +949,13 @@ pub const Action = union(enum) {
     /// the dashboard panel if it's closed. Surface-scoped, payload-less.
     spotlight_dashboard_split,
 
+    /// (ramon fork) Focus the Agent Dashboard (macOS): select its docked tab (docking
+    /// it into the focused terminal window first if needed), or bring the floating
+    /// panel forward — a fast "jump to the dashboard" from any terminal. App-global
+    /// effect, sourced from the focused surface (like `toggle_agent_dashboard`).
+    /// Payload-less.
+    focus_agent_dashboard,
+
     /// (ramon fork) Install the fork's Claude Code agent-state hooks (macOS): copy
     /// the hook script into `~/.config/ghostty-ramon/claude-hooks/` and merge the
     /// six hook events into `~/.claude/settings.json` (idempotently, with a
@@ -1673,6 +1680,7 @@ pub const Action = union(enum) {
             .toggle_command_palette,
             .toggle_project_selector,
             .toggle_agent_dashboard,
+            .focus_agent_dashboard,
             .hide_dashboard_split,
             .spotlight_dashboard_split,
             .install_agent_hooks,
@@ -3895,6 +3903,21 @@ test "Binding spotlight_dashboard_split" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("spotlight_dashboard_split", buf.written());
+}
+
+test "Binding focus_agent_dashboard" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=focus_agent_dashboard");
+    try testing.expect(binding.action == .focus_agent_dashboard);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("focus_agent_dashboard", buf.written());
 }
 
 test "Binding install_agent_hooks" {

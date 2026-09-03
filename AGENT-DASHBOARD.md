@@ -104,8 +104,16 @@ agent-dashboard-commands = claude,codex        # exe names that count as "an age
 agent-dashboard-pin      = true                # float the panel above other windows
 agent-dashboard-spotlight-seconds = 10         # how long spotlight_dashboard_split holds a tile on top
 
-# Keybind to toggle the panel (also in the command palette: "Toggle Agent Dashboard").
+# Keybind to CYCLE the dashboard presentation panel → tab → off (also in the
+# command palette: "Toggle Agent Dashboard").
 keybind = ctrl+a>d=toggle_agent_dashboard
+
+# Keybind to JUMP to the dashboard (also in the palette: "Focus Agent Dashboard"):
+# selects its docked tab (the "tab 0" left of your cmd-1..9 terminal tabs), or
+# brings the floating panel forward. `backquote` is the ` key left of 1. NOTE: use
+# the ctrl+a leader (not a bare cmd+`), which the macOS "next window" menu shortcut
+# would otherwise shadow.
+keybind = ctrl+a>backquote=focus_agent_dashboard
 
 # Keybind to HIDE the focused split from the dashboard (also in the command
 # palette: "Hide Split from Agent Dashboard"). Hide-only — reveal from the
@@ -153,6 +161,14 @@ keybind = ctrl+a>ctrl+shift+p=spotlight_dashboard_split   # more-human alias
   docked tab → off → panel** (see **Panel vs. docked tab** below), and the chosen state is
   **remembered across launches**. (This changed from a plain show/hide — the cycle now also
   covers hiding via its `off` step.)
+- **`focus_agent_dashboard`** — a payload-less keybind action (fork-only) that **jumps to the
+  dashboard** from any terminal: it **selects the docked tab** (docking it into the focused
+  terminal window first if it's dormant), or in panel mode **brings the panel forward**; if the
+  dashboard is off it comes up as a tab. Think of it as going to "tab 0" (the dashboard sits left
+  of your cmd-1..9 terminal tabs). Also in the command palette as **"Focus Agent Dashboard"**. No
+  default binding — `ctrl+a>backquote` (the ` key, left of 1) is the suggested one. (Unlike a bare
+  `cmd+\`` — the macOS "next window" shortcut — a `ctrl+a` leader sequence isn't shadowed by the
+  menu.)
 - **`hide_dashboard_split`** — a payload-less, **surface-scoped** keybind action
   (fork-only). It **hides the FOCUSED split** from the dashboard — the keyboard equivalent
   of a tile's eye-slash **Hide** button, so you can declutter the dashboard from inside the
@@ -486,6 +502,19 @@ gains a live state chip.
   reusing `RepeatableString`, `agent-dashboard-pin` bool, and `agent-dashboard-spotlight-seconds`
   `u32`); the `toggle_agent_dashboard` action in `src/input/Binding.zig`, `src/apprt/action.zig`,
   `src/input/command.zig`.
+- **`focus_agent_dashboard` action (jump to the dashboard — Zig+lib):** core —
+  `src/input/Binding.zig` (action + `scope` list + `Binding focus_agent_dashboard` test),
+  `src/apprt/action.zig` (union + `Key`, appended LAST after `compact_splits` — union order MUST
+  match `Key` MUST match ghostty.h), `include/ghostty.h` (`GHOSTTY_ACTION_FOCUS_AGENT_DASHBOARD`),
+  `src/Surface.zig` (dispatch, sourced from the surface like `toggle_agent_dashboard`),
+  `src/input/command.zig` ("Focus Agent Dashboard" palette entry). macOS — `Ghostty.App.swift`
+  `focusAgentDashboard` (posts `ghosttyFocusAgentDashboard`, app-global nil object),
+  `GhosttyPackage.swift` (the `Notification.Name`), `AppDelegate.swift`
+  (`ghosttyFocusAgentDashboard` observer → lazily creates the controller →
+  `agentDashboard.focusDashboard()`), `AgentDashboardController.focusDashboard()` (select the
+  docked tab / dock if dormant / bring the panel forward / off → come up as a tab). **This action
+  is the ONE Zig+lib piece of tab mode** (a new apprt action + C export) — rebuild the lib WITH the
+  xcframework; the rest of the dashboard/tab work is GUI-only.
 - **`spotlight_dashboard_split` action (spotlight the focused split at the top; focus highlight):**
   core — `src/input/Binding.zig` (action + surface scope + `Binding spotlight_dashboard_split` test),
   `src/apprt/action.zig` (union + `Key`, appended LAST after `hide_dashboard_split` — union

@@ -2122,6 +2122,24 @@ final class AgentDashboardController: NSWindowController {
         model.toggleSpotlight(id, duration: TimeInterval(ghostty.config.agentDashboardSpotlightSeconds))
     }
 
+    /// (ramon fork / Agent Dashboard, tab mode) Jump to the dashboard — the
+    /// `focus_agent_dashboard` keybind. Reveals + focuses it in its current
+    /// presentation: in tab mode select the docked tab (docking into the focused
+    /// terminal window if it's dormant); in panel mode bring the panel forward; if
+    /// off, bring it up as a tab and select it.
+    func focusDashboard() {
+        switch presentation {
+        case .off:
+            apply(.tab)            // dockTabIntoFocusedWindow(select: true) via apply
+        case .tab:
+            if tabWindow == nil { dockTabIntoFocusedWindow(select: true) }
+            else { tabWindow?.makeKeyAndOrderFront(nil) }
+        case .panel:
+            showPanel()
+            window?.makeKeyAndOrderFront(nil)
+        }
+    }
+
     // MARK: Panel shell
 
     /// Mount + order the floating panel front, resuming its mirror renderers. The

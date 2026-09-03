@@ -6406,6 +6406,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .focus_agent_dashboard => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .focus_agent_dashboard,
+            {},
+        ),
+
         .hide_dashboard_split => return try self.rt_app.performAction(
             .{ .surface = self },
             .hide_dashboard_split,

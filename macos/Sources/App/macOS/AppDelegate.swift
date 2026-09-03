@@ -462,6 +462,11 @@ class AppDelegate: NSObject,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(ghosttyFocusAgentDashboard(_:)),
+            name: Ghostty.Notification.ghosttyFocusAgentDashboard,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(ghosttyHideDashboardSplit(_:)),
             name: Ghostty.Notification.ghosttyHideDashboardSplit,
             object: nil)
@@ -628,6 +633,19 @@ class AppDelegate: NSObject,
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
             agentDashboard?.cycle()
+        }
+    }
+
+    /// (ramon fork / Agent Dashboard) Focus the dashboard (the `focus_agent_dashboard`
+    /// keybind, e.g. `ctrl+a>backquote`): jump to its docked tab (docking into the
+    /// focused terminal window if needed) or bring the floating panel forward — from
+    /// any terminal. Lazily creates the controller when not enabled at launch.
+    @objc private func ghosttyFocusAgentDashboard(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            if agentDashboard == nil {
+                agentDashboard = AgentDashboardController(ghostty: ghostty)
+            }
+            agentDashboard?.focusDashboard()
         }
     }
 

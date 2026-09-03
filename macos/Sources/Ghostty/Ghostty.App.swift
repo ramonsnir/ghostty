@@ -689,6 +689,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_AGENT_DASHBOARD:
                 toggleAgentDashboard(app, target: target)
 
+            case GHOSTTY_ACTION_FOCUS_AGENT_DASHBOARD:
+                focusAgentDashboard(app, target: target)
+
             case GHOSTTY_ACTION_HIDE_DASHBOARD_SPLIT:
                 return hideDashboardSplit(app, target: target)
 
@@ -1366,6 +1369,19 @@ extension Ghostty {
             target: ghostty_target_s) {
             NotificationCenter.default.post(
                 name: Notification.ghosttyToggleAgentDashboard,
+                object: nil
+            )
+        }
+
+        // (ramon fork / Agent Dashboard) Focus the dashboard — select its docked tab
+        // (docking into the focused terminal window if needed) or bring the floating
+        // panel forward. App-global (like toggle), so it's posted with a nil object
+        // and the AppDelegate (which owns the controller) does the work.
+        private static func focusAgentDashboard(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) {
+            NotificationCenter.default.post(
+                name: Notification.ghosttyFocusAgentDashboard,
                 object: nil
             )
         }

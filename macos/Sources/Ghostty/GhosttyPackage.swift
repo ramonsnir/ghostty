@@ -432,6 +432,7 @@ extension Ghostty.Notification {
     /// Agent Dashboard panel. App-wide (no object payload); observed by the
     /// AppDelegate, which owns the dashboard controller.
     static let ghosttyToggleAgentDashboard = Notification.Name("com.mitchellh.ghostty.toggleAgentDashboard")
+    static let ghosttyFocusAgentDashboard = Notification.Name("com.mitchellh.ghostty.focusAgentDashboard")
 
     /// (ramon fork / Agent Dashboard) Toggle whether a single surface is hidden
     /// from the Agent Dashboard. The posting `object` is the `SurfaceView` to

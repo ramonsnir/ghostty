@@ -421,6 +421,12 @@ pub const Action = union(Key) {
     /// additive.
     compact_splits,
 
+    /// (ramon fork) Focus the Agent Dashboard (macOS): select its docked tab
+    /// (docking it into the focused terminal window first if needed), or bring the
+    /// floating panel forward — a fast "jump to the dashboard" from any terminal.
+    /// Payload-less. Appended LAST so the Key enum / ghostty.h tag order stays additive.
+    focus_agent_dashboard,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -506,6 +512,7 @@ pub const Action = union(Key) {
         spotlight_dashboard_split,
         new_split_on_host,
         compact_splits,
+        focus_agent_dashboard,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
