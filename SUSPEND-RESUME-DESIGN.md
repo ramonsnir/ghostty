@@ -126,6 +126,16 @@ Plumbing (all additive, **hooks + GUI/Swift only, no host/Zig change**):
 `transcript_path` is available the same way if we ever want the on-disk transcript; not needed for
 the MVP.
 
+**Resume-id durability (three tiers, all implemented).** The `claude --resume <id>` token is sourced,
+in order: (1) the live in-memory hook capture (above); (2) PERSISTED across GUI relaunches in the
+per-host-session `PersistedAgentState` store (`claudeSessionId`/`cwd`/`lastActivity`, 14-day prune),
+rehydrated onto the reattached surface — so a once-captured id survives a relaunch; (3) RECOVERED at
+suspend time from Claude's own on-disk transcript (`TranscriptResolver`): find the `claude` process
+under the split's foreground pid, read its cwd, and take the newest `~/.claude/projects/<cwd→'-'>/…
+.jsonl` (the filename IS the session id). Tier 3 is what makes a NEVER-captured idle split
+suspendable with no poking — the encoding (every non-alphanumeric char → `-`) is verified against
+real project dirs, and `claude --resume` reads the transcript by id.
+
 ---
 
 ## Part 2 — Idle scanner (GUI-side, gated, no LLM)

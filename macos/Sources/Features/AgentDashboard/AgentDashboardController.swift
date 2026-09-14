@@ -1238,7 +1238,9 @@ final class AgentDashboardModel: ObservableObject {
         var count = 0
         for id in picked {
             guard let view = viewByID[id],
-                  let manifest = suspendManifest(for: id, title: view.title, now: now) else { continue }
+                  let manifest = suspendManifest(
+                    for: id, title: view.title,
+                    foregroundPid: view.foregroundPid.map { pid_t($0) }, now: now) else { continue }
             view.suspend(manifest: manifest)
             count += 1
         }
@@ -1248,9 +1250,20 @@ final class AgentDashboardModel: ObservableObject {
     /// (ramon fork / suspend-resume) Build the Resume manifest for a surface, or nil if it
     /// lacks a captured Claude session id / cwd (i.e. can't be resumed). Shared by the idle
     /// scanner and the manual `suspend_split` action.
-    func suspendManifest(for id: UUID, title: String, now: Date = Date()) -> SuspendManifest? {
-        guard let sid = claudeSessionId[id], !sid.isEmpty,
-              let cwd = agentCwd[id], !cwd.isEmpty else { return nil }
+    func suspendManifest(for id: UUID, title: String, foregroundPid: pid_t? = nil,
+                         now: Date = Date()) -> SuspendManifest? {
+        var sid = claudeSessionId[id]
+        var cwd = agentCwd[id]
+        // (transcript recovery) When the resume id/cwd weren't captured (e.g. an idle split
+        // that hasn't fired a hook since the GUI launched), recover them from Claude's on-disk
+        // transcript for the running claude under this split — what makes an idle split
+        // suspendable without first poking it.
+        if (sid?.isEmpty ?? true) || (cwd?.isEmpty ?? true), let fg = foregroundPid,
+           let rec = TranscriptResolver.recover(foregroundPid: fg) {
+            if sid?.isEmpty ?? true { sid = rec.sessionId }
+            if cwd?.isEmpty ?? true { cwd = rec.cwd }
+        }
+        guard let sid, !sid.isEmpty, let cwd, !cwd.isEmpty else { return nil }
         return SuspendManifest(
             claudeSessionId: sid,
             cwd: cwd,
@@ -1266,7 +1279,9 @@ final class AgentDashboardModel: ObservableObject {
     @discardableResult
     func suspendSurfaceManually(_ view: Ghostty.SurfaceView) -> Bool {
         guard !view.suspended,
-              let manifest = suspendManifest(for: view.id, title: view.title) else { return false }
+              let manifest = suspendManifest(
+                for: view.id, title: view.title,
+                foregroundPid: view.foregroundPid.map { pid_t($0) }) else { return false }
         view.suspend(manifest: manifest)
         return true
     }
