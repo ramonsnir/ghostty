@@ -162,4 +162,93 @@ enum MCPAgentState {
         }
         return nil
     }
+
+    // MARK: - Robust subtree tty resolution (login/session-leader foreground pid)
+
+    /// PURE robust resolve, used as a FALLBACK when `resolveSurface` finds no match: for
+    /// each surface, DESCEND its foreground pid's subtree (via `childrenMap`) and match any
+    /// descendant's tty against `hookTTY`. This handles a foreground pid that is a `login`
+    /// session leader (or other wrapper) whose OWN `proc_pidinfo().e_tdev` does not resolve
+    /// to the pty — a descendant (zsh / the pool bash / claude) shares the surface's pty
+    /// tty and resolves fine. Stops at the FIRST descendant that matches. Each surface's
+    /// login subtree is disjoint (its own session), so a subtree match is unique to that
+    /// surface. Bounded by `maxDepth` + a visited set (cycle-safe). `resolver`/`childrenMap`
+    /// are injectable so this is unit-testable without the live process table.
+    static func resolveSurfaceViaSubtree(
+        forTTY hookTTY: String,
+        surfaces: [(uuid: UUID, pid: pid_t)],
+        childrenMap: [pid_t: [pid_t]],
+        resolver: TTYResolver = liveTTYResolver,
+        maxDepth: Int = 6
+    ) -> UUID? {
+        let target = normalizeTTY(hookTTY)
+        guard target != "tty" else { return nil }
+        for s in surfaces {
+            if subtreeHasTTY(s.pid, target: target, childrenMap: childrenMap,
+                             resolver: resolver, maxDepth: maxDepth) {
+                return s.uuid
+            }
+        }
+        return nil
+    }
+
+    /// DFS `root`'s subtree (through `childrenMap`) for a pid whose normalized tty equals
+    /// `target`. Bounded depth; a visited set guards against a pathological cycle.
+    private static func subtreeHasTTY(
+        _ root: pid_t, target: String, childrenMap: [pid_t: [pid_t]],
+        resolver: TTYResolver, maxDepth: Int
+    ) -> Bool {
+        var stack: [(pid: pid_t, depth: Int)] = [(root, 0)]
+        var visited = Set<pid_t>()
+        while let (pid, depth) = stack.popLast() {
+            guard visited.insert(pid).inserted else { continue }
+            if let tty = resolver(pid), normalizeTTY(tty) == target { return true }
+            if depth < maxDepth {
+                for c in childrenMap[pid] ?? [] { stack.append((c, depth + 1)) }
+            }
+        }
+        return false
+    }
+
+    /// Build a `ppid -> [children]` map from the full process table via
+    /// `proc_listpids(PROC_ALL_PIDS)` + `proc_pidinfo(PROC_PIDTBSDINFO).pbi_ppid` — the
+    /// reliable method (mirrors `AgentDetector.LibprocEnumerator.childrenMap`;
+    /// `proc_listchildpids` is unreliable on macOS). ~one `proc_pidinfo` per process, so
+    /// the caller CACHES it (`cachedChildrenMap`) — this runs only on the fallback path.
+    static func childrenMap() -> [pid_t: [pid_t]] {
+        let needed = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard needed > 0 else { return [:] }
+        let cap = Int(needed) / MemoryLayout<pid_t>.size + 16
+        var pids = [pid_t](repeating: 0, count: cap)
+        let got = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids,
+                                Int32(cap * MemoryLayout<pid_t>.size))
+        guard got > 0 else { return [:] }
+        let count = Int(got) / MemoryLayout<pid_t>.size
+        var map: [pid_t: [pid_t]] = [:]
+        for i in 0..<count {
+            let p = pids[i]
+            guard p > 0 else { continue }
+            var bi = proc_bsdinfo()
+            let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(p, PROC_PIDTBSDINFO, 0, &bi, sz) == sz else { continue }
+            map[pid_t(bi.pbi_ppid), default: []].append(p)
+        }
+        return map
+    }
+
+    /// A short-TTL cache over `childrenMap()` so a burst of hook events (which hit the
+    /// fallback path together) shares ONE full process-table scan. Thread-safe.
+    private static let childrenMapLock = NSLock()
+    private static var childrenMapCache: (map: [pid_t: [pid_t]], at: Date)?
+    private static let childrenMapTTL: TimeInterval = 1.5
+    static func cachedChildrenMap(now: Date = Date()) -> [pid_t: [pid_t]] {
+        childrenMapLock.lock()
+        defer { childrenMapLock.unlock() }
+        if let c = childrenMapCache, now.timeIntervalSince(c.at) < childrenMapTTL {
+            return c.map
+        }
+        let m = childrenMap()
+        childrenMapCache = (m, now)
+        return m
+    }
 }

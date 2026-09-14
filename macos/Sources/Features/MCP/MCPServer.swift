@@ -605,7 +605,19 @@ final class MCPServer {
                 }
                 return out
             }
-            resolvedUUID = MCPAgentState.resolveSurface(forTTY: tty, surfaces: surfaces)
+            var matched = MCPAgentState.resolveSurface(forTTY: tty, surfaces: surfaces)
+            if matched == nil {
+                // (suspend-resume / login-foreground fix) The host-pushed foreground pid
+                // can be a `login` session leader whose own `e_tdev` doesn't resolve to the
+                // pty (seen on queue-spawned agent splits), so the fast path misses. Fall
+                // back to descending each surface's process subtree — a descendant (zsh /
+                // pool bash / claude) shares the pty tty and resolves. Only on a miss, and
+                // the process-table scan is cached across a burst of events.
+                matched = MCPAgentState.resolveSurfaceViaSubtree(
+                    forTTY: tty, surfaces: surfaces,
+                    childrenMap: MCPAgentState.cachedChildrenMap())
+            }
+            resolvedUUID = matched
         } else {
             resolvedUUID = nil  // parse guarantees this is unreachable
         }

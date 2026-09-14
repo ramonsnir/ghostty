@@ -62,6 +62,44 @@ struct MCPAgentStateTests {
         #expect(MCPAgentState.parse(body)?.claudeSessionId?.count == 256)
     }
 
+    // MARK: - resolveSurfaceViaSubtree (login/session-leader foreground pid fallback)
+
+    @Test func resolveViaSubtreeFindsTTYThroughLoginForeground() {
+        // Surface A's foreground pid 100 is a `login` with NO resolvable tty; its child 101
+        // (zsh) is on ttys000. The fast path (pid 100) misses; the subtree fallback matches.
+        let a = UUID()
+        let children: [pid_t: [pid_t]] = [100: [101], 101: [102]]
+        let ttyMap: [pid_t: String] = [101: "ttys000", 102: "ttys000"] // 100 has none
+        let resolver: MCPAgentState.TTYResolver = { ttyMap[$0] }
+        #expect(MCPAgentState.resolveSurfaceViaSubtree(
+            forTTY: "ttys000", surfaces: [(a, 100)], childrenMap: children, resolver: resolver) == a)
+    }
+
+    @Test func resolveViaSubtreeReturnsNilWhenTTYAbsent() {
+        let a = UUID()
+        let resolver: MCPAgentState.TTYResolver = { _ in "ttys999" }
+        #expect(MCPAgentState.resolveSurfaceViaSubtree(
+            forTTY: "ttys000", surfaces: [(a, 100)], childrenMap: [100: [101]], resolver: resolver) == nil)
+    }
+
+    @Test func resolveViaSubtreePicksTheOwningSurface() {
+        // Two surfaces with disjoint subtrees; the hook tty belongs to B's only.
+        let a = UUID(); let b = UUID()
+        let children: [pid_t: [pid_t]] = [100: [101], 200: [201]]
+        let ttyMap: [pid_t: String] = [101: "ttys001", 201: "ttys002"]
+        let resolver: MCPAgentState.TTYResolver = { ttyMap[$0] }
+        #expect(MCPAgentState.resolveSurfaceViaSubtree(
+            forTTY: "ttys002", surfaces: [(a, 100), (b, 200)], childrenMap: children, resolver: resolver) == b)
+    }
+
+    @Test func resolveViaSubtreeIsCycleSafe() {
+        let a = UUID()
+        let children: [pid_t: [pid_t]] = [100: [101], 101: [100]] // cycle
+        let resolver: MCPAgentState.TTYResolver = { _ in nil }
+        #expect(MCPAgentState.resolveSurfaceViaSubtree(
+            forTTY: "ttys000", surfaces: [(a, 100)], childrenMap: children, resolver: resolver) == nil)
+    }
+
     @Test func parseStateCaseInsensitive() {
         #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"WAITING"}"#.utf8))?.state == .waiting)
         #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"Idle"}"#.utf8))?.state == .idle)

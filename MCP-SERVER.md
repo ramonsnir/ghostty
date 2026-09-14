@@ -241,6 +241,15 @@ what's being asked → `send_key`/`send_text` to respond → repeat; plus `perfo
   echoing them on `list_surfaces` — this is the passive capture that lets a future suspend restart
   the agent with `claude --resume <id>` without ever running `/status`. See
   [SUSPEND-RESUME-DESIGN.md](SUSPEND-RESUME-DESIGN.md).
+- **Surface resolution robustness.** `/agent-state` maps the hook's tty to a surface via each
+  surface's host-pushed foreground pid (`MCPAgentState.resolveSurface`). Some splits (notably
+  queue-spawned agents) report the `login`/session-leader as their foreground pid, whose own
+  `proc_pidinfo().e_tdev` does NOT resolve to the pty — so the fast match misses and the event
+  (state AND `claudeSessionId`) would be silently dropped. On a miss the handler now falls back to
+  `resolveSurfaceViaSubtree`, which DESCENDS the foreground pid's process subtree (reliable
+  `ppid→children` map, cached ~1.5s) until a descendant (zsh / pool bash / claude) resolves to the
+  hook's tty — the same subtree robustness the Agent Dashboard's detector already had. This is what
+  makes suspend/resume work on those splits.
 - **Defense in depth** (copied from the web monitor, independent of the token): a
   Host-header allowlist (DNS-rebinding guard), a per-peer failed-token backoff (when a
   token is set), and per-connection bounds (idle watchdog + absolute deadline +
