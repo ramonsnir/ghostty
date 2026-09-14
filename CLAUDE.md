@@ -36,6 +36,7 @@ The docs:
 | `CLOUD-QUEUE-BALANCING.md` | per-queue multi-host load balancing |
 | `PTYHOST.md` | pty-host architecture, session lifecycle, write-pool fix, launchd LaunchAgent deploy |
 | `HOST-HANDOFF.md` | session-preserving `ghostty-host` upgrades: supervisor+worker, the handoff sequence, fd/child ownership contract, triggers (SIGHUP + exec-path self-check), the switchover deploy |
+| `SUSPEND-RESUME-DESIGN.md` | PROPOSED — suspend idle Claude agent splits (kill child to reclaim RAM, keep frozen placeholder, Resume via `claude-pool --resume <id>`); Claude-first, Codex postponed |
 | `FORK-FIXES.md` | standalone robustness / upstream-bug fixes (`CachedValue` crash) |
 | `FORK-DISTRIBUTION.md` | fork identity (bundle id / icon / update feed), colleague DMG release, `ForkSetup` first-launch (supervisor LaunchAgent + two-identity host reload) |
 | `FORK-DEV.md` | the macOS build / test / install iteration lifecycle |
