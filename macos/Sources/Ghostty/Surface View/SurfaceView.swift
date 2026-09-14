@@ -225,6 +225,16 @@ extension Ghostty {
                         hostName: host,
                         backgroundColor: ghostty.config.backgroundColor)
                 }
+
+                // (ramon fork / suspend-resume) A suspended split: its host session was
+                // Closed to reclaim RAM (child + Terminal), but the split is kept alive as
+                // a placeholder over the (dimmed) frozen last frame — click Resume to spawn
+                // a fresh `<pool> --resume <id>` in the recorded cwd. Local-only for the MVP.
+                if surfaceView.suspended {
+                    SuspendedOverlay(
+                        surfaceView: surfaceView,
+                        backgroundColor: ghostty.config.backgroundColor)
+                }
                 #endif
 
                 // If we're part of a split view and don't have focus, we put a semi-transparent
@@ -434,6 +444,74 @@ extension Ghostty {
                     .shadow(radius: 6)
             )
             .padding()
+        }
+    }
+
+    /// (ramon fork / suspend-resume) The placeholder shown over a suspended split. The
+    /// host session was Closed to reclaim RAM; this dims the frozen last frame (if any —
+    /// after a GUI restart there is none, so the reminder text carries it) and offers a
+    /// Resume button that respawns `<pool> --resume <id>` in the recorded cwd via
+    /// `SurfaceView.resume()`. Presentation only; the mechanism lives on `SurfaceView`.
+    struct SuspendedOverlay: View {
+        @ObservedObject var surfaceView: SurfaceView
+        let backgroundColor: Color
+
+        var body: some View {
+            let manifest = surfaceView.suspendManifest
+            ZStack {
+                Rectangle()
+                    .fill(backgroundColor)
+                    .opacity(0.65)
+                    .allowsHitTesting(false)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "moon.zzz.fill")
+                            .font(.title2)
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Suspended to save memory")
+                                .font(.headline)
+                            if let prompt = manifest?.lastPrompt, !prompt.isEmpty {
+                                Text(prompt)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: 360, alignment: .leading)
+                            } else {
+                                Text("The agent process was stopped. Resume to continue where you left off.")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .frame(maxWidth: 360, alignment: .leading)
+                            }
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button {
+                            surfaceView.resume()
+                        } label: {
+                            Label("Resume", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        // No safe resume command (e.g. a missing/odd session id) ⇒ disable
+                        // rather than silently no-op, so the state is legible.
+                        .disabled(manifest?.resumeInputLine == nil)
+                    }
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(.background)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .strokeBorder(.secondary.opacity(0.4), lineWidth: 1))
+                        .shadow(radius: 6)
+                )
+                .padding()
+            }
         }
     }
     #endif
@@ -878,6 +956,13 @@ extension Ghostty {
         /// default `false` keeps the normal attach/spawn behavior, so this is
         /// only ever set by the Agent Dashboard's preview tiles.
         var mirror: Bool = false
+
+        /// (ramon fork / suspend-resume) When set (only on RESTORE of a suspended
+        /// split), the surface comes back as a placeholder: `SurfaceView.init` does
+        /// NOT create a core surface (no spawn, no dial) — it marks itself `suspended`
+        /// and shows the Resume overlay, materializing a fresh session only when the
+        /// user resumes. GUI-only; never forwarded into the C `ghostty_surface_config_s`.
+        var suspendedResume: SuspendManifest?
 
         /// Wait after the command
         var waitAfterCommand: Bool = false

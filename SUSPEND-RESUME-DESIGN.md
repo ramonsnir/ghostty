@@ -7,7 +7,11 @@ host change — verified in code that suspend reuses the existing `Close` frame 
 and resume reuses the existing `Attach` (fresh spawn + `working_directory` + `initial_input` via the
 `materializeClientSurface` in-place recreate), so Parts 3–6 are **GUI-only Swift** — no Zig, no
 xcframework rebuild, no `ghostty-host` restart (the host-frame design is retained as a rejected
-alternative). Parts 3–6 not yet built.** Grounded in the code at HEAD
+alternative). Parts 3–6 now IMPLEMENTED (GUI-only Swift) and the app builds with all unit tests
+green (`SuspendPolicyTests` 8, `SuspendManifestTests` 5, plus the Part-1 `MCPAgentStateTests` /
+`AgentDashboardHookStateTests`); the interactive UX (placeholder → Resume → conversation continues)
+and the auto-suspend timing are pending hands-on verification in the `.local` build, and nothing is
+merged.** Grounded in the code at HEAD
 (citations are `file:line` / `file:symbol`) and in the four-thread investigation that preceded it;
 claims about *current* behavior were verified against source. Scope is deliberately **Claude Code
 only** for the MVP — Codex is postponed (see [Postponed: Codex](#postponed-codex)).
@@ -296,10 +300,10 @@ change to test.)
 |---|---|---|---|
 | Passive session-id capture (Part 1) | `example/claude-hooks/ghostty-agent-state.sh`; `MCPAgentState.swift`; `AgentStateBridge.swift`; `AgentDashboardController.swift`; `MCPLayout.swift`; `mcp.ts` | hooks + GUI/sidecar | **DONE** |
 | Idle policy core (Part 2) | `SuspendResume/SuspendPolicy.swift` (+ tests) | GUI | **DONE (core)** |
-| Suspend mechanism | reuses the EXISTING `ghostty_surface_close_session_now` C export via `SurfaceView.closeSessionNow()` (`Ghostty.Surface.swift:128`) — send `Close`, keep the surface | GUI only | TODO |
-| Resume mechanism | in-place surface recreate with a fresh `SurfaceConfiguration` (`sessionID=0`, `workingDirectory=cwd`, `initialInput="…\n"`) — the `materializeClientSurface` pattern (`SurfaceView_AppKit.swift:729`) | GUI only | TODO |
-| Placeholder + Resume button + manifest | `SurfaceView.swift` (overlay branch), `SurfaceView_AppKit.swift` (`suspended` flag + manifest CodingKeys) | GUI only | TODO |
-| Idle scanner + config | `AgentDashboardController.swift` (timer → `SuspendPolicy` → suspend); config via UserDefaults (like `agentDashboardPresentation`), default OFF | GUI only | TODO |
+| Suspend mechanism | `SurfaceView.suspend(manifest:)` — reuses the EXISTING `ghostty_surface_close_session_now` via `SurfaceView.closeSessionNow()`; keeps the split | GUI only | **DONE** |
+| Resume mechanism | `SurfaceView.resume()` — in-place recreate with a fresh `SurfaceConfiguration` (`sessionID=nil`, `workingDirectory=cwd`, `initialInput="<pool> --resume <id>\n"`) | GUI only | **DONE** |
+| Placeholder + Resume button + manifest | `SuspendedOverlay` in `SurfaceView.swift`; `suspended` flag + `SuspendManifest` CodingKeys + restore-defer in `SurfaceView_AppKit.swift`; `SuspendManifest.swift` | GUI only | **DONE** |
+| Idle scanner + config | `AgentDashboardController` scan timer → `AgentDashboardModel.suspendOverdueIdleAgents` → `SuspendPolicy`; `SuspendSettings` (UserDefaults, default OFF) | GUI only | **DONE** |
 
 **No `ghostty-host` row AND no Zig/xcframework row — the whole feature is GUI-only Swift** (the one C
 export it needs, `ghostty_surface_close_session_now`, already exists). Optional follow-up: manual

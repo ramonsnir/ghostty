@@ -311,6 +311,23 @@ extension Ghostty {
         private var pendingRemoteApp: ghostty_app_t?
         private var pendingRemoteConfig: SurfaceConfiguration?
 
+        /// (ramon fork / suspend-resume) True while this split is SUSPENDED — its host
+        /// session was Closed to reclaim RAM (child + Terminal) and the split is kept as
+        /// a placeholder (`SuspendedOverlay`) over the frozen last frame until resumed.
+        /// @Published so the overlay appears/vanishes; toggling it on Resume also drives
+        /// the re-render that picks up the freshly swapped `surfaceModel`.
+        @Published private(set) var suspended: Bool = false
+
+        /// (ramon fork / suspend-resume) The record needed to Resume (agent session id,
+        /// cwd, title, last prompt). Non-nil while `suspended`; persisted in the archive
+        /// so a suspended split survives a GUI restart and still resumes.
+        private(set) var suspendManifest: SuspendManifest?
+
+        /// (ramon fork / suspend-resume) The ghostty app handle stashed when a suspended
+        /// split is RESTORED (its surface creation deferred), so Resume can materialize a
+        /// fresh session. For a runtime suspend the app is re-fetched from the delegate.
+        private var pendingResumeApp: ghostty_app_t?
+
         /// (ramon fork / cloud-hosts, J1/D7) The host whose tunnel this surface
         /// has RETAINED via `RemoteTunnelController.retainTunnel`. Set exactly
         /// once when the deferred remote dial is armed (`subscribeRemoteReadiness`)
@@ -535,6 +552,20 @@ extension Ghostty {
             // (ramon fork / cloud-hosts) Remember the host identity so it
             // round-trips through restorable state paired with `sessionID` (D3).
             self.hostName = surface_cfg.hostName
+
+            // (ramon fork / suspend-resume) A RESTORED suspended split defers surface
+            // creation entirely: it comes back as a placeholder (surfaceModel == nil)
+            // showing the Resume overlay, and materializes a FRESH session only when the
+            // user resumes. This must precede the host dial/spawn below (a suspended split
+            // never dials or spawns). Local-only for the MVP.
+            if let manifest = surface_cfg.suspendedResume {
+                self.suspended = true
+                self.suspendManifest = manifest
+                self.pendingResumeApp = app
+                updateTrackingAreas()
+                registerForDraggedTypes(Array(Self.dropTypes))
+                return
+            }
 
             // (ramon fork / cloud-hosts) Three-way host resolution (D4). A surface
             // bound to a REMOTE host must NOT eagerly single-shot dial: the SSH
@@ -1322,6 +1353,60 @@ extension Ghostty {
         /// controller; a detached surface with no window is harmlessly skipped.)
         private func invalidateBellRestorableState() {
             window?.invalidateRestorableState()
+        }
+
+        // MARK: - Suspend / resume (ramon fork / suspend-resume)
+
+        /// Suspend this split to reclaim RAM: record the manifest, mark the surface
+        /// `suspended`, and send the host `Close` (via the existing `closeSessionNow` /
+        /// `ghostty_surface_close_session_now`) which reaps the child AND frees the
+        /// Terminal. The split/view is DELIBERATELY kept — the closing `.client` freezes
+        /// the last frame (its `closing` flag makes the drop leave state alone: no redial,
+        /// no adopt-fresh), and `SuspendedOverlay` draws over it. Idempotent.
+        func suspend(manifest: SuspendManifest) {
+            guard !suspended else { return }
+            suspendManifest = manifest
+            suspended = true
+            surfaceModel?.closeSessionNow()
+            invalidateBellRestorableState()
+        }
+
+        /// Resume a suspended split: materialize a FRESH host session in the SAME view
+        /// (the `materializeClientSurface` pattern) that runs `<pool> --resume <id>` in the
+        /// recorded cwd. The old (closing/frozen) surface, if any, is dropped first. The
+        /// surface adopts a NEW host session id (continuity comes from the agent's own
+        /// on-disk transcript, not host state). No-op if there is no safe resume command.
+        func resume() {
+            guard suspended, let manifest = suspendManifest,
+                  let input = manifest.resumeInputLine else { return }
+            let app = pendingResumeApp
+                ?? (NSApplication.shared.delegate as? AppDelegate)?.ghostty.app
+            guard let app else { return }
+
+            var cfg = SurfaceConfiguration()
+            cfg.workingDirectory = manifest.cwd
+            cfg.initialInput = input
+            // Fresh spawn on the local host: sessionID nil, hostName nil, no mirror.
+
+            // Drop the old closing/frozen surface (its host session is already Closed) so
+            // the fresh one is the sole owner.
+            surfaceModel = nil
+
+            let created = cfg.withCValue(view: self) { surface_cfg_c in
+                ghostty_surface_new(app, &surface_cfg_c)
+            }
+            guard let created else {
+                error = Ghostty.Error.apiFailed
+                return
+            }
+            surfaceModel = Ghostty.Surface(cSurface: created)
+
+            suspended = false
+            suspendManifest = nil
+            pendingResumeApp = nil
+            updateTrackingAreas()
+            registerForDraggedTypes(Array(Self.dropTypes))
+            invalidateBellRestorableState()
         }
 
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
@@ -2455,6 +2540,12 @@ extension Ghostty {
             // restored surface comes back still flagged "rang" / "needs you".
             case bell
             case attentionNeeded
+            // (ramon fork / suspend-resume) Persist the suspended state + its Resume
+            // manifest so a suspended split survives a GUI restart as a placeholder (and
+            // resumes after it). Emitted ONLY when suspended, so healthy/`.exec` archives
+            // stay byte-for-byte unchanged.
+            case suspended
+            case suspendManifest
         }
 
         required convenience init(from decoder: Decoder) throws {
@@ -2483,6 +2574,16 @@ extension Ghostty {
             // surface re-resolves its forwarded socket via the registry (D4).
             // Absent in local / `.exec` / pre-cloud archives ⇒ nil ⇒ local.
             config.hostName = try container.decodeIfPresent(String.self, forKey: .hostName)
+
+            // (ramon fork / suspend-resume) A suspended split restores as a placeholder:
+            // stash the manifest on the config so `init` defers surface creation (no spawn,
+            // no dial) and comes back showing the Resume overlay. Absent ⇒ nil ⇒ normal
+            // restore. Guarded on the `suspended` flag so a stray manifest can't trigger it.
+            let wasSuspended = try container.decodeIfPresent(Bool.self, forKey: .suspended) ?? false
+            if wasSuspended {
+                config.suspendedResume = try container.decodeIfPresent(
+                    SuspendManifest.self, forKey: .suspendManifest)
+            }
 
             self.init(app, baseConfig: config, uuid: uuid)
 
@@ -2541,6 +2642,14 @@ extension Ghostty {
             // emitted when set, so a healthy surface's archive is unchanged.
             if bell { try container.encode(bell, forKey: .bell) }
             if attentionNeeded { try container.encode(attentionNeeded, forKey: .attentionNeeded) }
+
+            // (ramon fork / suspend-resume) Persist the suspended state + manifest, only
+            // when suspended, so the split restores as a Resume placeholder. A non-suspended
+            // surface's archive is unchanged.
+            if suspended {
+                try container.encode(true, forKey: .suspended)
+                try container.encodeIfPresent(suspendManifest, forKey: .suspendManifest)
+            }
         }
     }
 }

@@ -357,6 +357,10 @@ final class AgentDashboardModel: ObservableObject {
     /// `cwd`), so Resume can respawn a fresh child in the same dir.
     private(set) var agentCwd: [UUID: String] = [:]
 
+    /// (ramon fork / suspend-resume) Wall-clock timestamp of the last hook event per
+    /// surface — "idle since" for the auto-suspend business-day threshold.
+    private(set) var lastActivityAt: [UUID: Date] = [:]
+
     /// Surfaces that have EVER reported a hook event. Hook-authoritative
     /// thereafter (mutes the `idleSeconds` heuristic for these ids).
     private(set) var hookBacked: Set<UUID> = []
@@ -816,6 +820,10 @@ final class AgentDashboardModel: ObservableObject {
         // so this never forces a tile rebuild.
         if let sid = payload.claudeSessionId { claudeSessionId[id] = sid }
         if let dir = payload.cwd { agentCwd[id] = dir }
+        // (suspend-resume) Stamp "last agent activity" on every hook event. For an idle
+        // agent this is when it went idle (its last Stop/SessionEnd), which the idle
+        // scanner reads as "idle since" for the business-day threshold.
+        lastActivityAt[id] = Date()
 
         let prev = agentStates[id]
 
@@ -1185,6 +1193,45 @@ final class AgentDashboardModel: ObservableObject {
         /// (ramon fork / suspend-resume) The agent's working dir (hook `cwd`), for respawn
         /// on Resume. Echoed into the `list_surfaces` row (`SurfaceRow.agentCwd`). Defaulted.
         var agentCwd: String? = nil
+    }
+
+    /// (ramon fork / suspend-resume) Suspend every idle Claude split that is overdue past
+    /// `thresholdBusinessDays`: build the PURE `SuspendPolicy` candidates from the model,
+    /// and for each selected id call `SurfaceView.suspend(manifest:)`. A split with no
+    /// captured resume id / cwd (can't be resumed) or no last-activity stamp (never idle)
+    /// is skipped. Returns the count suspended (for logging/tests). MUST run on main.
+    @discardableResult
+    func suspendOverdueIdleAgents(now: Date = Date(), thresholdBusinessDays: Int) -> Int {
+        var candidates: [SuspendPolicy.Candidate] = []
+        var viewByID: [UUID: Ghostty.SurfaceView] = [:]
+        for s in live {
+            guard let view = s.view, !view.suspended else { continue }
+            viewByID[s.id] = view
+            candidates.append(.init(
+                id: s.id,
+                agentKind: displayAgentKind(s.id)?.command,
+                isIdle: agentStates[s.id] == .idle,
+                // No activity stamp ⇒ distantFuture ⇒ 0 business days elapsed ⇒ never picked.
+                lastActivity: lastActivityAt[s.id] ?? Date.distantFuture))
+        }
+        let picked = SuspendPolicy.surfacesToSuspend(
+            candidates, now: now, thresholdBusinessDays: thresholdBusinessDays)
+        var count = 0
+        for id in picked {
+            guard let view = viewByID[id],
+                  let sid = claudeSessionId[id], !sid.isEmpty,
+                  let cwd = agentCwd[id], !cwd.isEmpty else { continue }
+            let manifest = SuspendManifest(
+                claudeSessionId: sid,
+                cwd: cwd,
+                agentKind: displayAgentKind(id)?.command ?? "claude",
+                title: view.title,
+                lastPrompt: lastPrompt[id],
+                suspendedAt: now)
+            view.suspend(manifest: manifest)
+            count += 1
+        }
+        return count
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -1936,6 +1983,16 @@ final class AgentDashboardController: NSWindowController {
 
     private let detector: AgentDetector
 
+    /// (ramon fork / suspend-resume) Low-frequency timer that auto-suspends idle Claude
+    /// splits past the business-day threshold. Runs regardless of whether the dashboard
+    /// is shown (it's about RAM, not the panel), gated on `SuspendSettings.enabled`
+    /// (OFF by default). nil until `startSuspendScan()`.
+    private var suspendScanTimer: Timer?
+
+    /// Suspend-scan cadence (seconds). Coarse: the threshold is in business DAYS, so a
+    /// few minutes of latency to notice an idle split is immaterial.
+    private static let suspendScanInterval: TimeInterval = 300
+
     /// (ramon fork / Agent Dashboard, tab mode) How the dashboard is presented.
     /// `.panel` = the original floating `AgentDashboardPanel`; `.tab` = docked as a
     /// native leftmost tab in a terminal window's group (`AgentDashboardTabWindow`);
@@ -2004,6 +2061,29 @@ final class AgentDashboardController: NSWindowController {
         subscribeQueueGraph()
         subscribeFocus()
         rebuildControllerObservers()
+        startSuspendScan()
+    }
+
+    /// (ramon fork / suspend-resume) Start the periodic idle auto-suspend scan. The timer
+    /// always runs (cheap: a no-op when `SuspendSettings.enabled` is false), so toggling
+    /// the setting takes effect on the next tick without restarting. `[weak self]` so it
+    /// never keeps the controller alive.
+    private func startSuspendScan() {
+        suspendScanTimer?.invalidate()
+        suspendScanTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.suspendScanInterval, repeats: true
+        ) { [weak self] _ in
+            // The timer fires on the main run loop; hop the isolation assertion so the
+            // @MainActor model call is legal under strict concurrency.
+            MainActor.assumeIsolated { self?.runSuspendScan() }
+        }
+    }
+
+    /// One idle auto-suspend pass. No-op unless enabled. MainActor: the timer fires on the
+    /// main run loop, and it mutates SurfaceViews.
+    private func runSuspendScan() {
+        guard SuspendSettings.enabled else { return }
+        model.suspendOverdueIdleAgents(thresholdBusinessDays: SuspendSettings.businessDays)
     }
 
     /// Build a fresh `NSHostingView` mounting the shared `AgentDashboardView`. Used
