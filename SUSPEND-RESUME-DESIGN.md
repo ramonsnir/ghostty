@@ -119,6 +119,11 @@ the MVP.
 
 ## Part 2 — Idle scanner (GUI-side, gated, no LLM)
 
+> **Status:** the PURE core is IMPLEMENTED (`SuspendPolicy` — business-day math + idle-selection,
+> fully unit-tested, no Zig change). The side-effecting wiring (a timer on
+> `AgentDashboardController`, the `suspend-idle*` config keys, and the call into the suspend action)
+> lands with Part 3, which it depends on.
+
 The "automated process" is **not** an agent that drives the TUI. It collapses to a passive periodic
 check, because the session id is already known (Part 1). The dashboard already tracks
 `agentState` (`working`/`waiting`/`idle`) and `idleSeconds` per surface, so the scanner is a small
