@@ -24,6 +24,21 @@ struct SuspendManifestTests {
         #expect(m.resumeInputLine == "codex-pool --resume roll-01\n")
     }
 
+    @Test func parsesResumeIdFromCommand() {
+        #expect(SuspendManifest.resumeId(
+            fromCommand: "bash /x/claude-pool --resume 6d768f90-612f-4c34-8d9f-2e1d9c6568f8")
+            == "6d768f90-612f-4c34-8d9f-2e1d9c6568f8")
+        // codex uses bare `resume <id>`
+        #expect(SuspendManifest.resumeId(
+            fromCommand: "bash /x/codex-pool resume 01a0869a-63e1-7940-be97-f31e77812cfa")
+            == "01a0869a-63e1-7940-be97-f31e77812cfa")
+        // fresh split (no --resume) → nil, never guessed
+        #expect(SuspendManifest.resumeId(fromCommand: "bash /x/claude-pool") == nil)
+        #expect(SuspendManifest.resumeId(fromCommand: "") == nil)
+        // an unsafe token after --resume is rejected (never rides into the shell)
+        #expect(SuspendManifest.resumeId(fromCommand: "claude --resume ;rm-rf") == nil)
+    }
+
     @Test func rejectsUnsafeSessionIds() {
         // Anything outside [A-Za-z0-9-_] must yield nil so nothing can ride into the shell.
         for bad in ["id; rm -rf ~", "id with space", "id$(whoami)", "id&", "id\nwhoami", "id`x`", "id/../x", ""] {

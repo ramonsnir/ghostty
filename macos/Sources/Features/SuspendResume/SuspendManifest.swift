@@ -39,6 +39,25 @@ struct SuspendManifest: Codable, Equatable {
     }
 }
 
+extension SuspendManifest {
+    /// (ramon fork / suspend-resume) Parse a `--resume <id>` (claude) or `resume <id>` (codex)
+    /// token from a split's foreground COMMAND line. This is the DEFINITIVE, per-process resume
+    /// id for a RESUMED split — unambiguous even when many sessions share one cwd (where a
+    /// transcript-by-mtime guess would mis-attribute). nil for a FRESH session (the id is minted
+    /// internally and is NOT on the command line) — those must come from the hook capture (live or
+    /// persisted); we deliberately never guess a fresh split's id.
+    static func resumeId(fromCommand cmd: String) -> String? {
+        let toks = cmd.split(separator: " ").map(String.init)
+        guard let i = toks.firstIndex(where: { $0 == "--resume" || $0 == "resume" }),
+              i + 1 < toks.count else { return nil }
+        let id = toks[i + 1]
+        let allowed = CharacterSet(charactersIn:
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        guard id.count >= 8, id.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        return id
+    }
+}
+
 /// (ramon fork / suspend-resume) GUI-only settings for the idle auto-suspend scanner,
 /// persisted in `UserDefaults` — the same no-config-key approach the Agent Dashboard's
 /// `agentDashboardPresentation` uses. OFF by default (opt-in). A ghostty-ramon

@@ -1240,7 +1240,7 @@ final class AgentDashboardModel: ObservableObject {
             guard let view = viewByID[id],
                   let manifest = suspendManifest(
                     for: id, title: view.title,
-                    foregroundPid: view.foregroundPid.map { pid_t($0) }, now: now) else { continue }
+                    command: view.foregroundCommand, pwd: view.pwd, now: now) else { continue }
             view.suspend(manifest: manifest)
             count += 1
         }
@@ -1250,19 +1250,20 @@ final class AgentDashboardModel: ObservableObject {
     /// (ramon fork / suspend-resume) Build the Resume manifest for a surface, or nil if it
     /// lacks a captured Claude session id / cwd (i.e. can't be resumed). Shared by the idle
     /// scanner and the manual `suspend_split` action.
-    func suspendManifest(for id: UUID, title: String, foregroundPid: pid_t? = nil,
-                         now: Date = Date()) -> SuspendManifest? {
+    func suspendManifest(for id: UUID, title: String, command: String? = nil,
+                         pwd: String? = nil, now: Date = Date()) -> SuspendManifest? {
         var sid = claudeSessionId[id]
-        var cwd = agentCwd[id]
-        // (transcript recovery) When the resume id/cwd weren't captured (e.g. an idle split
-        // that hasn't fired a hook since the GUI launched), recover them from Claude's on-disk
-        // transcript for the running claude under this split — what makes an idle split
-        // suspendable without first poking it.
-        if (sid?.isEmpty ?? true) || (cwd?.isEmpty ?? true), let fg = foregroundPid,
-           let rec = TranscriptResolver.recover(foregroundPid: fg) {
-            if sid?.isEmpty ?? true { sid = rec.sessionId }
-            if cwd?.isEmpty ?? true { cwd = rec.cwd }
+        // (resumed-split recovery) When the resume id wasn't captured (e.g. an idle split that
+        // hasn't fired a hook since the GUI launched), parse it from the split's foreground
+        // command — the DEFINITIVE per-process id for a RESUMED split (`… --resume <id>`),
+        // unambiguous even when many sessions share a cwd. A FRESH split has no id on its command
+        // line, so it stays nil here (never guessed) and relies on the hook capture + persistence.
+        if sid?.isEmpty ?? true, let cmd = command {
+            sid = SuspendManifest.resumeId(fromCommand: cmd)
         }
+        // cwd: the captured hook cwd if we have it, else the terminal's own pwd.
+        let cwd = (agentCwd[id]?.isEmpty == false ? agentCwd[id] : nil)
+            ?? (pwd?.isEmpty == false ? pwd : nil)
         guard let sid, !sid.isEmpty, let cwd, !cwd.isEmpty else { return nil }
         return SuspendManifest(
             claudeSessionId: sid,
@@ -1281,7 +1282,7 @@ final class AgentDashboardModel: ObservableObject {
         guard !view.suspended,
               let manifest = suspendManifest(
                 for: view.id, title: view.title,
-                foregroundPid: view.foregroundPid.map { pid_t($0) }) else { return false }
+                command: view.foregroundCommand, pwd: view.pwd) else { return false }
         view.suspend(manifest: manifest)
         return true
     }

@@ -126,15 +126,18 @@ Plumbing (all additive, **hooks + GUI/Swift only, no host/Zig change**):
 `transcript_path` is available the same way if we ever want the on-disk transcript; not needed for
 the MVP.
 
-**Resume-id durability (three tiers, all implemented).** The `claude --resume <id>` token is sourced,
-in order: (1) the live in-memory hook capture (above); (2) PERSISTED across GUI relaunches in the
+**Resume-id sourcing (three tiers, all implemented, all per-split-CORRECT).** The `claude --resume
+<id>` token is sourced, in order: (1) the live in-memory hook capture (above), attributed to the
+split by its own hook — always the right session; (2) PERSISTED across GUI relaunches in the
 per-host-session `PersistedAgentState` store (`claudeSessionId`/`cwd`/`lastActivity`, 14-day prune),
-rehydrated onto the reattached surface — so a once-captured id survives a relaunch; (3) RECOVERED at
-suspend time from Claude's own on-disk transcript (`TranscriptResolver`): find the `claude` process
-under the split's foreground pid, read its cwd, and take the newest `~/.claude/projects/<cwd→'-'>/…
-.jsonl` (the filename IS the session id). Tier 3 is what makes a NEVER-captured idle split
-suspendable with no poking — the encoding (every non-alphanumeric char → `-`) is verified against
-real project dirs, and `claude --resume` reads the transcript by id.
+rehydrated onto the reattached surface — so a once-captured id survives a relaunch; (3) for a
+RESUMED split, PARSED from its foreground command line (`… --resume <id>`, `SuspendManifest.resumeId`)
+— the definitive per-process id, unambiguous even when MANY sessions share one cwd.
+**Deliberately NOT done:** guessing a fresh split's id from the on-disk transcript by mtime — when
+many Claudes run in the same dir their transcripts share the project dir, so "newest" would
+mis-attribute and resume the WRONG conversation. A FRESH split whose id was never captured is left
+un-resumable (no unsafe guess); it is covered by tier 1/2 the moment it next fires a hook (e.g. its
+`SessionStart`/next turn), which then persists.
 
 ---
 
