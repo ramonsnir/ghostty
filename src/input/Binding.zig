@@ -956,6 +956,14 @@ pub const Action = union(enum) {
     /// Payload-less.
     focus_agent_dashboard,
 
+    /// (ramon fork / suspend-resume) Suspend the focused split to reclaim RAM: send
+    /// the host Close (reaps the agent process group + frees the Terminal) but KEEP
+    /// the split as a "Suspended — Resume" placeholder. Only meaningful for a captured
+    /// Claude agent split (needs its resume session id); a no-op otherwise. Resume is
+    /// the overlay's Resume button. GUI effect, sourced from the focused surface.
+    /// Payload-less.
+    suspend_split,
+
     /// (ramon fork) Install the fork's Claude Code agent-state hooks (macOS): copy
     /// the hook script into `~/.config/ghostty-ramon/claude-hooks/` and merge the
     /// six hook events into `~/.claude/settings.json` (idempotently, with a
@@ -1681,6 +1689,7 @@ pub const Action = union(enum) {
             .toggle_project_selector,
             .toggle_agent_dashboard,
             .focus_agent_dashboard,
+            .suspend_split,
             .hide_dashboard_split,
             .spotlight_dashboard_split,
             .install_agent_hooks,
@@ -3918,6 +3927,21 @@ test "Binding focus_agent_dashboard" {
     defer buf.deinit();
     try binding.action.format(&buf.writer);
     try testing.expectEqualStrings("focus_agent_dashboard", buf.written());
+}
+
+test "Binding suspend_split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Parses bare name to the payload-less tag.
+    const binding = try parseSingle("a=suspend_split");
+    try testing.expect(binding.action == .suspend_split);
+
+    // Round-trips with no ":" suffix.
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try binding.action.format(&buf.writer);
+    try testing.expectEqualStrings("suspend_split", buf.written());
 }
 
 test "Binding install_agent_hooks" {

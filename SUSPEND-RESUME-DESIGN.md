@@ -11,7 +11,9 @@ alternative). Parts 3–6 now IMPLEMENTED (GUI-only Swift) and the app builds wi
 green (`SuspendPolicyTests` 8, `SuspendManifestTests` 5, plus the Part-1 `MCPAgentStateTests` /
 `AgentDashboardHookStateTests`); the interactive UX (placeholder → Resume → conversation continues)
 and the auto-suspend timing are pending hands-on verification in the `.local` build, and nothing is
-merged.** Grounded in the code at HEAD
+merged. A manual "Suspend Split" command-palette action (`suspend_split`) is also implemented (the
+one piece that needed Zig — a payload-less apprt action) so a split can be parked on demand; the app
+builds with it and its Binding + `ghostty.h`↔`Action.Key` tests pass.** Grounded in the code at HEAD
 (citations are `file:line` / `file:symbol`) and in the four-thread investigation that preceded it;
 claims about *current* behavior were verified against source. Scope is deliberately **Claude Code
 only** for the MVP — Codex is postponed (see [Postponed: Codex](#postponed-codex)).
@@ -305,10 +307,13 @@ change to test.)
 | Placeholder + Resume button + manifest | `SuspendedOverlay` in `SurfaceView.swift`; `suspended` flag + `SuspendManifest` CodingKeys + restore-defer in `SurfaceView_AppKit.swift`; `SuspendManifest.swift` | GUI only | **DONE** |
 | Idle scanner + config | `AgentDashboardController` scan timer → `AgentDashboardModel.suspendOverdueIdleAgents` → `SuspendPolicy`; `SuspendSettings` (UserDefaults, default OFF) | GUI only | **DONE** |
 
-**No `ghostty-host` row AND no Zig/xcframework row — the whole feature is GUI-only Swift** (the one C
-export it needs, `ghostty_surface_close_session_now`, already exists). Optional follow-up: manual
-`suspend_split`/`resume_split` keybind + command-palette actions (that part would be Zig + lib) — not
-needed for the auto-suspend + Resume-button scenario.
+| Manual **Suspend Split** action | `suspend_split` apprt action (`Binding.zig`/`command.zig`/`action.zig`/`ghostty.h`/`Surface.zig`) → `Ghostty.App`/`GhosttyPackage`/`AppDelegate` → `AgentDashboardController.suspendSurface` → `SurfaceView.suspend` | Zig + lib (xcframework) | **DONE** |
+
+The runtime suspend/resume is GUI-only Swift (the one C export it needs,
+`ghostty_surface_close_session_now`, already exists). The **manual command-palette "Suspend Split"**
+(a user request — park a split on demand without waiting for the idle scanner) is the one piece that
+needed Zig: a payload-less apprt action. Resume stays the overlay's Resume button (no `resume_split`
+action was added).
 
 New fork-only config keys (proposed; all in `~/.config/ghostty-ramon/config`, OFF by default):
 - `suspend-idle` — master switch (default off).

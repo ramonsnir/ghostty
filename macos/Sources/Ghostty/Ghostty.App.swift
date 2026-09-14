@@ -695,6 +695,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_HIDE_DASHBOARD_SPLIT:
                 return hideDashboardSplit(app, target: target)
 
+            case GHOSTTY_ACTION_SUSPEND_SPLIT:
+                return suspendSplit(app, target: target)
+
             case GHOSTTY_ACTION_SPOTLIGHT_DASHBOARD_SPLIT:
                 return spotlightDashboardSplit(app, target: target)
 
@@ -1419,6 +1422,28 @@ extension Ghostty {
         // configurable duration (and open the panel if it's closed). Surface-scoped,
         // mirroring `hideDashboardSplit`: no-op + false on an APP target; posts the
         // resolved SurfaceView as `object`.
+        private static func suspendSplit(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return false
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                NotificationCenter.default.post(
+                    name: Notification.ghosttySuspendSplit,
+                    object: surfaceView
+                )
+                return true
+
+            default:
+                assertionFailure()
+                return false
+            }
+        }
+
         private static func spotlightDashboardSplit(
             _ app: ghostty_app_t,
             target: ghostty_target_s) -> Bool {

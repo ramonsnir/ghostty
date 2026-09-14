@@ -439,6 +439,9 @@ extension Ghostty.Notification {
     /// toggle (the focused split); observed by the AppDelegate, which owns the
     /// dashboard controller. The keyboard equivalent of a tile's Hide button.
     static let ghosttyHideDashboardSplit = Notification.Name("com.mitchellh.ghostty.hideDashboardSplit")
+    /// (ramon fork / suspend-resume) Posted with the focused SurfaceView when the
+    /// `suspend_split` action fires; the AgentDashboardController suspends that split.
+    static let ghosttySuspendSplit = Notification.Name("com.mitchellh.ghostty.suspendSplit")
 
     /// (ramon fork / Agent Dashboard) Spotlight a single surface at the very
     /// top of the Agent Dashboard: unhide it and float its tile above every other

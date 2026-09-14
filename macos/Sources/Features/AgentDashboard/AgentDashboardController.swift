@@ -1219,19 +1219,37 @@ final class AgentDashboardModel: ObservableObject {
         var count = 0
         for id in picked {
             guard let view = viewByID[id],
-                  let sid = claudeSessionId[id], !sid.isEmpty,
-                  let cwd = agentCwd[id], !cwd.isEmpty else { continue }
-            let manifest = SuspendManifest(
-                claudeSessionId: sid,
-                cwd: cwd,
-                agentKind: displayAgentKind(id)?.command ?? "claude",
-                title: view.title,
-                lastPrompt: lastPrompt[id],
-                suspendedAt: now)
+                  let manifest = suspendManifest(for: id, title: view.title, now: now) else { continue }
             view.suspend(manifest: manifest)
             count += 1
         }
         return count
+    }
+
+    /// (ramon fork / suspend-resume) Build the Resume manifest for a surface, or nil if it
+    /// lacks a captured Claude session id / cwd (i.e. can't be resumed). Shared by the idle
+    /// scanner and the manual `suspend_split` action.
+    func suspendManifest(for id: UUID, title: String, now: Date = Date()) -> SuspendManifest? {
+        guard let sid = claudeSessionId[id], !sid.isEmpty,
+              let cwd = agentCwd[id], !cwd.isEmpty else { return nil }
+        return SuspendManifest(
+            claudeSessionId: sid,
+            cwd: cwd,
+            agentKind: displayAgentKind(id)?.command ?? "claude",
+            title: title,
+            lastPrompt: lastPrompt[id],
+            suspendedAt: now)
+    }
+
+    /// (ramon fork / suspend-resume) Manually suspend one split (the `suspend_split`
+    /// action). No-op (returns false) if it is already suspended or has no captured resume
+    /// id — a plain shell / a Claude split whose hook never reported can't be resumed.
+    @discardableResult
+    func suspendSurfaceManually(_ view: Ghostty.SurfaceView) -> Bool {
+        guard !view.suspended,
+              let manifest = suspendManifest(for: view.id, title: view.title) else { return false }
+        view.suspend(manifest: manifest)
+        return true
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -2084,6 +2102,13 @@ final class AgentDashboardController: NSWindowController {
     private func runSuspendScan() {
         guard SuspendSettings.enabled else { return }
         model.suspendOverdueIdleAgents(thresholdBusinessDays: SuspendSettings.businessDays)
+    }
+
+    /// (ramon fork / suspend-resume) Manually suspend a split (the `suspend_split` action,
+    /// routed here from the AppDelegate notification observer). Always available regardless
+    /// of `SuspendSettings.enabled` — a manual suspend is an explicit user gesture.
+    func suspendSurface(_ view: Ghostty.SurfaceView) {
+        model.suspendSurfaceManually(view)
     }
 
     /// Build a fresh `NSHostingView` mounting the shared `AgentDashboardView`. Used

@@ -427,6 +427,11 @@ pub const Action = union(Key) {
     /// Payload-less. Appended LAST so the Key enum / ghostty.h tag order stays additive.
     focus_agent_dashboard,
 
+    /// (ramon fork / suspend-resume) Suspend the focused Claude split to reclaim RAM
+    /// (send host Close, keep the split as a Resume placeholder). Payload-less. Appended
+    /// LAST so the Key enum / ghostty.h tag order stays additive.
+    suspend_split,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -513,6 +518,7 @@ pub const Action = union(Key) {
         new_split_on_host,
         compact_splits,
         focus_agent_dashboard,
+        suspend_split,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");

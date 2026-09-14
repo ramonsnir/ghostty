@@ -477,6 +477,11 @@ class AppDelegate: NSObject,
             object: nil)
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(ghosttySuspendSplit(_:)),
+            name: Ghostty.Notification.ghosttySuspendSplit,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(ghosttyInstallAgentHooks(_:)),
             name: Ghostty.Notification.ghosttyInstallAgentHooks,
             object: nil)
@@ -665,6 +670,22 @@ class AppDelegate: NSObject,
                 agentDashboard = AgentDashboardController(ghostty: ghostty)
             }
             agentDashboard?.hide(surfaceID: surfaceView.id)
+        }
+    }
+
+    /// (ramon fork / suspend-resume) Manually suspend the focused split (the
+    /// `suspend_split` action / command palette). Routes to the dashboard controller,
+    /// which builds the Resume manifest from the captured agent state and suspends the
+    /// split (a no-op if it has no captured Claude session id — nothing to resume).
+    @objc private func ghosttySuspendSplit(_ notification: Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        // Posted from the apprt action callback on the main thread; the controller is
+        // @MainActor-isolated.
+        MainActor.assumeIsolated {
+            if agentDashboard == nil {
+                agentDashboard = AgentDashboardController(ghostty: ghostty)
+            }
+            agentDashboard?.suspendSurface(surfaceView)
         }
     }
 

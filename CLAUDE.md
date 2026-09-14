@@ -137,7 +137,8 @@ Fork-only actions on the focused surface (all in the command palette unless note
 `flip_split`, `toggle_split_direction`, `move_split_to_new_tab`, `merge_tabs`,
 `new_tab[:dir]`, `new_tab_command`, `mark_split` / `clear_split_mark` /
 `pull_marked_split`, `swap_split`, `compact_splits`, `goto_last_surface`, `report_bug`,
-`toggle_project_selector` (needs the `project-directory` key). Plus always-on tweaks to
+`toggle_project_selector` (needs the `project-directory` key), `suspend_split` (suspend an idle Claude
+split to reclaim RAM — see `SUSPEND-RESUME-DESIGN.md`). Plus always-on tweaks to
 upstream `goto_split` (directional wrap-around cycling) and `equalize_splits` (visual-grid
 equalization), and the `repeatable:` flag prefix (tmux `bind -r`). `compact_splits`
 reorganizes the tab into the densest `ceil(sqrt(N))`-column grid (reuses the Agent-Queue

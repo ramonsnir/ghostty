@@ -593,6 +593,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Jump to the Agent Dashboard — select its docked tab, or bring the floating panel forward.",
         }},
 
+        .suspend_split => comptime &.{.{
+            .action = .suspend_split,
+            .title = "Suspend Split",
+            .description = "Stop this Claude split's process to free memory, keeping it as a Resume placeholder.",
+        }},
+
         .hide_dashboard_split => comptime &.{.{
             .action = .hide_dashboard_split,
             .title = "Hide Split from Agent Dashboard",

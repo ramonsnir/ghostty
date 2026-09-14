@@ -6412,6 +6412,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
+        .suspend_split => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .suspend_split,
+            {},
+        ),
+
         .hide_dashboard_split => return try self.rt_app.performAction(
             .{ .surface = self },
             .hide_dashboard_split,
