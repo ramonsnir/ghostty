@@ -117,6 +117,14 @@ struct PersistedAgentState: Codable, Equatable {
     var prompt: String?
     var message: String?
     var updated: Double
+    // (ramon fork / suspend-resume) Persisted so an IDLE agent's resume token, working
+    // dir, and real idle-since time survive a GUI relaunch — idle sessions are long-lived
+    // and usually predate a restart, so without this Suspend Split can't resume them until
+    // they next fire a hook. Optional ⇒ old records (and non-Claude rows) decode as nil.
+    var claudeSessionId: String?   // the `claude --resume <id>` token
+    var cwd: String?               // the agent's working directory
+    var lastActivity: Double?      // real last-activity (timeIntervalSince1970), distinct
+                                   // from `updated` (which is touched to defeat age-pruning)
 }
 
 /// Persistence boundary for per-session agent state, injected for testability
@@ -1031,6 +1039,7 @@ final class AgentDashboardModel: ObservableObject {
     private func sameContent(_ a: PersistedAgentState?, _ b: PersistedAgentState) -> Bool {
         guard let a else { return false }
         return a.state == b.state && a.tool == b.tool && a.prompt == b.prompt && a.message == b.message
+            && a.claudeSessionId == b.claudeSessionId && a.cwd == b.cwd
     }
 
     /// Persist the current state for `id`'s host session, if its session id is
@@ -1039,7 +1048,9 @@ final class AgentDashboardModel: ObservableObject {
         guard let key = sessionKey(for: id), let state = agentStates[id] else { return }
         let rec = PersistedAgentState(
             state: state.rawValue, tool: lastTool[id], prompt: lastPrompt[id],
-            message: lastMessage[id], updated: Date().timeIntervalSince1970)
+            message: lastMessage[id], updated: Date().timeIntervalSince1970,
+            claudeSessionId: claudeSessionId[id], cwd: agentCwd[id],
+            lastActivity: lastActivityAt[id]?.timeIntervalSince1970)
         if !sameContent(restored[key], rec) {
             restored[key] = rec
             agentStore.save(restored)
@@ -1064,11 +1075,19 @@ final class AgentDashboardModel: ObservableObject {
                 if let t = rec.tool { lastTool[s.id] = t }
                 if let p = rec.prompt { lastPrompt[s.id] = p }
                 if let m = rec.message { lastMessage[s.id] = m }
+                // (suspend-resume) Rehydrate the resume token / cwd / idle-since so an idle
+                // agent is suspendable right after a GUI relaunch, without waiting for its
+                // next hook event.
+                if let sid = rec.claudeSessionId { claudeSessionId[s.id] = sid }
+                if let c = rec.cwd { agentCwd[s.id] = c }
+                if let la = rec.lastActivity { lastActivityAt[s.id] = Date(timeIntervalSince1970: la) }
                 hookBacked.insert(s.id)
             } else if let state = agentStates[s.id] {
                 let rec = PersistedAgentState(
                     state: state.rawValue, tool: lastTool[s.id], prompt: lastPrompt[s.id],
-                    message: lastMessage[s.id], updated: nowS)
+                    message: lastMessage[s.id], updated: nowS,
+                    claudeSessionId: claudeSessionId[s.id], cwd: agentCwd[s.id],
+                    lastActivity: lastActivityAt[s.id]?.timeIntervalSince1970)
                 let cur = restored[key]
                 let stale = cur.map { nowS - $0.updated > Self.persistTouchInterval } ?? true
                 if !sameContent(cur, rec) || stale {

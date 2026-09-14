@@ -65,6 +65,11 @@ export interface Surface {
   /** (ramon fork / suspend-resume) The agent's working directory (hook `cwd`), for respawn on
    *  Resume. OMITTED when unknown. */
   cwd?: string;
+  /** (ramon fork / suspend-resume) TRUE when this split is SUSPENDED (its host session was
+   *  Closed to reclaim RAM; it's a Resume placeholder). OMITTED (=== undefined) when live. When
+   *  set, the row's `agentState`/`foregroundPid`/`processName`/`command` are suppressed (they'd be
+   *  stale), so a suspended split is never mistaken for a running one. */
+  suspended?: boolean;
   /** (Agent Manager) Whether the user HID this surface's tile in the Agent Dashboard.
    *  OMITTED (=== undefined) when not hidden / unknown. The summarizer skips hidden
    *  tiles — no point spending a Haiku call on a tile you've decluttered away. */

@@ -159,7 +159,9 @@ positional encounter-order indices, **not** durable — only `id` is).
   `agentState` / `lastPrompt` / `lastTool` / `agentKind` / `notes`, and — captured passively from
   the Claude Code hook (suspend-resume) — **`claudeSessionId`** (Claude's own `claude --resume
   <id>` token) and **`cwd`** (the agent's working dir). NOTE `claudeSessionId` is DISTINCT from the
-  host PTY `sessionID` composite; never conflate them.
+  host PTY `sessionID` composite; never conflate them. A **suspended** split (its session Closed to
+  reclaim RAM — a Resume placeholder) emits **`suspended:true`** and SUPPRESSES its now-stale
+  `agentState`/`foregroundPid`/`processName`/`command`, so a suspended split never reads as a live one.
 - **`read_surface {id}`** — text of the **visible screen** (viewport). *Scrollback/history
   is not exposed* — see Known limits. To see output that scrolled off, `scroll` it into
   view, then read again.

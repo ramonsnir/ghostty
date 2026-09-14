@@ -525,6 +525,22 @@ struct MCPServerTests {
         #expect(d["hidden"] as? Bool == true)
     }
 
+    // fork / suspend-resume: `suspended` emits only when true (absent ⇒ live), so a
+    // suspended placeholder is never mistaken for a running split.
+    @Test func surfacesJSONDataEmitsSuspendedWhenTrue() {
+        func row(_ suspended: Bool) -> MCPLayout.SurfaceRow {
+            MCPLayout.SurfaceRow(
+                id: "S1", title: "claude", pwd: "/tmp",
+                window: 0, tab: 0, tabTitle: "T", splitIndex: 0, splitCount: 1,
+                focused: false, bell: false, attentionNeeded: false, exited: false, atPrompt: false,
+                processName: nil, command: nil, idleSeconds: nil,
+                agentState: nil, lastPrompt: nil, lastTool: nil, notes: nil,
+                agentKind: "claude", suspended: suspended, hidden: false, sessionID: 1)
+        }
+        #expect(MCPLayout.surfacesJSONData([row(true)])[0]["suspended"] as? Bool == true)
+        #expect(MCPLayout.surfacesJSONData([row(false)])[0]["suspended"] == nil)
+    }
+
     // fork: foregroundPid emits when set (it bridges a live surface to its host
     // session pid for orphan-session cleanup) and is OMITTED when nil.
     @Test func surfacesJSONDataEmitsForegroundPidWhenSet() {

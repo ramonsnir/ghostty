@@ -111,6 +111,11 @@ enum MCPLayout {
         /// fork / suspend-resume: the agent's working dir (hook `cwd`), for respawn on
         /// Resume. `var` + default, same rationale as `claudeSessionId`.
         var agentCwd: String? = nil
+        /// fork / suspend-resume: this split is SUSPENDED — its host session was Closed to
+        /// reclaim RAM and it's a Resume placeholder. Emitted as `suspended:true`; when set,
+        /// the row's stale "live" signals (`agentState`, `foregroundPid`) are suppressed so a
+        /// suspended split is never mistaken for a running one. `var` + default.
+        var suspended: Bool = false
         /// fork / Agent Manager: whether the user HID this surface's tile in the Agent
         /// Dashboard. Sourced from the dashboard model; false when the dashboard is
         /// disabled / the surface is unknown. The summarizer skips hidden tiles.
@@ -214,17 +219,21 @@ enum MCPLayout {
                     focused: view.focused, bell: view.bell,
                     attentionNeeded: view.attentionNeeded,
                     exited: exited, atPrompt: atPrompt,
-                    processName: view.foregroundProcessName,
-                    command: view.foregroundCommand,
-                    foregroundPid: view.foregroundPid,
+                    // (suspend-resume) A suspended split's host session is gone; its
+                    // process/foreground/agentState signals are STALE, so suppress them and
+                    // surface `suspended:true` instead (avoid it reading as a live agent).
+                    processName: view.suspended ? nil : view.foregroundProcessName,
+                    command: view.suspended ? nil : view.foregroundCommand,
+                    foregroundPid: view.suspended ? nil : view.foregroundPid,
                     idleSeconds: view.idleSeconds,
-                    agentState: hook?.agentState,
+                    agentState: view.suspended ? nil : hook?.agentState,
                     lastPrompt: hook?.lastPrompt,
                     lastTool: hook?.lastTool,
                     notes: hook?.notes,
                     agentKind: hook?.agentKind,
                     claudeSessionId: hook?.claudeSessionId,
                     agentCwd: hook?.agentCwd,
+                    suspended: view.suspended,
                     hidden: hook?.hidden ?? false,
                     sessionID: sessionID,
                     hostName: view.hostName ?? "local",
@@ -266,6 +275,9 @@ enum MCPLayout {
             // DISTINCT from `sessionID` (the host PTY id emitted below).
             if let csid = $0.claudeSessionId { d["claudeSessionId"] = csid }
             if let cwd = $0.agentCwd { d["cwd"] = cwd }
+            // fork / suspend-resume: emit only when suspended (absent ⇒ live), so a
+            // suspended placeholder is never mistaken for a running split.
+            if $0.suspended { d["suspended"] = true }
             // fork / Agent Manager: emit `hidden` only when true (absent ⇒ not
             // hidden), mirroring the omit-when-default style of the agent-* fields.
             if $0.hidden { d["hidden"] = true }

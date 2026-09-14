@@ -1436,6 +1436,31 @@ struct AgentDashboardHookStateTests {
         #expect(model.agentCwd[a] == "/Users/example/project")
     }
 
+    // (suspend-resume) The captured resume id + cwd + last-activity are PERSISTED and
+    // survive a GUI relaunch: a fresh model backed by the same store rehydrates them onto
+    // the reattached surface (keyed by the stable host session id), so a long-idle split is
+    // suspendable right after a relaunch without waiting for its next hook.
+    @Test func capturedResumeIdSurvivesRelaunch() {
+        let store = InMemoryAgentStateStore()
+        let a = UUID()
+        let sid: UInt64 = 4242
+        func liveA() -> [AgentDashboardModel.LiveSurface] {
+            [.init(id: a, view: nil, title: "t", pwd: "/x", sessionID: sid)]
+        }
+        let m1 = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
+        m1.rebuild(live: liveA())
+        m1.applyAgentState(a, AgentStatePayload(
+            tty: "ttys004", state: .idle, prompt: nil, tool: nil, message: nil,
+            claudeSessionId: "sess-xyz", cwd: "/Users/example/proj"))
+
+        // Fresh GUI process: new model, SAME persisted store, surface reattaches (same sid).
+        let m2 = AgentDashboardModel(store: InMemoryHideStore(), agentStateStore: store)
+        m2.rebuild(live: liveA())
+        #expect(m2.claudeSessionId[a] == "sess-xyz")
+        #expect(m2.agentCwd[a] == "/Users/example/proj")
+        #expect(m2.lastActivityAt[a] != nil)
+    }
+
     @Test func hookBackedInsertedOnFirstEvent() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
