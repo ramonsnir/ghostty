@@ -2,9 +2,11 @@
 
 Status: **IN PROGRESS on the `suspend-resume-design` branch. Part 1 (passive session-id capture) and
 the Part 2 policy core (`SuspendPolicy`) are IMPLEMENTED + unit-tested. Parts 3–6 REVISED to need NO
-host change — verified in code that suspend reuses the existing `Close` frame and resume reuses the
-existing `Attach` (fresh spawn + `working_directory` + `initial_input`), so the whole feature is GUI
-+ GUI-side lib, no `ghostty-host` restart (the host-frame design is retained as a rejected
+host change — verified in code that suspend reuses the existing `Close` frame (via the existing
+`ghostty_surface_close_session_now` export; the `closing` flag already suppresses redial/adopt-fresh)
+and resume reuses the existing `Attach` (fresh spawn + `working_directory` + `initial_input` via the
+`materializeClientSurface` in-place recreate), so Parts 3–6 are **GUI-only Swift** — no Zig, no
+xcframework rebuild, no `ghostty-host` restart (the host-frame design is retained as a rejected
 alternative). Parts 3–6 not yet built.** Grounded in the code at HEAD
 (citations are `file:line` / `file:symbol`) and in the four-thread investigation that preceded it;
 claims about *current* behavior were verified against source. Scope is deliberately **Claude Code
@@ -180,15 +182,15 @@ The `suspend_split` action, on the focused (or scanner-selected) split:
    reclaim). **Do NOT destroy the GUI surface/split.**
 3. Hold the last mirror frame (dimmed) and show the "Suspended — Resume" overlay (Part 4).
 
-**The one gotcha — suppress the local auto-respawn.** A local `.attach` today does NOT show a
-dead-pane overlay on session-end; it falls through to adopt-a-fresh-id (`handoff_redial=true,
-reconnect=false` — the P2 local handoff-redial path). The suspend path must SUPPRESS that for a
-surface it just suspended: a `suspended` gate in the `.client` session-ended handler
-(`src/termio/Client.zig`) that holds the frozen frame instead of redialing/adopting. This is the
-one load-bearing `.client` (Zig-lib) change.
+**The auto-respawn gotcha is already handled — no `.client` change needed.** `closeSession` sets a
+`closing` flag before sending `Close` (`Client.zig:1162`), and `classifyDrop` returns `null` when
+`closing` (`Client.zig:206-211`) — so the drop provoked by our `Close` leaves the frozen frame in
+place and does NOT go `.reconnecting`, redial, or adopt-a-fresh-id. So suspend is literally
+`SurfaceView.closeSessionNow()` (the existing `ghostty_surface_close_session_now` export) plus the
+GUI keeping the split and overlaying the banner. **Zero Zig.**
 
-**Redeploy:** GUI + lib (xcframework rebuild for the `.client`/apprt-action Zig); **no host
-restart**. A normal ReleaseLocal build + relaunch.
+**Redeploy:** GUI only (Swift) — no Zig, no xcframework rebuild, no host restart. A normal
+ReleaseLocal build + relaunch.
 
 ---
 
@@ -264,7 +266,7 @@ it reproduces the by-hand invocation exactly, and it is the mechanism `spawn_spl
 uses (`MCPLayout.swift:494-547`, `config.initialInput`). An exec-level argv would miss a shell
 function. (`GHOSTTY_ITEM_*`-style env is not needed for resume; the session id is the only input.)
 
-**Redeploy:** GUI + lib (xcframework rebuild); **no host restart**.
+**Redeploy:** GUI only (Swift); no Zig, no xcframework rebuild, no host restart.
 
 ---
 
@@ -294,12 +296,15 @@ change to test.)
 |---|---|---|---|
 | Passive session-id capture (Part 1) | `example/claude-hooks/ghostty-agent-state.sh`; `MCPAgentState.swift`; `AgentStateBridge.swift`; `AgentDashboardController.swift`; `MCPLayout.swift`; `mcp.ts` | hooks + GUI/sidecar | **DONE** |
 | Idle policy core (Part 2) | `SuspendResume/SuspendPolicy.swift` (+ tests) | GUI | **DONE (core)** |
-| `suspend_split` / `resume_split` actions | `src/input/Binding.zig`; `src/input/command.zig`; `src/apprt/action.zig`; `include/ghostty.h`; `src/Surface.zig`; `Ghostty.App.swift`; `GhosttyPackage.swift` | Zig + lib (xcframework) | TODO |
-| `.client` suspend gate + resume re-attach | `src/termio/Client.zig` (session-ended `suspended` gate); `SurfaceView_AppKit.swift` (`materializeClientSurface` resume) | Zig + lib (xcframework) | TODO |
-| Idle scanner wiring + config keys | `src/config/Config.zig` (`suspend-idle*` keys); `AgentDashboardController.swift` (timer → action) | Zig + lib (xcframework) | TODO |
-| Placeholder + Resume button + manifest | `SurfaceView.swift` (overlay branch), `SurfaceView_AppKit.swift` (`suspended` flag + manifest CodingKeys) | GUI | TODO |
+| Suspend mechanism | reuses the EXISTING `ghostty_surface_close_session_now` C export via `SurfaceView.closeSessionNow()` (`Ghostty.Surface.swift:128`) — send `Close`, keep the surface | GUI only | TODO |
+| Resume mechanism | in-place surface recreate with a fresh `SurfaceConfiguration` (`sessionID=0`, `workingDirectory=cwd`, `initialInput="…\n"`) — the `materializeClientSurface` pattern (`SurfaceView_AppKit.swift:729`) | GUI only | TODO |
+| Placeholder + Resume button + manifest | `SurfaceView.swift` (overlay branch), `SurfaceView_AppKit.swift` (`suspended` flag + manifest CodingKeys) | GUI only | TODO |
+| Idle scanner + config | `AgentDashboardController.swift` (timer → `SuspendPolicy` → suspend); config via UserDefaults (like `agentDashboardPresentation`), default OFF | GUI only | TODO |
 
-**No `ghostty-host` row — the whole feature is GUI + GUI-side lib.**
+**No `ghostty-host` row AND no Zig/xcframework row — the whole feature is GUI-only Swift** (the one C
+export it needs, `ghostty_surface_close_session_now`, already exists). Optional follow-up: manual
+`suspend_split`/`resume_split` keybind + command-palette actions (that part would be Zig + lib) — not
+needed for the auto-suspend + Resume-button scenario.
 
 New fork-only config keys (proposed; all in `~/.config/ghostty-ramon/config`, OFF by default):
 - `suspend-idle` — master switch (default off).
