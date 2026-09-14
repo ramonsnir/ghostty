@@ -1,8 +1,11 @@
 # Suspend / resume idle agent splits — reclaim RAM, keep the split
 
-Status: **PROPOSED — design of record. Part 1 (passive session-id capture) IMPLEMENTED on the
-`suspend-resume-design` branch (hooks + GUI/sidecar only, no host change); Parts 2–6 not yet
-built.** Grounded in the code at HEAD
+Status: **IN PROGRESS on the `suspend-resume-design` branch. Part 1 (passive session-id capture) and
+the Part 2 policy core (`SuspendPolicy`) are IMPLEMENTED + unit-tested. Parts 3–6 REVISED to need NO
+host change — verified in code that suspend reuses the existing `Close` frame and resume reuses the
+existing `Attach` (fresh spawn + `working_directory` + `initial_input`), so the whole feature is GUI
++ GUI-side lib, no `ghostty-host` restart (the host-frame design is retained as a rejected
+alternative). Parts 3–6 not yet built.** Grounded in the code at HEAD
 (citations are `file:line` / `file:symbol`) and in the four-thread investigation that preceded it;
 claims about *current* behavior were verified against source. Scope is deliberately **Claude Code
 only** for the MVP — Codex is postponed (see [Postponed: Codex](#postponed-codex)).
@@ -31,11 +34,10 @@ hundreds of MB; a shell is a few MB.
 | text-only | ≤~10 MB scrollback + tiny shell | scrollback (modest) |
 | text + Claude | ≤~10 MB scrollback + **hundreds of MB** node process | the agent child |
 
-So **suspend ≙ kill the child** (`Subprocess.killPid`, `src/termio/Exec.zig:1369`). That single act
-reclaims essentially all the RAM for an agent split. Everything else — the placeholder, the resume
-command, the cwd — is about fidelity, not reclaim. Keeping the ≤10 MB Terminal parked in host RAM
-is a rounding error against the child we freed, and it is what lets Resume be a graft rather than a
-cold restart.
+So **suspend ≙ tear the session down** — which reaps the child (the hundreds of MB) AND frees the
+≤10 MB Terminal. As Part 3 shows, the existing `Close` frame already does exactly that, so suspend
+reuses it; everything else — the placeholder, the resume command, the cwd — is GUI-side fidelity,
+not reclaim.
 
 ### Why this is *not* the host-handoff path
 
@@ -50,37 +52,38 @@ This "close-enough" tradeoff is accepted (user decision).
 
 ## Lifecycle model
 
-A session gains one new state, `suspended`, between "live" and "destroyed":
+The lifecycle is entirely GUI-side; the host session is fully torn down while suspended (the GUI
+surface/split lives on as a placeholder):
 
 ```
-  LIVE (child running, GUI attached)
+  LIVE (host session running, GUI split attached)
     │  idle > 2 business days  ──►  scanner fires suspend_split
     ▼
-  SUSPENDED (child killed + master closed; Terminal kept parked in host RAM;
-             GUI split still attached, showing a frozen placeholder)
-    │  user clicks Resume  ──►  resume_split
+  SUSPENDED  (GUI marks the surface `suspended` + records the manifest, then sends the
+              existing Close frame → host reaps the child, closes the master, frees the
+              Terminal (FULL RAM reclaim). The GUI split is NOT destroyed: it holds its
+              cached last frame + a "Suspended — Resume" overlay.)
+    │  user clicks Resume (or resume_split)  ──►  fresh Attach
     ▼
-  LIVE again (fresh child spawned into the SAME session, cwd + claude --resume <id>;
-              placeholder clears when the child's first bytes arrive)
+  LIVE again (SAME SurfaceView re-attaches to a NEW host session: fresh spawn in the
+              recorded cwd with initial_input="claude-pool --resume <id>\n"; overlay clears
+              on the first grid_frame; the surface adopts the new session_id)
 ```
 
-Two invariants:
+Invariants:
 
-- **The GUI split never dies and never detaches.** The placeholder is a GUI-side overlay over the
-  frozen last frame; the surface stays subscribed to the same `(host, session_id)` the whole time.
-  "Re-attach" on resume is just the overlay clearing — no re-dial, no new surface. (This is the
-  primary design; an alternative that detaches is noted under [Alternatives](#alternatives).)
-- **A suspended session is never reaped.** The existing reaper (`reapEligible`,
-  `dead_session_grace_ms = 3_600_000`, `src/host/Server.zig:978,996`) must treat `suspended` as
-  *never eligible*, the same way it already treats a live detached child (`Server.zig:994`).
+- **The GUI split survives; the host session does not.** Suspend is a `Close` (full teardown) plus a
+  GUI decision to keep the split as a placeholder. There is nothing parked host-side, so nothing to
+  reap and no host-RAM residue.
+- **Resume is a fresh session, not a reattach.** Continuity comes from Claude's own on-disk
+  transcript via `claude --resume <id>`, not from host state — consistent with "not
+  process-transparent" (see caveats).
 
-### MVP durability boundary
+### Durability
 
-The MVP keeps the parked Terminal **in host RAM only** — so a suspended split survives a **GUI
-restart** (the host outlives the GUI) but **not a host restart**. This is intentional: it needs
-zero serialization, dodges the `session_transfer` same-build guard entirely, and still delivers the
-whole RAM win (the child is gone). Disk durability is a documented follow-up (see
-[Future: disk durability](#future-disk-durability-layer-2)).
+Because suspend frees the host session completely, a suspended split survives BOTH a GUI restart and
+a host restart for free — the placeholder + resume manifest live in the SurfaceView restorable-state
+archive (Part 5), and there is no host-side state that a restart could lose.
 
 ---
 
@@ -146,41 +149,46 @@ asleep across a boundary (use wall-clock deltas, not tick counts).
 
 ---
 
-## Part 3 — Suspend (host change)
+## Part 3 — Suspend (GUI + GUI-side lib; NO host change)
 
-New host protocol frame `Suspend` (distinct from `Detach` and `Close`), triggered by a new
-`suspend_split` surface action. Semantics, contrasted with the two existing teardown paths:
+**Key finding (verified in code): the host needs no change.** The existing `Close` frame already
+SIGHUPs+reaps the child AND frees the Terminal (`Server.zig:2904`), and the existing `Attach` frame
+already carries a fresh-spawn `working_directory` + `initial_input` (`protocol.zig:554-564`) — so
+suspend reuses `Close` and resume (Part 6) reuses `Attach`. No new protocol frame, no minor bump,
+and nothing new links into `ghostty-host`. The `.client` state-machine tweaks are GUI-side **lib**
+Zig (rebuild the xcframework) but are NOT compiled into the host (the `.client` redial machine is
+GUI-lib-only), so there is **no host restart and no session-loss deploy** — the whole feature ships
+as a normal GUI/lib relaunch. The original host-frame design is kept as a rejected alternative below.
 
-| | child process | pty master fd | Terminal state | session entry |
-|---|---|---|---|---|
-| **Detach** (`Server.zig:1644`) | stays alive | stays open | kept in RAM | parked, reattachable |
-| **Close** (`Server.zig:2904`) | SIGHUP'd + reaped | closed | freed | destroyed |
-| **Suspend** (new) | **`killPid` (reaped)** | **closed** | **kept parked in RAM** | **alive, marked `suspended`** |
+Two bonuses over the parked-in-host-RAM design this replaces: it reclaims MORE RAM (the ≤10 MB
+Terminal is freed too, not just the child), and it matches the "no scrollback in the frozen frame"
+decision — the frozen frame is the GUI's cached last viewport (already retained for the
+session-ended overlay), not host-held scrollback.
 
-Suspend is a **new composition** of primitives that already exist — none of the three current paths
-does it:
+Contrast with the two existing teardown paths — suspend simply reuses `Close`, the difference being
+purely GUI-side (the split is kept, not destroyed):
 
-1. `Subprocess.killPid` (`Exec.zig:1369`) — SIGHUP + reap the whole process group (handles the
-   setsid race + Darwin EPERM).
-2. Close the master fd (as the adopted-close branch does, `Exec.zig:324-333`).
-3. Keep the `SessionEntry` registered, set a new `suspended` flag on it, and stop pushing
-   `foreground_pid` frames for it. This reuses the *dead-child park* scaffolding
-   (`sessionOwnerThread`, `Server.zig:2220-2236`) — but marked so the 1-hour reaper skips it.
+| | child process | pty master fd | Terminal | host session | GUI split |
+|---|---|---|---|---|---|
+| **Detach** (`Server.zig:1644`) | stays alive | stays open | kept in RAM | parked | destroyed/reparented |
+| **Close** (`Server.zig:2904`) | reaped | closed | freed | destroyed | destroyed |
+| **Suspend** (Close + keep split) | reaped | closed | freed | destroyed | **kept — frozen placeholder** |
 
-The cleanest place to add the composite is next to `Session.detachForHandoff` (the existing "stop
-the reader without killing" precedent, `detach_requested` in `Exec.zig:63`, detach branch
-`:301-313`). Suspend is its mirror: **kill** the reader's child instead of handing it off, but keep
-the Session object.
+The `suspend_split` action, on the focused (or scanner-selected) split:
+1. Record the manifest (Part 5) on the SurfaceView.
+2. Mark the surface `suspended` and send the existing `Close` frame to the host session (full RAM
+   reclaim). **Do NOT destroy the GUI surface/split.**
+3. Hold the last mirror frame (dimmed) and show the "Suspended — Resume" overlay (Part 4).
 
-GUI side at suspend:
-- Record the manifest (Part 5).
-- Flip the split to the placeholder (Part 4).
-- Do **not** detach the surface — it stays subscribed so the reaper never sees zero subscribers and
-  resume is a local graft.
+**The one gotcha — suppress the local auto-respawn.** A local `.attach` today does NOT show a
+dead-pane overlay on session-end; it falls through to adopt-a-fresh-id (`handoff_redial=true,
+reconnect=false` — the P2 local handoff-redial path). The suspend path must SUPPRESS that for a
+surface it just suspended: a `suspended` gate in the `.client` session-ended handler
+(`src/termio/Client.zig`) that holds the frozen frame instead of redialing/adopting. This is the
+one load-bearing `.client` (Zig-lib) change.
 
-**Redeploy:** this links into `ghostty-host` → it is a **Host change**. It lands via the
-supervisor/worker **handoff** path (`HOST-HANDOFF.md`), not a destructive bootout, and — per the
-testing plan below — is exercised in the **non-installed** build first.
+**Redeploy:** GUI + lib (xcframework rebuild for the `.client`/apprt-action Zig); **no host
+restart**. A normal ReleaseLocal build + relaunch.
 
 ---
 
@@ -201,7 +209,7 @@ Two changes:
 **Frozen frame fidelity (decided): viewport only, no scrollback.** The placeholder shows the last
 rendered viewport frame the split already holds — enough to remember what was in there. We do
 **not** marshal scrollback for the MVP; scrolling back in a suspended split is out of scope (that
-would be the optional Layer 2 snapshot, [below](#future-disk-durability-layer-2)).
+would be the optional screen snapshot, [below](#future-higher-fidelity-frozen-frame-optional)).
 
 ---
 
@@ -213,19 +221,21 @@ sticky `bell` / `attentionNeeded` flags — `SurfaceView_AppKit.swift:2456-2457,
 
 ```
 {
-  hostSessionId : u64      // the ghostty-host PTY session id (identity of the parked session)
-  hostName      : String   // "local" for MVP
-  claudeSessionId : String // the claude --resume <id> token (from Part 1)
-  cwd           : String   // working dir to respawn in (from the hook cwd)
-  agentKind     : "claude" // MVP; codex later
-  title         : String   // for the placeholder label
-  lastPrompt    : String?  // shown on the card as a reminder
-  suspendedAt   : Date
+  suspended       : Bool    // sticky flag: this split is suspended (drives the overlay + gate)
+  claudeSessionId : String  // the claude --resume <id> token (from Part 1)
+  cwd             : String   // working dir to respawn in (from the hook cwd)
+  agentKind       : "claude" // MVP; codex later
+  title           : String   // for the placeholder label
+  lastPrompt      : String?  // shown on the card as a reminder
+  suspendedAt     : Date
 }
 ```
 
-Add it as new CodingKeys on the SurfaceView archive (`SurfaceView_AppKit.swift:2441-2458`), emit
-only when set, decode with defaults for old archives — verbatim to the bell/attention pattern.
+No `hostSessionId` is needed as identity: suspend FREES the host session and resume mints a fresh
+one, so there is nothing to reattach to by id. `hostName` stays `"local"` for the MVP. Add these as
+new CodingKeys on the SurfaceView archive (`SurfaceView_AppKit.swift:2441-2458`), emit only when
+set, decode with defaults for old archives — verbatim to the sticky `bell`/`attentionNeeded` pattern.
+A suspended split thus survives a GUI restart as a placeholder and resumes after it.
 
 **Pool account note (decided):** `claude-pool` rotates accounts; `--resume` replays a *local*
 on-disk transcript that is not account-scoped for reading, so resume works regardless of which pool
@@ -233,72 +243,63 @@ account it lands on. Which account *continues* the session doesn't matter — ac
 
 ---
 
-## Part 6 — Resume (host change)
+## Part 6 — Resume (GUI + GUI-side lib; NO host change)
 
-New `resume_split` surface action + a host frame that spawns a **fresh child into the existing
-suspended session**:
+The `resume_split` action (or the overlay's Resume button) re-attaches the SAME SurfaceView to a
+FRESH host session that runs the resume command:
 
-1. Host: for the `suspended` SessionEntry, build a fresh subprocess — `Pty.open` + `fork_exec`
-   (`Subprocess.start`, `Exec.zig:~1102`) — with the recorded **cwd** and the reconstructed command
-   `claude-pool --resume <claudeSessionId>` (agentKind → `claude-pool`; `codex-pool` later). The
-   Terminal already parked on the session is reused as the emulation target; only a *new pty +
-   child* are attached to it.
-2. This is a small new variant of `Session.adopt` (`Session.zig:544`). Today `adopt` requires an
-   inherited `master_fd` **and** `child_pid`. The terminal-injection seam is already decoupled from
-   the pty (`Termio.init` adopts `opts.adopt_terminal` verbatim, `Termio.zig:262-295`) — so we need
-   a **fresh-spawn** variant of adopt: reuse the parked Terminal, but `subprocess.start` a new pty +
-   child instead of inheriting one. Clear the `suspended` flag; resume normal `foreground_pid`
-   pushes.
-3. GUI: the surface is already attached — the placeholder overlay clears when the child's first
-   output arrives (poll `clientStateInfo` back to `.healthy`, `SurfaceView_AppKit.swift:202-204`).
+1. Reconstruct the command from the manifest: `claude-pool --resume <claudeSessionId>` (agentKind →
+   `claude-pool`; `codex-pool` later).
+2. Re-attach via the existing content-swap `materializeClientSurface` (`SurfaceView_AppKit.swift:729`):
+   a new `Attach` with `session_id=null` (fresh spawn), `working_directory = manifest.cwd`, and
+   `initial_input = "<command>\n"`. The fresh interactive shell loads its rc (so a `claude-pool`
+   shell function resolves) and runs the resume — exactly the by-hand path.
+3. Clear the overlay + `suspended` flag on the first grid_frame of the new session (`clientStateInfo`
+   back to `.healthy`, `SurfaceView_AppKit.swift:202-204`); adopt its new `session_id` (the surface's
+   identity updates, as any fresh attach does).
 
-**Delivery of the resume command.** Two options:
-- (a) Host spawns `claude-pool` directly as the child's argv (exec-level). Cleanest; no shell
-  keystroke injection.
-- (b) Spawn a fresh shell child, then type the command as `initialInput` — the mechanism
-  `spawn_split_command` already uses (`MCPLayout.swift:494-547,630`, `config.initialInput`).
+**Why `initial_input`, not an exec-level argv:** typing the command into a fresh interactive shell
+works whether `claude-pool` is a shell function (loaded from the rc file) or an on-PATH executable —
+it reproduces the by-hand invocation exactly, and it is the mechanism `spawn_split_command` already
+uses (`MCPLayout.swift:494-547`, `config.initialInput`). An exec-level argv would miss a shell
+function. (`GHOSTTY_ITEM_*`-style env is not needed for resume; the session id is the only input.)
 
-Prefer **(a)** — it matches "start a new shell running claude-pool with --resume" without a
-racey type-into-shell step, and it's how a normal split's command is launched. (b) is the fallback
-if the pool wrapper must run under an interactive shell for its `.bashrc` account plumbing; that's a
-detail to confirm against how `claude-pool` resolves its account on this machine.
-
-**Redeploy:** Host change (links into `ghostty-host`); same handoff-deploy + non-installed-build
-testing as Part 3.
+**Redeploy:** GUI + lib (xcframework rebuild); **no host restart**.
 
 ---
 
-## Testing plan — use the non-installed build (decided)
+## Testing plan — GUI/lib only, NO host restart
 
-Parts 3 and 6 are **Host changes**, so they must be exercised without touching the installed
-Release that hosts this Claude Code session:
+Because there is no host change (Part 3), there is nothing to deploy to `ghostty-host` and no
+session-loss restart to schedule. The feature ships as a normal GUI/lib relaunch:
 
-- **Build + run the `.local` (ReleaseLocal) or `.debug` fork** (`macos/build/ReleaseLocal/…` /
-  `.../Debug/…`, bundle ids `com.mitchellh.ghostty-ramon.local` / `.debug`) and drive its **own**
-  `ghostty-host` there. These are freely quit/launched (`CLAUDE.md` identity table) and their host
-  is separate from the installed Release's host.
-- **Do NOT bootout/redeploy the installed Release's host** to test — that would end the live
-  session. Only after the feature is proven on the non-installed build do we schedule the installed
-  Release's host upgrade via the deliberate handoff path, at a time the user picks.
-- Full build/host-restart mechanics: `FORK-DEV.md` (iteration lifecycle) + `PTYHOST.md`
-  (bootout+bootstrap, never `kill`) + `HOST-HANDOFF.md` (session-preserving worker handoff).
+- **Unit tests** (the safe, CI-able bulk): the pure `SuspendPolicy` business-day/selection helper
+  (done — `SuspendPolicyTests`), the manifest encode/decode-with-old-archive, and the `.client`
+  session-ended `suspended`-gate decision as a pure helper (mirroring `client_difftest.zig`'s
+  arming/redial tests).
+- **Build + run the `.local` (ReleaseLocal) or `.debug` fork** to exercise suspend→placeholder→resume
+  interactively against its own host — never needed for correctness of the host, only to see the UI.
+  These identities are freely quit/launched (`CLAUDE.md` identity table).
+- Shipping to the installed Release is the normal GUI-only install block (`FORK-DEV.md` step 6) +
+  relaunch — non-destructive under pty-host, **no host bootout**.
 
-In-process host tests (`src/host/test.zig`) get: a suspend → parked-with-`suspended` test, a
-reaper-skips-`suspended` test, and a resume → fresh-child-into-parked-Terminal test (mirroring the
-existing detach/adopt sequence tests). Pure GUI helpers (business-day math, placeholder gating,
-manifest encode/decode-with-old-archive) get Swift unit tests.
+(The earlier plan's in-process `src/host/test.zig` suspend/resume tests are moot — there is no host
+change to test.)
 
 ---
 
 ## Implementation surface (Claude-first MVP)
 
-| Layer | Files | Redeploy |
-|---|---|---|
-| Passive session-id capture | `example/claude-hooks/ghostty-agent-state.sh`; `MCPAgentState.swift`; `AgentStateBridge.swift`; `AgentDashboardController.swift`; `MCPLayout.swift` | hooks + GUI/sidecar |
-| `suspend_split` / `resume_split` actions | `src/input/Binding.zig`; `src/input/command.zig`; `src/apprt/action.zig`; `include/ghostty.h`; `src/Surface.zig`; `Ghostty.App.swift`; `GhosttyPackage.swift` | Zig + lib (xcframework) |
-| Host suspend/resume | `src/host/protocol.zig` (new frames); `src/host/Server.zig` (handlers, `suspended` state, reaper skip); `src/host/Session.zig` (`suspendChild` + fresh-spawn `adopt` variant); `src/termio/Exec.zig`; `src/termio/Termio.zig` | **Host** (handoff deploy) |
-| Idle scanner + business-day math | `AgentDashboardController.swift` (+ pure helper) | GUI/sidecar |
-| Placeholder + Resume button | `SurfaceView.swift` (overlay branch), `SurfaceView_AppKit.swift` (`suspended` flag + manifest CodingKeys) | GUI |
+| Layer | Files | Redeploy | Status |
+|---|---|---|---|
+| Passive session-id capture (Part 1) | `example/claude-hooks/ghostty-agent-state.sh`; `MCPAgentState.swift`; `AgentStateBridge.swift`; `AgentDashboardController.swift`; `MCPLayout.swift`; `mcp.ts` | hooks + GUI/sidecar | **DONE** |
+| Idle policy core (Part 2) | `SuspendResume/SuspendPolicy.swift` (+ tests) | GUI | **DONE (core)** |
+| `suspend_split` / `resume_split` actions | `src/input/Binding.zig`; `src/input/command.zig`; `src/apprt/action.zig`; `include/ghostty.h`; `src/Surface.zig`; `Ghostty.App.swift`; `GhosttyPackage.swift` | Zig + lib (xcframework) | TODO |
+| `.client` suspend gate + resume re-attach | `src/termio/Client.zig` (session-ended `suspended` gate); `SurfaceView_AppKit.swift` (`materializeClientSurface` resume) | Zig + lib (xcframework) | TODO |
+| Idle scanner wiring + config keys | `src/config/Config.zig` (`suspend-idle*` keys); `AgentDashboardController.swift` (timer → action) | Zig + lib (xcframework) | TODO |
+| Placeholder + Resume button + manifest | `SurfaceView.swift` (overlay branch), `SurfaceView_AppKit.swift` (`suspended` flag + manifest CodingKeys) | GUI | TODO |
+
+**No `ghostty-host` row — the whole feature is GUI + GUI-side lib.**
 
 New fork-only config keys (proposed; all in `~/.config/ghostty-ramon/config`, OFF by default):
 - `suspend-idle` — master switch (default off).
@@ -321,36 +322,41 @@ after the Claude path is proven.
 
 ---
 
-## Future: disk durability (Layer 2)
+## Future: higher-fidelity frozen frame (optional)
 
-To make suspended splits survive a **host restart / reboot** (and free the parked ≤10 MB Terminal
-too), add a two-layer disk model:
+The GUI-only approach already reclaims ALL the RAM (suspend `Close`s the session, freeing child +
+Terminal) and already survives a GUI restart (the manifest + a cached frozen frame persist in the
+SurfaceView archive), so the original "Layer 2 disk durability" RAM/host-restart rationale is moot.
 
-- **Durable manifest (stable JSON):** the Part 5 record written to disk. Always resumable across
-  app updates and host restarts, because it holds only strings/ids.
-- **Best-effort screen snapshot (fragile blob):** `session_transfer.serialize`
-  (`src/host/session_transfer.zig`) is already a pointer-free, position-independent `[]u8`
-  (~16–20 MB for 10k×200, compresses hugely) that `Terminal.deserialize` rehydrates from bytes +
-  allocator alone — no child needed. **But** its MAGIC + 10-word struct-layout fingerprint guard
-  (`session_transfer.zig:49-81`) has **no versioning**: a blob written before any rebuild that
-  shifts those struct sizes fails to deserialize. So the snapshot is same-build-only and must be
-  best-effort — on mismatch, resume falls back to the durable manifest (blank frame + the resume
-  command still works). This is why durability rests on the manifest, with the snapshot as a bonus.
-
-Not needed for the MVP: the RAM win is the child, which the in-RAM path already reclaims fully.
+The one thing lost is scrollback fidelity in the placeholder — the frozen frame is viewport-only (by
+decision). If a future want is "scroll back through a suspended split," that's the only place
+`session_transfer.serialize` (`src/host/session_transfer.zig`) would help: capture a screen snapshot
+at suspend for a richer placeholder. It's a pointer-free `[]u8` that `Terminal.deserialize` rehydrates
+from bytes alone, BUT its MAGIC + 10-word struct-layout fingerprint guard (`session_transfer.zig:49-81`)
+has no versioning, so a snapshot is same-build-only and must be best-effort (fall back to the
+viewport frame on mismatch). Out of scope; noted for completeness.
 
 ---
 
 ## Alternatives (considered, not chosen)
 
-- **Detach the surface at suspend, re-adopt at resume by `(host, session_id)`.** The queue's
-  `adopt_split` already resumes an orphaned session by that pair (`AGENT-QUEUE.md:315-317`). Works,
-  but it makes the GUI split briefly ownerless and turns resume into a re-dial + content swap
-  (`materializeClientSurface`, `SurfaceView_AppKit.swift:729`). The keep-subscribed design (Part 4)
-  is simpler and keeps the placeholder a pure GUI overlay. Re-adopt becomes the natural mechanism if
-  we ever *do* detach (e.g. Layer 2, where the session is freed and recreated).
-- **Run `/status` via an agentic driver.** Rejected: wakes the idle session, pollutes the frame we
-  want to freeze, and needs TUI scraping — all unnecessary once the id is captured passively.
+- **New host `Suspend`/`Resume` frames + a parked "suspended" session (the original Part 3/6
+  design).** Suspend would `killPid` the child but KEEP the `SessionEntry` + its Terminal parked in
+  host RAM (marked `suspended`, excluded from the 1-hour reaper); resume would spawn a fresh child
+  into that parked session via a fresh-spawn variant of `Session.adopt`, keeping the same
+  `(host, session_id)`. **Rejected** once code review showed `Close` already frees everything and
+  `Attach` already spawns fresh with cwd + initial_input: the host approach is strictly more work (a
+  protocol minor bump, `Server`/`Session`/`Exec` changes, a destructive host redeploy scheduled via
+  the supervisor handoff, in-process host tests) for LESS RAM reclaim (it keeps the ≤10 MB Terminal
+  resident) and no functional gain — the only thing it preserved was the exact host-side scrollback,
+  which the "no scrollback in the frozen frame" decision doesn't want. The GUI-only path (Parts 3/6
+  above) supersedes it.
+- **Resume by exec-level argv (`claude-pool` as the child's argv) instead of `initial_input`.**
+  Rejected: misses a `claude-pool` *shell function*; typing into a fresh interactive shell
+  reproduces the by-hand invocation regardless of how `claude-pool` is provided.
+- **Run `/status` via an agentic driver to read the session id.** Rejected: wakes the idle session,
+  pollutes the frame we want to freeze, and needs TUI scraping — all unnecessary once the id is
+  captured passively (Part 1).
 
 ---
 
@@ -360,8 +366,14 @@ Not needed for the MVP: the RAM win is the child, which the in-RAM path already 
    `claude --resume`, i.e. the agent conversation continues, not the live process. Lossless for an
    idle Claude session; lossy for a shell mid-command (out of scope — we only suspend idle *agent*
    splits).
-2. **MVP survives GUI restart, not host restart** (Terminal parked in host RAM). Reboot durability
-   is Layer 2.
+2. **Survives GUI restart AND host restart** — suspend `Close`s the host session entirely, so there
+   is no host-side state to lose; the placeholder + resume manifest persist in the SurfaceView
+   archive. (A reboot loses only unsaved GUI state, same as any window restoration.)
 3. **Two unrelated "session ids".** The ghostty-host PTY `session_id` (`u64`) and Claude's resume
-   id (`claude --resume <id>` string) are different things; the code must never conflate them.
-4. **Codex not covered** until its capture path is built.
+   id (`claude --resume <id>` string) are different things; the code must never conflate them. On
+   resume the surface gets a NEW host `session_id` (fresh session); the Claude resume id is what
+   carries continuity.
+4. **Suspend is a deliberate `Close`.** Any non-Claude output, a half-typed command, or background
+   jobs in that split are gone — we restart a fresh shell + `claude --resume`. Fine for an idle
+   agent split (the only thing we suspend); never suspend a split doing non-agent work.
+5. **Codex not covered** until its capture path is built.
