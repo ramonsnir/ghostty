@@ -26,6 +26,16 @@ struct AgentStatePayload: Equatable, Sendable {
     /// local tty-walk path. `var` with a default so existing call sites that build a
     /// tty-only payload are unaffected.
     var nonce: String? = nil
+    /// (ramon fork / suspend-resume) Claude Code's OWN session id — the
+    /// `claude --resume <id>` token — echoed from the hook stdin (`session_id`),
+    /// captured passively so suspend never needs a `/status` probe. This is a
+    /// DIFFERENT thing from the ghostty-host PTY `sessionID` (a `u64`); never
+    /// conflate them. nil for a non-Claude surface or an older hook. `var` with a
+    /// default so existing call sites that omit it are unaffected.
+    var claudeSessionId: String? = nil
+    /// (ramon fork / suspend-resume) The agent's working directory (hook `cwd`),
+    /// recorded so Resume can respawn a fresh child in the same dir. `var` + default.
+    var cwd: String? = nil
 }
 
 /// (ramon fork / Agent Manager) An LLM annotation for one surface, written through

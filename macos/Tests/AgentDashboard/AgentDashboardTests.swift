@@ -1415,6 +1415,27 @@ struct AgentDashboardHookStateTests {
         #expect(model.hookSnapshot()[a]?.agentKind == "codex")
     }
 
+    // (suspend-resume) applyAgentState captures Claude's resume token + cwd passively,
+    // and hookSnapshot echoes them for the MCP list_surfaces row. Sticky: a later event
+    // that omits them (nil fields) leaves the prior values.
+    @Test func hookCapturesClaudeSessionIdAndCwd() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, AgentStatePayload(
+            tty: "ttys004", state: .working, prompt: "go", tool: nil, message: nil,
+            claudeSessionId: "sess-abc-123", cwd: "/Users/example/project"))
+        #expect(model.claudeSessionId[a] == "sess-abc-123")
+        #expect(model.agentCwd[a] == "/Users/example/project")
+        #expect(model.hookSnapshot()[a]?.claudeSessionId == "sess-abc-123")
+        #expect(model.hookSnapshot()[a]?.agentCwd == "/Users/example/project")
+
+        // Sticky across a later event that omits the fields.
+        model.applyAgentState(a, payload(.idle))
+        #expect(model.claudeSessionId[a] == "sess-abc-123")
+        #expect(model.agentCwd[a] == "/Users/example/project")
+    }
+
     @Test func hookBackedInsertedOnFirstEvent() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()

@@ -347,6 +347,16 @@ final class AgentDashboardModel: ObservableObject {
     /// Last Notification message per surface (the "needs input" reason).
     private(set) var lastMessage: [UUID: String] = [:]
 
+    /// (ramon fork / suspend-resume) Claude Code's OWN session id per surface — the
+    /// `claude --resume <id>` token, captured passively from the hook (sticky: a nil
+    /// field leaves the prior value). DISTINCT from the ghostty-host PTY session id.
+    /// Feeds the suspend manifest so Resume can restart the agent conversation.
+    private(set) var claudeSessionId: [UUID: String] = [:]
+
+    /// (ramon fork / suspend-resume) The agent's working directory per surface (hook
+    /// `cwd`), so Resume can respawn a fresh child in the same dir.
+    private(set) var agentCwd: [UUID: String] = [:]
+
     /// Surfaces that have EVER reported a hook event. Hook-authoritative
     /// thereafter (mutes the `idleSeconds` heuristic for these ids).
     private(set) var hookBacked: Set<UUID> = []
@@ -800,6 +810,13 @@ final class AgentDashboardModel: ObservableObject {
         hookMisses[id] = nil
         if staleHookState.contains(id) { staleHookState.remove(id) }
 
+        // (suspend-resume) Capture the resume token + cwd BEFORE the coalesce early-return
+        // below, so an unchanged-state republish still records them. Sticky: a nil field
+        // leaves the prior value (mirrors lastTool/lastPrompt). Plain dicts (not @Published)
+        // so this never forces a tile rebuild.
+        if let sid = payload.claudeSessionId { claudeSessionId[id] = sid }
+        if let dir = payload.cwd { agentCwd[id] = dir }
+
         let prev = agentStates[id]
 
         // Coalesce: unchanged state + unchanged (present) fields → no rebuild.
@@ -1159,6 +1176,15 @@ final class AgentDashboardModel: ObservableObject {
         /// completeness / a consistent value-type snapshot. Defaulted so existing
         /// constructors are unaffected.
         var hostName: String = "local"
+        /// (ramon fork / suspend-resume) Claude Code's OWN session id (the
+        /// `claude --resume <id>` token), captured passively from the hook. Echoed into
+        /// the MCP `list_surfaces` row (`SurfaceRow.claudeSessionId`) for observability and
+        /// to feed the future suspend manifest. DISTINCT from the host PTY session id.
+        /// Defaulted so existing constructors are unaffected.
+        var claudeSessionId: String? = nil
+        /// (ramon fork / suspend-resume) The agent's working dir (hook `cwd`), for respawn
+        /// on Resume. Echoed into the `list_surfaces` row (`SurfaceRow.agentCwd`). Defaulted.
+        var agentCwd: String? = nil
     }
 
     /// Snapshot the hook + annotation state for every surface that has any of it.
@@ -1171,6 +1197,7 @@ final class AgentDashboardModel: ObservableObject {
         for s in live { hostByID[s.id] = s.hostName }
         let ids = Set(agentStates.keys)
             .union(lastPrompt.keys).union(lastTool.keys)
+            .union(claudeSessionId.keys).union(agentCwd.keys)
             .union(annotations.keys).union(agents.keys)
             .union(hidden)
         for id in ids {
@@ -1190,7 +1217,9 @@ final class AgentDashboardModel: ObservableObject {
                 queueUrl: annotations[id]?.queueUrl,
                 queueHero: annotations[id]?.queueHero,
                 scheduleId: annotations[id]?.scheduleId,
-                hostName: hostByID[id] ?? "local")
+                hostName: hostByID[id] ?? "local",
+                claudeSessionId: claudeSessionId[id],
+                agentCwd: agentCwd[id])
         }
         return out
     }

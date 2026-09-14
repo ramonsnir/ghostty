@@ -58,6 +58,13 @@ export interface Surface {
   lastTool?: string;
   notes?: string;
   agentKind?: string;
+  /** (ramon fork / suspend-resume) Claude Code's OWN session id — the `claude --resume <id>`
+   *  token — captured passively from the hook. DISTINCT from `sessionID` (the ghostty-host PTY
+   *  id); never conflate them. OMITTED (=== undefined) for a non-Claude surface / older hook. */
+  claudeSessionId?: string;
+  /** (ramon fork / suspend-resume) The agent's working directory (hook `cwd`), for respawn on
+   *  Resume. OMITTED when unknown. */
+  cwd?: string;
   /** (Agent Manager) Whether the user HID this surface's tile in the Agent Dashboard.
    *  OMITTED (=== undefined) when not hidden / unknown. The summarizer skips hidden
    *  tiles — no point spending a Haiku call on a tile you've decluttered away. */

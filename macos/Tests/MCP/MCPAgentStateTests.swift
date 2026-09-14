@@ -41,6 +41,27 @@ struct MCPAgentStateTests {
         #expect(p?.message == "needs input")
     }
 
+    // MARK: - parse (suspend-resume: claudeSessionId + cwd)
+
+    @Test func parseCapturesSessionIdAndCwd() {
+        let body = Data(#"{"tty":"ttys004","state":"working","claudeSessionId":"abc123-def-456","cwd":"/Users/example/project"}"#.utf8)
+        let p = MCPAgentState.parse(body)
+        #expect(p?.claudeSessionId == "abc123-def-456")
+        #expect(p?.cwd == "/Users/example/project")
+    }
+
+    @Test func parseSessionIdAndCwdAbsentAreNil() {
+        let p = MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"idle"}"#.utf8))
+        #expect(p?.claudeSessionId == nil)
+        #expect(p?.cwd == nil)
+    }
+
+    @Test func parseSessionIdCappedAt256() {
+        let big = String(repeating: "x", count: 300)
+        let body = Data(#"{"tty":"ttys004","state":"working","claudeSessionId":"\#(big)"}"#.utf8)
+        #expect(MCPAgentState.parse(body)?.claudeSessionId?.count == 256)
+    }
+
     @Test func parseStateCaseInsensitive() {
         #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"WAITING"}"#.utf8))?.state == .waiting)
         #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"Idle"}"#.utf8))?.state == .idle)

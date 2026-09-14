@@ -155,7 +155,11 @@ positional encounter-order indices, **not** durable — only `id` is).
   surface to its host session-leader (walk its ppid chain up to the `login` child of
   `ghostty-host`) — the exact-diff basis for finding orphaned/detached host sessions. See
   Known limits for `processName`/`command`/`foregroundPid`'s host-restart requirement and the
-  `idleSeconds` TUI nuance.
+  `idleSeconds` TUI nuance. Agent rows also carry (omitted when unknown) the hook-sourced
+  `agentState` / `lastPrompt` / `lastTool` / `agentKind` / `notes`, and — captured passively from
+  the Claude Code hook (suspend-resume) — **`claudeSessionId`** (Claude's own `claude --resume
+  <id>` token) and **`cwd`** (the agent's working dir). NOTE `claudeSessionId` is DISTINCT from the
+  host PTY `sessionID` composite; never conflate them.
 - **`read_surface {id}`** — text of the **visible screen** (viewport). *Scrollback/history
   is not exposed* — see Known limits. To see output that scrolled off, `scroll` it into
   view, then read again.
@@ -231,7 +235,12 @@ what's being asked → `send_key`/`send_text` to respond → repeat; plus `perfo
   backoff as `/mcp`, so anyone holding the MCP token — or any caller, when the server runs
   open — can also POST agent-state events. It does NOT spawn shells; it only updates a
   dashboard tile's displayed state. Still, it is a real second authenticated surface on the
-  same token, so treat the token accordingly.
+  same token, so treat the token accordingly. (suspend-resume) The hook body also carries
+  `claudeSessionId` + `cwd` when Claude Code provides them (from the hook stdin's `session_id` /
+  `cwd`); `MCPAgentState.parse` captures both and the dashboard model stores them per surface,
+  echoing them on `list_surfaces` — this is the passive capture that lets a future suspend restart
+  the agent with `claude --resume <id>` without ever running `/status`. See
+  [SUSPEND-RESUME-DESIGN.md](SUSPEND-RESUME-DESIGN.md).
 - **Defense in depth** (copied from the web monitor, independent of the token): a
   Host-header allowlist (DNS-rebinding guard), a per-peer failed-token backoff (when a
   token is set), and per-connection bounds (idle watchdog + absolute deadline +

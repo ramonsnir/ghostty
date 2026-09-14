@@ -1,6 +1,8 @@
 # Suspend / resume idle agent splits — reclaim RAM, keep the split
 
-Status: **PROPOSED — design of record, not yet implemented.** Grounded in the code at HEAD
+Status: **PROPOSED — design of record. Part 1 (passive session-id capture) IMPLEMENTED on the
+`suspend-resume-design` branch (hooks + GUI/sidecar only, no host change); Parts 2–6 not yet
+built.** Grounded in the code at HEAD
 (citations are `file:line` / `file:symbol`) and in the four-thread investigation that preceded it;
 claims about *current* behavior were verified against source. Scope is deliberately **Claude Code
 only** for the MVP — Codex is postponed (see [Postponed: Codex](#postponed-codex)).
@@ -82,7 +84,7 @@ whole RAM win (the child is gone). Disk durability is a documented follow-up (se
 
 ---
 
-## Part 1 — Passive session-id capture (do this first; no host change)
+## Part 1 — Passive session-id capture (IMPLEMENTED; no host change)
 
 Resume needs Claude's own session id (the `claude --resume <id>` token). **We capture it passively
 from the hook — we do NOT run `/status`.** Claude Code already passes `session_id` (and `cwd`,

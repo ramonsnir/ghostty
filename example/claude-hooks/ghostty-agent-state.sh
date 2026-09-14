@@ -136,6 +136,21 @@ json_escape() {
     | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
+# --- session_id + cwd: passive capture for suspend/resume ---------------------
+# (ramon fork / suspend-resume) Claude Code passes `session_id` (the
+# `claude --resume <id>` token) and `cwd` on the stdin JSON of EVERY hook event.
+# Capture both passively here so the fork can later suspend an idle agent split
+# (kill the child to reclaim RAM, keep the split) and Resume it with
+# `claude-pool --resume <id>` in the same dir — WITHOUT ever running `/status`.
+# Best-effort like the rest: empty ⇒ the field is simply omitted from the POST.
+# Built once and reused by both the remote (nonce) and local (tty) bodies below.
+claude_session_id="$(json_field session_id)"
+cwd="$(json_field cwd)"
+sid_field=""
+cwd_field=""
+[ -n "$claude_session_id" ] && sid_field=",\"claudeSessionId\":\"$(json_escape "$claude_session_id")\""
+[ -n "$cwd" ]               && cwd_field=",\"cwd\":\"$(json_escape "$cwd")\""
+
 # --- REMOTE self-ID: POST {nonce, state} when spawned on a cloud box ----------
 # (cloud-hosts, D6.) A remote-spawned agent carries GHOSTTY_SURFACE_NONCE (a
 # non-secret per-spawn correlation id, GUI-injected via the spawn's initial
@@ -162,8 +177,8 @@ if [ -n "$GHOSTTY_SURFACE_NONCE" ]; then
   [ -n "$tool" ]    && tool_field=",\"tool\":\"$(json_escape "$tool")\""
   [ -n "$prompt" ]  && prompt_field=",\"prompt\":\"$(json_escape "$prompt")\""
   [ -n "$message" ] && msg_field=",\"message\":\"$(json_escape "$message")\""
-  body="$(printf '{"nonce":"%s","state":"%s"%s%s%s}' \
-    "$esc_nonce" "$state" "$tool_field" "$prompt_field" "$msg_field")"
+  body="$(printf '{"nonce":"%s","state":"%s"%s%s%s%s%s}' \
+    "$esc_nonce" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field")"
 
   # Feed the capability token via a curl config file on STDIN (`-K -`), NEVER an
   # `-H` argv flag, so it can't be snooped with `ps -ww` on the box.
@@ -263,8 +278,8 @@ msg_field=""
 [ -n "$prompt" ]  && prompt_field=",\"prompt\":\"$(json_escape "$prompt")\""
 [ -n "$message" ] && msg_field=",\"message\":\"$(json_escape "$message")\""
 
-body="$(printf '{"tty":"%s","state":"%s"%s%s%s}' \
-  "$esc_tty" "$state" "$tool_field" "$prompt_field" "$msg_field")"
+body="$(printf '{"tty":"%s","state":"%s"%s%s%s%s%s}' \
+  "$esc_tty" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field")"
 
 # --- fire-and-forget POST ----------------------------------------------------
 # Tight --max-time so a hung/absent server never stalls the agent. Backgrounded

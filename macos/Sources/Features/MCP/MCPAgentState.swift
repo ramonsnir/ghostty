@@ -24,6 +24,8 @@ enum MCPAgentState {
     /// or the other). `prompt`/`tool`/`message` are optional; `prompt`/`message` are
     /// truncated to `maxStringLen` (default 2000) so an enormous prompt can't bloat the
     /// payload. `state` strings accepted: "working", "waiting", "idle" (case-insensitive).
+    /// (suspend-resume) `claudeSessionId` (the `claude --resume <id>` token) and `cwd`
+    /// are optional too — captured passively from the hook, both capped.
     ///
     /// (cloud-hosts D6) A REMOTE box's hook can't name a LOCAL tty, so it POSTs a
     /// `{nonce, state}` body with NO `tty`; the `/agent-state` route resolves the nonce
@@ -67,13 +69,17 @@ enum MCPAgentState {
             return String(s.prefix(cap))
         }
 
+        // (suspend-resume) claudeSessionId + cwd ride EVERY Claude hook event and are
+        // captured passively. Modest caps: a session id is short; a path is bounded.
         return AgentStatePayload(
             tty: tty,
             state: state,
             prompt: optionalString("prompt", cap: maxStringLen),
             tool: optionalString("tool", cap: 256),
             message: optionalString("message", cap: maxStringLen),
-            nonce: nonce)
+            nonce: nonce,
+            claudeSessionId: optionalString("claudeSessionId", cap: 256),
+            cwd: optionalString("cwd", cap: 4096))
     }
 
     // MARK: - tty normalization + match (PURE)

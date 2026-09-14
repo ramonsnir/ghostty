@@ -102,6 +102,15 @@ enum MCPLayout {
         /// keys off THIS (not `processName`, which is `bash` under the claude-pool
         /// wrapper) to decide a surface is an agent worth summarizing.
         let agentKind: String?
+        /// fork / suspend-resume: Claude Code's OWN session id — the `claude --resume
+        /// <id>` token — captured passively from the hook. DISTINCT from `sessionID`
+        /// (the ghostty-host PTY id); never conflate them. nil for a non-Claude surface
+        /// / older hook. `var` + default so the (separate) WebMonitor SurfaceRow + test
+        /// constructors are unaffected.
+        var claudeSessionId: String? = nil
+        /// fork / suspend-resume: the agent's working dir (hook `cwd`), for respawn on
+        /// Resume. `var` + default, same rationale as `claudeSessionId`.
+        var agentCwd: String? = nil
         /// fork / Agent Manager: whether the user HID this surface's tile in the Agent
         /// Dashboard. Sourced from the dashboard model; false when the dashboard is
         /// disabled / the surface is unknown. The summarizer skips hidden tiles.
@@ -214,6 +223,8 @@ enum MCPLayout {
                     lastTool: hook?.lastTool,
                     notes: hook?.notes,
                     agentKind: hook?.agentKind,
+                    claudeSessionId: hook?.claudeSessionId,
+                    agentCwd: hook?.agentCwd,
                     hidden: hook?.hidden ?? false,
                     sessionID: sessionID,
                     hostName: view.hostName ?? "local",
@@ -250,6 +261,11 @@ enum MCPLayout {
             if let t = $0.lastTool { d["lastTool"] = t }
             if let notes = $0.notes { d["notes"] = notes }
             if let kind = $0.agentKind { d["agentKind"] = kind }
+            // fork / suspend-resume: Claude's own resume token + working dir, captured
+            // passively from the hook. Omitted when unknown. `claudeSessionId` is
+            // DISTINCT from `sessionID` (the host PTY id emitted below).
+            if let csid = $0.claudeSessionId { d["claudeSessionId"] = csid }
+            if let cwd = $0.agentCwd { d["cwd"] = cwd }
             // fork / Agent Manager: emit `hidden` only when true (absent ⇒ not
             // hidden), mirroring the omit-when-default style of the agent-* fields.
             if $0.hidden { d["hidden"] = true }
