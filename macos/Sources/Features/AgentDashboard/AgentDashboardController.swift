@@ -2108,7 +2108,12 @@ final class AgentDashboardController: NSWindowController {
     /// routed here from the AppDelegate notification observer). Always available regardless
     /// of `SuspendSettings.enabled` — a manual suspend is an explicit user gesture.
     func suspendSurface(_ view: Ghostty.SurfaceView) {
-        model.suspendSurfaceManually(view)
+        if !model.suspendSurfaceManually(view) {
+            // Never a silent no-op: tell the user why nothing happened.
+            view.showSuspendNotice(view.suspended
+                ? "Already suspended."
+                : "Can't suspend: no resumable Claude session captured in this split yet.")
+        }
     }
 
     /// Build a fresh `NSHostingView` mounting the shared `AgentDashboardView`. Used

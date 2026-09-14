@@ -235,6 +235,12 @@ extension Ghostty {
                         surfaceView: surfaceView,
                         backgroundColor: ghostty.config.backgroundColor)
                 }
+
+                // (ramon fork / suspend-resume) A brief top banner when a suspend gesture
+                // couldn't proceed — so the action is never a silent no-op.
+                if let notice = surfaceView.suspendNotice {
+                    SuspendNoticeOverlay(text: notice)
+                }
                 #endif
 
                 // If we're part of a split view and don't have focus, we put a semi-transparent
@@ -512,6 +518,34 @@ extension Ghostty {
                 )
                 .padding()
             }
+        }
+    }
+
+    /// (ramon fork / suspend-resume) A brief, non-interactive top banner shown when a
+    /// suspend gesture can't proceed (auto-dismissed by `SurfaceView.showSuspendNotice`).
+    struct SuspendNoticeOverlay: View {
+        let text: String
+        var body: some View {
+            VStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "moon.zzz")
+                        .foregroundStyle(.secondary)
+                    Text(text)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.background)
+                        .shadow(radius: 4))
+                .padding(.top, 12)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
+            .transition(.opacity)
+            .allowsHitTesting(false)
         }
     }
     #endif

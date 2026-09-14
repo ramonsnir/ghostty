@@ -328,6 +328,25 @@ extension Ghostty {
         /// fresh session. For a runtime suspend the app is re-fetched from the delegate.
         private var pendingResumeApp: ghostty_app_t?
 
+        /// (ramon fork / suspend-resume) A brief, auto-dismissing notice shown when a
+        /// suspend gesture can't proceed (e.g. this split has no captured resumable Claude
+        /// session yet) — so the action is never a silent no-op. @Published so the overlay
+        /// appears/vanishes.
+        @Published private(set) var suspendNotice: String?
+        private var suspendNoticeToken: Int = 0
+
+        /// Show a transient suspend notice for ~3s (latest wins; an older pending clear
+        /// won't dismiss a newer notice).
+        func showSuspendNotice(_ text: String) {
+            suspendNotice = text
+            suspendNoticeToken &+= 1
+            let token = suspendNoticeToken
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self, self.suspendNoticeToken == token else { return }
+                self.suspendNotice = nil
+            }
+        }
+
         /// (ramon fork / cloud-hosts, J1/D7) The host whose tunnel this surface
         /// has RETAINED via `RemoteTunnelController.retainTunnel`. Set exactly
         /// once when the deferred remote dial is armed (`subscribeRemoteReadiness`)
