@@ -466,6 +466,13 @@ pub const Surface = struct {
     /// A plain scalar (no ownership). 0 ⇒ the compiled-in default ceiling.
     pty_host_connect_timeout_s: u32 = 0,
 
+    /// (ramon fork / suspend-resume) NO-DIAL placeholder flag, carried from
+    /// `Options.no_dial` so the core `Surface.init` reads it off `rt_surface` and
+    /// threads it into `Client.Config.no_dial`. `true` ⇒ create the `.client`
+    /// surface but never connect (keyboard-live frozen placeholder for a restored
+    /// suspended split). A plain scalar (no ownership). `false` ⇒ dial as today.
+    no_dial: bool = false,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -543,6 +550,15 @@ pub const Surface = struct {
         /// compiled-in default ceiling. Appended last to keep the extern layout
         /// additive with the C header; zero-initialized callers get 0.
         pty_host_connect_timeout_s: u32 = 0,
+
+        /// (ramon fork / suspend-resume) NO-DIAL placeholder. true => create the
+        /// `.client` surface but NEVER connect: a keyboard-live frozen placeholder
+        /// for a restored suspended agent split (leader keys / command palette /
+        /// split-zoom all work) instead of a dead, surface-less pane. Requires the
+        /// `.client` backend (pty-host set). Default false = normal attach/spawn
+        /// (today's behavior). Appended last to keep the extern layout additive
+        /// with the C header; zero-initialized callers get false.
+        no_dial: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -569,6 +585,10 @@ pub const Surface = struct {
             // (cloud-hosts) Per-attempt redial connection ceiling (seconds); a
             // plain scalar the core Surface.init threads into Client.Config.
             .pty_host_connect_timeout_s = opts.pty_host_connect_timeout_s,
+            // (ramon fork / suspend-resume) Carry the no-dial placeholder flag
+            // through to the core Surface.init, which reads it off `rt_surface`
+            // when building the `.client` backend config (true => never connect).
+            .no_dial = opts.no_dial,
         };
 
         // Add ourselves to the list of surfaces on the app.

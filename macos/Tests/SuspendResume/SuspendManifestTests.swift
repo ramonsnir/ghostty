@@ -65,4 +65,55 @@ struct SuspendManifestTests {
         // restore
         if let saved { d.set(saved, forKey: key) } else { d.removeObject(forKey: key) }
     }
+
+    // MARK: - One-time re-attach seed (Fix 2)
+
+    @Test func parsesReattachSeedKeyedByUppercasedUUID() {
+        let json = """
+        { "surfaces": {
+            "2a14d41b-f26f-48cf-8572-ab1b262438da": {
+                "claudeSessionId": "6f0b1d10-7915-4e94-900f-91553c1f117a",
+                "cwd": "/Users/example/project", "agentKind": "claude",
+                "title": "PR #7124 implementation details" }
+        } }
+        """.data(using: .utf8)!
+        let seed = SuspendManifest.parseReattachSeed(json)
+        // Key is uppercased so it matches Foundation's UUID.uuidString.
+        let m = seed["2A14D41B-F26F-48CF-8572-AB1B262438DA"]
+        #expect(m?.claudeSessionId == "6f0b1d10-7915-4e94-900f-91553c1f117a")
+        #expect(m?.cwd == "/Users/example/project")
+        #expect(m?.agentKind == "claude")
+        #expect(m?.resumeInputLine == "claude-pool --resume 6f0b1d10-7915-4e94-900f-91553c1f117a\n")
+    }
+
+    @Test func reattachSeedDefaultsAgentKindToClaude() {
+        let json = """
+        { "surfaces": { "AAAAAAAA-0000-0000-0000-000000000000": {
+            "claudeSessionId": "sess-1", "cwd": "/x" } } }
+        """.data(using: .utf8)!
+        let seed = SuspendManifest.parseReattachSeed(json)
+        #expect(seed["AAAAAAAA-0000-0000-0000-000000000000"]?.agentKind == "claude")
+        #expect(seed["AAAAAAAA-0000-0000-0000-000000000000"]?.poolCommand == "claude-pool")
+    }
+
+    @Test func reattachSeedSkipsEntriesMissingIdOrCwd() {
+        let json = """
+        { "surfaces": {
+            "AAAAAAAA-0000-0000-0000-000000000000": { "claudeSessionId": "", "cwd": "/x" },
+            "BBBBBBBB-0000-0000-0000-000000000000": { "claudeSessionId": "ok", "cwd": "" },
+            "CCCCCCCC-0000-0000-0000-000000000000": { "claudeSessionId": "ok", "cwd": "/x" }
+        } }
+        """.data(using: .utf8)!
+        let seed = SuspendManifest.parseReattachSeed(json)
+        // Only the fully-specified entry survives (the others could never resume safely).
+        #expect(seed.count == 1)
+        #expect(seed["CCCCCCCC-0000-0000-0000-000000000000"] != nil)
+    }
+
+    @Test func reattachSeedFailsOpenOnGarbageOrMissing() {
+        #expect(SuspendManifest.parseReattachSeed(Data("not json".utf8)).isEmpty)
+        #expect(SuspendManifest.parseReattachSeed(Data("{}".utf8)).isEmpty)
+        // A missing file path yields an empty map (no crash, no behavior change).
+        #expect(SuspendManifest.loadReattachSeed(path: "/nonexistent/seed.json").isEmpty)
+    }
 }

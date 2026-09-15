@@ -991,11 +991,20 @@ extension Ghostty {
         /// only ever set by the Agent Dashboard's preview tiles.
         var mirror: Bool = false
 
+        /// (ramon fork / suspend-resume) NO-DIAL placeholder. When true the `.client`
+        /// surface is created but NEVER connects (see `ghostty_surface_config_s.no_dial`):
+        /// a keyboard-live frozen placeholder for a restored suspended split, so leader
+        /// keys / command palette / split-zoom work on it like a live split. Set together
+        /// with `suspendedResume` on RESTORE. Forwarded into the C config.
+        var noDial: Bool = false
+
         /// (ramon fork / suspend-resume) When set (only on RESTORE of a suspended
-        /// split), the surface comes back as a placeholder: `SurfaceView.init` does
-        /// NOT create a core surface (no spawn, no dial) — it marks itself `suspended`
-        /// and shows the Resume overlay, materializing a fresh session only when the
-        /// user resumes. GUI-only; never forwarded into the C `ghostty_surface_config_s`.
+        /// split), the surface comes back as a placeholder showing the Resume overlay.
+        /// `SurfaceView.init` creates a NO-DIAL core surface (`noDial = true` — a live
+        /// keybinding engine + renderer, but no host session: no spawn, no dial), and
+        /// materializes a fresh session only when the user resumes. This field itself is
+        /// GUI-only (never forwarded into the C config); `noDial` is what the C surface
+        /// sees.
         var suspendedResume: SuspendManifest?
 
         /// Wait after the command
@@ -1073,6 +1082,11 @@ extension Ghostty {
             // (ramon fork / Agent Dashboard) Read-only render mirror of a host
             // session. Default false => byte-identical attach/spawn behavior.
             config.mirror = mirror
+
+            // (ramon fork / suspend-resume) No-dial placeholder: create the `.client`
+            // surface but never connect (keyboard-live frozen placeholder for a
+            // restored suspended split). Default false => normal attach/spawn.
+            config.no_dial = noDial
 
             // (ramon fork / cloud-hosts, REG-T2) Per-attempt `.client` redial
             // connection ceiling in SECONDS (0 ⇒ compiled default). A plain scalar,

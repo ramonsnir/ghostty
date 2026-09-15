@@ -58,6 +58,65 @@ extension SuspendManifest {
     }
 }
 
+extension SuspendManifest {
+    /// (ramon fork / suspend-resume) ONE-TIME re-attach seed. A build that predates resume-id
+    /// persistence could suspend a split without ever recording its resume id (the id lived only
+    /// in GUI memory), so after a relaunch the split came back as a dead pane with no way to
+    /// Resume. This reads an operator-provided side table —
+    /// `~/.config/ghostty-ramon/suspend-reattach-seed.json`, keyed by the split's STABLE surface
+    /// UUID (which survives a relaunch in the window-state archive) — mapping each such dead leaf
+    /// to its recovered resume manifest. The archive-decode restore path consults it ONLY for a
+    /// surface with no archived manifest of its own, converting the dead leaf into a proper
+    /// suspended placeholder with a working Resume button. Consumed once; the file is meant to be
+    /// deleted after the splits are back. Fail-open: a missing/malformed file yields an empty map
+    /// (normal restore, no behavior change).
+    ///
+    /// Schema: `{ "surfaces": { "<UUID>": { claudeSessionId, cwd, agentKind?, title? } } }`.
+    /// Loaded once (cached) so repeated restore-decodes don't re-read disk.
+    static let reattachSeed: [String: SuspendManifest] = loadReattachSeed(path: defaultReattachSeedPath)
+
+    static var defaultReattachSeedPath: String {
+        (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".config/ghostty-ramon/suspend-reattach-seed.json")
+    }
+
+    /// Read + parse the seed file at `path`. Fail-open: any missing file / read / decode error
+    /// yields `[:]`. Separated from `parseReattachSeed` so the parse is unit-testable without a
+    /// filesystem.
+    static func loadReattachSeed(path: String) -> [String: SuspendManifest] {
+        guard let data = FileManager.default.contents(atPath: path) else { return [:] }
+        return parseReattachSeed(data)
+    }
+
+    /// One raw seed entry as authored in the JSON side table.
+    private struct ReattachSeedEntry: Decodable {
+        var claudeSessionId: String
+        var cwd: String
+        var agentKind: String?
+        var title: String?
+    }
+    private struct ReattachSeedFile: Decodable { var surfaces: [String: ReattachSeedEntry] }
+
+    /// PURE parse of the seed JSON → `[uppercased-UUID: manifest]`. Entries missing a session id
+    /// or cwd are skipped (they could never resume safely). `agentKind` defaults to `"claude"`.
+    static func parseReattachSeed(_ data: Data) -> [String: SuspendManifest] {
+        guard let file = try? JSONDecoder().decode(ReattachSeedFile.self, from: data) else { return [:] }
+        var out: [String: SuspendManifest] = [:]
+        for (uuid, e) in file.surfaces {
+            let key = uuid.uppercased()
+            guard !key.isEmpty, !e.claudeSessionId.isEmpty, !e.cwd.isEmpty else { continue }
+            out[key] = SuspendManifest(
+                claudeSessionId: e.claudeSessionId,
+                cwd: e.cwd,
+                agentKind: e.agentKind ?? "claude",
+                title: e.title ?? "",
+                lastPrompt: nil,
+                suspendedAt: Date())
+        }
+        return out
+    }
+}
+
 /// (ramon fork / suspend-resume) GUI-only settings for the idle auto-suspend scanner,
 /// persisted in `UserDefaults` — the same no-config-key approach the Agent Dashboard's
 /// `agentDashboardPresentation` uses. OFF by default (opt-in). A ghostty-ramon

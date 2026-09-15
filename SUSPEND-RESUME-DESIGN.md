@@ -289,9 +289,87 @@ function. (`GHOSTTY_ITEM_*`-style env is not needed for resume; the session id i
 
 ---
 
+## Part 7 — Keyboard parity on a RESTORED suspended split (the no-dial placeholder surface)
+
+**Problem.** A suspended split that a live GUI created keeps its `.client` surface (suspend =
+`closeSessionNow`, which closes the host session but leaves the libghostty surface — the frozen
+frame), so its keybinding engine stays live. But a suspended split RESTORED after a GUI relaunch
+originally came back with **`surfaceModel == nil`** (the archive-decode branch returned early
+without creating a surface). With no core surface, `SurfaceView.keyDown` fell into its
+`guard let surface … else { interpretKeyEvents } ` arm and **never reached `ghostty_surface_key`** —
+so leader sequences (`ctrl+a>z` zoom), the command palette, and `goto_split` silently did nothing.
+A zoomed suspended split was then a trap: you couldn't unzoom to reach its siblings.
+
+**Fix — a NO-DIAL `.client` surface.** A restored suspended split now gets a real libghostty
+surface whose keybinding engine + renderer are LIVE but which **never connects** — no host session,
+no spawn, no dial. Keyboard behaves exactly like a live split; only pty-bound bytes have nowhere to
+go (there is no pty), which is correct.
+
+Wiring (all additive; `no_dial=false` is byte-for-byte today's dialing path):
+- **`Client.Config.no_dial`** (`src/termio/Client.zig`) — new scalar. `connectAndAttach` early-returns
+  BEFORE `connectUnix`, installing an INERT `ThreadData` (`write_stream = initFd(-1)` whose xev
+  `deinit` is a no-op; `read_thread_pipe`/`read_thread_fd` = -1; `read_thread_live=false`; empty
+  write pools). `session_id` stays 0 and `render_state` stays `.empty` (blank). `sendFrame` is gated
+  on `no_dial` so queued resize/focus/input frames never touch the uninitialized stream. Teardown
+  (`threadExit`/`ThreadData.deinit`) is already guarded on `read_thread_live`, so the inert state is
+  leak- and crash-safe.
+- **ABI plumbing** — `ghostty_surface_config_s.no_dial` (`include/ghostty.h`, appended last),
+  `Surface.Options.no_dial` + the apprt `Surface.no_dial` field + `Surface.init` copy
+  (`src/apprt/embedded.zig`), and a defensive `@hasField` read in `src/Surface.zig` that threads it
+  into `Client.Config` and forces the redial arms off (a placeholder has no session to redial).
+- **Swift** — `SurfaceConfiguration.noDial` → `config.no_dial` in `withCValue`; the archive-decode
+  restore branch (`SurfaceView_AppKit.swift`) now creates a `noDial=true` surface (working directory
+  from the manifest, sessionID NOT reattached) instead of returning `surfaceModel == nil`. Resume is
+  unchanged: it drops this surface (inert-safe) and materializes a fresh dialing session in the same
+  view.
+
+**Why this is still NOT a host restart.** `Client.zig`/`Surface.zig` ARE compiled into `ghostty-host`
+(the backend union codegens both arms), so the host BINARY bytes change — but the host only ever
+instantiates `.exec`, never `.client`, so the `no_dial` guard is **dead code the host never executes**.
+The host's runtime behavior and wire protocol are unchanged. So this ships as a **Zig + lib** rebuild
+(xcframework + app) with **no `ghostty-host` redeploy and no session loss** — the running host keeps
+going. (Redeploy class: **Zig + lib**, not Host — the one exception noted in `CLAUDE.md`'s "no host
+restart if the change isn't compiled into `ghostty-host`", here refined to "not EXECUTED by it".)
+
+**Tests.** `client_difftest.zig` T4 (`no_dial` installs an inert backend: no connect against a bogus
+path, no fd opened, safe leak-free teardown). The keyboard parity itself is a ReleaseLocal smoke
+(restore a suspended split, press `ctrl+a>z` and open the palette on it).
+
+---
+
+## Part 8 — One-time re-attach seed (recovery for pre-persistence suspends)
+
+**Problem.** A split suspended by a build that predated resume-id persistence (Part 5's archive keys
+/ Part 1's `PersistedAgentState`) recorded its resume id only in GUI memory. After a relaunch it came
+back as a dead leaf with no manifest, so its Resume button had nothing to run — the id was
+recoverable from Claude's on-disk transcript but not re-attached to the GUI split.
+
+**Fix — a UUID-keyed seed the restore path consults once.** An operator side table
+`~/.config/ghostty-ramon/suspend-reattach-seed.json`, keyed by each split's STABLE surface UUID
+(which survives a relaunch in the window-state archive), maps a dead leaf to its recovered manifest:
+
+```
+{ "surfaces": { "<UUID>": { "claudeSessionId": "...", "cwd": "...", "agentKind": "claude", "title": "..." } } }
+```
+
+`SuspendManifest.parseReattachSeed` (pure, unit-tested) + `reattachSeed` (cached load) read it; the
+archive-decode restore path (`SurfaceView_AppKit.swift`) fills `config.suspendedResume` from the seed
+**only when the surface has no archived manifest of its own** (so a normally-persisted suspend always
+wins), converting the dead leaf into a Part-7 no-dial placeholder with a working Resume button.
+Fail-open: a missing/malformed file yields an empty map (normal restore). It is meant to be **consumed
+once** and the file deleted after the splits are back. Redeploy: **GUI only**.
+
+---
+
 ## Testing plan — GUI/lib only, NO host restart
 
-Because there is no host change (Part 3), there is nothing to deploy to `ghostty-host` and no
+> **Note (Part 7):** the no-dial placeholder adds a **Zig + lib** change (a new `.client`-only
+> config field), so it needs the xcframework rebuilt (`zig build -Demit-macos-app=false
+> -Doptimize=ReleaseFast` + `rm -rf macos/build/ReleaseLocal` + app build). It is STILL **no host
+> restart / no session loss**: the new code is dead in `ghostty-host` (the host never runs `.client`).
+> The rest of the feature (Parts 1–6, 8) stays Swift-GUI-only.
+
+Because there is no host BEHAVIOR change (Parts 3, 7), there is nothing to deploy to `ghostty-host` and no
 session-loss restart to schedule. The feature ships as a normal GUI/lib relaunch:
 
 - **Unit tests** (the safe, CI-able bulk): the pure `SuspendPolicy` business-day/selection helper

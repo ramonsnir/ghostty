@@ -572,15 +572,38 @@ extension Ghostty {
             // round-trips through restorable state paired with `sessionID` (D3).
             self.hostName = surface_cfg.hostName
 
-            // (ramon fork / suspend-resume) A RESTORED suspended split defers surface
-            // creation entirely: it comes back as a placeholder (surfaceModel == nil)
-            // showing the Resume overlay, and materializes a FRESH session only when the
-            // user resumes. This must precede the host dial/spawn below (a suspended split
-            // never dials or spawns). Local-only for the MVP.
+            // (ramon fork / suspend-resume) A RESTORED suspended split comes back as a
+            // placeholder showing the Resume overlay, and materializes a FRESH session
+            // only when the user resumes. This must precede the host dial/spawn below (a
+            // suspended split never dials or spawns). Local-only for the MVP.
+            //
+            // It gets a LIVE but NO-DIAL core surface (`noDial = true`): the `.client`
+            // backend is created with a live keybinding engine + renderer but never
+            // connects (no host session, no spawn). This is what makes keyboard shortcuts
+            // — leader sequences (ctrl+a>z zoom), the command palette, goto_split — work
+            // on a suspended split exactly like a live one; a surface-less placeholder
+            // (the old behavior) routed keyDown through `interpretKeyEvents` and silently
+            // swallowed every keybind. The working directory is carried so a later Resume
+            // spawns in the right place; sessionID is deliberately NOT reattached (the old
+            // host session is gone).
             if let manifest = surface_cfg.suspendedResume {
                 self.suspended = true
                 self.suspendManifest = manifest
                 self.pendingResumeApp = app
+
+                var placeholderCfg = SurfaceConfiguration()
+                placeholderCfg.noDial = true
+                placeholderCfg.workingDirectory = manifest.cwd
+                let created = placeholderCfg.withCValue(view: self) { surface_cfg_c in
+                    ghostty_surface_new(app, &surface_cfg_c)
+                }
+                if let created {
+                    self.surfaceModel = Ghostty.Surface(cSurface: created)
+                } else {
+                    // Never crash a restore: fall back to the surface-less placeholder
+                    // (keyboard won't work on it, but the Resume overlay still does).
+                    self.error = Ghostty.Error.apiFailed
+                }
                 updateTrackingAreas()
                 registerForDraggedTypes(Array(Self.dropTypes))
                 return
@@ -2602,6 +2625,20 @@ extension Ghostty {
             if wasSuspended {
                 config.suspendedResume = try container.decodeIfPresent(
                     SuspendManifest.self, forKey: .suspendManifest)
+            }
+
+            // (ramon fork / suspend-resume) ONE-TIME re-attach seed. A split suspended by a build
+            // that predated resume-id persistence has NO archived manifest (config.suspendedResume
+            // == nil above) and would otherwise restore as a dead leaf that adopts a fresh shell.
+            // If this surface's STABLE uuid is listed in the operator seed
+            // (~/.config/ghostty-ramon/suspend-reattach-seed.json), restore it as a suspended
+            // placeholder with the recovered manifest instead — so the split comes back with a
+            // working Resume button. Only fills in when there's no archived manifest of its own, so
+            // a normally-persisted suspend always wins. Fail-open (empty seed ⇒ no-op).
+            if config.suspendedResume == nil, let uuid,
+               let seeded = SuspendManifest.reattachSeed[uuid.uuidString.uppercased()] {
+                config.suspendedResume = seeded
+                Ghostty.logger.info("suspend-resume: re-attached seed manifest to surface \(uuid.uuidString, privacy: .public)")
             }
 
             self.init(app, baseConfig: config, uuid: uuid)

@@ -722,6 +722,17 @@ pub fn init(
                 @TypeOf(rt_surface.*),
                 "mirror",
             )) rt_surface.mirror else false;
+            // (ramon fork / suspend-resume) NO-DIAL placeholder flag, read
+            // defensively (same @hasField pattern) so apprts without the field
+            // compile to a normal dialing client. `true` ⇒ create the `.client`
+            // surface but never connect (keyboard-live frozen placeholder for a
+            // restored suspended split). Forces the redial arms off (a placeholder
+            // has no session to redial) — and connectAndAttach returns before the
+            // arming block anyway, so this is belt-and-suspenders.
+            const req_no_dial: bool = if (@hasField(
+                @TypeOf(rt_surface.*),
+                "no_dial",
+            )) rt_surface.no_dial else false;
             const client_role: termio.Client.Role =
                 if (req_mirror and req_session_id != 0) .mirror else .attach;
             const io_client = try termio.Client.init(alloc, .{
@@ -729,6 +740,8 @@ pub fn init(
                 .render_mutex = mutex,
                 .session_id = termio.Client.sessionIdFromConfig(req_session_id),
                 .role = client_role,
+                // (ramon fork / suspend-resume) See `req_no_dial` above.
+                .no_dial = req_no_dial,
                 // (cloud-hosts) Identity label for the `(host_name, session_id)`
                 // pair. Client.init DUPES it, so the borrowed slice need not
                 // outlive this call. `null` ⇒ "local" (today's behavior).
@@ -742,7 +755,7 @@ pub fn init(
                 // role: a `.mirror` NEVER redials via this machine (it self-heals
                 // via the macOS AgentPreviewTile backoff). So `local`/nil host and
                 // mirrors stay byte-for-byte single-shot (reconnect=false).
-                .reconnect = per_surface_sock != null and client_role == .attach,
+                .reconnect = !req_no_dial and per_surface_sock != null and client_role == .attach,
                 // FORK(host-handoff): the INVERSE population — a LOCAL `.attach`
                 // surface (no per-surface socket override ⇒ the global `pty-host`
                 // scalar ⇒ the local host) opts into a BOUNDED redial so it can
@@ -753,7 +766,7 @@ pub fn init(
                 // exactly one of {reconnect, handoff_redial} is true and a `.mirror`
                 // gets NEITHER — never both. A genuinely-dead local host is NOT
                 // stormed: the redial is capped (see `shouldKeepRedialing`).
-                .handoff_redial = per_surface_sock == null and client_role == .attach,
+                .handoff_redial = !req_no_dial and per_surface_sock == null and client_role == .attach,
                 // (cloud-hosts / REG-T2) Per-attempt redial connection ceiling
                 // (seconds); 0 ⇒ the compiled-in default. Read defensively so
                 // apprts without the field compile to 0.

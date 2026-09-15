@@ -530,6 +530,13 @@ typedef struct {
   // default) ⇒ the compiled-in default ceiling. Appended last so the ABI stays
   // additive; zero-initialized callers get 0.
   uint32_t pty_host_connect_timeout_s;
+  // (ramon fork / suspend-resume) NO-DIAL placeholder. true ⇒ create the
+  // `.client` surface but NEVER connect: a keyboard-live frozen placeholder for a
+  // restored suspended agent split (leader keys / command palette / split-zoom
+  // work) instead of a dead, surface-less pane. Requires the `.client` backend
+  // (pty-host set). false (the default) ⇒ normal attach/spawn (today's behavior).
+  // Appended last so the ABI stays additive; zero-initialized callers get false.
+  bool no_dial;
 } ghostty_surface_config_s;
 
 typedef struct {

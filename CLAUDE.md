@@ -36,7 +36,7 @@ The docs:
 | `CLOUD-QUEUE-BALANCING.md` | per-queue multi-host load balancing |
 | `PTYHOST.md` | pty-host architecture, session lifecycle, write-pool fix, launchd LaunchAgent deploy |
 | `HOST-HANDOFF.md` | session-preserving `ghostty-host` upgrades: supervisor+worker, the handoff sequence, fd/child ownership contract, triggers (SIGHUP + exec-path self-check), the switchover deploy |
-| `SUSPEND-RESUME-DESIGN.md` | PROPOSED — suspend idle Claude agent splits (kill child to reclaim RAM, keep frozen placeholder, Resume via `claude-pool --resume <id>`); Claude-first, Codex postponed |
+| `SUSPEND-RESUME-DESIGN.md` | Suspend idle Claude agent splits (kill child to reclaim RAM, keep frozen placeholder, Resume via `claude-pool --resume <id>`). A RESTORED placeholder gets a live **no-dial `.client` surface** (Part 7) so keyboard/leader/palette work on it — the one **Zig+lib** bit (dead code in `ghostty-host` → still **no host restart**); a one-time UUID-keyed **re-attach seed** (Part 8, `~/.config/ghostty-ramon/suspend-reattach-seed.json`) recovers pre-persistence suspends. Rest is GUI-only. Claude-first, Codex postponed |
 | `FORK-FIXES.md` | standalone robustness / upstream-bug fixes (`CachedValue` crash) |
 | `FORK-DISTRIBUTION.md` | fork identity (bundle id / icon / update feed), colleague DMG release, `ForkSetup` first-launch (supervisor LaunchAgent + two-identity host reload) |
 | `FORK-DEV.md` | the macOS build / test / install iteration lifecycle |

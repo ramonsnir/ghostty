@@ -1144,6 +1144,50 @@ test "client lifecycle T3 forced Attach-send failure unwinds cleanly (finding #2
     // (deferred) frees only the decode-side mirror.
 }
 
+test "client lifecycle T4 no_dial installs an inert backend (no connect, no fd, safe teardown)" {
+    // (ramon fork / suspend-resume) A no-dial placeholder client must NEVER connect:
+    // connectAndAttach returns before connectUnix, installs an INERT ThreadData, and
+    // opens no fd; teardown over that inert state is safe + leak-free. Proven with a
+    // BOGUS socket path — a dial would fail on it, but no-dial never dials.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const alloc = testing.allocator;
+
+    // Deliberately NO TestListener: nothing to connect to.
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    var client = try Client.init(alloc, .{
+        .socket_path = "/nonexistent/no-dial.sock",
+        .no_dial = true,
+    });
+    defer client.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    td.alloc = alloc;
+    td.loop = &loop;
+
+    const before = countOpenFds(FD_PROBE_LIMIT);
+
+    // Must NOT error (never dials the bogus path) and must NOT open any fd.
+    td.backend = .{ .client = undefined };
+    try client.connectAndAttach(alloc, &loop, &td.backend.client, undefined);
+
+    // The installed backend is inert: no live read thread, pipe/fd sentinels -1,
+    // and the Client holds no socket.
+    try testing.expect(!td.backend.client.read_thread_live);
+    try testing.expectEqual(@as(std.posix.fd_t, -1), td.backend.client.read_thread_pipe);
+    try testing.expectEqual(@as(std.posix.fd_t, -1), td.backend.client.read_thread_fd);
+    try testing.expect(client.socket_fd == null);
+
+    // No fd opened by the no-dial connect path.
+    try testing.expectEqual(before, countOpenFds(FD_PROBE_LIMIT));
+
+    // Teardown over the inert backend is safe (no join, no double-close) + leak-free.
+    client.threadExit(&td);
+    td.backend.deinit(alloc);
+    try testing.expectEqual(before, countOpenFds(FD_PROBE_LIMIT));
+}
+
 // --- handleFrame arm coverage (finding #6) ---
 //
 // The .mode_frame / .attached / .child_exited arms of handleFrame were never

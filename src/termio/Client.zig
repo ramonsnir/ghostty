@@ -622,6 +622,19 @@ pub const Config = struct {
     /// `0` ⇒ `DEFAULT_CONNECT_TIMEOUT_S`. A SCALAR copied by value.
     connect_timeout_s: u32 = 0,
 
+    /// (ramon fork / suspend-resume) NO-DIAL placeholder client. `true` ⇒ this
+    /// `.client` surface is created but NEVER connects: `connectAndAttach` installs
+    /// an INERT ThreadData (no socket, no read thread, sentinels -1) and returns,
+    /// so the core Surface's keybinding engine + renderer are LIVE while nothing
+    /// dials or spawns. `session_id` stays 0 and `render_state` stays `.empty`
+    /// (blank), so there is no fresh id and no host session. Used to restore a
+    /// SUSPENDED agent split after a GUI relaunch as a keyboard-live frozen
+    /// placeholder (leader keys / command palette / split-zoom all work), instead
+    /// of a dead, surface-less pane. A SCALAR copied by value. `.client`-only —
+    /// the host never selects `.client`, so this is inert in `ghostty-host`.
+    /// `false` (default) is byte-for-byte today's dialing path.
+    no_dial: bool = false,
+
     /// FORK(host-handoff): the DERIVED arming predicate for the IO-thread redial
     /// machine. `true` ⇒ arm it (create the async/timers, wake it on a drop, and
     /// hold outbound frames via `.reconnecting` during the gap). A remote
@@ -914,6 +927,26 @@ pub fn connectAndAttach(
     client_td: *ThreadData,
     io: *termio.Termio,
 ) !void {
+    // (ramon fork / suspend-resume) NO-DIAL placeholder: never connect. Install an
+    // INERT ThreadData so the union is a valid `.client` (not `undefined`) and
+    // teardown is safe — read_thread_live stays false (its default) so
+    // threadExit/ThreadData.deinit skip the join; the pipe/fd sentinels are -1 so
+    // nothing is closed; the write pools are empty (freeing an empty pool is a
+    // no-op); the write_stream wraps -1 and its `deinit` is a no-op on this xev
+    // backend (never closes an fd). `self.socket_fd` is left null; `sendFrame` is
+    // gated on `no_dial` so no resize/focus/input frame ever touches this stream.
+    // The core Surface's keybinding engine + renderer run normally (render_state
+    // stays `.empty` → blank, over which the GUI draws the Resume overlay).
+    if (self.config.no_dial) {
+        client_td.* = .{
+            .write_stream = xev.Stream.initFd(-1),
+            .read_thread = undefined,
+            .read_thread_pipe = -1,
+            .read_thread_fd = -1,
+        };
+        return;
+    }
+
     // Connect to the ptyhost over AF_UNIX SOCK_STREAM.
     const fd = try connectUnix(self.config.socket_path);
     errdefer posix.close(fd);
@@ -2174,6 +2207,12 @@ fn sendFrame(
     // `.mirror` client (neither flag) never does, so this stays a byte-for-byte
     // no-op on the single-shot path.
     if (self.client_state.load(.acquire) == .reconnecting) return;
+    // (ramon fork / suspend-resume) A no-dial placeholder has no socket / write
+    // stream (connectAndAttach installed an inert ThreadData). Drop every stateful
+    // frame so nothing touches it. Keybinding actions are consumed by the core
+    // Surface BEFORE termio, so keyboard parity is unaffected; only pty-bound bytes
+    // are dropped, and there is no pty.
+    if (self.config.no_dial) return;
     std.debug.assert(td.backend == .client);
     try sendFrameRaw(&td.backend.client, td.loop, td.alloc, tag, frame);
 }
