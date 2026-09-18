@@ -241,8 +241,18 @@ test("parseStore drops individual records missing required identity fields", () 
 test("isAssignmentState guards the union", () => {
   assert.ok(isAssignmentState("RUNNING"));
   assert.ok(isAssignmentState("COOLDOWN"));
+  // (suspend-resume) SUSPENDED must be a recognized state or parseStore drops a persisted
+  // suspended record on rehydrate (losing its slot on the next reconcile).
+  assert.ok(isAssignmentState("SUSPENDED"));
   assert.ok(!isAssignmentState("running"));
   assert.ok(!isAssignmentState("nope"));
+});
+
+test("serializeStore -> parseStore round-trips a SUSPENDED record (survives sidecar restart)", () => {
+  const rec = asgn({ state: "SUSPENDED", sessionID: 0 });
+  const round = parseStore(serializeStore([rec]));
+  assert.equal(round.length, 1);
+  assert.equal(round[0].state, "SUSPENDED");
 });
 
 // ---------------------------------------------------------------------------
@@ -341,6 +351,58 @@ test("reconcile: finalized record whose session vanished (PAST grace) => prune (
   assert.equal(a.kind, "prune");
   if (a.kind === "prune") assert.equal(a.reason, "session-gone");
   assert.equal(plan.kept.length, 0);
+});
+
+test("reconcile: a queue record whose surface is SUSPENDED (session Closed → sessionID 0) is KEPT as SUSPENDED, not session-gone-pruned (retains its slot)", () => {
+  // (suspend-resume) The reported over-pack bug: a live agent split is suspended — its host
+  // session is Closed so the row reports sessionID 0 while keeping its stable UUID. The record
+  // still carries the OLD non-zero sessionID and an OLD sinceMs (well past grace), so WITHOUT the
+  // fix it would session-gone-prune → free the slot → a replacement packs into the same tab.
+  const rec = asgn({ sessionID: 300, surfaceUUID: "u1", gridSlot: 2, sinceMs: 1000, state: "RUNNING" });
+  // Suspended surface: sessionID 0, same UUID, and (realistically) the queueKey annotation is gone.
+  const suspendedSurface = live({ sessionID: 0, surfaceUUID: "u1", suspended: true, queueKey: undefined, queueName: undefined });
+  const plan = reconcile([rec], [suspendedSurface], 1000 + 30001, 30000);
+  assert.equal(plan.actions.length, 1);
+  const a = plan.actions[0];
+  assert.equal(a.kind, "active"); // NOT a prune
+  if (a.kind === "active") {
+    assert.equal(a.assignment.state, "SUSPENDED");
+    assert.equal(a.assignment.sessionID, 0); // session is gone; reset so RESUME backfills a fresh id
+    assert.equal(a.assignment.surfaceUUID, "u1");
+    assert.equal(a.assignment.gridSlot, 2); // grid cell reserved
+    assert.equal(a.needsAnnotationRestamp, true); // lost annotation → re-stamp the placeholder's queue tag
+  }
+  assert.equal(plan.kept.length, 1);
+  assert.equal(plan.kept[0].state, "SUSPENDED");
+});
+
+test("reconcile: a SUSPENDED record whose surface stays suspended across sweeps stays SUSPENDED (never no-pty-host-pruned; sinceMs preserved)", () => {
+  // Second+ sweep: the record is already SUSPENDED with sessionID 0. It must NOT be mistaken for a
+  // never-attached (no-pty-host) sessionID-0 record and pruned.
+  const rec = asgn({ sessionID: 0, surfaceUUID: "u1", state: "SUSPENDED", sinceMs: 5000 });
+  const plan = reconcile([rec], [live({ sessionID: 0, surfaceUUID: "u1", suspended: true })], 5000 + 999999, 30000);
+  assert.equal(plan.actions.length, 1);
+  assert.equal(plan.actions[0].kind, "active");
+  assert.equal(plan.kept.length, 1);
+  assert.equal(plan.kept[0].state, "SUSPENDED");
+  assert.equal(plan.kept[0].sinceMs, 5000); // steady re-observation preserves the entry time
+});
+
+test("reconcile: a SUSPENDED record whose surface RESUMED (fresh session attached) backfills the session and transitions to RUNNING", () => {
+  const rec = asgn({ sessionID: 0, surfaceUUID: "u1", gridSlot: 2, state: "SUSPENDED", sinceMs: 5000 });
+  // Resume minted a NEW host session (500) on the SAME pane; the surface is no longer suspended.
+  const resumed = live({ sessionID: 500, surfaceUUID: "u1", suspended: false, queueKey: undefined, queueName: undefined });
+  const plan = reconcile([rec], [resumed], 9000, 30000);
+  assert.equal(plan.actions.length, 1);
+  const a = plan.actions[0];
+  assert.equal(a.kind, "active");
+  if (a.kind === "active") {
+    assert.equal(a.assignment.state, "RUNNING"); // rejoined the live lifecycle
+    assert.equal(a.assignment.sessionID, 500); // fresh id backfilled
+    assert.equal(a.assignment.gridSlot, 2); // same cell
+  }
+  assert.equal(plan.kept.length, 1);
+  assert.equal(plan.kept[0].state, "RUNNING");
 });
 
 test("reconcile: reconcileStartedMs SHIELDS a long-lived RUNNING record from a transient post-restart empty list (premature-prune fix)", () => {

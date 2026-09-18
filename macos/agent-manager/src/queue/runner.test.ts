@@ -1779,6 +1779,7 @@ test("occupiesSlot: only the live, pre/in-flight states occupy a slot", () => {
     DONE_PENDING: true,
     CLOSING: true,
     EXITED: false, // kept-but-freed (leave-and-bell) — blocks re-dispatch, frees the slot
+    SUSPENDED: true, // (suspend-resume) keeps its GUI pane → RETAINS concurrency + grid slot
     FINISHED: false,
     FAILED: false,
     COOLDOWN: false,

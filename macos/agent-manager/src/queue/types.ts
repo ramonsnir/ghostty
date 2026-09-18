@@ -407,6 +407,14 @@ export interface WorkItem {
  *
  *   EXITED: process exited early (before completion) — keep the split (leave-and-bell),
  *           free the slot. NOT auto-re-queued.
+ *
+ *   SUSPENDED: (ramon fork / suspend-resume) the split was SUSPENDED — its child was killed
+ *           to reclaim RAM but the GUI pane is KEPT as a frozen placeholder (see
+ *           SUSPEND-RESUME-DESIGN.md). UNLIKE EXITED, a suspended split STILL OCCUPIES its
+ *           concurrency + grid slot (`occupiesSlot` counts it) so the queue never reclaims the
+ *           slot and packs a replacement into the same tab (the over-pack bug). Re-matched by
+ *           the stable surface UUID (its host session is Closed ⇒ row sessionID 0). On RESUME
+ *           the surface attaches a fresh session and the record transitions back to a live state.
  */
 export type AssignmentState =
   | "QUEUED"
@@ -417,6 +425,7 @@ export type AssignmentState =
   | "FINISHED"
   | "FAILED"
   | "EXITED"
+  | "SUSPENDED"
   | "COOLDOWN";
 
 /** A live binding of a work-item key to a spawned surface, with lifecycle state.

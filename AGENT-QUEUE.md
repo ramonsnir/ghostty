@@ -562,6 +562,11 @@ after a restart with no re-dispatch** (tracked by its `scheduleId` annotation OR
   queue **continuously consolidates**: when a whole tab's panes fit an earlier tab's free space it moves
   them there and closes the emptied tab (over a few sweeps). It leaves a balanced layout alone (`4 + 4`,
   `5 + 2` with a 6-pane grid). The move is focus-preserving (never yanks focus or raises a window).
+- **A suspended agent keeps its slot** — if you [suspend](SUSPEND-RESUME-DESIGN.md) a queue-managed split
+  (to reclaim RAM), it stays counted against the queue's concurrency AND its grid cell: the queue will
+  **not** pack a replacement into the freed space, so the tab never over-fills. The suspended pane parks a
+  running slot until you **Resume** it (which rejoins the run) or close it. (Before this, a suspended split
+  vanished from the queue's count and a 6-slot tab could grow to 7 panes.)
 - **Restart-proof** — a started queue, its tiles, and its in-flight items survive a sidecar or GUI restart
   with no re-dispatch and no orphaned agents. (A *host* restart loses all RAM-only sessions, as always.)
 - **Closes cleanly** — only when the item is provider-`done` **and** its agent has been quiescent (idle

@@ -479,6 +479,7 @@ const ALL_STATES: ReadonlySet<string> = new Set<AssignmentState>([
   "FINISHED",
   "FAILED",
   "EXITED",
+  "SUSPENDED",
   "COOLDOWN",
 ]);
 
@@ -609,6 +610,12 @@ export function finalizeRecord(
  *  caller projects `list_surfaces` rows + the annotation read into this. */
 export interface LiveSurface {
   sessionID: number;
+  /** (ramon fork / suspend-resume) TRUE when this surface is a SUSPENDED placeholder (its host
+   *  session was Closed to reclaim RAM, so `sessionID` reads 0, but the GUI pane + stable UUID
+   *  remain). Reconcile re-matches such a surface to its record by UUID and KEEPS it in the
+   *  SUSPENDED state so its concurrency + grid slot are retained (not reclaimed / over-packed).
+   *  Projected from `Surface.suspended`. */
+  suspended?: boolean;
   /** (ramon fork / cloud-hosts, Phase 4 Q2) The host the surface's session lives on — paired
    *  with `sessionID` via `sessionKey` for the cross-host reconcile match. OPTIONAL / OMITTED ⇒
    *  `"local"` (every read defaults it), so existing single-host callers/tests are unaffected.
@@ -767,6 +774,40 @@ export function reconcile(
       continue;
     }
 
+    // (ramon fork / suspend-resume) SUSPENDED re-match, BEFORE any prune. A queue-managed split
+    // that was suspended keeps its GUI pane but Closes its host session, so its row now reports
+    // sessionID 0 (no liveBySession match above) while keeping its STABLE UUID. Re-match by UUID:
+    // if that surface is `suspended`, KEEP the record in the SUSPENDED state — retaining BOTH its
+    // concurrency slot and its grid cell (`occupiesSlot` counts SUSPENDED) so the queue never
+    // frees the slot and packs a replacement into the same tab (the over-pack bug). Reset
+    // `sessionID` to 0 (the session IS gone) so that on RESUME — when the surface attaches a fresh
+    // session — the sessionID-0 UUID branch below backfills the new id and transitions the record
+    // back to a live state. `gridSlot` is preserved so the cell stays reserved. This runs for
+    // records of ANY prior sessionID (a live split suspends with a non-zero recorded id) and is
+    // placed ahead of BOTH the non-zero "session-gone" prune and the sessionID-0 "no-pty-host"
+    // prune so a suspended placeholder is never mistaken for a vanished session.
+    const suspendedLive =
+      rec.surfaceUUID !== undefined ? liveByUUID.get(rec.surfaceUUID) : undefined;
+    if (suspendedLive !== undefined && suspendedLive.suspended === true) {
+      claimedUUIDs.add(suspendedLive.surfaceUUID);
+      const refreshed: Assignment = {
+        ...rec,
+        sessionID: 0,
+        surfaceUUID: suspendedLive.surfaceUUID,
+        state: "SUSPENDED",
+        // Stamp the entry time only on the transition INTO suspended (steady re-observation
+        // keeps the original), matching the state-machine `sinceMs` convention.
+        sinceMs: rec.state === "SUSPENDED" ? rec.sinceMs : nowMs,
+      };
+      // Re-stamp the queue annotation if the suspended surface lost it (the hook lease that
+      // carries queueKey expires once the child is gone), so the placeholder still reads as
+      // belonging to this run.
+      const needsAnnotationRestamp = suspendedLive.queueKey !== rec.key;
+      actions.push({ kind: "active", assignment: refreshed, needsAnnotationRestamp });
+      kept.push(refreshed);
+      continue;
+    }
+
     // No live surface for this record.
     if (rec.sessionID !== 0) {
       // Finalized but the session is not (yet) in list_surfaces. A FRESHLY-finalized
@@ -820,6 +861,11 @@ export function reconcile(
           ...rec,
           sessionID: liveByUuid.sessionID,
           surfaceUUID: liveByUuid.surfaceUUID,
+          // (ramon fork / suspend-resume) RESUME transition: a SUSPENDED record whose surface has
+          // re-attached a fresh session is live again — move it back to RUNNING (fresh `sinceMs`)
+          // so it rejoins the normal lifecycle (status probes, idle-fold, close loop). Any other
+          // state (a pending spawn attaching its session) is preserved unchanged.
+          ...(rec.state === "SUSPENDED" ? { state: "RUNNING" as AssignmentState, sinceMs: nowMs } : {}),
         };
         const needsAnnotationRestamp = liveByUuid.queueKey !== rec.key;
         actions.push({ kind: "active", assignment: refreshed, needsAnnotationRestamp });

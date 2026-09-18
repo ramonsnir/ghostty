@@ -225,7 +225,10 @@ Includes **adopt a free split**, **hero agents** (→ `HERO-AGENTS.md`), **sched
 scan agents), the compact-grid retiling, and **per-queue multi-host** (→ `CLOUD-QUEUE-BALANCING.md`).
 ⚠️ Recurring chokepoint: a new queue command/annotation field must be whitelisted in
 `coerceQueueCommands` (`mcp.ts`) and emitted on `list_surfaces` rows (`MCPLayout.surfacesJSONData`)
-or it is SILENTLY DROPPED. GUI relaunch + rebuilt sidecar `dist`; usually no host/Zig change.
+or it is SILENTLY DROPPED. A **suspended** queue split keeps its slot: a `SUSPENDED` `AssignmentState`
+that `occupiesSlot` counts, re-matched in `reconcile` by stable surface UUID (its session Closes →
+`sessionID 0`), so the queue never reclaims the slot / over-packs the tab; resume transitions it back
+to RUNNING (→ `AGENT-QUEUE-INTERNALS.md`). GUI relaunch + rebuilt sidecar `dist`; usually no host/Zig change.
 
 ### PTY-host + session lifecycle → `PTYHOST.md`
 The `.client` emulation-on-host backend: sessions survive a GUI quit/relaunch (RAM-only; a HOST

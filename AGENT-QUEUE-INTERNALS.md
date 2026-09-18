@@ -307,6 +307,41 @@ change** (pure Swift + TS).
   reclamation, and the `sessionID:0` self-disable — were the adversarial-review blockers; all fixed +
   regression-tested.)
 
+### Suspended splits RETAIN their slot (the `SUSPENDED` state) — no over-pack
+
+- **The bug:** suspending a queue-managed split (`suspend_split` / the idle scanner — see
+  `SUSPEND-RESUME-DESIGN.md`) kills the child and Closes its host session but KEEPS the GUI pane. The
+  row then reports `sessionID 0` (session gone) while keeping its stable UUID. `reconcile` matches a
+  finalized record by `(host, sessionID)` and only falls back to UUID for `sessionID:0` records — so a
+  finalized record whose surface drops to `sessionID 0` found no match, was **session-gone-pruned**, its
+  concurrency + grid slot was freed, and the next dispatch packed a REPLACEMENT into the same tab → a
+  6-slot tab ended up with 7 panes (6 live + 1 orphaned suspended).
+- **The fix (`SUSPENDED` state):** a new `AssignmentState = "SUSPENDED"` that `occupiesSlot` counts as
+  occupying (it is NOT in the EXITED/FINISHED/FAILED/COOLDOWN freed set), so a suspended split keeps
+  BOTH its concurrency slot and its grid cell. In `reconcile`, BEFORE any prune, a record whose surface
+  is found by UUID with `suspended:true` is KEPT as `SUSPENDED` (`sessionID` reset to 0, `gridSlot`
+  preserved, annotation re-stamped if the hook lease dropped its `queueKey`). This runs ahead of BOTH
+  the non-zero `session-gone` prune and the `sessionID:0` `no-pty-host` prune, so a suspended placeholder
+  is never mistaken for a vanished/never-attached session. Its key stays in `run.active`, so
+  `selectCandidates` suppresses re-dispatch (§7) — no replacement, no over-pack. `advanceStates` skips
+  `SUSPENDED` (nothing to status-probe / idle-fold / force-close). **On RESUME** the pane attaches a
+  FRESH session; the `sessionID:0` UUID backfill branch adopts the new id and transitions the record
+  `SUSPENDED → RUNNING`, rejoining the normal lifecycle.
+- **Match is by stable surface UUID, not the annotation** — the suspended surface loses its `queueKey`
+  (the agent-detection hook lease expires once the child is gone), so reconcile keys the re-match on the
+  UUID + `suspended` flag. This is **durable across a GUI restart** too: a restored suspended placeholder
+  keeps its archived surface UUID (the window-state archive the suspend-resume feature relies on), and its
+  persisted `SUSPENDED` record round-trips `parseStore` (so `"SUSPENDED"` MUST be in `ALL_STATES`), so the
+  UUID re-match keeps the slot after a restart as well. (The one dependency: the surface UUID surviving
+  the restart. A freshly-spawned, never-archived surface re-mints its UUID — not the suspended-placeholder
+  case.)
+- **Wiring:** `queue/types.ts` (`AssignmentState` + `SUSPENDED` doc), `queue/store.ts` (`ALL_STATES`,
+  `LiveSurface.suspended`, reconcile suspend-rematch + resume backfill→RUNNING), `queue/runner.ts`
+  (`projectLiveSurfaces` projects `suspended`; `advanceStates` skip; `occupiesSlot` contract comment).
+  Tests: `store.test.ts` (kept-not-pruned / stays-suspended / resume→RUNNING / round-trip / guard),
+  `runner.test.ts` (`occupiesSlot(SUSPENDED)===true`). Redeploy: **sidecar** (`npm run build` + GUI
+  relaunch); no host/Zig change — the Swift side already emits `suspended` + the stable UUID.
+
 ### DISPATCH LATCH (§7.1)
 
 - **DISPATCH LATCH (§7.1) — block re-dispatch ENTIRELY until the item leaves the list and returns.** The

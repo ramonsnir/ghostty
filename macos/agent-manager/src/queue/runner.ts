@@ -790,8 +790,12 @@ async function abortRun(run: QueueRun, surfaces: Surface[], deps: QueueDeps): Pr
  *  (leave-and-bell) assignment is KEPT in the active map to block its key from
  *  re-dispatch (§6) but does NOT occupy a slot — so the run never deadlocks behind a
  *  crashed agent. (FINISHED/FAILED/COOLDOWN are removed from `active` outright, so in
- *  practice the live `active` map holds only slot-occupying states + EXITED.) Exported
- *  for a direct state-table unit test of the occupancy contract. */
+ *  practice the live `active` map holds only slot-occupying states + EXITED.)
+ *  (ramon fork / suspend-resume) SUSPENDED intentionally OCCUPIES its slot (it is NOT in
+ *  the excluded set): a suspended split keeps its GUI pane, so it must keep BOTH its
+ *  concurrency slot and its grid cell — otherwise the queue reclaims the slot and packs a
+ *  replacement into the same tab (the over-pack bug). Distinct from EXITED, which frees it.
+ *  Exported for a direct state-table unit test of the occupancy contract. */
 export function occupiesSlot(a: Assignment): boolean {
   return a.state !== "EXITED" && a.state !== "FINISHED" && a.state !== "FAILED" && a.state !== "COOLDOWN";
 }
@@ -1360,6 +1364,11 @@ export function projectLiveSurfaces(
     const sQueueName = (s as { queueName?: string }).queueName;
     if (sQueueName !== undefined && sQueueName !== queueName) continue;
     const live: LiveSurface = { sessionID: sid, hostName, surfaceUUID: s.id };
+    // (ramon fork / suspend-resume) Carry the suspended flag so reconcile re-matches a suspended
+    // placeholder to its record by UUID and RETAINS its slot (see LiveSurface.suspended). A
+    // suspended surface has lost its queue annotation (sQueueName undefined), which passes the
+    // this-run filter above (undefined ⇒ not skipped), so it reaches reconcile for UUID re-match.
+    if ((s as { suspended?: boolean }).suspended === true) live.suspended = true;
     const qk = (s as { queueKey?: string }).queueKey;
     if (typeof qk === "string") live.queueKey = qk;
     if (typeof sQueueName === "string") live.queueName = sQueueName;
@@ -1468,11 +1477,16 @@ async function advanceStates(
 
   for (const a of activeList) {
     // Terminal/transitional states are owned by the close loop / cooldown logic.
+    // (ramon fork / suspend-resume) SUSPENDED is likewise left alone here: its child is gone, so
+    // there is nothing to status-probe, idle-fold, or force-close — it just holds its slot until
+    // it is resumed (reconcile transitions it back to RUNNING) or the pane is closed. It is
+    // already excluded from `probeTargets` above (neither SPAWNED nor RUNNING).
     if (
       a.state === "CLOSING" ||
       a.state === "FINISHED" ||
       a.state === "FAILED" ||
       a.state === "EXITED" ||
+      a.state === "SUSPENDED" ||
       a.state === "COOLDOWN"
     ) {
       continue;
