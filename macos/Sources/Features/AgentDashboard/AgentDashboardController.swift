@@ -763,8 +763,28 @@ final class AgentDashboardModel: ObservableObject {
     /// script running a headless `claude -p` credential probe) became a permanent
     /// dashboard tile. The state is a LEASE: renewed by evidence, expired without it.
     ///
-    /// Renewed by EITHER a detector hit (`agents[id] != nil`) or a fresh hook post
-    /// (`applyAgentState`). Expired after `hookOnlyMissLimit` consecutive clean walks.
+    /// Renewed by EITHER a detector hit (`agents[id] != nil`), a fresh hook post
+    /// (`applyAgentState`), or an ACTIVE last-known hook state (`.working`/`.waiting`,
+    /// see below). Expired after `hookOnlyMissLimit` consecutive clean walks.
+    ///
+    /// (ramon fork / hook-state lease v2) WHY the active-state renewal: the detector
+    /// walk is UNRELIABLE for exactly the splits hook state exists to cover — an
+    /// account-pool split (`login → …/claude-pool → claude`) is often not classified
+    /// by the local subtree walk, so `agents[id]` stays nil and the surface is
+    /// hook-only. A live such agent legitimately emits NO hook event for long stretches
+    /// — one WAITING on the user (a `Notification`, then silence until you reply) or one
+    /// inside a single long-running tool call (one `PreToolUse`, then silence until it
+    /// returns) — so a pure detector-miss counter would expire a plainly-live agent
+    /// after ~30s and drop it off the dashboard / web monitor / `list_surfaces`
+    /// `agentKind`. The agent's OWN last report is the authority: `.working`/`.waiting`
+    /// means a turn is still in flight (`.waiting` is literally "needs you"), so a
+    /// detector miss must NOT age it. Only a surface whose last state is TERMINAL
+    /// (`.idle` — `Stop`/`SessionEnd` fired) or nil is aged — which still reaps the case
+    /// the lease was built for: a shell that ran a one-shot `claude -p` probe and
+    /// returned to the prompt (that probe ends by firing `.idle`). The accepted residual
+    /// is a `claude` KILLED mid-turn without firing `Stop`: it lingers as an agent until
+    /// its split closes (the surface then leaves `live` and is pruned) — already a
+    /// documented limitation, and rarer than the live-agent-vanishes bug this fixes.
     ///
     /// Scoped to LOCAL surfaces on purpose: the detector walks the LOCAL process table
     /// from the row's foreground pid, which for a REMOTE surface is a pid on the box —
@@ -775,6 +795,18 @@ final class AgentDashboardModel: ObservableObject {
         for id in walked where agentStates[id] != nil {
             if detected[id] != nil {
                 // The process is right there — full renewal.
+                hookMisses[id] = nil
+                nowStale.remove(id)
+                continue
+            }
+            // (hook-state lease v2) An ACTIVE last-known hook state is the agent's own
+            // proof it is mid-turn — a detector miss (endemic to pool splits) must not
+            // expire it. Only a terminal (`.idle`) / nil last state is aged. Clearing the
+            // stale/miss bookkeeping here is defensive: it keeps the invariant that a
+            // surface carrying stale evidence always has a terminal/none last state (an
+            // active surface never accrues misses, since a prior applyAgentState/detector
+            // hit cleared them) — so the removals are normally no-ops, kept for robustness.
+            if let st = agentStates[id], st == .working || st == .waiting {
                 hookMisses[id] = nil
                 nowStale.remove(id)
                 continue

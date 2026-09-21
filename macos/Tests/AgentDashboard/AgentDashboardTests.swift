@@ -1515,7 +1515,9 @@ struct AgentDashboardHookStateTests {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
         model.rebuild(live: live([a]))
-        model.applyAgentState(a, payload(.waiting))
+        // `.idle` (ageable) isolates the detector-hit renewal — an active state would
+        // keep it alive on its own (see the active-state tests).
+        model.applyAgentState(a, payload(.idle))
         // The detector sees it on every tick, so the misses never accumulate.
         for _ in 0..<(AgentDashboardModel.hookOnlyMissLimit * 3) {
             model.applyAgents(agents([a]), walked: [a])
@@ -1528,12 +1530,63 @@ struct AgentDashboardHookStateTests {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
         model.rebuild(live: live([a]))
-        model.applyAgentState(a, payload(.working))
+        // `.idle` is used deliberately: it is an AGEABLE state (an active `.working`/
+        // `.waiting` surface is never aged — see the active-state tests below), so this
+        // isolates the applyAgentState heartbeat reset. Without the heartbeat the two
+        // runs of clean walks would sum past the limit and expire it.
+        model.applyAgentState(a, payload(.idle))
 
         cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit - 1)
-        model.applyAgentState(a, payload(.working, tool: "Bash"))   // heartbeat
+        model.applyAgentState(a, payload(.idle, tool: "Bash"))      // heartbeat
         cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit - 1)
         #expect(model.isAgentSurface(a))                            // counter restarted
+    }
+
+    /// (hook-state lease v2) The B&G case: a live account-pool agent WAITING on the
+    /// user. The subtree detector never classifies a pool split (`login → …/claude-pool
+    /// → claude`), so `agents[id]` stays nil, and a waiting agent emits no hook events
+    /// while blocked — but it is plainly still an agent (it "needs you"). Its own last
+    /// reported state (`.waiting`) is the authority, so no number of clean detector walks
+    /// may expire it.
+    @Test func aWaitingHookAgentIsNotLeasedAwayWhileTheDetectorStaysBlind() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.waiting))
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit * 3)
+        #expect(model.isAgentSurface(a))
+        #expect(model.staleHookState.isEmpty)
+        #expect(model.displayAgentKind(a)?.command == "claude")
+        #expect(model.hookSnapshot()[a]?.agentKind == "claude")
+    }
+
+    /// (hook-state lease v2) The ATP case: a live pool agent WORKING inside a single
+    /// long-running tool call. It fired one `PreToolUse` (`.working`) then goes silent
+    /// for the duration — no new hook, and the detector is blind — yet it is actively
+    /// running. `.working` must never be leased away.
+    @Test func aWorkingHookAgentSurvivesALongSilentToolCall() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.working, tool: "Bash"))
+        cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit * 3)
+        #expect(model.isAgentSurface(a))
+        #expect(model.staleHookState.isEmpty)
+    }
+
+    /// (hook-state lease v2) The contrast that keeps the lease honest: only a TERMINAL
+    /// last state (`.idle` — Stop/SessionEnd) is aged, so the one-shot `claude -p ping`
+    /// probe the lease exists to reap still expires, while a live `.working`/`.waiting`
+    /// agent (above) does not.
+    @Test func anIdleHookOnlyProbeStillExpiresButAnActiveOneDoesNot() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let probe = UUID(), live1 = UUID()
+        model.rebuild(live: live([probe, live1]))
+        model.applyAgentState(probe, payload(.idle, prompt: "ping"))   // finished probe
+        model.applyAgentState(live1, payload(.working))                // live agent
+        cleanWalks(model, [probe, live1], AgentDashboardModel.hookOnlyMissLimit)
+        #expect(!model.isAgentSurface(probe))   // reaped
+        #expect(model.isAgentSurface(live1))    // kept
     }
 
     /// A new agent in the same surface must un-stale it — the tile has to come back.
@@ -1549,7 +1602,10 @@ struct AgentDashboardHookStateTests {
         #expect(model.isAgentSurface(a))
         #expect(model.displayAgentKind(a)?.command == "claude")
 
-        // ...and equally when only the DETECTOR sees the new process.
+        // ...and equally when only the DETECTOR sees the new process. Return it to an
+        // ageable (`.idle`) state first so the lease can expire again — a `.working`/
+        // `.waiting` surface is never aged (lease v2) — then confirm a detector hit revives it.
+        model.applyAgentState(a, payload(.idle))
         cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit)
         #expect(!model.isAgentSurface(a))
         model.applyAgents(agents([a]), walked: [a])
@@ -1564,7 +1620,9 @@ struct AgentDashboardHookStateTests {
         let a = UUID()
         model.rebuild(live: [.init(id: a, view: nil, title: "t", pwd: "/x",
                                    sessionID: 7, hostName: "box")])
-        model.applyAgentState(a, payload(.working))
+        // `.idle` (ageable) so this exercises the LOCAL-only guard, not the active-state
+        // renewal — a remote surface must be spared even when its last state is terminal.
+        model.applyAgentState(a, payload(.idle))
         cleanWalks(model, [a], AgentDashboardModel.hookOnlyMissLimit * 2)
         #expect(model.isAgentSurface(a))
     }
@@ -1575,7 +1633,8 @@ struct AgentDashboardHookStateTests {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID(), other = UUID()
         model.rebuild(live: live([a, other]))
-        model.applyAgentState(a, payload(.working))
+        // `.idle` (ageable) so the "never walked = no opinion" gate is what's under test.
+        model.applyAgentState(a, payload(.idle))
         // Ticks happen, but `a` is never in the walked set.
         for _ in 0..<(AgentDashboardModel.hookOnlyMissLimit * 2) {
             model.applyAgents([:], walked: [other])
@@ -1588,7 +1647,8 @@ struct AgentDashboardHookStateTests {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
         model.rebuild(live: live([a]))
-        model.applyAgentState(a, payload(.working))
+        // `.idle` (ageable) so the no-walk-evidence default is what's under test.
+        model.applyAgentState(a, payload(.idle))
         for _ in 0..<(AgentDashboardModel.hookOnlyMissLimit * 2) { model.applyAgents([:]) }
         #expect(model.isAgentSurface(a))
     }
