@@ -203,7 +203,9 @@ skip the non-terminal tab (cmd-1/`goto_tab:1` = first TERMINAL); ctrl-tab from t
 piece** (new apprt action + C export → rebuild the xcframework). Traps: agent detection is HOST-GATED
 on the minor-4 `foreground_pid` frame; per-tile state comes from Claude Code hooks POSTing to MCP
 `/agent-state`; hook-only evidence is a LEASE that expires so a plain shell that once ran `claude`
-stops being a tile. Mostly GUI; the mirror-grid C export is Zig+lib but NOT compiled into the host.
+stops being a tile — BUT (lease v2) only a split whose last hook state is terminal (`idle`) is
+aged, so a live pool agent that's `working`/`waiting` (detector-blind, silent for >30s) is never
+wrongly dropped. Mostly GUI; the mirror-grid C export is Zig+lib but NOT compiled into the host.
 
 ### Agent Manager → `AGENT-MANAGER.md`
 Haiku status summarizer (warm TS Agent SDK sidecar) that annotates each dashboard tile with a live

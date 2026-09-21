@@ -47,6 +47,20 @@ below); without it the panel degrades to metadata-only tiles.
 > detector hit *or* a fresh hook post) brings it straight back. Only **local** splits are
 > aged this way — a cross-host split's foreground pid lives on the box, where the local
 > walk can say nothing, so a box agent is never expired.
+>
+> **BUT the agent's own last-reported STATE overrides the miss counter (lease v2).** The
+> subtree detector is structurally blind to an **account-pool** split (`login →
+> …/claude-pool → claude`) — the wrapper is exactly why the hook signal exists — so such a
+> split is hook-only, and a *live* one legitimately emits **no** hook for long stretches:
+> one **waiting** on you (a `Notification`, then silence until you reply) or one **inside a
+> single long-running tool call** (one `PreToolUse`, then silence until it returns). Ageing
+> those on detector misses alone wrongly dropped a plainly-live agent after ~30s (off the
+> dashboard, the web monitor, and `list_surfaces` `agentKind`). So the lease now only ages
+> a split whose **last hook state is terminal (`idle` = Stop/SessionEnd) or none** — a
+> `working`/`waiting` split is never expired by a detector miss (the agent itself reports a
+> turn is still in flight). The `claude -p` probe is still reaped because it ends by firing
+> `idle`. The one accepted residual: a `claude` **killed mid-turn without firing Stop**
+> lingers as an agent until its split closes (the surface then leaves `live` and is pruned).
 
 ## Panel vs. docked tab (for a small laptop screen)
 
@@ -464,14 +478,16 @@ gains a live state chip.
   keep the preview-only tile (still detected, still previewed, just no state chip).
 - **No TTL / no liveness ping on the STATE itself.** The state value changes only on a
   hook event. If a session is killed mid-turn without firing `Stop`, the tile can sit on
-  a stale `working` until the ~2s detector poll notices the process is gone and removes
-  the tile entirely — a cosmetic miss, not a leak. (The *agent classification* implied by
-  a hook report does expire — see the lease below — but the last reported state value is
-  kept, so `list_surfaces` can still report how a finished agent ended.)
+  a stale `working`. When the detector CAN see the split it removes the tile on the next
+  ~2s poll (process gone); for a **pool split the detector is blind to**, the lease no
+  longer ages a `working`/`waiting` split (lease v2 — see below), so a killed-without-Stop
+  pool agent lingers until its split closes (the surface then leaves `live` and is pruned).
+  A cosmetic miss, not a leak. (The last reported state value is always kept, so
+  `list_surfaces` can still report how a finished agent ended.)
 - **A one-shot `claude` in a shell briefly makes that shell a tile.** Anything that runs
-  `claude` in a split fires the hooks, so the split shows up as an agent for as long as
-  that process lives plus the ~30s lease. That is correct while it runs and self-clears
-  after; it is not permanent.
+  `claude` in a split fires the hooks, so the split shows up as an agent while that process
+  lives; it self-clears once the run **ends by firing `idle`** (`Stop`/`SessionEnd`) plus
+  the ~30s lease. A headless `claude -p` probe ends that way, so it is not permanent.
 - **One tab per tty.** Correlation is by controlling tty, which is unique per terminal
   split, so this is exact in practice.
 
@@ -1197,6 +1213,27 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   `@Published staleHookState` set, and `isAgentSurface`/`displayAgentKind` stop honoring signal
   2 for it. `applyAgentState` renews the lease BEFORE its coalesce early-return, so an
   unchanged republish still counts as a heartbeat. Load-bearing details:
+  - **The agent's last-reported STATE gates ageing (lease v2 — the load-bearing fix).**
+    `updateHookLease` renews (skips the miss counter for) a walked hook-only surface whose
+    `agentStates[id]` is **`.working` or `.waiting`**, and only ages one whose last state is
+    **`.idle` or none**. WHY: the detector is structurally blind to an account-pool split
+    (`login → …/claude-pool → claude` — the very case signal 2 exists for), so `agents[id]`
+    stays nil and the split is hook-only; and a *live* such agent legitimately emits no hook
+    for long stretches — one **waiting** on the user (a `Notification`, then silence) or one
+    **inside a single long-running tool call** (one `PreToolUse`, then silence). The pre-v2
+    miss counter expired those live agents after ~30s, dropping them off the dashboard, the
+    web monitor, and `list_surfaces` `agentKind`. The agent's own report is the authority:
+    `.working`/`.waiting` = a turn is still in flight (`.waiting` is literally "needs you"),
+    so a detector miss must not age it. `.idle` (Stop/SessionEnd) still ages — which is how
+    the `claude -p ping` probe below is still reaped (it ends by firing `idle`). Accepted
+    residual: a `claude` KILLED mid-turn without firing `Stop` on a detector-blind pool split
+    stays an agent until its split closes (surface leaves `live` → pruned) — rarer than the
+    live-agent-vanishes bug it fixes, and already listed under Limitations. The renewal
+    branch also clears any stale/miss bookkeeping, keeping the invariant that a surface
+    carrying stale evidence always has a terminal/none last state. Tests:
+    `aWaitingHookAgentIsNotLeasedAwayWhileTheDetectorStaysBlind`,
+    `aWorkingHookAgentSurvivesALongSilentToolCall`,
+    `anIdleHookOnlyProbeStillExpiresButAnActiveOneDoesNot`.
   - **The lease EXPIRES the classification, it does NOT delete the state.** `agentStates`/
     `lastTool`/`lastPrompt` stay readable via `hookSnapshot`, so an Agent Queue item whose
     agent just exited can still be seen as `idle` by the close gate; only `agentKind` goes
