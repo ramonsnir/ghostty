@@ -57,9 +57,12 @@ The supervisor **self-disables silently** (one info log) unless all of these hol
    The hooks post to the **installed Release** on the default MCP port, so run real queues there,
    not a dev `+1/+2` build.
 
-> **Codex (and other non-Claude agents):** the launch command is generic and a Codex split
-> runs + previews fine, but it **cannot auto-close in v1** — only Claude Code emits the
-> agent-state hooks the close-gate needs. You'd close its splits by hand. (Codex hooks: TODO.)
+> **Codex:** at full parity with Claude — install the Codex agent-state hooks (**Install Agent
+> Hooks** installs both; then run Codex's `/hooks` once to trust them) and a Codex split
+> auto-closes exactly like a Claude one (its `Stop`→`idle` satisfies the close gate). See
+> `CODEX-HOOKS.md`. **Other non-Claude/Codex agents:** the launch command is generic and such
+> a split runs + previews fine, but without agent-state hooks it can't auto-close — close it
+> by hand.
 
 ## Enable
 

@@ -56,6 +56,39 @@ struct MCPAgentStateTests {
         #expect(p?.cwd == nil)
     }
 
+    @Test func parseCapturesKind() {
+        let body = Data(#"{"tty":"ttys004","state":"working","kind":"codex"}"#.utf8)
+        #expect(MCPAgentState.parse(body)?.kind == "codex")
+    }
+
+    @Test func parseKindAbsentIsNil() {
+        // Claude's hook omits `kind`, so a body without it parses to nil (→ the
+        // hook-implied "claude" default happens downstream, not here).
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"idle"}"#.utf8))?.kind == nil)
+    }
+
+    @Test func parseKindLowercasedAndTrimmed() {
+        let body = Data(#"{"tty":"ttys004","state":"working","kind":"  Codex  "}"#.utf8)
+        #expect(MCPAgentState.parse(body)?.kind == "codex")
+    }
+
+    @Test func parseKindRejectsUnsafeValues() {
+        // A path separator, whitespace, a shell metacharacter, an empty value, or an
+        // over-long value all sanitize to nil — `kind` becomes an AgentKind command
+        // string + a suspend pool-wrapper choice, so it must be a safe basename token.
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"working","kind":"../evil"}"#.utf8))?.kind == nil)
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"working","kind":"a b"}"#.utf8))?.kind == nil)
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"working","kind":"co;dex"}"#.utf8))?.kind == nil)
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"working","kind":""}"#.utf8))?.kind == nil)
+        let big = String(repeating: "x", count: 33)
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"working","kind":"\#(big)"}"#.utf8))?.kind == nil)
+    }
+
+    @Test func parseKindAcceptsDashUnderscoreDigits() {
+        let body = Data(#"{"tty":"ttys004","state":"working","kind":"my-agent_2"}"#.utf8)
+        #expect(MCPAgentState.parse(body)?.kind == "my-agent_2")
+    }
+
     @Test func parseSessionIdCappedAt256() {
         let big = String(repeating: "x", count: 300)
         let body = Data(#"{"tty":"ttys004","state":"working","claudeSessionId":"\#(big)"}"#.utf8)

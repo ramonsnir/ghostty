@@ -17,9 +17,12 @@ struct AgentStatePayload: Equatable, Sendable {
     /// a body with neither).
     let tty: String?
     let state: AgentState
-    let prompt: String?      // UserPromptSubmit prompt text (truncated by the parser)
-    let tool: String?        // PreToolUse tool name
-    let message: String?     // Notification message (the "needs input" reason)
+    // These three carry an explicit `= nil` default (like the fields below) so a payload
+    // can be built from just tty/nonce + state + kind — Swift's memberwise init does NOT
+    // give an Optional an implicit nil unless it has an explicit default.
+    var prompt: String? = nil      // UserPromptSubmit prompt text (truncated by the parser)
+    var tool: String? = nil        // PreToolUse tool name
+    var message: String? = nil     // Notification / PermissionRequest reason ("needs input")
     /// (ramon fork / cloud-hosts, D6) The GUI-minted per-spawn correlation nonce a
     /// REMOTE agent's hook echoes back (from GHOSTTY_SURFACE_NONCE), resolved by the
     /// `/agent-state` route to the local surface via `RemoteAgentIdentity`. nil for the
@@ -36,6 +39,16 @@ struct AgentStatePayload: Equatable, Sendable {
     /// (ramon fork / suspend-resume) The agent's working directory (hook `cwd`),
     /// recorded so Resume can respawn a fresh child in the same dir. `var` + default.
     var cwd: String? = nil
+    /// (ramon fork / Codex hooks) The agent KIND the hook self-reports (`"codex"`;
+    /// Claude Code's hook omits it). Used ONLY as the hook-implied fallback label for
+    /// a surface the local process detector could not classify — the cross-host /
+    /// hook-only case, where the detector walks a pid on another box and finds
+    /// nothing. Without it such a surface defaults to `"claude"` (see
+    /// `AgentDashboardModel.displayAgentKind`), mislabeling a remote Codex agent and
+    /// reconstructing the wrong `--resume` pool wrapper on suspend. Sanitized to a
+    /// short safe-basename token by the parser. `var` + default so existing tty-only
+    /// call sites are unaffected.
+    var kind: String? = nil
 }
 
 /// (ramon fork / Agent Manager) An LLM annotation for one surface, written through

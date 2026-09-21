@@ -613,8 +613,8 @@ fn actionCommands(action: Action.Key) []const Command {
 
         .install_agent_hooks => comptime &.{.{
             .action = .install_agent_hooks,
-            .title = "Install Claude Agent Hooks",
-            .description = "Set up the Claude Code hooks for agent status + queue auto-close.",
+            .title = "Install Agent Hooks",
+            .description = "Set up the Claude Code and Codex hooks for agent status + queue auto-close.",
         }},
 
         .start_agent_queue => comptime &.{.{

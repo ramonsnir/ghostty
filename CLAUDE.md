@@ -36,7 +36,8 @@ The docs:
 | `CLOUD-QUEUE-BALANCING.md` | per-queue multi-host load balancing |
 | `PTYHOST.md` | pty-host architecture, session lifecycle, write-pool fix, launchd LaunchAgent deploy |
 | `HOST-HANDOFF.md` | session-preserving `ghostty-host` upgrades: supervisor+worker, the handoff sequence, fd/child ownership contract, triggers (SIGHUP + exec-path self-check), the switchover deploy |
-| `SUSPEND-RESUME-DESIGN.md` | Suspend idle Claude agent splits (kill child to reclaim RAM, keep frozen placeholder, Resume via `claude-pool --resume <id>`). A RESTORED placeholder gets a live **no-dial `.client` surface** (Part 7) so keyboard/leader/palette work on it — the one **Zig+lib** bit (dead code in `ghostty-host` → still **no host restart**); a one-time UUID-keyed **re-attach seed** (Part 8, `~/.config/ghostty-ramon/suspend-reattach-seed.json`) recovers pre-persistence suspends. Rest is GUI-only. Claude-first, Codex postponed |
+| `SUSPEND-RESUME-DESIGN.md` | Suspend idle Claude agent splits (kill child to reclaim RAM, keep frozen placeholder, Resume via `claude-pool --resume <id>`). A RESTORED placeholder gets a live **no-dial `.client` surface** (Part 7) so keyboard/leader/palette work on it — the one **Zig+lib** bit (dead code in `ghostty-host` → still **no host restart**); a one-time UUID-keyed **re-attach seed** (Part 8, `~/.config/ghostty-ramon/suspend-reattach-seed.json`) recovers pre-persistence suspends. Rest is GUI-only. Claude **and Codex** (via `CODEX-HOOKS.md`) |
+| `CODEX-HOOKS.md` | Codex agent-state hooks — full parity with Claude Code (status chip, attention/push, queue auto-close, suspend/resume) via the same `/agent-state` ingest; `CodexHooksInstaller`, the `kind` wire field, cross-host nonce |
 | `FORK-FIXES.md` | standalone robustness / upstream-bug fixes (`CachedValue` crash) |
 | `FORK-DISTRIBUTION.md` | fork identity (bundle id / icon / update feed), colleague DMG release, `ForkSetup` first-launch (supervisor LaunchAgent + two-identity host reload) |
 | `FORK-DEV.md` | the macOS build / test / install iteration lifecycle |
@@ -201,11 +202,11 @@ to the dashboard (select the docked tab / bring the panel forward) — the "tab 
 skip the non-terminal tab (cmd-1/`goto_tab:1` = first TERMINAL); ctrl-tab from the tab is handled in
 `AppDelegate.localEventKeyDown`. **Mostly GUI-only Swift; `focus_agent_dashboard` is the one Zig+lib
 piece** (new apprt action + C export → rebuild the xcframework). Traps: agent detection is HOST-GATED
-on the minor-4 `foreground_pid` frame; per-tile state comes from Claude Code hooks POSTing to MCP
-`/agent-state`; hook-only evidence is a LEASE that expires so a plain shell that once ran `claude`
-stops being a tile — BUT (lease v2) only a split whose last hook state is terminal (`idle`) is
-aged, so a live pool agent that's `working`/`waiting` (detector-blind, silent for >30s) is never
-wrongly dropped. Mostly GUI; the mirror-grid C export is Zig+lib but NOT compiled into the host.
+on the minor-4 `foreground_pid` frame; per-tile state comes from Claude Code AND Codex hooks POSTing
+to MCP `/agent-state` (→ `CODEX-HOOKS.md`); hook-only evidence is a LEASE that expires so a plain shell
+that once ran `claude` stops being a tile — BUT (lease v2) only a split whose last hook state is
+terminal (`idle`) is aged, so a live pool agent that's `working`/`waiting` (detector-blind, silent
+for >30s) is never wrongly dropped. Mostly GUI; the mirror-grid C export is Zig+lib but NOT compiled into the host.
 
 ### Agent Manager → `AGENT-MANAGER.md`
 Haiku status summarizer (warm TS Agent SDK sidecar) that annotates each dashboard tile with a live
@@ -222,7 +223,7 @@ Turns the dashboard into an active supervisor: from a JSON template it opens a t
 launches one CLI agent per work item, caps concurrency, tracks to completion, force-closes done+idle
 splits (unless kept), and re-polls. Fork-only, macOS, OFF by default. Keys: `agent-queue`,
 `agent-queue-templates-dir` (RepeatableString search list), `agent-queue-max-total` (0 = unlimited),
-`agent-queue-hero-max`; action `start_agent_queue`. Hard deps: pty-host + Claude agent-state hooks.
+`agent-queue-hero-max`; action `start_agent_queue`. Hard deps: pty-host + Claude/Codex agent-state hooks.
 Includes **adopt a free split**, **hero agents** (→ `HERO-AGENTS.md`), **schedules** (recurring
 scan agents), the compact-grid retiling, and **per-queue multi-host** (→ `CLOUD-QUEUE-BALANCING.md`).
 ⚠️ Recurring chokepoint: a new queue command/annotation field must be whitelisted in
@@ -231,6 +232,19 @@ or it is SILENTLY DROPPED. A **suspended** queue split keeps its slot: a `SUSPEN
 that `occupiesSlot` counts, re-matched in `reconcile` by stable surface UUID (its session Closes →
 `sessionID 0`), so the queue never reclaims the slot / over-packs the tab; resume transitions it back
 to RUNNING (→ `AGENT-QUEUE-INTERNALS.md`). GUI relaunch + rebuilt sidecar `dist`; usually no host/Zig change.
+
+### Codex agent hooks → `CODEX-HOOKS.md`
+Brings Codex to full parity with Claude Code: the same per-tile agent-state hooks POSTing to MCP
+`/agent-state`, so a Codex split gets a live status chip, attention/phone push (`PermissionRequest`
+→ `waiting`), Agent Queue auto-close (`Stop`→`idle`), and idle suspend/resume (`codex-pool --resume`).
+Fork-only, macOS, OFF until installed. No config key. Install via the **Install Agent Hooks** palette
+entry (or the launch offer) — it installs BOTH agents into `~/.claude/settings.json` +
+`~/.codex/hooks.json` (idempotent); Codex then needs a one-time `/hooks` TRUST. `CodexHooksInstaller`
+mirrors `AgentHooksInstaller`; the one wire addition is the optional **`kind`** field on `/agent-state`
+(hook-implied fallback label + suspend pool-wrapper for a hook-only/cross-host surface the detector
+can't classify — a detected kind always wins). Sidecar needs NO code change (its auto-close gate is
+already agentState-based). GUI-only **except** the one-line "Install Agent Hooks" palette label
+(`src/input/command.zig`) → that makes it **Zig+lib**; no host restart, no sidecar rebuild.
 
 ### PTY-host + session lifecycle → `PTYHOST.md`
 The `.client` emulation-on-host backend: sessions survive a GUI quit/relaunch (RAM-only; a HOST

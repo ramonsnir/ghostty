@@ -4,8 +4,17 @@ import Foundation
 /// split is overdue for suspension. Nothing here touches AppKit, the model, or the wall clock:
 /// `now` and `calendar` are injected so the business-day math is deterministic in tests. The
 /// side-effecting scanner (a timer on `AgentDashboardController` that calls the suspend action)
-/// consumes this. MVP is Claude-only. See SUSPEND-RESUME-DESIGN.md → "Part 2 — Idle scanner".
+/// consumes this. Covers Claude AND Codex (both capture a resume id via their agent-state hook;
+/// the pool wrapper differs — see `SuspendManifest.poolCommand`). See SUSPEND-RESUME-DESIGN.md →
+/// "Part 2 — Idle scanner".
 enum SuspendPolicy {
+
+    /// The agent kinds the idle scanner is allowed to auto-suspend. Both capture a
+    /// per-process resume id through their agent-state hook (Claude's `session_id` →
+    /// `claude-pool --resume`, Codex's `session_id` → `codex-pool --resume`), so both
+    /// can be resumed. A kind NOT in this set (a plain shell, an unknown agent) is never
+    /// auto-suspended. Manual `suspend_split` is separately gated on a captured resume id.
+    static let suspendableKinds: Set<String> = ["claude", "codex"]
 
     /// The number of BUSINESS days (weekdays; weekends skipped) elapsed between `from` and `to`,
     /// at calendar-day granularity: the count of weekday dates `d` with
@@ -55,15 +64,14 @@ enum SuspendPolicy {
         let lastActivity: Date   // when the split's content last changed / last hook event
     }
 
-    /// PURE selection: the ids overdue for suspension — a CLAUDE agent, currently idle, last
-    /// active at least `thresholdBusinessDays` business days ago. Codex is deliberately excluded
-    /// (MVP is Claude-only; Codex has no resume-id capture yet — see the design doc). Order is
-    /// preserved from `candidates`.
+    /// PURE selection: the ids overdue for suspension — a SUSPENDABLE agent kind (Claude or
+    /// Codex, see `suspendableKinds`), currently idle, last active at least
+    /// `thresholdBusinessDays` business days ago. Order is preserved from `candidates`.
     static func surfacesToSuspend(
         _ candidates: [Candidate], now: Date, thresholdBusinessDays: Int, calendar: Calendar = .current
     ) -> [UUID] {
         candidates.compactMap { c in
-            guard c.agentKind == "claude", c.isIdle,
+            guard let kind = c.agentKind, suspendableKinds.contains(kind), c.isIdle,
                   isIdleOverdue(
                     lastActivity: c.lastActivity, now: now,
                     thresholdBusinessDays: thresholdBusinessDays, calendar: calendar)

@@ -125,6 +125,11 @@ struct PersistedAgentState: Codable, Equatable {
     var cwd: String?               // the agent's working directory
     var lastActivity: Double?      // real last-activity (timeIntervalSince1970), distinct
                                    // from `updated` (which is touched to defeat age-pruning)
+    // (ramon fork / Codex hooks) The hook-reported agent kind ("codex"; nil for Claude
+    // and old records), persisted so a cross-host / hook-only tile keeps its correct
+    // label — and its suspend manifest the correct pool wrapper — across a GUI relaunch,
+    // until the next hook re-reports it. Optional ⇒ old records decode as nil (→ "claude").
+    var agentKind: String?
 }
 
 /// Persistence boundary for per-session agent state, injected for testability
@@ -364,6 +369,14 @@ final class AgentDashboardModel: ObservableObject {
     /// (ramon fork / suspend-resume) The agent's working directory per surface (hook
     /// `cwd`), so Resume can respawn a fresh child in the same dir.
     private(set) var agentCwd: [UUID: String] = [:]
+
+    /// (ramon fork / Codex hooks) The agent KIND a hook self-reported per surface
+    /// (e.g. "codex"; Claude Code's hook omits it). Used ONLY by `displayAgentKind`
+    /// as the hook-implied fallback for a surface the local process detector could
+    /// not classify — the cross-host / hook-only case. Without it that fallback is a
+    /// hard-coded "claude", which mislabels a remote Codex agent and picks the wrong
+    /// `--resume` pool wrapper on suspend. Sticky (a nil field leaves the prior value).
+    private(set) var hookKind: [UUID: String] = [:]
 
     /// (ramon fork / suspend-resume) Wall-clock timestamp of the last hook event per
     /// surface — "idle since" for the auto-suspend business-day threshold.
@@ -860,6 +873,10 @@ final class AgentDashboardModel: ObservableObject {
         // so this never forces a tile rebuild.
         if let sid = payload.claudeSessionId { claudeSessionId[id] = sid }
         if let dir = payload.cwd { agentCwd[id] = dir }
+        // (Codex hooks) Record the hook-reported kind so a hook-only / cross-host
+        // surface (no local process to classify) is labeled correctly and its suspend
+        // manifest reconstructs the right pool wrapper. Sticky like the fields above.
+        if let k = payload.kind { hookKind[id] = k }
         // (suspend-resume) Stamp "last agent activity" on every hook event. For an idle
         // agent this is when it went idle (its last Stop/SessionEnd), which the idle
         // scanner reads as "idle since" for the business-day threshold.
@@ -1071,7 +1088,7 @@ final class AgentDashboardModel: ObservableObject {
     private func sameContent(_ a: PersistedAgentState?, _ b: PersistedAgentState) -> Bool {
         guard let a else { return false }
         return a.state == b.state && a.tool == b.tool && a.prompt == b.prompt && a.message == b.message
-            && a.claudeSessionId == b.claudeSessionId && a.cwd == b.cwd
+            && a.claudeSessionId == b.claudeSessionId && a.cwd == b.cwd && a.agentKind == b.agentKind
     }
 
     /// Persist the current state for `id`'s host session, if its session id is
@@ -1082,7 +1099,8 @@ final class AgentDashboardModel: ObservableObject {
             state: state.rawValue, tool: lastTool[id], prompt: lastPrompt[id],
             message: lastMessage[id], updated: Date().timeIntervalSince1970,
             claudeSessionId: claudeSessionId[id], cwd: agentCwd[id],
-            lastActivity: lastActivityAt[id]?.timeIntervalSince1970)
+            lastActivity: lastActivityAt[id]?.timeIntervalSince1970,
+            agentKind: hookKind[id])
         if !sameContent(restored[key], rec) {
             restored[key] = rec
             agentStore.save(restored)
@@ -1113,13 +1131,15 @@ final class AgentDashboardModel: ObservableObject {
                 if let sid = rec.claudeSessionId { claudeSessionId[s.id] = sid }
                 if let c = rec.cwd { agentCwd[s.id] = c }
                 if let la = rec.lastActivity { lastActivityAt[s.id] = Date(timeIntervalSince1970: la) }
+                if let k = rec.agentKind { hookKind[s.id] = k }
                 hookBacked.insert(s.id)
             } else if let state = agentStates[s.id] {
                 let rec = PersistedAgentState(
                     state: state.rawValue, tool: lastTool[s.id], prompt: lastPrompt[s.id],
                     message: lastMessage[s.id], updated: nowS,
                     claudeSessionId: claudeSessionId[s.id], cwd: agentCwd[s.id],
-                    lastActivity: lastActivityAt[s.id]?.timeIntervalSince1970)
+                    lastActivity: lastActivityAt[s.id]?.timeIntervalSince1970,
+                    agentKind: hookKind[s.id])
                 let cur = restored[key]
                 let stale = cur.map { nowS - $0.updated > Self.persistTouchInterval } ?? true
                 if !sameContent(cur, rec) || stale {
@@ -1179,7 +1199,9 @@ final class AgentDashboardModel: ObservableObject {
     func displayAgentKind(_ id: UUID) -> AgentKind? {
         if let a = agents[id] { return a }
         guard agentStates[id] != nil, !staleHookState.contains(id) else { return nil }
-        return AgentKind("claude")
+        // Hook-implied kind: the agent's self-reported `kind` (Codex sends "codex"),
+        // else "claude" (Claude Code's hook omits it — the historical default).
+        return AgentKind(hookKind[id] ?? "claude")
     }
 
     /// (ramon fork / Hero Agents) The set of currently-live surface ids annotated as HEROES

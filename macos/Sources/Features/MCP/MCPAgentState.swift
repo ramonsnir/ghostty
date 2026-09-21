@@ -69,7 +69,23 @@ enum MCPAgentState {
             return String(s.prefix(cap))
         }
 
-        // (suspend-resume) claudeSessionId + cwd ride EVERY Claude hook event and are
+        // (Codex hooks) `kind` is the agent's self-reported kind ("codex"). Sanitize
+        // HARD to a short safe-basename token — it becomes an `AgentKind` command
+        // string that drives the tile badge + the suspend pool-wrapper choice, so it
+        // must never carry a path separator, whitespace, or a shell metacharacter.
+        // A value with any disallowed character (or an empty/over-long one) is dropped
+        // to nil (the surface then falls back to the hook-implied "claude" default).
+        func safeKind(_ key: String) -> String? {
+            guard let raw = dict[key] as? String else { return nil }
+            let s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !s.isEmpty, s.count <= 32 else { return nil }
+            let allowed = CharacterSet(charactersIn:
+                "abcdefghijklmnopqrstuvwxyz0123456789-_")
+            guard s.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+            return s
+        }
+
+        // (suspend-resume) claudeSessionId + cwd ride EVERY hook event and are
         // captured passively. Modest caps: a session id is short; a path is bounded.
         return AgentStatePayload(
             tty: tty,
@@ -79,7 +95,8 @@ enum MCPAgentState {
             message: optionalString("message", cap: maxStringLen),
             nonce: nonce,
             claudeSessionId: optionalString("claudeSessionId", cap: 256),
-            cwd: optionalString("cwd", cap: 4096))
+            cwd: optionalString("cwd", cap: 4096),
+            kind: safeKind("kind"))
     }
 
     // MARK: - tty normalization + match (PURE)

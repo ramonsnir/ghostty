@@ -135,6 +135,7 @@
 				Features/AgentDashboard/QueueBacklogCanvas.swift,
 				Features/AgentManager/AgentManagerController.swift,
 				Features/AgentHooks/AgentHooksInstaller.swift,
+				Features/AgentHooks/CodexHooksInstaller.swift,
 				"Features/App Intents/CloseTerminalIntent.swift",
 				"Features/App Intents/CommandPaletteIntent.swift",
 				"Features/App Intents/Entities/CommandEntity.swift",

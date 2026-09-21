@@ -35,8 +35,9 @@ below); without it the panel degrades to metadata-only tiles.
 > host-side `/proc` descent gives up when a launcher has more than one non-launcher child (an
 > account-pool wrapper spawns `claude` alongside a transient `sleep`), so detection alone never
 > classifies a pool-launched cloud agent. A hook report is proof of an agent, so the tile
-> appears with a hook-implied `claude` badge; a detected kind still wins when present. A plain
-> shell (neither signal) is still never shown.
+> appears with a hook-implied badge — the agent's self-reported `kind` (Codex sends
+> `codex`), else `claude` (Claude Code's hook omits it); a detected kind still wins when
+> present. A plain shell (neither signal) is still never shown.
 >
 > **Hook evidence EXPIRES (it is a lease, not a permanent fact).** A hook report proves a
 > Claude Code process *ran* in that split, not that one is running *now* — so a shell that
@@ -375,10 +376,10 @@ A hook-backed tile shows one of three states next to its badge:
 - **idle** (dim) — the agent finished its turn (`Stop`) or the session ended
   (`SessionEnd`).
 
-A tile only shows a state chip once that agent has reported at least one hook event;
-agents you haven't wired hooks for (or non-Claude agents like Codex) keep the
-preview-only behavior. Once a tile is **hook-backed**, the hook state is
-authoritative — it overrides any heuristic idle/working guess.
+A tile only shows a state chip once that agent has reported at least one hook event.
+Both Claude Code and **Codex** wire these hooks (see `CODEX-HOOKS.md`); an agent you
+haven't wired hooks for keeps the preview-only behavior. Once a tile is **hook-backed**,
+the hook state is authoritative — it overrides any heuristic idle/working guess.
 
 **Statuses survive a GUI restart.** The hooks only POST on *transitions*, so a
 relaunched GUI would otherwise show blank chips until each agent next acts. Instead the
@@ -474,8 +475,9 @@ gains a live state chip.
 
 ### Limitations (honest)
 
-- **Claude Code only.** The hook events are Claude Code's; Codex and other agents
-  keep the preview-only tile (still detected, still previewed, just no state chip).
+- **Claude Code + Codex.** Both wire agent-state hooks (Codex via `~/.codex/hooks.json`;
+  its `PermissionRequest` is the `waiting` edge — see `CODEX-HOOKS.md`). Any OTHER agent
+  keeps the preview-only tile (still detected, still previewed, just no state chip).
 - **No TTL / no liveness ping on the STATE itself.** The state value changes only on a
   hook event. If a session is killed mid-turn without firing `Stop`, the tile can sit on
   a stale `working`. When the detector CAN see the split it removes the tile on the next
@@ -1277,8 +1279,18 @@ surfaced and controlled. The engine + wire contract live in **HERO-AGENTS.md** a
   counter, so a stale record could briefly hydrate a reused id with wrong state until the next
   hook self-corrects (host restarts are rare + lose all sessions anyway). `prune` /
   `AgentStateStore` / `UserDefaultsAgentStateStore` / the pair-keying round-trip (incl. legacy
-  → local + the two-host-same-u64 no-collision case) are unit-tested. Claude-Code-only (Codex
-  tiles stay preview-only).
+  → local + the two-host-same-u64 no-collision case) are unit-tested. Both Claude Code and
+  Codex drive this (see `CODEX-HOOKS.md`); `PersistedAgentState.agentKind` (optional; nil for
+  Claude/old records) persists a hook-only tile's kind so a cross-host Codex tile keeps its
+  label + suspend pool wrapper across a relaunch.
+
+- **Hook-implied kind + the `kind` field (Codex parity).** The `/agent-state` body carries an
+  optional `kind` (`AgentStatePayload.kind`; Codex sends `"codex"`, Claude omits it), captured
+  into `hookKind[id]` (sticky) in `applyAgentState`. `displayAgentKind` uses it ONLY as the
+  hook-implied fallback — `hookKind[id] ?? "claude"` — for a surface the local detector could
+  not classify (the cross-host case); a DETECTED kind always wins. `MCPAgentState.parse`
+  sanitizes `kind` hard to a safe basename (`[a-z0-9-_]`, ≤32) since it becomes an `AgentKind`
+  command + the suspend pool-wrapper choice. See `CODEX-HOOKS.md` for the full parity picture.
 
 - **(cloud-hosts Phase 4 · M1/M3/D6) Cross-host per-tile state uses a NONCE, not the tty walk.**
   A remote box's hook can't name a LOCAL tty, so the GUI mints a per-spawn correlation nonce

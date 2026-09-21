@@ -1415,6 +1415,55 @@ struct AgentDashboardHookStateTests {
         #expect(model.hookSnapshot()[a]?.agentKind == "codex")
     }
 
+    // (Codex hooks) A hook-only CODEX agent (cross-host: no local process to classify)
+    // self-reports `kind:"codex"`, so the hook-implied label is codex — NOT the historical
+    // hard-coded "claude". Without this a remote Codex tile would be mislabeled claude.
+    @Test func hookReportedKindLabelsAHookOnlyCodexAgent() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, AgentStatePayload(tty: "ttys004", state: .working, kind: "codex"))
+        #expect(model.displayAgentKind(a)?.command == "codex")
+        #expect(model.entries.first(where: { $0.id == a })?.agent?.command == "codex")
+        #expect(model.hookSnapshot()[a]?.agentKind == "codex")
+    }
+
+    // A hook WITHOUT a kind (Claude Code omits it) still falls back to "claude".
+    @Test func hookWithoutKindStillFallsBackToClaude() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, payload(.working))   // no kind
+        #expect(model.displayAgentKind(a)?.command == "claude")
+    }
+
+    // The local process detector still WINS over a (conflicting) hook-reported kind —
+    // the detector is authoritative when it classified the subtree.
+    @Test func detectorKindWinsOverHookReportedKind() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgents([a: AgentKind("claude")])
+        model.applyAgentState(a, AgentStatePayload(tty: "ttys004", state: .working, kind: "codex"))
+        #expect(model.displayAgentKind(a)?.command == "claude")
+    }
+
+    // (suspend-resume) A hook-only Codex agent's suspend manifest reconstructs the CODEX
+    // pool wrapper (`codex-pool --resume <id>`), driven by the hook-reported kind flowing
+    // through displayAgentKind — the cross-host case the local detector can't classify.
+    @Test func hookReportedCodexKindDrivesTheSuspendPoolWrapper() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, AgentStatePayload(
+            tty: "ttys004", state: .idle,
+            claudeSessionId: "codex-sess-01", cwd: "/tmp/proj", kind: "codex"))
+        let manifest = model.suspendManifest(for: a, title: "codex split")
+        #expect(manifest?.agentKind == "codex")
+        #expect(manifest?.poolCommand == "codex-pool")
+        #expect(manifest?.resumeInputLine == "codex-pool --resume codex-sess-01\n")
+    }
+
     // (suspend-resume) applyAgentState captures Claude's resume token + cwd passively,
     // and hookSnapshot echoes them for the MCP list_surfaces row. Sticky: a later event
     // that omits them (nil fields) leaves the prior values.

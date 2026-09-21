@@ -15,8 +15,8 @@ merged. A manual "Suspend Split" command-palette action (`suspend_split`) is als
 one piece that needed Zig — a payload-less apprt action) so a split can be parked on demand; the app
 builds with it and its Binding + `ghostty.h`↔`Action.Key` tests pass.** Grounded in the code at HEAD
 (citations are `file:line` / `file:symbol`) and in the four-thread investigation that preceded it;
-claims about *current* behavior were verified against source. Scope is deliberately **Claude Code
-only** for the MVP — Codex is postponed (see [Postponed: Codex](#postponed-codex)).
+claims about *current* behavior were verified against source. The MVP was Claude-only; **Codex is
+now covered** at parity (see [Codex: supported](#codex-supported)).
 
 ---
 
@@ -245,7 +245,7 @@ sticky `bell` / `attentionNeeded` flags — `SurfaceView_AppKit.swift:2456-2457,
   suspended       : Bool    // sticky flag: this split is suspended (drives the overlay + gate)
   claudeSessionId : String  // the claude --resume <id> token (from Part 1)
   cwd             : String   // working dir to respawn in (from the hook cwd)
-  agentKind       : "claude" // MVP; codex later
+  agentKind       : "claude" // or "codex" — picks the pool wrapper
   title           : String   // for the placeholder label
   lastPrompt      : String?  // shown on the card as a reminder
   suspendedAt     : Date
@@ -269,8 +269,8 @@ account it lands on. Which account *continues* the session doesn't matter — ac
 The `resume_split` action (or the overlay's Resume button) re-attaches the SAME SurfaceView to a
 FRESH host session that runs the resume command:
 
-1. Reconstruct the command from the manifest: `claude-pool --resume <claudeSessionId>` (agentKind →
-   `claude-pool`; `codex-pool` later).
+1. Reconstruct the command from the manifest: `<pool> --resume <claudeSessionId>` (agentKind →
+   `claude-pool` or `codex-pool`).
 2. Re-attach via the existing content-swap `materializeClientSurface` (`SurfaceView_AppKit.swift:729`):
    a new `Attach` with `session_id=null` (fresh spawn), `working_directory = manifest.cwd`, and
    `initial_input = "<command>\n"`. The fresh interactive shell loads its rc (so a `claude-pool`
@@ -416,14 +416,15 @@ entry here + the CLAUDE.md Feature map + Fork-only config keys index, in the sam
 
 ---
 
-## Postponed: Codex
+## Codex: supported
 
-Codex is **detected** (same subtree-walk matcher, `agentKind == "codex"`) but has **no hook
-mechanism** in this fork — so neither passive session-id capture nor a clean idle signal exists for
-it (`AGENT-QUEUE.md:60-62` "Codex hooks: TODO"). Bringing Codex to parity needs a new capture path
-(read Codex's rollout file for the latest session in that cwd, or a future Codex hook) and a
-`codex-pool --resume`/equivalent invocation. **Out of scope for the MVP** (user decision); revisit
-after the Claude path is proven.
+Codex is now at parity. Its agent-state hooks (`~/.codex/hooks.json`, see `CODEX-HOOKS.md`) give the
+SAME two things the Claude path relies on: passive session-id capture (Codex's hook `session_id` →
+the `claudeSessionId` wire field → the resume token) and a clean idle signal (`Stop`/`SessionEnd` →
+`idle`). So `SuspendPolicy.suspendableKinds` includes `"codex"`, the idle scanner selects an overdue
+idle Codex split, and `SuspendManifest.poolCommand` reconstructs `codex-pool --resume <id>` (the
+external pool wrapper, mirroring `claude-pool`). Detection was always there (`agentKind == "codex"`
+via the subtree-walk matcher); the hooks add the state + resume-id capture that suspend needs.
 
 ---
 
@@ -481,4 +482,4 @@ viewport frame on mismatch). Out of scope; noted for completeness.
 4. **Suspend is a deliberate `Close`.** Any non-Claude output, a half-typed command, or background
    jobs in that split are gone — we restart a fresh shell + `claude --resume`. Fine for an idle
    agent split (the only thing we suspend); never suspend a split doing non-agent work.
-5. **Codex not covered** until its capture path is built.
+5. **Codex is covered** (its hooks supply the same capture + idle signal — see `CODEX-HOOKS.md`).

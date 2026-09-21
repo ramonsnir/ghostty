@@ -138,9 +138,11 @@ class AppDelegate: NSObject,
     private var agentManager: AgentManagerController?
 
     /// (ramon fork / Agent Hooks) UserDefaults key recording whether the one-time
-    /// launch offer to install the Claude agent-state hooks has been shown. Set
-    /// once (per bundle-id domain) so the prompt never re-fires.
-    static let kAgentHooksAskedKey = "agentHooks.offered"
+    /// launch offer to install the agent-state hooks has been shown. Set once (per
+    /// bundle-id domain) so the prompt never re-fires. The `.v2` suffix rev'd when
+    /// the offer grew to cover Codex too, so an existing user who was asked under the
+    /// Claude-only offer is asked once more (to pick up the Codex hooks).
+    static let kAgentHooksAskedKey = "agentHooks.offered.v2"
 
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
@@ -725,70 +727,115 @@ class AppDelegate: NSObject,
         return agentDashboard != nil
     }
 
-    /// (ramon fork / Agent Hooks) Install the Claude Code agent-state hooks
-    /// (command-palette "Install Claude Agent Hooks"). Runs the filesystem work
-    /// off-main, then reports the outcome in an NSAlert on main.
+    /// (ramon fork / Agent Hooks) Install BOTH the Claude Code and Codex agent-state
+    /// hooks (command-palette "Install Agent Hooks"). Each installer is independent +
+    /// idempotent, so installing when one is already present is a no-op for it. Runs
+    /// the filesystem work off-main, then reports a combined outcome in an NSAlert.
     @objc private func ghosttyInstallAgentHooks(_ notification: Notification) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let outcome: Result<AgentHooksInstaller.InstallResult, Error>
-            do {
-                outcome = .success(try AgentHooksInstaller.install())
-            } catch {
-                outcome = .failure(error)
-            }
+            let claude: Result<AgentHooksInstaller.InstallResult, Error>
+            do { claude = .success(try AgentHooksInstaller.install()) }
+            catch { claude = .failure(error) }
+
+            let codex: Result<CodexHooksInstaller.InstallResult, Error>
+            do { codex = .success(try CodexHooksInstaller.install()) }
+            catch { codex = .failure(error) }
+
             DispatchQueue.main.async {
-                AppDelegate.presentAgentHooksResult(outcome)
+                AppDelegate.presentAgentHooksResult(claude: claude, codex: codex)
             }
         }
     }
 
-    /// Present an NSAlert describing an agent-hooks install outcome. Main-thread.
+    /// One agent's install summary, folded to a common shape so the combined alert
+    /// treats Claude and Codex uniformly.
+    private struct HookInstallSummary {
+        let label: String            // "Claude Code" / "Codex"
+        let settingsFile: String     // "~/.claude/settings.json" / "~/.codex/hooks.json"
+        let created: Bool
+        let added: [String]
+        let skipped: [String]
+        let backupPath: String?
+        let error: String?
+    }
+
+    /// Present a single NSAlert describing BOTH agents' install outcomes. Main-thread.
     private static func presentAgentHooksResult(
-        _ outcome: Result<AgentHooksInstaller.InstallResult, Error>
+        claude: Result<AgentHooksInstaller.InstallResult, Error>,
+        codex: Result<CodexHooksInstaller.InstallResult, Error>
     ) {
+        let summaries: [HookInstallSummary] = [
+            {
+                switch claude {
+                case .success(let r):
+                    return HookInstallSummary(
+                        label: "Claude Code", settingsFile: "~/.claude/settings.json",
+                        created: r.merge.created, added: r.merge.added,
+                        skipped: r.merge.skipped, backupPath: r.backupPath, error: nil)
+                case .failure(let e):
+                    return HookInstallSummary(
+                        label: "Claude Code", settingsFile: "~/.claude/settings.json",
+                        created: false, added: [], skipped: [], backupPath: nil,
+                        error: "\(e)")
+                }
+            }(),
+            {
+                switch codex {
+                case .success(let r):
+                    return HookInstallSummary(
+                        label: "Codex", settingsFile: "~/.codex/hooks.json",
+                        created: r.merge.created, added: r.merge.added,
+                        skipped: r.merge.skipped, backupPath: r.backupPath, error: nil)
+                case .failure(let e):
+                    return HookInstallSummary(
+                        label: "Codex", settingsFile: "~/.codex/hooks.json",
+                        created: false, added: [], skipped: [], backupPath: nil,
+                        error: "\(e)")
+                }
+            }(),
+        ]
+
         let alert = NSAlert()
-        switch outcome {
-        case .failure(let error):
-            alert.alertStyle = .warning
-            alert.messageText = "Couldn't install the Claude agent hooks"
-            alert.informativeText = "\(error)"
-        case .success(let result):
-            alert.alertStyle = .informational
-            let merge = result.merge
-            if merge.created {
-                alert.messageText = "Claude agent hooks installed"
-            } else if merge.added.isEmpty {
-                alert.messageText = "Claude agent hooks already installed"
-            } else {
-                alert.messageText = "Claude agent hooks installed"
+        let anyError = summaries.contains { $0.error != nil }
+        alert.alertStyle = anyError ? .warning : .informational
+        alert.messageText = anyError ? "Agent hooks: partial install" : "Agent hooks installed"
+
+        var blocks: [String] = []
+        for s in summaries {
+            if let error = s.error {
+                blocks.append("\(s.label): couldn't install — \(error)")
+                continue
             }
-            var lines: [String] = []
-            if merge.created {
-                lines.append("Created ~/.claude/settings.json with all six hooks.")
+            var parts: [String] = []
+            if s.created {
+                parts.append("Created \(s.settingsFile).")
+            } else if s.added.isEmpty {
+                parts.append("Already installed.")
             } else {
-                if !merge.added.isEmpty {
-                    lines.append("Added: \(merge.added.joined(separator: ", ")).")
-                }
-                if !merge.skipped.isEmpty {
-                    lines.append(
-                        "Already present (left untouched): " +
-                        "\(merge.skipped.joined(separator: ", ")).")
+                parts.append("Added: \(s.added.joined(separator: ", ")).")
+                if !s.skipped.isEmpty {
+                    parts.append("Kept: \(s.skipped.joined(separator: ", ")).")
                 }
             }
-            if let backup = result.backupPath {
-                lines.append("Backed up your previous settings to \(backup).")
+            if let backup = s.backupPath {
+                parts.append("Backed up your previous file to \(backup).")
             }
-            lines.append("Restart your Claude Code sessions to pick up the hooks.")
-            alert.informativeText = lines.joined(separator: "\n\n")
+            blocks.append("\(s.label): " + parts.joined(separator: " "))
         }
+        blocks.append(
+            "Restart your Claude Code sessions to pick up the hooks. For Codex, run " +
+            "its `/hooks` command once to TRUST the hook before it will run.")
+        alert.informativeText = blocks.joined(separator: "\n\n")
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
 
-    /// (ramon fork / Agent Hooks) One-time launch-time offer to install the hooks
-    /// when a queue/manager feature is enabled but the hooks aren't installed.
-    /// Persists an "asked" flag in the per-bundle-id UserDefaults so it never
-    /// re-prompts (whether the colleague installs or declines).
+    /// (ramon fork / Agent Hooks) One-time launch-time offer to install the agent
+    /// hooks (Claude Code AND Codex) when a queue/manager feature is enabled but the
+    /// hooks aren't installed for BOTH agents. Persists an "asked" flag in the
+    /// per-bundle-id UserDefaults so it never re-prompts (whether the colleague
+    /// installs or declines). Offered when EITHER agent's hooks are missing, so a
+    /// user who already had the Claude hooks is still offered the Codex ones.
     private func maybeOfferAgentHooks() {
         let defaults = UserDefaults.ghostty
         let alreadyAsked = defaults.bool(forKey: AppDelegate.kAgentHooksAskedKey)
@@ -797,14 +844,22 @@ class AppDelegate: NSObject,
 
         // Detect installation off-main (filesystem), then decide + prompt on main.
         DispatchQueue.global(qos: .utility).async {
-            let installed: Bool = {
+            // Installed only when BOTH agents' hooks are present — so a partial
+            // install (Claude but not Codex) still triggers the offer. `try?`
+            // flattens absent (nil) + malformed (throw) to a single false.
+            let claudeInstalled: Bool = {
                 let path = AgentHooksInstaller.settingsPath(home: NSHomeDirectory())
-                // `readSettings` returns `[String:Any]?` (nil when absent) and throws
-                // on malformed; Swift's `try?` flattens both to a single optional.
                 guard let settings = try? AgentHooksInstaller.readSettings(path: path)
                 else { return false }
                 return AgentHooksInstaller.hooksInstalled(settings: settings)
             }()
+            let codexInstalled: Bool = {
+                let path = CodexHooksInstaller.settingsPath(home: NSHomeDirectory())
+                guard let settings = try? CodexHooksInstaller.readSettings(path: path)
+                else { return false }
+                return CodexHooksInstaller.hooksInstalled(settings: settings)
+            }()
+            let installed = claudeInstalled && codexInstalled
 
             guard AgentHooksInstaller.shouldAutoOfferHooks(
                 featureEnabled: featureEnabled,
@@ -819,9 +874,11 @@ class AppDelegate: NSObject,
 
                 let alert = NSAlert()
                 alert.alertStyle = .informational
-                alert.messageText = "Install Ghostty's Claude Code hooks?"
+                alert.messageText = "Install Ghostty's agent hooks?"
                 alert.informativeText =
-                    "Enables per-agent status and Agent Queue auto-close."
+                    "Sets up the Claude Code and Codex hooks that enable per-agent " +
+                    "status, attention alerts, and Agent Queue auto-close. Idempotent " +
+                    "— anything already present is left untouched."
                 alert.addButton(withTitle: "Install")
                 alert.addButton(withTitle: "Not now")
                 if alert.runModal() == .alertFirstButtonReturn {

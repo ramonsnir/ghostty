@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh working" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh working" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh working" } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh waiting" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh idle" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh idle" } ] }
+    ]
+  }
+}

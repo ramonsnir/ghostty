@@ -103,6 +103,22 @@ struct SuspendPolicyTests {
             .init(id: shellIdleOld,      agentKind: nil,      isIdle: true,  lastActivity: old),
         ]
         let picked = SuspendPolicy.surfacesToSuspend(candidates, now: now, thresholdBusinessDays: 2, calendar: c)
-        #expect(picked == [claudeIdleOld]) // only the idle, old-enough CLAUDE split
+        // Both the idle, old-enough CLAUDE and CODEX splits, in candidate order. The
+        // idle-but-recent claude, the working claude, and the plain shell are excluded.
+        #expect(picked == [claudeIdleOld, codexIdleOld])
+    }
+
+    @Test func selectionExcludesUnknownAndWorkingKinds() {
+        let c = cal()
+        let now = date(2026, 9, 16, 9, cal: c) // Wednesday
+        let old = date(2026, 9, 11, cal: c)    // Friday
+        let codexWorking = UUID()
+        let unknownIdle = UUID()
+        let candidates: [SuspendPolicy.Candidate] = [
+            .init(id: codexWorking, agentKind: "codex",  isIdle: false, lastActivity: old),
+            .init(id: unknownIdle,  agentKind: "gemini", isIdle: true,  lastActivity: old),
+        ]
+        let picked = SuspendPolicy.surfacesToSuspend(candidates, now: now, thresholdBusinessDays: 2, calendar: c)
+        #expect(picked.isEmpty) // a working codex and an unknown-kind idle are both skipped
     }
 }

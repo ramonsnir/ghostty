@@ -231,18 +231,22 @@ what's being asked → `send_key`/`send_text` to respond → repeat; plus `perfo
 - **The token gates every `/mcp` request** (`X-Ghostty-Token`, constant-time compare). It
   is a **shell-execution credential** — treat it like an SSH key.
 - **Second route — `POST /agent-state`.** The same listener also serves a token-gated
-  `POST /agent-state`, the ingest endpoint for the Claude Code per-tile-state hooks (see
-  AGENT-DASHBOARD.md → "Per-tile agent state (Claude Code hooks)"). It rides the **exact
-  same** Host-header guard, token gate (same `X-Ghostty-Token`, constant-time compare), and
-  backoff as `/mcp`, so anyone holding the MCP token — or any caller, when the server runs
-  open — can also POST agent-state events. It does NOT spawn shells; it only updates a
-  dashboard tile's displayed state. Still, it is a real second authenticated surface on the
-  same token, so treat the token accordingly. (suspend-resume) The hook body also carries
-  `claudeSessionId` + `cwd` when Claude Code provides them (from the hook stdin's `session_id` /
-  `cwd`); `MCPAgentState.parse` captures both and the dashboard model stores them per surface,
-  echoing them on `list_surfaces` — this is the passive capture that lets a future suspend restart
-  the agent with `claude --resume <id>` without ever running `/status`. See
-  [SUSPEND-RESUME-DESIGN.md](SUSPEND-RESUME-DESIGN.md).
+  `POST /agent-state`, the ingest endpoint for the per-tile-state hooks that **both Claude
+  Code and Codex** wire (see AGENT-DASHBOARD.md → "Per-tile agent state" and
+  [CODEX-HOOKS.md](CODEX-HOOKS.md)). It rides the **exact same** Host-header guard, token gate
+  (same `X-Ghostty-Token`, constant-time compare), and backoff as `/mcp`, so anyone holding the
+  MCP token — or any caller, when the server runs open — can also POST agent-state events. It
+  does NOT spawn shells; it only updates a dashboard tile's displayed state. Still, it is a real
+  second authenticated surface on the same token, so treat the token accordingly. The body is
+  `{tty|nonce, state, prompt?, tool?, message?, claudeSessionId?, cwd?, kind?}`. (suspend-resume)
+  `claudeSessionId` + `cwd` are captured passively (from the hook stdin's `session_id` / `cwd`)
+  and echoed on `list_surfaces`, letting a future suspend restart the agent with
+  `<pool> --resume <id>` without ever running `/status`. (Codex parity) **`kind`** is the agent's
+  self-reported kind (`"codex"`; Claude omits it), parsed + HARD-sanitized in
+  `MCPAgentState.parse` to a safe basename (`[a-z0-9-_]`, ≤32) — it is used ONLY as
+  `displayAgentKind`'s hook-implied fallback label for a surface the local detector could not
+  classify (the cross-host case), where it also fixes the suspend pool-wrapper choice. See
+  [SUSPEND-RESUME-DESIGN.md](SUSPEND-RESUME-DESIGN.md) and [CODEX-HOOKS.md](CODEX-HOOKS.md).
 - **Surface resolution robustness.** `/agent-state` maps the hook's tty to a surface via each
   surface's host-pushed foreground pid (`MCPAgentState.resolveSurface`). Some splits (notably
   queue-spawned agents) report the `login`/session-leader as their foreground pid, whose own
