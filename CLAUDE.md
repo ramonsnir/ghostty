@@ -236,15 +236,19 @@ to RUNNING (→ `AGENT-QUEUE-INTERNALS.md`). GUI relaunch + rebuilt sidecar `dis
 ### Codex agent hooks → `CODEX-HOOKS.md`
 Brings Codex to full parity with Claude Code: the same per-tile agent-state hooks POSTing to MCP
 `/agent-state`, so a Codex split gets a live status chip, attention/phone push (`PermissionRequest`
-→ `waiting`), Agent Queue auto-close (`Stop`→`idle`), and idle suspend/resume (`codex-pool --resume`).
+→ `waiting`), Agent Queue auto-close (`Stop`→`idle`), and idle suspend/resume (**home-pinned**
+`CODEX_HOME='<home>' codex resume <id>` — Codex sessions are `CODEX_HOME`-scoped, so resume pins the
+originating account home and bypasses the pool; the hook captures `codexHome`).
 Fork-only, macOS, OFF until installed. No config key. Install via the **Install Agent Hooks** palette
 entry (or the launch offer) — it installs BOTH agents into `~/.claude/settings.json` +
 `~/.codex/hooks.json` (idempotent); Codex then needs a one-time `/hooks` TRUST. `CodexHooksInstaller`
-mirrors `AgentHooksInstaller`; the one wire addition is the optional **`kind`** field on `/agent-state`
-(hook-implied fallback label + suspend pool-wrapper for a hook-only/cross-host surface the detector
-can't classify — a detected kind always wins). Sidecar needs NO code change (its auto-close gate is
-already agentState-based). GUI-only **except** the one-line "Install Agent Hooks" palette label
-(`src/input/command.zig`) → that makes it **Zig+lib**; no host restart, no sidecar rebuild.
+mirrors `AgentHooksInstaller`; two optional `/agent-state` wire fields are added — **`kind`**
+(hook-implied fallback label for a hook-only/cross-host surface the detector can't classify — a
+detected kind always wins) and **`codexHome`** (the symlink-resolved `CODEX_HOME` that owns the
+session's rollout, so a suspended Codex session resumes home-pinned; a Codex split with no captured
+home is not suspendable). Sidecar needs NO code change (its auto-close gate is already
+agentState-based). GUI-only (the "Install Agent Hooks" palette label was the one Zig+lib touch, already
+landed) — no host restart, no sidecar rebuild.
 
 ### PTY-host + session lifecycle → `PTYHOST.md`
 The `.client` emulation-on-host backend: sessions survive a GUI quit/relaunch (RAM-only; a HOST

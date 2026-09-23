@@ -49,6 +49,14 @@ struct AgentStatePayload: Equatable, Sendable {
     /// short safe-basename token by the parser. `var` + default so existing tty-only
     /// call sites are unaffected.
     var kind: String? = nil
+    /// (ramon fork / Codex suspend-resume) The STABLE, symlink-resolved `CODEX_HOME`
+    /// the Codex hook reports — the account home whose `sessions/` owns this session's
+    /// rollout. Codex resume (`codex resume <id>`) reads the rollout from
+    /// `$CODEX_HOME/sessions`, so a suspended Codex session can ONLY be resumed under
+    /// this exact home (an account pool rotates homes and can't be told which). The
+    /// suspend manifest records it so Resume pins `CODEX_HOME=<home> codex resume <id>`.
+    /// nil for Claude / an older hook. Validated by the parser to a safe absolute path.
+    var codexHome: String? = nil
 }
 
 /// (ramon fork / Agent Manager) An LLM annotation for one surface, written through

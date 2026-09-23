@@ -238,14 +238,17 @@ what's being asked → `send_key`/`send_text` to respond → repeat; plus `perfo
   MCP token — or any caller, when the server runs open — can also POST agent-state events. It
   does NOT spawn shells; it only updates a dashboard tile's displayed state. Still, it is a real
   second authenticated surface on the same token, so treat the token accordingly. The body is
-  `{tty|nonce, state, prompt?, tool?, message?, claudeSessionId?, cwd?, kind?}`. (suspend-resume)
-  `claudeSessionId` + `cwd` are captured passively (from the hook stdin's `session_id` / `cwd`)
-  and echoed on `list_surfaces`, letting a future suspend restart the agent with
-  `<pool> --resume <id>` without ever running `/status`. (Codex parity) **`kind`** is the agent's
-  self-reported kind (`"codex"`; Claude omits it), parsed + HARD-sanitized in
-  `MCPAgentState.parse` to a safe basename (`[a-z0-9-_]`, ≤32) — it is used ONLY as
+  `{tty|nonce, state, prompt?, tool?, message?, claudeSessionId?, cwd?, kind?, codexHome?}`.
+  (suspend-resume) `claudeSessionId` + `cwd` are captured passively (from the hook stdin's
+  `session_id` / `cwd`) and echoed on `list_surfaces`, letting suspend restart the agent (Claude:
+  `claude-pool --resume <id>`; Codex: home-pinned, below) without ever running `/status`.
+  (Codex parity) **`kind`** is the agent's self-reported kind (`"codex"`; Claude omits it), parsed +
+  HARD-sanitized in `MCPAgentState.parse` (`safeKind`: `[a-z0-9-_]`, ≤32) — used ONLY as
   `displayAgentKind`'s hook-implied fallback label for a surface the local detector could not
-  classify (the cross-host case), where it also fixes the suspend pool-wrapper choice. See
+  classify (the cross-host case). **`codexHome`** is the symlink-resolved `CODEX_HOME` that owns a
+  Codex session's rollout, parsed by `safePath` (absolute, ≤4096, no control byte / single-quote) —
+  it feeds a HOME-PINNED resume (`CODEX_HOME='<home>' codex resume <id>`), since a Codex session can
+  only be resumed under its originating account home. See
   [SUSPEND-RESUME-DESIGN.md](SUSPEND-RESUME-DESIGN.md) and [CODEX-HOOKS.md](CODEX-HOOKS.md).
 - **Surface resolution robustness.** `/agent-state` maps the hook's tty to a surface via each
   surface's host-pushed foreground pid (`MCPAgentState.resolveSurface`). Some splits (notably

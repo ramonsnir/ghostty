@@ -1448,20 +1448,34 @@ struct AgentDashboardHookStateTests {
         #expect(model.displayAgentKind(a)?.command == "claude")
     }
 
-    // (suspend-resume) A hook-only Codex agent's suspend manifest reconstructs the CODEX
-    // pool wrapper (`codex-pool --resume <id>`), driven by the hook-reported kind flowing
-    // through displayAgentKind — the cross-host case the local detector can't classify.
-    @Test func hookReportedCodexKindDrivesTheSuspendPoolWrapper() {
+    // (suspend-resume) A hook-only Codex agent's suspend manifest reconstructs a HOME-PINNED
+    // resume (`CODEX_HOME='<home>' codex resume <id>`) from the hook-captured kind + CODEX_HOME
+    // — a Codex session can only be resumed under its originating account home.
+    @Test func hookReportedCodexDrivesHomePinnedResume() {
         let model = AgentDashboardModel(store: InMemoryHideStore())
         let a = UUID()
         model.rebuild(live: live([a]))
         model.applyAgentState(a, AgentStatePayload(
             tty: "ttys004", state: .idle,
-            claudeSessionId: "codex-sess-01", cwd: "/tmp/proj", kind: "codex"))
+            claudeSessionId: "codex-sess-01", cwd: "/tmp/proj", kind: "codex",
+            codexHome: "/Users/example/.codex-accounts/one"))
         let manifest = model.suspendManifest(for: a, title: "codex split")
         #expect(manifest?.agentKind == "codex")
-        #expect(manifest?.poolCommand == "codex-pool")
-        #expect(manifest?.resumeInputLine == "codex-pool --resume codex-sess-01\n")
+        #expect(manifest?.codexHome == "/Users/example/.codex-accounts/one")
+        #expect(manifest?.resumeInputLine
+            == "CODEX_HOME='/Users/example/.codex-accounts/one' codex resume codex-sess-01\n")
+    }
+
+    // A Codex split whose hook never reported CODEX_HOME is NOT suspendable — the manifest
+    // builder returns nil so the idle scanner / manual suspend won't strand an unresumable split.
+    @Test func codexWithoutCapturedHomeIsNotSuspendable() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        let a = UUID()
+        model.rebuild(live: live([a]))
+        model.applyAgentState(a, AgentStatePayload(
+            tty: "ttys004", state: .idle,
+            claudeSessionId: "codex-sess-02", cwd: "/tmp/proj", kind: "codex"))  // no codexHome
+        #expect(model.suspendManifest(for: a, title: "codex split") == nil)
     }
 
     // (suspend-resume) applyAgentState captures Claude's resume token + cwd passively,

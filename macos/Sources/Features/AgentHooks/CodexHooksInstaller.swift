@@ -494,6 +494,20 @@ cwd_field=""
 [ -n "$claude_session_id" ] && sid_field=",\"claudeSessionId\":\"$(json_escape "$claude_session_id")\""
 [ -n "$cwd" ]               && cwd_field=",\"cwd\":\"$(json_escape "$cwd")\""
 
+# --- CODEX_HOME: the account home that owns this session's rollout ------------
+# (suspend-resume, Codex) Codex resume is `codex resume <id>` and reads the
+# rollout from $CODEX_HOME/sessions — so a suspended session can ONLY be resumed
+# under the SAME home that created it. An account pool points CODEX_HOME at an
+# EPHEMERAL <pool>/creds SYMLINK whose target is the durable account home, and
+# that symlink is torn down when the pooled run exits. So resolve to the PHYSICAL
+# path (`pwd -P` follows the symlink) — that durable dir is where the rollout
+# actually lives and is still valid after the pool dir is gone. Default home when
+# CODEX_HOME is unset. The GUI records this so Resume can pin it (see MCPAgentState
+# + SuspendManifest). Empty ⇒ the field is simply omitted.
+codex_home="$(cd "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null && pwd -P || printf '%s' "${CODEX_HOME:-$HOME/.codex}")"
+codexhome_field=""
+[ -n "$codex_home" ] && codexhome_field=",\"codexHome\":\"$(json_escape "$codex_home")\""
+
 # --- REMOTE self-ID: POST {nonce, state} when spawned on a cloud box ----------
 # (cloud-hosts, D6.) A remote-spawned agent carries GHOSTTY_SURFACE_NONCE (a
 # non-secret per-spawn correlation id, GUI-injected via the spawn's initial
@@ -517,8 +531,8 @@ if [ -n "$GHOSTTY_SURFACE_NONCE" ]; then
   [ -n "$tool" ]    && tool_field=",\"tool\":\"$(json_escape "$tool")\""
   [ -n "$prompt" ]  && prompt_field=",\"prompt\":\"$(json_escape "$prompt")\""
   [ -n "$message" ] && msg_field=",\"message\":\"$(json_escape "$message")\""
-  body="$(printf '{"nonce":"%s","state":"%s","kind":"codex"%s%s%s%s%s}' \
-    "$esc_nonce" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field")"
+  body="$(printf '{"nonce":"%s","state":"%s","kind":"codex"%s%s%s%s%s%s}' \
+    "$esc_nonce" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field" "$codexhome_field")"
 
   printf 'header = "X-Ghostty-Token: %s"\n' "$cap_token" \
     | curl -fsS --max-time 2 -K - \
@@ -595,8 +609,8 @@ msg_field=""
 [ -n "$prompt" ]  && prompt_field=",\"prompt\":\"$(json_escape "$prompt")\""
 [ -n "$message" ] && msg_field=",\"message\":\"$(json_escape "$message")\""
 
-body="$(printf '{"tty":"%s","state":"%s","kind":"codex"%s%s%s%s%s}' \
-  "$esc_tty" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field")"
+body="$(printf '{"tty":"%s","state":"%s","kind":"codex"%s%s%s%s%s%s}' \
+  "$esc_tty" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field" "$codexhome_field")"
 
 # --- fire-and-forget POST ----------------------------------------------------
 # Tight --max-time so a hung/absent server never stalls the agent. Backgrounded

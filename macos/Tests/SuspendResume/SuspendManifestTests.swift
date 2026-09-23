@@ -6,10 +6,11 @@ import Testing
 /// shell-safety guard on `resumeInputLine` and the pool-command mapping.
 struct SuspendManifestTests {
 
-    private func manifest(id: String, kind: String = "claude") -> SuspendManifest {
+    private func manifest(id: String, kind: String = "claude", codexHome: String? = nil) -> SuspendManifest {
         SuspendManifest(
             claudeSessionId: id, cwd: "/Users/example/project", agentKind: kind,
-            title: "work", lastPrompt: "do the thing", suspendedAt: Date(timeIntervalSince1970: 0))
+            title: "work", lastPrompt: "do the thing", suspendedAt: Date(timeIntervalSince1970: 0),
+            codexHome: codexHome)
     }
 
     @Test func buildsClaudeResumeLine() {
@@ -18,10 +19,30 @@ struct SuspendManifestTests {
         #expect(m.resumeInputLine == "claude-pool --resume abc123-DEF-456_78\n")
     }
 
-    @Test func codexUsesCodexPool() {
-        let m = manifest(id: "roll-01", kind: "codex")
-        #expect(m.poolCommand == "codex-pool")
-        #expect(m.resumeInputLine == "codex-pool --resume roll-01\n")
+    // (Codex) Resume is a SUBCOMMAND pinned to the originating CODEX_HOME — NOT a pool
+    // `--resume` flag. A Codex session's rollout lives only under its creating home, and
+    // the account pool rotates + can't target one, so we pin the home and bypass the pool.
+    @Test func codexResumeIsHomePinnedSubcommand() {
+        let m = manifest(id: "01a0cec1-eb24-7ee3", kind: "codex",
+                         codexHome: "/Users/example/.codex-accounts/one")
+        #expect(m.resumeInputLine
+            == "CODEX_HOME='/Users/example/.codex-accounts/one' codex resume 01a0cec1-eb24-7ee3\n")
+    }
+
+    // A Codex manifest with NO home is NOT resumable (can't find the rollout) → nil, so the
+    // caller keeps the placeholder rather than killing a child it can never bring back.
+    @Test func codexWithoutHomeIsNotResumable() {
+        #expect(manifest(id: "roll-01", kind: "codex", codexHome: nil).resumeInputLine == nil)
+        #expect(manifest(id: "roll-01", kind: "codex", codexHome: "").resumeInputLine == nil)
+    }
+
+    // The home rides a single-quoted env assignment, so an unsafe home (relative, a single
+    // quote, or a control byte) must yield nil — never break out of the quoting.
+    @Test func codexRejectsUnsafeHome() {
+        for badHome in ["relative/path", "/home/'; rm -rf ~", "/home/\nx", "~/.codex"] {
+            #expect(manifest(id: "roll-01", kind: "codex", codexHome: badHome).resumeInputLine == nil,
+                    "expected nil for home \(badHome.debugDescription)")
+        }
     }
 
     @Test func parsesResumeIdFromCommand() {

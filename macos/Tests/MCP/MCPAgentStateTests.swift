@@ -89,6 +89,23 @@ struct MCPAgentStateTests {
         #expect(MCPAgentState.parse(body)?.kind == "my-agent_2")
     }
 
+    @Test func parseCapturesCodexHome() {
+        let body = Data(#"{"tty":"ttys004","state":"idle","kind":"codex","codexHome":"/Users/example/.codex-accounts/one"}"#.utf8)
+        #expect(MCPAgentState.parse(body)?.codexHome == "/Users/example/.codex-accounts/one")
+    }
+
+    @Test func parseCodexHomeAbsentIsNil() {
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"idle"}"#.utf8))?.codexHome == nil)
+    }
+
+    @Test func parseCodexHomeRejectsUnsafe() {
+        // Becomes a single-quoted env value in a resume command, so it must be an absolute
+        // path with no single-quote / control byte; anything else → nil.
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"idle","codexHome":"relative/x"}"#.utf8))?.codexHome == nil)
+        #expect(MCPAgentState.parse(Data(#"{"tty":"ttys004","state":"idle","codexHome":"/a/'; rm -rf ~"}"#.utf8))?.codexHome == nil)
+        #expect(MCPAgentState.parse(Data("{\"tty\":\"ttys004\",\"state\":\"idle\",\"codexHome\":\"/a/\\nx\"}".utf8))?.codexHome == nil)
+    }
+
     @Test func parseSessionIdCappedAt256() {
         let big = String(repeating: "x", count: 300)
         let body = Data(#"{"tty":"ttys004","state":"working","claudeSessionId":"\#(big)"}"#.utf8)

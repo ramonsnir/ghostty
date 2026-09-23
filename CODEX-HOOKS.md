@@ -23,8 +23,8 @@ A local **or** cross-host Codex split behaves exactly like a Claude one:
   (`PermissionRequest` → `waiting`);
 - **Agent Queue auto-close** of a finished Codex split (its `Stop`/`SessionEnd` → `idle`
   satisfies the queue's quiescence gate);
-- **idle auto-suspend + Resume** of an idle Codex split (`codex-pool --resume <id>`),
-  the same business-day scanner that covers Claude.
+- **idle auto-suspend + Resume** of an idle Codex split (home-pinned
+  `CODEX_HOME='<home>' codex resume <id>`), the same business-day scanner that covers Claude.
 
 ## Install
 
@@ -66,11 +66,14 @@ also needs the one-time `/hooks` trust.**
 Load-bearing facts + file wiring; read before touching the feature.
 
 - **Wire contract is CLI-agnostic.** `POST /agent-state` takes
-  `{tty|nonce, state, prompt?, tool?, message?, claudeSessionId?, cwd?, kind?}`. The one
-  field added for Codex is **`kind`** (`AgentStatePayload.kind`), parsed + sanitized in
+  `{tty|nonce, state, prompt?, tool?, message?, claudeSessionId?, cwd?, kind?, codexHome?}`.
+  Two fields were added for Codex: **`kind`** (`AgentStatePayload.kind`, parsed + sanitized in
   `MCPAgentState.parse` (`safeKind`: lowercased, ≤32 chars, `[a-z0-9-_]` only, else nil —
   it becomes an `AgentKind` command string + a suspend pool-wrapper choice, so it must be
-  a safe basename token). The server handler is UNCHANGED (it forwards the whole payload).
+  a safe basename token), and **`codexHome`** (`AgentStatePayload.codexHome`, parsed by
+  `safePath`: an absolute path, ≤4096, no control byte / single-quote — it becomes a
+  single-quoted env value in the resume line). The server handler is UNCHANGED (it forwards
+  the whole payload).
 - **`kind` is a FALLBACK-ONLY label.** `AgentDashboardModel.displayAgentKind` returns the
   DETECTED kind when the local subtree walk classified one; only for a hook-only surface
   (the cross-host case the detector can't reach) does it fall back to
@@ -87,12 +90,26 @@ Load-bearing facts + file wiring; read before touching the feature.
   `idle` OR `waiting`, and SPAWNED→RUNNING keys off any `agentState`. Codex posting `idle`
   on `Stop` satisfies the close gate directly; the only thing that was missing was Codex
   posting agent-state at all.
-- **Suspend/resume.** `SuspendPolicy.suspendableKinds = ["claude","codex"]` gates the idle
-  scanner; `SuspendManifest.poolCommand` maps `agentKind == "codex"` → `codex-pool`, and
-  `resumeInputLine` emits `codex-pool --resume <id>` (the id is Codex's hook `session_id`,
-  captured into the `claudeSessionId` wire field — historically named, kind-neutral in
-  purpose, guarded to a safe charset). `codex resume`/`codex-pool` semantics live in the
-  external pool wrapper, exactly like `claude-pool`.
+- **Suspend/resume — HOME-PINNED, not pool-routed (the load-bearing gotcha).** A Codex
+  session's rollout lives ONLY under the `CODEX_HOME` that created it: each account home
+  (`~/.codex-accounts/<acct>/`, plus the default `~/.codex/`) has its OWN `sessions/` +
+  `auth.json`, and `codex resume <id>` reads `$CODEX_HOME/sessions`. The account pool
+  ROTATES homes (least-used) and can't be told which one, so resuming through the pool lands
+  on the wrong home and the session isn't found. Codex resume is also a **subcommand**
+  (`codex resume <id>`), not a `--resume` flag. So:
+  - The hook captures the **symlink-resolved** `CODEX_HOME` (`pwd -P` — the pool points it at
+    an ephemeral `<pool>/creds` symlink whose durable target is the real account home) and
+    POSTs it as the **`codexHome`** field.
+  - `SuspendManifest.resumeInputLine` for codex emits `CODEX_HOME='<home>' codex resume <id>`
+    (home pinned, pool bypassed; the id is Codex's hook `session_id`, carried in the
+    `claudeSessionId` wire field — historically named, kind-neutral). `codexHome` is validated
+    to a safe absolute path (single-quoted in the line); the session id is charset-guarded.
+  - A Codex split with **no captured `codexHome` is NOT suspendable** — `suspendManifest`
+    returns nil so the scanner never kills a child it can't bring back.
+  - `SuspendPolicy.suspendableKinds = ["claude","codex"]` gates the idle scanner. Caveat: the
+    pinned account may be usage-exhausted — resume still opens from the local rollout; the next
+    API call uses that account (exhaustion recovers server-side). Claude's path is unchanged
+    (`claude-pool --resume <id>` — Claude sessions are id-keyed, not home-scoped).
 - **The installer** is `CodexHooksInstaller` (a self-contained twin of
   `AgentHooksInstaller`): script dir `codex-hooks/`, settings file `~/.codex/hooks.json`,
   events with `PreToolUse` matcher `".*"` (Codex matchers are REGEXES), marker
@@ -110,10 +127,11 @@ Load-bearing facts + file wiring; read before touching the feature.
 - `example/codex-hooks/hooks.json` — the six-event config merged into `~/.codex/hooks.json`
 - `macos/Sources/Features/AgentHooks/CodexHooksInstaller.swift` — installer + embedded script
 - `macos/Sources/Features/AgentHooks/AgentHooksInstaller.swift` — the Claude twin (unchanged)
-- `macos/Sources/Features/AgentDashboard/AgentStateBridge.swift` — `AgentStatePayload.kind`
-- `macos/Sources/Features/MCP/MCPAgentState.swift` — `parse` reads + sanitizes `kind`
-- `macos/Sources/Features/AgentDashboard/AgentDashboardController.swift` — `hookKind`,
-  `displayAgentKind` fallback, `PersistedAgentState.agentKind`
+- `macos/Sources/Features/AgentDashboard/AgentStateBridge.swift` — `AgentStatePayload.kind` + `.codexHome`
+- `macos/Sources/Features/MCP/MCPAgentState.swift` — `parse` reads + sanitizes `kind` (`safeKind`) + `codexHome` (`safePath`)
+- `macos/Sources/Features/AgentDashboard/AgentDashboardController.swift` — `hookKind`, `codexHome`,
+  `displayAgentKind` fallback, `PersistedAgentState.agentKind`/`.codexHome`, home-pinned `suspendManifest`
+- `macos/Sources/Features/SuspendResume/SuspendManifest.swift` — `codexHome` field + home-pinned `resumeInputLine`
 - `macos/Sources/Features/SuspendResume/SuspendPolicy.swift` — `suspendableKinds`
 - `macos/Sources/App/macOS/AppDelegate.swift` — install-both handler + combined offer
 - `src/input/command.zig` — the "Install Agent Hooks" palette label
@@ -123,10 +141,12 @@ Load-bearing facts + file wiring; read before touching the feature.
 - `macos/Tests/AgentHooks/CodexHooksInstallerTests.swift` — merge idempotency, matcher
   `.*`, `~/.codex/hooks.json` path, marker disambiguation, embedded-script byte-identity,
   malformed refusal, end-to-end install.
-- `macos/Tests/MCP/MCPAgentStateTests.swift` — `kind` parse + sanitization.
+- `macos/Tests/MCP/MCPAgentStateTests.swift` — `kind` + `codexHome` parse + sanitization.
+- `macos/Tests/SuspendResume/SuspendManifestTests.swift` — codex home-pinned resume line,
+  not-resumable without a home, unsafe-home rejection.
 - `macos/Tests/AgentDashboard/AgentDashboardTests.swift` — hook-reported kind labels a
   hook-only Codex tile, detector still wins, no-kind falls back to claude, suspend manifest
-  picks `codex-pool`.
+  home-pins the codex resume (and is nil without a captured `codexHome`).
 - `macos/Tests/SuspendResume/SuspendPolicyTests.swift` — Codex now selected; unknown kind /
   working codex excluded.
 

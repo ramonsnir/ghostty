@@ -269,8 +269,13 @@ account it lands on. Which account *continues* the session doesn't matter — ac
 The `resume_split` action (or the overlay's Resume button) re-attaches the SAME SurfaceView to a
 FRESH host session that runs the resume command:
 
-1. Reconstruct the command from the manifest: `<pool> --resume <claudeSessionId>` (agentKind →
-   `claude-pool` or `codex-pool`).
+1. Reconstruct the command from the manifest (`resumeInputLine`): Claude →
+   `claude-pool --resume <claudeSessionId>` (a flag; the account pool may rotate — Claude
+   sessions are id-keyed). **Codex → `CODEX_HOME='<home>' codex resume <claudeSessionId>`** — a
+   SUBCOMMAND pinned to the originating `codexHome` (a Codex session's rollout lives only under
+   the home that created it; the pool rotates homes and can't target one, so Codex resume
+   BYPASSES the pool and pins the home). A Codex manifest with no captured `codexHome` is not
+   resumable (nil ⇒ keep the placeholder).
 2. Re-attach via the existing content-swap `materializeClientSurface` (`SurfaceView_AppKit.swift:729`):
    a new `Attach` with `session_id=null` (fresh spawn), `working_directory = manifest.cwd`, and
    `initial_input = "<command>\n"`. The fresh interactive shell loads its rc (so a `claude-pool`
@@ -418,13 +423,25 @@ entry here + the CLAUDE.md Feature map + Fork-only config keys index, in the sam
 
 ## Codex: supported
 
-Codex is now at parity. Its agent-state hooks (`~/.codex/hooks.json`, see `CODEX-HOOKS.md`) give the
-SAME two things the Claude path relies on: passive session-id capture (Codex's hook `session_id` →
-the `claudeSessionId` wire field → the resume token) and a clean idle signal (`Stop`/`SessionEnd` →
-`idle`). So `SuspendPolicy.suspendableKinds` includes `"codex"`, the idle scanner selects an overdue
-idle Codex split, and `SuspendManifest.poolCommand` reconstructs `codex-pool --resume <id>` (the
-external pool wrapper, mirroring `claude-pool`). Detection was always there (`agentKind == "codex"`
-via the subtree-walk matcher); the hooks add the state + resume-id capture that suspend needs.
+Codex is now at parity, but its resume is **home-pinned**, not pool-routed — the load-bearing
+difference from Claude. Its agent-state hooks (`~/.codex/hooks.json`, see `CODEX-HOOKS.md`) give
+passive session-id capture (Codex's hook `session_id` → the `claudeSessionId` wire field → the
+resume token), a clean idle signal (`Stop`/`SessionEnd` → `idle`), AND the **`codexHome`** capture
+that resume requires.
+
+**Why home-pinned:** a Codex session's rollout lives ONLY under the `CODEX_HOME` that created it —
+each account home (`~/.codex-accounts/<acct>/`, plus default `~/.codex/`) has its own `sessions/` +
+`auth.json`, and `codex resume <id>` reads `$CODEX_HOME/sessions`. The account pool rotates homes
+(least-used) and can't be told which, so resuming through the pool lands on the wrong home. Codex
+resume is also a SUBCOMMAND (`codex resume <id>`), not a `--resume` flag. So the hook captures the
+symlink-resolved `CODEX_HOME` (`pwd -P` — the pool points it at an ephemeral `<pool>/creds` symlink
+whose durable target is the real account home), the manifest records it as `codexHome`, and
+`SuspendManifest.resumeInputLine` emits `CODEX_HOME='<home>' codex resume <id>` (pool bypassed,
+home single-quoted + validated). `SuspendPolicy.suspendableKinds` includes `"codex"`; a Codex split
+with no captured `codexHome` is NOT suspendable (`suspendManifest` returns nil). Detection was
+always there (`agentKind == "codex"` via the subtree-walk matcher); the hooks add the state +
+resume-id + home capture that suspend needs. Caveat: the pinned account may be usage-exhausted —
+resume opens from the local rollout fine; the next API call uses that account (recovers server-side).
 
 ---
 

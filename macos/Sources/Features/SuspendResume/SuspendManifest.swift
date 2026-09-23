@@ -5,12 +5,12 @@ import Foundation
 /// `SurfaceView`'s Codable) so a suspended split survives a GUI restart as a
 /// placeholder and resumes after it. See SUSPEND-RESUME-DESIGN.md.
 struct SuspendManifest: Codable, Equatable {
-    /// The agent's OWN session id — the `<pool> --resume <id>` token (from the Part-1
-    /// hook capture). DISTINCT from the ghostty-host PTY session id.
+    /// The agent's OWN session id — the resume token (from the Part-1 hook capture).
+    /// DISTINCT from the ghostty-host PTY session id.
     var claudeSessionId: String
     /// Working directory to respawn the fresh resume shell in (from the hook `cwd`).
     var cwd: String
-    /// The detected agent kind: "claude" (MVP) or "codex" (postponed).
+    /// The detected agent kind: "claude" or "codex".
     var agentKind: String
     /// Split title at suspend time, for the placeholder label.
     var title: String
@@ -18,24 +18,46 @@ struct SuspendManifest: Codable, Equatable {
     var lastPrompt: String?
     /// When the split was suspended.
     var suspendedAt: Date
+    /// (Codex) The symlink-resolved `CODEX_HOME` that owns this session's rollout, from the
+    /// hook capture. REQUIRED to resume a Codex session — `codex resume <id>` reads the
+    /// rollout from `$CODEX_HOME/sessions`, and the account pool rotates homes and can't be
+    /// told which, so Resume pins this home directly (bypassing the pool). nil for Claude /
+    /// an unknown home (then a Codex manifest is not resumable). Defaulted so the Claude
+    /// path and the reattach seed are unaffected.
+    var codexHome: String? = nil
 
-    /// The pool wrapper for this agent kind. MVP ships Claude; Codex is postponed but
-    /// the mapping is here so a future Codex path is a one-line change.
+    /// The Claude pool wrapper. Claude resume goes through `claude-pool` (account rotation
+    /// is fine — Claude sessions are keyed by id, not by a per-account home). Codex resume
+    /// does NOT use a pool (see `resumeInputLine`), so this returns `codex-pool` only for
+    /// legacy/observability; the codex resume line is home-pinned instead.
     var poolCommand: String {
         agentKind == "codex" ? "codex-pool" : "claude-pool"
     }
 
-    /// The exact line typed into the fresh resume shell (as `initialInput`), or nil if
-    /// the captured session id is not a safe token. The id is GUARDED to a conservative
-    /// charset (letters, digits, dash, underscore — Claude/Codex ids are uuid-ish) so it
-    /// can never carry a shell metacharacter into the interactive shell. nil ⇒ do not
-    /// attempt a resume (the caller keeps the placeholder).
+    /// The exact line typed into the fresh resume shell (as `initialInput`), or nil when the
+    /// session can't be safely resumed (the caller then keeps the placeholder). The session
+    /// id is GUARDED to a conservative charset (letters, digits, dash, underscore — Claude/
+    /// Codex ids are uuid-ish) so it can never carry a shell metacharacter.
+    ///
+    /// - **Claude:** `claude-pool --resume <id>` (a flag; account rotation is fine).
+    /// - **Codex:** `CODEX_HOME='<home>' codex resume <id>` — a SUBCOMMAND, pinned to the
+    ///   originating home. A Codex session's rollout lives only under the CODEX_HOME that
+    ///   created it (each account home has its own `sessions/` + `auth.json`), and the pool
+    ///   rotates + can't target a home, so we bypass the pool and pin `CODEX_HOME`. Requires
+    ///   a safe absolute `codexHome` (no control byte / single-quote so it single-quotes
+    ///   safely); nil ⇒ not resumable.
     var resumeInputLine: String? {
         guard !claudeSessionId.isEmpty else { return nil }
         let allowed = CharacterSet(charactersIn:
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
         guard claudeSessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
-        return "\(poolCommand) --resume \(claudeSessionId)\n"
+        if agentKind == "codex" {
+            guard let home = codexHome, !home.isEmpty, home.hasPrefix("/"),
+                  !home.unicodeScalars.contains(where: { $0.value < 0x20 || $0 == "'" })
+            else { return nil }
+            return "CODEX_HOME='\(home)' codex resume \(claudeSessionId)\n"
+        }
+        return "claude-pool --resume \(claudeSessionId)\n"
     }
 }
 
@@ -94,6 +116,7 @@ extension SuspendManifest {
         var cwd: String
         var agentKind: String?
         var title: String?
+        var codexHome: String?
     }
     private struct ReattachSeedFile: Decodable { var surfaces: [String: ReattachSeedEntry] }
 
@@ -111,7 +134,8 @@ extension SuspendManifest {
                 agentKind: e.agentKind ?? "claude",
                 title: e.title ?? "",
                 lastPrompt: nil,
-                suspendedAt: Date())
+                suspendedAt: Date(),
+                codexHome: e.codexHome)
         }
         return out
     }

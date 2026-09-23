@@ -130,6 +130,10 @@ struct PersistedAgentState: Codable, Equatable {
     // label — and its suspend manifest the correct pool wrapper — across a GUI relaunch,
     // until the next hook re-reports it. Optional ⇒ old records decode as nil (→ "claude").
     var agentKind: String?
+    // (ramon fork / Codex suspend-resume) The symlink-resolved CODEX_HOME (nil for Claude
+    // / old records), persisted so an idle Codex split stays resumable under its
+    // originating account home after a GUI relaunch. Optional ⇒ old records decode as nil.
+    var codexHome: String?
 }
 
 /// Persistence boundary for per-session agent state, injected for testability
@@ -377,6 +381,13 @@ final class AgentDashboardModel: ObservableObject {
     /// hard-coded "claude", which mislabels a remote Codex agent and picks the wrong
     /// `--resume` pool wrapper on suspend. Sticky (a nil field leaves the prior value).
     private(set) var hookKind: [UUID: String] = [:]
+
+    /// (ramon fork / Codex suspend-resume) The symlink-resolved `CODEX_HOME` a Codex
+    /// hook reported per surface — the account home whose `sessions/` owns the session's
+    /// rollout. Feeds the suspend manifest so Resume pins `CODEX_HOME=<home> codex
+    /// resume <id>` (a Codex session can only be resumed under its originating home).
+    /// Sticky; nil for Claude. Persisted like `claudeSessionId`/`agentCwd`.
+    private(set) var codexHome: [UUID: String] = [:]
 
     /// (ramon fork / suspend-resume) Wall-clock timestamp of the last hook event per
     /// surface — "idle since" for the auto-suspend business-day threshold.
@@ -877,6 +888,8 @@ final class AgentDashboardModel: ObservableObject {
         // surface (no local process to classify) is labeled correctly and its suspend
         // manifest reconstructs the right pool wrapper. Sticky like the fields above.
         if let k = payload.kind { hookKind[id] = k }
+        // (Codex suspend-resume) Record the reported CODEX_HOME so Resume can pin it.
+        if let ch = payload.codexHome { codexHome[id] = ch }
         // (suspend-resume) Stamp "last agent activity" on every hook event. For an idle
         // agent this is when it went idle (its last Stop/SessionEnd), which the idle
         // scanner reads as "idle since" for the business-day threshold.
@@ -1089,6 +1102,7 @@ final class AgentDashboardModel: ObservableObject {
         guard let a else { return false }
         return a.state == b.state && a.tool == b.tool && a.prompt == b.prompt && a.message == b.message
             && a.claudeSessionId == b.claudeSessionId && a.cwd == b.cwd && a.agentKind == b.agentKind
+            && a.codexHome == b.codexHome
     }
 
     /// Persist the current state for `id`'s host session, if its session id is
@@ -1100,7 +1114,7 @@ final class AgentDashboardModel: ObservableObject {
             message: lastMessage[id], updated: Date().timeIntervalSince1970,
             claudeSessionId: claudeSessionId[id], cwd: agentCwd[id],
             lastActivity: lastActivityAt[id]?.timeIntervalSince1970,
-            agentKind: hookKind[id])
+            agentKind: hookKind[id], codexHome: codexHome[id])
         if !sameContent(restored[key], rec) {
             restored[key] = rec
             agentStore.save(restored)
@@ -1132,6 +1146,7 @@ final class AgentDashboardModel: ObservableObject {
                 if let c = rec.cwd { agentCwd[s.id] = c }
                 if let la = rec.lastActivity { lastActivityAt[s.id] = Date(timeIntervalSince1970: la) }
                 if let k = rec.agentKind { hookKind[s.id] = k }
+                if let ch = rec.codexHome { codexHome[s.id] = ch }
                 hookBacked.insert(s.id)
             } else if let state = agentStates[s.id] {
                 let rec = PersistedAgentState(
@@ -1139,7 +1154,7 @@ final class AgentDashboardModel: ObservableObject {
                     message: lastMessage[s.id], updated: nowS,
                     claudeSessionId: claudeSessionId[s.id], cwd: agentCwd[s.id],
                     lastActivity: lastActivityAt[s.id]?.timeIntervalSince1970,
-                    agentKind: hookKind[s.id])
+                    agentKind: hookKind[s.id], codexHome: codexHome[s.id])
                 let cur = restored[key]
                 let stale = cur.map { nowS - $0.updated > Self.persistTouchInterval } ?? true
                 if !sameContent(cur, rec) || stale {
@@ -1319,13 +1334,21 @@ final class AgentDashboardModel: ObservableObject {
         let cwd = (agentCwd[id]?.isEmpty == false ? agentCwd[id] : nil)
             ?? (pwd?.isEmpty == false ? pwd : nil)
         guard let sid, !sid.isEmpty, let cwd, !cwd.isEmpty else { return nil }
+        let kind = displayAgentKind(id)?.command ?? "claude"
+        // (Codex suspend-resume) Codex resume is home-pinned (`CODEX_HOME=<home> codex
+        // resume <id>`) — without the originating CODEX_HOME we could kill the child but
+        // never resume it, stranding the placeholder. So a Codex split with no captured
+        // home is NOT suspendable: return nil (keep it running) rather than trap it.
+        let home = (codexHome[id]?.isEmpty == false) ? codexHome[id] : nil
+        guard kind != "codex" || home != nil else { return nil }
         return SuspendManifest(
             claudeSessionId: sid,
             cwd: cwd,
-            agentKind: displayAgentKind(id)?.command ?? "claude",
+            agentKind: kind,
             title: title,
             lastPrompt: lastPrompt[id],
-            suspendedAt: now)
+            suspendedAt: now,
+            codexHome: home)
     }
 
     /// (ramon fork / suspend-resume) Manually suspend one split (the `suspend_split`

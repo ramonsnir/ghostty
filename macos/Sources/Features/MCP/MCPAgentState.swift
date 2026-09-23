@@ -85,6 +85,19 @@ enum MCPAgentState {
             return s
         }
 
+        // (Codex suspend-resume) `codexHome` becomes an env value in a resume command
+        // line (`CODEX_HOME='<home>' codex resume <id>`), so validate it HARD: an
+        // absolute path (leading "/"), no C0 control bytes, and no single-quote (so it
+        // single-quotes safely in the shell). Anything else → nil (no home ⇒ Resume is
+        // skipped rather than run under the wrong/unsafe home). Capped like a path.
+        func safePath(_ key: String) -> String? {
+            guard let raw = dict[key] as? String else { return nil }
+            let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard s.hasPrefix("/"), s.count <= 4096 else { return nil }
+            guard !s.unicodeScalars.contains(where: { $0.value < 0x20 || $0 == "'" }) else { return nil }
+            return s
+        }
+
         // (suspend-resume) claudeSessionId + cwd ride EVERY hook event and are
         // captured passively. Modest caps: a session id is short; a path is bounded.
         return AgentStatePayload(
@@ -96,7 +109,8 @@ enum MCPAgentState {
             nonce: nonce,
             claudeSessionId: optionalString("claudeSessionId", cap: 256),
             cwd: optionalString("cwd", cap: 4096),
-            kind: safeKind("kind"))
+            kind: safeKind("kind"),
+            codexHome: safePath("codexHome"))
     }
 
     // MARK: - tty normalization + match (PURE)
