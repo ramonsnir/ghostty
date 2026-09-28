@@ -1485,6 +1485,119 @@ struct WebMonitorServerTests {
                        headers: ["host": "\(Self.host):\(Self.port)"]) == .unauthorized)
     }
 
+    // (ramon fork / Web monitor) ＋ Split: a surface-scoped POST (any pane of the tab
+    // anchors it; the Mac picks the placement). Header-token only.
+    @Test func decideRouteSplitPost() {
+        let id = UUID()
+        #expect(decide("POST", "/api/surface/\(id.uuidString)/split") == .newSplit(uuid: id))
+    }
+
+    @Test func decideRouteSplitGetMethodNotAllowed() {
+        #expect(decide("GET", "/api/surface/\(UUID().uuidString)/split") == .methodNotAllowed)
+    }
+
+    @Test func decideRouteSplitBadUUIDNotFound() {
+        #expect(decide("POST", "/api/surface/not-a-uuid/split") == .notFound)
+    }
+
+    @Test func decideRouteSplitRejectsQueryToken() {
+        #expect(decide("POST", "/api/surface/\(UUID().uuidString)/split",
+                       query: ["token": Self.tok],
+                       headers: ["host": "\(Self.host):\(Self.port)"]) == .unauthorized)
+    }
+
+    // (ramon fork / Web monitor) +1 max items on a queue run. Not surface-scoped; the
+    // run rides the body. POST only; header-token only.
+    @Test func decideRouteQueueMaxItemsPost() {
+        #expect(decide("POST", "/api/queue/max-items") == .queueMaxItems)
+    }
+
+    @Test func decideRouteQueueMaxItemsGetMethodNotAllowed() {
+        #expect(decide("GET", "/api/queue/max-items") == .methodNotAllowed)
+    }
+
+    @Test func decideRouteQueueMaxItemsRejectsQueryToken() {
+        #expect(decide("POST", "/api/queue/max-items",
+                       query: ["token": Self.tok],
+                       headers: ["host": "\(Self.host):\(Self.port)"]) == .unauthorized)
+    }
+
+    @Test func queueBumpRequestDecode() {
+        func dec(_ s: String) -> String? {
+            WebMonitorServer.queueBumpRequest(body: Data(s.utf8)).map { "\($0.run)|\($0.delta)" }
+        }
+        #expect(dec(#"{"run":"Example · v2"}"#) == "Example · v2|1")         // delta defaults to 1
+        #expect(dec(#"{"run":" Acme ","delta":3}"#) == "Acme|3")             // trimmed
+        #expect(dec(#"{"run":"Acme","delta":100}"#) == "Acme|100")           // upper bound
+        #expect(dec(#"{"run":"Acme","delta":101}"#) == nil)                  // over the bound
+        #expect(dec(#"{"run":"Acme","delta":0}"#) == nil)
+        #expect(dec(#"{"run":"Acme","delta":-1}"#) == nil)
+        #expect(dec(#"{"run":"Acme","delta":1.5}"#) == nil)                  // not an integer
+        #expect(dec(#"{"run":"Acme","delta":true}"#) == nil)                 // bool is not 1
+        #expect(dec(#"{"run":"Acme","delta":"1"}"#) == nil)
+        #expect(dec(#"{"run":"   "}"#) == nil)
+        #expect(dec(#"{"run":7}"#) == nil)
+        #expect(dec(#"{}"#) == nil)
+        #expect(dec("not json") == nil)
+    }
+
+    @Test func surfacesJSONCarriesQueues() throws {
+        let d = WebMonitorServer.surfacesJSONData([], agentDashboard: true, queues: [
+            .init(run: "Acme", phase: "running", active: 2, queued: 5, dispatched: 7, maxItems: 10),
+            .init(run: "Example", phase: "paused", active: 0, queued: 1, dispatched: 3, maxItems: nil),
+        ])
+        let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any]
+        let qs = obj?["queues"] as? [[String: Any]]
+        #expect(qs?.count == 2)
+        #expect(qs?[0]["run"] as? String == "Acme")
+        #expect(qs?[0]["phase"] as? String == "running")
+        #expect(qs?[0]["active"] as? Int == 2)
+        #expect(qs?[0]["queued"] as? Int == 5)
+        #expect(qs?[0]["dispatched"] as? Int == 7)
+        #expect(qs?[0]["maxItems"] as? Int == 10)
+        #expect(qs?[1]["maxItems"] is NSNull)                                 // unlimited
+    }
+
+    @Test func surfacesJSONQueuesDefaultsEmpty() throws {
+        let d = WebMonitorServer.surfacesJSONData([], agentDashboard: false)
+        let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any]
+        #expect((obj?["queues"] as? [Any])?.isEmpty == true)
+    }
+
+    @Test func htmlPageHasPerTabSplitControl() {
+        // The ＋ Split lives on each tab's group header in the LIST (not the terminal
+        // view), POSTs /split with the tab's first pane as anchor, and jumps into the
+        // new split (a plain shell is hidden by the default "Agents only" filter).
+        let page = WebMonitorServer.htmlPage
+        #expect(page.contains("sb.className = \"splitbtn\""))
+        #expect(page.contains("newSplit(g.rows[0].id, sb)"))
+        #expect(page.contains("function newSplit(anchorId, btn)"))
+        #expect(page.contains("\"/split\""))
+        #expect(page.contains("showSurface(data.id, \"New split\", false)"))
+    }
+
+    @Test func htmlPageHasQueuesSectionAboveTheList() throws {
+        let page = WebMonitorServer.htmlPage
+        let q = try #require(page.range(of: "<div id=\"queues\"></div>"))
+        let l = try #require(page.range(of: "<div id=\"list\"></div>"))
+        #expect(q.lowerBound < l.lowerBound)
+        #expect(page.contains("renderQueues((data && data.queues) || [])"))
+        #expect(page.contains("\"/api/queue/max-items\""))
+        #expect(page.contains("JSON.stringify({ run: q.run, delta: 1 })"))
+        // +1 is disabled for an unlimited cap.
+        #expect(page.contains("b.disabled = unlimited || !!queueBumping[q.run]"))
+    }
+
+    @Test func densestGridColumns() {
+        #expect(MCPLayout.densestGridColumns(0) == 0)
+        #expect(MCPLayout.densestGridColumns(1) == 1)
+        #expect(MCPLayout.densestGridColumns(2) == 2)
+        #expect(MCPLayout.densestGridColumns(4) == 2)
+        #expect(MCPLayout.densestGridColumns(5) == 3)
+        #expect(MCPLayout.densestGridColumns(9) == 3)
+        #expect(MCPLayout.densestGridColumns(10) == 4)
+    }
+
     @Test func maximizedFlagDecode() {
         #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"maximized":true}"#.utf8)) == true)
         #expect(WebMonitorServer.maximizedFlag(body: Data(#"{"maximized":false}"#.utf8)) == false)

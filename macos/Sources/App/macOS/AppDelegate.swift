@@ -727,6 +727,15 @@ class AppDelegate: NSObject,
         return agentDashboard != nil
     }
 
+    /// (ramon fork / Web monitor) `+1 max items` on a queue run from the phone
+    /// (`POST /api/queue/max-items`). nil when the Agent Dashboard isn't running — no
+    /// dashboard means no queue runs, so unlike `setWebMonitorHidden` this does NOT
+    /// lazily create the controller. Called on main, wrapped in `assumeIsolated`.
+    @MainActor
+    func webMonitorBumpQueueMaxItems(run: String, by delta: Int) -> AgentDashboardModel.MaxItemsBump? {
+        agentDashboard?.webMonitorBumpMaxItems(run: run, by: delta)
+    }
+
     /// (ramon fork / Agent Hooks) Install BOTH the Claude Code and Codex agent-state
     /// hooks (command-palette "Install Agent Hooks"). Each installer is independent +
     /// idempotent, so installing when one is already present is a no-op for it. Runs
