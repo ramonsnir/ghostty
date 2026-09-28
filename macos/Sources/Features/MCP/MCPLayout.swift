@@ -499,6 +499,48 @@ enum MCPLayout {
         return created?.surfaceTree.first?.id
     }
 
+    /// (ramon fork / Web monitor ＋ Split) Add a plain shell split to the tab holding
+    /// `anchorUUID`, placed for PACKING rather than in a caller-chosen direction — the
+    /// remote viewer can't see the physical layout, so it asks for "one more pane" and we
+    /// pick where. Same logic as an Agent Queue spawn: birth the pane at the LARGEST leaf
+    /// along its longer side (`largestLeafSplit`, real pixel bounds), then re-tile the whole
+    /// tab into its densest grid (`ceil(sqrt(N))` columns — the `compact_splits` shape) with
+    /// the new pane LAST. The new shell inherits from the tab's focused pane (cwd etc.), like
+    /// ⌘D there, and takes focus. Returns the new leaf's UUID, or nil when the anchor is
+    /// gone / the split failed. MUST be called on main.
+    static func newPackedSplitReturningID(anchorUUID: UUID) -> UUID? {
+        guard let (controller, anchor) = controllerAndView(forUUID: anchorUUID) else { return nil }
+        let bounds = controller.window?.contentView?.bounds.size
+            ?? CGSize(width: 1600, height: 1000)
+        guard let pick = controller.surfaceTree.largestLeafSplit(within: bounds) else { return nil }
+        let source: Ghostty.SurfaceView = {
+            if let f = controller.focusedSurface, controller.surfaceTree.contains(f) { return f }
+            return anchor
+        }()
+        let config = source.surface.map {
+            Ghostty.SurfaceConfiguration(
+                from: ghostty_surface_inherited_config($0, GHOSTTY_SURFACE_CONTEXT_SPLIT))
+        }
+        let orderBefore = Array(controller.surfaceTree)
+        // A pane born into a zoomed-away region would stay invisible; the re-tile below
+        // resets the zoom anyway, this just keeps the intermediate tree honest.
+        revealIfZoomedAway(controller, pick.view)
+        guard let newView = controller.newSplit(
+            at: pick.view, direction: pick.direction, baseConfig: config) else { return nil }
+        let order = orderBefore + [newView]
+        controller.retileCompactGrid(
+            order: order, focus: newView,
+            maxCols: densestGridColumns(order.count), maxRows: 0)
+        return newView.id
+    }
+
+    /// PURE: the column count of the densest grid for `count` panes — `ceil(sqrt(N))`, the
+    /// same shape `SplitTree.compactedToDensestGrid` (`compact_splits`) builds.
+    static func densestGridColumns(_ count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        return Int(Double(count).squareRoot().rounded(.up))
+    }
+
     // MARK: - Agent Queue: spawn_split_command / force_close
 
     /// (Agent Queue, §8.1) Spawn the run's NEXT agent: either open the run's first

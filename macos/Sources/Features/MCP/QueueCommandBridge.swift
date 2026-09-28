@@ -359,6 +359,16 @@ struct QueueStatus: Equatable, Sendable {
         return nil
     }
 
+    /// (pure, testable / Web monitor "+1") The cap a relative bump should set: `delta` MORE
+    /// dispatches than are allowed right now. The base is `max(maxItems, dispatched)` — a cap
+    /// that was lowered below the lifetime count still lets exactly `delta` more items go,
+    /// instead of a "+1" that lands at or under `dispatched` and changes nothing. nil when
+    /// the cap is unlimited (there is nothing to raise) or `delta` isn't positive.
+    static func bumpedCap(maxItems: Int?, dispatched: Int, delta: Int) -> Int? {
+        guard let maxItems, delta > 0 else { return nil }
+        return max(maxItems, dispatched) + delta
+    }
+
     /// (pure, testable) Parse the cap-editor's raw string the SAME way the sidecar's
     /// `parseMaxItemsValue` does, for the optimistic update. Returns a DOUBLE optional so
     /// "leave unchanged" is distinct from "set to unlimited":

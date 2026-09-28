@@ -131,6 +131,19 @@ is loopback, hence identical; only your `ts.net` hostname differs:
      terminal window (a brand-new window if none is open). The auto-jump is deliberate: a plain new
      shell isn't a detected agent, so the default **Agents only** filter would otherwise hide it
      from the list and the button would look like it did nothing.
+   - **＋ Split** sits on each tab's header in the list. It adds a plain shell split to **that**
+     tab on the Mac and jumps you into it (same reason as ＋ New tab). There is no direction to
+     pick — you can't see the physical layout from here, so the Mac **packs** it like the Agent
+     Queue does: the new pane is born at the largest pane, then the whole tab is re-tiled into its
+     densest grid (`ceil(√N)` columns, the `compact_splits` shape). The new shell inherits the
+     tab's focused pane (cwd etc.) like ⌘D, and takes focus on the Mac. It lives in the list,
+     not the terminal view, so it costs no screen space where you're reading.
+   - **Queues** (shown above the list only while an [Agent Queue](AGENT-QUEUE.md) run is live):
+     one row per run — `name · phase · dispatched/cap` — with a **+1** button that raises the
+     run's lifetime **max items** by one (the dashboard's cap editor, live, no restart). The +1
+     is disabled for an unlimited (`∞`) cap. It always allows exactly one MORE dispatch, so an
+     exhausted `10/10` becomes `10/11`, and a cap lowered below the lifetime count still frees
+     one slot.
 3. The screen renders in **`xterm.js`** — **full ANSI color, native scrollback, live updates**
    (fed by a host byte stream over **Server-Sent Events**, which streams incrementally on every
    browser — notably iOS Safari, which *buffers* a plain `fetch()` stream and would otherwise show
@@ -340,8 +353,9 @@ real scrollback can't come from the GUI. Instead:
 | `GET /` | the embedded responsive page — serves both phone and laptop (`?token=` accepted here when a token is set) |
 | `GET /xterm.js`, `GET /xterm.css` | the vendored xterm.js assets (`?token=` accepted) |
 | `GET /jetbrains-mono-{regular,bold}.woff2` | vendored JetBrains Mono Nerd Font (`?token=` accepted) |
-| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,splitCount,isAgent,hidden,hero,maximized}]}` of live surfaces (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is; `maximized`+`splitCount` drive the ⛶ Maximize control) |
+| `GET /api/surfaces` | JSON `{agentDashboard:Bool, surfaces:[{id,title,pwd,…,splitCount,isAgent,hidden,hero,maximized}], queues:[{run,phase,active,queued,dispatched,maxItems}]}` of live surfaces (+ live queue runs, `maxItems` null = unlimited) (`agentDashboard` = is the dashboard running; `isAgent`/`hidden`/`hero` drive the list filters + the purple hero ★ and are only meaningful when it is; `maximized`+`splitCount` drive the ⛶ Maximize control) |
 | `POST /api/new-tab` | open a fresh Ghostty tab on the Mac (frontmost window, or a new window if none) → `{ok:true,id:<uuid>}` so the page navigates into it. `500` if nothing was created |
+| `POST /api/queue/max-items` | `{"run":<name>,"delta"?:1}` → raise a live queue run's lifetime cap to `max(cap, dispatched) + delta` → `{ok:true,maxItems:N}`. `400` bad body (delta must be an integer 1…100), `404` unknown run, `409` unlimited cap, `503` Agent Dashboard not running |
 | `GET /api/surface/{uuid}/stream-sse` | **live stream over Server-Sent Events — the page's primary live transport** (xterm.js source; needs `pty-host`). Same host bytes as `/stream`, base64-framed as SSE `data:` events; the grid size is the first `event: size` (EventSource can't read response headers) and the token rides `?token=` (EventSource can't set a header). iOS-safe: iOS WebKit **buffers** a plain `fetch()`-body stream so the terminal shows stale content, while EventSource delivers incrementally on every browser. |
 | `GET /api/surface/{uuid}/stream` | live **raw** byte stream (`application/octet-stream`; header-token only). Kept as an alternative; the page no longer uses it (iOS buffers it — see `/stream-sse`) |
 | `GET /api/surface/{uuid}/screen?mode=viewport\|scrollback` | plain-text snapshot (fallback) |
@@ -350,6 +364,7 @@ real scrollback can't come from the GUI. Instead:
 | `POST /api/surface/{uuid}/scroll` | `{"dy":±ticks}` → seed cursor at surface center, then a real mouse wheel to the app |
 | `POST /api/surface/{uuid}/hidden` | `{"hidden":bool}` → hide/reveal in the Agent Dashboard hide set (503 if the dashboard isn't running) |
 | `POST /api/surface/{uuid}/maximize` | `{"maximized":bool}` → split-zoom / unzoom this split's tab on the Mac, so its grid (and the viewport here) grows. `409` when the split is alone in its tab |
+| `POST /api/surface/{uuid}/split` | add a PACKED plain-shell split to the tab holding `{uuid}` (largest pane, then the densest-grid re-tile; no direction) → `{ok:true,id:<uuid>}` so the page navigates into it. `404` if the surface is gone / the split failed |
 | `GET /sw.js` | the Web Push service worker (bootstrap; `?token=` accepted) |
 | `GET /api/push/config` | JSON `{vapidPublicKey, enabled, subscriptions}` |
 | `POST /api/push/subscribe` | register a browser `PushSubscription` |
@@ -712,12 +727,15 @@ fallback, reuses `cachedVisibleContents`/`cachedScreenContents`); `POST
 /api/surface/{uuid}/input`; `POST /api/surface/{uuid}/scroll` (`{"dy":±ticks}`); `POST
 /api/surface/{uuid}/hidden` (`{"hidden":bool}` → toggle the Agent Dashboard hide set, see the
 hide note below); `POST /api/new-tab` (open a fresh tab on the Mac → `{ok:true,id:<uuid>}`, see
-the new-tab note below).
+the new-tab note below); `POST /api/surface/{uuid}/split` (packed split in that tab →
+`{ok:true,id}`) and `POST /api/queue/max-items` (`{run,delta?}` → `{ok:true,maxItems}`), see
+their notes below.
 
 Status codes: Unknown id/path → 404, wrong method → 405, bad/negative/oversized
 Content-Length → 400, chunked → 411, oversized → 413, bad Host → 403, throttled (token mode)
 → 429; `/hidden` → 503 when the dashboard isn't running; `/api/new-tab` → 500 when nothing
-was created.
+was created; `/split` → 404 when the anchor is gone or the split failed; `/api/queue/max-items`
+→ 400 bad body / 404 unknown run / 409 unlimited cap / 503 dashboard not running.
 
 ### Agent filters (fork-only, GUI-only) — list-only "Agents only" / "Hide hidden"
 
@@ -789,6 +807,72 @@ token-recovery box, matching `loadList`). ZERO host/Zig/protocol change; GUI rel
 (`newTabReturningID` core + the thin `newTab` Bool wrapper). Tests: `WebMonitorServerTests`
 (`decideRouteNewTabPost`/`…GetMethodNotAllowed`/`…IsNotABootstrapPathSoQueryTokenIsRejected`,
 `htmlPageHasNewTabControl`, `htmlPageNewTabButtonSitsAboveTheList`).
+
+### Add a packed split from the list (fork-only, GUI/page-only) — per-tab ＋ Split
+
+Each tab's `.grouphdr` in the list carries a `.splitbtn` "＋ Split" (deliberately in the LIST, not
+the viewer toolbar — the terminal view's real estate is the scarce resource). It POSTs
+`/api/surface/{uuid}/split` with the tab's FIRST visible row as the anchor — any pane of the tab
+works, since the anchor only selects the TAB. Surface-scoped, POST only, header-token only (not a
+bootstrap path, so `?token=` is rejected — `decideRouteSplitRejectsQueryToken`).
+
+**No direction on the wire, by design.** The remote viewer can't see the physical layout, so the
+Mac chooses: `MCPLayout.newPackedSplitReturningID(anchorUUID:)` mirrors the Agent Queue's balanced
+spawn — `largestLeafSplit(within:)` (real pixel bounds, no grid caps) picks where the pane is born,
+then `retileCompactGrid(order: before + [new], focus: new, maxCols: densestGridColumns(N), maxRows: 0)`
+rebuilds the tab into the densest grid (`ceil(√N)` columns = `SplitTree.compactedToDensestGrid`,
+i.e. `compact_splits`), the new pane LAST in row-major order. Passing a real `maxCols` is what
+makes `retileCompactGrid` act (it no-ops without a cap). This DOES reshuffle the tab's existing
+layout — the same trade the queue and `compact_splits` make. The new surface's config is
+`ghostty_surface_inherited_config(…, GHOSTTY_SURFACE_CONTEXT_SPLIT)` from the tab's focused pane
+(falling back to the anchor), i.e. ⌘D semantics (cwd, etc.). It TAKES Mac focus (`newSplit` +
+the re-tile's `moveFocusTo`) — unlike ⛶ Maximize, you're creating the pane to use it.
+
+The page navigates into `{id}` (`showSurface(data.id, "New split", false)`) for the ＋ New tab
+reason (a plain shell is dropped by "Agents only"), and that also sidesteps the stale-grid
+problem: every pane in the tab re-grids, and the new split opens a fresh, correctly-sized stream.
+A tab entirely filtered out of the list has no header, so no ＋ Split — relax the filters to reach
+it. In a queue's tab the extra pane is a plain shell the queue doesn't own; its next pack/re-tile
+treats the tab as it finds it. The button is disabled while in flight; failures raise a sticky
+banner (401 → token recovery). Wiring: `WebMonitorServer.swift` (`RouteDecision.newSplit` + the
+`split` arm + handler; page `.splitbtn` CSS + group-header button + `newSplit()`), `MCPLayout.swift`
+(`newPackedSplitReturningID` + pure `densestGridColumns`). Tests: `decideRouteSplit*`,
+`htmlPageHasPerTabSplitControl`, `densestGridColumns`.
+
+### +1 max items on a queue run (fork-only, GUI/page-only) — Queues section
+
+`/api/surfaces` gains a top-level `queues` array (`QueueRow` = `{run, phase, active, queued,
+dispatched, maxItems}`, `maxItems` JSON `null` = unlimited), projected from the dashboard model's
+`queueStatuses` via `AgentDashboardController.webMonitorQueues()` (sorted by name) inside
+`surfacesJSON()`'s existing on-main `assumeIsolated` read. So it rides the list's existing refresh
++ ~1s cache — no new poll. The page's `renderQueues()` (called in `loadList` BEFORE the "no
+sessions" early returns) fills `#queues` (above `#list`, hidden when empty): `name · phase ·
+dispatched/cap · [+1]`.
+
+`POST /api/queue/max-items`, body `{"run":<name>,"delta"?:<int>}` — NOT surface-scoped, and the run
+rides the BODY (run names carry spaces/`·`). Pure `queueBumpRequest(body:)` requires a non-empty
+trimmed string `run` and an integer `delta` in `1…maxQueueBumpDelta` (100; default 1; a JSON bool
+is rejected rather than read as 1). The handler calls
+`AppDelegate.webMonitorBumpQueueMaxItems` → `AgentDashboardModel.bumpQueueMaxItems(run:by:)`,
+which computes the new cap **on main from the model's current status**, not the page's copy:
+`QueueStatus.bumpedCap = max(maxItems, dispatched) + delta`. Two load-bearing consequences: (1)
+rapid taps compound (11, then 12) because `setQueueMaxItems` updates `queueStatuses`
+OPTIMISTICALLY before the sidecar's next push; (2) a cap lowered below the lifetime count still
+frees exactly `delta` dispatches instead of a +1 that changes nothing. It then posts through the
+existing `setQueueMaxItems` → `set_max_items` path (the dashboard cap editor's), so NO sidecar
+change. Outcomes: `.bumped(N)` → `{ok:true,maxItems:N}`; `.unlimited` → 409; `.unknownRun` → 404;
+no dashboard → 503 (unlike `/hidden`, it does NOT lazily create the controller — no dashboard, no
+queue runs). The page disables +1 for an unlimited cap and while its POST is in flight
+(`queueBumping[run]`, survives re-renders), paints the returned cap immediately, then reloads the
+list after the ~1s cache TTL. Wiring: `WebMonitorServer.swift` (`RouteDecision.queueMaxItems` +
+route + handler, `queueBumpRequest`, `QueueRow`, `surfacesJSONData(queues:)`; page `#queues` CSS/DOM
++ `renderQueues`/`bumpQueue`/`queueMeta`), `AgentDashboardController.swift`
+(`AgentDashboardModel.MaxItemsBump` + `bumpQueueMaxItems`, `webMonitorQueues`,
+`webMonitorBumpMaxItems`), `QueueCommandBridge.swift` (`QueueStatus.bumpedCap`), `AppDelegate.swift`
+(`webMonitorBumpQueueMaxItems`). Tests: `WebMonitorServerTests` (`decideRouteQueueMaxItems*`,
+`queueBumpRequestDecode`, `surfacesJSONCarriesQueues`/`…QueuesDefaultsEmpty`,
+`htmlPageHasQueuesSectionAboveTheList`), `AgentQueueHealthTests` (`bumpedCapRaises…`,
+`bumpQueueMaxItemsCompounds…`, `bumpQueueMaxItemsUnlimitedAndUnknownRun`).
 
 ### Maximize a split from the phone/laptop (fork-only, GUI/page-only) — ⛶ Maximize/Restore
 
@@ -1054,10 +1138,13 @@ GUI/page parts are GUI-only (a relaunch reattaches).
 - `macos/Sources/Features/WebMonitor/WebMonitorServer.swift` (server + xterm page + routes +
   Notify toggle + `/sw.js` + `/api/push/*`; the ⛶ Maximize route `.setMaximized` +
   `maximizeOutcome` + `SurfaceRow.maximized` + the page's Maximize/Restore control; the ＋ New tab
-  route `.newTab` + `/api/new-tab` handler + the page's `#newtab` button + `newTab()`)
+  route `.newTab` + `/api/new-tab` handler + the page's `#newtab` button + `newTab()`; the ＋ Split
+  route `.newSplit` + the page's per-tab `.splitbtn` + `newSplit()`; the queue +1 route
+  `.queueMaxItems` + `queueBumpRequest` + `QueueRow`/`queues` + the page's `#queues` +
+  `renderQueues()`/`bumpQueue()`)
 - `macos/Sources/Features/MCP/MCPLayout.swift` (`newTabReturningID` — the UUID-returning new-tab
   core the ＋ New tab route uses; `newTab` is now a thin Bool wrapper over it, so the MCP `new_tab`
-  tool is unchanged)
+  tool is unchanged; `newPackedSplitReturningID` + `densestGridColumns` for ＋ Split)
 - `macos/Sources/Features/WebMonitor/WebMonitorPush.swift` (`WebPushCrypto` + `WebPushManager`;
   Hero Agents: `PushKind.hero`/`payloadValue`, `onHero`, pure `pushTitle`/`pushPayload` seams,
   the `AgentStateUserInfoKey.hero`→`onHero` route in the attention observer)

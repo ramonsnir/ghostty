@@ -1831,6 +1831,27 @@ final class AgentDashboardModel: ObservableObject {
             ])
     }
 
+    /// (Web monitor "+1") Outcome of a relative lifetime-cap bump.
+    enum MaxItemsBump: Equatable {
+        case bumped(Int)   // the new cap that was posted
+        case unlimited     // the run has no cap — nothing to raise
+        case unknownRun    // no live status for that run
+    }
+
+    /// (Web monitor "+1") Raise a live run's lifetime cap by `delta`, computed HERE from the
+    /// current (optimistically-updated) status rather than from a remote client's possibly
+    /// stale copy — so two quick taps land 11 then 12, never 11 twice. Goes through
+    /// `setQueueMaxItems`, the same `set_max_items` path as the dashboard's cap editor.
+    func bumpQueueMaxItems(run: String, by delta: Int) -> MaxItemsBump {
+        guard run != AgentDashboardModel.otherOrigin, let status = queueStatuses[run]
+        else { return .unknownRun }
+        guard let next = QueueStatus.bumpedCap(
+            maxItems: status.maxItems, dispatched: status.dispatched, delta: delta)
+        else { return .unlimited }
+        setQueueMaxItems(run: run, value: String(next))
+        return .bumped(next)
+    }
+
     /// (live concurrency edit) Post a `set_concurrency` intent for a queue RUN — re-set its
     /// max SIMULTANEOUS agents WITHOUT restarting it. `value` is the raw user string ("9");
     /// the sidecar parses it (blank/garbage/non-positive = ignored). Raising it past the
@@ -2832,6 +2853,17 @@ final class AgentDashboardController: NSWindowController {
     /// running" — so when it's nil the filters are offered disabled.
     func webMonitorFilterState() -> (agents: Set<UUID>, hidden: Set<UUID>, hero: Set<UUID>) {
         (model.liveAgentIDs, model.hidden, model.heroIDs)
+    }
+
+    /// (ramon fork / Web Monitor) The live queue runs, sorted by name, for the monitor's
+    /// Queues section. Value types only; MUST be called on main.
+    func webMonitorQueues() -> [QueueStatus] {
+        model.queueStatuses.values.sorted { $0.queueName < $1.queueName }
+    }
+
+    /// (ramon fork / Web Monitor) `+1 max items` from the phone. MUST be called on main.
+    func webMonitorBumpMaxItems(run: String, by delta: Int) -> AgentDashboardModel.MaxItemsBump {
+        model.bumpQueueMaxItems(run: run, by: delta)
     }
 
     /// (ramon fork / Hero Agents) True iff `id` is annotated a hero (`queueHero`). Used by the

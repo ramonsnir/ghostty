@@ -386,6 +386,9 @@ design + review ledger is `scratchpad/agent-queue-design.md` (paths in the itera
   `runner.test.ts` (live override + bump-re-enables-dispatch), `store.test.ts`, `mcp.test.ts`; Swift
   `MCPServerTests` (`queueCommandJSONObjectSetMaxItems*`), `AgentDashboardTests` (`capDraft*`). **GUI relaunch
   + rebuilt sidecar `dist`; no host/Zig change.**
+- **Web monitor "+1".** The phone's Queues section reuses this path: `AgentDashboardModel.bumpQueueMaxItems`
+  computes `QueueStatus.bumpedCap = max(maxItems, dispatched) + delta` from the (optimistic) status and
+  calls `setQueueMaxItems` — no new command, no sidecar change (→ `WEB-MONITOR.md`, "+1 max items").
 
 ### LIVE concurrency EDIT
 

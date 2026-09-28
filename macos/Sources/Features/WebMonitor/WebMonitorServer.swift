@@ -555,6 +555,8 @@ final class WebMonitorServer {
         case clearAttention(uuid: UUID)          // POST /api/surface/{uuid}/attention (acknowledge promotion)
         case setHidden(uuid: UUID)               // POST /api/surface/{uuid}/hidden {hidden:bool} (dashboard hide set)
         case setMaximized(uuid: UUID)            // POST /api/surface/{uuid}/maximize {maximized:bool} (split zoom)
+        case newSplit(uuid: UUID)                // POST /api/surface/{uuid}/split (packed new split in that tab)
+        case queueMaxItems                       // POST /api/queue/max-items {run, delta?} (+N lifetime cap)
         case asset(name: String, ext: String, contentType: String) // GET /xterm.js|/xterm.css
         case serviceWorker                       // GET /sw.js (bootstrap; Web Push SW)
         case pushConfig                          // GET /api/push/config (VAPID pubkey + enabled)
@@ -674,6 +676,11 @@ final class WebMonitorServer {
         if path == "/api/new-tab" {
             return method == "POST" ? .newTab : .methodNotAllowed
         }
+        // Raise a live Agent Queue run's lifetime cap (`+1 max items`). Not surface-scoped:
+        // the run name rides the BODY (run names carry spaces / `·`, awkward in a path).
+        if path == "/api/queue/max-items" {
+            return method == "POST" ? .queueMaxItems : .methodNotAllowed
+        }
 
         // /api/push/{action} — Web Push registration + the arm/mute toggle.
         if path == "/api/push/config" {
@@ -735,6 +742,9 @@ final class WebMonitorServer {
             case "maximize":
                 guard method == "POST" else { return .methodNotAllowed }
                 return .setMaximized(uuid: uuid)
+            case "split":
+                guard method == "POST" else { return .methodNotAllowed }
+                return .newSplit(uuid: uuid)
             default:
                 return .notFound
             }
@@ -1051,6 +1061,47 @@ final class WebMonitorServer {
                     return .json(Data(#"{"ok":true,"maximized":false}"#.utf8))
                 case .noop(let maximized):
                     return .json(Data("{\"ok\":true,\"maximized\":\(maximized)}".utf8))
+                }
+            }
+
+        case .newSplit(let uuid):
+            clearAuthFailures(peer)
+            // (ramon fork / Web monitor ＋ Split) Add a plain shell split to the tab holding
+            // `uuid` (any of its panes — the list's per-tab button sends its first row). No
+            // direction: the viewer can't see the physical layout, so we PACK like the Agent
+            // Queue (largest leaf, then the densest-grid re-tile). Returns the new leaf's id
+            // so the page jumps into it — a plain shell isn't an agent, so with the default
+            // "Agents only" filter it would otherwise never show up (same as ＋ New tab).
+            respondFromMain(on: conn) {
+                let id = MainActor.assumeIsolated {
+                    MCPLayout.newPackedSplitReturningID(anchorUUID: uuid)
+                }
+                guard let id else { return .status(404, "Not Found") }
+                return .json(Data(#"{"ok":true,"id":"\#(id.uuidString)"}"#.utf8))
+            }
+
+        case .queueMaxItems:
+            clearAuthFailures(peer)
+            // (ramon fork / Web monitor) `+1 max items` on a live queue run. The NEW cap is
+            // computed on main from the dashboard's current status (not the page's copy), so
+            // rapid taps compound correctly; it rides the same `set_max_items` path as the
+            // dashboard's cap editor. 400 bad body · 404 unknown run · 409 unlimited (nothing
+            // to raise) · 503 dashboard not running.
+            guard let bump = Self.queueBumpRequest(body: req.body) else {
+                send(.status(400, "Bad Request"), on: conn)
+                return
+            }
+            respondFromMain(on: conn) {
+                let outcome = MainActor.assumeIsolated {
+                    (NSApp.delegate as? AppDelegate)?.webMonitorBumpQueueMaxItems(
+                        run: bump.run, by: bump.delta)
+                }
+                switch outcome {
+                case .none: return .status(503, "Service Unavailable")
+                case .some(.unknownRun): return .status(404, "Not Found")
+                case .some(.unlimited): return .status(409, "Conflict")
+                case .some(.bumped(let cap)):
+                    return .json(Data(#"{"ok":true,"maxItems":\#(cap)}"#.utf8))
                 }
             }
 
@@ -1582,6 +1633,29 @@ final class WebMonitorServer {
     /// list can't invert the state it thinks it is changing.
     static func maximizedFlag(body: Data) -> Bool? { boolFlag(body: body, key: "maximized") }
 
+    /// The largest relative bump one `/api/queue/max-items` request may ask for — the
+    /// control is a "+1" button; this only bounds a hand-crafted request.
+    static let maxQueueBumpDelta = 100
+
+    /// PURE: decode a `/api/queue/max-items` body `{"run": <name>, "delta"?: <int>}`.
+    /// `run` must be a non-empty string (trimmed); `delta` defaults to 1 and must be an
+    /// integer in `1...maxQueueBumpDelta` (a JSON bool is rejected, not read as 1). nil on
+    /// anything else.
+    static func queueBumpRequest(body: Data) -> (run: String, delta: Int)? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let rawRun = obj["run"] as? String else { return nil }
+        let run = rawRun.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !run.isEmpty else { return nil }
+        var delta = 1
+        if let raw = obj["delta"] {
+            guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
+                  n.doubleValue == n.doubleValue.rounded() else { return nil }
+            delta = n.intValue
+        }
+        guard (1...maxQueueBumpDelta).contains(delta) else { return nil }
+        return (run, delta)
+    }
+
     /// What a `/maximize` request should actually do, given what the client asked for
     /// and the tab's real state. PURE so the whole decision matrix is testable without
     /// AppKit; the handler only performs the resulting tree mutation.
@@ -1792,6 +1866,28 @@ final class WebMonitorServer {
         var maximized: Bool = false
     }
 
+    /// (ramon fork / Web monitor) One live Agent Queue run for the list's Queues section
+    /// (`+1 max items`). A value-type projection of `QueueStatus` so the JSON shaping stays
+    /// pure/testable. `maxItems` nil = unlimited (the page disables +1).
+    struct QueueRow: Equatable {
+        let run: String
+        let phase: String
+        let active: Int
+        let queued: Int
+        let dispatched: Int
+        let maxItems: Int?
+
+        init(run: String, phase: String, active: Int, queued: Int, dispatched: Int, maxItems: Int?) {
+            self.run = run; self.phase = phase; self.active = active
+            self.queued = queued; self.dispatched = dispatched; self.maxItems = maxItems
+        }
+
+        init(_ s: QueueStatus) {
+            self.init(run: s.queueName, phase: s.phase, active: s.active, queued: s.queued,
+                      dispatched: s.dispatched, maxItems: s.maxItems)
+        }
+    }
+
     /// MUST be called on main. Iterates AppKit surfaces (thin) and defers the
     /// pure dict/JSON shaping to `surfacesJSONData` so the shaping is testable.
     /// Each `TerminalController` is one tab; its `surfaceTree` is that tab's
@@ -1809,6 +1905,12 @@ final class WebMonitorServer {
             MainActor.assumeIsolated {
                 (NSApp.delegate as? AppDelegate)?.agentDashboard?.webMonitorFilterState()
             }
+        // (ramon fork) The live queue runs for the Queues section (+1 max items). Same
+        // on-main/assumeIsolated discipline as the filter read above.
+        let queues: [QueueRow] = MainActor.assumeIsolated {
+            ((NSApp.delegate as? AppDelegate)?.agentDashboard?.webMonitorQueues() ?? [])
+                .map(QueueRow.init)
+        }
         let dashboardRunning = filter != nil
         // Assign a stable window-group index per tab group (or standalone window)
         // in the order we first encounter it.
@@ -1851,7 +1953,7 @@ final class WebMonitorServer {
         }
         return Self.surfacesJSONData(
             rows, agentDashboard: dashboardRunning,
-            monitorBell: monitorBell, monitorAttn: monitorAttn)
+            monitorBell: monitorBell, monitorAttn: monitorAttn, queues: queues)
     }
 
     /// Pure JSON shaping for the surfaces list (testable; no AppKit). Returns an
@@ -1867,9 +1969,14 @@ final class WebMonitorServer {
     /// flag of bell-features / attention-features. Default config (both true) ⇒
     /// `bell || attentionNeeded` (reproduces today + surfaces promotions). The page
     /// renders the flag off `attnIndicator` so the `monitor` effect is config-routable.
+    ///
+    /// (ramon fork) A top-level `queues` array carries the live Agent Queue runs
+    /// (`{run, phase, active, queued, dispatched, maxItems}`, `maxItems` JSON null =
+    /// unlimited) for the list's Queues section; empty when no run is live.
     static func surfacesJSONData(
         _ rows: [SurfaceRow], agentDashboard: Bool,
-        monitorBell: Bool = true, monitorAttn: Bool = true
+        monitorBell: Bool = true, monitorAttn: Bool = true,
+        queues: [QueueRow] = []
     ) -> Data {
         let arr: [[String: Any]] = rows.map {
             [
@@ -1882,9 +1989,15 @@ final class WebMonitorServer {
                 "maximized": $0.maximized,
             ]
         }
-        let obj: [String: Any] = ["agentDashboard": agentDashboard, "surfaces": arr]
+        let queueArr: [[String: Any]] = queues.map {
+            [
+                "run": $0.run, "phase": $0.phase, "active": $0.active, "queued": $0.queued,
+                "dispatched": $0.dispatched, "maxItems": $0.maxItems.map { $0 as Any } ?? NSNull(),
+            ]
+        }
+        let obj: [String: Any] = ["agentDashboard": agentDashboard, "surfaces": arr, "queues": queueArr]
         return (try? JSONSerialization.data(withJSONObject: obj))
-            ?? Data("{\"agentDashboard\":false,\"surfaces\":[]}".utf8)
+            ?? Data("{\"agentDashboard\":false,\"surfaces\":[],\"queues\":[]}".utf8)
     }
 
     /// Whether a cached-at timestamp is still fresh at `now` for the given TTL.
@@ -2339,12 +2452,30 @@ final class WebMonitorServer {
       #listactions { padding: 8px 12px 0; }
       #listactions #newtab { width: 100%; padding: 9px 10px; font-weight: 600; }
       #listactions #newtab:hover { border-color: var(--accent); color: var(--accent); }
+      /* Live Agent Queue runs (+1 max items). Hidden when no run is live. */
+      #queues { display: none; padding: 8px 12px 0; }
+      #queues .qhdr { color: var(--muted); font-size: 10px; font-weight: bold; letter-spacing: .04em;
+                      text-transform: uppercase; padding: 0 2px 4px; }
+      .qrow { display: flex; align-items: center; gap: 8px; padding: 6px 8px; margin: 4px 0;
+              background: var(--rowbg); border: 1px solid var(--border); border-radius: 7px; }
+      .qrow .qname { flex: 1 1 auto; min-width: 0; color: var(--fg); font-size: 12px; font-weight: bold;
+                     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .qrow .qmeta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+      .qrow .qbump { padding: 3px 9px; font-size: 12px; font-weight: 600; }
       #list { flex: 1 1 auto; overflow-y: auto; padding: 8px; }
       .grouphdr { padding: 10px 4px 5px; margin-top: 8px; border-bottom: 1px solid var(--border); }
       .grouphdr:first-child { margin-top: 0; }
       .grouphdr .loc { color: var(--muted); font-size: 10px; font-weight: bold; letter-spacing: .04em;
                        text-transform: uppercase; }
       .grouphdr .ttl { color: var(--fg); font-size: 12px; margin-top: 2px; word-break: break-word; }
+      /* Per-tab "＋ Split" — adds a packed split to that tab (no direction: the layout
+         isn't visible from here, so the Mac picks the densest grid). */
+      .grouphdr { position: relative; }
+      .grouphdr .splitbtn { position: absolute; top: 7px; right: 2px; padding: 2px 8px; border-radius: 6px;
+                            background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+                            font-size: 11px; }
+      .grouphdr .splitbtn:hover { border-color: var(--accent); color: var(--accent); }
+      .grouphdr .loc, .grouphdr .ttl { padding-right: 64px; }
       .row { position: relative; padding: 9px 10px; margin: 5px 0; background: var(--rowbg);
              border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 7px;
              cursor: pointer; }
@@ -2458,6 +2589,9 @@ final class WebMonitorServer {
         <div id="listactions">
           <button id="newtab" title="Open a new terminal tab on the Mac and jump into it">&#43; New tab</button>
         </div>
+        <!-- Live Agent Queue runs with a "+1" lifetime-cap bump (POST /api/queue/max-items).
+             Filled by loadList from /api/surfaces' `queues`; hidden when none is live. -->
+        <div id="queues"></div>
         <div id="list"></div>
       </aside>
       <main id="main">
@@ -2546,6 +2680,10 @@ final class WebMonitorServer {
       var menuBtn = document.getElementById("menubtn");
       var listEl = document.getElementById("list");
       var newTabBtn = document.getElementById("newtab");
+      var queuesEl = document.getElementById("queues");
+      // Runs with a +1 POST in flight (kept across the list's re-renders so the button
+      // stays disabled until the request settles).
+      var queueBumping = {};
       var filterBar = document.getElementById("filterbar");
       var fHeroes = document.getElementById("f-heroes");
       var fAgents = document.getElementById("f-agents");
@@ -2695,6 +2833,7 @@ final class WebMonitorServer {
             }
           }
           applyFilterAvailability(dashboard);
+          renderQueues((data && data.queues) || []);
           var heroFocus = dashboard && fHeroes.checked;
           var agentsOnly = !heroFocus && dashboard && fAgents.checked;
           var hideHidden = agentsOnly && fVisible.checked;
@@ -2728,6 +2867,12 @@ final class WebMonitorServer {
               ttl.textContent = g.tabTitle;
               h.appendChild(ttl);
             }
+            // Any pane of the tab anchors the split; the Mac picks WHERE (packing).
+            var sb = document.createElement("button"); sb.className = "splitbtn";
+            sb.textContent = "\\uFF0B Split";
+            sb.title = "Add a split to this tab on the Mac (packed into the densest grid) and jump into it";
+            sb.onclick = function (ev) { ev.stopPropagation(); newSplit(g.rows[0].id, sb); };
+            h.appendChild(sb);
             frag.appendChild(h);
             g.rows.forEach(function (row) {
               var d = document.createElement("div");
@@ -3424,6 +3569,102 @@ final class WebMonitorServer {
           });
       }
       newTabBtn.onclick = newTab;
+
+      // Add a split to the tab holding `anchorId` (POST /api/surface/{id}/split). The Mac
+      // chooses the placement (largest pane, then the densest-grid re-tile, like the Agent
+      // Queue) since the physical layout isn't visible here. Jump into the new split for
+      // the same reason ＋ New tab does: a plain shell is hidden by "Agents only".
+      function newSplit(anchorId, btn) {
+        if (btn) btn.disabled = true;
+        fetch(url("/api/surface/" + anchorId + "/split"), { method: "POST", headers: headers() })
+          .then(function (r) {
+            if (r && r.status === 401) throw new Error("401");
+            return r && r.ok ? r.json() : null;
+          })
+          .then(function (data) {
+            if (btn) btn.disabled = false;
+            if (data && data.id) {
+              setBanner(null);
+              showSurface(data.id, "New split", false);
+              loadList();
+            } else {
+              setBanner("Couldn't add a split (the tab may have closed).", false, true);
+              loadList();
+            }
+          })
+          .catch(function (e) {
+            if (btn) btn.disabled = false;
+            if (String(e.message) === "401") {
+              showTokenRecovery("Unauthorized. The token is wrong or was rotated. Reopen with ?token=..., or paste a token below.");
+            } else {
+              setBanner("Couldn't add a split \\u2014 not delivered.", false, true);
+            }
+          });
+      }
+
+      // Render the live Agent Queue runs: "name · phase · dispatched/cap · [+1]". +1 is
+      // disabled for an unlimited cap (nothing to raise) and while a bump is in flight.
+      function queueMeta(q) {
+        var cap = (q.maxItems === null || q.maxItems === undefined) ? "\\u221E" : String(q.maxItems);
+        return (q.phase || "") + " \\u00B7 " + (q.dispatched || 0) + "/" + cap;
+      }
+      function renderQueues(queues) {
+        if (!queues.length) { queuesEl.style.display = "none"; queuesEl.replaceChildren(); return; }
+        var frag = document.createDocumentFragment();
+        var hdr = document.createElement("div"); hdr.className = "qhdr"; hdr.textContent = "Queues";
+        frag.appendChild(hdr);
+        queues.forEach(function (q) {
+          var d = document.createElement("div"); d.className = "qrow";
+          var n = document.createElement("span"); n.className = "qname"; n.textContent = q.run; n.title = q.run;
+          var m = document.createElement("span"); m.className = "qmeta"; m.textContent = queueMeta(q);
+          var b = document.createElement("button"); b.className = "qbump"; b.textContent = "+1";
+          var unlimited = (q.maxItems === null || q.maxItems === undefined);
+          b.disabled = unlimited || !!queueBumping[q.run];
+          b.title = unlimited ? "No max-items cap on this run" : "Allow one more item (raise max items by 1)";
+          b.onclick = function () { bumpQueue(q, b, m); };
+          d.appendChild(n); d.appendChild(m); d.appendChild(b);
+          frag.appendChild(d);
+        });
+        queuesEl.replaceChildren(frag);
+        queuesEl.style.display = "block";
+      }
+      function bumpQueue(q, btn, metaEl) {
+        queueBumping[q.run] = true;
+        btn.disabled = true;
+        fetch(url("/api/queue/max-items"), {
+          method: "POST",
+          headers: headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ run: q.run, delta: 1 })
+        }).then(function (r) {
+          if (r && r.status === 401) throw new Error("401");
+          if (r && r.ok) return r.json();
+          var why = r && r.status === 409 ? "that run has no cap"
+            : r && r.status === 404 ? "that run is gone"
+            : r && r.status === 503 ? "the Agent Dashboard isn't running"
+            : "HTTP " + (r ? r.status : "?");
+          setBanner("Couldn't raise max items \\u2014 " + why + ".", false, true);
+          return null;
+        }).then(function (data) {
+          delete queueBumping[q.run];
+          btn.disabled = false;
+          if (data && typeof data.maxItems === "number") {
+            // Show the new cap now; the list cache (~1s) catches up on the next refresh.
+            q.maxItems = data.maxItems;
+            metaEl.textContent = queueMeta(q);
+            setTimeout(loadList, 1100);
+          } else {
+            loadList();
+          }
+        }).catch(function (e) {
+          delete queueBumping[q.run];
+          btn.disabled = false;
+          if (String(e.message) === "401") {
+            showTokenRecovery("Unauthorized. The token is wrong or was rotated. Reopen with ?token=..., or paste a token below.");
+          } else {
+            setBanner("Couldn't raise max items \\u2014 not delivered.", false, true);
+          }
+        });
+      }
 
       // FRAME MODE (scrolling a full-screen app) — carried over unchanged from the
       // phone page: drive the host wheel (/scroll) then PAINT the host's

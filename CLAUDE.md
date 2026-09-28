@@ -25,7 +25,7 @@ The docs:
 |---|---|
 | `FORK-ACTIONS.md` | fork keybind actions + command-palette entries |
 | `BELL-ATTENTION.md` | bell/attention two-tier model, focused variant, diagnostics, persistence, split/zoom visibility |
-| `WEB-MONITOR.md` | phone/laptop HTTP monitor (xterm.js color stream, input, scroll, maximize, push) |
+| `WEB-MONITOR.md` | phone/laptop HTTP monitor (xterm.js color stream, input, scroll, maximize, new tab/split, queue +1, push) |
 | `MCP-SERVER.md` | MCP server + shim, agent-control + knowledge tools |
 | `AGENT-DASHBOARD.md` | live agent-preview sidebar panel |
 | `AGENT-MANAGER.md` | Haiku status summarizer sidecar, warm-base, usage tracking, rate-limit watchdog, orphan guard |
@@ -163,7 +163,11 @@ bell visibility across splits/zoom. GUI relaunch + rebuilt sidecar `dist`; no ho
 ### Web monitor → `WEB-MONITOR.md`
 GUI-embedded HTTP server; from a phone/laptop over Tailscale lists surfaces, renders one in color
 via xterm.js off a per-session host byte stream, sends input, scrolls, maximizes a split, opens a
-new tab (＋ New tab in the list → `POST /api/new-tab`, auto-jumps into it), and does bell→Web-Push.
+new tab (＋ New tab in the list → `POST /api/new-tab`, auto-jumps into it), adds a PACKED split to a
+tab (per-tab ＋ Split in the list → `POST /api/surface/{uuid}/split`; no direction — largest pane +
+densest-grid re-tile like the queue; auto-jumps), raises a live queue run's max items by one
+(Queues section +1 → `POST /api/queue/max-items`, cap = `max(cap,dispatched)+1` computed on main via
+the existing `set_max_items` path), and does bell→Web-Push.
 Fork-only, OFF by default. Keys: `web-monitor-listen` (bind loopback `127.0.0.1:18787`, front with
 `tailscale serve` for HTTPS), `web-monitor-token` 🔒. ONE responsive capability-adaptive page for
 phone + desktop. Traps: input is REAL key events with NATIVE macOS virtual keycodes (the
@@ -174,7 +178,7 @@ size as the first in-band `event: size`, token via `?token=`), NOT `fetch()`+get
 WebKit BUFFERS a fetch body stream so the preview goes stale (the raw `/stream` is kept but
 unused).** Mobile input: the Send field has autocorrect/spellcheck ON (autocapitalize off; token
 box strict-off); buttons `preventDefault` pointerdown so the iOS keyboard-dismiss doesn't eat the
-first tap. The raw-tee is a HOST change; the SSE/scroll/hide/maximize/page work is GUI-only.
+first tap. The raw-tee is a HOST change; the SSE/scroll/hide/maximize/split/queue-+1/page work is GUI-only.
 
 ### MCP server + knowledge tools → `MCP-SERVER.md`
 GUI-embedded MCP server (HTTP JSON-RPC + stdio shim `ghostty-mcp`) giving an orchestrating agent

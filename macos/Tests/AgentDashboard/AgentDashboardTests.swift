@@ -2858,6 +2858,39 @@ struct AgentQueueHealthTests {
         #expect(model.queueStatuses["Ghost"] == nil)
     }
 
+    // MARK: - Web monitor "+1 max items"
+
+    @Test func bumpedCapRaisesFromTheLargerOfCapAndDispatched() {
+        #expect(QueueStatus.bumpedCap(maxItems: 10, dispatched: 4, delta: 1) == 11)
+        // Exhausted (cap == dispatched): +1 lets exactly one more go.
+        #expect(QueueStatus.bumpedCap(maxItems: 10, dispatched: 10, delta: 1) == 11)
+        // Cap lowered BELOW the lifetime count: +1 still allows one more (not a no-op 6).
+        #expect(QueueStatus.bumpedCap(maxItems: 5, dispatched: 8, delta: 1) == 9)
+        #expect(QueueStatus.bumpedCap(maxItems: 3, dispatched: 0, delta: 2) == 5)
+        // Unlimited: nothing to raise. Non-positive delta: rejected.
+        #expect(QueueStatus.bumpedCap(maxItems: nil, dispatched: 4, delta: 1) == nil)
+        #expect(QueueStatus.bumpedCap(maxItems: 10, dispatched: 4, delta: 0) == nil)
+        #expect(QueueStatus.bumpedCap(maxItems: 10, dispatched: 4, delta: -1) == nil)
+    }
+
+    @Test func bumpQueueMaxItemsCompoundsOffTheOptimisticCap() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", dispatched: 10, maxItems: 10))
+        // Two rapid bumps land 11 then 12 (the second reads the first's optimistic cap).
+        #expect(model.bumpQueueMaxItems(run: "ExampleOS", by: 1) == .bumped(11))
+        #expect(model.bumpQueueMaxItems(run: "ExampleOS", by: 1) == .bumped(12))
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == 12)
+    }
+
+    @Test func bumpQueueMaxItemsUnlimitedAndUnknownRun() {
+        let model = AgentDashboardModel(store: InMemoryHideStore())
+        model.applyQueueStatus(status("ExampleOS", dispatched: 2, maxItems: nil))
+        #expect(model.bumpQueueMaxItems(run: "ExampleOS", by: 1) == .unlimited)
+        #expect(model.queueStatuses["ExampleOS"]?.maxItems == nil)       // untouched
+        #expect(model.bumpQueueMaxItems(run: "Ghost", by: 1) == .unknownRun)
+        #expect(model.bumpQueueMaxItems(run: AgentDashboardModel.otherOrigin, by: 1) == .unknownRun)
+    }
+
     @Test func parseConcurrencyOptimisticMirrorsSidecar() {
         // positive int → the value; blank/garbage/zero/negative → nil (ignore, NO unlimited).
         #expect(QueueStatus.parseConcurrencyOptimistic("9") == 9)
