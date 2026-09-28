@@ -2224,7 +2224,7 @@ final class AgentDashboardController: NSWindowController {
             // Never a silent no-op: tell the user why nothing happened.
             view.showSuspendNotice(view.suspended
                 ? "Already suspended."
-                : "Can't suspend: no resumable Claude session captured in this split yet.")
+                : "Can't suspend: no resumable agent session captured in this split yet.")
         }
     }
 

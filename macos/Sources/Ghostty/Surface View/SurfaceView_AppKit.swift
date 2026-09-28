@@ -329,8 +329,8 @@ extension Ghostty {
         private var pendingResumeApp: ghostty_app_t?
 
         /// (ramon fork / suspend-resume) A brief, auto-dismissing notice shown when a
-        /// suspend gesture can't proceed (e.g. this split has no captured resumable Claude
-        /// session yet) — so the action is never a silent no-op. @Published so the overlay
+        /// suspend gesture can't proceed (e.g. this split has no captured resumable agent
+        /// session yet — Claude or Codex) — so the action is never a silent no-op. @Published so the overlay
         /// appears/vanishes.
         @Published private(set) var suspendNotice: String?
         private var suspendNoticeToken: Int = 0
