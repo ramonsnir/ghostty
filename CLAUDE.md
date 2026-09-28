@@ -252,7 +252,10 @@ detected kind always wins) and **`codexHome`** (the symlink-resolved `CODEX_HOME
 session's rollout, so a suspended Codex session resumes home-pinned; a Codex split with no captured
 home is not suspendable). Sidecar needs NO code change (its auto-close gate is already
 agentState-based). GUI-only (the "Install Agent Hooks" palette label was the one Zig+lib touch, already
-landed) — no host restart, no sidecar rebuild.
+landed) — no host restart, no sidecar rebuild. ⚠️ Each installer EMBEDS its hook script and writes THAT
+to disk, so it must stay byte-in-sync with `example/{claude,codex}-hooks/ghostty-agent-state.sh` — the
+Claude copy drifted once (lost the `session_id`→`claudeSessionId` capture) so reinstalled agents couldn't
+suspend; a `embeddedHookScriptMatchesTrackedSourceOfTruth` guard test now pins each (→ `CODEX-HOOKS.md`).
 
 ### PTY-host + session lifecycle → `PTYHOST.md`
 The `.client` emulation-on-host backend: sessions survive a GUI quit/relaunch (RAM-only; a HOST

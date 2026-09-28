@@ -121,6 +121,21 @@ Load-bearing facts + file wiring; read before touching the feature.
   (`maybeOfferAgentHooks`, asked-key `agentHooks.offered.v2`) fires when EITHER agent's
   hooks are missing.
 
+- **⚠️ Embedded-script byte-in-sync invariant (both installers).** Each installer writes its
+  EMBEDDED `hookScript` verbatim to disk, so that embedded copy — not `example/…` — is what
+  actually runs. It MUST stay byte-identical to its tracked source of truth
+  (`example/{claude,codex}-hooks/ghostty-agent-state.sh`). **This drifted once and caused a real
+  outage:** `AgentHooksInstaller.hookScript` (the Claude twin) lagged the suspend-resume Part-1
+  `session_id`/`cwd` addition, so when the Codex-parity reinstall ran it shipped a hook that never
+  captured `claudeSessionId` → agents had no `--resume` token → splits **refused to suspend**
+  (silently, since `agentState` still posted). Fixed by re-syncing the embedded copy AND adding a
+  guard test to EACH installer's suite that reads the tracked `example/…` file (via `#filePath`)
+  and asserts `hookScript` equals it + still contains the id capture (`session_id`/`claudeSessionId`
+  for Claude, `session_id`/`CODEX_HOME` for Codex). The pre-existing "embedded↔on-disk" test did
+  NOT catch this — it only proved the installer writes the embedded copy faithfully, not that the
+  embedded copy matches the source. **When you touch either `example/…` hook, re-run these tests;
+  a red `embeddedHookScriptMatchesTrackedSourceOfTruth` means re-sync the embedded copy.**
+
 ### Files
 
 - `example/codex-hooks/ghostty-agent-state.sh` — the POST script (source of truth)
@@ -138,9 +153,11 @@ Load-bearing facts + file wiring; read before touching the feature.
 
 ### Tests
 
-- `macos/Tests/AgentHooks/CodexHooksInstallerTests.swift` — merge idempotency, matcher
-  `.*`, `~/.codex/hooks.json` path, marker disambiguation, embedded-script byte-identity,
-  malformed refusal, end-to-end install.
+- `macos/Tests/AgentHooks/CodexHooksInstallerTests.swift` + `AgentHooksInstallerTests.swift` —
+  merge idempotency, matcher `.*`, `~/.codex/hooks.json` path, marker disambiguation, embedded-
+  script byte-identity, malformed refusal, end-to-end install, AND
+  `embeddedHookScriptMatchesTrackedSourceOfTruth` (the drift guard: embedded `hookScript` ==
+  `example/…/ghostty-agent-state.sh` + still captures the resume id).
 - `macos/Tests/MCP/MCPAgentStateTests.swift` — `kind` + `codexHome` parse + sanitization.
 - `macos/Tests/SuspendResume/SuspendManifestTests.swift` — codex home-pinned resume line,
   not-resumable without a home, unsafe-home rejection.

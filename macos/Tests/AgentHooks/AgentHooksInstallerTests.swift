@@ -23,6 +23,38 @@ struct AgentHooksInstallerTests {
         return dir.path
     }
 
+    // MARK: - Embedded hook script stays byte-in-sync with the tracked source of truth
+
+    /// (ramon fork / suspend-resume regression) `install()` writes `hookScript` VERBATIM to
+    /// `~/.config/ghostty-ramon/claude-hooks/ghostty-agent-state.sh`. It MUST stay byte-identical
+    /// to `example/claude-hooks/ghostty-agent-state.sh` — the file that carries the `session_id`
+    /// (→ `claudeSessionId`) + `cwd` capture that `list_surfaces` and suspend/resume depend on.
+    /// It silently drifted once: the embedded copy lagged the Part-1 `session_id` addition, so a
+    /// reinstall shipped a hook that never captured the resume id and splits could not be
+    /// suspended. This test pins the two together so the drift can't recur.
+    @Test func embeddedHookScriptMatchesTrackedSourceOfTruth() throws {
+        // Locate the repo's tracked hook relative to THIS test file (a compile-time path):
+        // .../macos/Tests/AgentHooks/AgentHooksInstallerTests.swift → up 4 → repo root.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // AgentHooks
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // macos
+            .deletingLastPathComponent()  // repo root
+        let tracked = repoRoot.appendingPathComponent("example/claude-hooks/ghostty-agent-state.sh")
+        let trackedText = try String(contentsOf: tracked, encoding: .utf8)
+
+        // Byte-in-sync (ignoring only a trailing-newline difference; install() normalizes that).
+        #expect(
+            AgentHooksInstaller.hookScript.trimmingCharacters(in: .newlines)
+                == trackedText.trimmingCharacters(in: .newlines),
+            "AgentHooksInstaller.hookScript drifted from example/claude-hooks/ghostty-agent-state.sh — re-sync them; the EMBEDDED copy is what the installer writes.")
+
+        // Direct guard for the specific regression: the resume-id capture must be present in the
+        // thing that actually ships, even if example/ itself were ever to regress.
+        #expect(AgentHooksInstaller.hookScript.contains("session_id"))
+        #expect(AgentHooksInstaller.hookScript.contains("claudeSessionId"))
+    }
+
     // MARK: - mergeHooks: create from empty
 
     @Test func mergeCreatesFromEmpty() {

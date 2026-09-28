@@ -386,6 +386,37 @@ enum AgentHooksInstaller {
 #   1. Copy this script to ~/.config/ghostty-ramon/claude-hooks/ and chmod +x it.
 #   2. Merge settings-hooks.json into ~/.claude/settings.json.
 # See AGENT-DASHBOARD.md for the full walkthrough.
+#
+# (cloud-hosts) REMOTE self-ID via a correlation nonce
+# ----------------------------------------------------
+# When Ghostty spawns an agent on a REMOTE ghostty-host box it injects ONE thing:
+# a non-secret per-spawn correlation nonce (GHOSTTY_SURFACE_NONCE), via the
+# spawn's initial input, which crosses to the box. The box cannot walk a process
+# tree to a laptop-side tty, so this hook detects that env and POSTs
+# {nonce, state} instead of {tty, state} — the MCP `/agent-state` route resolves
+# the nonce to the (host, session id) via the GUI's nonce map. The tty-walk below
+# is the LOCAL fallback (used when the nonce is absent).
+#
+# The MCP ingest URL (GHOSTTY_MCP_URL, e.g. an https tailnet URL fronted by
+# `tailscale serve`) is NOT injected by the GUI — it is a per-box, laptop-facing
+# value, so provision it in the BOX's own environment (its ghostty-host systemd
+# unit `Environment=GHOSTTY_MCP_URL=…`, or a shell profile), where the spawned
+# shells inherit it. With no URL in the box environment this remote branch is a
+# silent no-op. See CLOUD-HOSTS-DESIGN.md → Deployment.
+#
+# The token authorizing the remote POST is a PER-BOX, CAPABILITY-SCOPED token
+# (authorizes /agent-state ingest ONLY, never /mcp spawn/input) — it is NOT the
+# laptop's master mcp-token. Provision it ONCE per box into a 0600 file (default
+# ~/.config/ghostty-ramon/mcp-capability-token; override GHOSTTY_MCP_TOKEN_FILE):
+#
+#     umask 077
+#     printf '%s' "<per-box-capability-token>" \
+#       > "$HOME/.config/ghostty-ramon/mcp-capability-token"
+#     chmod 600 "$HOME/.config/ghostty-ramon/mcp-capability-token"
+#
+# The token is read from that file and fed to curl via `-K -` (a config file on
+# stdin), NEVER on argv — the same leak-avoidance the local path uses below.
+# Rotate it per box.
 
 # Never let an error here surface to Claude Code.
 set +e
@@ -454,6 +485,73 @@ case "$state" in
     message="$(json_field message)"
     ;;
 esac
+
+# --- JSON-escape a string for safe interpolation -----------------------------
+# Drop ALL C0 control bytes (0x00–0x1F, incl. CR/LF/TAB) then escape backslashes
+# and double-quotes. A raw control byte (e.g. a TAB in a prompt) is invalid in a
+# JSON string per RFC 8259, so JSONSerialization in MCPAgentState.parse would
+# reject the whole body (400) and the event would be silently lost; dropping the
+# control bytes here keeps the hint best-effort lossy rather than dropping the
+# event. (We strip rather than \uXXXX-escape: these are display hints, not data.)
+json_escape() {
+  printf '%s' "$1" \
+    | tr -d '\000-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# --- session_id + cwd: passive capture for suspend/resume ---------------------
+# (ramon fork / suspend-resume) Claude Code passes `session_id` (the
+# `claude --resume <id>` token) and `cwd` on the stdin JSON of EVERY hook event.
+# Capture both passively here so the fork can later suspend an idle agent split
+# (kill the child to reclaim RAM, keep the split) and Resume it with
+# `claude-pool --resume <id>` in the same dir — WITHOUT ever running `/status`.
+# Best-effort like the rest: empty ⇒ the field is simply omitted from the POST.
+# Built once and reused by both the remote (nonce) and local (tty) bodies below.
+claude_session_id="$(json_field session_id)"
+cwd="$(json_field cwd)"
+sid_field=""
+cwd_field=""
+[ -n "$claude_session_id" ] && sid_field=",\"claudeSessionId\":\"$(json_escape "$claude_session_id")\""
+[ -n "$cwd" ]               && cwd_field=",\"cwd\":\"$(json_escape "$cwd")\""
+
+# --- REMOTE self-ID: POST {nonce, state} when spawned on a cloud box ----------
+# (cloud-hosts, D6.) A remote-spawned agent carries GHOSTTY_SURFACE_NONCE (a
+# non-secret per-spawn correlation id, GUI-injected via the spawn's initial
+# input). GHOSTTY_MCP_URL (the full ingest URL) comes from the BOX's own
+# environment (its ghostty-host systemd unit / shell profile — NOT GUI-injected).
+# Correlate by nonce — the box has no laptop-side tty to walk to — and authorize
+# with the PER-BOX capability token from a 0600 file (see the header comment).
+# Best-effort + fire-and-forget like the local path; any missing piece is a
+# silent no-op. The tty-walk below is the local fallback (nonce unset).
+if [ -n "$GHOSTTY_SURFACE_NONCE" ]; then
+  url="${GHOSTTY_MCP_URL:-}"
+  [ -n "$url" ] || exit 0
+
+  # Per-box capability token from a 0600 file (NOT the master mcp-token). Take
+  # the first line, stripping any surrounding whitespace/newline.
+  cap_token_file="${GHOSTTY_MCP_TOKEN_FILE:-$HOME/.config/ghostty-ramon/mcp-capability-token}"
+  cap_token="$(head -1 "$cap_token_file" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$cap_token" ] || exit 0
+
+  esc_nonce="$(json_escape "$GHOSTTY_SURFACE_NONCE")"
+  tool_field=""
+  prompt_field=""
+  msg_field=""
+  [ -n "$tool" ]    && tool_field=",\"tool\":\"$(json_escape "$tool")\""
+  [ -n "$prompt" ]  && prompt_field=",\"prompt\":\"$(json_escape "$prompt")\""
+  [ -n "$message" ] && msg_field=",\"message\":\"$(json_escape "$message")\""
+  body="$(printf '{"nonce":"%s","state":"%s"%s%s%s%s%s}' \
+    "$esc_nonce" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field")"
+
+  # Feed the capability token via a curl config file on STDIN (`-K -`), NEVER an
+  # `-H` argv flag, so it can't be snooped with `ps -ww` on the box.
+  printf 'header = "X-Ghostty-Token: %s"\n' "$cap_token" \
+    | curl -fsS --max-time 2 -K - \
+        -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -d "$body" >/dev/null 2>&1 &
+  exit 0
+fi
 
 # --- tty: the surface's controlling terminal ---------------------------------
 # Claude Code spawns hooks DETACHED from the controlling terminal, so this
@@ -535,19 +633,6 @@ if [ "$state" = "working" ]; then
   fi
 fi
 
-# --- JSON-escape a string for safe interpolation -----------------------------
-# Drop ALL C0 control bytes (0x00–0x1F, incl. CR/LF/TAB) then escape backslashes
-# and double-quotes. A raw control byte (e.g. a TAB in a prompt) is invalid in a
-# JSON string per RFC 8259, so JSONSerialization in MCPAgentState.parse would
-# reject the whole body (400) and the event would be silently lost; dropping the
-# control bytes here keeps the hint best-effort lossy rather than dropping the
-# event. (We strip rather than \uXXXX-escape: these are display hints, not data.)
-json_escape() {
-  printf '%s' "$1" \
-    | tr -d '\000-\037' \
-    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
-}
-
 esc_tty="$(json_escape "$tty")"
 tool_field=""
 prompt_field=""
@@ -556,8 +641,8 @@ msg_field=""
 [ -n "$prompt" ]  && prompt_field=",\"prompt\":\"$(json_escape "$prompt")\""
 [ -n "$message" ] && msg_field=",\"message\":\"$(json_escape "$message")\""
 
-body="$(printf '{"tty":"%s","state":"%s"%s%s%s}' \
-  "$esc_tty" "$state" "$tool_field" "$prompt_field" "$msg_field")"
+body="$(printf '{"tty":"%s","state":"%s"%s%s%s%s%s}' \
+  "$esc_tty" "$state" "$tool_field" "$prompt_field" "$msg_field" "$sid_field" "$cwd_field")"
 
 # --- fire-and-forget POST ----------------------------------------------------
 # Tight --max-time so a hung/absent server never stalls the agent. Backgrounded

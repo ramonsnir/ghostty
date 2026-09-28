@@ -22,6 +22,30 @@ struct CodexHooksInstallerTests {
         return dir.path
     }
 
+    // MARK: - Embedded hook script stays byte-in-sync with the tracked source of truth
+
+    /// (ramon fork) Codex twin of the Claude guard. The installer writes `hookScript` VERBATIM to
+    /// `~/.config/ghostty-ramon/codex-hooks/ghostty-agent-state.sh`; it MUST stay byte-identical to
+    /// `example/codex-hooks/ghostty-agent-state.sh` (the `session_id` → `claudeSessionId` + the
+    /// `CODEX_HOME` → `codexHome` capture that suspend/resume depend on). The existing test only
+    /// checks embedded↔on-disk, which would NOT catch the embedded copy drifting from the tracked
+    /// source (the exact regression that hit the Claude hook). This pins them together.
+    @Test func embeddedHookScriptMatchesTrackedSourceOfTruth() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // AgentHooks
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // macos
+            .deletingLastPathComponent()  // repo root
+        let tracked = repoRoot.appendingPathComponent("example/codex-hooks/ghostty-agent-state.sh")
+        let trackedText = try String(contentsOf: tracked, encoding: .utf8)
+        #expect(
+            CodexHooksInstaller.hookScript.trimmingCharacters(in: .newlines)
+                == trackedText.trimmingCharacters(in: .newlines),
+            "CodexHooksInstaller.hookScript drifted from example/codex-hooks/ghostty-agent-state.sh — re-sync them; the EMBEDDED copy is what the installer writes.")
+        #expect(CodexHooksInstaller.hookScript.contains("session_id"))
+        #expect(CodexHooksInstaller.hookScript.contains("CODEX_HOME"))
+    }
+
     // MARK: - Event set + shape
 
     @Test func hookEventsAreTheCodexSix() {
