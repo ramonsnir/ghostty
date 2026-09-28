@@ -374,8 +374,13 @@ entries). Loading mechanism + how the tracked `example/` copies mirror the live 
     refspec overrides the pinned one and, from a feature branch, would overwrite
     `fork/main` with the wrong branch. Always use the bare `git push fork`.
 
-So pushing to `fork` is now allowed and is the backup path; just confirm the
-remote is `fork` before pushing, and **never** `git push origin`. Any local-only
+**🛑 Do NOT run `git push fork` yourself — push ONLY via the release script
+`dist/macos/release-local.sh`** (run from the repo root on `ramon-fork`). It builds,
+signs, notarizes, publishes the GitHub Release/appcast AND does the bare `git push fork`
+itself, so a release and its backup always land together; a hand-run push backs up
+`ramon-fork` without the matching release. When the user asks to back up / push /
+release, run the script. The refspec notes above describe what its push does.
+**Never** `git push origin`. Any local-only
 feature branches (the old `ptyhost/*` ones are gone, merged into `ramon-fork`) have
 no remote set — leave them local-only unless explicitly asked to back them up to
 `fork`, and remember a bare `git push fork` backs up `ramon-fork`, not them.
