@@ -680,14 +680,18 @@ test("parseActiveRuns: tolerates a malformed concurrencyLive (non-positive / non
   );
 });
 
-test("parseActiveRuns: tolerates a malformed maxItemsLive (non-positive / non-int / string dropped)", () => {
+test("parseActiveRuns: tolerates a malformed maxItemsLive (negative / non-int / string dropped)", () => {
   // A garbage maxItemsLive is DROPPED (record kept without it → falls back to the param/template cap).
-  for (const v of ["0", "-2", "2.5", '"5"', "true"]) {
+  for (const v of ["-2", "2.5", '"5"', "true"]) {
     const recs = parseActiveRuns(`{"version":1,"runs":[{"template":"t","name":"t","maxItemsLive":${v}}]}`);
     assert.equal(recs.length, 1, `v=${v} keeps the record`);
     assert.equal(recs[0].maxItemsLive, undefined, `v=${v} drops the bad maxItemsLive`);
   }
-  // null is explicitly honored (unlimited); a positive int is honored.
+  // null is explicitly honored (unlimited); a non-negative int (incl. a 0 cap) is honored.
+  assert.equal(
+    parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","maxItemsLive":0}]}')[0].maxItemsLive,
+    0,
+  );
   assert.equal(
     parseActiveRuns('{"version":1,"runs":[{"template":"t","name":"t","maxItemsLive":null}]}')[0].maxItemsLive,
     null,

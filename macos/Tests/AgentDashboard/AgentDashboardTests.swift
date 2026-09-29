@@ -2834,7 +2834,7 @@ struct AgentQueueHealthTests {
         // number → cap; unlimited tokens → .some(nil); blank/garbage/negative → .none (ignore).
         if case .some(.some(10)) = QueueStatus.parseCapOptimistic("10") {} else { Issue.record("10 → cap 10") }
         if case .some(nil) = QueueStatus.parseCapOptimistic("unlimited") {} else { Issue.record("unlimited → nil") }
-        if case .some(nil) = QueueStatus.parseCapOptimistic("0") {} else { Issue.record("0 → nil") }
+        if case .some(.some(0)) = QueueStatus.parseCapOptimistic("0") {} else { Issue.record("0 → cap 0 (not unlimited)") }
         if case .none = QueueStatus.parseCapOptimistic("") {} else { Issue.record("blank → ignore") }
         if case .none = QueueStatus.parseCapOptimistic("abc") {} else { Issue.record("garbage → ignore") }
         if case .none = QueueStatus.parseCapOptimistic("-3") {} else { Issue.record("negative → ignore") }

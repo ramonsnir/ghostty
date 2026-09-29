@@ -542,8 +542,12 @@ change** (pure Swift + TS).
   engine). Env resolution is `answer ?? default ?? omit` (`resolveParamsEnv`, pure); a REQUIRED param with
   no answer+no default REJECTS the start (`missingRequiredParams`, enforced in the factory + the Start button
   disabled). The maxItems override (`resolveMaxItemsOverride`, pure): blank/garbage → `undefined` (template
-  `maxItems`); `"0"`/`"unlimited"`/`"none"`/`"inf"`/`"∞"` → unlimited (`maxItemsRemaining` is Infinity; the
-  global cap+grid+concurrency still bound it); a positive integer → that cap. Validation: `target` must be
+  `maxItems`); `"unlimited"`/`"none"`/`"inf"`/`"∞"` → `null` = unlimited (`maxItemsRemaining` is Infinity; the
+  global cap+grid+concurrency still bound it); a non-negative integer → that cap. **`"0"` is a REAL zero cap,
+  NOT unlimited** (so a run can start idle and be raised live): `parseMaxItemsValue` accepts `n >= 0`, the
+  override returns `number | null | undefined` (no more 0-as-unlimited sentinel), `effectiveMaxItemsCap` passes
+  it through, `parseActiveRuns` keeps a persisted `maxItemsLive: 0`, and the Swift optimistic
+  `QueueStatus.parseCapOptimistic` mirrors it. The template-level `maxItems` field stays positive-only. Validation: `target` must be
   `"env"`|`"maxItems"`; an env param needs a valid `env`; AT MOST ONE maxItems param. Params persist in the
   active-runs record (`params` map) so a restart re-applies scope AND maxItems. A template with no params
   starts directly. **The Swift palette is UNCHANGED** — its `templateParams` parser reads
@@ -554,7 +558,7 @@ change** (pure Swift + TS).
   `commands.ts`, `store.ts`, `mcp.ts`, `wiring.ts`, `QueueCommandBridge.swift`, `QueuePalette.swift`) is
   unchanged — the maxItems answer rides the existing `params` map. Tests: `templates.test.ts` (target validate
   + `resolveParamsEnv` skip + `resolveMaxItemsOverride` cases), `runner.test.ts` (override CAPS a sweep below
-  list size + `"0"` unlimited dispatches PAST the template cap), plus existing `commands`/`store`/`mcp` and
+  list size + `"unlimited"` dispatches PAST the template cap + `"0"` dispatches nothing until raised live), plus existing `commands`/`store`/`mcp` and
   Swift `QueuePaletteTests`. **A rebuilt sidecar `dist` is enough (the GUI respawns it); no GUI relaunch /
   host / Zig change.**
 

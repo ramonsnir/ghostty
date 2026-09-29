@@ -1810,7 +1810,7 @@ final class AgentDashboardModel: ObservableObject {
 
     /// (live maxItems edit) Post a `set_max_items` intent for a queue RUN — re-set its
     /// lifetime dispatch cap WITHOUT restarting it. `value` is the raw user string
-    /// ("10", "unlimited"/"0"/…); the sidecar parses it (blank/garbage = ignored, so a
+    /// ("10", "0", "unlimited"/…; "0" is a real zero cap); the sidecar parses it (blank/garbage = ignored, so a
     /// fat-finger never silently removes the cap). Same FIFO path as `sendRunCommand`.
     func setQueueMaxItems(run: String, value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

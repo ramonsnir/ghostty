@@ -235,7 +235,9 @@ scan agents), the compact-grid retiling, and **per-queue multi-host** (→ `CLOU
 or it is SILENTLY DROPPED. A **suspended** queue split keeps its slot: a `SUSPENDED` `AssignmentState`
 that `occupiesSlot` counts, re-matched in `reconcile` by stable surface UUID (its session Closes →
 `sessionID 0`), so the queue never reclaims the slot / over-packs the tab; resume transitions it back
-to RUNNING (→ `AGENT-QUEUE-INTERNALS.md`). GUI relaunch + rebuilt sidecar `dist`; usually no host/Zig change.
+to RUNNING (→ `AGENT-QUEUE-INTERNALS.md`). A maxItems VALUE of `"0"` is a REAL zero cap (start idle, raise
+live), distinct from `"unlimited"`/`none`/`inf`/`∞` = no cap — sidecar `parseMaxItemsValue` and Swift
+`parseCapOptimistic` must agree. GUI relaunch + rebuilt sidecar `dist`; usually no host/Zig change.
 
 ### Codex agent hooks → `CODEX-HOOKS.md`
 Brings Codex to full parity with Claude Code: the same per-tile agent-state hooks POSTing to MCP
