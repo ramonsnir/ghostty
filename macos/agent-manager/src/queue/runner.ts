@@ -385,14 +385,14 @@ export function makeQueueRun(
 }
 
 /** (§11 health) The run's EFFECTIVE lifetime cap: the LIVE edit if set (the dashboard cap
- *  control — `null` ⇒ unlimited), else the §8b maxItems override if set (0 ⇒ unlimited ⇒
- *  null), else the template `maxItems`. PURE. Shared by the dispatch gate and the health
+ *  control — `null` ⇒ unlimited), else the §8b maxItems override if set (`null` ⇒ unlimited;
+ *  `0` ⇒ a REAL zero cap — the run dispatches nothing until raised), else the template
+ *  `maxItems` (always a positive int). PURE. Shared by the dispatch gate and the health
  *  report so they agree. */
 export function effectiveMaxItemsCap(run: QueueRun): number | null {
   if (run.maxItemsLive !== undefined) return run.maxItemsLive; // live edit wins (null = unlimited)
   const override = resolveMaxItemsOverride(run.template, run.params);
-  const cap = override === undefined ? run.template.maxItems : override;
-  return cap <= 0 ? null : cap;
+  return override === undefined ? run.template.maxItems : override;
 }
 
 /**

@@ -990,7 +990,7 @@ export interface ActiveRunRecord {
    *  restart re-applies the same provider scope. Omitted when the template declares none. */
   params?: Record<string, string>;
   /** (live maxItems edit) The run-level lifetime-cap OVERRIDE set by a `set_max_items`
-   *  command while the run was live. `null` = live-set to unlimited; a positive number = the
+   *  command while the run was live. `null` = live-set to unlimited; a non-negative number (0 = dispatch nothing) = the
    *  live cap. OMITTED when never live-edited (a restart then falls back to the start-time /
    *  template cap). Persisted so a restart re-applies the user's live edit. */
   maxItemsLive?: number | null;
@@ -1062,13 +1062,13 @@ export function parseActiveRuns(text: string | null): ActiveRunRecord[] {
       }
       if (Object.keys(params).length > 0) rec.params = params;
     }
-    // (live maxItems edit) carry a live cap override: null = unlimited; a positive integer =
-    // the cap. Anything else (absent / non-finite / <=0 number) is dropped → no live override
+    // (live maxItems edit) carry a live cap override: null = unlimited; a non-negative integer
+    // = the cap (0 = dispatch nothing). Anything else (absent / non-finite / negative) is dropped → no live override
     // rehydrates (falls back to the start-time/template cap), matching the tolerant default.
     const mil = r.maxItemsLive;
     if (mil === null) {
       rec.maxItemsLive = null;
-    } else if (typeof mil === "number" && Number.isInteger(mil) && mil > 0) {
+    } else if (typeof mil === "number" && Number.isInteger(mil) && mil >= 0) {
       rec.maxItemsLive = mil;
     }
     // (live concurrency edit) carry a live concurrency override: a positive integer only.

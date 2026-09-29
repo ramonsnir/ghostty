@@ -373,13 +373,13 @@ struct QueueStatus: Equatable, Sendable {
     /// `parseMaxItemsValue` does, for the optimistic update. Returns a DOUBLE optional so
     /// "leave unchanged" is distinct from "set to unlimited":
     ///   `.none`            → blank / garbage → caller should NOT optimistically change
-    ///   `.some(nil)`       → unlimited (`0`/`unlimited`/`none`/`inf`/`∞`) → set maxItems = nil
-    ///   `.some(.some(n))`  → a positive-integer cap
+    ///   `.some(nil)`       → unlimited (`unlimited`/`none`/`inf`/`∞`) → set maxItems = nil
+    ///   `.some(.some(n))`  → a non-negative-integer cap (`0` = a REAL zero cap, not unlimited)
     static func parseCapOptimistic(_ raw: String) -> Int?? {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if s.isEmpty { return .none }
-        if ["0", "unlimited", "none", "inf", "infinity", "∞"].contains(s) { return .some(nil) }
-        if let n = Int(s), n > 0 { return .some(n) }
+        if ["unlimited", "none", "inf", "infinity", "∞"].contains(s) { return .some(nil) }
+        if let n = Int(s), n >= 0 { return .some(n) }
         return .none
     }
 }

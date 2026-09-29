@@ -195,7 +195,7 @@ template can be pointed at a different project/milestone each run with no file e
       "valuesCommand": ["python3", "/abs/path/list-projects.py"] },
     { "name": "milestones", "env": "LINEAR_MILESTONES", "label": "Milestone(s), comma-sep",
       "valuesCommand": ["python3", "/abs/path/list-milestones.py"] },
-    { "name": "maxItems",   "target": "maxItems",       "label": "Max items (0 = unlimited)", "default": "1" }
+    { "name": "maxItems",   "target": "maxItems",       "label": "Max items (0 = start idle, unlimited = no cap)", "default": "1" }
   ]
 }
 ```
@@ -205,7 +205,9 @@ template can be pointed at a different project/milestone each run with no file e
   - **`"env"` (the default)** → exported as `param.env` in the environment your
     `list`/`status`/`claim` commands run with (so your script reads `$LINEAR_PROJECT`, etc.).
   - **`"maxItems"`** → sets the **run's lifetime dispatch cap** for this start, overriding the
-    template's `maxItems`. A positive number caps it; **`0`/`unlimited`** removes the cap;
+    template's `maxItems`. A number caps it; **`0` is a real zero cap** — the run starts (tab, health bar,
+    "N waiting" preview) but dispatches nothing until you raise the cap live (`+1` / the cap editor /
+    the web monitor's `+1`); **`unlimited`** (or `none`/`inf`/`∞`) removes the cap;
     blank/non-numeric falls back to the template's `maxItems`. Needs no `env` (it tunes the
     engine); a template may declare at most one. This is the recommended way to vary run size.
     You can also **change this cap while the run is live** from the health bar (tap `dispatched/cap`).
@@ -388,7 +390,7 @@ Full design, the selector, and every edge case: **`CLOUD-QUEUE-BALANCING.md`**.
   visible even when every tile is hidden or there are no agents yet**. Pushed every ~5s; a
   finished/aborted run's section disappears.
 - **Change the cap live:** the **`dispatched/cap`** part is **tap-to-edit** — a popover (presets
-  `1 / 2 / 5 / 10 / ∞` + custom) raises or lowers a *running* queue's `maxItems` **without restarting**
+  `0 / 1 / 2 / 5 / 10 / ∞` + custom; `0` = stop future dispatch, `∞` = unlimited) raises or lowers a *running* queue's `maxItems` **without restarting**
   it. Raising re-enables dispatch next sweep; lowering only stops *future* dispatch (running agents
   are never killed). A blank/garbage entry is ignored. A same-scope re-`start` is a no-op, so this
   editor is the only in-place way.

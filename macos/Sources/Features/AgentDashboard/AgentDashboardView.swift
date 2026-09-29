@@ -843,6 +843,9 @@ private struct OriginSectionHeader: View {
             }
             // Absolute presets.
             HStack(spacing: 6) {
+                Button("0") { commitCap("0") }
+                    .buttonStyle(.bordered)
+                    .help("Zero — dispatch nothing more (running agents keep going)")
                 ForEach(["1", "2", "5", "10"], id: \.self) { v in
                     Button(v) { commitCap(v) }.buttonStyle(.bordered)
                 }

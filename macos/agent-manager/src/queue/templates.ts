@@ -788,15 +788,17 @@ export function scopeSlug(scope: string): string {
   return (h >>> 0).toString(36);
 }
 
-/** Tokens (case-insensitive) a maxItems answer may use to mean "no cap". */
-const MAXITEMS_UNLIMITED_TOKENS = new Set(["0", "unlimited", "none", "inf", "infinity", "∞"]);
+/** Tokens (case-insensitive) a maxItems answer may use to mean "no cap". NOT "0": a `0` is
+ *  a literal ZERO cap (start the run dispatching nothing; raise it later from the dashboard). */
+const MAXITEMS_UNLIMITED_TOKENS = new Set(["unlimited", "none", "inf", "infinity", "∞"]);
 
 /**
  * Parse a raw maxItems VALUE string. PURE. SHARED by the start-time param resolution
  * (`resolveMaxItemsOverride`) and the live `set_max_items` command (the dashboard cap
  * control). Returns:
- *   - `null` for an explicit "unlimited" token ("0"/"unlimited"/"none"/"inf"/"∞") — NO cap.
- *   - a positive integer N for an explicit numeric cap.
+ *   - `null` for an explicit "unlimited" token ("unlimited"/"none"/"inf"/"∞") — NO cap.
+ *   - a non-negative integer N for an explicit numeric cap. `0` is a REAL zero cap (the run
+ *     starts but dispatches nothing until the cap is raised) — NOT unlimited.
  *   - `undefined` for blank or garbage — the CALLER decides the fallback (start-time uses
  *     the template default; the live command IGNORES it / keeps the current cap). Garbage
  *     never silently means "spawn forever".
@@ -806,7 +808,7 @@ export function parseMaxItemsValue(raw: string): number | null | undefined {
   if (s === "") return undefined;
   if (MAXITEMS_UNLIMITED_TOKENS.has(s)) return null; // explicit unlimited
   const n = Number(s);
-  if (Number.isInteger(n) && n > 0) return n; // explicit positive cap
+  if (Number.isInteger(n) && n >= 0) return n; // explicit cap (0 = dispatch nothing)
   return undefined; // garbage
 }
 
@@ -832,20 +834,18 @@ export function parseConcurrencyValue(raw: string): number | undefined {
  *   - `undefined` when the template declares no maxItems param, OR the answer is blank, OR
  *     the answer is garbage (non-integer) — the caller then uses the template's `maxItems`
  *     (a safe finite default; garbage never silently means "spawn forever").
- *   - `0` for an explicit "unlimited" answer ("0"/"unlimited"/"none"/"inf"/"∞") — the caller
- *     treats 0 as NO lifetime cap.
- *   - a positive integer N for an explicit numeric cap.
+ *   - `null` for an explicit "unlimited" answer ("unlimited"/"none"/"inf"/"∞") — NO cap.
+ *   - a non-negative integer N for an explicit numeric cap (`0` = a real zero cap: the run
+ *     starts idle and dispatches nothing until the cap is raised live).
  * Only the FIRST maxItems-target param is honored (the validator already rejects a second).
  */
 export function resolveMaxItemsOverride(
   template: QueueTemplate,
   values: Record<string, string> = {},
-): number | undefined {
+): number | null | undefined {
   const p = template.params.find((q) => paramTarget(q) === "maxItems");
   if (p === undefined) return undefined;
-  const parsed = parseMaxItemsValue(values[p.name] ?? p.default ?? "");
-  if (parsed === undefined) return undefined; // blank/garbage → template default
-  return parsed === null ? 0 : parsed; // null (unlimited) → 0 (the override's unlimited sentinel)
+  return parseMaxItemsValue(values[p.name] ?? p.default ?? ""); // undefined → template default
 }
 
 /**

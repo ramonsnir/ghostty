@@ -226,15 +226,24 @@ test("applyCommand set_max_items: sets the live cap (number) on a live run", () 
   assert.equal(reg.get("r")!.maxItemsLive, 10);
 });
 
-test("applyCommand set_max_items: 'unlimited'/'0' tokens set the live cap to null (no cap)", () => {
+test("applyCommand set_max_items: 'unlimited' tokens set the live cap to null (no cap)", () => {
   const reg: RunRegistry = new Map();
   const { factory } = makeFactory({ f: "r" });
   applyCommand(reg, { action: "start", template: "f" }, factory);
-  for (const v of ["unlimited", "0", "none", "∞"]) {
+  for (const v of ["unlimited", "none", "∞"]) {
     const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: v }, factory);
     assert.equal(res.kind, "maxItemsSet", `"${v}" applies`);
     assert.equal(reg.get("r")!.maxItemsLive, null, `"${v}" → unlimited (null)`);
   }
+});
+
+test("applyCommand set_max_items: '0' sets a REAL zero cap (stop future dispatch), not unlimited", () => {
+  const reg: RunRegistry = new Map();
+  const { factory } = makeFactory({ f: "r" });
+  applyCommand(reg, { action: "start", template: "f" }, factory);
+  const res = applyCommand(reg, { action: "set_max_items", run: "r", maxItems: "0" }, factory);
+  assert.equal(res.kind, "maxItemsSet");
+  assert.equal(reg.get("r")!.maxItemsLive, 0);
 });
 
 test("applyCommand set_max_items: a blank/garbage value is IGNORED (no change, no removed cap)", () => {

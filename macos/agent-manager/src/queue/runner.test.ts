@@ -537,7 +537,7 @@ test("runQueueSweep: a maxItems-param override CAPS dispatch below the list size
   assert.equal(run.active.size, 1);
 });
 
-test("runQueueSweep: maxItems override '0' (unlimited) dispatches PAST the template maxItems", async () => {
+test("runQueueSweep: maxItems override 'unlimited' dispatches PAST the template maxItems", async () => {
   const fake = makeQueueFake({
     surfaces: [],
     listJson: '[{"id":"A"},{"id":"B"},{"id":"C"}]',
@@ -547,9 +547,9 @@ test("runQueueSweep: maxItems override '0' (unlimited) dispatches PAST the templ
       { id: "s-c", sessionId: 3 },
     ],
   });
-  // Template maxItems is only 2; the "0" override must override it to UNLIMITED so all 3 go.
+  // Template maxItems is only 2; the "unlimited" override must lift it so all 3 go.
   const t = tmpl({ maxItems: 2, params: [{ name: "maxItems", target: "maxItems" }] });
-  const run = makeQueueRun(t, memStore(), { params: { maxItems: "0" } });
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "unlimited" } });
   let now = 4_500_000;
   const deps = makeQueueDeps(fake, [run], () => now);
 
@@ -558,6 +558,29 @@ test("runQueueSweep: maxItems override '0' (unlimited) dispatches PAST the templ
   await runQueueSweep(deps); // dispatch — unlimited override beats the template cap of 2
 
   assert.equal(fake.calls.spawn.length, 3, "unlimited override dispatches all 3 (> template maxItems 2)");
+});
+
+test("runQueueSweep: maxItems override '0' is a REAL zero cap — dispatches nothing until raised live", async () => {
+  const fake = makeQueueFake({
+    surfaces: [],
+    listJson: '[{"id":"A"},{"id":"B"}]',
+    spawns: [{ id: "s-a", sessionId: 1 }],
+  });
+  const t = tmpl({ params: [{ name: "maxItems", target: "maxItems" }] });
+  const run = makeQueueRun(t, memStore(), { params: { maxItems: "0" } });
+  let now = 4_700_000;
+  const deps = makeQueueDeps(fake, [run], () => now);
+
+  assert.equal(effectiveMaxItemsCap(run), 0, "0 is a zero cap, not unlimited (null)");
+  await runQueueSweep(deps); // arm
+  now += 5000;
+  await runQueueSweep(deps); // would dispatch — but the cap is 0
+  assert.equal(fake.calls.spawn.length, 0, "a 0 cap dispatches nothing");
+
+  run.maxItemsLive = 1; // the dashboard "+1"
+  now += 60_000; // past the list-fetch throttle
+  await runQueueSweep(deps);
+  assert.equal(fake.calls.spawn.length, 1, "raising the cap to 1 dispatches exactly one");
 });
 
 // ---------------------------------------------------------------------------

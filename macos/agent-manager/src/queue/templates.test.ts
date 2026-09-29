@@ -209,9 +209,12 @@ test("resolveParamsEnv: skips a maxItems-target param (never reaches provider en
   assert.deepEqual(resolveParamsEnv(t, { maxItems: "5" }), { LINEAR_PROJECT: "Acme" });
 });
 
-test("parseMaxItemsValue: unlimited tokens → null, positive int → N, blank/garbage → undefined", () => {
+test("parseMaxItemsValue: unlimited tokens → null, non-negative int → N, blank/garbage → undefined", () => {
+  // "0" is a REAL zero cap (start idle, raise later) — NOT unlimited.
+  assert.equal(parseMaxItemsValue("0"), 0);
+  assert.equal(parseMaxItemsValue(" 0 "), 0);
   // Unlimited tokens (case-insensitive, trimmed) → null (NO cap).
-  for (const v of ["0", "unlimited", "UNLIMITED", "  none ", "inf", "infinity", "∞"]) {
+  for (const v of ["unlimited", "UNLIMITED", "  none ", "inf", "infinity", "∞"]) {
     assert.equal(parseMaxItemsValue(v), null, `"${v}" → null (unlimited)`);
   }
   // Positive integers → the number.
@@ -234,7 +237,7 @@ test("parseConcurrencyValue: positive int → N, blank/garbage/zero/negative →
   }
 });
 
-test("resolveMaxItemsOverride: blank/garbage → undefined, unlimited tokens → 0, positive int → N", () => {
+test("resolveMaxItemsOverride: blank/garbage → undefined, unlimited tokens → null, int → N (0 = zero cap)", () => {
   const t = {
     params: [{ name: "maxItems", target: "maxItems", default: "1" }],
   } as unknown as QueueTemplate;
@@ -244,9 +247,11 @@ test("resolveMaxItemsOverride: blank/garbage → undefined, unlimited tokens →
   // Explicit positive integers.
   assert.equal(resolveMaxItemsOverride(t, { maxItems: "2" }), 2);
   assert.equal(resolveMaxItemsOverride(t, { maxItems: "100" }), 100);
-  // Unlimited tokens (case-insensitive) → 0.
-  for (const v of ["0", "unlimited", "UNLIMITED", "none", "inf", "∞"]) {
-    assert.equal(resolveMaxItemsOverride(t, { maxItems: v }), 0, v);
+  // "0" → a real zero cap (distinct from unlimited).
+  assert.equal(resolveMaxItemsOverride(t, { maxItems: "0" }), 0);
+  // Unlimited tokens (case-insensitive) → null.
+  for (const v of ["unlimited", "UNLIMITED", "none", "inf", "∞"]) {
+    assert.equal(resolveMaxItemsOverride(t, { maxItems: v }), null, v);
   }
   // An explicitly-CLEARED answer ("") is a real answer (?? only falls back on
   // null/undefined), so it does NOT use the param default → undefined (template default).
